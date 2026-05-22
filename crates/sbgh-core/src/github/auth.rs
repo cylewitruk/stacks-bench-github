@@ -23,10 +23,15 @@ use tokio::sync::RwLock;
 
 use crate::{Error, Result};
 
-/// App-level credentials: the App id and its RS256 private key.
+/// App-level credentials: the App Client ID and its RS256 private key.
+///
+/// We use the Client ID (e.g. `Iv23li...`) rather than the numeric App ID as
+/// the JWT `iss` claim. Both are accepted by GitHub today, but Client ID is
+/// the recommended path per GitHub's 2024 guidance and is the only form that
+/// works on OAuth-style endpoints, so we'd rather standardise on it now.
 #[derive(Clone)]
 pub struct AppCredentials {
-    app_id: u64,
+    client_id: String,
     encoding_key: Arc<EncodingKey>,
 }
 
@@ -37,13 +42,13 @@ impl AppCredentials {
     /// signing key that anyone with shell access can read is essentially the
     /// same as no auth. We refuse to start rather than silently sign with a
     /// compromised key.
-    pub fn from_pem_file(app_id: u64, path: &Path) -> Result<Self> {
+    pub fn from_pem_file(client_id: impl Into<String>, path: &Path) -> Result<Self> {
         check_key_permissions(path)?;
         let pem = std::fs::read(path)?;
         let encoding_key = EncodingKey::from_rsa_pem(&pem)
             .map_err(|e| Error::Config(format!("invalid RSA private key: {e}")))?;
         Ok(Self {
-            app_id,
+            client_id: client_id.into(),
             encoding_key: Arc::new(encoding_key),
         })
     }
@@ -59,7 +64,7 @@ impl AppCredentials {
         let claims = JwtClaims {
             iat: now - 60,
             exp: now + (9 * 60),
-            iss: self.app_id.to_string(),
+            iss: self.client_id.clone(),
         };
         Ok(encode(&Header::new(Algorithm::RS256), &claims, &self.encoding_key)?)
     }

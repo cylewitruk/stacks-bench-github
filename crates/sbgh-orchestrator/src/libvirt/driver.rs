@@ -454,7 +454,7 @@ mod tests {
                 service_user: "sbgh".into(),
             },
             github: GitHubConfig {
-                app_id: 1,
+                client_id: "Iv23litest".into(),
                 api_base_url: "https://api.github.test".into(),
                 private_key_path: PathBuf::from("/dev/null"),
                 webhook_secret: "unused".into(),

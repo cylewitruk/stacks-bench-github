@@ -4,6 +4,7 @@ members = [
     "crates/sbgh-core",
     "crates/sbgh-handler",
     "crates/sbgh-orchestrator",
+    "crates/sbgh-smee",
 ]
 
 [workspace.package]
@@ -50,7 +51,13 @@ sqlx = { version = "0.8", default-features = false, features = [
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` is critical for sbgh-smee: it forwards GitHub webhook
+# payloads, and the receiver verifies HMAC against the body bytes. If we
+# re-serialize JSON with keys in alphabetical order, the byte stream differs
+# from what GitHub originally sent and HMAC fails. preserve_order keeps the
+# insertion order through the round-trip, matching V8's behaviour that
+# upstream smee-client relies on.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Errors
 thiserror = "2"
@@ -69,6 +76,9 @@ toml = "1"
 quick-xml = "0.40"
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+
+reqwest-eventsource = "0.6"
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 lto = "thin"

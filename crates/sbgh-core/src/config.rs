@@ -50,7 +50,11 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubConfig {
-    pub app_id: u64,
+    /// GitHub App **Client ID** (e.g. `Iv23li...`) — used as the JWT `iss`
+    /// claim when minting installation tokens. Both Client ID and the older
+    /// numeric App ID work at GitHub today; we standardise on Client ID per
+    /// GitHub's 2024 recommendation.
+    pub client_id: String,
     pub api_base_url: String,
     pub private_key_path: PathBuf,
     /// Webhook signing secret. Always loaded from env.
@@ -161,7 +165,7 @@ struct RawServer {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawGitHub {
-    app_id: Option<u64>,
+    client_id: Option<String>,
     api_base_url: Option<String>,
     private_key_path: Option<PathBuf>,
     webhook_secret: Option<String>,
@@ -221,7 +225,7 @@ impl RawConfig {
         merge_opt(&mut self.server.database_url, other.server.database_url);
         merge_opt(&mut self.server.service_user, other.server.service_user);
 
-        merge_opt(&mut self.github.app_id, other.github.app_id);
+        merge_opt(&mut self.github.client_id, other.github.client_id);
         merge_opt(&mut self.github.api_base_url, other.github.api_base_url);
         merge_opt(&mut self.github.private_key_path, other.github.private_key_path);
         merge_opt(&mut self.github.webhook_secret, other.github.webhook_secret);
@@ -314,7 +318,7 @@ impl RawConfig {
         env_into(&mut self.server.service_user, "SBGH_SERVICE_USER");
 
         // github
-        env_parse_into(&mut self.github.app_id, "SBGH_GH_APP_ID");
+        env_into(&mut self.github.client_id, "SBGH_GH_CLIENT_ID");
         env_into(&mut self.github.api_base_url, "SBGH_GH_API_BASE_URL");
         env_path_into(&mut self.github.private_key_path, "SBGH_GH_PRIVATE_KEY_PATH");
         env_into(&mut self.github.webhook_secret, "SBGH_GH_WEBHOOK_SECRET");
@@ -397,7 +401,10 @@ impl RawConfig {
                     .unwrap_or_else(|| "sbgh".into()),
             },
             github: GitHubConfig {
-                app_id: required(self.github.app_id, "[github].app_id / SBGH_GH_APP_ID")?,
+                client_id: required(
+                    self.github.client_id,
+                    "[github].client_id / SBGH_GH_CLIENT_ID",
+                )?,
                 api_base_url: self
                     .github
                     .api_base_url
@@ -618,7 +625,7 @@ mod tests {
     fn required_env_vars() -> Vec<(&'static str, &'static str)> {
         vec![
             ("DATABASE_URL", "postgres://x"),
-            ("SBGH_GH_APP_ID", "42"),
+            ("SBGH_GH_CLIENT_ID", "Iv23litest123"),
             ("SBGH_GH_PRIVATE_KEY_PATH", "/tmp/key.pem"),
             ("SBGH_GH_WEBHOOK_SECRET", "hunter2"),
             ("SBGH_LVM_VG", "sbgh-vg"),
@@ -631,7 +638,7 @@ mod tests {
     fn loads_from_env_only() {
         let _g = EnvGuard::set(&required_env_vars());
         let cfg = Config::load_layered(None).unwrap();
-        assert_eq!(cfg.github.app_id, 42);
+        assert_eq!(cfg.github.client_id, "Iv23litest123");
         assert_eq!(cfg.lvm.vg_name, "sbgh-vg");
         assert_eq!(cfg.vm.vcpus, 2);
         assert_eq!(cfg.vm.memory_gib, 8);
@@ -679,7 +686,7 @@ mod tests {
     #[test]
     fn missing_required_field_errors() {
         // Don't set DATABASE_URL etc.
-        let _g = EnvGuard::set(&[("SBGH_GH_APP_ID", "1")]);
+        let _g = EnvGuard::set(&[("SBGH_GH_CLIENT_ID", "Iv23litest")]);
         let err = Config::load_layered(None).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }

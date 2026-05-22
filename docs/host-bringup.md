@@ -130,11 +130,11 @@ sudo -u sbgh sudo -n /usr/bin/virsh --version
 
 You don't need a public domain — webhook delivery will be tunneled (next section).
 
-1. Go to **https://github.com/settings/apps/new** (or your org's developer settings).
+1. Go to **<https://github.com/settings/apps/new>** (or your org's developer settings).
 2. Fill in:
    - **GitHub App name**: anything unique, e.g. `sbgh-dev-<your-handle>`
    - **Homepage URL**: anything (e.g. your repo URL)
-   - **Webhook URL**: paste your smee.io URL here (from `smee.io` — just visit the page and it gives you one) **or** any placeholder if using `gh webhook forward`, then update later.
+   - **Webhook URL**: paste a fresh smee.io channel URL — visit [smee.io](https://smee.io/) in a browser, it'll redirect you to one, copy that. Or programmatically: `curl -sI https://smee.io/new | awk -F': ' 'tolower($1)=="location"{print $2}' | tr -d '\r\n'`. (We use smee.io because GitHub App webhooks are delivered to a single App-level URL — `gh webhook forward` only works for repo/org webhooks, not App webhooks.)
    - **Webhook secret**: paste a long random string. Generate one with:
 
      ```bash
@@ -154,7 +154,7 @@ You don't need a public domain — webhook delivery will be tunneled (next secti
 4. **Subscribe to events**: `Issue comment` (that's the only one we need; PR comments come through this event).
 5. **Where can this GitHub App be installed?**: "Only on this account" (for dev).
 6. Click **Create GitHub App**.
-7. From the new app's settings page, copy the **App ID** — that's `SBGH_GH_APP_ID`.
+7. From the new app's settings page, copy the **Client ID** (the `Iv23li…` value listed near the top, right under "About") — that's `SBGH_GH_CLIENT_ID`. GitHub also displays an "App ID" (a numeric value); we don't use that. Both work today, but Client ID is the recommended modern form and the only one that survives if GitHub ever deprecates the legacy App ID auth path.
 8. Scroll down → **Generate a private key**. The browser downloads a `.pem` file. Move it somewhere safe and lock it down:
 
     ```bash
@@ -166,36 +166,24 @@ You don't need a public domain — webhook delivery will be tunneled (next secti
 
 ## 5. Tunnel webhook deliveries to localhost
 
-Pick one. `gh webhook forward` is the lowest-friction option if you already have `gh` installed.
-
-### Option A: gh webhook forward
+Use the workspace-local `sbgh-smee` binary — a ~150 LoC Rust port of `smee-client` that avoids pulling in the npm dep tree. It's an SSE consumer that subscribes to the smee.io channel set on the App and POSTs each delivery to a local URL with the original GitHub headers reconstructed.
 
 ```bash
-gh auth status                  # must be logged in
-gh webhook forward \
-  --repo=<your-handle>/stacks-core \
-  --events=issue_comment \
-  --url=http://localhost:8080/webhook
-```
-
-Leave this running. It prints each delivery. When the handler is running, you can verify by re-delivering a past webhook from the App settings page (**Advanced → Recent Deliveries → Redeliver**).
-
-### Option B: smee.io
-
-If you set the webhook URL on the App to your smee channel:
-
-```bash
-# pick one
-npm install --global smee-client
-# or
-docker run --rm -p 0 --name smee deltaprojects/smee-client \
-  --url https://smee.io/<your-channel> \
+cargo run --release -p sbgh-smee -- \
+  --channel https://smee.io/<your-channel> \
   --target http://localhost:8080/webhook
 ```
 
-```bash
-smee --url https://smee.io/<your-channel> --target http://localhost:8080/webhook
-```
+Leave this running. It logs each forwarded delivery. When the handler is running, you can verify by re-delivering a past webhook from the App settings page (**Advanced → Recent Deliveries → Redeliver**).
+
+### Why not `gh webhook forward` or `npm smee-client`?
+
+- `gh webhook forward` (a `gh` CLI extension) only works with **repository** / **organization** webhooks, not GitHub App webhooks. Our App's webhook URL is set at the App level, so this isn't applicable.
+- `npm install --global smee-client` works but pulls in Node + a transitive dep tree, which we don't otherwise need on a dev machine. `sbgh-smee` is the same protocol, audited per-line, and shares the rest of the workspace's Rust deps.
+
+### HMAC compatibility note
+
+`sbgh-smee` re-serializes the JSON body before forwarding, which means GitHub's HMAC-SHA256 over the original body needs the re-serialized bytes to match exactly. We achieve this by enabling `serde_json`'s `preserve_order` feature workspace-wide so the body's key order survives the round trip (the upstream Node `smee-client` relies on V8 having the same property). If your handler ever rejects forwarded deliveries with `401 invalid signature`, this is the first thing to check.
 
 ## 6. Configure + run the services
 
@@ -207,16 +195,37 @@ docker compose -f docker/docker-compose.yml up -d
 
 ### Environment
 
+Two ways to load secrets, pick one (or mix):
+
+**A. `.env` in the repo** — convenient for prod where the host is dedicated to this service:
+
 ```bash
 cp .env.example .env
 chmod 0600 .env
 ```
 
-Edit `.env` and set at minimum:
+**B. Secrets file outside the repo** — recommended when you share the repo with other tools/people (or with an AI assistant) and don't want secrets in any path they can read:
+
+```bash
+mkdir -p ~/.config/sbgh && chmod 700 ~/.config/sbgh
+cp .env.example ~/.config/sbgh/secrets.env
+chmod 600 ~/.config/sbgh/secrets.env
+```
+
+Then point the binaries at it with `--env-file`:
+
+```bash
+sbgh-handler      --env-file ~/.config/sbgh/secrets.env
+sbgh-orchestrator --env-file ~/.config/sbgh/secrets.env
+```
+
+(With `--env-file`, a missing/unreadable file is a hard error. Without it, `./.env` is loaded best-effort and a missing file is silently tolerated.)
+
+Edit whichever file you chose and set at minimum:
 
 ```bash
 DATABASE_URL=postgres://sbgh:sbgh@127.0.0.1:5432/sbgh
-SBGH_GH_APP_ID=<from step 4.7>
+SBGH_GH_CLIENT_ID=<from step 4.7>
 SBGH_GH_PRIVATE_KEY_PATH=/etc/sbgh/github-app.private-key.pem
 SBGH_GH_WEBHOOK_SECRET=<from step 4.2>
 SBGH_ALLOWED_REPOS=<your-handle>/stacks-core
@@ -225,6 +234,8 @@ SBGH_LVM_VG=sbgh-vg
 SBGH_LVM_THINPOOL=thinpool
 RUST_LOG=info,sbgh_handler=debug,sbgh_orchestrator=debug
 ```
+
+Either way, variables you `export` in your shell before launching the binary win over what's in the file — useful for one-off overrides without editing.
 
 Optionally drop a `config.toml` for non-secret settings:
 

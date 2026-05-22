@@ -8,7 +8,10 @@
 bind_addr = "0.0.0.0:8080"
 
 [github]
-app_id = 1234567
+# GitHub App Client ID (the `Iv23li...` string in the App's settings page,
+# right under "About"). We use this rather than the numeric App ID as the
+# JWT `iss` claim — both work today, Client ID is GitHub's recommended path.
+client_id = "Iv23liREPLACE_ME"
 api_base_url = "https://api.github.com"
 
 [authorization]
