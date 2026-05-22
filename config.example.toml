@@ -1,0 +1,41 @@
+# Example sbgh config. Copy to /etc/sbgh/config.toml (or wherever $SBGH_CONFIG points)
+# and fill in.
+#
+# Secrets (DATABASE_URL, SBGH_GH_*) come from env only — they are NOT read from
+# this file. Anything else: env overrides what's set here.
+
+[server]
+bind_addr = "0.0.0.0:8080"
+
+[github]
+app_id = 1234567
+api_base_url = "https://api.github.com"
+
+[authorization]
+allowed_repositories = ["cylewitruk/stacks-core"]
+allowed_users = []
+allowed_associations = ["OWNER", "MEMBER", "COLLABORATOR"]
+
+[vm]
+golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
+vcpus = 2
+memory_gib = 8
+boot_disk_gib = 64
+job_timeout_secs = 21600   # 6 hours
+network = "default"
+
+[paths]
+jobs_dir = "/var/lib/sbgh/jobs"
+git_mirror = "/var/lib/sbgh/git/stacks-core.git"
+results_tmpfs_root = "/run/sbgh/jobs"
+results_archive_dir = "/var/lib/sbgh/results"
+virsh_binary = "/usr/bin/virsh"
+
+[lvm]
+vg_name = "sbgh-vg"
+thinpool = "thinpool"
+chainstate_base_prefix = "mainnet-"
+chainstate_snapshot_size_gib = 64
+
+[stacks_bench]
+default_args = ""

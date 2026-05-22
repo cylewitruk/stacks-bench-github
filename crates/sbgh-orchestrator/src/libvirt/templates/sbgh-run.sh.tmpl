@@ -1,0 +1,67 @@
+#!/bin/bash
+# Runs inside the guest VM under cloud-init.
+#
+# Layout (mounted by this script):
+#   {{ source_mount }}        — source disk (vdc), ext4, freshly cloned + checked out
+#   {{ chainstate_mount }}    — chainstate snapshot (vdb), XFS
+#   {{ results_mount }}       — virtio-fs share to host tmpfs (tag={{ results_share_tag }})
+#
+# Phases (written to {{ results_mount }}/.phase; orchestrator polls for these):
+#   building   -> cargo build is running
+#   running    -> stacks-bench is executing
+#   collecting -> sqlite finalize / sync
+#   done       -> normal completion
+#   error      -> a step failed; details in console.log
+
+set -euo pipefail
+
+HEAD_SHA="{{ head_sha }}"
+SRC="{{ source_mount }}"
+CHAIN="{{ chainstate_mount }}"
+RESULTS="{{ results_mount }}"
+SHARE_TAG="{{ results_share_tag }}"
+
+# Split `{{ stacks_bench_args }}` into separate argv tokens at whitespace.
+# Quoting EXTRA_ARGS would pass the whole string as one argument; using an
+# array makes the word-split explicit and shellcheck-clean.
+read -r -a EXTRA_ARGS <<<"{{ stacks_bench_args }}"
+
+PHASE="$RESULTS/.phase"
+
+phase()  { echo "$1" >"$PHASE"; sync; }
+die()    { phase "error"; echo "ERROR: $*" >&2; exit 1; }
+
+# --- mount results share (virtio-fs) -------------------------------------------------
+mkdir -p "$RESULTS"
+mount -t virtiofs "$SHARE_TAG" "$RESULTS" || die "failed to mount virtio-fs $SHARE_TAG"
+phase "starting"
+
+# --- mount source disk (vdc) ---------------------------------------------------------
+# Mounted read-write: cargo writes target/ under the workspace. The disk is
+# per-job and torn down after the run, so there's nothing to protect.
+mkdir -p "$SRC"
+mount /dev/disk/by-label/sbgh-src "$SRC" || die "failed to mount source disk"
+
+# --- mount chainstate snapshot (vdb) -------------------------------------------------
+mkdir -p "$CHAIN"
+mount -t xfs /dev/vdb "$CHAIN" || die "failed to mount chainstate xfs"
+
+# --- build stacks-bench from the checked-out source ----------------------------------
+phase "building"
+cd "$SRC"
+git rev-parse HEAD | grep -q "$HEAD_SHA" || die "checkout sha mismatch"
+cargo build --release -p stacks-bench || die "cargo build failed"
+
+# --- run benchmark -------------------------------------------------------------------
+phase "running"
+./target/release/stacks-bench \
+    --chainstate "$CHAIN" \
+    --output "$RESULTS/run.sqlite" \
+    "${EXTRA_ARGS[@]}" \
+    || die "stacks-bench exited non-zero"
+
+# --- finalize -----------------------------------------------------------------------
+phase "collecting"
+sync
+phase "done"
+# cloud-init's `power_state: poweroff` will shut us down cleanly.

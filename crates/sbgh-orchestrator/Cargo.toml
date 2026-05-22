@@ -1,0 +1,36 @@
+[package]
+name = "sbgh-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sbgh-orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+sbgh-core.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+thiserror.workspace = true
+anyhow.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+sqlx.workspace = true
+dotenvy.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+quick-xml.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

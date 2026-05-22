@@ -1,0 +1,299 @@
+//! Build a libvirt domain XML programmatically with `quick-xml`.
+//!
+//! Output shape (abridged):
+//!   <domain type='kvm'>
+//!     <name/>, <memory/>, <vcpu/>, <os/>, <features/>, <cpu/>, ...
+//!     <memoryBacking><source type='memfd'/><access
+//! mode='shared'/></memoryBacking>     <devices>
+//!       <disk vda boot.qcow2 qcow2>
+//!       <disk vdb /dev/.../chainstate raw block>
+//!       <disk vdc source.raw raw>
+//!       <disk sda cidata.iso cdrom readonly>
+//!       <filesystem virtiofs results_share_dir -> tag>
+//!       <interface type='network' source=network/>
+//!       <serial/console type='file' path=console.log>
+//!       <channel virtio org.qemu.guest_agent.0>
+//!     </devices>
+//!   </domain>
+
+use std::io::Cursor;
+use std::path::Path;
+
+use quick_xml::Writer;
+use quick_xml::events::*;
+
+pub struct DomainSpec<'a> {
+    pub name: &'a str,
+    pub vcpus: u32,
+    pub memory_gib: u32,
+    pub boot_disk_path: &'a Path,
+    pub chainstate_dev_path: &'a Path,
+    pub source_disk_path: &'a Path,
+    pub cidata_iso_path: &'a Path,
+    pub results_share_dir: &'a Path,
+    pub results_share_tag: &'a str,
+    pub console_log_path: &'a Path,
+    pub network: &'a str,
+}
+
+pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
+    let mut w = Writer::new_with_indent(Cursor::new(Vec::new()), b' ', 2);
+
+    w.create_element("domain")
+        .with_attribute(("type", "kvm"))
+        .write_inner_content(|w| {
+            text(w, "name", spec.name)?;
+            w.create_element("memory")
+                .with_attribute(("unit", "GiB"))
+                .write_text_content(BytesText::new(&spec.memory_gib.to_string()))?;
+            text(w, "vcpu", &spec.vcpus.to_string())?;
+
+            w.create_element("os")
+                .write_inner_content(|w| {
+                    w.create_element("type")
+                        .with_attribute(("arch", "x86_64"))
+                        .with_attribute(("machine", "q35"))
+                        .write_text_content(BytesText::new("hvm"))?;
+                    empty(w, "boot", &[("dev", "hd")])?;
+                    Ok(())
+                })?;
+
+            w.create_element("features")
+                .write_inner_content(|w| {
+                    empty(w, "acpi", &[])?;
+                    empty(w, "apic", &[])?;
+                    Ok(())
+                })?;
+
+            empty(w, "cpu", &[("mode", "host-passthrough"), ("check", "none")])?;
+            empty(w, "clock", &[("offset", "utc")])?;
+
+            text(w, "on_poweroff", "destroy")?;
+            text(w, "on_reboot", "destroy")?;
+            text(w, "on_crash", "destroy")?;
+
+            // memoryBacking is required for virtio-fs (shared memory access).
+            w.create_element("memoryBacking")
+                .write_inner_content(|w| {
+                    empty(w, "source", &[("type", "memfd")])?;
+                    empty(w, "access", &[("mode", "shared")])?;
+                    Ok(())
+                })?;
+
+            w.create_element("devices")
+                .write_inner_content(|w| {
+                    emulator(w, "/usr/bin/qemu-system-x86_64")?;
+
+                    file_disk(w, spec.boot_disk_path, "qcow2", "vda", false)?;
+                    block_disk(w, spec.chainstate_dev_path, "vdb")?;
+                    file_disk(w, spec.source_disk_path, "raw", "vdc", false)?;
+                    file_disk(w, spec.cidata_iso_path, "raw", "sda", true)?;
+
+                    virtiofs_filesystem(w, spec.results_share_dir, spec.results_share_tag)?;
+                    interface_network(w, spec.network)?;
+                    serial_console_file(w, spec.console_log_path)?;
+                    guest_agent_channel(w)?;
+                    Ok(())
+                })?;
+
+            Ok(())
+        })?;
+
+    let bytes = w.into_inner().into_inner();
+    Ok(String::from_utf8(bytes)?)
+}
+
+// ─────────────────────────── element helpers ───────────────────────────
+
+type W = Writer<Cursor<Vec<u8>>>;
+
+fn text(w: &mut W, name: &str, content: &str) -> std::io::Result<()> {
+    w.create_element(name)
+        .write_text_content(BytesText::new(content))?;
+    Ok(())
+}
+
+fn empty(w: &mut W, name: &str, attrs: &[(&str, &str)]) -> std::io::Result<()> {
+    let mut el = w.create_element(name);
+    for (k, v) in attrs {
+        el = el.with_attribute((*k, *v));
+    }
+    el.write_empty()?;
+    Ok(())
+}
+
+fn emulator(w: &mut W, path: &str) -> std::io::Result<()> {
+    w.create_element("emulator")
+        .write_text_content(BytesText::new(path))?;
+    Ok(())
+}
+
+fn file_disk(
+    w: &mut W,
+    path: &Path,
+    driver_type: &str,
+    target_dev: &str,
+    cdrom: bool,
+) -> std::io::Result<()> {
+    let device = if cdrom { "cdrom" } else { "disk" };
+    let bus = if cdrom { "sata" } else { "virtio" };
+    let mut disk = w.create_element("disk");
+    disk = disk
+        .with_attribute(("type", "file"))
+        .with_attribute(("device", device));
+    disk.write_inner_content(|w| {
+        empty(w, "driver", &[("name", "qemu"), ("type", driver_type)])?;
+        empty(w, "source", &[("file", &path.display().to_string())])?;
+        empty(w, "target", &[("dev", target_dev), ("bus", bus)])?;
+        if cdrom {
+            empty(w, "readonly", &[])?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn block_disk(w: &mut W, dev: &Path, target_dev: &str) -> std::io::Result<()> {
+    w.create_element("disk")
+        .with_attribute(("type", "block"))
+        .with_attribute(("device", "disk"))
+        .write_inner_content(|w| {
+            empty(
+                w,
+                "driver",
+                &[("name", "qemu"), ("type", "raw"), ("cache", "none"), ("io", "native")],
+            )?;
+            empty(w, "source", &[("dev", &dev.display().to_string())])?;
+            empty(w, "target", &[("dev", target_dev), ("bus", "virtio")])?;
+            Ok(())
+        })?;
+    Ok(())
+}
+
+fn virtiofs_filesystem(w: &mut W, dir: &Path, tag: &str) -> std::io::Result<()> {
+    w.create_element("filesystem")
+        .with_attribute(("type", "mount"))
+        .with_attribute(("accessmode", "passthrough"))
+        .write_inner_content(|w| {
+            empty(w, "driver", &[("type", "virtiofs")])?;
+            empty(w, "source", &[("dir", &dir.display().to_string())])?;
+            empty(w, "target", &[("dir", tag)])?;
+            Ok(())
+        })?;
+    Ok(())
+}
+
+fn interface_network(w: &mut W, network: &str) -> std::io::Result<()> {
+    w.create_element("interface")
+        .with_attribute(("type", "network"))
+        .write_inner_content(|w| {
+            empty(w, "source", &[("network", network)])?;
+            empty(w, "model", &[("type", "virtio")])?;
+            Ok(())
+        })?;
+    Ok(())
+}
+
+fn serial_console_file(w: &mut W, log: &Path) -> std::io::Result<()> {
+    let log_s = log.display().to_string();
+    w.create_element("serial")
+        .with_attribute(("type", "file"))
+        .write_inner_content(|w| {
+            empty(w, "source", &[("path", &log_s), ("append", "off")])?;
+            empty(w, "target", &[("type", "isa-serial"), ("port", "0")])?;
+            Ok(())
+        })?;
+    w.create_element("console")
+        .with_attribute(("type", "file"))
+        .write_inner_content(|w| {
+            empty(w, "source", &[("path", &log_s), ("append", "off")])?;
+            empty(w, "target", &[("type", "serial"), ("port", "0")])?;
+            Ok(())
+        })?;
+    Ok(())
+}
+
+fn guest_agent_channel(w: &mut W) -> std::io::Result<()> {
+    w.create_element("channel")
+        .with_attribute(("type", "unix"))
+        .write_inner_content(|w| {
+            empty(w, "target", &[("type", "virtio"), ("name", "org.qemu.guest_agent.0")])?;
+            Ok(())
+        })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn sample<'a>() -> DomainSpec<'a> {
+        DomainSpec {
+            name: "sbgh-job1",
+            vcpus: 4,
+            memory_gib: 8,
+            boot_disk_path: Path::new("/var/lib/sbgh/jobs/job1/boot.qcow2"),
+            chainstate_dev_path: Path::new("/dev/sbgh-vg/sbgh-job1-chainstate"),
+            source_disk_path: Path::new("/var/lib/sbgh/jobs/job1/source.raw"),
+            cidata_iso_path: Path::new("/var/lib/sbgh/jobs/job1/cidata.iso"),
+            results_share_dir: Path::new("/run/sbgh/jobs/job1"),
+            results_share_tag: "results",
+            console_log_path: Path::new("/var/lib/sbgh/jobs/job1/console.log"),
+            network: "default",
+        }
+    }
+
+    #[test]
+    fn renders_all_required_sections() {
+        let xml = render(&sample()).unwrap();
+        // sanity: well-formed structure
+        assert!(xml.starts_with("<domain type=\"kvm\">"));
+        assert!(xml.contains("<name>sbgh-job1</name>"));
+        assert!(xml.contains("<memory unit=\"GiB\">8</memory>"));
+        assert!(xml.contains("<vcpu>4</vcpu>"));
+        // disks
+        assert!(xml.contains("/var/lib/sbgh/jobs/job1/boot.qcow2"));
+        assert!(xml.contains("/dev/sbgh-vg/sbgh-job1-chainstate"));
+        assert!(xml.contains("/var/lib/sbgh/jobs/job1/source.raw"));
+        assert!(xml.contains("/var/lib/sbgh/jobs/job1/cidata.iso"));
+        // virtio-fs
+        assert!(xml.contains("type=\"virtiofs\""));
+        assert!(xml.contains("dir=\"results\""));
+        assert!(xml.contains("/run/sbgh/jobs/job1"));
+        // memoryBacking shared (virtio-fs requirement)
+        assert!(xml.contains("<memoryBacking>"));
+        assert!(xml.contains("mode=\"shared\""));
+        // network + console + guest agent
+        assert!(xml.contains("network=\"default\""));
+        assert!(xml.contains("/var/lib/sbgh/jobs/job1/console.log"));
+        assert!(xml.contains("org.qemu.guest_agent.0"));
+    }
+
+    #[test]
+    fn xml_parses_back_with_quick_xml() {
+        // Cheap sanity check that what we wrote is well-formed.
+        use quick_xml::reader::Reader;
+        let xml = render(&sample()).unwrap();
+        let mut reader = Reader::from_str(&xml);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => panic!("malformed XML: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn paths_with_special_chars_are_escaped() {
+        let mut spec = sample();
+        let weird: PathBuf = PathBuf::from("/var/lib/sbgh/jobs/job&id/boot.qcow2");
+        spec.boot_disk_path = weird.as_path();
+        let xml = render(&spec).unwrap();
+        // attribute values should be XML-escaped
+        assert!(xml.contains("job&amp;id"));
+        assert!(!xml.contains("job&id\""));
+    }
+}

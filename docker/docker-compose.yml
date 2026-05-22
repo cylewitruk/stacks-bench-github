@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: sbgh-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sbgh
+      POSTGRES_PASSWORD: sbgh
+      POSTGRES_DB: sbgh
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - sbgh-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sbgh -d sbgh"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  sbgh-pgdata:

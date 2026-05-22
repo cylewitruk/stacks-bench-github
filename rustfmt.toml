@@ -1,0 +1,51 @@
+style_edition = "2024"
+
+# Use options that prioritize vertical compactness
+# Options: "Off", "Default", "Max"
+use_small_heuristics = "Max"
+
+# Maximum line width
+max_width = 100
+
+# Comment width
+comment_width = 80
+
+# Reorder import statements alphabetically
+reorder_imports = true
+
+# Reorder module statements alphabetically
+reorder_modules = true
+
+# How to group imports
+# Options: "Preserve", "StdExternalCrate", "One"
+group_imports = "StdExternalCrate"
+
+# Controls the granularity of imports combining paths from the same crate
+# Options: "Preserve", "Crate", "Module", "Item", "One"
+imports_granularity = "Module"
+
+# Format code snippets in documentation comments
+format_code_in_doc_comments = true
+
+# Force multiline closures and match arms to be enclosed in braces
+force_multiline_blocks = false
+
+# Wrap comments to respect max_width
+wrap_comments = true
+
+# Normalize comments by removing extra spaces and adjusting indentation
+normalize_comments = true
+
+# Use field initialization shorthand if possible
+use_field_init_shorthand = true
+
+# Replace strings of _ wildcards by a single .. in tuple patterns
+condense_wildcard_suffixes = true
+
+# Format string literals where necessary (adds a \ and breaks the line
+format_strings = true
+
+# Force chained method calls to be wrapped more aggressively.
+chain_width = 30
+
+struct_lit_width = 30
