@@ -519,6 +519,7 @@ mod tests {
             .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP --show
             .expect_ok(1) // mount loop
             .expect_ok(1) // chown
+            .expect_ok(1) // rmdir lost+found (ext4 leftover, blocks git clone)
             .expect_ok(1) // git clone --reference
             .expect_ok(1) // git checkout
             .expect_ok(1) // umount source
@@ -591,6 +592,7 @@ mod tests {
             "losetup",       // source: attach loop
             "mount",         // source: mount loop
             "chown",         // source: chown to service user
+            "rmdir",         // source: drop ext4 lost+found
             "git",           // source: clone --reference
             "git",           // source: checkout sha
             "umount",        // source: unmount
@@ -664,6 +666,7 @@ mod tests {
             .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP --show
             .expect_ok(1) // mount loop
             .expect_ok(1) // chown
+            .expect_ok(1) // rmdir lost+found (ext4 leftover, blocks git clone)
             .expect_ok(1) // git clone --reference
             .expect_ok(1) // git checkout
             .expect_ok(1) // umount source

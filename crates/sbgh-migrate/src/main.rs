@@ -5,12 +5,11 @@
 //! `docker-compose.yml`). The handler and orchestrator never run with owner
 //! credentials — they each connect as their own narrow role:
 //!
-//!   - `sbgh_handler`  → INSERT on a small set of jobs columns + SELECT
-//!                       on `id` and `github_delivery_id` (required for
-//!                       `INSERT ... ON CONFLICT ... RETURNING` to work).
-//!                       No read access to head_sha / args / result, no
-//!                       way to fabricate a `status='completed'` row.
-//!   - `sbgh_orch`     → SELECT + UPDATE on the full `jobs` table.
+//! - `sbgh_handler` → INSERT on a small set of jobs columns + SELECT on `id`
+//!   and `github_delivery_id` (required for `INSERT ... ON CONFLICT ...
+//!   RETURNING` to work). No read access to head_sha / args / result, no way to
+//!   fabricate a `status='completed'` row.
+//! - `sbgh_orch` → SELECT + UPDATE on the full `jobs` table.
 //!
 //! Run on `docker compose up` as a `service_completed_successfully` dependency
 //! of both handler and orchestrator. Idempotent: re-running just re-applies

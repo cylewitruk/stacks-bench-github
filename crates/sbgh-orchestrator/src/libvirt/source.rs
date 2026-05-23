@@ -2,16 +2,17 @@
 //! `stacks-core` checked out at the PR's head SHA. Attached to the VM as `vdc`.
 //!
 //! Steps:
-//!   1. `truncate -s 8G <source.raw>`         (host-writable)
+//!   1. `truncate -s 8G <source.raw>` (host-writable)
 //!   2. `mkfs.ext4 -F -L sbgh-src <source.raw>` (root)
-//!   3. `losetup -fP --show <source.raw>`     (root) — returns loop device
-//!   4. `mount <loop> <mountpoint>`           (root)
-//!   5. `chown -R sbgh <mountpoint>`          (root) — so user-owned git can
-//!      write
-//!   6. `git clone --reference <mirror> --shared <mirror> <mountpoint>` (user)
-//!   7. `git -C <mountpoint> checkout <sha>` (user)
-//!   8. `umount <mountpoint>`                 (root)
-//!   9. `losetup -d <loop>`                   (root)
+//!   3. `losetup -fP --show <source.raw>` (root) — returns loop device
+//!   4. `mount <loop> <mountpoint>` (root)
+//!   5. `chown -R sbgh <mountpoint>` (root) — so user-owned git can write
+//!   6. `rmdir <mountpoint>/lost+found` (user) — mke2fs always creates this;
+//!      git clone refuses to clone into a non-empty dir
+//!   7. `git clone --reference <mirror> --shared <mirror> <mountpoint>` (user)
+//!   8. `git -C <mountpoint> checkout <sha>` (user)
+//!   9. `umount <mountpoint>` (root)
+//!  10. `losetup -d <loop>` (root)
 //!
 //! Cleanup invariant: once `losetup` attaches a loop device, the function MUST
 //! detach it before returning, even on failure. Same for the mount: once
@@ -169,6 +170,20 @@ async fn populate_checkout(
         .await?;
     check(&out, &format!("chown -R {service_user} {mount_s}"))?;
 
+    // Remove ext4's `lost+found`. mke2fs creates it (required by fsck);
+    // git clone would otherwise refuse with "destination path '…' already
+    // exists and is not an empty directory". It's empty by construction
+    // (mke2fs initialises it that way) and we just chowned the parent to
+    // `service_user`, so a plain unprivileged `rmdir` is enough.
+    let lost_found = mount_dir
+        .join("lost+found")
+        .display()
+        .to_string();
+    let out = shell
+        .run(spec(Path::new("/usr/bin/rmdir"), &[&lost_found]))
+        .await?;
+    check(&out, &format!("rmdir {lost_found}"))?;
+
     // git clone (from local mirror)
     let mirror = paths
         .git_mirror
@@ -236,15 +251,16 @@ mod tests {
 
         let shell = RecordingShell::new();
         shell
-            .expect_ok(1) // truncate
-            .expect_ok(1) // mkfs.ext4
-            .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP
-            .expect_ok(1) // mount
-            .expect_ok(1) // chown
-            .expect_ok(1) // git clone
-            .expect_ok(1) // git checkout
-            .expect_ok(1) // umount
-            .expect_ok(1); // losetup -d
+            .expect_ok(1) // 0: truncate
+            .expect_ok(1) // 1: mkfs.ext4
+            .reply(PreparedReply::with_stdout("/dev/loop42\n")) // 2: losetup -fP
+            .expect_ok(1) // 3: mount
+            .expect_ok(1) // 4: chown
+            .expect_ok(1) // 5: rmdir lost+found
+            .expect_ok(1) // 6: git clone
+            .expect_ok(1) // 7: git checkout
+            .expect_ok(1) // 8: umount
+            .expect_ok(1); // 9: losetup -d
 
         let disk = SourceDisk::provision(&shell, &paths, &job_dir, &mount_dir, "abc123", "sbgh")
             .await
@@ -279,35 +295,48 @@ mod tests {
                 .args
                 .contains(&"/dev/loop42".to_string())
         );
+        // 5: rmdir lost+found (unprivileged — sbgh owns the dir post-chown).
         assert!(
             calls[5]
                 .program
-                .ends_with("git")
+                .ends_with("rmdir")
         );
+        assert!(!calls[5].privileged);
         assert!(
             calls[5]
                 .args
                 .iter()
-                .any(|a| a == "--reference")
+                .any(|a| a.ends_with("lost+found"))
+        );
+        assert!(
+            calls[6]
+                .program
+                .ends_with("git")
         );
         assert!(
             calls[6]
                 .args
                 .iter()
-                .any(|a| a == "abc123")
+                .any(|a| a == "--reference")
         );
         assert!(
             calls[7]
+                .args
+                .iter()
+                .any(|a| a == "abc123")
+        );
+        assert!(
+            calls[8]
                 .program
                 .ends_with("umount")
         );
         assert!(
-            calls[8]
+            calls[9]
                 .program
                 .ends_with("losetup")
         );
         assert!(
-            calls[8]
+            calls[9]
                 .args
                 .contains(&"-d".to_string())
         );
@@ -330,6 +359,7 @@ mod tests {
             .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP
             .expect_ok(1) // mount
             .expect_ok(1) // chown
+            .expect_ok(1) // rmdir lost+found
             .reply(PreparedReply::fail("fatal: repository not found")) // git clone fails
             .expect_ok(1) // umount (cleanup)
             .expect_ok(1); // losetup -d (cleanup)
@@ -382,6 +412,7 @@ mod tests {
             .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP
             .expect_ok(1) // mount
             .expect_ok(1) // chown
+            .expect_ok(1) // rmdir lost+found
             .expect_ok(1) // git clone
             .expect_ok(1) // git checkout
             .reply(PreparedReply::fail("umount: target is busy")) // umount fails
@@ -414,6 +445,7 @@ mod tests {
             .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP
             .expect_ok(1) // mount
             .expect_ok(1) // chown
+            .expect_ok(1) // rmdir lost+found
             .expect_ok(1) // git clone
             .expect_ok(1) // git checkout
             .expect_ok(1) // umount
