@@ -5,8 +5,12 @@
 //! `docker-compose.yml`). The handler and orchestrator never run with owner
 //! credentials — they each connect as their own narrow role:
 //!
-//!   - `sbgh_handler`  → INSERT on `jobs` only.
-//!   - `sbgh_orch`     → SELECT, UPDATE on `jobs` only.
+//!   - `sbgh_handler`  → INSERT on a small set of jobs columns + SELECT
+//!                       on `id` and `github_delivery_id` (required for
+//!                       `INSERT ... ON CONFLICT ... RETURNING` to work).
+//!                       No read access to head_sha / args / result, no
+//!                       way to fabricate a `status='completed'` row.
+//!   - `sbgh_orch`     → SELECT + UPDATE on the full `jobs` table.
 //!
 //! Run on `docker compose up` as a `service_completed_successfully` dependency
 //! of both handler and orchestrator. Idempotent: re-running just re-applies
@@ -82,20 +86,41 @@ async fn apply_roles(
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
-    // sbgh_handler: INSERT on jobs only. SELECT/UPDATE/DELETE deliberately
-    // withheld so a compromised handler cannot read other PRs' state or
-    // mutate the queue beyond enqueuing.
+    // sbgh_handler: column-level grants.
+    //
+    // Columns it CAN INSERT into = exactly the fields the handler's
+    // `PostgresJobStore::enqueue` writes. By NOT granting INSERT on
+    // `status`, `result`, `started_at`, `finished_at`, `error`, etc.,
+    // a compromised handler cannot fabricate a `status='completed'`
+    // row with a fake result blob — those columns can only be written
+    // by sbgh_orch's UPDATE. Server-side DEFAULTs (gen_random_uuid for
+    // `id`, 'queued' for `status`, NOW() for `queued_at`) still fire
+    // normally for omitted columns; you only need INSERT grant on a
+    // column to *specify a value* for it.
+    //
+    // Columns it CAN SELECT = the two referenced by enqueue's SQL:
+    //   - `id`                 read back by the RETURNING clause
+    //   - `github_delivery_id` referenced by the ON CONFLICT predicate
+    // Granting SELECT on these two specifically — not the whole table —
+    // means a compromised handler still can't enumerate other PRs'
+    // job rows (head_sha, args, result, …).
     upsert_role(&mut tx, "sbgh_handler", handler_password).await?;
     sqlx::query("REVOKE ALL ON TABLE jobs FROM sbgh_handler")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("GRANT INSERT ON TABLE jobs TO sbgh_handler")
+    sqlx::query(
+        "GRANT INSERT (repository, pr_number, head_sha, requested_by, command, args, \
+         installation_id, github_delivery_id) ON TABLE jobs TO sbgh_handler",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("GRANT SELECT (id, github_delivery_id) ON TABLE jobs TO sbgh_handler")
         .execute(&mut *tx)
         .await?;
 
-    // sbgh_orch: SELECT + UPDATE on jobs. No INSERT (handler enqueues),
-    // no DELETE (we never delete from the queue; rows transition to
-    // completed/failed and are kept for audit).
+    // sbgh_orch: SELECT + UPDATE on the full table. No INSERT (handler
+    // enqueues), no DELETE (we never delete from the queue; rows
+    // transition to completed/failed and are kept for audit).
     upsert_role(&mut tx, "sbgh_orch", orch_password).await?;
     sqlx::query("REVOKE ALL ON TABLE jobs FROM sbgh_orch")
         .execute(&mut *tx)

@@ -518,25 +518,35 @@ else
             fi
         done
 
-        # Tripwire: sbgh_handler must NOT have SELECT on jobs. If it
-        # does, the role split is silently bypassed.
-        handler_select=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
-            "SELECT has_table_privilege('sbgh_handler','public.jobs','SELECT')" 2>/dev/null \
-            | tr -d '[:space:]')
-        case "$handler_select" in
-            f) pass "sbgh_handler has no SELECT on jobs (boundary intact)" ;;
-            t) fail "sbgh_handler has SELECT on jobs — grants too wide, role split bypassed" ;;
-            *) warn "couldn't check sbgh_handler SELECT privilege (got '$handler_select')" ;;
-        esac
-
-        handler_insert=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
-            "SELECT has_table_privilege('sbgh_handler','public.jobs','INSERT')" 2>/dev/null \
-            | tr -d '[:space:]')
-        if [[ "$handler_insert" == "t" ]]; then
-            pass "sbgh_handler has INSERT on jobs"
-        else
-            fail "sbgh_handler missing INSERT on jobs — handler can't enqueue"
-        fi
+        # Tripwire: sbgh_handler's grants on `jobs` are column-level — it
+        # CAN read id + github_delivery_id (needed for INSERT ... ON
+        # CONFLICT ... RETURNING), but MUST NOT be able to read or write
+        # the sensitive columns (head_sha, args, requested_by, result,
+        # status, …). Pick a representative column from each side to
+        # check; if either side regresses the whole boundary is leaky.
+        check_col_priv() {
+            local col="$1" priv="$2" want="$3" label="$4"
+            local got
+            got=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
+                "SELECT has_column_privilege('sbgh_handler','public.jobs','$col','$priv')" \
+                2>/dev/null | tr -d '[:space:]')
+            case "$got" in
+                "$want") pass "sbgh_handler $label" ;;
+                f|t)     fail "sbgh_handler $label: got $got, expected $want" ;;
+                *)       warn "couldn't probe sbgh_handler $priv on $col (got '$got')" ;;
+            esac
+        }
+        # Must-have: needed for enqueue to actually work.
+        check_col_priv id                 SELECT t "can SELECT id (for RETURNING)"
+        check_col_priv github_delivery_id SELECT t "can SELECT github_delivery_id (for ON CONFLICT)"
+        check_col_priv repository         INSERT t "can INSERT repository"
+        check_col_priv github_delivery_id INSERT t "can INSERT github_delivery_id"
+        # Must-NOT-have: leaks of orchestrator-owned state.
+        check_col_priv head_sha    SELECT f "cannot SELECT head_sha (orchestrator-owned)"
+        check_col_priv result      SELECT f "cannot SELECT result blobs"
+        check_col_priv requested_by SELECT f "cannot SELECT requested_by"
+        check_col_priv status      INSERT f "cannot INSERT status (no fabricated 'completed' rows)"
+        check_col_priv result      INSERT f "cannot INSERT result"
 
         for priv in SELECT UPDATE; do
             orch_priv=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
