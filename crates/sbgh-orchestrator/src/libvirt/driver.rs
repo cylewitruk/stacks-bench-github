@@ -484,7 +484,7 @@ mod tests {
                 vg_name: "sbgh-vg".into(),
                 thinpool: "thinpool".into(),
                 chainstate_base_prefix: "mainnet-".into(),
-                chainstate_snapshot_size_gib: 64,
+                chainstate_snapshot_size_gib: None,
             },
             stacks_bench: StacksBenchConfig { default_args: String::new() },
         }

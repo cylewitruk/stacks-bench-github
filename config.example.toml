@@ -35,10 +35,17 @@ results_archive_dir = "/var/lib/sbgh/results"
 virsh_binary = "/usr/bin/virsh"
 
 [lvm]
-vg_name = "sbgh-vg"
+# Most installs have a single VG that already holds root/swap (often `vg0`
+# or named after the hostname). Use whatever `vgs` shows; it does not need
+# to be dedicated.
+vg_name = "vg0"
 thinpool = "thinpool"
 chainstate_base_prefix = "mainnet-"
-chainstate_snapshot_size_gib = 64
+# Leave commented out for the recommended thin-snapshot path (snapshot lives
+# in the same thin pool as the origin, grows on demand). Set explicitly only
+# if your base chainstate LV is a thick (non-thin) volume — the value is then
+# the COW exception-store size in GiB.
+# chainstate_snapshot_size_gib = 64
 
 [stacks_bench]
 default_args = ""

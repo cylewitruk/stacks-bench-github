@@ -75,7 +75,7 @@ fn test_config() -> Config {
             vg_name: "sbgh-vg".into(),
             thinpool: "thinpool".into(),
             chainstate_base_prefix: "mainnet-".into(),
-            chainstate_snapshot_size_gib: 64,
+            chainstate_snapshot_size_gib: None,
         },
         stacks_bench: StacksBenchConfig { default_args: String::new() },
     }
@@ -287,7 +287,7 @@ async fn happy_path_enqueues_and_comments() {
             _ => None,
         })
         .expect("expected a CreateComment");
-    assert!(posted.contains("position **#1**"));
+    assert!(posted.contains("position **1**"));
     assert!(posted.contains(&job.id.to_string()));
 }
 
@@ -356,7 +356,7 @@ async fn queue_position_increments() {
             })
             .collect();
     assert_eq!(posted_positions.len(), 3);
-    assert!(posted_positions[0].contains("position **#1**"));
-    assert!(posted_positions[1].contains("position **#2**"));
-    assert!(posted_positions[2].contains("position **#3**"));
+    assert!(posted_positions[0].contains("position **1**"));
+    assert!(posted_positions[1].contains("position **2**"));
+    assert!(posted_positions[2].contains("position **3**"));
 }

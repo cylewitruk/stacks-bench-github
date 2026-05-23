@@ -34,24 +34,25 @@ impl ChainstateSnapshot {
     ) -> anyhow::Result<Self> {
         let base = pick_latest_base(shell, cfg).await?;
         let name = format!("sbgh-{job_id}-chainstate");
-        let snapshot_size = format!("{}G", cfg.chainstate_snapshot_size_gib);
+        let origin = format!("{}/{}", cfg.vg_name, base);
+
+        // `-L` is included only when explicitly configured (thick snapshot
+        // path). Against a thin-pool origin we omit it so lvcreate produces
+        // a thin snapshot that lives in the same pool.
+        let snapshot_size_arg = cfg
+            .chainstate_snapshot_size_gib
+            .map(|g| format!("{g}G"));
+        let mut args: Vec<&str> = vec!["--snapshot", "--name", &name, "--setactivationskip", "n"];
+        if let Some(ref s) = snapshot_size_arg {
+            args.push("-L");
+            args.push(s);
+        }
+        args.push(&origin);
 
         let out = shell
-            .run(spec_priv(
-                std::path::Path::new("/usr/sbin/lvcreate"),
-                &[
-                    "--snapshot",
-                    "--name",
-                    &name,
-                    "--setactivationskip",
-                    "n",
-                    "-L",
-                    &snapshot_size,
-                    &format!("{}/{}", cfg.vg_name, base),
-                ],
-            ))
+            .run(spec_priv(std::path::Path::new("/usr/sbin/lvcreate"), &args))
             .await?;
-        check(&out, &format!("lvcreate snapshot of {}/{}", cfg.vg_name, base))?;
+        check(&out, &format!("lvcreate snapshot of {origin}"))?;
 
         Ok(Self {
             vg: cfg.vg_name.clone(),
@@ -115,18 +116,19 @@ mod tests {
             vg_name: "sbgh-vg".into(),
             thinpool: "thinpool".into(),
             chainstate_base_prefix: "mainnet-".into(),
-            chainstate_snapshot_size_gib: 64,
+            // Default for new deployments: thin snapshot, no -L.
+            chainstate_snapshot_size_gib: None,
         }
     }
 
     #[tokio::test]
-    async fn picks_latest_base_by_lexicographic_sort() {
+    async fn thin_snapshot_omits_size_flag() {
+        // Default path: thin pool origin → lvcreate must NOT receive `-L`.
         let shell = RecordingShell::new();
         shell.reply(PreparedReply::with_stdout(
             "  mainnet-2026-05-20\n  mainnet-2026-05-21\n  mainnet-2026-04-30\n",
         ));
-        let snap_create_ok = PreparedReply::ok();
-        shell.reply(snap_create_ok);
+        shell.expect_ok(1); // lvcreate
 
         let snap = ChainstateSnapshot::provision(&shell, &cfg(), "job123")
             .await
@@ -150,14 +152,52 @@ mod tests {
         assert!(
             calls[1]
                 .args
-                .contains(&"sbgh-job123-chainstate".to_string())
+                .contains(&"sbgh-job123-chainstate".to_string()),
+            "expected snapshot name in args"
         );
-        // confirm we targeted the latest base
         assert!(
             calls[1]
                 .args
                 .iter()
-                .any(|a| a == "sbgh-vg/mainnet-2026-05-21")
+                .any(|a| a == "sbgh-vg/mainnet-2026-05-21"),
+            "expected to target the latest base"
+        );
+        assert!(
+            !calls[1]
+                .args
+                .iter()
+                .any(|a| a == "-L"),
+            "thin snapshot must NOT receive -L (got args: {:?})",
+            calls[1].args
+        );
+    }
+
+    #[tokio::test]
+    async fn thick_snapshot_includes_size_flag() {
+        // Opt-in: setting chainstate_snapshot_size_gib reverts to the classic
+        // -L COW-size form for thick origins.
+        let mut cfg = cfg();
+        cfg.chainstate_snapshot_size_gib = Some(64);
+
+        let shell = RecordingShell::new();
+        shell.reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n"));
+        shell.expect_ok(1);
+
+        ChainstateSnapshot::provision(&shell, &cfg, "job1")
+            .await
+            .unwrap();
+
+        let calls = shell.calls();
+        let lvcreate_args = &calls[1].args;
+        let l_pos = lvcreate_args
+            .iter()
+            .position(|a| a == "-L")
+            .expect("thick snapshot must include -L");
+        assert_eq!(
+            lvcreate_args
+                .get(l_pos + 1)
+                .map(String::as_str),
+            Some("64G")
         );
     }
 

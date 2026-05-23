@@ -46,7 +46,7 @@ impl Runner {
                         // create the job dir). VM-side failures come back as
                         // `Ok(BenchmarkOutcome { status: Failed })` and are
                         // routed below.
-                        tracing::error!(job_id = %job.id, error = %e, "job setup failed");
+                        tracing::error!(job_id = %job.id, error = ?e, "job setup failed");
                         let _ = self
                             .jobs
                             .fail(job.id, &e.to_string(), None)
@@ -59,7 +59,7 @@ impl Runner {
                 }
                 Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
                 Err(e) => {
-                    tracing::error!(error = %e, "queue claim failed");
+                    tracing::error!(error = ?e, "queue claim failed");
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
             }
@@ -130,7 +130,10 @@ impl PhaseListener for CommentPhaseListener {
             .update_pr_comment(self.job.installation_id, &self.job.repository, comment_id, &body)
             .await
         {
-            tracing::warn!(error = %e, "phase comment update failed");
+            // Debug repr surfaces GitHub's response body (status + message),
+            // e.g. "Resource not accessible by integration" when the App is
+            // missing the Issues: Write permission.
+            tracing::warn!(error = ?e, "phase comment update failed");
         }
     }
 }

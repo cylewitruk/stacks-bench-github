@@ -68,42 +68,92 @@ sudo virt-customize -a /var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2 \
 
 You should see `cargo 1.x` and `rustc 1.x`.
 
-## 2. Configure the host LVM thin-pool
+## 2. Configure the host LVM layout
 
-If you haven't already, set up the thin-pool and a base chainstate LV:
+The orchestrator needs three things from LVM, all of which usually live inside the **existing OS volume group** (typically `vg0` or one named after the hostname — whatever `sudo vgs` shows). You do **not** need a dedicated VG; renaming the OS VG is invasive (GRUB + initramfs + reboot) and not worth it.
+
+| Inside the VG | Purpose | Notes |
+| ---- | ---- | ---- |
+| `sbgh-meta` | Linear XFS LV mounted at `/var/lib/sbgh` | Per-job artifacts, archived SQLite results, bare git mirror. ~50–150 GiB is plenty. |
+| `thinpool` | Thin pool | Holds base chainstate LVs and per-job snapshots. Size = total chainstate baselines you want to keep × ~2–3×. |
+| `mainnet-YYYY-MM-DD` | Thin LV, XFS | One per chainstate baseline. The orchestrator snapshots whichever is lexicographically newest. |
+
+### Playbook
 
 ```bash
-# one-time pool setup (use a real disk or LVM PV you can dedicate)
-sudo pvcreate /dev/<disk>
-sudo vgcreate sbgh-vg /dev/<disk>
-sudo lvcreate -L 2T --thinpool thinpool sbgh-vg
+# Substitute your actual VG name everywhere. `sudo vgs` shows what you have.
+VG=vg0
 
-# base chainstate LV — name format is `<chainstate_base_prefix><date>`
-# refresh this LV out-of-band whenever you want a newer snapshot baseline
-sudo lvcreate -V 500G --thin --name mainnet-2026-05-21 sbgh-vg/thinpool
-sudo mkfs.xfs /dev/sbgh-vg/mainnet-2026-05-21
+# ─── Metadata LV (persistent: /var/lib/sbgh) ────────────────────────────
+sudo lvcreate -L 150G -n sbgh-meta "$VG"
+sudo mkfs.xfs -f "/dev/$VG/sbgh-meta"
+sudo mkdir -p /var/lib/sbgh
 
-# populate it with a chainstate snapshot, e.g. by mounting and untarring
-sudo mount /dev/sbgh-vg/mainnet-2026-05-21 /mnt
-# ... rsync / curl / etc. ...
-sudo umount /mnt
+META_UUID=$(sudo blkid -s UUID -o value "/dev/$VG/sbgh-meta")
+echo "UUID=$META_UUID  /var/lib/sbgh  xfs  defaults,noatime  0  2" \
+  | sudo tee -a /etc/fstab
+sudo systemctl daemon-reload
+sudo mount /var/lib/sbgh
+findmnt /var/lib/sbgh         # confirm
 
-# deactivate so snapshots can be created
-sudo lvchange -an sbgh-vg/mainnet-2026-05-21
+# ─── Thin pool ──────────────────────────────────────────────────────────
+# -Zn        : don't zero new blocks (faster; chainstate writes overwrite anyway)
+# --chunksize: smaller chunks = better space efficiency for snapshot churn
+sudo lvcreate --type thin-pool --name thinpool -L 1500G \
+    --chunksize 256K -Zn "$VG"
+sudo lvchange --monitor y "$VG/thinpool"
+
+# ─── First base chainstate LV ───────────────────────────────────────────
+# Use the helper script — it creates today's dated LV, downloads + verifies
+# the latest Hiro mainnet snapshot in parallel via aria2c, extracts it, and
+# rotates out any older `mainnet-*` LVs (skipping any with active snapshots).
+sudo apt install -y aria2 zstd
+sudo ./scripts/download-chainstate.sh
+# See `scripts/download-chainstate.sh --help` for --vg / --date / --keep-old /
+# --connections / etc. Allow several hours; run inside tmux/screen if remote.
 ```
 
-The orchestrator will pick the lexicographically-newest LV matching `chainstate_base_prefix`, so dated suffixes are fine.
+Manual equivalent (skip if you ran the script):
+
+```bash
+# Create the LV
+sudo lvcreate -V 500G --thin --name mainnet-2026-05-23 "$VG/thinpool"
+sudo mkfs.xfs "/dev/$VG/mainnet-2026-05-23"
+
+# Populate it (mount, write chainstate, unmount, deactivate so snapshots can
+# be created against it).
+sudo mount "/dev/$VG/mainnet-2026-05-23" /mnt
+# ... rsync / curl / extract ...
+sudo umount /mnt
+sudo lvchange -an "$VG/mainnet-2026-05-23"
+```
+
+### Refreshing the chainstate later
+
+The script is idempotent across days: just rerun `sudo ./scripts/download-chainstate.sh` whenever you want a fresher baseline. It picks today's date for the new LV name, and by default rotates out the previous one (with `--keep-old` to retain history). Active benchmark runs against the old LV are protected — the rotation step skips any LV with active snapshots.
+
+### Thin vs thick snapshots
+
+The orchestrator creates per-job snapshots of the base chainstate LV. Two modes, controlled by `[lvm].chainstate_snapshot_size_gib` in `config.toml`:
+
+- **Thin (default, leave the field unset)**: `lvcreate --snapshot` runs without `-L`, so the snapshot lives in the thin pool and grows on demand. This is what you want when the base LV is itself thin (the playbook above). Cheap, fast, no upfront allocation.
+- **Thick (set the field to a GiB value)**: `lvcreate --snapshot -L NG` allocates a fixed COW exception store outside the pool. Use only if your base chainstate LV is a thick (non-thin) volume — otherwise the result is a thick snapshot of a thin volume, which loses the cheap-snapshot property and (on some lvm2 versions) errors out.
+
+If you're following the playbook above, leave the field unset.
 
 ## 3. Service user + sudoers
 
 ```bash
 sudo useradd --system --create-home --shell /usr/sbin/nologin sbgh
 sudo usermod -a -G libvirt sbgh        # virsh access without sudo for read-only ops
-sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh
+
+# Per-job subdirs on the XFS metadata LV (mounted at /var/lib/sbgh in §2)
+# and the tmpfs root on /run.
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/jobs
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/results
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/git
 sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh
+sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh/jobs
 ```
 
 Install the sudoers fragment:
@@ -230,19 +280,36 @@ SBGH_GH_PRIVATE_KEY_PATH=/etc/sbgh/github-app.private-key.pem
 SBGH_GH_WEBHOOK_SECRET=<from step 4.2>
 SBGH_ALLOWED_REPOS=<your-handle>/stacks-core
 SBGH_VM_GOLDEN_IMAGE=/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2
-SBGH_LVM_VG=sbgh-vg
+SBGH_LVM_VG=vg0                  # whatever `sudo vgs` shows — usually your OS VG
 SBGH_LVM_THINPOOL=thinpool
 RUST_LOG=info,sbgh_handler=debug,sbgh_orchestrator=debug
 ```
 
 Either way, variables you `export` in your shell before launching the binary win over what's in the file — useful for one-off overrides without editing.
 
-Optionally drop a `config.toml` for non-secret settings:
+#### Or: put everything (including secrets) in a TOML file
+
+The split between "secrets in env" and "everything else in TOML" is a convention, not enforced — `Config::load` accepts `webhook_secret`, `private_key_path`, `client_id`, and `database_url` from either source, with env winning on collision. If you'd rather keep one file and skip the env dance entirely (handy on a personal dev box), drop a TOML at one of these paths and the loader will find it without any flag:
+
+```text
+$SBGH_CONFIG                          # if set, takes precedence
+/etc/sbgh/config.toml                 # system path
+~/.config/sbgh/config.toml            # user path (XDG-style fallback)
+```
 
 ```bash
+# personal dev box
+mkdir -p ~/.config/sbgh && chmod 700 ~/.config/sbgh
+cp config.example.toml ~/.config/sbgh/config.toml
+chmod 600 ~/.config/sbgh/config.toml
+$EDITOR ~/.config/sbgh/config.toml    # add webhook_secret, private_key_path, etc.
+
+# prod / systemd
 sudo install -m 0644 -o sbgh -g sbgh config.example.toml /etc/sbgh/config.toml
 sudo $EDITOR /etc/sbgh/config.toml
 ```
+
+The "outside the repo at mode 0600" combo gives you the same leakage properties as an env file without the shell-sourcing dance.
 
 ### Build + run
 
@@ -266,9 +333,9 @@ sudo -u sbgh -E \
 1. Go to a PR on your fork.
 2. Comment exactly `/benchmark` on its own line.
 3. Within a few seconds you should see:
-   - **gh webhook forward** prints the `issue_comment` delivery.
-   - **handler** logs: `webhook → parsed command → enqueued`, and a new comment appears on the PR: *"⏳ queued at position #1…"*.
-   - **orchestrator** logs: claims the job, starts provisioning, defines + starts the domain.
+   - **sbgh-smee** logs `forwarded delivery status=200`.
+   - **handler** logs the inbound POST (visible at `RUST_LOG=debug` via `tower_http::trace`) and a new comment appears on the PR: *"⏳ queued at position **1** (job `<uuid>`)…"*.
+   - **orchestrator** (Linux only): claims the job, starts provisioning, defines + starts the domain. On a macOS dev machine without the orchestrator running, the row simply stays in `queued` — that's the expected handler-only mode for inbound-side validation.
 4. The PR comment updates as phases change: `building → running → collecting → done`.
 5. On success the comment becomes a ✅ with the summary JSON; on failure ❌ with the error + console tail.
 
@@ -311,9 +378,28 @@ sqlite3 /var/lib/sbgh/results/<job-id>.sqlite '.tables'
 
 ### Webhook isn't reaching the handler
 
-- Check `gh webhook forward` is still running.
+- Check `sbgh-smee` is still running and shows `connected to smee channel`.
 - Re-deliver an old webhook from **App settings → Advanced → Recent Deliveries** to retry without re-typing `/benchmark`.
 - `curl -v http://localhost:8080/health` should return 200.
+
+### `sbgh-smee` is connected but only logs `event=ping`
+
+You're subscribed to a smee.io channel that nobody is delivering to. GitHub's "Recent Deliveries" page may show successful 200s — that just means smee.io accepted the POST for *its* channel, not that any client received it. **The smee URL set on the App's Webhook URL field and the one passed to `sbgh-smee --channel` must be byte-identical.** Open both in a browser and compare; the App's channel will show the delivery, the other won't.
+
+### Handler logs the inbound webhook but the bot can't post a comment (HTTP 401)
+
+```text
+http.method=POST http.url=https://api.github.com/repos/.../issues/N/comments
+http.status_code=401 otel.status_code="ERROR"
+failed to post initial PR comment
+```
+
+Two possible causes, in order:
+
+1. **Permission isn't granted**: App settings → **Permissions & events → Repository permissions → Issues** must be **"Read & write"**. PR comments go through the issues endpoint, not the pull-request reviews endpoint.
+2. **Permission was changed after install and the installation hasn't accepted it**: visit <https://github.com/settings/installations>, find the App, click **Configure** — there'll be a yellow banner *"This GitHub App is requesting new permissions. Review →"*. Accept it.
+
+After fixing either, **restart the handler** (the in-memory installation token cache holds the old token for up to ~1 hour) and hit **Redeliver** on the GitHub delivery page.
 
 ### Signature verification fails (401)
 
@@ -331,7 +417,7 @@ sqlite3 /var/lib/sbgh/results/<job-id>.sqlite '.tables'
 
 ### `no base chainstate LV found in VG ... matching prefix mainnet-`
 
-- `sudo lvs` — confirm at least one LV exists in `sbgh-vg` with a name starting with `mainnet-`.
+- `sudo lvs` — confirm at least one LV exists in your VG (whatever `[lvm].vg_name` is set to) with a name starting with `mainnet-`.
 - The orchestrator uses `lvs --select 'lv_name=~^mainnet-'` (regex). If your LV is in a different VG or named differently, override `chainstate_base_prefix` in the config.
 
 ### `lvcreate` fails with "Snapshots of snapshots are not supported"
@@ -376,7 +462,7 @@ sudo lvs | grep sbgh-
 # clean up an orphan
 sudo virsh destroy sbgh-<job-id> 2>/dev/null
 sudo virsh undefine sbgh-<job-id>
-sudo lvremove --force sbgh-vg/sbgh-<job-id>-chainstate
+sudo lvremove --force <vg>/sbgh-<job-id>-chainstate   # <vg> = your [lvm].vg_name
 sudo umount /run/sbgh/jobs/<job-id> 2>/dev/null
 sudo rm -rf /var/lib/sbgh/jobs/<job-id> /run/sbgh/jobs/<job-id>
 ```

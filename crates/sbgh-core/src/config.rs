@@ -2,19 +2,19 @@
 //!
 //! Loading precedence (lowest → highest):
 //!   1. compiled-in defaults
-//!   2. TOML config file (path from `SBGH_CONFIG`, default
-//!      `/etc/sbgh/config.toml`; missing file is fine, missing env-only secrets
-//!      are not)
-//!   3. environment variables (always win; intended for secrets and operational
-//!      overrides)
+//!   2. TOML config file. Path resolution:
+//!        - `$SBGH_CONFIG` if set (used verbatim; missing file is silently
+//!          treated as env-only, no fallback)
+//!        - else `/etc/sbgh/config.toml` if it exists
+//!        - else `$HOME/.config/sbgh/config.toml` if it exists
+//!        - else: no file layer, defaults + env only
+//!   3. environment variables (always win; intended for operational overrides
+//!      and for keeping secrets out of source-controlled files)
 //!
-//! Secrets that must come from env (never from the TOML file):
-//!   - `SBGH_GH_WEBHOOK_SECRET`
-//!   - `SBGH_GH_PRIVATE_KEY_PATH` (path; the key itself is on disk)
-//!   - `DATABASE_URL` (often deployment-specific)
-//!
-//! Anything else has a sensible default and can be set from either the file or
-//! env.
+//! Any field can live in either the TOML file or env. The convention is to
+//! put secrets (webhook secret, private key path, DB URL) in env when the
+//! TOML is checked in, and in the TOML when it lives outside the repo at
+//! mode 0600. The loader doesn't enforce a split.
 
 use std::collections::HashSet;
 use std::env;
@@ -24,7 +24,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/sbgh/config.toml";
+/// Paths the loader checks when `SBGH_CONFIG` is not set, in order. First
+/// existing file wins. System path comes before the per-user XDG path so a
+/// host with both gets the system one; if neither is present we fall back to
+/// env-only.
+const DEFAULT_CONFIG_PATHS: &[&str] = &["/etc/sbgh/config.toml"];
+const HOME_CONFIG_RELATIVE: &str = ".config/sbgh/config.toml";
 
 // ─────────────────────────── Public config struct ───────────────────────────
 
@@ -57,7 +62,8 @@ pub struct GitHubConfig {
     pub client_id: String,
     pub api_base_url: String,
     pub private_key_path: PathBuf,
-    /// Webhook signing secret. Always loaded from env.
+    /// Webhook signing secret. May come from either the TOML file or the
+    /// `SBGH_GH_WEBHOOK_SECRET` env var; env wins on collision.
     pub webhook_secret: String,
 }
 
@@ -100,7 +106,18 @@ pub struct LvmConfig {
     pub thinpool: String,
     /// Prefix used to discover the newest base chainstate LV (e.g. `mainnet-`).
     pub chainstate_base_prefix: String,
-    pub chainstate_snapshot_size_gib: u32,
+    /// Size hint for `lvcreate --snapshot -L`.
+    ///
+    /// - `None` (default): the snapshot is created **without** `-L`. This is
+    ///   correct for **thin** snapshots of a thin-pool origin — the snapshot
+    ///   shares the pool and grows on demand.
+    /// - `Some(n)`: thick snapshot with an `n GiB` COW exception store. Use
+    ///   only when the base chainstate LV is a thick (non-thin) volume.
+    ///
+    /// Passing a size against a thin origin would create a thick snapshot of
+    /// a thin volume, defeating the cheap-snapshot property and (on some
+    /// lvm2 versions) erroring.
+    pub chainstate_snapshot_size_gib: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,8 +131,16 @@ pub struct StacksBenchConfig {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let path = env::var("SBGH_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
-        Self::load_layered(Some(PathBuf::from(path).as_path()))
+        let explicit = env::var("SBGH_CONFIG").ok();
+        let mut search = Vec::with_capacity(DEFAULT_CONFIG_PATHS.len() + 1);
+        for p in DEFAULT_CONFIG_PATHS {
+            search.push(PathBuf::from(p));
+        }
+        if let Some(home) = env::var_os("HOME") {
+            search.push(PathBuf::from(home).join(HOME_CONFIG_RELATIVE));
+        }
+        let path = pick_config_path(explicit.as_deref(), &search);
+        Self::load_layered(path.as_deref())
     }
 
     /// Test-friendly entry: explicit path (or `None` to skip file layer).
@@ -502,10 +527,11 @@ impl RawConfig {
                     .lvm
                     .chainstate_base_prefix
                     .unwrap_or_else(|| "mainnet-".into()),
+                // Propagate as-is. `None` (the default) means "thin snapshot,
+                // no -L"; see the field doc on LvmConfig.
                 chainstate_snapshot_size_gib: self
                     .lvm
-                    .chainstate_snapshot_size_gib
-                    .unwrap_or(64),
+                    .chainstate_snapshot_size_gib,
             },
             stacks_bench: StacksBenchConfig {
                 default_args: self
@@ -563,6 +589,25 @@ fn set_from(v: Vec<String>) -> HashSet<String> {
 
 fn required<T>(value: Option<T>, name: &str) -> Result<T> {
     value.ok_or_else(|| Error::Config(format!("missing required config: {name}")))
+}
+
+/// Decide which config file (if any) to load, given an optional explicit
+/// override and a search-path of fallback locations.
+///
+/// Precedence:
+///   1. `explicit` is honoured verbatim. It's not required to exist — the
+///      downstream `load_layered` silently treats a missing file as env-only,
+///      so an explicit-but-typo'd path doesn't accidentally hit a fallback.
+///   2. Otherwise: first existing file in `search` wins. Pure function; we pass
+///      the search list in so this stays unit-testable.
+fn pick_config_path(explicit: Option<&str>, search: &[PathBuf]) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(PathBuf::from(p));
+    }
+    search
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
 }
 
 #[cfg(test)]
@@ -689,5 +734,45 @@ mod tests {
         let _g = EnvGuard::set(&[("SBGH_GH_CLIENT_ID", "Iv23litest")]);
         let err = Config::load_layered(None).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
+    }
+
+    // ─── pick_config_path ───
+
+    #[test]
+    fn pick_explicit_path_wins_even_when_missing() {
+        // If the user sets SBGH_CONFIG explicitly, we don't try to be clever —
+        // pass it through verbatim. load_layered will silently fall back to
+        // env-only if the file doesn't exist, which matches existing behaviour.
+        let chosen = pick_config_path(Some("/some/explicit/path.toml"), &[]);
+        assert_eq!(chosen, Some(PathBuf::from("/some/explicit/path.toml")));
+    }
+
+    #[test]
+    fn pick_picks_first_existing_search_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        std::fs::write(&b, "").unwrap();
+        let chosen = pick_config_path(None, &[a.clone(), b.clone()]);
+        assert_eq!(chosen, Some(b), "should skip non-existent `a` and pick `b`");
+    }
+
+    #[test]
+    fn pick_returns_first_match_in_declared_order() {
+        // System path should win over the home-dir fallback when both exist.
+        let dir = tempfile::TempDir::new().unwrap();
+        let system = dir.path().join("system.toml");
+        let home = dir.path().join("home.toml");
+        std::fs::write(&system, "").unwrap();
+        std::fs::write(&home, "").unwrap();
+        let chosen = pick_config_path(None, &[system.clone(), home]);
+        assert_eq!(chosen, Some(system));
+    }
+
+    #[test]
+    fn pick_returns_none_when_nothing_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let chosen = pick_config_path(None, &[dir.path().join("nope.toml")]);
+        assert!(chosen.is_none());
     }
 }

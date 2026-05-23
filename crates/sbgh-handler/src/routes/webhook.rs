@@ -115,7 +115,10 @@ async fn handle_issue_comment(
     {
         Ok(sha) => sha,
         Err(e) => {
-            tracing::error!(error = %e, "failed to resolve head sha");
+            // Use Debug repr so octocrab's `GitHub { source: GitHubError { .. } }`
+            // structure (status code, response body, GH-side message) lands in the log.
+            // Display alone collapses to a bare "github api error: GitHub".
+            tracing::error!(error = ?e, "failed to resolve head sha");
             return (StatusCode::INTERNAL_SERVER_ERROR, "head sha lookup failed").into_response();
         }
     };
@@ -148,14 +151,17 @@ async fn handle_issue_comment(
             return (StatusCode::OK, "duplicate").into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "failed to enqueue job");
+            tracing::error!(error = ?e, "failed to enqueue job");
             return (StatusCode::INTERNAL_SERVER_ERROR, "queue error").into_response();
         }
     };
 
+    // Avoid a `#{position}` literal — GitHub's autolinker turns `#N` into a
+    // cross-repo issue/PR reference and the rendered text becomes confusing
+    // (e.g. "queued at position upstream#42").
     let body = format!(
-        ":hourglass_flowing_sand: queued at position **#{position}** (job `{job_id}`). I'll \
-         update this comment when it starts."
+        ":hourglass_flowing_sand: queued at position **{position}** (job `{job_id}`). I'll update \
+         this comment when it starts."
     );
     match state
         .gh
@@ -173,10 +179,14 @@ async fn handle_issue_comment(
                 .set_comment_id(job_id, comment.id)
                 .await
             {
-                tracing::error!(error = %e, "failed to persist comment id");
+                tracing::error!(error = ?e, "failed to persist comment id");
             }
         }
-        Err(e) => tracing::error!(error = %e, "failed to post initial PR comment"),
+        // Debug repr surfaces the inner octocrab `GitHubError` (status code,
+        // GH-side message, response body) instead of the bare "github api
+        // error: GitHub" we get from Display. Critical for diagnosing 401s
+        // like "Resource not accessible by integration" vs "Bad credentials".
+        Err(e) => tracing::error!(error = ?e, "failed to post initial PR comment"),
     }
 
     (StatusCode::OK, "queued").into_response()
