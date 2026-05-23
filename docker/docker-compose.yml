@@ -60,8 +60,16 @@ services:
     # Host-bound data dir — survives `docker volume prune`. Default lives
     # on /var/lib/sbgh/postgres; MUST be pre-created owned by the same
     # uid we run postgres as (default 900). See docs/host-bringup.md §6.
+    #
+    # Postgres 18 changed the on-disk layout to support `pg_upgrade
+    # --link` across major versions: the image now expects the mount at
+    # `/var/lib/postgresql` (one level up from the old `/data`), and it
+    # creates `<MAJOR>/docker/` inside the mount. So on disk you'll see
+    # /var/lib/sbgh/postgres/18/docker/ after first init. Do NOT use the
+    # old `/var/lib/postgresql/data` mount target with PG 18 — the image
+    # refuses to start.
     volumes:
-      - ${POSTGRES_DATA_DIR:-/var/lib/sbgh/postgres}:/var/lib/postgresql/data
+      - ${POSTGRES_DATA_DIR:-/var/lib/sbgh/postgres}:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sbgh -d sbgh"]
       interval: 5s
