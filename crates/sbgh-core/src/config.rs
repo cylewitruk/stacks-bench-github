@@ -451,10 +451,13 @@ impl RawOrchestrator {
             vm: VmConfig {
                 golden_image: required(self.vm.golden_image, "[vm].golden_image")?,
                 vcpus: self.vm.vcpus.unwrap_or(2),
+                // 16 GiB floor: stacks-bench's final-link rustc holds
+                // ~7.6 GiB RSS under stacks-core's `lto=fat` release
+                // profile. Anything less OOM-kills the build.
                 memory_gib: self
                     .vm
                     .memory_gib
-                    .unwrap_or(8),
+                    .unwrap_or(16),
                 boot_disk_gib: self
                     .vm
                     .boot_disk_gib

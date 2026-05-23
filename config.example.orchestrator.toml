@@ -30,7 +30,12 @@ private_key_path = "/etc/sbgh/orchestrator/github-app.private-key.pem"
 [vm]
 golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
 vcpus = 2
-memory_gib = 8
+# 16 GiB is the practical floor. rustc's final-link of `stacks-bench` with
+# the stacks-core release profile (`lto=fat`, `codegen-units=1`) holds
+# ~7.6 GiB of RSS at peak — 8 GiB leaves no room for the kernel + cargo +
+# cache and triggers the OOM killer mid-link. Bump higher if the host
+# can spare it; lower will break the build.
+memory_gib = 16
 boot_disk_gib = 64
 job_timeout_secs = 21600   # 6 hours
 network = "default"
