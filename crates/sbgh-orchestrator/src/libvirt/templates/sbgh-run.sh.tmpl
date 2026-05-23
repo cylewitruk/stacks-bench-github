@@ -53,11 +53,39 @@ git rev-parse HEAD | grep -q "$HEAD_SHA" || die "checkout sha mismatch"
 cargo build --release -p stacks-bench || die "cargo build failed"
 
 # --- run benchmark -------------------------------------------------------------------
+#
+# Three structural flags the orchestrator owns (NOT user-tunable; injected
+# here):
+#   --json                        suppress styled/interactive output (spinners,
+#                                 progress bars); send a structured JSON
+#                                 summary to stdout for the host to capture.
+#   --db "$RESULTS"               point stacks-bench's app-data dir at the
+#                                 virtio-fs share. Materialises the SQLite
+#                                 store at $RESULTS/appdata/stacks-bench.db,
+#                                 which the orchestrator archives off after
+#                                 the VM shuts down (see tmpfs.rs::sqlite_file).
+#   --source "$CHAIN"             chainstate dir; this is the LVM-thin
+#                                 snapshot mounted at $CHAIN.
+#   --dangerous-no-chainstate-copy
+#                                 skip stacks-bench's own reflink/CoW copy.
+#                                 We've ALREADY CoW'd at the LVM-thin layer,
+#                                 so a second copy inside the VM would double
+#                                 our snapshot footprint and break our
+#                                 chainstate-isolation guarantee.
+#
+# EXTRA_ARGS is the user-tunable workload (start-at, count, warmup,
+# bench-spans-only, etc.); see [stacks_bench].default_args in the
+# orchestrator config for the per-deployment default and `/benchmark`
+# command for per-PR overrides.
 phase "running"
 ./target/release/stacks-bench \
-    --chainstate "$CHAIN" \
-    --output "$RESULTS/run.sqlite" \
+    --json \
+    --db "$RESULTS" \
+    bench run \
+    --source "$CHAIN" \
+    --dangerous-no-chainstate-copy \
     "${EXTRA_ARGS[@]}" \
+    > "$RESULTS/run.json" \
     || die "stacks-bench exited non-zero"
 
 # --- finalize -----------------------------------------------------------------------

@@ -65,10 +65,15 @@ impl ResultsTmpfs {
         self.mount_dir.join(".phase")
     }
 
-    #[allow(dead_code)] // consumed by the result archiver in chunk D
+    /// Path to the SQLite database stacks-bench writes inside the results
+    /// share. The in-VM template invokes `stacks-bench --db "$RESULTS" ...`;
+    /// stacks-bench then materialises its store under
+    /// `<--db>/appdata/stacks-bench.db`. We archive this file off after
+    /// the VM shuts down.
     pub fn sqlite_file(&self) -> PathBuf {
         self.mount_dir
-            .join("run.sqlite")
+            .join("appdata")
+            .join("stacks-bench.db")
     }
 }
 

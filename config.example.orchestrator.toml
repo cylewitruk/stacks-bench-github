@@ -60,4 +60,19 @@ chainstate_base_prefix = "mainnet-"
 # chainstate_snapshot_size_gib = 64
 
 [stacks_bench]
-default_args = ""
+# Default args appended to every `stacks-bench bench run` invocation when
+# a PR comment is plain `/benchmark` (no args). When the comment carries
+# args, they REPLACE this string entirely — no merging.
+#
+# The orchestrator injects the structural flags itself (`--json`, `--db`,
+# `bench run`, `--source`, `--dangerous-no-chainstate-copy`); only put
+# workload-control flags here. See `stacks-bench bench run --help` for
+# the full surface.
+#
+# The default below is a "smoke test" invocation: replay 5000 mainnet
+# blocks starting partway through the chain, with 1000 warmup blocks,
+# skipping the slow per-span KV persistence. Completes in tens of
+# minutes rather than hours — useful for first-time pipeline validation.
+# Tune the start-at / count for your chainstate's height and for what
+# you're trying to measure.
+default_args = "--start-at 7800000 --count 5000 --warmup 1000 --no-profiler-kv --bench-spans-only"
