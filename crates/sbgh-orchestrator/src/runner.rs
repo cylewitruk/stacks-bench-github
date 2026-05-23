@@ -96,7 +96,15 @@ impl Runner {
         {
             Ok(o) => o,
             Err(e) => {
-                let msg = e.to_string();
+                // Driver-level error (couldn't even start the run). Log
+                // the full anyhow chain locally — reporter.failed posts
+                // only a short snippet to the PR.
+                tracing::error!(
+                    job_id = %job.id,
+                    error = ?e,
+                    "driver returned setup error",
+                );
+                let msg = format!("{e:#}");
                 let _ = self
                     .jobs
                     .fail(job.id, &msg, None)
@@ -116,6 +124,18 @@ impl Runner {
                     .await?;
             }
             OutcomeStatus::Failed(err) => {
+                // VM-side or libvirt-side failure (virsh start refused,
+                // VM powered off before phase=done, timeout, etc.). The
+                // `err` already carries enough context for the DB row;
+                // surface it locally too so operators don't have to dig
+                // through Postgres to see why a run failed.
+                tracing::error!(
+                    job_id = %job.id,
+                    finish_reason = ?outcome.summary.get("finish_reason"),
+                    last_phase = ?outcome.summary.get("last_phase"),
+                    error = %err,
+                    "benchmark failed",
+                );
                 self.jobs
                     .fail(job.id, &err, Some(outcome.summary.clone()))
                     .await?;

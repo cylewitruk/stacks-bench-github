@@ -29,7 +29,7 @@ use crate::libvirt::cloudinit::{CloudInitArtifacts, CloudInitParams};
 use crate::libvirt::domain::{self, DomainSpec};
 use crate::libvirt::lvm::ChainstateSnapshot;
 use crate::libvirt::phase::{self, Phase};
-use crate::libvirt::shell::Shell;
+use crate::libvirt::shell::{Shell, spec_priv};
 use crate::libvirt::source::SourceDisk;
 use crate::libvirt::tmpfs::ResultsTmpfs;
 use crate::libvirt::virsh::{self, DomState};
@@ -150,8 +150,43 @@ impl LibvirtDriver {
             })
             .unwrap_or((None, None));
 
-        let (console_tail, console_size_bytes) =
-            forensics::console_tail(&job_dir.join("console.log"));
+        // Chown the serial console log to sbgh before we try to read it.
+        // libvirt-qemu creates this file as itself (typically
+        // libvirt-qemu:libvirt-qemu mode 0600), so a plain open from
+        // sbgh hits EACCES and we lose the only artifact telling us
+        // what happened inside the VM. Best-effort — if the chown
+        // fails, forensics::console_tail will still log its EACCES
+        // warning and we proceed with whatever forensics we have.
+        let console_log = job_dir.join("console.log");
+        if console_log.exists() {
+            let owner = format!(
+                "{u}:{u}",
+                u = self
+                    .config
+                    .server
+                    .service_user
+            );
+            let console_s = console_log
+                .display()
+                .to_string();
+            match self
+                .shell
+                .run(spec_priv(Path::new("/usr/bin/chown"), &[&owner, &console_s]))
+                .await
+            {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => tracing::warn!(
+                    status = ?out.status,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "chown console.log returned non-zero; forensics may be incomplete",
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "chown console.log failed; forensics may be incomplete")
+                }
+            }
+        }
+
+        let (console_tail, console_size_bytes) = forensics::console_tail(&console_log);
 
         // --- teardown -----------------------------------------------------
         self.teardown(arts, &domain_name, &job_id, &job_dir)
