@@ -122,19 +122,30 @@ async fn upsert_role(
     role: &'static str,
     password: &str,
 ) -> anyhow::Result<()> {
-    // DO blocks don't accept bind parameters and the password has to be
-    // a SQL literal, so escape and inline it. Single quotes are the only
-    // metacharacter inside a SQL string literal.
+    // Existence check happens in Rust, NOT in a `DO $$ ... EXECUTE '...'`
+    // wrapper. Reason: the password literal `'pw'` embedded inside an
+    // outer EXECUTE string would close the outer single-quoted string
+    // prematurely (postgres tokenises the next char as a fresh token —
+    // typically a numeric literal that explodes with "trailing junk
+    // after numeric literal"). Doing the conditional from Rust means
+    // each statement has exactly ONE layer of single-quoting around the
+    // password, which `sql_string_literal` already handles correctly.
     let pw_lit = sql_string_literal(password);
 
-    let create = format!(
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN EXECUTE \
-         'CREATE ROLE {role} LOGIN PASSWORD {pw_lit}'; END IF; END $$"
-    );
-    sqlx::query(&create)
-        .execute(&mut **tx)
-        .await
-        .with_context(|| format!("ensuring role {role} exists"))?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(role)
+            .fetch_one(&mut **tx)
+            .await
+            .with_context(|| format!("probing for role {role}"))?;
+
+    if !exists {
+        let create = format!("CREATE ROLE {role} LOGIN PASSWORD {pw_lit}");
+        sqlx::query(&create)
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("creating role {role}"))?;
+    }
 
     let alter = format!("ALTER ROLE {role} WITH LOGIN PASSWORD {pw_lit}");
     sqlx::query(&alter)
