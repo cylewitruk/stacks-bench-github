@@ -33,10 +33,14 @@ Required packages (Debian/Ubuntu):
 ```bash
 sudo apt update
 sudo apt install -y \
-  qemu-system-x86 qemu-utils libvirt-daemon-system virtinst \
+  qemu-system-x86 qemu-utils libvirt-daemon-system virtinst virtiofsd \
   cloud-image-utils libguestfs-tools \
   git lvm2 util-linux e2fsprogs xfsprogs
 ```
+
+`virtiofsd` is the userspace daemon libvirt spawns to back the virtio-fs
+results share. It ships in its own apt package on Debian/Ubuntu; without
+it `virsh start` aborts with "Unable to find a satisfying virtiofsd".
 
 ## 1. Build the golden Ubuntu 24 image
 

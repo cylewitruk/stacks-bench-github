@@ -158,6 +158,15 @@ for cmd in virsh qemu-img cloud-localds git \
     fi
 done
 
+# virtiofsd is special: libvirt invokes it directly (not via PATH), and on
+# Debian/Ubuntu it lives at /usr/libexec/virtiofsd, not in $PATH. Check
+# both locations so a /usr/libexec install passes.
+if command -v virtiofsd >/dev/null || [[ -x /usr/libexec/virtiofsd ]]; then
+    pass "virtiofsd (backs the virtio-fs results share)"
+else
+    fail "virtiofsd missing  → apt install virtiofsd  (without it, virsh start fails with 'Unable to find a satisfying virtiofsd')"
+fi
+
 # ─── 2. Virtualization ─────────────────────────────────────────────────
 section "2. Virtualization"
 if grep -qE 'vmx|svm' /proc/cpuinfo 2>/dev/null; then
