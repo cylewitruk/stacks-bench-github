@@ -1,12 +1,16 @@
 //! GitHub webhook entry point.
 //!
-//! Flow:
-//!   1. Read raw body (signature is over the bytes, not parsed JSON).
-//!   2. Verify HMAC-SHA256 signature against the App webhook secret.
-//!   3. Dispatch on `X-GitHub-Event` header.
-//!   4. For `issue_comment`: check authorization, parse `/benchmark` command,
-//!      resolve PR head SHA, enqueue a job, and reply on the PR with the queue
-//!      position.
+//! The handler is deliberately the narrowest surface in the system. It:
+//!   1. Reads the raw body (signature is over the bytes, not parsed JSON).
+//!   2. Verifies the HMAC-SHA256 signature against the webhook secret.
+//!   3. Dispatches on `X-GitHub-Event`.
+//!   4. For `issue_comment`: parses the `/benchmark` command, checks the
+//!      authorization allowlist, and enqueues a job row.
+//!
+//! Notably absent: any GitHub API call. The handler holds **no** App
+//! credentials. Head-SHA resolution and the initial PR comment are both
+//! deferred to the orchestrator, which runs on the host with the App
+//! private key. The handler's only DB grant is `INSERT ON jobs`.
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -34,14 +38,7 @@ pub async fn handle(
         Some(s) => s,
         None => return (StatusCode::UNAUTHORIZED, "missing signature").into_response(),
     };
-    if let Err(e) = verify_signature(
-        &state
-            .config
-            .github
-            .webhook_secret,
-        &body,
-        signature,
-    ) {
+    if let Err(e) = verify_signature(&state.config.webhook.secret, &body, signature) {
         tracing::warn!(error = %e, "rejecting webhook: bad signature");
         return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
     }
@@ -108,28 +105,16 @@ async fn handle_issue_comment(
         return (StatusCode::OK, "unauthorized").into_response();
     }
 
-    let head_sha = match state
-        .gh
-        .pr_head_sha(event.installation.id, &event.repository.full_name, event.issue.number as u64)
-        .await
-    {
-        Ok(sha) => sha,
-        Err(e) => {
-            // Use Debug repr so octocrab's `GitHub { source: GitHubError { .. } }`
-            // structure (status code, response body, GH-side message) lands in the log.
-            // Display alone collapses to a bare "github api error: GitHub".
-            tracing::error!(error = ?e, "failed to resolve head sha");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "head sha lookup failed").into_response();
-        }
-    };
-
+    // head_sha is left empty: only the orchestrator (which holds the App
+    // private key) can hit `GET /repos/{}/pulls/{}` to resolve it. It does
+    // so on job pickup and writes back via JobStore::set_head_sha.
     let new = NewJob {
         repository: event
             .repository
             .full_name
             .clone(),
         pr_number: event.issue.number,
-        head_sha,
+        head_sha: String::new(),
         requested_by: event.sender.login.clone(),
         command: command
             .subcommand
@@ -139,8 +124,8 @@ async fn handle_issue_comment(
         github_delivery_id: delivery_id.clone(),
     };
 
-    let (job_id, position) = match state.jobs.enqueue(&new).await {
-        Ok(Some(x)) => x,
+    match state.jobs.enqueue(&new).await {
+        Ok(Some(_id)) => (StatusCode::OK, "queued").into_response(),
         Ok(None) => {
             tracing::info!(
                 delivery = ?delivery_id,
@@ -148,48 +133,13 @@ async fn handle_issue_comment(
                 pr = event.issue.number,
                 "ignoring duplicate webhook delivery"
             );
-            return (StatusCode::OK, "duplicate").into_response();
+            (StatusCode::OK, "duplicate").into_response()
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to enqueue job");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "queue error").into_response();
+            (StatusCode::INTERNAL_SERVER_ERROR, "queue error").into_response()
         }
-    };
-
-    // Avoid a `#{position}` literal — GitHub's autolinker turns `#N` into a
-    // cross-repo issue/PR reference and the rendered text becomes confusing
-    // (e.g. "queued at position upstream#42").
-    let body = format!(
-        ":hourglass_flowing_sand: queued at position **{position}** (job `{job_id}`). I'll update \
-         this comment when it starts."
-    );
-    match state
-        .gh
-        .create_pr_comment(
-            event.installation.id,
-            &event.repository.full_name,
-            event.issue.number as u64,
-            &body,
-        )
-        .await
-    {
-        Ok(comment) => {
-            if let Err(e) = state
-                .jobs
-                .set_comment_id(job_id, comment.id)
-                .await
-            {
-                tracing::error!(error = ?e, "failed to persist comment id");
-            }
-        }
-        // Debug repr surfaces the inner octocrab `GitHubError` (status code,
-        // GH-side message, response body) instead of the bare "github api
-        // error: GitHub" we get from Display. Critical for diagnosing 401s
-        // like "Resource not accessible by integration" vs "Bad credentials".
-        Err(e) => tracing::error!(error = ?e, "failed to post initial PR comment"),
     }
-
-    (StatusCode::OK, "queued").into_response()
 }
 
 fn authorized(cfg: &AuthorizationConfig, event: &IssueCommentEvent) -> Result<(), &'static str> {

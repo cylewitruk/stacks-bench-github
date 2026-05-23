@@ -141,14 +141,60 @@ The orchestrator creates per-job snapshots of the base chainstate LV. Two modes,
 
 If you're following the playbook above, leave the field unset.
 
-## 3. Service user + sudoers
+## 3. Service users + sudoers
+
+Two host users, one per service. Keeping them separate is the filesystem
+half of the security boundary — without it, a compromised handler
+container could read the orchestrator's bind-mounted GitHub App PEM and
+impersonate the App. (The Postgres half is in §6.)
+
+Four distinct uids total. Two of them only exist *inside* containers
+(postgres and smee) and need no host user — only the host file
+ownership of their bind mounts (postgres) or nothing at all (smee)
+matters:
+
+| Identity | uid/gid | Where it lives | Holds |
+| ---- | ---- | ---- | ---- |
+| postgres (container) | 900/900 | Owns `/var/lib/sbgh/postgres` on the host. | DB on disk |
+| `sbgh-handler` (host) | 901/901 | Owns `/etc/sbgh/handler` on the host. The handler container is built with this uid so the bind-mounted config is readable. | webhook HMAC secret only |
+| `sbgh` (host) | 902/902 | Runs the orchestrator on the host (libvirt, LVM, sudoers). Owns `/etc/sbgh/orchestrator`. | GitHub App private key |
+| smee (container only) | 903/903 | No host user, no bind mounts, no secrets. Distinct uid only for defense-in-depth against a future container escape. | — |
+
+All four are in the system uid range (100–999) so `useradd --system`
+doesn't warn. Numbers picked in the low 900s to dodge the common Ubuntu
+allocations at the top of that range (997 `systemd-timesync`, 998
+`systemd-network`, 999 `dnsmasq`).
+
+Confirm the ids are free first:
 
 ```bash
-sudo useradd --system --create-home --shell /usr/sbin/nologin sbgh
+getent passwd 900 901 902 903     # all four lines must be empty
+getent group  900 901 902 903     # ditto
+```
+
+If any are taken, pick alternatives and set the corresponding env vars
+in `docker/.env` to match — substitute the same numbers in the `useradd`
+commands below — then rebuild the images (`docker compose -f
+docker/docker-compose.yml build --no-cache`). The smee uid
+(`SBGH_SMEE_UID`/`SBGH_SMEE_GID`) is runtime-only and doesn't need a
+rebuild.
+
+```bash
+# Handler-container shadow user. Owns the handler-side config dir. No
+# --create-home, no shell — it's purely a filesystem identity.
+sudo groupadd --system --gid 901 sbgh-handler
+sudo useradd  --system --uid 901 --gid 901 \
+              --shell /usr/sbin/nologin sbgh-handler
+
+# Orchestrator service user. Runs the actual binary on the host.
+sudo groupadd --system --gid 902 sbgh
+sudo useradd  --system --uid 902 --gid 902 \
+              --shell /usr/sbin/nologin sbgh
 sudo usermod -a -G libvirt sbgh        # virsh access without sudo for read-only ops
 
 # Per-job subdirs on the XFS metadata LV (mounted at /var/lib/sbgh in §2)
-# and the tmpfs root on /run.
+# and the tmpfs root on /run. All sbgh-owned — handler never touches
+# these.
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/jobs
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/results
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/git
@@ -156,7 +202,12 @@ sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh
 sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh/jobs
 ```
 
-Install the sudoers fragment:
+The in-container postgres uid (900) doesn't need a matching host user —
+it's only used as a numeric owner for `/var/lib/sbgh/postgres` (created
+in §6).
+
+Install the sudoers fragment. Only the orchestrator user needs sudo;
+`sbgh-handler` runs entirely inside an unprivileged container.
 
 ```bash
 sudo tee /etc/sudoers.d/sbgh >/dev/null <<'EOF'
@@ -191,7 +242,9 @@ You don't need a public domain — webhook delivery will be tunneled (next secti
      openssl rand -hex 32
      ```
 
-     Save this — it's `SBGH_GH_WEBHOOK_SECRET`.
+     Save this — it'll go in `/etc/sbgh/handler/secrets.env` as
+     `SBGH_WEBHOOK_SECRET` in the next section. The orchestrator never
+     sees it (it doesn't need to verify webhook signatures).
 3. **Repository permissions**:
 
     | Permission | Access |
@@ -205,128 +258,212 @@ You don't need a public domain — webhook delivery will be tunneled (next secti
 5. **Where can this GitHub App be installed?**: "Only on this account" (for dev).
 6. Click **Create GitHub App**.
 7. From the new app's settings page, copy the **Client ID** (the `Iv23li…` value listed near the top, right under "About") — that's `SBGH_GH_CLIENT_ID`. GitHub also displays an "App ID" (a numeric value); we don't use that. Both work today, but Client ID is the recommended modern form and the only one that survives if GitHub ever deprecates the legacy App ID auth path.
-8. Scroll down → **Generate a private key**. The browser downloads a `.pem` file. Move it somewhere safe and lock it down:
+8. Scroll down → **Generate a private key**. The browser downloads a `.pem` file. Move it to the orchestrator's config dir (the handler never sees this file):
 
     ```bash
+    sudo install -d -m 0700 -o sbgh -g sbgh /etc/sbgh/orchestrator
     sudo install -m 0600 -o sbgh -g sbgh \
-      ~/Downloads/sbgh-dev-*.pem /etc/sbgh/github-app.private-key.pem
+      ~/Downloads/sbgh-dev-*.pem /etc/sbgh/orchestrator/github-app.private-key.pem
     ```
 
 9. In the left sidebar of the app page, click **Install App** → install on your account → choose the fork of `stacks-core` you'll be testing against. Note the **installation ID** in the URL (`/settings/installations/<N>`).
 
-## 5. Tunnel webhook deliveries to localhost
+## 5. Lay out the two config directories
 
-Use the workspace-local `sbgh-smee` binary — a ~150 LoC Rust port of `smee-client` that avoids pulling in the npm dep tree. It's an SSE consumer that subscribes to the smee.io channel set on the App and POSTs each delivery to a local URL with the original GitHub headers reconstructed.
+Two disjoint dirs, one per service, owned by different users. This is
+the filesystem half of the security boundary: a compromised handler
+container can read `/etc/sbgh/handler` (its own bind mount) but not
+`/etc/sbgh/orchestrator` (owned by a different uid, never mounted into
+the handler container).
 
-```bash
-cargo run --release -p sbgh-smee -- \
-  --channel https://smee.io/<your-channel> \
-  --target http://localhost:8080/webhook
-```
+| Path | Owner / mode | Files | Read by |
+| ---- | ---- | ---- | ---- |
+| `/etc/sbgh/handler/` | `sbgh-handler:sbgh-handler` 0700 | `config.toml`, `secrets.env` | handler container |
+| `/etc/sbgh/orchestrator/` | `sbgh:sbgh` 0700 | `config.toml`, `github-app.private-key.pem` | host orchestrator |
 
-Leave this running. It logs each forwarded delivery. When the handler is running, you can verify by re-delivering a past webhook from the App settings page (**Advanced → Recent Deliveries → Redeliver**).
+Both dirs are bind-mounted into their respective containers at the
+*same* path on both sides, so file references inside the TOML
+(`private_key_path = "/etc/sbgh/orchestrator/github-app.private-key.pem"`)
+resolve identically on host and in container.
 
-### Why not `gh webhook forward` or `npm smee-client`?
-
-- `gh webhook forward` (a `gh` CLI extension) only works with **repository** / **organization** webhooks, not GitHub App webhooks. Our App's webhook URL is set at the App level, so this isn't applicable.
-- `npm install --global smee-client` works but pulls in Node + a transitive dep tree, which we don't otherwise need on a dev machine. `sbgh-smee` is the same protocol, audited per-line, and shares the rest of the workspace's Rust deps.
-
-### HMAC compatibility note
-
-`sbgh-smee` re-serializes the JSON body before forwarding, which means GitHub's HMAC-SHA256 over the original body needs the re-serialized bytes to match exactly. We achieve this by enabling `serde_json`'s `preserve_order` feature workspace-wide so the body's key order survives the round trip (the upstream Node `smee-client` relies on V8 having the same property). If your handler ever rejects forwarded deliveries with `401 invalid signature`, this is the first thing to check.
-
-## 6. Configure + run the services
-
-### Postgres
+### 5a. Handler config
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+# Directory (uid 997 from §3).
+sudo install -d -m 0700 -o sbgh-handler -g sbgh-handler /etc/sbgh/handler
+
+# config.toml: non-secret settings (allowlist, bind addr).
+sudo install -m 0600 -o sbgh-handler -g sbgh-handler \
+  config.example.handler.toml /etc/sbgh/handler/config.toml
+sudo -u sbgh-handler $EDITOR /etc/sbgh/handler/config.toml
+# Set at minimum:
+#   [authorization].allowed_repositories = ["<your-handle>/stacks-core"]
+
+# secrets.env: env_file for the handler container. The webhook HMAC
+# secret is the ONLY secret the handler ever sees — no App key.
+# DATABASE_URL is overridden by compose to use the narrow sbgh_handler
+# role, so leave it out of this file.
+sudo tee /etc/sbgh/handler/secrets.env >/dev/null <<EOF
+SBGH_WEBHOOK_SECRET=<openssl rand -hex 32>
+EOF
+sudo chmod 0600 /etc/sbgh/handler/secrets.env
+sudo chown sbgh-handler:sbgh-handler /etc/sbgh/handler/secrets.env
 ```
 
-### Environment
-
-Two ways to load secrets, pick one (or mix):
-
-**A. `.env` in the repo** — convenient for prod where the host is dedicated to this service:
+### 5b. Orchestrator config
 
 ```bash
-cp .env.example .env
-chmod 0600 .env
+# Directory (uid 998 from §3). The PEM from step 4.8 already lives here.
+sudo install -d -m 0700 -o sbgh -g sbgh /etc/sbgh/orchestrator
+
+# config.toml: App credentials, LVM/libvirt knobs, etc.
+sudo install -m 0600 -o sbgh -g sbgh \
+  config.example.orchestrator.toml /etc/sbgh/orchestrator/config.toml
+sudo -u sbgh $EDITOR /etc/sbgh/orchestrator/config.toml
+# Set at minimum:
+#   [server].database_url       = "postgres://sbgh_orch:<SBGH_ORCH_DB_PASSWORD>@127.0.0.1:5432/sbgh"
+#                                 (use the same value you put in docker/.env in §6)
+#   [github].client_id          = "Iv23li..."   (from step 4.7)
+#   [github].private_key_path   = "/etc/sbgh/orchestrator/github-app.private-key.pem"
+#   [lvm].vg_name               = "vg0"
+#   [lvm].thinpool              = "thinpool"
+#   [vm].golden_image           = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
 ```
 
-**B. Secrets file outside the repo** — recommended when you share the repo with other tools/people (or with an AI assistant) and don't want secrets in any path they can read:
+## 6. Run handler + smee + Postgres + migrate in Docker
+
+The handler, smee, Postgres, and a one-shot migrate job run in containers
+via [docker/docker-compose.yml](../docker/docker-compose.yml). The
+orchestrator stays on the host (it needs LVM + libvirt + the golden
+image).
+
+### Database role split (the Postgres half of the boundary)
+
+| DB role | Holds password | Grants | Used by |
+| ---- | ---- | ---- | ---- |
+| `sbgh` | `POSTGRES_OWNER_PASSWORD` | full ownership of the `sbgh` database | `sbgh-migrate` one-shot only |
+| `sbgh_handler` | `SBGH_HANDLER_DB_PASSWORD` | `USAGE` on schema, `INSERT` on `jobs` | handler container |
+| `sbgh_orch` | `SBGH_ORCH_DB_PASSWORD` | `USAGE` on schema, `SELECT, UPDATE` on `jobs` | host orchestrator |
+
+Roles + grants are (re)applied on every `docker compose up` by the
+`sbgh-migrate` service (Rust binary, `crates/sbgh-migrate`). It connects
+as the owner, runs schema migrations, then upserts the two narrow roles
+with whatever passwords are currently in `docker/.env`. Handler + smee
+`depends_on: service_completed_successfully` so they never see a
+half-migrated schema or a role without grants.
+
+### One-time setup
 
 ```bash
-mkdir -p ~/.config/sbgh && chmod 700 ~/.config/sbgh
-cp .env.example ~/.config/sbgh/secrets.env
-chmod 600 ~/.config/sbgh/secrets.env
+# Docker if not installed.
+sudo apt install -y docker.io docker-compose-v2
+sudo usermod -a -G docker $USER     # log out + back in for this to take effect
+
+# Runtime env. Required values (SMEE_CHANNEL + all three DB passwords)
+# have no sensible defaults; compose will refuse to start without them.
+cp docker/.env.example docker/.env
+$EDITOR docker/.env
+
+# Generate three distinct passwords. Keep them out of shell history.
+for v in POSTGRES_OWNER_PASSWORD SBGH_HANDLER_DB_PASSWORD SBGH_ORCH_DB_PASSWORD; do
+    echo "$v=$(openssl rand -base64 32)"
+done >> docker/.env
+
+# The orchestrator config.toml needs the SBGH_ORCH_DB_PASSWORD value too
+# (host-side DB URL). Same value, two places — there is no shared file
+# the orchestrator and the migrate container both read.
+
+# Prepare the host-side Postgres data directory. We bind-mount this into
+# the container so the data survives `docker volume prune`. The container
+# runs rootless as uid 900 (overriding the upstream image's 999 to dodge
+# dnsmasq) and the entrypoint skips its usual chown when not running as
+# root — so the host dir MUST already exist owned by uid 900 mode 0700
+# before first start.
+sudo install -d -m 0700 -o 900 -g 900 /var/lib/sbgh/postgres
 ```
 
-Then point the binaries at it with `--env-file`:
+### Bring up the stack
 
 ```bash
-sbgh-handler      --env-file ~/.config/sbgh/secrets.env
-sbgh-orchestrator --env-file ~/.config/sbgh/secrets.env
+docker compose -f docker/docker-compose.yml up -d --build
 ```
 
-(With `--env-file`, a missing/unreadable file is a hard error. Without it, `./.env` is loaded best-effort and a missing file is silently tolerated.)
+What gets built + run:
 
-Edit whichever file you chose and set at minimum:
+| Service | Image | Listens | DB role | Talks to |
+| ---- | ---- | ---- | ---- | ---- |
+| `sbgh-postgres` | `postgres:18-trixie` (uid `${POSTGRES_UID:-900}`) | 127.0.0.1:5432 | — | — |
+| `sbgh-migrate` | local `migrate` target (one-shot) | — | `sbgh` (owner) | `postgres:5432` |
+| `sbgh-handler` | local `handler` target (uid `${SBGH_UID:-901}`) | 127.0.0.1:8080 | `sbgh_handler` | `postgres:5432` (INSERT only) |
+| `sbgh-smee` | local `smee` target (uid `${SBGH_SMEE_UID:-903}`) | — | — | smee.io (SSE in), `handler:8080` (HTTP out) |
+
+All four containers run rootless. The handler + smee in-container uid
+must match the host `sbgh-handler` uid so the mode-0600 config bind-
+mounted from `/etc/sbgh/handler` is readable. Defaults to 901; override
+via `SBGH_UID` / `SBGH_GID` in `docker/.env` if your host uses a
+different id (check with `id sbgh-handler`). Rebuild after changing
+those:
 
 ```bash
-DATABASE_URL=postgres://sbgh:sbgh@127.0.0.1:5432/sbgh
-SBGH_GH_CLIENT_ID=<from step 4.7>
-SBGH_GH_PRIVATE_KEY_PATH=/etc/sbgh/github-app.private-key.pem
-SBGH_GH_WEBHOOK_SECRET=<from step 4.2>
-SBGH_ALLOWED_REPOS=<your-handle>/stacks-core
-SBGH_VM_GOLDEN_IMAGE=/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2
-SBGH_LVM_VG=vg0                  # whatever `sudo vgs` shows — usually your OS VG
-SBGH_LVM_THINPOOL=thinpool
-RUST_LOG=info,sbgh_handler=debug,sbgh_orchestrator=debug
+docker compose -f docker/docker-compose.yml build --no-cache
 ```
 
-Either way, variables you `export` in your shell before launching the binary win over what's in the file — useful for one-off overrides without editing.
-
-#### Or: put everything (including secrets) in a TOML file
-
-The split between "secrets in env" and "everything else in TOML" is a convention, not enforced — `Config::load` accepts `webhook_secret`, `private_key_path`, `client_id`, and `database_url` from either source, with env winning on collision. If you'd rather keep one file and skip the env dance entirely (handy on a personal dev box), drop a TOML at one of these paths and the loader will find it without any flag:
-
-```text
-$SBGH_CONFIG                          # if set, takes precedence
-/etc/sbgh/config.toml                 # system path
-~/.config/sbgh/config.toml            # user path (XDG-style fallback)
-```
+### Tail + verify
 
 ```bash
-# personal dev box
-mkdir -p ~/.config/sbgh && chmod 700 ~/.config/sbgh
-cp config.example.toml ~/.config/sbgh/config.toml
-chmod 600 ~/.config/sbgh/config.toml
-$EDITOR ~/.config/sbgh/config.toml    # add webhook_secret, private_key_path, etc.
+# All logs
+docker compose -f docker/docker-compose.yml logs -f
 
-# prod / systemd
-sudo install -m 0644 -o sbgh -g sbgh config.example.toml /etc/sbgh/config.toml
-sudo $EDITOR /etc/sbgh/config.toml
+# Just the handler
+docker compose -f docker/docker-compose.yml logs -f handler
+
+# The migrate run — should have "migrate complete" then exited 0.
+docker compose -f docker/docker-compose.yml logs migrate
+
+# Quick health check
+curl -i http://127.0.0.1:8080/health    # → 200 OK
 ```
 
-The "outside the repo at mode 0600" combo gives you the same leakage properties as an env file without the shell-sourcing dance.
+The smee container picks up `SMEE_CHANNEL` from `docker/.env` and starts
+forwarding to `http://handler:8080/webhook` over the docker network.
+After `migrate` exits successfully, handler + smee start and stay up.
 
-### Build + run
+To re-run migrations (e.g. after pulling new code that adds a SQL
+migration):
 
 ```bash
-cargo build --release --workspace
+docker compose -f docker/docker-compose.yml run --rm migrate
+```
 
-# handler — apply migrations + listen for webhooks on :8080
-SBGH_CONFIG=/etc/sbgh/config.toml \
-  target/release/sbgh-handler &
+### Why not the orchestrator too?
 
-# orchestrator — claim + execute jobs
-sudo -u sbgh -E \
-  SBGH_CONFIG=/etc/sbgh/config.toml \
+Three reasons it stays on the host:
+
+- It calls `lvcreate`/`lvremove` via sudo — easy to wire from host, awkward from inside a container.
+- It calls `virsh` — same, plus the libvirt socket is host-side.
+- It needs read access to `/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2` and write access under `/var/lib/sbgh/jobs/`, both of which are host paths the libvirt-qemu apparmor profile already knows about.
+
+### Build + run the orchestrator (host-side)
+
+```bash
+# Build
+cargo build --release -p sbgh-orchestrator
+
+# Foreground run for first-time debugging
+sudo -u sbgh \
+  RUST_LOG=info,sbgh_orchestrator=debug,sqlx=warn \
   target/release/sbgh-orchestrator
 ```
 
-(For a long-running setup, write systemd units; for first-run debugging, foreground is easier.)
+(For a long-running setup, write a systemd unit — see `docs/architecture.md` for the operator-setup notes.)
+
+Successful boot:
+
+```text
+INFO sbgh_orchestrator: orchestrator started
+```
+
+It'll sit there polling the queue every 5 seconds. The handler in Docker writes jobs to the same Postgres; the orchestrator on the host picks them up.
 
 ## 7. First real run
 
@@ -403,13 +540,32 @@ After fixing either, **restart the handler** (the in-memory installation token c
 
 ### Signature verification fails (401)
 
-- The `SBGH_GH_WEBHOOK_SECRET` env value must match exactly what you set in the App. No surrounding quotes, no trailing newline.
+- `SBGH_WEBHOOK_SECRET` in `/etc/sbgh/handler/secrets.env` must match exactly what you set in the App. No surrounding quotes, no trailing newline.
 - If you copy-pasted, regenerate with `openssl rand -hex 32` and update both sides.
 
-### `loading github app private key` error at handler startup
+### `loading github app private key` error at orchestrator startup
 
-- `ls -l $SBGH_GH_PRIVATE_KEY_PATH` — must be readable by the user running the handler (mode `0600`, owned by that user is ideal).
+(The handler never loads the PEM — if you see this error, it's the orchestrator on the host.)
+
+- `sudo -u sbgh ls -l /etc/sbgh/orchestrator/github-app.private-key.pem` — must be readable as user `sbgh` (mode `0600`, owner `sbgh:sbgh`).
 - PEM file must start with `-----BEGIN RSA PRIVATE KEY-----` (GitHub gives you PKCS#1; `jsonwebtoken` accepts both PKCS#1 and PKCS#8).
+
+### Handler logs `permission denied for table jobs`
+
+The handler is trying a query other than `INSERT`. By design `sbgh_handler` only has `INSERT` (see §6 role table). Either:
+
+- A code change introduced a `SELECT`/`UPDATE` from the handler path — that's a regression of the role split; either move the query to the orchestrator or widen the grant deliberately, don't paper over it.
+- The migrate container didn't run (or ran with stale passwords). Check `docker compose logs migrate`; re-run with `docker compose run --rm migrate`.
+
+### `password authentication failed for user "sbgh_handler"` (or `sbgh_orch`)
+
+The role's password in Postgres no longer matches what the handler/orchestrator was given. Likely cause: someone edited `docker/.env` but didn't re-run migrate (which resets passwords to match). Fix:
+
+```bash
+docker compose -f docker/docker-compose.yml run --rm migrate
+docker compose -f docker/docker-compose.yml restart handler
+# (and restart the host orchestrator)
+```
 
 ### `installation token mint failed: 404`
 

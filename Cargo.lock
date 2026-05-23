@@ -2592,6 +2592,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbgh-migrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "sbgh-core",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sbgh-orchestrator"
 version = "0.1.0"
 dependencies = [

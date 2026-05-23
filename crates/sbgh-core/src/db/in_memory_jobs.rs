@@ -37,7 +37,7 @@ impl InMemoryJobStore {
 
 #[async_trait]
 impl JobStore for InMemoryJobStore {
-    async fn enqueue(&self, new: &NewJob) -> Result<Option<(Uuid, i64)>> {
+    async fn enqueue(&self, new: &NewJob) -> Result<Option<Uuid>> {
         let mut jobs = self.lock();
         // Duplicate-detection on github_delivery_id; matches the partial
         // unique index in Postgres (multiple NULL deliveries are allowed).
@@ -69,11 +69,7 @@ impl JobStore for InMemoryJobStore {
             result: None,
             error: None,
         });
-        let position = jobs
-            .iter()
-            .filter(|j| j.status == JobStatus::Queued)
-            .count() as i64;
-        Ok(Some((id, position)))
+        Ok(Some(id))
     }
 
     async fn claim_next(&self) -> Result<Option<Job>> {
@@ -120,22 +116,11 @@ impl JobStore for InMemoryJobStore {
         Ok(())
     }
 
-    async fn queue_position(&self, id: Uuid) -> Result<Option<i64>> {
-        let jobs = self.lock();
-        let Some(target) = jobs
-            .iter()
-            .find(|j| j.id == id)
-        else {
-            return Ok(None);
-        };
-        if target.status != JobStatus::Queued {
-            return Ok(None);
-        }
-        let pos = jobs
-            .iter()
-            .filter(|j| j.status == JobStatus::Queued && j.queued_at <= target.queued_at)
-            .count() as i64;
-        Ok(Some(pos))
+    async fn set_head_sha(&self, id: Uuid, head_sha: &str) -> Result<()> {
+        let mut jobs = self.lock();
+        let job = find_mut(&mut jobs, id)?;
+        job.head_sha = head_sha.to_string();
+        Ok(())
     }
 }
 

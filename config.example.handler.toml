@@ -1,0 +1,27 @@
+# Example handler config. Copy to /etc/sbgh/handler/config.toml (or wherever
+# $SBGH_CONFIG points) and fill in.
+#
+# The handler holds **no** GitHub App credentials — only the webhook HMAC
+# secret. App-side identity (client_id, private key) lives only in the
+# orchestrator's config (see config.example.orchestrator.toml).
+#
+# Secret values can also come from env:
+#   DATABASE_URL                — overrides [server].database_url
+#   SBGH_WEBHOOK_SECRET         — overrides [webhook].secret
+# The compose stack passes DATABASE_URL via env (so the password isn't in
+# this file) and sources SBGH_WEBHOOK_SECRET from secrets.env.
+
+[server]
+bind_addr = "0.0.0.0:8080"
+# database_url is set via env (DATABASE_URL) by compose so the role password
+# stays in docker/.env. For host-side debugging, set it here.
+# database_url = "postgres://sbgh_handler:CHANGE_ME@127.0.0.1:5432/sbgh"
+
+[webhook]
+# Set via secrets.env in the deployed stack — leave commented here.
+# secret = "<openssl rand -hex 32>"
+
+[authorization]
+allowed_repositories = ["cylewitruk/stacks-core"]
+allowed_users = []
+allowed_associations = ["OWNER", "MEMBER", "COLLABORATOR"]

@@ -1,0 +1,43 @@
+# Keep build contexts small: the docker build only needs Cargo.{toml,lock},
+# crates/, and migrations/. Everything else is irrelevant and slows things
+# down (or, in the case of target/, blows up the docker daemon's storage).
+
+# Rust build artifacts
+target/
+**/target/
+
+# IDE / editor noise
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local secrets + env (just in case)
+.env
+.env.local
+*.pem
+*.key
+
+# Git internals — never needed by the build
+.git/
+.gitignore
+
+# Docs + scripts — not needed by the build
+docs/
+scripts/
+
+# The compose env (would be pointless inside the image)
+docker/.env
+
+# Cached cloud / chainstate images that might happen to be in repo root
+*.qcow2
+*.img
+*.iso
+*.tar.zst
+
+# sqlx offline query cache
+.sqlx/
+
+# Coverage / profiling
+lcov.info
+profile-*

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sbgh_core::config::Config;
+use sbgh_core::config::OrchestratorConfig;
 use sbgh_core::models::Job;
 
 use crate::libvirt::boot::BootDisk;
@@ -96,12 +96,12 @@ struct JobArtifacts {
 }
 
 pub struct LibvirtDriver {
-    config: Arc<Config>,
+    config: Arc<OrchestratorConfig>,
     shell: Arc<dyn Shell>,
 }
 
 impl LibvirtDriver {
-    pub fn new(config: Arc<Config>, shell: Arc<dyn Shell>) -> Self {
+    pub fn new(config: Arc<OrchestratorConfig>, shell: Arc<dyn Shell>) -> Self {
         Self { config, shell }
     }
 
@@ -434,8 +434,7 @@ mod tests {
 
     use chrono::Utc;
     use sbgh_core::config::{
-        AuthorizationConfig, GitHubConfig, LvmConfig, PathsConfig, ServerConfig, StacksBenchConfig,
-        VmConfig,
+        GitHubConfig, LvmConfig, OrchestratorServerConfig, PathsConfig, StacksBenchConfig, VmConfig,
     };
     use sbgh_core::models::{Job, JobStatus};
     use sqlx::types::Json;
@@ -445,11 +444,10 @@ mod tests {
     use super::*;
     use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
 
-    fn test_config(tmp: &TempDir) -> Config {
+    fn test_config(tmp: &TempDir) -> OrchestratorConfig {
         let p = tmp.path();
-        Config {
-            server: ServerConfig {
-                bind_addr: "127.0.0.1:0".into(),
+        OrchestratorConfig {
+            server: OrchestratorServerConfig {
                 database_url: "postgres://unused".into(),
                 service_user: "sbgh".into(),
             },
@@ -457,9 +455,7 @@ mod tests {
                 client_id: "Iv23litest".into(),
                 api_base_url: "https://api.github.test".into(),
                 private_key_path: PathBuf::from("/dev/null"),
-                webhook_secret: "unused".into(),
             },
-            authorization: AuthorizationConfig::default(),
             vm: VmConfig {
                 golden_image: p.join("golden.qcow2"),
                 vcpus: 2,

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::db::Pool;
 use crate::db::jobs::JobStore;
-use crate::models::{Job, JobStatus, NewJob};
+use crate::models::{Job, NewJob};
 
 #[derive(Clone)]
 pub struct PostgresJobStore {
@@ -21,9 +21,7 @@ impl PostgresJobStore {
 
 #[async_trait]
 impl JobStore for PostgresJobStore {
-    async fn enqueue(&self, new: &NewJob) -> Result<Option<(Uuid, i64)>> {
-        let mut tx = self.pool.begin().await?;
-
+    async fn enqueue(&self, new: &NewJob) -> Result<Option<Uuid>> {
         // INSERT ... ON CONFLICT DO NOTHING + RETURNING — returns Some(id) for
         // a fresh row, None if `github_delivery_id` collided with an existing
         // job (i.e. a retried delivery).
@@ -32,6 +30,10 @@ impl JobStore for PostgresJobStore {
         // index from the migration; without the predicate, Postgres returns
         // "no unique or exclusion constraint matching the ON CONFLICT
         // specification".
+        //
+        // Single statement (no SELECT, no transaction) keeps the handler's
+        // required Postgres grants down to INSERT — see the role-split
+        // migration.
         let id: Option<Uuid> = sqlx::query_scalar(
             r#"
             INSERT INTO jobs (
@@ -52,27 +54,9 @@ impl JobStore for PostgresJobStore {
         .bind(&new.args)
         .bind(new.installation_id)
         .bind(&new.github_delivery_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await?;
-
-        let Some(id) = id else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-
-        let position: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM jobs
-            WHERE status = 'queued'
-              AND queued_at <= (SELECT queued_at FROM jobs WHERE id = $1)
-            "#,
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(Some((id, position)))
+        Ok(id)
     }
 
     async fn claim_next(&self) -> Result<Option<Job>> {
@@ -154,23 +138,12 @@ impl JobStore for PostgresJobStore {
         Ok(())
     }
 
-    async fn queue_position(&self, id: Uuid) -> Result<Option<i64>> {
-        let row: Option<(JobStatus, i64)> = sqlx::query_as(
-            r#"
-            WITH target AS (
-                SELECT status, queued_at FROM jobs WHERE id = $1
-            )
-            SELECT
-                target.status,
-                (SELECT COUNT(*) FROM jobs
-                 WHERE status = 'queued' AND queued_at <= target.queued_at) AS position
-            FROM target
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.and_then(|(status, pos)| (status == JobStatus::Queued).then_some(pos)))
+    async fn set_head_sha(&self, id: Uuid, head_sha: &str) -> Result<()> {
+        sqlx::query("UPDATE jobs SET head_sha = $2 WHERE id = $1")
+            .bind(id)
+            .bind(head_sha)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }

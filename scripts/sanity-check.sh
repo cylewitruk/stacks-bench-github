@@ -34,25 +34,40 @@ warn()    { echo "  ${YLW}[WARN]${RST} $*"; WARN_COUNT=$((WARN_COUNT+1)); }
 info()    { echo "         $*"; }
 
 # ─── locate + parse config ─────────────────────────────────────────────
+# Only the orchestrator config is parsed here — it has everything we need
+# to validate (LVM, VM, GitHub credentials, DB URL, paths). The handler
+# config is much narrower (webhook secret + allowlist) and is sanity-
+# checked separately in §12 (presence + ownership only).
+#
+# Search order matches `OrchestratorConfig::load`:
+#   $SBGH_CONFIG → /etc/sbgh/orchestrator/config.toml → $HOME/.config/sbgh/orchestrator/config.toml.
+SBGH_HOME=$(getent passwd sbgh 2>/dev/null | cut -d: -f6)
+
 locate_config() {
     if [[ -n "${SBGH_CONFIG:-}" ]] && [[ -r "$SBGH_CONFIG" ]]; then
         echo "$SBGH_CONFIG"; return
     fi
-    if [[ -r /etc/sbgh/config.toml ]]; then
-        echo /etc/sbgh/config.toml; return
+    if [[ -r /etc/sbgh/orchestrator/config.toml ]]; then
+        echo /etc/sbgh/orchestrator/config.toml; return
     fi
-    if [[ -n "${HOME:-}" ]] && [[ -r "$HOME/.config/sbgh/config.toml" ]]; then
-        echo "$HOME/.config/sbgh/config.toml"; return
+    if [[ -n "$SBGH_HOME" ]] && [[ -r "$SBGH_HOME/.config/sbgh/orchestrator/config.toml" ]]; then
+        echo "$SBGH_HOME/.config/sbgh/orchestrator/config.toml"; return
+    fi
+    if [[ -n "${HOME:-}" ]] && [[ -r "$HOME/.config/sbgh/orchestrator/config.toml" ]]; then
+        echo "$HOME/.config/sbgh/orchestrator/config.toml"; return
     fi
     echo ""
 }
 
 CONFIG_PATH=$(locate_config)
 if [[ -z "$CONFIG_PATH" ]]; then
-    echo "${RED}No config file found.${RST} Looked at:" >&2
+    echo "${RED}No orchestrator config file found.${RST} Looked at:" >&2
     echo "  - \$SBGH_CONFIG (\"${SBGH_CONFIG:-unset}\")" >&2
-    echo "  - /etc/sbgh/config.toml" >&2
-    echo "  - \$HOME/.config/sbgh/config.toml (\"${HOME:-unset}/.config/sbgh/config.toml\")" >&2
+    echo "  - /etc/sbgh/orchestrator/config.toml" >&2
+    if [[ -n "$SBGH_HOME" ]]; then
+        echo "  - $SBGH_HOME/.config/sbgh/orchestrator/config.toml" >&2
+    fi
+    echo "  - \$HOME/.config/sbgh/orchestrator/config.toml (\"${HOME:-unset}/.config/sbgh/orchestrator/config.toml\")" >&2
     exit 2
 fi
 
@@ -62,7 +77,7 @@ if ! command -v python3 >/dev/null; then
 fi
 
 echo "${BLD}sbgh host sanity check${RST}"
-echo "Config: $CONFIG_PATH"
+echo "Orchestrator config: $CONFIG_PATH"
 
 # Pull everything we need out of the TOML in one shot. tomllib is stdlib
 # from Python 3.11+ (Debian 12 / Ubuntu 24.04 both ship 3.11+).
@@ -251,19 +266,91 @@ else
     fail "git mirror parent $git_mirror_parent does not exist"
 fi
 
+# Config dirs — security boundary. Each must be owned by the right user
+# (different uid each!) and mode 0700 so the other user can't read it.
+for entry in "/etc/sbgh/handler:sbgh-handler" "/etc/sbgh/orchestrator:sbgh"; do
+    dir="${entry%%:*}"
+    expected_owner="${entry##*:}"
+    if [[ -d "$dir" ]]; then
+        owner=$(stat -c '%U' "$dir" 2>/dev/null)
+        mode=$(stat -c '%a' "$dir" 2>/dev/null)
+        if [[ "$owner" == "$expected_owner" ]] && [[ "$mode" == "700" ]]; then
+            pass "$dir (mode $mode, owner $owner)"
+        elif [[ "$owner" != "$expected_owner" ]]; then
+            fail "$dir owner is $owner, expected $expected_owner"
+        else
+            warn "$dir owner is correct ($owner) but mode is $mode (expected 700)"
+        fi
+    else
+        fail "$dir does not exist  → install -d -m 0700 -o $expected_owner -g $expected_owner $dir"
+    fi
+done
+
 # ─── 6. Service user + groups ──────────────────────────────────────────
-section "6. Service user: $CFG_SERVICE_USER"
+section "6. Service users"
+# Two host users, one per service. See docs/host-bringup.md §3.
+#   - sbgh-handler (uid 997): identity for the handler container
+#   - sbgh         (uid 998): runs the orchestrator binary on the host
+
+# Read handler uid override from docker/.env if present.
+expected_handler_uid=901
+expected_handler_gid=901
+for candidate in \
+        "$(dirname "$0")/../docker/.env" \
+        "./docker/.env"; do
+    if [[ -f "$candidate" ]]; then
+        override_uid=$(grep -E '^SBGH_UID=' "$candidate" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d ' ')
+        override_gid=$(grep -E '^SBGH_GID=' "$candidate" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d ' ')
+        [[ -n "$override_uid" ]] && expected_handler_uid="$override_uid"
+        [[ -n "$override_gid" ]] && expected_handler_gid="$override_gid"
+        break
+    fi
+done
+
+# --- sbgh-handler (uid 997) ---
+if id sbgh-handler >/dev/null 2>&1; then
+    pass "user 'sbgh-handler' exists"
+    h_uid=$(id -u sbgh-handler)
+    h_gid=$(id -g sbgh-handler)
+    if [[ "$h_uid" == "$expected_handler_uid" ]] && [[ "$h_gid" == "$expected_handler_gid" ]]; then
+        pass "sbgh-handler uid/gid $h_uid/$h_gid matches container expectation ($expected_handler_uid/$expected_handler_gid)"
+    else
+        fail "sbgh-handler uid/gid is $h_uid/$h_gid, but containers expect $expected_handler_uid/$expected_handler_gid"
+        info "→ set SBGH_UID=$h_uid SBGH_GID=$h_gid in docker/.env and rebuild:"
+        info "  docker compose -f docker/docker-compose.yml build --no-cache"
+    fi
+else
+    fail "user 'sbgh-handler' missing  → groupadd --system --gid 901 sbgh-handler && useradd --system --uid 901 --gid 901 --shell /usr/sbin/nologin sbgh-handler"
+fi
+
+# --- sbgh (uid 998, orchestrator) ---
 if id "$CFG_SERVICE_USER" >/dev/null 2>&1; then
     pass "user '$CFG_SERVICE_USER' exists"
     groups=$(id -nG "$CFG_SERVICE_USER")
     if [[ " $groups " == *" libvirt "* ]]; then
-        pass "in 'libvirt' group"
+        pass "$CFG_SERVICE_USER is in 'libvirt' group"
     else
-        warn "not in 'libvirt' group — virsh access will need sudo"
+        warn "$CFG_SERVICE_USER not in 'libvirt' group — virsh access will need sudo"
         info "→ usermod -a -G libvirt $CFG_SERVICE_USER"
     fi
+
+    s_uid=$(id -u "$CFG_SERVICE_USER")
+    s_gid=$(id -g "$CFG_SERVICE_USER")
+    if [[ "$s_uid" == "902" ]] && [[ "$s_gid" == "902" ]]; then
+        pass "$CFG_SERVICE_USER uid/gid 902/902 (recommended)"
+    else
+        warn "$CFG_SERVICE_USER uid/gid is $s_uid/$s_gid (recommended: 902/902)"
+    fi
+
+    # Tripwire: the two service uids MUST differ — sharing one defeats
+    # the filesystem boundary between handler and orchestrator config.
+    if id sbgh-handler >/dev/null 2>&1; then
+        if [[ "$(id -u sbgh-handler)" == "$s_uid" ]]; then
+            fail "sbgh-handler and $CFG_SERVICE_USER share uid $s_uid — orchestrator config readable from handler container!"
+        fi
+    fi
 else
-    fail "user '$CFG_SERVICE_USER' does not exist  → useradd --system --shell /usr/sbin/nologin $CFG_SERVICE_USER"
+    fail "user '$CFG_SERVICE_USER' does not exist  → groupadd --system --gid 902 sbgh && useradd --system --uid 902 --gid 902 --shell /usr/sbin/nologin sbgh"
 fi
 
 # ─── 7. Sudoers ────────────────────────────────────────────────────────
@@ -371,13 +458,42 @@ for host in api.github.com github.com cloud-images.ubuntu.com archive.hiro.so; d
     fi
 done
 
-# ─── 11. Postgres ──────────────────────────────────────────────────────
+# ─── 11. Postgres + role split ─────────────────────────────────────────
 section "11. Postgres: $CFG_DATABASE_URL"
 if [[ -z "$CFG_DATABASE_URL" ]]; then
     fail "DATABASE_URL is unset (neither config nor env)"
-elif command -v psql >/dev/null; then
+elif ! command -v psql >/dev/null; then
+    warn "psql not installed — skipping Postgres check (apt install postgresql-client)"
+else
+    # The orchestrator's DSN should use the narrow `sbgh_orch` role. If
+    # it's still using the owner role `sbgh`, the Postgres half of the
+    # boundary is wide open.
+    db_user=""
+    if [[ "$CFG_DATABASE_URL" =~ postgres://([^:@/]+)[:@] ]]; then
+        db_user="${BASH_REMATCH[1]}"
+    fi
+    case "$db_user" in
+        sbgh_orch)
+            pass "orchestrator DSN uses the narrow 'sbgh_orch' role"
+            ;;
+        sbgh)
+            fail "orchestrator DSN uses owner role 'sbgh' — role split bypassed"
+            info "→ change [server].database_url to postgres://sbgh_orch:<SBGH_ORCH_DB_PASSWORD>@.../sbgh"
+            ;;
+        sbgh_handler)
+            fail "orchestrator DSN uses 'sbgh_handler' role — that's the *handler*'s role, INSERT-only"
+            ;;
+        "")
+            warn "couldn't parse user from DATABASE_URL"
+            ;;
+        *)
+            warn "orchestrator DSN uses unexpected role '$db_user' (expected 'sbgh_orch')"
+            ;;
+    esac
+
     if PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc 'SELECT 1' >/dev/null 2>&1; then
-        pass "can connect to Postgres"
+        pass "can connect to Postgres as '$db_user'"
+
         if PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
                 "SELECT to_regclass('public.jobs') IS NOT NULL" 2>/dev/null | grep -q '^t$'; then
             pass "'jobs' table exists"
@@ -387,13 +503,195 @@ elif command -v psql >/dev/null; then
                 "SELECT count(*) FROM jobs WHERE status='running'" 2>/dev/null)
             info "queued=${queued:-?}  running=${running:-?}"
         else
-            warn "'jobs' table not present — handler hasn't run migrations yet"
+            warn "'jobs' table not present — sbgh-migrate hasn't run yet"
         fi
+
+        # Verify the three roles exist and have the expected grants. Use
+        # has_table_privilege so we don't need to query pg_authid (which
+        # the orchestrator's role can't read).
+        for role in sbgh sbgh_handler sbgh_orch; do
+            if PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
+                    "SELECT 1 FROM pg_roles WHERE rolname='$role'" 2>/dev/null | grep -q '^1$'; then
+                pass "role '$role' exists"
+            else
+                fail "role '$role' missing — sbgh-migrate hasn't applied roles yet"
+            fi
+        done
+
+        # Tripwire: sbgh_handler must NOT have SELECT on jobs. If it
+        # does, the role split is silently bypassed.
+        handler_select=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
+            "SELECT has_table_privilege('sbgh_handler','public.jobs','SELECT')" 2>/dev/null \
+            | tr -d '[:space:]')
+        case "$handler_select" in
+            f) pass "sbgh_handler has no SELECT on jobs (boundary intact)" ;;
+            t) fail "sbgh_handler has SELECT on jobs — grants too wide, role split bypassed" ;;
+            *) warn "couldn't check sbgh_handler SELECT privilege (got '$handler_select')" ;;
+        esac
+
+        handler_insert=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
+            "SELECT has_table_privilege('sbgh_handler','public.jobs','INSERT')" 2>/dev/null \
+            | tr -d '[:space:]')
+        if [[ "$handler_insert" == "t" ]]; then
+            pass "sbgh_handler has INSERT on jobs"
+        else
+            fail "sbgh_handler missing INSERT on jobs — handler can't enqueue"
+        fi
+
+        for priv in SELECT UPDATE; do
+            orch_priv=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
+                "SELECT has_table_privilege('sbgh_orch','public.jobs','$priv')" 2>/dev/null \
+                | tr -d '[:space:]')
+            if [[ "$orch_priv" == "t" ]]; then
+                pass "sbgh_orch has $priv on jobs"
+            else
+                fail "sbgh_orch missing $priv on jobs"
+            fi
+        done
     else
         fail "Postgres unreachable at $CFG_DATABASE_URL"
     fi
+fi
+
+# ─── 12. Docker stack (handler + smee + Postgres) ─────────────────────
+section "12. Docker stack"
+if command -v docker >/dev/null; then
+    pass "docker CLI present"
+    if docker info >/dev/null 2>&1; then
+        pass "docker daemon reachable"
+    else
+        fail "docker daemon unreachable (started? user in docker group?)"
+    fi
+
+    compose_yml=""
+    for candidate in \
+            "$(dirname "$0")/../docker/docker-compose.yml" \
+            "./docker/docker-compose.yml"; do
+        if [[ -f "$candidate" ]]; then
+            compose_yml=$(realpath "$candidate")
+            break
+        fi
+    done
+
+    if [[ -n "$compose_yml" ]]; then
+        pass "compose file: $compose_yml"
+        compose_dir=$(dirname "$compose_yml")
+
+        # Small helper: pull `KEY=value` from compose_dir/.env (last wins).
+        env_lookup() {
+            grep -E "^$1=" "$compose_dir/.env" 2>/dev/null | tail -1 \
+                | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d ' '
+        }
+
+        if [[ -f "$compose_dir/.env" ]]; then
+            pass "$compose_dir/.env present"
+            if grep -qE '^SMEE_CHANNEL=https?://smee\.io/' "$compose_dir/.env"; then
+                pass "SMEE_CHANNEL set in .env"
+            else
+                warn "SMEE_CHANNEL not set (or placeholder) in $compose_dir/.env"
+            fi
+            for required in POSTGRES_OWNER_PASSWORD SBGH_HANDLER_DB_PASSWORD SBGH_ORCH_DB_PASSWORD; do
+                val=$(env_lookup "$required")
+                if [[ -n "$val" ]] && [[ "$val" != "REPLACE_ME" ]]; then
+                    pass "$required set in .env"
+                else
+                    fail "$required missing or placeholder in $compose_dir/.env"
+                fi
+            done
+        else
+            warn "$compose_dir/.env not found  → cp $compose_dir/.env.example $compose_dir/.env"
+        fi
+
+        # Handler secrets.env — only file env_file references in compose.
+        # Default /etc/sbgh/handler, honor SBGH_HANDLER_CONFIG_DIR override.
+        handler_config_dir="/etc/sbgh/handler"
+        if [[ -f "$compose_dir/.env" ]]; then
+            override_dir=$(env_lookup SBGH_HANDLER_CONFIG_DIR)
+            [[ -n "$override_dir" ]] && handler_config_dir="$override_dir"
+        fi
+        handler_secrets="$handler_config_dir/secrets.env"
+        if [[ -f "$handler_secrets" ]]; then
+            mode=$(stat -c '%a' "$handler_secrets" 2>/dev/null)
+            owner=$(stat -c '%U:%G' "$handler_secrets" 2>/dev/null)
+            if [[ "$mode" == "600" ]]; then
+                pass "$handler_secrets (mode 0600, owner $owner)"
+            else
+                warn "$handler_secrets mode is $mode, expected 0600"
+            fi
+            if grep -qE '^SBGH_WEBHOOK_SECRET=' "$handler_secrets" 2>/dev/null; then
+                pass "SBGH_WEBHOOK_SECRET set in $handler_secrets"
+            else
+                fail "SBGH_WEBHOOK_SECRET missing from $handler_secrets"
+            fi
+        else
+            warn "secrets file not found at $handler_secrets (compose env_file will fail)"
+        fi
+
+        # Rootless Postgres bind-mount dir. The container runs as uid
+        # ${POSTGRES_UID:-900} (we override the image's baked-in 999 to
+        # dodge dnsmasq on most Ubuntu installs). The entrypoint skips
+        # its usual chown when not root, so the host dir MUST already be
+        # owned by that same uid or postgres fails to start.
+        pg_uid_expected=900
+        pg_gid_expected=900
+        pg_data_dir="/var/lib/sbgh/postgres"
+        if [[ -f "$compose_dir/.env" ]]; then
+            override=$(env_lookup POSTGRES_UID)
+            [[ -n "$override" ]] && pg_uid_expected="$override"
+            override=$(env_lookup POSTGRES_GID)
+            [[ -n "$override" ]] && pg_gid_expected="$override"
+            override_pg_dir=$(env_lookup POSTGRES_DATA_DIR)
+            [[ -n "$override_pg_dir" ]] && pg_data_dir="$override_pg_dir"
+        fi
+        if [[ -d "$pg_data_dir" ]]; then
+            pg_uid=$(stat -c '%u' "$pg_data_dir" 2>/dev/null)
+            pg_gid=$(stat -c '%g' "$pg_data_dir" 2>/dev/null)
+            if [[ "$pg_uid" == "$pg_uid_expected" ]] && [[ "$pg_gid" == "$pg_gid_expected" ]]; then
+                pass "$pg_data_dir owned by uid $pg_uid (matches POSTGRES_UID)"
+            else
+                fail "$pg_data_dir owned by $pg_uid:$pg_gid, expected $pg_uid_expected:$pg_gid_expected  → sudo chown -R $pg_uid_expected:$pg_gid_expected $pg_data_dir"
+            fi
+        else
+            fail "$pg_data_dir does not exist  → sudo install -d -m 0700 -o $pg_uid_expected -g $pg_gid_expected $pg_data_dir"
+        fi
+
+        # Are the long-running containers up? Migrate is one-shot so we
+        # only check it exited successfully if present.
+        for svc in sbgh-postgres sbgh-handler sbgh-smee; do
+            if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$svc"; then
+                pass "$svc container is running"
+            else
+                warn "$svc container is NOT running (docker compose up -d ?)"
+            fi
+        done
+        if docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null | grep -q '^sbgh-migrate\b'; then
+            migrate_status=$(docker ps -a --format '{{.Names}}\t{{.Status}}' | grep '^sbgh-migrate\b' | cut -f2)
+            if [[ "$migrate_status" =~ ^Exited\ \(0\) ]]; then
+                pass "sbgh-migrate completed successfully ($migrate_status)"
+            else
+                warn "sbgh-migrate status: $migrate_status (expected 'Exited (0) ...')"
+            fi
+        fi
+
+        # Verify handler ≠ smee uid at runtime (defense-in-depth — they
+        # share an image but compose pins each to a distinct numeric uid).
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx sbgh-handler \
+                && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx sbgh-smee; then
+            handler_runtime_uid=$(docker exec sbgh-handler id -u 2>/dev/null)
+            smee_runtime_uid=$(docker exec sbgh-smee id -u 2>/dev/null)
+            if [[ -n "$handler_runtime_uid" ]] && [[ -n "$smee_runtime_uid" ]]; then
+                if [[ "$handler_runtime_uid" != "$smee_runtime_uid" ]]; then
+                    pass "handler ($handler_runtime_uid) and smee ($smee_runtime_uid) run as distinct uids"
+                else
+                    fail "handler and smee both run as uid $handler_runtime_uid — defense-in-depth lost"
+                fi
+            fi
+        fi
+    else
+        warn "docker-compose.yml not found near this script"
+    fi
 else
-    warn "psql not installed — skipping Postgres check (apt install postgresql-client)"
+    warn "docker not installed  → apt install docker.io docker-compose-v2"
 fi
 
 # ─── Summary ───────────────────────────────────────────────────────────

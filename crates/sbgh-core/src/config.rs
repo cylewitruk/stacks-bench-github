@@ -1,20 +1,22 @@
 //! Configuration.
 //!
+//! The handler and the orchestrator hold different secrets and so are
+//! deliberately given separate config schemas:
+//!
+//! - [`HandlerConfig`] — webhook-facing service. Only the HMAC secret, DB URL,
+//!   and authorization allowlist. **No GitHub App credentials.**
+//! - [`OrchestratorConfig`] — host-side benchmark runner. Holds the App private
+//!   key, libvirt/LVM knobs, and everything required to run a job.
+//!
+//! Each binary loads its own type from its own TOML file. They never share a
+//! config dir on disk — see [`HANDLER_DEFAULT_CONFIG_PATH`] /
+//! [`ORCHESTRATOR_DEFAULT_CONFIG_PATH`].
+//!
 //! Loading precedence (lowest → highest):
 //!   1. compiled-in defaults
-//!   2. TOML config file. Path resolution:
-//!        - `$SBGH_CONFIG` if set (used verbatim; missing file is silently
-//!          treated as env-only, no fallback)
-//!        - else `/etc/sbgh/config.toml` if it exists
-//!        - else `$HOME/.config/sbgh/config.toml` if it exists
-//!        - else: no file layer, defaults + env only
-//!   3. environment variables (always win; intended for operational overrides
-//!      and for keeping secrets out of source-controlled files)
-//!
-//! Any field can live in either the TOML file or env. The convention is to
-//! put secrets (webhook secret, private key path, DB URL) in env when the
-//! TOML is checked in, and in the TOML when it lives outside the repo at
-//! mode 0600. The loader doesn't enforce a split.
+//!   2. TOML config file (see [`HandlerConfig::load`] /
+//!      [`OrchestratorConfig::load`])
+//!   3. environment variables (always win)
 
 use std::collections::HashSet;
 use std::env;
@@ -24,47 +26,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-/// Paths the loader checks when `SBGH_CONFIG` is not set, in order. First
-/// existing file wins. System path comes before the per-user XDG path so a
-/// host with both gets the system one; if neither is present we fall back to
-/// env-only.
-const DEFAULT_CONFIG_PATHS: &[&str] = &["/etc/sbgh/config.toml"];
-const HOME_CONFIG_RELATIVE: &str = ".config/sbgh/config.toml";
+/// Default on-disk path for the handler's TOML config. Bind-mounted into the
+/// container at the same path so file refs work in both contexts.
+pub const HANDLER_DEFAULT_CONFIG_PATH: &str = "/etc/sbgh/handler/config.toml";
+/// Default on-disk path for the orchestrator's TOML config.
+pub const ORCHESTRATOR_DEFAULT_CONFIG_PATH: &str = "/etc/sbgh/orchestrator/config.toml";
 
-// ─────────────────────────── Public config struct ───────────────────────────
+const HANDLER_HOME_RELATIVE: &str = ".config/sbgh/handler/config.toml";
+const ORCHESTRATOR_HOME_RELATIVE: &str = ".config/sbgh/orchestrator/config.toml";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    pub server: ServerConfig,
-    pub github: GitHubConfig,
-    pub authorization: AuthorizationConfig,
-    pub vm: VmConfig,
-    pub paths: PathsConfig,
-    pub lvm: LvmConfig,
-    pub stacks_bench: StacksBenchConfig,
-}
+// ─────────────────────────── Shared subtypes ───────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind_addr: String,
     pub database_url: String,
-    /// OS user the orchestrator runs as. Used to chown the per-job source
-    /// mount.
-    pub service_user: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitHubConfig {
-    /// GitHub App **Client ID** (e.g. `Iv23li...`) — used as the JWT `iss`
-    /// claim when minting installation tokens. Both Client ID and the older
-    /// numeric App ID work at GitHub today; we standardise on Client ID per
-    /// GitHub's 2024 recommendation.
-    pub client_id: String,
-    pub api_base_url: String,
-    pub private_key_path: PathBuf,
-    /// Webhook signing secret. May come from either the TOML file or the
-    /// `SBGH_GH_WEBHOOK_SECRET` env var; env wins on collision.
-    pub webhook_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -72,6 +48,135 @@ pub struct AuthorizationConfig {
     pub allowed_repositories: HashSet<String>,
     pub allowed_users: HashSet<String>,
     pub allowed_associations: HashSet<String>,
+}
+
+// ─────────────────────────── HandlerConfig ───────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandlerConfig {
+    pub server: ServerConfig,
+    pub webhook: WebhookConfig,
+    pub authorization: AuthorizationConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// HMAC-SHA256 secret used to verify inbound webhook signatures. The
+    /// handler holds nothing else GitHub-related — no App ID, no private
+    /// key — so a compromised handler cannot impersonate the App.
+    pub secret: String,
+}
+
+impl HandlerConfig {
+    pub fn load() -> Result<Self> {
+        let path = resolve_config_path(HANDLER_DEFAULT_CONFIG_PATH, HANDLER_HOME_RELATIVE);
+        Self::load_layered(path.as_deref())
+    }
+
+    pub fn load_layered(file: Option<&std::path::Path>) -> Result<Self> {
+        let mut raw = RawHandler::default();
+        if let Some(p) = file
+            && p.exists()
+        {
+            let body = std::fs::read_to_string(p)?;
+            let from_file: RawHandler = toml::from_str(&body)
+                .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display())))?;
+            raw.merge(from_file);
+        }
+        raw.apply_env();
+        raw.into_config()
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawHandler {
+    server: RawServer,
+    webhook: RawWebhook,
+    authorization: RawAuth,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawServer {
+    bind_addr: Option<String>,
+    database_url: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawWebhook {
+    secret: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawAuth {
+    allowed_repositories: Option<Vec<String>>,
+    allowed_users: Option<Vec<String>>,
+    allowed_associations: Option<Vec<String>>,
+}
+
+impl RawHandler {
+    fn merge(&mut self, other: RawHandler) {
+        merge_opt(&mut self.server.bind_addr, other.server.bind_addr);
+        merge_opt(&mut self.server.database_url, other.server.database_url);
+        merge_opt(&mut self.webhook.secret, other.webhook.secret);
+        merge_auth(&mut self.authorization, other.authorization);
+    }
+
+    fn apply_env(&mut self) {
+        env_into(&mut self.server.bind_addr, "SBGH_BIND_ADDR");
+        env_into(&mut self.server.database_url, "DATABASE_URL");
+        env_into(&mut self.webhook.secret, "SBGH_WEBHOOK_SECRET");
+        apply_auth_env(&mut self.authorization);
+    }
+
+    fn into_config(self) -> Result<HandlerConfig> {
+        Ok(HandlerConfig {
+            server: ServerConfig {
+                bind_addr: self
+                    .server
+                    .bind_addr
+                    .unwrap_or_else(|| "0.0.0.0:8080".into()),
+                database_url: required(self.server.database_url, "DATABASE_URL")?,
+            },
+            webhook: WebhookConfig {
+                secret: required(self.webhook.secret, "[webhook].secret / SBGH_WEBHOOK_SECRET")?,
+            },
+            authorization: build_auth(self.authorization),
+        })
+    }
+}
+
+// ─────────────────────────── OrchestratorConfig ───────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorConfig {
+    pub server: OrchestratorServerConfig,
+    pub github: GitHubConfig,
+    pub vm: VmConfig,
+    pub paths: PathsConfig,
+    pub lvm: LvmConfig,
+    pub stacks_bench: StacksBenchConfig,
+}
+
+/// Orchestrator-specific server bits. No `bind_addr` (it doesn't listen).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorServerConfig {
+    pub database_url: String,
+    /// OS user the orchestrator runs as. Used to chown the per-job source
+    /// mount inside libvirt.
+    pub service_user: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubConfig {
+    /// GitHub App **Client ID** (e.g. `Iv23li...`) — JWT `iss` claim when
+    /// minting installation tokens.
+    pub client_id: String,
+    pub api_base_url: String,
+    pub private_key_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,71 +213,44 @@ pub struct LvmConfig {
     pub chainstate_base_prefix: String,
     /// Size hint for `lvcreate --snapshot -L`.
     ///
-    /// - `None` (default): the snapshot is created **without** `-L`. This is
-    ///   correct for **thin** snapshots of a thin-pool origin — the snapshot
-    ///   shares the pool and grows on demand.
-    /// - `Some(n)`: thick snapshot with an `n GiB` COW exception store. Use
-    ///   only when the base chainstate LV is a thick (non-thin) volume.
-    ///
-    /// Passing a size against a thin origin would create a thick snapshot of
-    /// a thin volume, defeating the cheap-snapshot property and (on some
-    /// lvm2 versions) erroring.
+    /// - `None` (default): no `-L` — thin snapshot in the pool.
+    /// - `Some(n)`: thick snapshot with an `n GiB` COW exception store.
     pub chainstate_snapshot_size_gib: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StacksBenchConfig {
-    /// Placeholder until we lock down the `/benchmark` arg shape — threaded
-    /// verbatim into the cloud-init startup script.
+    /// Placeholder until we lock down the `/benchmark` arg shape.
     pub default_args: String,
 }
 
-// ─────────────────────────── Loader ───────────────────────────
-
-impl Config {
+impl OrchestratorConfig {
     pub fn load() -> Result<Self> {
-        let explicit = env::var("SBGH_CONFIG").ok();
-        let mut search = Vec::with_capacity(DEFAULT_CONFIG_PATHS.len() + 1);
-        for p in DEFAULT_CONFIG_PATHS {
-            search.push(PathBuf::from(p));
-        }
-        if let Some(home) = env::var_os("HOME") {
-            search.push(PathBuf::from(home).join(HOME_CONFIG_RELATIVE));
-        }
-        let path = pick_config_path(explicit.as_deref(), &search);
+        let path =
+            resolve_config_path(ORCHESTRATOR_DEFAULT_CONFIG_PATH, ORCHESTRATOR_HOME_RELATIVE);
         Self::load_layered(path.as_deref())
     }
 
-    /// Test-friendly entry: explicit path (or `None` to skip file layer).
     pub fn load_layered(file: Option<&std::path::Path>) -> Result<Self> {
-        let mut raw: RawConfig = RawConfig::default();
-
+        let mut raw = RawOrchestrator::default();
         if let Some(p) = file
             && p.exists()
         {
             let body = std::fs::read_to_string(p)?;
-            let from_file: RawConfig = toml::from_str(&body)
+            let from_file: RawOrchestrator = toml::from_str(&body)
                 .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display())))?;
             raw.merge(from_file);
         }
-
         raw.apply_env();
         raw.into_config()
     }
 }
 
-// ─────────────────────────── Internal layered shape
-// ───────────────────────────
-//
-// Every field is Optional so layers can compose. `into_config` checks required
-// fields once at the end.
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RawConfig {
-    server: RawServer,
+struct RawOrchestrator {
+    server: RawOrchServer,
     github: RawGitHub,
-    authorization: RawAuth,
     vm: RawVm,
     paths: RawPaths,
     lvm: RawLvm,
@@ -181,8 +259,7 @@ struct RawConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RawServer {
-    bind_addr: Option<String>,
+struct RawOrchServer {
     database_url: Option<String>,
     service_user: Option<String>,
 }
@@ -193,15 +270,6 @@ struct RawGitHub {
     client_id: Option<String>,
     api_base_url: Option<String>,
     private_key_path: Option<PathBuf>,
-    webhook_secret: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawAuth {
-    allowed_repositories: Option<Vec<String>>,
-    allowed_users: Option<Vec<String>>,
-    allowed_associations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -244,41 +312,14 @@ struct RawStacksBench {
     default_args: Option<String>,
 }
 
-impl RawConfig {
-    fn merge(&mut self, other: RawConfig) {
-        merge_opt(&mut self.server.bind_addr, other.server.bind_addr);
+impl RawOrchestrator {
+    fn merge(&mut self, other: RawOrchestrator) {
         merge_opt(&mut self.server.database_url, other.server.database_url);
         merge_opt(&mut self.server.service_user, other.server.service_user);
 
         merge_opt(&mut self.github.client_id, other.github.client_id);
         merge_opt(&mut self.github.api_base_url, other.github.api_base_url);
         merge_opt(&mut self.github.private_key_path, other.github.private_key_path);
-        merge_opt(&mut self.github.webhook_secret, other.github.webhook_secret);
-
-        merge_opt(
-            &mut self
-                .authorization
-                .allowed_repositories,
-            other
-                .authorization
-                .allowed_repositories,
-        );
-        merge_opt(
-            &mut self
-                .authorization
-                .allowed_users,
-            other
-                .authorization
-                .allowed_users,
-        );
-        merge_opt(
-            &mut self
-                .authorization
-                .allowed_associations,
-            other
-                .authorization
-                .allowed_associations,
-        );
 
         merge_opt(&mut self.vm.golden_image, other.vm.golden_image);
         merge_opt(&mut self.vm.vcpus, other.vm.vcpus);
@@ -337,38 +378,13 @@ impl RawConfig {
     }
 
     fn apply_env(&mut self) {
-        // server
-        env_into(&mut self.server.bind_addr, "SBGH_BIND_ADDR");
         env_into(&mut self.server.database_url, "DATABASE_URL");
         env_into(&mut self.server.service_user, "SBGH_SERVICE_USER");
 
-        // github
         env_into(&mut self.github.client_id, "SBGH_GH_CLIENT_ID");
         env_into(&mut self.github.api_base_url, "SBGH_GH_API_BASE_URL");
         env_path_into(&mut self.github.private_key_path, "SBGH_GH_PRIVATE_KEY_PATH");
-        env_into(&mut self.github.webhook_secret, "SBGH_GH_WEBHOOK_SECRET");
 
-        // authorization (CSV in env)
-        env_csv_into(
-            &mut self
-                .authorization
-                .allowed_repositories,
-            "SBGH_ALLOWED_REPOS",
-        );
-        env_csv_into(
-            &mut self
-                .authorization
-                .allowed_users,
-            "SBGH_ALLOWED_USERS",
-        );
-        env_csv_into(
-            &mut self
-                .authorization
-                .allowed_associations,
-            "SBGH_ALLOWED_ASSOCIATIONS",
-        );
-
-        // vm
         env_path_into(&mut self.vm.golden_image, "SBGH_VM_GOLDEN_IMAGE");
         env_parse_into(&mut self.vm.vcpus, "SBGH_VM_VCPUS");
         env_parse_into(&mut self.vm.memory_gib, "SBGH_VM_MEMORY_GIB");
@@ -376,7 +392,6 @@ impl RawConfig {
         env_parse_into(&mut self.vm.job_timeout_secs, "SBGH_VM_JOB_TIMEOUT_SECS");
         env_into(&mut self.vm.network, "SBGH_VM_NETWORK");
 
-        // paths
         env_path_into(&mut self.paths.jobs_dir, "SBGH_JOBS_DIR");
         env_path_into(&mut self.paths.git_mirror, "SBGH_GIT_MIRROR");
         env_path_into(&mut self.paths.results_tmpfs_root, "SBGH_RESULTS_TMPFS_ROOT");
@@ -392,7 +407,6 @@ impl RawConfig {
         );
         env_path_into(&mut self.paths.git_binary, "SBGH_GIT_BIN");
 
-        // lvm
         env_into(&mut self.lvm.vg_name, "SBGH_LVM_VG");
         env_into(&mut self.lvm.thinpool, "SBGH_LVM_THINPOOL");
         env_into(
@@ -408,17 +422,12 @@ impl RawConfig {
             "SBGH_LVM_SNAPSHOT_GIB",
         );
 
-        // stacks-bench
         env_into(&mut self.stacks_bench.default_args, "SBGH_STACKS_BENCH_ARGS");
     }
 
-    fn into_config(self) -> Result<Config> {
-        Ok(Config {
-            server: ServerConfig {
-                bind_addr: self
-                    .server
-                    .bind_addr
-                    .unwrap_or_else(|| "0.0.0.0:8080".into()),
+    fn into_config(self) -> Result<OrchestratorConfig> {
+        Ok(OrchestratorConfig {
+            server: OrchestratorServerConfig {
                 database_url: required(self.server.database_url, "DATABASE_URL")?,
                 service_user: self
                     .server
@@ -436,31 +445,8 @@ impl RawConfig {
                     .unwrap_or_else(|| "https://api.github.com".into()),
                 private_key_path: required(
                     self.github.private_key_path,
-                    "SBGH_GH_PRIVATE_KEY_PATH",
+                    "[github].private_key_path / SBGH_GH_PRIVATE_KEY_PATH",
                 )?,
-                webhook_secret: required(self.github.webhook_secret, "SBGH_GH_WEBHOOK_SECRET")?,
-            },
-            authorization: AuthorizationConfig {
-                allowed_repositories: self
-                    .authorization
-                    .allowed_repositories
-                    .map(set_from)
-                    .unwrap_or_default(),
-                allowed_users: self
-                    .authorization
-                    .allowed_users
-                    .map(set_from)
-                    .unwrap_or_default(),
-                allowed_associations: self
-                    .authorization
-                    .allowed_associations
-                    .map(set_from)
-                    .unwrap_or_else(|| {
-                        ["OWNER", "MEMBER", "COLLABORATOR"]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect()
-                    }),
             },
             vm: VmConfig {
                 golden_image: required(self.vm.golden_image, "[vm].golden_image")?,
@@ -527,8 +513,6 @@ impl RawConfig {
                     .lvm
                     .chainstate_base_prefix
                     .unwrap_or_else(|| "mainnet-".into()),
-                // Propagate as-is. `None` (the default) means "thin snapshot,
-                // no -L"; see the field doc on LvmConfig.
                 chainstate_snapshot_size_gib: self
                     .lvm
                     .chainstate_snapshot_size_gib,
@@ -543,7 +527,41 @@ impl RawConfig {
     }
 }
 
-// ─────────────────────────── Small helpers ───────────────────────────
+// ─────────────────────────── Shared helpers ───────────────────────────
+
+fn merge_auth(dst: &mut RawAuth, src: RawAuth) {
+    merge_opt(&mut dst.allowed_repositories, src.allowed_repositories);
+    merge_opt(&mut dst.allowed_users, src.allowed_users);
+    merge_opt(&mut dst.allowed_associations, src.allowed_associations);
+}
+
+fn apply_auth_env(auth: &mut RawAuth) {
+    env_csv_into(&mut auth.allowed_repositories, "SBGH_ALLOWED_REPOS");
+    env_csv_into(&mut auth.allowed_users, "SBGH_ALLOWED_USERS");
+    env_csv_into(&mut auth.allowed_associations, "SBGH_ALLOWED_ASSOCIATIONS");
+}
+
+fn build_auth(raw: RawAuth) -> AuthorizationConfig {
+    AuthorizationConfig {
+        allowed_repositories: raw
+            .allowed_repositories
+            .map(set_from)
+            .unwrap_or_default(),
+        allowed_users: raw
+            .allowed_users
+            .map(set_from)
+            .unwrap_or_default(),
+        allowed_associations: raw
+            .allowed_associations
+            .map(set_from)
+            .unwrap_or_else(|| {
+                ["OWNER", "MEMBER", "COLLABORATOR"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }),
+    }
+}
 
 fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
     if let Some(v) = src {
@@ -591,23 +609,28 @@ fn required<T>(value: Option<T>, name: &str) -> Result<T> {
     value.ok_or_else(|| Error::Config(format!("missing required config: {name}")))
 }
 
-/// Decide which config file (if any) to load, given an optional explicit
-/// override and a search-path of fallback locations.
+/// Pick a config path for the given default + home-relative location.
 ///
-/// Precedence:
-///   1. `explicit` is honoured verbatim. It's not required to exist — the
-///      downstream `load_layered` silently treats a missing file as env-only,
-///      so an explicit-but-typo'd path doesn't accidentally hit a fallback.
-///   2. Otherwise: first existing file in `search` wins. Pure function; we pass
-///      the search list in so this stays unit-testable.
-fn pick_config_path(explicit: Option<&str>, search: &[PathBuf]) -> Option<PathBuf> {
-    if let Some(p) = explicit {
-        return Some(PathBuf::from(p));
+/// Order:
+///   1. `$SBGH_CONFIG` if set (verbatim — typos do not silently fall back).
+///   2. The system default if it exists.
+///   3. `$HOME/<home_relative>` if it exists.
+///   4. None — fall through to env-only loading.
+fn resolve_config_path(system_default: &str, home_relative: &str) -> Option<PathBuf> {
+    if let Ok(explicit) = env::var("SBGH_CONFIG") {
+        return Some(PathBuf::from(explicit));
     }
-    search
-        .iter()
-        .find(|p| p.exists())
-        .cloned()
+    let system = PathBuf::from(system_default);
+    if system.exists() {
+        return Some(system);
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let path = PathBuf::from(home).join(home_relative);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -622,16 +645,10 @@ mod tests {
         f
     }
 
-    /// These tests mutate process-wide environment variables. Under nextest
-    /// each test runs in its own process so isolation is free, but plain
-    /// `cargo test` shares one process across multiple threads, so we must
-    /// serialize ourselves. A poisoned mutex (i.e. a test panicked while
-    /// holding the lock) is harmless — we just want exclusivity, not
-    /// invariants.
+    /// Process-wide env mutex (covers plain `cargo test`; nextest runs each
+    /// test in its own process and doesn't need this).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Set env vars for a single test, restoring them on drop. Owns the
-    /// global env lock for the test's lifetime.
     struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -645,8 +662,6 @@ mod tests {
                 .iter()
                 .map(|(k, v)| {
                     let old = env::var(k).ok();
-                    // Safety: ENV_LOCK ensures no other test mutates env
-                    // concurrently for the duration of this guard.
                     unsafe { env::set_var(k, v) };
                     (*k, old)
                 })
@@ -667,27 +682,17 @@ mod tests {
         }
     }
 
-    fn required_env_vars() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("DATABASE_URL", "postgres://x"),
-            ("SBGH_GH_CLIENT_ID", "Iv23litest123"),
-            ("SBGH_GH_PRIVATE_KEY_PATH", "/tmp/key.pem"),
-            ("SBGH_GH_WEBHOOK_SECRET", "hunter2"),
-            ("SBGH_LVM_VG", "sbgh-vg"),
-            ("SBGH_LVM_THINPOOL", "thinpool"),
-            ("SBGH_VM_GOLDEN_IMAGE", "/var/lib/libvirt/images/golden.qcow2"),
-        ]
+    // ─── HandlerConfig ───
+
+    fn handler_env() -> Vec<(&'static str, &'static str)> {
+        vec![("DATABASE_URL", "postgres://h"), ("SBGH_WEBHOOK_SECRET", "hunter2")]
     }
 
     #[test]
-    fn loads_from_env_only() {
-        let _g = EnvGuard::set(&required_env_vars());
-        let cfg = Config::load_layered(None).unwrap();
-        assert_eq!(cfg.github.client_id, "Iv23litest123");
-        assert_eq!(cfg.lvm.vg_name, "sbgh-vg");
-        assert_eq!(cfg.vm.vcpus, 2);
-        assert_eq!(cfg.vm.memory_gib, 8);
-        assert_eq!(cfg.vm.boot_disk_gib, 64);
+    fn handler_loads_from_env_only() {
+        let _g = EnvGuard::set(&handler_env());
+        let cfg = HandlerConfig::load_layered(None).unwrap();
+        assert_eq!(cfg.webhook.secret, "hunter2");
         assert!(
             cfg.authorization
                 .allowed_associations
@@ -696,21 +701,21 @@ mod tests {
     }
 
     #[test]
-    fn toml_file_overrides_defaults() {
-        let _g = EnvGuard::set(&required_env_vars());
+    fn handler_toml_overrides_defaults_env_overrides_toml() {
+        let mut env = handler_env();
+        env.push(("SBGH_BIND_ADDR", "127.0.0.1:9000"));
+        let _g = EnvGuard::set(&env);
         let f = write(
             r#"
-            [vm]
-            vcpus = 4
-            memory_gib = 16
+            [server]
+            bind_addr = "0.0.0.0:8081"
 
             [authorization]
             allowed_repositories = ["acme/widgets"]
             "#,
         );
-        let cfg = Config::load_layered(Some(f.path())).unwrap();
-        assert_eq!(cfg.vm.vcpus, 4);
-        assert_eq!(cfg.vm.memory_gib, 16);
+        let cfg = HandlerConfig::load_layered(Some(f.path())).unwrap();
+        assert_eq!(cfg.server.bind_addr, "127.0.0.1:9000", "env wins over TOML");
         assert!(
             cfg.authorization
                 .allowed_repositories
@@ -719,60 +724,73 @@ mod tests {
     }
 
     #[test]
-    fn env_overrides_toml() {
-        let mut required = required_env_vars();
-        required.push(("SBGH_VM_VCPUS", "12"));
-        let _g = EnvGuard::set(&required);
+    fn handler_missing_secret_errors() {
+        let _g = EnvGuard::set(&[("DATABASE_URL", "postgres://h")]);
+        let err = HandlerConfig::load_layered(None).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    // ─── OrchestratorConfig ───
+
+    fn orch_env() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("DATABASE_URL", "postgres://o"),
+            ("SBGH_GH_CLIENT_ID", "Iv23litest123"),
+            ("SBGH_GH_PRIVATE_KEY_PATH", "/tmp/key.pem"),
+            ("SBGH_LVM_VG", "sbgh-vg"),
+            ("SBGH_LVM_THINPOOL", "thinpool"),
+            ("SBGH_VM_GOLDEN_IMAGE", "/var/lib/libvirt/images/golden.qcow2"),
+        ]
+    }
+
+    #[test]
+    fn orchestrator_loads_from_env_only() {
+        let _g = EnvGuard::set(&orch_env());
+        let cfg = OrchestratorConfig::load_layered(None).unwrap();
+        assert_eq!(cfg.github.client_id, "Iv23litest123");
+        assert_eq!(cfg.lvm.vg_name, "sbgh-vg");
+        assert_eq!(cfg.vm.vcpus, 2);
+    }
+
+    #[test]
+    fn orchestrator_env_overrides_toml() {
+        let mut env = orch_env();
+        env.push(("SBGH_VM_VCPUS", "12"));
+        let _g = EnvGuard::set(&env);
         let f = write("[vm]\nvcpus = 4\n");
-        let cfg = Config::load_layered(Some(f.path())).unwrap();
+        let cfg = OrchestratorConfig::load_layered(Some(f.path())).unwrap();
         assert_eq!(cfg.vm.vcpus, 12);
     }
 
     #[test]
-    fn missing_required_field_errors() {
-        // Don't set DATABASE_URL etc.
+    fn orchestrator_missing_required_field_errors() {
         let _g = EnvGuard::set(&[("SBGH_GH_CLIENT_ID", "Iv23litest")]);
-        let err = Config::load_layered(None).unwrap_err();
+        let err = OrchestratorConfig::load_layered(None).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }
 
-    // ─── pick_config_path ───
+    // ─── resolve_config_path ───
 
     #[test]
-    fn pick_explicit_path_wins_even_when_missing() {
-        // If the user sets SBGH_CONFIG explicitly, we don't try to be clever —
-        // pass it through verbatim. load_layered will silently fall back to
-        // env-only if the file doesn't exist, which matches existing behaviour.
-        let chosen = pick_config_path(Some("/some/explicit/path.toml"), &[]);
+    fn resolve_explicit_via_sbgh_config_wins() {
+        let _g = EnvGuard::set(&[("SBGH_CONFIG", "/some/explicit/path.toml")]);
+        let chosen = resolve_config_path("/etc/sbgh/handler/config.toml", ".config/sbgh/x.toml");
         assert_eq!(chosen, Some(PathBuf::from("/some/explicit/path.toml")));
     }
 
     #[test]
-    fn pick_picks_first_existing_search_path() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let a = dir.path().join("a.toml");
-        let b = dir.path().join("b.toml");
-        std::fs::write(&b, "").unwrap();
-        let chosen = pick_config_path(None, &[a.clone(), b.clone()]);
-        assert_eq!(chosen, Some(b), "should skip non-existent `a` and pick `b`");
-    }
-
-    #[test]
-    fn pick_returns_first_match_in_declared_order() {
-        // System path should win over the home-dir fallback when both exist.
-        let dir = tempfile::TempDir::new().unwrap();
-        let system = dir.path().join("system.toml");
-        let home = dir.path().join("home.toml");
-        std::fs::write(&system, "").unwrap();
-        std::fs::write(&home, "").unwrap();
-        let chosen = pick_config_path(None, &[system.clone(), home]);
-        assert_eq!(chosen, Some(system));
-    }
-
-    #[test]
-    fn pick_returns_none_when_nothing_exists() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let chosen = pick_config_path(None, &[dir.path().join("nope.toml")]);
+    fn resolve_returns_none_when_nothing_exists() {
+        let _g = EnvGuard::set(&[]);
+        // Unset SBGH_CONFIG explicitly in case it leaked from the surrounding shell.
+        let _saved = env::var("SBGH_CONFIG").ok();
+        unsafe { env::remove_var("SBGH_CONFIG") };
+        let chosen = resolve_config_path(
+            "/definitely/does/not/exist.toml",
+            "almost-certainly-not-here.toml",
+        );
         assert!(chosen.is_none());
+        if let Some(v) = _saved {
+            unsafe { env::set_var("SBGH_CONFIG", v) };
+        }
     }
 }

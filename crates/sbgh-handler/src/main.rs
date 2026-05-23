@@ -8,9 +8,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::Router;
 use clap::Parser;
-use sbgh_core::config::Config;
+use sbgh_core::config::HandlerConfig;
 use sbgh_core::db::{self, PostgresJobStore};
-use sbgh_core::github::{AppCredentials, InstallationTokenCache, OctocrabClient};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
@@ -21,11 +20,9 @@ use crate::state::AppState;
 #[derive(Parser, Debug)]
 #[command(version, about = "stacks-bench GitHub App webhook handler")]
 struct Args {
-    /// Path to an env file to source secrets from (e.g.
-    /// `~/.config/sbgh/secrets.env`). If omitted, `./.env` in the working
-    /// directory is loaded best-effort. When this flag IS supplied, a
-    /// missing or unreadable file is a fatal error rather than a silent
-    /// miss.
+    /// Path to an env file to source secrets from. If omitted, `./.env` in the
+    /// working directory is loaded best-effort. When this flag IS supplied, a
+    /// missing or unreadable file is a fatal error rather than a silent miss.
     #[arg(long, value_name = "PATH")]
     env_file: Option<PathBuf>,
 }
@@ -36,25 +33,13 @@ async fn main() -> anyhow::Result<()> {
     load_env(args.env_file.as_deref())?;
     init_tracing();
 
-    let config = Config::load().context("loading config")?;
+    let config = HandlerConfig::load().context("loading config")?;
+    // Connect using the narrow `sbgh_handler` role — INSERT-only. The
+    // database schema is established by `sbgh-migrate` (running as the
+    // owner role) before this binary starts.
     let pool = db::connect(&config.server.database_url)
         .await
         .context("connecting to postgres")?;
-    db::migrate(&pool)
-        .await
-        .context("running migrations")?;
-
-    let creds =
-        AppCredentials::from_pem_file(&config.github.client_id, &config.github.private_key_path)
-            .context("loading github app private key")?;
-    let tokens = InstallationTokenCache::new(
-        creds,
-        config
-            .github
-            .api_base_url
-            .clone(),
-    );
-    let gh = Arc::new(OctocrabClient::new(tokens));
     let jobs = Arc::new(PostgresJobStore::new(pool));
 
     let bind_addr: SocketAddr = config
@@ -63,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("parsing server.bind_addr")?;
 
-    let state = AppState { config, jobs, gh };
+    let state = AppState { config, jobs };
 
     let app = Router::new()
         .merge(routes::router())
@@ -84,9 +69,6 @@ fn init_tracing() {
         .init();
 }
 
-/// Populate `std::env` from a dotenv file. `dotenvy` does not overwrite
-/// vars already set in the process environment, so shell-exported values
-/// always win over both an explicit `--env-file` and the implicit `./.env`.
 fn load_env(explicit: Option<&Path>) -> anyhow::Result<()> {
     match explicit {
         Some(path) => {
@@ -94,8 +76,6 @@ fn load_env(explicit: Option<&Path>) -> anyhow::Result<()> {
                 .with_context(|| format!("loading env file from {}", path.display()))?;
         }
         None => {
-            // Best-effort: a missing `.env` is fine, just means the caller
-            // sourced their secrets through the shell or some other mechanism.
             let _ = dotenvy::dotenv();
         }
     }

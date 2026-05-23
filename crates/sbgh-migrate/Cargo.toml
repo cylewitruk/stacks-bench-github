@@ -1,0 +1,22 @@
+[package]
+name = "sbgh-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sbgh-migrate"
+path = "src/main.rs"
+
+[dependencies]
+sbgh-core.workspace = true
+
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sqlx.workspace = true
+clap.workspace = true
+dotenvy.workspace = true

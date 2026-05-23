@@ -1,21 +1,166 @@
+# Run handler + smee + Postgres + one-shot migrate on the orchestrator host.
+# The orchestrator itself stays on the host (LVM + libvirt + golden image).
+#
+# Security boundary enforced here. Default uids picked low in the system
+# range (900–902) to avoid the common Ubuntu allocations 997/998/999 used
+# by systemd-timesync / systemd-network / dnsmasq:
+#   - postgres            runs as uid ${POSTGRES_UID:-900}, overriding the
+#                         image baseline of 999 so we don't share the
+#                         host's dnsmasq uid.
+#   - sbgh-migrate        runs as the DB *owner* role (full access). One-shot.
+#   - sbgh-handler        runs as uid ${SBGH_UID:-901} and connects as
+#                         `sbgh_handler` — INSERT on jobs only. Holds the
+#                         webhook HMAC secret; NO GitHub App credentials.
+#   - sbgh-smee           runs as uid ${SBGH_SMEE_UID:-903}. No secrets,
+#                         no mounts — distinct uid is just defense-in-
+#                         depth against a future container escape.
+#   - sbgh-orchestrator   runs ON THE HOST as uid 902, connects as
+#                         `sbgh_orch` (SELECT + UPDATE on jobs), and holds
+#                         the GitHub App private key.
+#
+# Two config dirs on the host, never shared:
+#   ${SBGH_HANDLER_CONFIG_DIR:-/etc/sbgh/handler}      → handler container
+#   ${SBGH_ORCH_CONFIG_DIR:-/etc/sbgh/orchestrator}    → host orchestrator
+#
+# Bring up:   docker compose -f docker/docker-compose.yml up -d
+# Tail logs:  docker compose -f docker/docker-compose.yml logs -f handler
+# Tear down:  docker compose -f docker/docker-compose.yml down
+#
+# Required in docker/.env (no sensible defaults):
+#   SMEE_CHANNEL                — your https://smee.io/<...> URL
+#   POSTGRES_OWNER_PASSWORD     — password for the `sbgh` DB owner
+#   SBGH_HANDLER_DB_PASSWORD    — password for the `sbgh_handler` role
+#   SBGH_ORCH_DB_PASSWORD       — password for the `sbgh_orch` role
+#
+# Optional knobs: SBGH_UID, SBGH_GID, RUST_LOG, POSTGRES_DATA_DIR,
+# SBGH_HANDLER_CONFIG_DIR.
+
+x-restart-policy: &restart unless-stopped
+
 services:
   postgres:
-    image: postgres:17
+    image: postgres:18-trixie
     container_name: sbgh-postgres
-    restart: unless-stopped
+    restart: *restart
+    # Run rootless as ${POSTGRES_UID:-900}. The upstream image's baked-in
+    # `postgres` user is uid 999, but we override to dodge dnsmasq on most
+    # Ubuntu installs. Postgres doesn't care about its uid — it just needs
+    # to own the data dir. The host bind-mount MUST be pre-chown'd to the
+    # same uid (see bringup doc §6) since the entrypoint skips its usual
+    # chown when not running as root.
+    user: "${POSTGRES_UID:-900}:${POSTGRES_GID:-900}"
     environment:
       POSTGRES_USER: sbgh
-      POSTGRES_PASSWORD: sbgh
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD must be set in docker/.env}
       POSTGRES_DB: sbgh
+    # Bind to loopback so the host-side orchestrator can reach it on
+    # 127.0.0.1:5432. Containers on `sbgh-net` reach it as `postgres:5432`.
     ports:
       - "127.0.0.1:5432:5432"
+    # Host-bound data dir — survives `docker volume prune`. Default lives
+    # on /var/lib/sbgh/postgres; MUST be pre-created owned by the same
+    # uid we run postgres as (default 900). See docs/host-bringup.md §6.
     volumes:
-      - sbgh-pgdata:/var/lib/postgresql/data
+      - ${POSTGRES_DATA_DIR:-/var/lib/sbgh/postgres}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sbgh -d sbgh"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
+    networks: [sbgh-net]
 
-volumes:
-  sbgh-pgdata:
+  # One-shot: apply schema migrations + (re)create the narrow runtime roles
+  # with the passwords from .env. Handler + smee wait for this to exit
+  # cleanly before they start, so handler always opens its pool against a
+  # fully-grants'd `sbgh_handler` role.
+  migrate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: migrate
+    image: sbgh-migrate:latest
+    container_name: sbgh-migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Owner DSN — full access. Lives only in the migrate container's env;
+      # never given to the handler or orchestrator.
+      DATABASE_URL: postgres://sbgh:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD must be set in docker/.env}@postgres:5432/sbgh
+      SBGH_HANDLER_DB_PASSWORD: ${SBGH_HANDLER_DB_PASSWORD:?SBGH_HANDLER_DB_PASSWORD must be set in docker/.env}
+      SBGH_ORCH_DB_PASSWORD: ${SBGH_ORCH_DB_PASSWORD:?SBGH_ORCH_DB_PASSWORD must be set in docker/.env}
+      RUST_LOG: ${RUST_LOG:-info,sbgh_migrate=debug,sqlx=warn}
+    networks: [sbgh-net]
+
+  handler:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: handler
+      args:
+        SBGH_UID: ${SBGH_UID:-901}
+        SBGH_GID: ${SBGH_GID:-901}
+    image: sbgh-handler:latest
+    container_name: sbgh-handler
+    restart: *restart
+    user: "${SBGH_UID:-901}:${SBGH_GID:-901}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      # Connect as the narrow `sbgh_handler` role — INSERT on jobs only.
+      DATABASE_URL: postgres://sbgh_handler:${SBGH_HANDLER_DB_PASSWORD:?SBGH_HANDLER_DB_PASSWORD must be set in docker/.env}@postgres:5432/sbgh
+      RUST_LOG: ${RUST_LOG:-info,sbgh_handler=debug,sqlx=warn,tower_http=warn}
+    # secrets.env holds SBGH_WEBHOOK_SECRET. The handler has nothing else
+    # security-relevant — no App ID, no PEM path — so a compromised
+    # container can't impersonate the App.
+    env_file:
+      - ${SBGH_HANDLER_CONFIG_DIR:-/etc/sbgh/handler}/secrets.env
+    # Bind-mount the handler-owned config dir read-only at the same path
+    # the container expects, so file refs in TOML resolve identically on
+    # both sides of the mount.
+    volumes:
+      - ${SBGH_HANDLER_CONFIG_DIR:-/etc/sbgh/handler}:/etc/sbgh/handler:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks: [sbgh-net]
+
+  smee:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: smee
+      # Same build args as handler — the image bakes a named `sbgh` user
+      # at SBGH_UID. We override at runtime below to a different uid;
+      # smee runs as a numeric-only uid with no /etc/passwd entry, which
+      # is fine since it never reads files, writes $HOME, or looks up
+      # its own user name.
+      args:
+        SBGH_UID: ${SBGH_UID:-901}
+        SBGH_GID: ${SBGH_GID:-901}
+    image: sbgh-smee:latest
+    container_name: sbgh-smee
+    restart: *restart
+    # Distinct uid from the handler (defense-in-depth against a future
+    # container escape — see header).
+    user: "${SBGH_SMEE_UID:-903}:${SBGH_SMEE_GID:-903}"
+    depends_on:
+      - handler
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,sbgh_smee=debug}
+    # SMEE_CHANNEL comes from docker/.env (required). Whole line quoted
+    # because YAML would otherwise treat the `:?` colon as a key/value
+    # separator inside the `${...}` expansion.
+    command:
+      - "--channel"
+      - "${SMEE_CHANNEL:?SMEE_CHANNEL must be set in docker/.env}"
+      - "--target"
+      - "http://handler:8080/webhook"
+    networks: [sbgh-net]
+
+networks:
+  sbgh-net:
+    driver: bridge

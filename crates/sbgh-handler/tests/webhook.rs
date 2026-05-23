@@ -1,26 +1,20 @@
-//! End-to-end handler tests using the real axum router with fake GH + in-memory
-//! queue.
+//! End-to-end handler tests. Asserts the handler is restricted to: signature
+//! verification, authorization, and enqueuing a job row. Any GitHub API call
+//! from the handler would be a regression — the handler holds no App
+//! credentials. The orchestrator is responsible for all GitHub-side I/O.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
-use sbgh_core::config::{
-    AuthorizationConfig, Config, GitHubConfig, LvmConfig, PathsConfig, ServerConfig,
-    StacksBenchConfig, VmConfig,
-};
+use sbgh_core::config::{AuthorizationConfig, HandlerConfig, ServerConfig, WebhookConfig};
 use sbgh_core::db::InMemoryJobStore;
-use sbgh_core::github::test_support::{FakeCall, FakeGitHub};
 use sbgh_core::models::JobStatus;
 use sha2::Sha256;
 use tower::ServiceExt;
 
-// `routes` and `state` are inline modules in the binary crate, so we re-import
-// them here by including the source files. This keeps the test binary self-
-// contained without exposing the modules as a `lib.rs`.
 #[path = "../src/routes/mod.rs"]
 mod routes;
 #[path = "../src/state.rs"]
@@ -30,19 +24,13 @@ use state::AppState;
 
 const SECRET: &str = "test-webhook-secret";
 
-fn test_config() -> Config {
-    Config {
+fn test_config() -> HandlerConfig {
+    HandlerConfig {
         server: ServerConfig {
             database_url: "postgres://unused".into(),
             bind_addr: "127.0.0.1:0".into(),
-            service_user: "sbgh".into(),
         },
-        github: GitHubConfig {
-            client_id: "Iv23litest".into(),
-            api_base_url: "https://api.github.test".into(),
-            private_key_path: PathBuf::from("/dev/null"),
-            webhook_secret: SECRET.into(),
-        },
+        webhook: WebhookConfig { secret: SECRET.into() },
         authorization: AuthorizationConfig {
             allowed_repositories: ["acme/widgets".into()]
                 .into_iter()
@@ -52,51 +40,22 @@ fn test_config() -> Config {
                 .into_iter()
                 .collect(),
         },
-        vm: VmConfig {
-            golden_image: PathBuf::from("/tmp/golden.qcow2"),
-            vcpus: 2,
-            memory_gib: 8,
-            boot_disk_gib: 64,
-            job_timeout_secs: 60,
-            network: "default".into(),
-        },
-        paths: PathsConfig {
-            jobs_dir: PathBuf::from("/tmp/jobs"),
-            git_mirror: PathBuf::from("/tmp/git/stacks-core.git"),
-            results_tmpfs_root: PathBuf::from("/tmp/results-tmpfs"),
-            results_archive_dir: PathBuf::from("/tmp/results-archive"),
-            virsh_binary: PathBuf::from("/usr/bin/virsh"),
-            sudo_binary: PathBuf::from("/usr/bin/sudo"),
-            qemu_img_binary: PathBuf::from("/usr/bin/qemu-img"),
-            cloud_localds_binary: PathBuf::from("/usr/bin/cloud-localds"),
-            git_binary: PathBuf::from("/usr/bin/git"),
-        },
-        lvm: LvmConfig {
-            vg_name: "sbgh-vg".into(),
-            thinpool: "thinpool".into(),
-            chainstate_base_prefix: "mainnet-".into(),
-            chainstate_snapshot_size_gib: None,
-        },
-        stacks_bench: StacksBenchConfig { default_args: String::new() },
     }
 }
 
 struct Harness {
     router: axum::Router,
     jobs: Arc<InMemoryJobStore>,
-    gh: Arc<FakeGitHub>,
 }
 
 fn setup() -> Harness {
     let jobs = Arc::new(InMemoryJobStore::new());
-    let gh = Arc::new(FakeGitHub::new());
     let state = AppState {
         config: test_config(),
         jobs: jobs.clone(),
-        gh: gh.clone(),
     };
     let router = routes::router().with_state(state);
-    Harness { router, jobs, gh }
+    Harness { router, jobs }
 }
 
 fn sign(body: &[u8]) -> String {
@@ -228,7 +187,6 @@ async fn ignores_comment_without_command() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(text, "no command");
     assert!(h.jobs.snapshot().is_empty());
-    assert!(h.gh.calls().is_empty());
 }
 
 #[tokio::test]
@@ -254,9 +212,12 @@ async fn rejects_disallowed_association() {
 }
 
 #[tokio::test]
-async fn happy_path_enqueues_and_comments() {
+async fn happy_path_enqueues_without_head_sha() {
+    // Pinning the post-refactor contract: the handler enqueues with an empty
+    // head_sha and a NULL comment_id. The orchestrator fills both in on
+    // pickup. If a future change re-introduces a GitHub API call here, the
+    // role-split blast radius opens back up — fail the test instead.
     let h = setup();
-    h.gh.set_head_sha("acme/widgets", 42, "abc123def456");
 
     let body =
         issue_comment_payload("acme/widgets", "/benchmark run --iters=5", "alice", "MEMBER", true);
@@ -271,33 +232,23 @@ async fn happy_path_enqueues_and_comments() {
     assert_eq!(job.status, JobStatus::Queued);
     assert_eq!(job.repository, "acme/widgets");
     assert_eq!(job.pr_number, 42);
-    assert_eq!(job.head_sha, "abc123def456");
     assert_eq!(job.requested_by, "alice");
     assert_eq!(job.command, "run");
     assert_eq!(job.installation_id, 7);
-    assert_eq!(job.comment_id, Some(1000));
     assert_eq!(job.args.0, serde_json::json!({ "args": ["--iters=5"] }));
-
-    let calls = h.gh.calls();
-    assert!(matches!(&calls[0], FakeCall::HeadSha { pr_number: 42, .. }));
-    let posted = calls
-        .iter()
-        .find_map(|c| match c {
-            FakeCall::CreateComment { body, .. } => Some(body.clone()),
-            _ => None,
-        })
-        .expect("expected a CreateComment");
-    assert!(posted.contains("position **1**"));
-    assert!(posted.contains(&job.id.to_string()));
+    assert!(
+        job.head_sha.is_empty(),
+        "handler must not resolve head_sha (no App credentials); got {:?}",
+        job.head_sha
+    );
+    assert!(job.comment_id.is_none(), "handler must not post a comment");
 }
 
 #[tokio::test]
 async fn duplicate_delivery_id_is_deduped() {
-    // GitHub redelivers on 5xx and on operator "Redeliver" clicks. The same
-    // X-GitHub-Delivery value identifies the same logical webhook, even
-    // across retries, so it's our idempotency key.
+    // GitHub redelivers on 5xx and on operator "Redeliver" clicks. Same
+    // X-GitHub-Delivery means same logical webhook, even across retries.
     let h = setup();
-    h.gh.set_head_sha("acme/widgets", 42, "abc");
 
     let body = issue_comment_payload("acme/widgets", "/benchmark", "alice", "MEMBER", true);
     let sig = sign(&body);
@@ -320,43 +271,4 @@ async fn duplicate_delivery_id_is_deduped() {
     assert_eq!(b2, "duplicate");
 
     assert_eq!(h.jobs.snapshot().len(), 1, "second delivery must not enqueue");
-}
-
-#[tokio::test]
-async fn queue_position_increments() {
-    let h = setup();
-    for i in 0..3 {
-        let body = issue_comment_payload(
-            "acme/widgets",
-            &format!("/benchmark run{i}"),
-            "alice",
-            "MEMBER",
-            true,
-        );
-        let sig = sign(&body);
-        let delivery = format!("delivery-pos-{i}");
-        let (status, _) = post_webhook_with_delivery(
-            &h.router,
-            "issue_comment",
-            body,
-            Some(&sig),
-            Some(&delivery),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-    }
-    assert_eq!(h.jobs.snapshot().len(), 3);
-
-    let posted_positions: Vec<String> =
-        h.gh.calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                FakeCall::CreateComment { body, .. } => Some(body),
-                _ => None,
-            })
-            .collect();
-    assert_eq!(posted_positions.len(), 3);
-    assert!(posted_positions[0].contains("position **1**"));
-    assert!(posted_positions[1].contains("position **2**"));
-    assert!(posted_positions[2].contains("position **3**"));
 }

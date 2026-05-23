@@ -49,15 +49,16 @@ async fn read_terminal_state(
 /// migrations) MUST succeed — those failures indicate a real regression and
 /// we let them panic so the test reports as failed, not skipped.
 async fn setup() -> Option<(ContainerAsync<Postgres>, Pool)> {
-    // - `with_tag("17-alpine")`: the module defaults to `postgres:11-alpine`, but
-    //   our `gen_random_uuid()` default on `jobs.id` needs PG 13+. We pin 17 to
-    //   match the prod docker-compose.
+    // - `with_tag("18-trixie")`: the module defaults to `postgres:11-alpine`, but
+    //   our `gen_random_uuid()` default on `jobs.id` needs PG 13+. We pin the same
+    //   version as the prod docker-compose so tests catch any behaviour that
+    //   differs from what we deploy.
     // - `with_mapped_port(0, Tcp(5432))`: the Postgres image doesn't override
     //   `Image::expose_ports`, so without an explicit mapping `get_host_port_ipv4`
     //   returns `PortNotExposed`. `host_port = 0` asks Docker for a free port so
     //   parallel tests don't collide.
     let container = match Postgres::default()
-        .with_tag("17-alpine")
+        .with_tag("18-trixie")
         .with_mapped_port(0, ContainerPort::Tcp(5432))
         .start()
         .await
@@ -93,20 +94,6 @@ fn new_job(delivery: Option<&str>) -> NewJob {
         installation_id: 7,
         github_delivery_id: delivery.map(str::to_string),
     }
-}
-
-#[tokio::test]
-async fn enqueue_returns_position_one_for_first_job() {
-    let Some((_c, pool)) = setup().await else {
-        return;
-    };
-    let store = PostgresJobStore::new(pool);
-    let (_id, position) = store
-        .enqueue(&new_job(Some("d1")))
-        .await
-        .unwrap()
-        .expect("first enqueue must not be deduped");
-    assert_eq!(position, 1);
 }
 
 #[tokio::test]
@@ -160,7 +147,7 @@ async fn claim_next_flips_status_and_sets_started_at() {
         return;
     };
     let store = PostgresJobStore::new(pool);
-    let (id, _) = store
+    let id = store
         .enqueue(&new_job(Some("c1")))
         .await
         .unwrap()
@@ -197,12 +184,12 @@ async fn concurrent_claims_pick_different_jobs() {
     };
     let store = Arc::new(PostgresJobStore::new(pool));
 
-    let (id_a, _) = store
+    let id_a = store
         .enqueue(&new_job(Some("c-a")))
         .await
         .unwrap()
         .unwrap();
-    let (id_b, _) = store
+    let id_b = store
         .enqueue(&new_job(Some("c-b")))
         .await
         .unwrap()
@@ -227,57 +214,12 @@ async fn concurrent_claims_pick_different_jobs() {
 }
 
 #[tokio::test]
-async fn queue_position_honours_queued_at_order() {
-    let Some((_c, pool)) = setup().await else {
-        return;
-    };
-    let store = PostgresJobStore::new(pool);
-    let (id1, _) = store
-        .enqueue(&new_job(Some("q1")))
-        .await
-        .unwrap()
-        .unwrap();
-    let (id2, _) = store
-        .enqueue(&new_job(Some("q2")))
-        .await
-        .unwrap()
-        .unwrap();
-    let (id3, _) = store
-        .enqueue(&new_job(Some("q3")))
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(
-        store
-            .queue_position(id1)
-            .await
-            .unwrap(),
-        Some(1)
-    );
-    assert_eq!(
-        store
-            .queue_position(id2)
-            .await
-            .unwrap(),
-        Some(2)
-    );
-    assert_eq!(
-        store
-            .queue_position(id3)
-            .await
-            .unwrap(),
-        Some(3)
-    );
-}
-
-#[tokio::test]
-async fn complete_writes_result_and_clears_position() {
+async fn complete_writes_result_and_removes_from_queue() {
     let Some((_c, pool)) = setup().await else {
         return;
     };
     let store = PostgresJobStore::new(pool.clone());
-    let (id, _) = store
+    let id = store
         .enqueue(&new_job(Some("done1")))
         .await
         .unwrap()
@@ -304,14 +246,7 @@ async fn complete_writes_result_and_clears_position() {
         .0;
     assert_eq!(stored, summary);
 
-    // And the queue-side observations: gone from the queue, no other claimable job.
-    assert!(
-        store
-            .queue_position(id)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    // Queue-side: gone, nothing claimable.
     assert!(
         store
             .claim_next()
@@ -329,7 +264,7 @@ async fn fail_with_summary_stores_both_error_and_forensics() {
         return;
     };
     let store = PostgresJobStore::new(pool.clone());
-    let (id, _) = store
+    let id = store
         .enqueue(&new_job(Some("fail1")))
         .await
         .unwrap()
@@ -377,7 +312,7 @@ async fn fail_without_summary_leaves_null_result_null() {
         return;
     };
     let store = PostgresJobStore::new(pool.clone());
-    let (id, _) = store
+    let id = store
         .enqueue(&new_job(Some("fail-null-stays-null")))
         .await
         .unwrap()
@@ -408,7 +343,7 @@ async fn fail_without_summary_preserves_existing_result() {
         return;
     };
     let store = PostgresJobStore::new(pool.clone());
-    let (id, _) = store
+    let id = store
         .enqueue(&new_job(Some("fail-preserves-prior")))
         .await
         .unwrap()
@@ -448,7 +383,7 @@ async fn set_comment_id_persists_through_subsequent_reads() {
         return;
     };
     let store = PostgresJobStore::new(pool);
-    let (id, _) = store
+    let id = store
         .enqueue(&new_job(Some("comment-id-1")))
         .await
         .unwrap()
@@ -473,4 +408,36 @@ async fn set_comment_id_persists_through_subsequent_reads() {
             .as_deref(),
         Some("comment-id-1")
     );
+}
+
+#[tokio::test]
+async fn set_head_sha_updates_the_column() {
+    // Handler enqueues with head_sha = "" (it doesn't hold App credentials
+    // and can't call the PR API). The orchestrator resolves on pickup and
+    // writes it back via set_head_sha. Make sure that round-trips.
+    let Some((_c, pool)) = setup().await else {
+        return;
+    };
+    let store = PostgresJobStore::new(pool);
+    let id = store
+        .enqueue(&NewJob {
+            head_sha: String::new(),
+            ..new_job(Some("head-sha-1"))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    store
+        .set_head_sha(id, "deadbeefcafef00d")
+        .await
+        .unwrap();
+
+    let claimed = store
+        .claim_next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, id);
+    assert_eq!(claimed.head_sha, "deadbeefcafef00d");
 }
