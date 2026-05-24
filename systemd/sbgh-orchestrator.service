@@ -35,28 +35,37 @@ Environment=RUST_LOG=info,sbgh_orchestrator=info,sqlx=warn
 
 # ─── Hardening ──────────────────────────────────────────────────────────
 #
-# The orchestrator only legitimately needs:
-#   read:  /etc/sbgh/orchestrator/, /var/lib/libvirt/images/ (golden qcow2),
-#          /var/lib/sbgh/git/, the workspace binary itself
-#   write: /var/lib/sbgh/{jobs,results,git}, /run/sbgh/{jobs,...}
-# Plus escalation via sudo for lvcreate/mount/virsh/etc.
+# We intentionally do NOT use ProtectSystem= / ProtectHome= /
+# PrivateTmp= / ReadWritePaths= here. Those create a private mount
+# namespace for the unit, which is fundamentally incompatible with
+# how our per-job tmpfs share works:
 #
-# NoNewPrivileges MUST stay false: sudo is a setuid binary, and our
-# orchestrator->sudo->lvcreate chain depends on the privilege change.
-NoNewPrivileges=false
-# Protect everything else.
-ProtectSystem=strict
-ProtectHome=true
-# /etc/lvm is needed because `lvcreate` writes a metadata archive to
-# /etc/lvm/archive/ + a backup to /etc/lvm/backup/ on every VG mutation.
-# Without this, `lvcreate --snapshot ...` fails with "Cannot archive
-# volume group metadata for vg0 to read-only filesystem". The sudo'd
-# lvcreate child inherits this unit's mount namespace even as root.
-ReadWritePaths=/var/lib/sbgh /run/sbgh /etc/lvm
-PrivateTmp=true
+#   - Orchestrator sudo-mounts a tmpfs at /run/sbgh/jobs/<id>/.
+#     Inside its private namespace, this is the per-job results dir.
+#   - libvirtd spawns virtiofsd to serve that path to the VM.
+#     virtiofsd runs in the *host's main namespace* (libvirtd's
+#     namespace), not the orchestrator's private one. It sees the
+#     empty underlying directory, not our tmpfs.
+#   - VM writes through virtio-fs → virtiofsd writes to the underlying
+#     directory in the host namespace. The orchestrator looking for
+#     those files in its private namespace sees an empty tmpfs.
+#
+# The result was a 10-minute build VM finishing cleanly with the
+# orchestrator reading an empty .phase-log, mis-reported as
+# "VM powered off before reporting phase=done".
+#
+# Filesystem permissions (sbgh is uid 902 — can't touch /usr, /etc,
+# /home/* via ownership) and the narrow sudoers allowlist
+# (/etc/sudoers.d/sbgh — see docs/host-bringup.md §3) give us most
+# of what ProtectSystem= was nominally providing. Kernel-interface
+# restrictions don't affect mount namespaces, so we keep those:
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+
+# NoNewPrivileges MUST stay false: sudo is a setuid binary, and our
+# orchestrator->sudo->lvcreate chain depends on the privilege change.
+NoNewPrivileges=false
 RestrictSUIDSGID=false   # see NoNewPrivileges note above
 
 # Resource ceiling. The orchestrator process itself is tiny (~30 MB
