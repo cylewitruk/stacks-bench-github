@@ -215,10 +215,19 @@ Install the sudoers fragment. Only the orchestrator user needs sudo;
 
 ```bash
 sudo tee /etc/sudoers.d/sbgh >/dev/null <<'EOF'
+# Orchestrator (per-job VM provisioning).
 sbgh ALL=(root) NOPASSWD: /usr/sbin/lvcreate, /usr/sbin/lvremove, /usr/sbin/lvs
 sbgh ALL=(root) NOPASSWD: /usr/sbin/mkfs.ext4, /usr/sbin/losetup
 sbgh ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/chown
+sbgh ALL=(root) NOPASSWD: /usr/bin/rmdir
 sbgh ALL=(root) NOPASSWD: /usr/bin/virsh
+# Chainstate refresh (download-chainstate.sh, runs as the systemd timer
+# `sbgh-chainstate-refresh.service`). The XFS format + tar/zstd extract
+# both need root, and the LV (de)activation flips an attribute that
+# requires lvm2 root too.
+sbgh ALL=(root) NOPASSWD: /usr/sbin/mkfs.xfs, /usr/sbin/lvchange
+sbgh ALL=(root) NOPASSWD: /usr/bin/aria2c, /usr/bin/mkdir
+sbgh ALL=(root) NOPASSWD: /usr/bin/zstd, /usr/bin/tar
 EOF
 sudo chmod 0440 /etc/sudoers.d/sbgh
 sudo visudo -cf /etc/sudoers.d/sbgh     # syntax check

@@ -375,6 +375,7 @@ orchestrator_cmds=(
 chainstate_cmds=(
     /usr/sbin/mkfs.xfs /usr/sbin/lvchange
     /usr/bin/aria2c /usr/bin/mkdir /usr/bin/rmdir
+    /usr/bin/zstd /usr/bin/tar
 )
 
 check_sudo() {

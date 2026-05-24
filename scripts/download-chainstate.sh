@@ -96,15 +96,33 @@ if sudo lvs --noheadings -o lv_name "$VG" 2>/dev/null \
     exit 1
 fi
 
-# ─── cleanup trap (scratch is always reaped; base only on partial failure) ─
+# ─── cleanup trap ──────────────────────────────────────────────────────
+# Two LVs to track:
+#   - SCRATCH_LV is always temporary: lvremove unconditionally if we
+#     made it.
+#   - BASE_LV is the deliverable: keep on success, lvremove on failure.
+#     An empty/partial base LV is actively dangerous because the
+#     orchestrator picks the lexicographically newest mainnet-* LV at
+#     job pickup — leaving a poisoned LV around means every subsequent
+#     /benchmark fails with "Unable to open chainstate sqlite". So
+#     `BASE_POPULATED=1` is set ONLY after the extract pipeline returns
+#     0 and the LV is unmounted cleanly; if the trap fires before that
+#     flag flips, we lvremove the base too.
 SCRATCH_CREATED=0
+BASE_CREATED=0
+BASE_POPULATED=0
 cleanup() {
     local rc=$?
     set +e
     mountpoint -q "$MOUNT_SCRATCH" 2>/dev/null && sudo umount "$MOUNT_SCRATCH"
     mountpoint -q "$MOUNT_BASE"    2>/dev/null && sudo umount "$MOUNT_BASE"
     [[ $SCRATCH_CREATED -eq 1 ]] && sudo lvremove -y "$VG/$SCRATCH_LV"
-    sudo lvchange -an "$VG/$BASE_LV" 2>/dev/null
+    if [[ $BASE_CREATED -eq 1 && $BASE_POPULATED -eq 0 ]]; then
+        echo "cleanup: removing partial base LV $VG/$BASE_LV (extract did not complete)" >&2
+        sudo lvremove -y "$VG/$BASE_LV"
+    else
+        sudo lvchange -an "$VG/$BASE_LV" 2>/dev/null
+    fi
     sudo rmdir "$MOUNT_SCRATCH" "$MOUNT_BASE" 2>/dev/null
     return $rc
 }
@@ -139,15 +157,22 @@ sudo aria2c \
 # ─── 4. create + populate the new base LV ──────────────────────────────
 echo "[4/5] Creating base LV $VG/$BASE_LV and extracting..."
 sudo lvcreate -V "$BASE_SIZE" --thin --name "$BASE_LV" "$VG/$THINPOOL"
+BASE_CREATED=1
 sudo mkfs.xfs -q "/dev/$VG/$BASE_LV"
 sudo mkdir -p "$MOUNT_BASE"
 sudo mount "/dev/$VG/$BASE_LV" "$MOUNT_BASE"
 
+# Pipefail (set in `set -euo pipefail` above) means a failure in either
+# `zstd` or `tar` aborts the script and the cleanup trap removes the
+# half-populated base LV.
 sudo zstd --decompress --stdout "$MOUNT_SCRATCH/archive.tar.zst" \
     | sudo tar --extract --file - --directory "$MOUNT_BASE"
 
 sudo umount "$MOUNT_BASE"
 sudo lvchange -an "$VG/$BASE_LV"
+# Mark the LV as a successful deliverable AFTER unmount completes;
+# anything before this point is "partial" from the trap's perspective.
+BASE_POPULATED=1
 
 # ─── 5. rotate older baselines ─────────────────────────────────────────
 if [[ $KEEP_OLD -eq 1 ]]; then
