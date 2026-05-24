@@ -535,8 +535,16 @@ impl LibvirtDriver {
 
         let console_log = job_dir.join("console.log");
         let domain_xml_path = job_dir.join(format!("domain.{phase_label}.xml"));
+        // Pin the domain UUID across phases. Without this, libvirt auto-
+        // generates a fresh UUID on the bench-phase `virsh define` and
+        // rejects it because the build-phase definition (same name,
+        // different auto UUID) is still registered.
+        let job_uuid = domain_name
+            .strip_prefix("sbgh-")
+            .unwrap_or(domain_name);
         let xml = domain::render(&DomainSpec {
             name: domain_name,
+            uuid: job_uuid,
             vcpus,
             memory_bytes,
             boot_disk_path: &boot_ref.path,

@@ -25,6 +25,15 @@ use quick_xml::events::*;
 
 pub struct DomainSpec<'a> {
     pub name: &'a str,
+    /// Stable per-job UUID. MUST be identical across both phases of a
+    /// job's two-VM lifecycle — `virsh define` only treats the second
+    /// call as an update-in-place when the XML carries the same UUID
+    /// as the existing inactive domain definition. Without this,
+    /// libvirt auto-generates a fresh UUID on each render and the
+    /// second define fails with "domain '<name>' already exists with
+    /// uuid <previous>". The job UUID itself is a natural fit since
+    /// it's already a uniquely-allocated UUID per job.
+    pub uuid: &'a str,
     /// vCPUs allocated to the VM. Different per phase — build typically
     /// gets more for parallel cargo, bench gets fewer to match
     /// production deployment shape.
@@ -59,6 +68,7 @@ pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
         .with_attribute(("type", "kvm"))
         .write_inner_content(|w| {
             text(w, "name", spec.name)?;
+            text(w, "uuid", spec.uuid)?;
             // libvirt rounds memory down to its smallest unit; KiB is
             // universally supported. Divide-by-1024 is safe (memory is
             // always allocated in page-multiples upstream).
@@ -253,6 +263,7 @@ mod tests {
     fn sample<'a>() -> DomainSpec<'a> {
         DomainSpec {
             name: "sbgh-job1",
+            uuid: "11111111-2222-3333-4444-555555555555",
             vcpus: 4,
             memory_bytes: 8u64 * 1024 * 1024 * 1024, // 8 GiB
             boot_disk_path: Path::new("/var/lib/sbgh/jobs/job1/boot.qcow2"),
@@ -271,6 +282,10 @@ mod tests {
     #[test]
     fn renders_all_required_sections() {
         let xml = render(&sample()).unwrap();
+        // UUID is pinned so two-phase redefine works (`virsh define`
+        // treats same-UUID as an update-in-place rather than a name
+        // collision).
+        assert!(xml.contains("<uuid>11111111-2222-3333-4444-555555555555</uuid>"));
         // sanity: well-formed structure
         assert!(xml.starts_with("<domain type=\"kvm\">"));
         assert!(xml.contains("<name>sbgh-job1</name>"));
