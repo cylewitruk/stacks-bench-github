@@ -47,7 +47,12 @@ NoNewPrivileges=false
 # Protect everything else.
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/sbgh /run/sbgh
+# /etc/lvm is needed because `lvcreate` writes a metadata archive to
+# /etc/lvm/archive/ + a backup to /etc/lvm/backup/ on every VG mutation.
+# Without this, `lvcreate --snapshot ...` fails with "Cannot archive
+# volume group metadata for vg0 to read-only filesystem". The sudo'd
+# lvcreate child inherits this unit's mount namespace even as root.
+ReadWritePaths=/var/lib/sbgh /run/sbgh /etc/lvm
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
