@@ -35,38 +35,46 @@ Environment=RUST_LOG=info,sbgh_orchestrator=info,sqlx=warn
 
 # ─── Hardening ──────────────────────────────────────────────────────────
 #
-# We intentionally do NOT use ProtectSystem= / ProtectHome= /
-# PrivateTmp= / ReadWritePaths= here. Those create a private mount
-# namespace for the unit, which is fundamentally incompatible with
-# how our per-job tmpfs share works:
+# Effectively no systemd-level hardening — see the long story below.
 #
-#   - Orchestrator sudo-mounts a tmpfs at /run/sbgh/jobs/<id>/.
-#     Inside its private namespace, this is the per-job results dir.
-#   - libvirtd spawns virtiofsd to serve that path to the VM.
-#     virtiofsd runs in the *host's main namespace* (libvirtd's
-#     namespace), not the orchestrator's private one. It sees the
-#     empty underlying directory, not our tmpfs.
-#   - VM writes through virtio-fs → virtiofsd writes to the underlying
-#     directory in the host namespace. The orchestrator looking for
-#     those files in its private namespace sees an empty tmpfs.
+# Why: we share state with libvirtd (per-job tmpfs at /run/sbgh/jobs/<id>/
+# is created by the orchestrator and consumed by libvirtd's virtiofsd to
+# serve it to the VM). ANY systemd directive that puts the unit in a
+# private mount namespace breaks that share — the orchestrator's mounts
+# are invisible to libvirtd, so virtiofsd serves the underlying empty
+# directory, the VM writes its phase log into a void, and the
+# orchestrator never sees it. End result: 10-minute build VM finishes
+# cleanly, orchestrator reports "VM powered off before reporting
+# phase=done", we tear our hair out.
 #
-# The result was a 10-minute build VM finishing cleanly with the
-# orchestrator reading an empty .phase-log, mis-reported as
-# "VM powered off before reporting phase=done".
+# The full list of directives that implicitly enable PrivateMounts=yes
+# (per the systemd.exec(5) man page — search "MountFlags= and
+# PrivateMounts= are implied"):
+#   ProtectSystem=, ProtectHome=, PrivateTmp=, PrivateDevices=,
+#   ReadWritePaths=, ReadOnlyPaths=, InaccessiblePaths=, BindPaths=,
+#   BindReadOnlyPaths=, ProtectKernelTunables=, ProtectKernelModules=,
+#   ProtectControlGroups=, ProtectKernelLogs=, ProtectClock=,
+#   ProtectHostname=, ProtectProc=, ProcSubset=
 #
-# Filesystem permissions (sbgh is uid 902 — can't touch /usr, /etc,
-# /home/* via ownership) and the narrow sudoers allowlist
-# (/etc/sudoers.d/sbgh — see docs/host-bringup.md §3) give us most
-# of what ProtectSystem= was nominally providing. Kernel-interface
-# restrictions don't affect mount namespaces, so we keep those:
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
+# So the hardening defaults to: filesystem ownership (sbgh is uid 902,
+# can only write to its own dirs), narrow sudoers allowlist (per-binary
+# NOPASSWD in /etc/sudoers.d/sbgh — see docs/host-bringup.md §3), and
+# the fact that the orchestrator's network surface is internal (DB +
+# GitHub API, both initiated outbound).
+#
+# When we want to add more layers, look at:
+#   CapabilityBoundingSet=   (drops capabilities — doesn't touch mounts)
+#   SystemCallFilter=        (seccomp — doesn't touch mounts; careful
+#                             with sudo)
+#   RestrictAddressFamilies= (block exotic socket families)
+#   LimitNOFILE= LimitNPROC= (resource limits)
 
 # NoNewPrivileges MUST stay false: sudo is a setuid binary, and our
 # orchestrator->sudo->lvcreate chain depends on the privilege change.
+# RestrictSUIDSGID also stays off for the same reason — restricting
+# SUID would block sudo's privilege gain even with NoNewPrivileges=false.
 NoNewPrivileges=false
-RestrictSUIDSGID=false   # see NoNewPrivileges note above
+RestrictSUIDSGID=false
 
 # Resource ceiling. The orchestrator process itself is tiny (~30 MB
 # typical); these limits are a tripwire for a runaway leak, not a
