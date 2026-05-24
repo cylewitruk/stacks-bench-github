@@ -63,6 +63,18 @@ chown -R root:root "$SRC" || die "chown $SRC to root failed"
 mkdir -p "$CHAIN"
 mount -t xfs /dev/vdb "$CHAIN" || die "failed to mount chainstate xfs"
 
+# Prove the chainstate is actually writable before we hand it to
+# stacks-bench. We pass `--dangerous-no-chainstate-copy`, which means
+# stacks-bench writes mini-fork blocks directly into the mount; if
+# any of the three layers (LVM snapshot permission / domain XML disk
+# device / xfs mount opts) accidentally regress to read-only, this
+# probe fails loudly here instead of letting stacks-bench die with a
+# cryptic sqlite error 10+ minutes into the benchmark.
+PROBE="$CHAIN/.sbgh-write-probe"
+touch "$PROBE" 2>/dev/null \
+    || die "chainstate mount at $CHAIN is read-only — check LVM snapshot, domain XML, and mount opts"
+rm -f "$PROBE"
+
 # stacks-bench's `--source` flag wants the directory CONTAINING the
 # `chainstate/` folder (not the chainstate dir itself). Hiro's tarballs
 # unpack with a network-name wrapper (`mainnet/chainstate/...`,
