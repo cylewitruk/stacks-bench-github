@@ -10,6 +10,7 @@
 //!       <disk vdc source.raw raw>
 //!       <disk sda cidata.iso cdrom readonly>
 //!       <filesystem virtiofs results_share_dir -> tag>
+//!       <filesystem virtiofs sccache_share_dir -> sccache_tag>
 //!       <interface type='network' source=network/>
 //!       <serial/console type='file' path=console.log>
 //!       <channel virtio org.qemu.guest_agent.0>
@@ -32,6 +33,13 @@ pub struct DomainSpec<'a> {
     pub cidata_iso_path: &'a Path,
     pub results_share_dir: &'a Path,
     pub results_share_tag: &'a str,
+    /// Host-side persistent sccache cache directory, shared rw across
+    /// jobs via a virtio-fs mount. The in-VM script exports
+    /// `SCCACHE_DIR` pointing at the mount + `RUSTC_WRAPPER=sccache`
+    /// so `cargo build` transparently hits the cache. See
+    /// [`PathsConfig::sccache_dir`](sbgh_core::config::PathsConfig).
+    pub sccache_share_dir: &'a Path,
+    pub sccache_share_tag: &'a str,
     pub console_log_path: &'a Path,
     pub network: &'a str,
 }
@@ -90,6 +98,7 @@ pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
                     file_disk(w, spec.cidata_iso_path, "raw", "sda", true)?;
 
                     virtiofs_filesystem(w, spec.results_share_dir, spec.results_share_tag)?;
+                    virtiofs_filesystem(w, spec.sccache_share_dir, spec.sccache_share_tag)?;
                     interface_network(w, spec.network)?;
                     serial_console_file(w, spec.console_log_path)?;
                     guest_agent_channel(w)?;
@@ -240,6 +249,8 @@ mod tests {
             cidata_iso_path: Path::new("/var/lib/sbgh/jobs/job1/cidata.iso"),
             results_share_dir: Path::new("/run/sbgh/jobs/job1"),
             results_share_tag: "results",
+            sccache_share_dir: Path::new("/var/lib/sbgh/sccache"),
+            sccache_share_tag: "sccache",
             console_log_path: Path::new("/var/lib/sbgh/jobs/job1/console.log"),
             network: "default",
         }

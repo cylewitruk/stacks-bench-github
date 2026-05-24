@@ -1,3 +1,4 @@
+mod bench_summary;
 mod libvirt;
 mod progress;
 mod runner;

@@ -57,11 +57,13 @@ What it does:
 1. Downloads `noble-server-cloudimg-amd64.img` from cloud-images.ubuntu.com.
 2. Resizes to 32 GiB.
 3. Uses `virt-customize` to:
-   - install `qemu-guest-agent`, `xfsprogs`, build toolchain (`git build-essential pkg-config libssl-dev libclang-dev cmake clang zstd`)
+   - install `qemu-guest-agent`, `xfsprogs`, build toolchain (`git build-essential pkg-config libssl-dev libclang-dev cmake clang zstd`), and **`sccache`** (caches rustc output across jobs via a persistent host-side dir bind-mounted into every VM at `/var/cache/sccache`)
    - install rustup → `/opt/{rustup,cargo}` system-wide, with symlinks in `/usr/local/bin`
    - enable `qemu-guest-agent` to start on boot
    - truncate `/etc/machine-id` and `/var/lib/dbus/machine-id` so each VM gets a unique id on first boot
 4. Drops the image at the destination path you passed.
+
+If you bump the package list later, re-run this script (it overwrites the qcow2). No rolling upgrade — each per-job VM is a fresh boot from the same golden image, so the new package set is in effect from the next `/benchmark`.
 
 Verify the image is bootable + has the toolchain:
 
@@ -202,6 +204,11 @@ sudo usermod -a -G libvirt sbgh        # virsh access without sudo for read-only
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/jobs
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/results
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/git
+# Persistent sccache cache, bind-mounted into every job VM via virtio-fs.
+# sccache self-caps at 20 GiB (SCCACHE_CACHE_SIZE inside the VM), so this
+# dir can't run away. Hot cache is what turns a ~35-min cold build into a
+# ~5-min warm build for subsequent jobs against similar PRs.
+sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/sccache
 sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh
 sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh/jobs
 ```
@@ -459,18 +466,42 @@ Three reasons it stays on the host:
 ### Build + run the orchestrator (host-side)
 
 ```bash
-# Build
-cargo build --release -p sbgh-orchestrator
+# Build the binary.
+just build
+```
 
-# Foreground run for first-time debugging
+**For a long-running setup**, install as a systemd unit (recommended once
+the first manual smoke test has succeeded — see below for the manual path):
+
+```bash
+# Installs the binary to /usr/local/bin/sbgh-orchestrator and the unit
+# file to /etc/systemd/system/sbgh-orchestrator.service, then enables +
+# starts the service. Idempotent — re-run after every `just build` to
+# pick up new code (it'll restart the service automatically).
+sudo ./scripts/install-orchestrator.sh
+
+# Tail logs:
+journalctl -u sbgh-orchestrator -f
+
+# Status:
+systemctl status sbgh-orchestrator
+```
+
+Unit lives at [systemd/sbgh-orchestrator.service](../systemd/sbgh-orchestrator.service)
+in the repo. To override `RUST_LOG` or other env per host, use
+`sudo systemctl edit sbgh-orchestrator` (creates a drop-in at
+`/etc/systemd/system/sbgh-orchestrator.service.d/override.conf`).
+
+**For first-time debugging** before installing the unit (sees errors
+immediately, easier to ctrl-C), foreground-run in a `tmux` session:
+
+```bash
 sudo -u sbgh \
   RUST_LOG=info,sbgh_orchestrator=debug,sqlx=warn \
   target/release/sbgh-orchestrator
 ```
 
-(For a long-running setup, write a systemd unit — see `docs/architecture.md` for the operator-setup notes.)
-
-Successful boot:
+Either way, successful boot logs:
 
 ```text
 INFO sbgh_orchestrator: orchestrator started

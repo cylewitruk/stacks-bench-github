@@ -61,8 +61,13 @@ impl ResultsTmpfs {
         Ok(())
     }
 
-    pub fn phase_file(&self) -> PathBuf {
-        self.mount_dir.join(".phase")
+    /// Path to the append-only phase journal the in-VM `sbgh-run.sh`
+    /// writes to (one `<unix-seconds> <phase>` line per transition).
+    /// The orchestrator's poll loop tails this; forensics archives it
+    /// per-job for after-the-fact "what took so long" debugging.
+    pub fn phase_log(&self) -> PathBuf {
+        self.mount_dir
+            .join(".phase-log")
     }
 
     /// Path to the SQLite database stacks-bench writes inside the results
@@ -74,6 +79,23 @@ impl ResultsTmpfs {
         self.mount_dir
             .join("appdata")
             .join("stacks-bench.db")
+    }
+
+    /// Path to the stacks-bench binary snapshot the in-VM script copies
+    /// here just before phase=done. We archive it next to the SQLite so
+    /// the canonical reader of the DB schema is always paired with the
+    /// data it produced.
+    pub fn stacks_bench_binary(&self) -> PathBuf {
+        self.mount_dir
+            .join("stacks-bench")
+    }
+
+    /// Path to the JSON stdout capture of `stacks-bench bench run --json`.
+    /// Archived for use by the PR-comment summary builder + as a
+    /// human-readable record of the run's high-level metrics.
+    pub fn run_json(&self) -> PathBuf {
+        self.mount_dir
+            .join("run.json")
     }
 }
 
@@ -90,6 +112,7 @@ mod tests {
             git_mirror: dir.path().join("mirror.git"),
             results_tmpfs_root: dir.path().join("results"),
             results_archive_dir: dir.path().join("archive"),
+            sccache_dir: dir.path().join("sccache"),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -114,7 +137,7 @@ mod tests {
                 .results_tmpfs_root
                 .join("j1")
         );
-        assert_eq!(r.phase_file(), r.mount_dir.join(".phase"));
+        assert_eq!(r.phase_log(), r.mount_dir.join(".phase-log"));
 
         let calls = shell.calls();
         assert_eq!(calls.len(), 1);

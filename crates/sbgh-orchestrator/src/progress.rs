@@ -1,7 +1,11 @@
 //! Posts/edits the PR comment owned by a job as its lifecycle advances.
 
+use std::path::Path;
+
 use sbgh_core::github::GitHubApi;
 use sbgh_core::models::Job;
+
+use crate::bench_summary::{self, RunResult};
 
 pub struct ProgressReporter<'a> {
     gh: &'a dyn GitHubApi,
@@ -23,12 +27,29 @@ impl<'a> ProgressReporter<'a> {
     }
 
     pub async fn completed(&self, summary: &serde_json::Value) -> anyhow::Result<()> {
-        self.update(&format!(
-            ":white_check_mark: benchmark `{id}` completed.\n\n```json\n{summary}\n```",
-            id = self.job.id,
-            summary = serde_json::to_string_pretty(summary).unwrap_or_default(),
-        ))
-        .await
+        // The orchestrator-side summary blob carries pointers to the
+        // archived artifacts. Read + parse run.json (the actual
+        // stacks-bench output) for the user-facing metrics; everything
+        // else in the summary blob is operator/debugging detail that
+        // doesn't belong in the PR comment.
+        let archive_dir = summary
+            .get("archive_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("/var/lib/sbgh/results");
+        let run_json_path = summary
+            .get("run_json_archived_path")
+            .and_then(|v| v.as_str());
+        let parsed = run_json_path
+            .map(Path::new)
+            .and_then(read_run_json);
+
+        let body = bench_summary::render_pr_comment(
+            &self.job.id.to_string(),
+            &self.job.head_sha,
+            archive_dir,
+            parsed.as_ref(),
+        );
+        self.update(&body).await
     }
 
     /// Update the PR comment with a short failure snippet.
@@ -56,6 +77,20 @@ impl<'a> ProgressReporter<'a> {
             .update_pr_comment(self.job.installation_id, &self.job.repository, comment_id, body)
             .await?;
         Ok(())
+    }
+}
+
+/// Best-effort read + parse of the archived `run.json`. Returns `None`
+/// (and lets the renderer fall back to "missing/unparseable" text) on
+/// any I/O or parse error — we never want a forensics gap to crash
+/// the PR-comment update for a successful run.
+fn read_run_json(path: &Path) -> Option<RunResult> {
+    match std::fs::read(path) {
+        Ok(bytes) => RunResult::from_bytes(&bytes),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "read archived run.json failed");
+            None
+        }
     }
 }
 

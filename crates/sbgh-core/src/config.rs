@@ -188,6 +188,18 @@ pub struct VmConfig {
     pub job_timeout_secs: u64,
     /// libvirt network to attach to the VM (default: `default`, NAT outbound).
     pub network: String,
+    /// How often the orchestrator polls the in-VM phase log + virsh
+    /// domstate. Each poll runs a `virsh domstate` subprocess (~50–
+    /// 100ms), so lower values = more CPU on the host. 5s is the
+    /// sensible floor for our workload — actual phases (`building`,
+    /// `running`) last minutes to hours, so the phase-change detection
+    /// latency is invisible.
+    pub poll_interval_secs: u64,
+    /// How often the orchestrator emits a heartbeat log line (and a
+    /// throttled PR-comment refresh) showing the current phase + elapsed
+    /// time in that phase. Independent of poll interval so we can poll
+    /// rarely but still surface liveness frequently (or vice versa).
+    pub heartbeat_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +210,12 @@ pub struct PathsConfig {
     pub results_tmpfs_root: PathBuf,
     /// Persistent destination for `run.sqlite` after a job completes.
     pub results_archive_dir: PathBuf,
+    /// Host-side directory bind-mounted into every job's VM via virtio-fs
+    /// as the sccache compiler cache. Persistent across jobs — that's the
+    /// whole point. sccache enforces its own size cap (`SCCACHE_CACHE_SIZE`,
+    /// see template) so this dir grows to at most ~20 GiB even if you
+    /// never clean it manually.
+    pub sccache_dir: PathBuf,
     pub virsh_binary: PathBuf,
     pub sudo_binary: PathBuf,
     pub qemu_img_binary: PathBuf,
@@ -281,6 +299,8 @@ struct RawVm {
     boot_disk_gib: Option<u32>,
     job_timeout_secs: Option<u64>,
     network: Option<String>,
+    poll_interval_secs: Option<u64>,
+    heartbeat_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -290,6 +310,7 @@ struct RawPaths {
     git_mirror: Option<PathBuf>,
     results_tmpfs_root: Option<PathBuf>,
     results_archive_dir: Option<PathBuf>,
+    sccache_dir: Option<PathBuf>,
     virsh_binary: Option<PathBuf>,
     sudo_binary: Option<PathBuf>,
     qemu_img_binary: Option<PathBuf>,
@@ -327,6 +348,15 @@ impl RawOrchestrator {
         merge_opt(&mut self.vm.boot_disk_gib, other.vm.boot_disk_gib);
         merge_opt(&mut self.vm.job_timeout_secs, other.vm.job_timeout_secs);
         merge_opt(&mut self.vm.network, other.vm.network);
+        merge_opt(&mut self.vm.poll_interval_secs, other.vm.poll_interval_secs);
+        merge_opt(
+            &mut self
+                .vm
+                .heartbeat_interval_secs,
+            other
+                .vm
+                .heartbeat_interval_secs,
+        );
 
         merge_opt(&mut self.paths.jobs_dir, other.paths.jobs_dir);
         merge_opt(&mut self.paths.git_mirror, other.paths.git_mirror);
@@ -337,6 +367,7 @@ impl RawOrchestrator {
                 .paths
                 .results_archive_dir,
         );
+        merge_opt(&mut self.paths.sccache_dir, other.paths.sccache_dir);
         merge_opt(&mut self.paths.virsh_binary, other.paths.virsh_binary);
         merge_opt(&mut self.paths.sudo_binary, other.paths.sudo_binary);
         merge_opt(&mut self.paths.qemu_img_binary, other.paths.qemu_img_binary);
@@ -391,11 +422,19 @@ impl RawOrchestrator {
         env_parse_into(&mut self.vm.boot_disk_gib, "SBGH_VM_BOOT_DISK_GIB");
         env_parse_into(&mut self.vm.job_timeout_secs, "SBGH_VM_JOB_TIMEOUT_SECS");
         env_into(&mut self.vm.network, "SBGH_VM_NETWORK");
+        env_parse_into(&mut self.vm.poll_interval_secs, "SBGH_VM_POLL_INTERVAL_SECS");
+        env_parse_into(
+            &mut self
+                .vm
+                .heartbeat_interval_secs,
+            "SBGH_VM_HEARTBEAT_INTERVAL_SECS",
+        );
 
         env_path_into(&mut self.paths.jobs_dir, "SBGH_JOBS_DIR");
         env_path_into(&mut self.paths.git_mirror, "SBGH_GIT_MIRROR");
         env_path_into(&mut self.paths.results_tmpfs_root, "SBGH_RESULTS_TMPFS_ROOT");
         env_path_into(&mut self.paths.results_archive_dir, "SBGH_RESULTS_ARCHIVE_DIR");
+        env_path_into(&mut self.paths.sccache_dir, "SBGH_SCCACHE_DIR");
         env_path_into(&mut self.paths.virsh_binary, "SBGH_VIRSH_BIN");
         env_path_into(&mut self.paths.sudo_binary, "SBGH_SUDO_BIN");
         env_path_into(&mut self.paths.qemu_img_binary, "SBGH_QEMU_IMG_BIN");
@@ -470,6 +509,14 @@ impl RawOrchestrator {
                     .vm
                     .network
                     .unwrap_or_else(|| "default".into()),
+                poll_interval_secs: self
+                    .vm
+                    .poll_interval_secs
+                    .unwrap_or(5),
+                heartbeat_interval_secs: self
+                    .vm
+                    .heartbeat_interval_secs
+                    .unwrap_or(60),
             },
             paths: PathsConfig {
                 jobs_dir: self
@@ -488,6 +535,10 @@ impl RawOrchestrator {
                     .paths
                     .results_archive_dir
                     .unwrap_or_else(|| PathBuf::from("/var/lib/sbgh/results")),
+                sccache_dir: self
+                    .paths
+                    .sccache_dir
+                    .unwrap_or_else(|| PathBuf::from("/var/lib/sbgh/sccache")),
                 virsh_binary: self
                     .paths
                     .virsh_binary

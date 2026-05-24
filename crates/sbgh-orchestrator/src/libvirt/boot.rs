@@ -74,6 +74,7 @@ mod tests {
                 git_mirror: "/tmp/git".into(),
                 results_tmpfs_root: "/run/sbgh".into(),
                 results_archive_dir: "/var/lib/sbgh/results".into(),
+                sccache_dir: "/var/lib/sbgh/sccache".into(),
                 virsh_binary: "/usr/bin/virsh".into(),
                 sudo_binary: "/usr/bin/sudo".into(),
                 qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -87,6 +88,8 @@ mod tests {
                 boot_disk_gib: 64,
                 job_timeout_secs: 60,
                 network: "default".into(),
+                poll_interval_secs: 5,
+                heartbeat_interval_secs: 60,
             },
         )
     }

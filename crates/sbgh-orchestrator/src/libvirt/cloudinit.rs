@@ -21,6 +21,14 @@ pub struct CloudInitParams<'a> {
     pub results_share_tag: &'a str,
     /// Mountpoint inside the VM for the results share.
     pub results_mount: &'a str,
+    /// Virtio-fs tag for the persistent sccache cache share.
+    pub sccache_share_tag: &'a str,
+    /// Mountpoint inside the VM for the sccache cache.
+    pub sccache_mount: &'a str,
+    /// Cache-size cap to pass to sccache (`SCCACHE_CACHE_SIZE`).
+    /// Bytes-with-unit format, e.g. `"20G"`. sccache enforces this
+    /// itself via LRU eviction.
+    pub sccache_max_size: &'a str,
 }
 
 pub struct CloudInitArtifacts {
@@ -79,7 +87,10 @@ fn render_user_data(p: &CloudInitParams<'_>) -> String {
         .replace("{{ chainstate_mount }}", p.chainstate_mount)
         .replace("{{ source_mount }}", p.source_mount)
         .replace("{{ results_share_tag }}", p.results_share_tag)
-        .replace("{{ results_mount }}", p.results_mount);
+        .replace("{{ results_mount }}", p.results_mount)
+        .replace("{{ sccache_share_tag }}", p.sccache_share_tag)
+        .replace("{{ sccache_mount }}", p.sccache_mount)
+        .replace("{{ sccache_max_size }}", p.sccache_max_size);
 
     format!(
         "#cloud-config\nwrite_files:\n  - path: /usr/local/bin/sbgh-run.sh\n    permissions: \
@@ -110,6 +121,7 @@ mod tests {
             git_mirror: dir.path().join("mirror.git"),
             results_tmpfs_root: dir.path().join("results"),
             results_archive_dir: dir.path().join("archive"),
+            sccache_dir: dir.path().join("sccache"),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -127,6 +139,9 @@ mod tests {
             source_mount: "/opt/stacks-core",
             results_share_tag: "results",
             results_mount: "/results",
+            sccache_share_tag: "sccache",
+            sccache_mount: "/var/cache/sccache",
+            sccache_max_size: "20G",
         }
     }
 

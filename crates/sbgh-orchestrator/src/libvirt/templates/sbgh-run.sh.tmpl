@@ -6,12 +6,18 @@
 #   {{ chainstate_mount }}    — chainstate snapshot (vdb), XFS
 #   {{ results_mount }}       — virtio-fs share to host tmpfs (tag={{ results_share_tag }})
 #
-# Phases (written to {{ results_mount }}/.phase; orchestrator polls for these):
+# Phases (appended to {{ results_mount }}/.phase-log; orchestrator polls for these):
+#   starting   -> mounts complete, about to build
 #   building   -> cargo build is running
 #   running    -> stacks-bench is executing
 #   collecting -> sqlite finalize / sync
 #   done       -> normal completion
 #   error      -> a step failed; details in console.log
+#
+# Format per line: `<unix-seconds> <phase>`. Append-only — the orchestrator
+# replays new entries between polls so it never misses fast transitions
+# (e.g. starting → building can be sub-second). The journal also gets
+# archived per-job for forensics.
 
 set -euo pipefail
 
@@ -26,9 +32,12 @@ SHARE_TAG="{{ results_share_tag }}"
 # array makes the word-split explicit and shellcheck-clean.
 read -r -a EXTRA_ARGS <<<"{{ stacks_bench_args }}"
 
-PHASE="$RESULTS/.phase"
+PHASE_LOG="$RESULTS/.phase-log"
 
-phase()  { echo "$1" >"$PHASE"; sync; }
+# Append-only journal. Each phase transition becomes a timestamped line;
+# the orchestrator's poll loop replays new entries between polls so it
+# never misses fast transitions even at multi-second poll intervals.
+phase()  { printf '%s %s\n' "$(date +%s)" "$1" >> "$PHASE_LOG"; sync; }
 die()    { phase "error"; echo "ERROR: $*" >&2; exit 1; }
 
 # --- mount results share (virtio-fs) -------------------------------------------------
@@ -84,11 +93,36 @@ rm -f "$PROBE"
 SBGH_SOURCE_DIR=$(find "$CHAIN" -maxdepth 3 -mindepth 1 -name chainstate -type d -printf '%h\n' 2>/dev/null | head -1)
 [[ -n "$SBGH_SOURCE_DIR" ]] || die "couldn't locate chainstate/ under $CHAIN"
 
+# --- mount the persistent sccache cache share ---------------------------------------
+# Persists rustc compiler output across jobs via a host bind-mount (virtio-fs).
+# `RUSTC_WRAPPER=sccache` makes cargo route every `rustc` invocation through
+# sccache; hits skip the actual compile and copy the cached artifact instead.
+# sccache enforces SCCACHE_CACHE_SIZE via LRU eviction so the cache dir tops
+# out at the configured ceiling regardless of how many jobs have populated it.
+#
+# Safety note: the share is rw, so a malicious build.rs CAN poison cache
+# entries — but sccache validates the input hash on every read, so a
+# poisoned entry only affects future jobs whose input keys you can already
+# produce (i.e. the same trusted committer's PRs). Out of scope for our
+# trust model (allowlist-gated /benchmark trigger).
+SCCACHE_MOUNT="{{ sccache_mount }}"
+SCCACHE_SHARE_TAG="{{ sccache_share_tag }}"
+mkdir -p "$SCCACHE_MOUNT"
+mount -t virtiofs "$SCCACHE_SHARE_TAG" "$SCCACHE_MOUNT" \
+    || die "failed to mount virtio-fs $SCCACHE_SHARE_TAG"
+export SCCACHE_DIR="$SCCACHE_MOUNT"
+export SCCACHE_CACHE_SIZE="{{ sccache_max_size }}"
+export RUSTC_WRAPPER=sccache
+sccache --start-server >/dev/null 2>&1 || true
+
 # --- build stacks-bench from the checked-out source ----------------------------------
 phase "building"
 cd "$SRC"
 git rev-parse HEAD | grep -q "$HEAD_SHA" || die "checkout sha mismatch"
 cargo build --release -p stacks-bench || die "cargo build failed"
+# Surface the cache hit-rate in the console log — invaluable when
+# diagnosing "why is this build still slow?" runs.
+sccache --show-stats || true
 
 # --- run benchmark -------------------------------------------------------------------
 #
@@ -128,6 +162,17 @@ phase "running"
 
 # --- finalize -----------------------------------------------------------------------
 phase "collecting"
+# Snapshot the stacks-bench binary alongside its SQLite output. The
+# binary is the canonical reader of its own DB (`bench list`,
+# `bench summary`, `bench compare`); a different-version binary may
+# not understand the schema. Saving it next to the DB means
+# "investigate later" is a 1-liner with no version-juggling:
+#     cd /var/lib/sbgh/results/<job-id>
+#     ./stacks-bench --db . bench list
+# Compressing would save ~70% disk but adds a decompress step before
+# every investigation — keep uncompressed for ergonomics.
+cp -f ./target/release/stacks-bench "$RESULTS/stacks-bench" \
+    || die "failed to snapshot stacks-bench binary into results"
 sync
 phase "done"
 # cloud-init's `power_state: poweroff` will shut us down cleanly.

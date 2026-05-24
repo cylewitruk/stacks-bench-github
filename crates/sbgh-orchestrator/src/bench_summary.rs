@@ -1,0 +1,392 @@
+//! Defensive parser + Markdown renderer for the `--json` output of
+//! `stacks-bench bench run`. The schema is owned upstream and will
+//! drift; this module **intentionally** uses `Option<T>` on every field
+//! with `#[serde(default)]` so a renamed or removed field disappears
+//! from the PR comment rather than crashing the orchestrator. The
+//! caller decides whether the resulting render is "rich enough"; if
+//! every field round-trips as `None`, the caller falls back to a
+//! generic "completed" comment.
+//!
+//! Mirrors the upstream Rust shape from `stacks-bench/src/runner.rs`
+//! (RunResult / RunSummaryJson / TargetSummary) verbatim except for
+//! the optional-everywhere relaxation. Extra fields from the JSON are
+//! ignored silently by serde's default behaviour.
+
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RunResult {
+    pub run_id: Option<i64>,
+    pub blocks: Option<u64>,
+    pub warmup_blocks: Option<u64>,
+    pub measured_blocks: Option<u64>,
+    pub duration_secs: Option<f64>,
+    pub interrupted: Option<bool>,
+    pub summary: Option<RunSummary>,
+    pub targets: Option<Vec<TargetSummary>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RunSummary {
+    pub total_duration_us: Option<u64>,
+    pub setup_duration_us: Option<u64>,
+    pub execution_duration_us: Option<u64>,
+    pub commit_duration_us: Option<u64>,
+    pub transactions: Option<u64>,
+    pub clarity_runtime: Option<u64>,
+    pub write_length: Option<u64>,
+    pub read_length: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TargetSummary {
+    pub kind: Option<String>,
+    pub identifier: Option<String>,
+    pub parent_block: Option<u64>,
+    pub warmup_count: Option<u32>,
+    pub measured_count: Option<u32>,
+    pub summary: Option<RunSummary>,
+}
+
+impl RunResult {
+    /// Parse from the raw `run.json` byte slice (typically read off
+    /// disk after the VM has shut down). Returns `None` and logs on
+    /// any parse failure — caller decides whether to fall back.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match serde_json::from_slice::<Self>(bytes) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to parse run.json; PR comment will fall back");
+                None
+            }
+        }
+    }
+}
+
+/// Render the per-job PR comment for a successful run.
+///
+/// `archive_dir` is the per-job archive path on the host (the place
+/// where the binary + appdata + run.json got copied). It's shown in
+/// the collapsed "Investigate locally" block so operators can rerun
+/// stacks-bench against the same DB without hunting for paths.
+///
+/// Returns Markdown ready to be passed straight to `update_pr_comment`.
+pub fn render_pr_comment(
+    job_id: &str,
+    head_sha: &str,
+    archive_dir: &str,
+    result: Option<&RunResult>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(":white_check_mark: benchmark `");
+    out.push_str(job_id);
+    out.push_str("` complete (commit `");
+    out.push_str(head_sha);
+    out.push_str("`)\n\n");
+
+    if let Some(r) = result {
+        let table = metric_table(r);
+        if !table.is_empty() {
+            out.push_str(&table);
+            out.push('\n');
+        }
+    } else {
+        out.push_str(
+            "_(run.json missing or unparseable — see archive for raw stacks-bench output)_\n\n",
+        );
+    }
+
+    out.push_str("<details><summary>Investigate locally</summary>\n\n");
+    out.push_str("```bash\n");
+    out.push_str("cd ");
+    out.push_str(archive_dir);
+    out.push('\n');
+    out.push_str("./stacks-bench --db . bench list\n");
+    if let Some(rid) = result.and_then(|r| r.run_id) {
+        out.push_str(&format!("./stacks-bench --db . bench summary {rid}\n"));
+    }
+    out.push_str("```\n\n");
+    out.push_str("</details>");
+    out
+}
+
+/// Build the "Metric | Value" GitHub-flavoured Markdown table. Skips
+/// any row whose source field is `None`. Returns an empty string if no
+/// metrics were present (caller renders the fallback message).
+fn metric_table(r: &RunResult) -> String {
+    let mut rows: Vec<(String, String)> = Vec::new();
+
+    if let Some(m) = r.measured_blocks {
+        let warmup = r.warmup_blocks.unwrap_or(0);
+        rows.push((
+            "Blocks measured".to_string(),
+            format!("{} ({} warmup)", thousands(m), thousands(warmup)),
+        ));
+    }
+    if let Some(d) = r.duration_secs {
+        rows.push(("Run duration".to_string(), format_duration(d)));
+    }
+
+    if let Some(s) = r.summary.as_ref() {
+        if let Some(tx) = s.transactions {
+            rows.push(("Transactions replayed".to_string(), thousands(tx)));
+        }
+
+        // Per-block averages — only meaningful if we have a divisor.
+        let divisor = r
+            .measured_blocks
+            .filter(|m| *m > 0);
+        if let Some(setup) = s.setup_duration_us {
+            rows.push(("Setup".to_string(), avg_us_per(setup, divisor)));
+        }
+        if let Some(exec) = s.execution_duration_us {
+            rows.push(("Execution".to_string(), avg_us_per(exec, divisor)));
+        }
+        if let Some(commit) = s.commit_duration_us {
+            rows.push(("Commit".to_string(), avg_us_per(commit, divisor)));
+        }
+        if let Some(cr) = s.clarity_runtime {
+            rows.push(("Clarity runtime (total cost units)".to_string(), thousands(cr)));
+        }
+        if let (Some(read), Some(write)) = (s.read_length, s.write_length) {
+            rows.push((
+                "Read / write length".to_string(),
+                format!("{} / {}", human_bytes(read), human_bytes(write)),
+            ));
+        } else if let Some(read) = s.read_length {
+            rows.push(("Read length".to_string(), human_bytes(read)));
+        } else if let Some(write) = s.write_length {
+            rows.push(("Write length".to_string(), human_bytes(write)));
+        }
+    }
+
+    if r.interrupted == Some(true) {
+        rows.push(("Interrupted".to_string(), "**yes** (partial measurements)".to_string()));
+    }
+
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("| Metric | Value |\n| ---- | ---- |\n");
+    for (k, v) in rows {
+        out.push_str(&format!("| {k} | {v} |\n"));
+    }
+    out
+}
+
+fn avg_us_per(total_us: u64, divisor: Option<u64>) -> String {
+    match divisor {
+        Some(d) => format!("{} µs avg ({} µs total)", thousands(total_us / d), thousands(total_us)),
+        None => format!("{} µs (total)", thousands(total_us)),
+    }
+}
+
+/// 1234567 → "1,234,567". Reads better in a results table than the
+/// raw u64. Comma-grouping by reversing the digits, inserting commas
+/// every 3, then reversing back — straightforward, no off-by-one
+/// arithmetic to second-guess.
+fn thousands<N: ToString>(n: N) -> String {
+    let s = n.to_string();
+    let (sign, digits) = match s.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", s.as_str()),
+    };
+    let reversed_grouped: String = digits
+        .chars()
+        .rev()
+        .enumerate()
+        .flat_map(|(i, c)| if i > 0 && i % 3 == 0 { vec![',', c] } else { vec![c] })
+        .collect();
+    let mut out = String::with_capacity(reversed_grouped.len() + sign.len());
+    out.push_str(sign);
+    out.extend(reversed_grouped.chars().rev());
+    out
+}
+
+fn human_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut idx = 0;
+    while v >= 1024.0 && idx + 1 < UNITS.len() {
+        v /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 { format!("{} {}", b, UNITS[idx]) } else { format!("{:.1} {}", v, UNITS[idx]) }
+}
+
+fn format_duration(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return format!("{secs}s");
+    }
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{:.2}s", secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_full_payload() {
+        let json = br#"{
+            "run_id": 42,
+            "blocks": 5000,
+            "warmup_blocks": 1000,
+            "measured_blocks": 4000,
+            "duration_secs": 454.5,
+            "interrupted": false,
+            "summary": {
+                "total_duration_us": 100000000,
+                "setup_duration_us": 9380000,
+                "execution_duration_us": 72940000,
+                "commit_duration_us": 18280000,
+                "transactions": 12345,
+                "clarity_runtime": 9876543210,
+                "write_length": 89000000,
+                "read_length": 245000000
+            }
+        }"#;
+        let r = RunResult::from_bytes(json).unwrap();
+        assert_eq!(r.run_id, Some(42));
+        assert_eq!(r.measured_blocks, Some(4000));
+        let s = r.summary.as_ref().unwrap();
+        assert_eq!(s.transactions, Some(12345));
+    }
+
+    #[test]
+    fn parse_minimal_payload_keeps_unknown_fields_none() {
+        let json = br#"{ "run_id": 1 }"#;
+        let r = RunResult::from_bytes(json).unwrap();
+        assert_eq!(r.run_id, Some(1));
+        assert!(r.summary.is_none());
+        assert!(r.measured_blocks.is_none());
+    }
+
+    #[test]
+    fn parse_ignores_unknown_fields_for_forward_compat() {
+        let json =
+            br#"{ "run_id": 7, "future_field": "we_dont_know_yet", "summary": { "transactions": 9 } }"#;
+        let r = RunResult::from_bytes(json).unwrap();
+        assert_eq!(r.run_id, Some(7));
+        assert_eq!(
+            r.summary
+                .unwrap()
+                .transactions,
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn parse_garbage_returns_none() {
+        assert!(RunResult::from_bytes(b"not json at all").is_none());
+        assert!(RunResult::from_bytes(b"").is_none());
+    }
+
+    #[test]
+    fn render_includes_table_when_metrics_present() {
+        let r = RunResult {
+            run_id: Some(42),
+            measured_blocks: Some(5000),
+            warmup_blocks: Some(1000),
+            duration_secs: Some(454.5),
+            summary: Some(RunSummary {
+                transactions: Some(12345),
+                setup_duration_us: Some(9_380_000),
+                execution_duration_us: Some(72_940_000),
+                commit_duration_us: Some(18_280_000),
+                read_length: Some(245_000_000),
+                write_length: Some(89_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let md = render_pr_comment("job-1", "abc123", "/var/lib/sbgh/results/job-1", Some(&r));
+
+        assert!(md.contains("benchmark `job-1`"));
+        assert!(md.contains("(commit `abc123`)"));
+        assert!(md.contains("| Metric | Value |"));
+        assert!(md.contains("5,000 (1,000 warmup)"));
+        assert!(md.contains("12,345"));
+        assert!(md.contains("µs avg"));
+        // Investigate-locally block always included; bench summary uses run_id when
+        // present.
+        assert!(md.contains("cd /var/lib/sbgh/results/job-1"));
+        assert!(md.contains("bench list"));
+        assert!(md.contains("bench summary 42"));
+    }
+
+    #[test]
+    fn render_falls_back_when_no_run_json() {
+        let md = render_pr_comment("job-x", "deadbeef", "/some/path", None);
+        assert!(md.contains("benchmark `job-x`"));
+        assert!(md.contains("(commit `deadbeef`)"));
+        assert!(md.contains("run.json missing"));
+        // No bench summary line because we have no run_id.
+        assert!(!md.contains("bench summary"));
+    }
+
+    #[test]
+    fn render_omits_table_when_only_unknown_fields_parsed() {
+        // RunResult with everything None — table should be empty,
+        // fallback message kicks in.
+        let r = RunResult::default();
+        let md = render_pr_comment("j", "h", "/p", Some(&r));
+        // No "| Metric | Value |" but also no "missing" message
+        // (we DID parse, the result is just empty).
+        assert!(!md.contains("| Metric"));
+        assert!(!md.contains("missing"));
+    }
+
+    #[test]
+    fn render_marks_interrupted_runs() {
+        let r = RunResult {
+            interrupted: Some(true),
+            measured_blocks: Some(100),
+            ..Default::default()
+        };
+        let md = render_pr_comment("j", "h", "/p", Some(&r));
+        assert!(md.contains("Interrupted"));
+        assert!(md.contains("partial measurements"));
+    }
+
+    // ─── helpers ───
+
+    #[test]
+    fn thousands_formats_correctly() {
+        assert_eq!(thousands(0_u64), "0");
+        assert_eq!(thousands(42_u64), "42");
+        assert_eq!(thousands(1_000_u64), "1,000");
+        assert_eq!(thousands(1_234_567_u64), "1,234,567");
+        assert_eq!(thousands(12_345_678_u64), "12,345,678");
+    }
+
+    #[test]
+    fn human_bytes_picks_unit() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MiB");
+        assert_eq!(human_bytes(3_500_000_000), "3.3 GiB");
+    }
+
+    #[test]
+    fn format_duration_picks_granularity() {
+        assert_eq!(format_duration(0.5), "0.50s");
+        assert_eq!(format_duration(45.0), "45.00s");
+        assert_eq!(format_duration(125.0), "2m 5s");
+        assert_eq!(format_duration(3725.0), "1h 2m 5s");
+    }
+}

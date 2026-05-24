@@ -39,12 +39,30 @@ memory_gib = 16
 boot_disk_gib = 64
 job_timeout_secs = 21600   # 6 hours
 network = "default"
+# How often the orchestrator polls the in-VM phase journal + virsh
+# domstate. Each poll runs a `virsh domstate` subprocess (~50–100ms),
+# so smaller values = more host CPU. 5s is the sensible floor for
+# our workload; transitions are append-only and replayed in batches
+# so we never miss one even at multi-second polls.
+poll_interval_secs = 5
+# How often the orchestrator emits a heartbeat log line + (debounced)
+# PR-comment refresh showing the current phase and elapsed time
+# within it. Independent of poll interval — poll rarely, surface
+# liveness frequently.
+heartbeat_interval_secs = 60
 
 [paths]
 jobs_dir = "/var/lib/sbgh/jobs"
 git_mirror = "/var/lib/sbgh/git/stacks-core.git"
 results_tmpfs_root = "/run/sbgh/jobs"
 results_archive_dir = "/var/lib/sbgh/results"
+# Host-side persistent sccache cache, bind-mounted into every job VM
+# via virtio-fs. Persists rustc output across jobs so cold cargo
+# builds (~35 min) drop to ~5 min on warm cache. sccache enforces its
+# own LRU eviction inside the VM (SCCACHE_CACHE_SIZE=20G hardcoded by
+# the orchestrator), so this dir can't exceed that ceiling regardless
+# of how many jobs run.
+sccache_dir = "/var/lib/sbgh/sccache"
 virsh_binary = "/usr/bin/virsh"
 sudo_binary = "/usr/bin/sudo"
 qemu_img_binary = "/usr/bin/qemu-img"

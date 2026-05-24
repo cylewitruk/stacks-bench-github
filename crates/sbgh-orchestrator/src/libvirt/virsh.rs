@@ -90,6 +90,7 @@ mod tests {
             git_mirror: "/tmp".into(),
             results_tmpfs_root: "/tmp".into(),
             results_archive_dir: "/tmp".into(),
+            sccache_dir: "/tmp".into(),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),

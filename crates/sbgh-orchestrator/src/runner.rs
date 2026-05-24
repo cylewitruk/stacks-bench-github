@@ -9,18 +9,31 @@
 //!   3. Runs the benchmark.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sbgh_core::config::OrchestratorConfig;
 use sbgh_core::db::JobStore;
 use sbgh_core::github::GitHubApi;
 use sbgh_core::models::Job;
+use tokio::sync::Mutex;
 
-use crate::libvirt::{LibvirtDriver, OutcomeStatus, Phase, PhaseListener, Shell};
+use crate::libvirt::{LibvirtDriver, OutcomeStatus, Phase, PhaseListener, Shell, format_elapsed};
 use crate::progress::ProgressReporter;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Minimum interval between PR-comment edits driven by the
+/// `CommentPhaseListener`. Phase transitions and heartbeats both go
+/// through this debounce; terminal phases (done/error) bypass it so
+/// the user always sees the final state immediately.
+///
+/// 30s gives us at most ~2 edits/min in the worst case, which is well
+/// below any plausible GitHub secondary rate limit and looks calm in
+/// the PR's "edit history". The first edit after a comment is created
+/// is always allowed through — so the user sees the initial state
+/// transition immediately rather than waiting 30s.
+const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Runner {
     config: Arc<OrchestratorConfig>,
@@ -187,27 +200,67 @@ impl Runner {
 }
 
 /// Bridge between the libvirt driver's phase events and the PR comment.
+///
+/// Two callers drive PR comment edits:
+///   * `on_phase` — fires once per transition the driver replays from the in-VM
+///     phase journal. Terminal phases (`done`/`error`) bypass the debounce;
+///     non-terminal phases are debounced.
+///   * `on_heartbeat` — fires periodically while the same phase is current,
+///     refreshing the elapsed-time annotation. Always debounced.
+///
+/// The debounce window (`PR_UPDATE_MIN_INTERVAL`) keeps us well below
+/// GitHub's secondary rate limits and avoids spamming the PR's edit
+/// history. The very first edit after job pickup is always allowed
+/// through (last_pr_update_at starts as None), so the user sees
+/// something happen immediately when they `/benchmark`.
 struct CommentPhaseListener {
     gh: Arc<dyn GitHubApi>,
     job: Job,
+    state: Mutex<CommentState>,
+}
+
+#[derive(Default)]
+struct CommentState {
+    last_pr_update_at: Option<Instant>,
 }
 
 impl CommentPhaseListener {
     fn new(gh: Arc<dyn GitHubApi>, job: Job) -> Self {
-        Self { gh, job }
+        Self {
+            gh,
+            job,
+            state: Mutex::new(CommentState::default()),
+        }
     }
-}
 
-#[async_trait]
-impl PhaseListener for CommentPhaseListener {
-    async fn on_phase(&self, phase: &Phase) {
+    async fn try_update(&self, phase: &Phase, elapsed: Duration, force: bool) {
         let Some(comment_id) = self.job.comment_id else {
             return;
         };
+
+        // Decide whether to actually send the edit. Brief lock — we
+        // don't hold across the network call.
+        {
+            let mut state = self.state.lock().await;
+            if !force
+                && let Some(last) = state.last_pr_update_at
+                && last.elapsed() < PR_UPDATE_MIN_INTERVAL
+            {
+                tracing::trace!(
+                    phase = %phase,
+                    since_last = ?last.elapsed(),
+                    "PR update debounced",
+                );
+                return;
+            }
+            state.last_pr_update_at = Some(Instant::now());
+        }
+
         let body = format!(
-            ":construction: benchmark `{id}` — **{phase}** (commit `{sha}`)",
+            ":construction: benchmark `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
             id = self.job.id,
             phase = phase,
+            elapsed = format_elapsed(elapsed),
             sha = self.job.head_sha,
         );
         if let Err(e) = self
@@ -220,5 +273,26 @@ impl PhaseListener for CommentPhaseListener {
             // missing the Issues: Write permission.
             tracing::warn!(error = ?e, "phase comment update failed");
         }
+    }
+}
+
+#[async_trait]
+impl PhaseListener for CommentPhaseListener {
+    async fn on_phase(&self, phase: &Phase) {
+        // Terminal phases bypass debounce so the user sees the final
+        // state immediately even if we just edited the comment for a
+        // heartbeat. The "elapsed in current phase" annotation isn't
+        // meaningful here (we've just entered the phase), so pass 0;
+        // the prose still reads naturally as "running for 00:00:00".
+        let force = phase.is_terminal();
+        self.try_update(phase, Duration::ZERO, force)
+            .await;
+    }
+
+    async fn on_heartbeat(&self, phase: &Phase, elapsed: Duration) {
+        // Heartbeats are always debounced — they're inherently a
+        // "still alive" signal and missing one is fine.
+        self.try_update(phase, elapsed, false)
+            .await;
     }
 }

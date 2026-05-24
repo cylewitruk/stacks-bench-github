@@ -35,13 +35,39 @@ use crate::libvirt::tmpfs::ResultsTmpfs;
 use crate::libvirt::virsh::{self, DomState};
 use crate::libvirt::{forensics, git_mirror};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
-const RESULTS_TMPFS_MIB: u32 = 256;
+/// Size of the per-job host tmpfs that holds the virtio-fs results
+/// share. Must accommodate everything the VM writes there before
+/// shutdown: the stacks-bench SQLite store, the `stacks-bench` binary
+/// itself (snapshotted alongside the DB so its schema is always
+/// readable later), the run.json stdout capture, and the phase
+/// journal. Stacks-bench's release binary with `lto=fat` is ~60–100
+/// MiB, so the old 256 MiB ceiling was tight. 5 GiB is generous and
+/// the cost is host RAM only while a job is running; we only ever run
+/// one job concurrently.
+const RESULTS_TMPFS_MIB: u32 = 5120;
 const RESULTS_SHARE_TAG: &str = "results";
+/// Virtio-fs tag for the persistent sccache cache share. Must match
+/// the `<target dir>` element of the second `<filesystem>` block in
+/// the rendered domain XML and the in-VM mount in `sbgh-run.sh.tmpl`.
+const SCCACHE_SHARE_TAG: &str = "sccache";
+/// In-VM mountpoint for the sccache cache share.
+const SCCACHE_MOUNT: &str = "/var/cache/sccache";
+/// `SCCACHE_CACHE_SIZE` value handed to sccache inside the VM. sccache
+/// LRU-evicts to keep the cache dir under this ceiling; the host
+/// `paths.sccache_dir` won't grow past this regardless of how many
+/// jobs run against it.
+const SCCACHE_MAX_SIZE: &str = "20G";
 
 #[async_trait]
 pub trait PhaseListener: Send + Sync {
+    /// Called once per phase transition observed in the in-VM journal.
+    /// Multiple transitions between polls are replayed in order.
     async fn on_phase(&self, phase: &Phase);
+
+    /// Called periodically while the same phase is current, so the
+    /// listener can refresh "still alive, currently in X for Y" UI
+    /// (PR comment, status page, etc.). Default no-op.
+    async fn on_heartbeat(&self, _phase: &Phase, _elapsed: Duration) {}
 }
 
 #[allow(dead_code)] // used by tests; kept on the public surface as a convenience
@@ -132,7 +158,7 @@ impl LibvirtDriver {
         let last_phase = arts
             .tmpfs
             .as_ref()
-            .and_then(|t| phase::read(&t.phase_file()))
+            .and_then(|t| phase::read_last(&t.phase_log()))
             .map(|p| p.label().to_string());
 
         let (sqlite_archived_path, sqlite_size_bytes) = arts
@@ -141,6 +167,62 @@ impl LibvirtDriver {
             .map(|t| {
                 forensics::archive_sqlite(
                     &t.sqlite_file(),
+                    &self
+                        .config
+                        .paths
+                        .results_archive_dir,
+                    &job_id,
+                )
+            })
+            .unwrap_or((None, None));
+
+        // Archive the append-only phase journal alongside the SQLite —
+        // cheap (a few hundred bytes) and makes per-job "how long was
+        // each phase" trivial to answer after the job dir is gone.
+        let (phase_log_archived_path, phase_log_size_bytes) = arts
+            .tmpfs
+            .as_ref()
+            .map(|t| {
+                forensics::archive_phase_log(
+                    &t.phase_log(),
+                    &self
+                        .config
+                        .paths
+                        .results_archive_dir,
+                    &job_id,
+                )
+            })
+            .unwrap_or((None, None));
+
+        // Snapshot the stacks-bench binary that produced this run. The
+        // template `cp`s it into $RESULTS just before phase=done; archive
+        // it next to the SQLite so post-hoc `bench list` / `bench summary`
+        // queries always have the exact-version reader. Missing when the
+        // VM didn't reach the collecting phase (e.g. build failed).
+        let (binary_archived_path, binary_size_bytes) = arts
+            .tmpfs
+            .as_ref()
+            .map(|t| {
+                forensics::archive_binary(
+                    &t.stacks_bench_binary(),
+                    &self
+                        .config
+                        .paths
+                        .results_archive_dir,
+                    &job_id,
+                )
+            })
+            .unwrap_or((None, None));
+
+        // Raw JSON stdout from `stacks-bench bench run --json`. Useful
+        // both for the PR-comment summary builder and as the canonical
+        // human-readable summary of what each run produced.
+        let (run_json_archived_path, run_json_size_bytes) = arts
+            .tmpfs
+            .as_ref()
+            .map(|t| {
+                forensics::archive_run_json(
+                    &t.run_json(),
                     &self
                         .config
                         .paths
@@ -206,8 +288,18 @@ impl LibvirtDriver {
             "last_phase": last_phase,
             "console_tail": console_tail,
             "console_size_bytes": console_size_bytes,
+            "archive_dir": forensics::job_archive_root(
+                &self.config.paths.results_archive_dir,
+                &job_id,
+            ),
             "sqlite_archived_path": sqlite_archived_path,
             "sqlite_size_bytes": sqlite_size_bytes,
+            "binary_archived_path": binary_archived_path,
+            "binary_size_bytes": binary_size_bytes,
+            "run_json_archived_path": run_json_archived_path,
+            "run_json_size_bytes": run_json_size_bytes,
+            "phase_log_archived_path": phase_log_archived_path,
+            "phase_log_size_bytes": phase_log_size_bytes,
         });
 
         // Only an explicit phase=done counts as success. A `shut off` domain
@@ -318,6 +410,9 @@ impl LibvirtDriver {
                 source_mount: "/opt/stacks-core",
                 results_share_tag: RESULTS_SHARE_TAG,
                 results_mount: "/results",
+                sccache_share_tag: SCCACHE_SHARE_TAG,
+                sccache_mount: SCCACHE_MOUNT,
+                sccache_max_size: SCCACHE_MAX_SIZE,
             },
         )
         .await?;
@@ -343,6 +438,8 @@ impl LibvirtDriver {
             cidata_iso_path: &cidata.iso_path,
             results_share_dir: &tmpfs_ref.mount_dir,
             results_share_tag: RESULTS_SHARE_TAG,
+            sccache_share_dir: &self.config.paths.sccache_dir,
+            sccache_share_tag: SCCACHE_SHARE_TAG,
             console_log_path: &console_log,
             network: &self.config.vm.network,
         })?;
@@ -354,10 +451,12 @@ impl LibvirtDriver {
         virsh::start(self.shell.as_ref(), &self.config.paths, domain_name).await?;
         arts.domain_started = true;
 
-        // Poll.
-        let phase_file = tmpfs_ref.phase_file();
+        // Poll the journal + virsh domstate. The phase log is append-
+        // only so we never miss a transition even with multi-second
+        // polling.
+        let phase_log = tmpfs_ref.phase_log();
         let reason = self
-            .poll_to_completion(domain_name, &phase_file, listener)
+            .poll_to_completion(domain_name, &phase_log, listener)
             .await;
         Ok(reason)
     }
@@ -365,7 +464,7 @@ impl LibvirtDriver {
     async fn poll_to_completion(
         &self,
         domain_name: &str,
-        phase_file: &Path,
+        phase_log: &Path,
         listener: &dyn PhaseListener,
     ) -> FinishReason {
         let started = Instant::now();
@@ -374,24 +473,72 @@ impl LibvirtDriver {
                 .vm
                 .job_timeout_secs,
         );
-        let mut last_phase: Option<Phase> = None;
+        let poll_interval = Duration::from_secs(
+            self.config
+                .vm
+                .poll_interval_secs
+                .max(1),
+        );
+        let heartbeat_interval = Duration::from_secs(
+            self.config
+                .vm
+                .heartbeat_interval_secs
+                .max(1),
+        );
+
+        // Where we are in the (append-only) phase journal. The poll loop
+        // advances it after consuming each new line.
+        let mut journal_offset: u64 = 0;
+        // Most recent observed phase + when we first saw it. The
+        // heartbeat reports elapsed time within the current phase, not
+        // wall-clock since job start — operators care about "is the
+        // current step making progress?".
+        let mut current_phase: Option<Phase> = None;
+        let mut current_phase_started: Instant = Instant::now();
+        let mut last_heartbeat: Instant = Instant::now();
 
         loop {
-            if let Some(p) = phase::read(phase_file)
-                && last_phase.as_ref() != Some(&p)
-            {
+            // Replay any new journal entries. Multiple transitions in
+            // one poll window get emitted in order so the listener sees
+            // every state change, not just the most recent.
+            for (_when, p) in phase::read_since(phase_log, &mut journal_offset) {
                 tracing::info!(domain = domain_name, phase = %p, "phase change");
                 listener.on_phase(&p).await;
+                current_phase_started = Instant::now();
+                current_phase = Some(p.clone());
                 if p.is_terminal() {
                     return match p {
                         Phase::Done => FinishReason::PhaseDone,
                         Phase::Error => FinishReason::PhaseError,
-                        _ => unreachable!(),
+                        _ => unreachable!("Phase::is_terminal only returns true for Done/Error"),
                     };
                 }
-                last_phase = Some(p);
             }
 
+            // Heartbeat — periodic liveness signal. INFO log + listener
+            // callback so the PR comment (or whatever) can surface the
+            // elapsed time. Listener is responsible for any throttling
+            // on its own emit side (e.g. PR comments are debounced).
+            if last_heartbeat.elapsed() >= heartbeat_interval
+                && let Some(p) = current_phase.as_ref()
+            {
+                let elapsed = current_phase_started.elapsed();
+                tracing::info!(
+                    domain = domain_name,
+                    phase = %p,
+                    elapsed = %phase::format_elapsed(elapsed),
+                    "heartbeat",
+                );
+                listener
+                    .on_heartbeat(p, elapsed)
+                    .await;
+                last_heartbeat = Instant::now();
+            }
+
+            // VM-state sanity check. If the domain has powered off
+            // without writing a terminal phase to the journal, treat as
+            // a `ShutOff` failure — the run-script either died before
+            // it could `phase "error"` or the kernel/cloud-init panicked.
             match virsh::domstate(self.shell.as_ref(), &self.config.paths, domain_name).await {
                 Ok(DomState::ShutOff) | Ok(DomState::Undefined) => return FinishReason::ShutOff,
                 Ok(_) => {}
@@ -401,7 +548,7 @@ impl LibvirtDriver {
             if started.elapsed() > timeout {
                 return FinishReason::Timeout;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(poll_interval).await;
         }
     }
 
@@ -499,12 +646,17 @@ mod tests {
                 // Big enough that we never reach the timeout in the test.
                 job_timeout_secs: 30,
                 network: "default".into(),
+                // Tight intervals so the test driver doesn't sleep for
+                // multiple seconds between poll iterations.
+                poll_interval_secs: 1,
+                heartbeat_interval_secs: 60,
             },
             paths: PathsConfig {
                 jobs_dir: p.join("jobs"),
                 git_mirror: p.join("mirror.git"),
                 results_tmpfs_root: p.join("tmpfs"),
                 results_archive_dir: p.join("archive"),
+                sccache_dir: p.join("sccache"),
                 virsh_binary: "/usr/bin/virsh".into(),
                 sudo_binary: "/usr/bin/sudo".into(),
                 qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -581,16 +733,16 @@ mod tests {
         let job = fake_job();
 
         // Pre-create the bare mirror so git_mirror::ensure() is a no-op,
-        // and pre-create the tmpfs mount dir + write .phase=done so the
-        // poll loop exits on its very first iteration (the recording shell
-        // can't actually mount the tmpfs).
+        // and pre-create the tmpfs mount dir + write a `.phase-log`
+        // entry of `done` so the poll loop exits on its very first
+        // iteration (the recording shell can't actually mount the tmpfs).
         std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
         let tmpfs_dir = cfg
             .paths
             .results_tmpfs_root
             .join(job.id.to_string());
         std::fs::create_dir_all(&tmpfs_dir).unwrap();
-        std::fs::write(tmpfs_dir.join(".phase"), b"done\n").unwrap();
+        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 done\n").unwrap();
 
         let shell = Arc::new(happy_path_shell());
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
@@ -688,9 +840,10 @@ mod tests {
             .results_tmpfs_root
             .join(job.id.to_string());
         std::fs::create_dir_all(&tmpfs_dir).unwrap();
-        // Note: no .phase file pre-written. The poll loop sees no phase, then
-        // queries virsh domstate, which we'll return as "shut off". This
-        // simulates a VM that crashed before writing phase=done.
+        // Note: no .phase-log pre-written. The poll loop finds an empty
+        // journal, then queries virsh domstate, which we'll return as
+        // "shut off". This simulates a VM that crashed before writing
+        // any phase entries.
 
         let shell = Arc::new(RecordingShell::new());
         shell
@@ -752,7 +905,7 @@ mod tests {
         std::fs::create_dir_all(&tmpfs_dir).unwrap();
         // Phase=error → driver should classify the outcome as Failed but
         // still go through cleanup + return Ok.
-        std::fs::write(tmpfs_dir.join(".phase"), b"error\n").unwrap();
+        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 error\n").unwrap();
         // Drop a small console.log into the job dir so we can verify
         // the tail makes it into the summary.
         let job_dir = cfg

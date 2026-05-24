@@ -108,6 +108,7 @@ vars = {
     "CFG_VM_MEMORY":     g("vm.memory_gib", 8),
     "CFG_JOBS_DIR":      g("paths.jobs_dir", "/var/lib/sbgh/jobs"),
     "CFG_RESULTS_DIR":   g("paths.results_archive_dir", "/var/lib/sbgh/results"),
+    "CFG_SCCACHE_DIR":   g("paths.sccache_dir", "/var/lib/sbgh/sccache"),
     "CFG_GIT_MIRROR":    g("paths.git_mirror", "/var/lib/sbgh/git/stacks-core.git"),
     "CFG_TMPFS_ROOT":    g("paths.results_tmpfs_root", "/run/sbgh/jobs"),
     "CFG_VIRSH":         g("paths.virsh_binary", "/usr/bin/virsh"),
@@ -243,7 +244,7 @@ fi
 
 # ─── 5. Filesystem paths ───────────────────────────────────────────────
 section "5. Filesystem paths"
-for p in "$CFG_JOBS_DIR" "$CFG_RESULTS_DIR" "$CFG_TMPFS_ROOT"; do
+for p in "$CFG_JOBS_DIR" "$CFG_RESULTS_DIR" "$CFG_TMPFS_ROOT" "$CFG_SCCACHE_DIR"; do
     if [[ -d "$p" ]]; then
         owner=$(stat -c '%U:%G' "$p" 2>/dev/null)
         mode=$(stat -c '%a' "$p" 2>/dev/null)
@@ -256,6 +257,14 @@ for p in "$CFG_JOBS_DIR" "$CFG_RESULTS_DIR" "$CFG_TMPFS_ROOT"; do
         fail "$p does not exist  → install -d -m 0755 -o $CFG_SERVICE_USER -g $CFG_SERVICE_USER $p"
     fi
 done
+
+# sccache cache disk usage — interesting once jobs have populated it. Just
+# informational; the cache is self-capping via SCCACHE_CACHE_SIZE inside
+# the VM so it can't run away here.
+if [[ -d "$CFG_SCCACHE_DIR" ]]; then
+    sccache_size=$(du -sh "$CFG_SCCACHE_DIR" 2>/dev/null | awk '{print $1}')
+    info "sccache cache currently $sccache_size in use at $CFG_SCCACHE_DIR"
+fi
 
 # git mirror parent dir (the .git itself may not exist until first job)
 git_mirror_parent=$(dirname "$CFG_GIT_MIRROR")

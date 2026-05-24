@@ -1,0 +1,65 @@
+[Unit]
+Description=stacks-bench-github orchestrator (libvirt benchmark runner)
+Documentation=https://github.com/cylewitruk/stacks-bench-github
+# Wait for the prerequisites the orchestrator immediately touches:
+#   - network-online: GitHub API + git fetches
+#   - libvirtd:       virsh define/start/destroy
+#   - docker:         postgres (job queue) + handler run in containers;
+#                     the orchestrator's DB pool retries on failure but we
+#                     start after docker so the normal boot order doesn't race.
+After=network-online.target libvirtd.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sbgh
+Group=sbgh
+WorkingDirectory=/var/lib/sbgh
+ExecStart=/usr/local/bin/sbgh-orchestrator
+
+# Restart with a delay on crash so we don't tight-loop if e.g. the DB
+# config is wrong. Per-job failures don't crash the orchestrator (they're
+# logged + DB-recorded); a Rust panic or unwrap somewhere does.
+Restart=on-failure
+RestartSec=10s
+
+# Logs go to journald — view with:
+#   journalctl -u sbgh-orchestrator -f
+#   journalctl -u sbgh-orchestrator -p info --since '1h ago'
+StandardOutput=journal
+StandardError=journal
+
+# Default RUST_LOG. Override per-host in /etc/systemd/system/sbgh-orchestrator.service.d/override.conf
+# (use `systemctl edit sbgh-orchestrator` to create it).
+Environment=RUST_LOG=info,sbgh_orchestrator=info,sqlx=warn
+
+# ─── Hardening ──────────────────────────────────────────────────────────
+#
+# The orchestrator only legitimately needs:
+#   read:  /etc/sbgh/orchestrator/, /var/lib/libvirt/images/ (golden qcow2),
+#          /var/lib/sbgh/git/, the workspace binary itself
+#   write: /var/lib/sbgh/{jobs,results,git}, /run/sbgh/{jobs,...}
+# Plus escalation via sudo for lvcreate/mount/virsh/etc.
+#
+# NoNewPrivileges MUST stay false: sudo is a setuid binary, and our
+# orchestrator->sudo->lvcreate chain depends on the privilege change.
+NoNewPrivileges=false
+# Protect everything else.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sbgh /run/sbgh
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=false   # see NoNewPrivileges note above
+
+# Resource ceiling. The orchestrator process itself is tiny (~30 MB
+# typical); these limits are a tripwire for a runaway leak, not a
+# sizing knob. The per-job VMs are libvirt-managed separately and
+# unaffected by these.
+MemoryHigh=256M
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

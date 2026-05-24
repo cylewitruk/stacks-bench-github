@@ -134,6 +134,13 @@ PACKAGES=(
     clang
     zstd
     protobuf-compiler
+    # sccache caches rustc output to a persistent per-host dir bind-
+    # mounted from the orchestrator via virtio-fs (tag=`sccache`,
+    # mount=/var/cache/sccache). RUSTC_WRAPPER=sccache + SCCACHE_DIR
+    # are exported by sbgh-run.sh.tmpl before `cargo build`, so cold
+    # builds in subsequent jobs hit the cache and finish in single-
+    # digit minutes instead of ~35.
+    sccache
 )
 
 # Workdir for the seed ISO + console log + domain XML must be readable by

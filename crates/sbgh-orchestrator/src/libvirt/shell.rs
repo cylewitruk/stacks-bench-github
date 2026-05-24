@@ -101,7 +101,12 @@ impl Shell for SystemShell {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        tracing::debug!(?cmd, "executing");
+        // TRACE rather than DEBUG: the orchestrator polls `virsh
+        // domstate` every few seconds for the duration of every job,
+        // so per-command logging at DEBUG buries the actually-useful
+        // phase-change / heartbeat / failure lines. Re-enable with
+        // RUST_LOG=trace if you need the per-invocation detail.
+        tracing::trace!(?cmd, "executing");
         let mut child = command.spawn()?;
         if let Some(input) = cmd.stdin
             && let Some(mut sin) = child.stdin.take()
