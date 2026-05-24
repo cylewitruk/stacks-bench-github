@@ -63,6 +63,15 @@ chown -R root:root "$SRC" || die "chown $SRC to root failed"
 mkdir -p "$CHAIN"
 mount -t xfs /dev/vdb "$CHAIN" || die "failed to mount chainstate xfs"
 
+# stacks-bench's `--source` flag wants the directory CONTAINING the
+# `chainstate/` folder (not the chainstate dir itself). Hiro's tarballs
+# unpack with a network-name wrapper (`mainnet/chainstate/...`,
+# `testnet/chainstate/...`), so the actual source dir is one level
+# under the LV mount. Probe for it instead of hardcoding `mainnet`
+# so the same script works for testnet / regtest snapshots later.
+SBGH_SOURCE_DIR=$(find "$CHAIN" -maxdepth 3 -mindepth 1 -name chainstate -type d -printf '%h\n' 2>/dev/null | head -1)
+[[ -n "$SBGH_SOURCE_DIR" ]] || die "couldn't locate chainstate/ under $CHAIN"
+
 # --- build stacks-bench from the checked-out source ----------------------------------
 phase "building"
 cd "$SRC"
@@ -99,7 +108,7 @@ phase "running"
     --json \
     --db "$RESULTS" \
     bench run \
-    --source "$CHAIN" \
+    --source "$SBGH_SOURCE_DIR" \
     --dangerous-no-chainstate-copy \
     "${EXTRA_ARGS[@]}" \
     > "$RESULTS/run.json" \
