@@ -25,10 +25,10 @@ use sbgh_core::config::OrchestratorConfig;
 use sbgh_core::models::Job;
 
 use crate::libvirt::boot::BootDisk;
-use crate::libvirt::cloudinit::{CloudInitArtifacts, CloudInitParams};
+use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitCommon};
 use crate::libvirt::domain::{self, DomainSpec};
 use crate::libvirt::lvm::ChainstateSnapshot;
-use crate::libvirt::phase::{self, Phase};
+use crate::libvirt::phase::{self, Phase, PollMode};
 use crate::libvirt::shell::{Shell, spec_priv};
 use crate::libvirt::source::SourceDisk;
 use crate::libvirt::tmpfs::ResultsTmpfs;
@@ -336,19 +336,89 @@ impl LibvirtDriver {
         arts: &mut JobArtifacts,
         listener: &dyn PhaseListener,
     ) -> anyhow::Result<FinishReason> {
+        // ── one-time provisioning shared by both phases ────────────────
+        let cidata = self
+            .provision_artifacts(job, job_id, job_dir, arts)
+            .await?;
+
+        // ── phase 1: build VM ─────────────────────────────────────────
+        // Succeeds on phase=build_done OR (ShutOff after seeing
+        // BuildDone). Anything else (error phase, ShutOff without
+        // BuildDone, timeout) aborts the whole job — no bench attempt.
+        let build_reason = self
+            .run_phase(
+                "build",
+                PollMode::Build,
+                self.config.vm.build_vcpus,
+                self.config
+                    .vm
+                    .build_memory
+                    .as_bytes(),
+                &cidata.build_iso_path,
+                job_dir,
+                domain_name,
+                arts,
+                listener,
+            )
+            .await?;
+        match build_reason {
+            FinishReason::PhaseDone => {
+                // success path — fall through to bench
+            }
+            other => return Ok(other),
+        }
+
+        // ── phase 2: bench VM ─────────────────────────────────────────
+        // Same domain name, redefined at bench memory + cidata. The
+        // existing boot/source/chainstate/tmpfs/sccache stay attached
+        // by virtue of being referenced in the new XML.
+        let bench_reason = self
+            .run_phase(
+                "bench",
+                PollMode::Bench,
+                self.config.vm.bench_vcpus,
+                self.config
+                    .vm
+                    .bench_memory
+                    .as_bytes(),
+                &cidata.bench_iso_path,
+                job_dir,
+                domain_name,
+                arts,
+                listener,
+            )
+            .await?;
+        Ok(bench_reason)
+    }
+
+    /// One-time provisioning: artifacts that live across both VM
+    /// lifecycles (boot disk, source disk, chainstate snapshot, results
+    /// tmpfs) + the two cidata ISOs.
+    async fn provision_artifacts(
+        &self,
+        job: &Job,
+        job_id: &str,
+        job_dir: &Path,
+        arts: &mut JobArtifacts,
+    ) -> anyhow::Result<CloudInitArtifacts> {
         // Git mirror.
         let repo_url = format!("https://github.com/{}.git", job.repository);
         git_mirror::ensure(self.shell.as_ref(), &self.config.paths, &repo_url).await?;
         git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, &job.head_sha)
             .await?;
 
-        // Boot disk.
+        // Boot disk — single qcow2 overlay reused across both phases.
+        // The bench VM boots from the same disk the build VM left
+        // behind; cloud-init's per-instance-id re-run is the mechanism
+        // that gets a different script executed on the second boot.
         arts.boot = Some(
             BootDisk::provision(self.shell.as_ref(), &self.config.paths, &self.config.vm, job_dir)
                 .await?,
         );
 
-        // Source disk.
+        // Source disk — persists across both phases. Build phase puts
+        // `target/release/stacks-bench` on it; bench phase finds it
+        // already there.
         let source_mount = job_dir.join("source.mnt");
         arts.source = Some(
             SourceDisk::provision(
@@ -365,12 +435,15 @@ impl LibvirtDriver {
             .await?,
         );
 
-        // Chainstate snapshot.
+        // Chainstate snapshot — only the bench phase mounts it, but
+        // the device is attached to the domain in both phases (build
+        // phase ignores it). Saves a domain-XML difference.
         arts.chainstate = Some(
             ChainstateSnapshot::provision(self.shell.as_ref(), &self.config.lvm, job_id).await?,
         );
 
-        // Results tmpfs.
+        // Results tmpfs — shared between phases. Phase journal lives
+        // here, so both VMs append to the same `.phase-log`.
         arts.tmpfs = Some(
             ResultsTmpfs::mount(
                 self.shell.as_ref(),
@@ -385,7 +458,8 @@ impl LibvirtDriver {
             .await?,
         );
 
-        // Cloud-init ISO.
+        // Cloud-init: two ISOs, one per phase, distinct instance-ids
+        // so cloud-init re-runs user-data on the second boot.
         let stacks_bench_args = derive_stacks_bench_args(
             job,
             &self
@@ -393,19 +467,13 @@ impl LibvirtDriver {
                 .stacks_bench
                 .default_args,
         );
-        let tmpfs_ref = arts.tmpfs.as_ref().unwrap();
-        let chainstate_ref = arts
-            .chainstate
-            .as_ref()
-            .unwrap();
         let cidata = CloudInitArtifacts::build(
             self.shell.as_ref(),
             &self.config.paths,
             job_dir,
-            &CloudInitParams {
+            &CloudInitCommon {
                 job_id,
                 head_sha: &job.head_sha,
-                stacks_bench_args: &stacks_bench_args,
                 chainstate_mount: "/var/lib/stacks-chainstate",
                 source_mount: "/opt/stacks-core",
                 results_share_tag: RESULTS_SHARE_TAG,
@@ -414,28 +482,67 @@ impl LibvirtDriver {
                 sccache_mount: SCCACHE_MOUNT,
                 sccache_max_size: SCCACHE_MAX_SIZE,
             },
+            &BenchPhaseParams {
+                stacks_bench_args: &stacks_bench_args,
+            },
         )
         .await?;
+        Ok(cidata)
+    }
 
-        // Render + write XML.
+    /// Render the domain XML at this phase's memory/vcpu/cidata,
+    /// `virsh define` (replaces any prior inactive definition for the
+    /// same name), `virsh start`, then poll until success-or-failure.
+    ///
+    /// On clean exit (success or per-phase failure), this returns
+    /// `Ok(FinishReason)`. The caller decides whether to continue to
+    /// the next phase based on which `FinishReason` came back.
+    ///
+    /// We intentionally do NOT undefine the domain here — that
+    /// happens in teardown. `virsh define` on the next call replaces
+    /// the existing inactive definition with the new XML.
+    #[allow(clippy::too_many_arguments)] // top-level orchestration; readability wins
+    async fn run_phase(
+        &self,
+        phase_label: &'static str,
+        mode: PollMode,
+        vcpus: u32,
+        memory_bytes: u64,
+        cidata_iso_path: &Path,
+        job_dir: &Path,
+        domain_name: &str,
+        arts: &mut JobArtifacts,
+        listener: &dyn PhaseListener,
+    ) -> anyhow::Result<FinishReason> {
+        tracing::info!(domain = domain_name, phase_lifecycle = phase_label, "starting phase");
+
+        let tmpfs_ref = arts
+            .tmpfs
+            .as_ref()
+            .expect("tmpfs provisioned before run_phase");
+        let chainstate_ref = arts
+            .chainstate
+            .as_ref()
+            .expect("chainstate provisioned before run_phase");
+        let boot_ref = arts
+            .boot
+            .as_ref()
+            .expect("boot provisioned before run_phase");
+        let source_ref = arts
+            .source
+            .as_ref()
+            .expect("source provisioned before run_phase");
+
         let console_log = job_dir.join("console.log");
-        let domain_xml_path = job_dir.join("domain.xml");
+        let domain_xml_path = job_dir.join(format!("domain.{phase_label}.xml"));
         let xml = domain::render(&DomainSpec {
             name: domain_name,
-            vcpus: self.config.vm.vcpus,
-            memory_gib: self.config.vm.memory_gib,
-            boot_disk_path: &arts
-                .boot
-                .as_ref()
-                .unwrap()
-                .path,
+            vcpus,
+            memory_bytes,
+            boot_disk_path: &boot_ref.path,
             chainstate_dev_path: &chainstate_ref.device,
-            source_disk_path: &arts
-                .source
-                .as_ref()
-                .unwrap()
-                .path,
-            cidata_iso_path: &cidata.iso_path,
+            source_disk_path: &source_ref.path,
+            cidata_iso_path,
             results_share_dir: &tmpfs_ref.mount_dir,
             results_share_tag: RESULTS_SHARE_TAG,
             sccache_share_dir: &self.config.paths.sccache_dir,
@@ -445,18 +552,14 @@ impl LibvirtDriver {
         })?;
         std::fs::write(&domain_xml_path, &xml)?;
 
-        // Define + start.
         virsh::define(self.shell.as_ref(), &self.config.paths, &domain_xml_path).await?;
         arts.domain_defined = true;
         virsh::start(self.shell.as_ref(), &self.config.paths, domain_name).await?;
         arts.domain_started = true;
 
-        // Poll the journal + virsh domstate. The phase log is append-
-        // only so we never miss a transition even with multi-second
-        // polling.
         let phase_log = tmpfs_ref.phase_log();
         let reason = self
-            .poll_to_completion(domain_name, &phase_log, listener)
+            .poll_to_completion(domain_name, &phase_log, listener, mode)
             .await;
         Ok(reason)
     }
@@ -466,6 +569,7 @@ impl LibvirtDriver {
         domain_name: &str,
         phase_log: &Path,
         listener: &dyn PhaseListener,
+        mode: PollMode,
     ) -> FinishReason {
         let started = Instant::now();
         let timeout = Duration::from_secs(
@@ -487,7 +591,13 @@ impl LibvirtDriver {
         );
 
         // Where we are in the (append-only) phase journal. The poll loop
-        // advances it after consuming each new line.
+        // advances it after consuming each new line. The journal is
+        // shared across both VMs (it lives on the results tmpfs); we
+        // start at offset 0 each phase but `read_since` is idempotent —
+        // any entries from the previous phase that we re-replay get
+        // listener-emitted, which is fine (CommentPhaseListener
+        // debounces) and aligns the heartbeat's "current phase" with
+        // reality from a fresh poll perspective.
         let mut journal_offset: u64 = 0;
         // Most recent observed phase + when we first saw it. The
         // heartbeat reports elapsed time within the current phase, not
@@ -496,6 +606,13 @@ impl LibvirtDriver {
         let mut current_phase: Option<Phase> = None;
         let mut current_phase_started: Instant = Instant::now();
         let mut last_heartbeat: Instant = Instant::now();
+        // True once we've seen the success phase for this `mode`. A
+        // subsequent clean ShutOff is then "success poweroff" rather
+        // than a "VM died unexpectedly" failure. The build VM
+        // *deliberately* powers off after writing BuildDone (via
+        // cloud-init power_state); we don't want that to look like
+        // crash.
+        let mut success_phase_seen = false;
 
         loop {
             // Replay any new journal entries. Multiple transitions in
@@ -506,12 +623,18 @@ impl LibvirtDriver {
                 listener.on_phase(&p).await;
                 current_phase_started = Instant::now();
                 current_phase = Some(p.clone());
-                if p.is_terminal() {
-                    return match p {
-                        Phase::Done => FinishReason::PhaseDone,
-                        Phase::Error => FinishReason::PhaseError,
-                        _ => unreachable!("Phase::is_terminal only returns true for Done/Error"),
-                    };
+
+                if p == Phase::Error {
+                    return FinishReason::PhaseError;
+                }
+                if p.is_success_for(mode) {
+                    success_phase_seen = true;
+                    // We DON'T return immediately on success — the VM
+                    // is still powering off (cloud-init's poweroff
+                    // takes a few seconds after the script exits). We
+                    // let the next domstate poll detect the ShutOff,
+                    // which we then map to PhaseDone because
+                    // `success_phase_seen` is true.
                 }
             }
 
@@ -535,12 +658,20 @@ impl LibvirtDriver {
                 last_heartbeat = Instant::now();
             }
 
-            // VM-state sanity check. If the domain has powered off
-            // without writing a terminal phase to the journal, treat as
-            // a `ShutOff` failure — the run-script either died before
-            // it could `phase "error"` or the kernel/cloud-init panicked.
+            // VM-state sanity check. If the domain has powered off:
+            //   - success_phase_seen=true  → clean exit, treat as PhaseDone (build VM does
+            //     this every successful run; bench VM also does this).
+            //   - success_phase_seen=false → VM died without writing the success phase. The
+            //     run-script either died before it could `phase "error"` or the
+            //     kernel/cloud-init panicked. Treat as ShutOff failure.
             match virsh::domstate(self.shell.as_ref(), &self.config.paths, domain_name).await {
-                Ok(DomState::ShutOff) | Ok(DomState::Undefined) => return FinishReason::ShutOff,
+                Ok(DomState::ShutOff) | Ok(DomState::Undefined) => {
+                    return if success_phase_seen {
+                        FinishReason::PhaseDone
+                    } else {
+                        FinishReason::ShutOff
+                    };
+                }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "domstate poll failed"),
             }
@@ -640,8 +771,10 @@ mod tests {
             },
             vm: VmConfig {
                 golden_image: p.join("golden.qcow2"),
-                vcpus: 2,
-                memory_gib: 8,
+                build_vcpus: 4,
+                bench_vcpus: 2,
+                build_memory: sbgh_core::memory::MemorySize::from_gib(16),
+                bench_memory: sbgh_core::memory::MemorySize::from_gib(8),
                 boot_disk_gib: 64,
                 // Big enough that we never reach the timeout in the test.
                 job_timeout_secs: 30,
@@ -695,7 +828,11 @@ mod tests {
     }
 
     /// Build a shell that returns canned outputs in the order the driver
-    /// will issue them, all the way through provisioning, virsh, and teardown.
+    /// will issue them, all the way through provisioning, both VM
+    /// lifecycles, and teardown. The test pre-writes the phase log
+    /// with both `build_done` and `done` so each poll loop sees its
+    /// success phase on iteration 1; the very next domstate poll
+    /// returns ShutOff (success-poweroff) which we map to PhaseDone.
     fn happy_path_shell() -> RecordingShell {
         let shell = RecordingShell::new();
         shell
@@ -714,10 +851,18 @@ mod tests {
             .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
             .expect_ok(1) // lvcreate snapshot
             .expect_ok(1) // mount tmpfs
-            .expect_ok(1) // cloud-localds
-            .expect_ok(1) // virsh define
-            .expect_ok(1) // virsh start
-            // poll loop exits on first iter when .phase=done; no domstate calls
+            // Two cloud-localds calls — one per cidata ISO (build, bench).
+            .expect_ok(1) // cloud-localds (build)
+            .expect_ok(1) // cloud-localds (bench)
+            // ── build VM lifecycle ──────────────────────────────────
+            .expect_ok(1) // virsh define (build)
+            .expect_ok(1) // virsh start (build)
+            .reply(PreparedReply::with_stdout("shut off\n")) // virsh domstate (build poll, ShutOff after seeing BuildDone)
+            // ── bench VM lifecycle ──────────────────────────────────
+            .expect_ok(1) // virsh define (bench, replaces inactive build def)
+            .expect_ok(1) // virsh start (bench)
+            .reply(PreparedReply::with_stdout("shut off\n")) // virsh domstate (bench poll, ShutOff after seeing Done)
+            // ── teardown ────────────────────────────────────────────
             .expect_ok(1) // virsh destroy
             .expect_ok(1) // virsh undefine
             .expect_ok(1) // umount tmpfs
@@ -742,7 +887,11 @@ mod tests {
             .results_tmpfs_root
             .join(job.id.to_string());
         std::fs::create_dir_all(&tmpfs_dir).unwrap();
-        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 done\n").unwrap();
+        // Two-phase happy path: build VM writes `build_done`, then bench
+        // VM writes `done`. Both pre-seeded so each phase's poll loop
+        // observes its success phase on the first read.
+        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 build_done\n1700000060 done\n")
+            .unwrap();
 
         let shell = Arc::new(happy_path_shell());
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
@@ -787,14 +936,22 @@ mod tests {
             "lvs",           // chainstate: pick base
             "lvcreate",      // chainstate: snapshot
             "mount",         // tmpfs mount
-            "cloud-localds", // cidata ISO
-            "virsh",         // define
-            "virsh",         // start
-            "virsh",         // destroy
-            "virsh",         // undefine
-            "umount",        // tmpfs unmount
-            "lvremove",      // chainstate teardown
-            "git",           // mirror prune
+            "cloud-localds", // cidata ISO (build)
+            "cloud-localds", // cidata ISO (bench)
+            // build phase
+            "virsh", // define (build)
+            "virsh", // start (build)
+            "virsh", // domstate poll → ShutOff after BuildDone
+            // bench phase — same domain redefined with new memory + cidata
+            "virsh", // define (bench)
+            "virsh", // start (bench)
+            "virsh", // domstate poll → ShutOff after Done
+            // teardown
+            "virsh",    // destroy
+            "virsh",    // undefine
+            "umount",   // tmpfs unmount
+            "lvremove", // chainstate teardown
+            "git",      // mirror prune
         ];
         assert_eq!(programs, expected, "command order mismatch");
 

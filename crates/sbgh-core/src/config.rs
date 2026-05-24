@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory::MemorySize;
 use crate::{Error, Result};
 
 /// Default on-disk path for the handler's TOML config. Bind-mounted into the
@@ -182,8 +183,28 @@ pub struct GitHubConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
     pub golden_image: PathBuf,
-    pub vcpus: u32,
-    pub memory_gib: u32,
+    /// vCPUs allocated for the **build phase**. Cargo parallelises
+    /// across cores; more vCPUs ≈ faster cargo. Defaults to 4.
+    pub build_vcpus: u32,
+    /// vCPUs allocated for the **bench phase**. Should match the
+    /// production deployment shape — a stacks-node typically runs on
+    /// 2–4 cores in prod, so the bench is meaningless if measured
+    /// against 16+ cores worth of parallel block validation. Defaults
+    /// to 2.
+    pub bench_vcpus: u32,
+    /// Memory the VM gets for its **build phase**. Stacks-core's
+    /// `lto=fat` release link of `stacks-bench` peaks at ~7.6 GiB
+    /// RSS; 16G is the practical floor (lower OOM-kills the build).
+    /// Accepts the IEC short-form syntax (e.g. `"16G"`, `"8192M"`).
+    pub build_memory: MemorySize,
+    /// Memory the VM gets for its **bench phase** — typically smaller
+    /// than `build_memory` to match the production deployment size
+    /// that's being measured. Page cache + kernel memory pressure
+    /// directly affect block-replay timing, so running the bench at
+    /// build memory would make the numbers non-representative of
+    /// production. Defaults to `"8G"` (the stacks-node prod target).
+    /// Same syntax as `build_memory`.
+    pub bench_memory: MemorySize,
     pub boot_disk_gib: u32,
     pub job_timeout_secs: u64,
     /// libvirt network to attach to the VM (default: `default`, NAT outbound).
@@ -294,8 +315,10 @@ struct RawGitHub {
 #[serde(default, deny_unknown_fields)]
 struct RawVm {
     golden_image: Option<PathBuf>,
-    vcpus: Option<u32>,
-    memory_gib: Option<u32>,
+    build_vcpus: Option<u32>,
+    bench_vcpus: Option<u32>,
+    build_memory: Option<MemorySize>,
+    bench_memory: Option<MemorySize>,
     boot_disk_gib: Option<u32>,
     job_timeout_secs: Option<u64>,
     network: Option<String>,
@@ -343,8 +366,10 @@ impl RawOrchestrator {
         merge_opt(&mut self.github.private_key_path, other.github.private_key_path);
 
         merge_opt(&mut self.vm.golden_image, other.vm.golden_image);
-        merge_opt(&mut self.vm.vcpus, other.vm.vcpus);
-        merge_opt(&mut self.vm.memory_gib, other.vm.memory_gib);
+        merge_opt(&mut self.vm.build_vcpus, other.vm.build_vcpus);
+        merge_opt(&mut self.vm.bench_vcpus, other.vm.bench_vcpus);
+        merge_opt(&mut self.vm.build_memory, other.vm.build_memory);
+        merge_opt(&mut self.vm.bench_memory, other.vm.bench_memory);
         merge_opt(&mut self.vm.boot_disk_gib, other.vm.boot_disk_gib);
         merge_opt(&mut self.vm.job_timeout_secs, other.vm.job_timeout_secs);
         merge_opt(&mut self.vm.network, other.vm.network);
@@ -417,8 +442,10 @@ impl RawOrchestrator {
         env_path_into(&mut self.github.private_key_path, "SBGH_GH_PRIVATE_KEY_PATH");
 
         env_path_into(&mut self.vm.golden_image, "SBGH_VM_GOLDEN_IMAGE");
-        env_parse_into(&mut self.vm.vcpus, "SBGH_VM_VCPUS");
-        env_parse_into(&mut self.vm.memory_gib, "SBGH_VM_MEMORY_GIB");
+        env_parse_into(&mut self.vm.build_vcpus, "SBGH_VM_BUILD_VCPUS");
+        env_parse_into(&mut self.vm.bench_vcpus, "SBGH_VM_BENCH_VCPUS");
+        env_parse_into(&mut self.vm.build_memory, "SBGH_VM_BUILD_MEMORY");
+        env_parse_into(&mut self.vm.bench_memory, "SBGH_VM_BENCH_MEMORY");
         env_parse_into(&mut self.vm.boot_disk_gib, "SBGH_VM_BOOT_DISK_GIB");
         env_parse_into(&mut self.vm.job_timeout_secs, "SBGH_VM_JOB_TIMEOUT_SECS");
         env_into(&mut self.vm.network, "SBGH_VM_NETWORK");
@@ -489,14 +516,27 @@ impl RawOrchestrator {
             },
             vm: VmConfig {
                 golden_image: required(self.vm.golden_image, "[vm].golden_image")?,
-                vcpus: self.vm.vcpus.unwrap_or(2),
-                // 16 GiB floor: stacks-bench's final-link rustc holds
-                // ~7.6 GiB RSS under stacks-core's `lto=fat` release
-                // profile. Anything less OOM-kills the build.
-                memory_gib: self
+                // Build phase defaults — give cargo plenty of parallelism
+                // and headroom; 16 GiB is the rustc-link-OOM floor for
+                // stacks-core's lto=fat release profile.
+                build_vcpus: self
                     .vm
-                    .memory_gib
-                    .unwrap_or(16),
+                    .build_vcpus
+                    .unwrap_or(4),
+                build_memory: self
+                    .vm
+                    .build_memory
+                    .unwrap_or_else(|| MemorySize::from_gib(16)),
+                // Bench phase defaults match the production stacks-node
+                // deployment shape so per-block timings are representative.
+                bench_vcpus: self
+                    .vm
+                    .bench_vcpus
+                    .unwrap_or(2),
+                bench_memory: self
+                    .vm
+                    .bench_memory
+                    .unwrap_or_else(|| MemorySize::from_gib(8)),
                 boot_disk_gib: self
                     .vm
                     .boot_disk_gib
@@ -803,17 +843,25 @@ mod tests {
         let cfg = OrchestratorConfig::load_layered(None).unwrap();
         assert_eq!(cfg.github.client_id, "Iv23litest123");
         assert_eq!(cfg.lvm.vg_name, "sbgh-vg");
-        assert_eq!(cfg.vm.vcpus, 2);
+        // Default split: 4 vCPU / 16 GiB for build, 2 vCPU / 8 GiB for bench.
+        assert_eq!(cfg.vm.build_vcpus, 4);
+        assert_eq!(cfg.vm.bench_vcpus, 2);
+        assert_eq!(cfg.vm.build_memory, crate::memory::MemorySize::from_gib(16));
+        assert_eq!(cfg.vm.bench_memory, crate::memory::MemorySize::from_gib(8));
     }
 
     #[test]
     fn orchestrator_env_overrides_toml() {
+        // Env wins on collision for both vcpus AND memory; memory parses
+        // the IEC short-form ("12G") the same way the TOML loader does.
         let mut env = orch_env();
-        env.push(("SBGH_VM_VCPUS", "12"));
+        env.push(("SBGH_VM_BUILD_VCPUS", "12"));
+        env.push(("SBGH_VM_BUILD_MEMORY", "24G"));
         let _g = EnvGuard::set(&env);
-        let f = write("[vm]\nvcpus = 4\n");
+        let f = write("[vm]\nbuild_vcpus = 4\nbuild_memory = \"16G\"\n");
         let cfg = OrchestratorConfig::load_layered(Some(f.path())).unwrap();
-        assert_eq!(cfg.vm.vcpus, 12);
+        assert_eq!(cfg.vm.build_vcpus, 12);
+        assert_eq!(cfg.vm.build_memory, crate::memory::MemorySize::from_gib(24));
     }
 
     #[test]

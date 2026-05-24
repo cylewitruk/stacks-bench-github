@@ -1,0 +1,102 @@
+#!/bin/bash
+# In-VM cloud-init script for the **bench phase** of a job. Runs on
+# the second boot of the per-job VM, after the build phase powered
+# off and the orchestrator redefined the domain at `bench_memory` /
+# `bench_vcpus`. Distinct instance-id (sbgh-<job-id>-bench) makes
+# cloud-init treat this as a fresh instance and re-run user-data.
+#
+# The bench phase deliberately runs at the production deployment
+# shape (smaller memory + vcpus) — running the bench against the
+# build phase's resources would inflate the page cache and skew
+# per-block timings vs what stacks-node sees in production.
+#
+# What this phase does:
+#   - mount source disk (already has target/release/stacks-bench from build)
+#   - mount chainstate snapshot
+#   - mount results share (continuation of the same phase log)
+#   - run stacks-bench against the chainstate
+#   - write phase=done; poweroff
+#
+# Phases written to {{ results_mount }}/.phase-log:
+#   starting    → mounts complete (this is the second `starting`; first was build)
+#   running     → stacks-bench is executing
+#   collecting  → sqlite finalise / sync
+#   done        → terminal; orchestrator does forensics + teardown next
+
+set -euo pipefail
+
+HEAD_SHA="{{ head_sha }}"
+SRC="{{ source_mount }}"
+CHAIN="{{ chainstate_mount }}"
+RESULTS="{{ results_mount }}"
+SHARE_TAG="{{ results_share_tag }}"
+
+read -r -a EXTRA_ARGS <<<"{{ stacks_bench_args }}"
+
+PHASE_LOG="$RESULTS/.phase-log"
+phase()  { printf '%s %s\n' "$(date +%s)" "$1" >> "$PHASE_LOG"; sync; }
+die()    { phase "error"; echo "ERROR: $*" >&2; exit 1; }
+
+# --- mount results share (virtio-fs) ------------------------------------------------
+mkdir -p "$RESULTS"
+mount -t virtiofs "$SHARE_TAG" "$RESULTS" || die "failed to mount virtio-fs $SHARE_TAG"
+phase "starting"
+
+# --- mount source disk (vdc) --------------------------------------------------------
+# Already chown'd to root by the build phase + has target/release/
+# populated; we just mount it as-is.
+mkdir -p "$SRC"
+mount /dev/disk/by-label/sbgh-src "$SRC" || die "failed to mount source disk"
+
+# --- mount chainstate snapshot (vdb) ------------------------------------------------
+mkdir -p "$CHAIN"
+mount -t xfs /dev/vdb "$CHAIN" || die "failed to mount chainstate xfs"
+
+# Prove the chainstate is writable. stacks-bench needs to commit
+# mini-fork blocks; if any layer (LVM snapshot, domain XML disk,
+# xfs mount) regressed to read-only we want a loud failure here
+# instead of a cryptic sqlite error 10+ min into the run.
+PROBE="$CHAIN/.sbgh-write-probe"
+touch "$PROBE" 2>/dev/null \
+    || die "chainstate mount at $CHAIN is read-only — check LVM snapshot, domain XML, and mount opts"
+rm -f "$PROBE"
+
+# stacks-bench's --source flag wants the dir CONTAINING `chainstate/`.
+# Hiro tarballs unpack with a network-name wrapper (mainnet/chainstate/...);
+# probe so the same script works for testnet/regtest snapshots too.
+SBGH_SOURCE_DIR=$(find "$CHAIN" -maxdepth 3 -mindepth 1 -name chainstate -type d -printf '%h\n' 2>/dev/null | head -1)
+[[ -n "$SBGH_SOURCE_DIR" ]] || die "couldn't locate chainstate/ under $CHAIN"
+
+# --- run the benchmark --------------------------------------------------------------
+#
+# Structural flags (orchestrator-owned, NOT user-tunable via /benchmark):
+#   --json                          machine-parseable summary on stdout (also
+#                                   suppresses interactive spinners).
+#   --db "$RESULTS"                 point sccache's app-data dir at the
+#                                   virtio-fs share; SQLite lands at
+#                                   $RESULTS/appdata/stacks-bench.db.
+#   --source "$SBGH_SOURCE_DIR"     parent of the `chainstate/` dir.
+#   --dangerous-no-chainstate-copy  the LVM-thin snapshot already gave us
+#                                   per-job CoW; a second copy inside the
+#                                   VM would double snapshot footprint.
+#
+# EXTRA_ARGS is the user-tunable workload (start-at, count, warmup,
+# bench-spans-only, etc.) from [stacks_bench].default_args or per-PR
+# `/benchmark` overrides.
+cd "$SRC"
+phase "running"
+./target/release/stacks-bench \
+    --json \
+    --db "$RESULTS" \
+    bench run \
+    --source "$SBGH_SOURCE_DIR" \
+    --dangerous-no-chainstate-copy \
+    "${EXTRA_ARGS[@]}" \
+    > "$RESULTS/run.json" \
+    || die "stacks-bench exited non-zero"
+
+# --- finalize -----------------------------------------------------------------------
+phase "collecting"
+sync
+phase "done"
+# cloud-init's `power_state: poweroff` will shut us down cleanly.

@@ -29,13 +29,26 @@ private_key_path = "/etc/sbgh/orchestrator/github-app.private-key.pem"
 
 [vm]
 golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
-vcpus = 2
-# 16 GiB is the practical floor. rustc's final-link of `stacks-bench` with
-# the stacks-core release profile (`lto=fat`, `codegen-units=1`) holds
-# ~7.6 GiB of RSS at peak — 8 GiB leaves no room for the kernel + cargo +
-# cache and triggers the OOM killer mid-link. Bump higher if the host
-# can spare it; lower will break the build.
-memory_gib = 16
+
+# Each job runs the same VM in two phases — build at one size, bench at
+# another (typically smaller, matching the production deployment shape).
+# Memory accepts the IEC short form: "16G", "8192M", "1024K", or bare
+# bytes. All units are binary (G ≡ Gi = 1024³). Between phases the
+# orchestrator powers the VM off cleanly and redefines it at the new
+# memory + vcpus, giving the bench phase a fresh kernel boot.
+#
+# Build phase: cargo wants parallelism and rustc's `lto=fat` final
+# link of `stacks-bench` peaks at ~7.6 GiB RSS. 16 GiB is the floor;
+# lower OOM-kills the build.
+build_vcpus = 4
+build_memory = "16G"
+
+# Bench phase: should mirror the production deployment shape so the
+# per-block timings are representative. stacks-node typically runs on
+# 2–4 cores / 8 GiB in prod.
+bench_vcpus = 2
+bench_memory = "8G"
+
 boot_disk_gib = 64
 job_timeout_secs = 21600   # 6 hours
 network = "default"

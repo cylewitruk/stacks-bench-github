@@ -83,8 +83,10 @@ mod tests {
             },
             VmConfig {
                 golden_image: PathBuf::from("/var/lib/libvirt/images/golden.qcow2"),
-                vcpus: 2,
-                memory_gib: 8,
+                build_vcpus: 4,
+                bench_vcpus: 2,
+                build_memory: sbgh_core::memory::MemorySize::from_gib(16),
+                bench_memory: sbgh_core::memory::MemorySize::from_gib(8),
                 boot_disk_gib: 64,
                 job_timeout_secs: 60,
                 network: "default".into(),

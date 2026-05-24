@@ -25,8 +25,16 @@ use quick_xml::events::*;
 
 pub struct DomainSpec<'a> {
     pub name: &'a str,
+    /// vCPUs allocated to the VM. Different per phase — build typically
+    /// gets more for parallel cargo, bench gets fewer to match
+    /// production deployment shape.
     pub vcpus: u32,
-    pub memory_gib: u32,
+    /// Memory allocated to the VM, in bytes. Set per render call from
+    /// `vm.build_memory.as_bytes()` or `vm.bench_memory.as_bytes()`.
+    /// We emit `<memory unit='KiB'>` because libvirt's smallest
+    /// guaranteed-supported unit is KiB; bytes would work on modern
+    /// libvirt but KiB is the safe portable choice.
+    pub memory_bytes: u64,
     pub boot_disk_path: &'a Path,
     pub chainstate_dev_path: &'a Path,
     pub source_disk_path: &'a Path,
@@ -51,9 +59,13 @@ pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
         .with_attribute(("type", "kvm"))
         .write_inner_content(|w| {
             text(w, "name", spec.name)?;
+            // libvirt rounds memory down to its smallest unit; KiB is
+            // universally supported. Divide-by-1024 is safe (memory is
+            // always allocated in page-multiples upstream).
+            let memory_kib = spec.memory_bytes / 1024;
             w.create_element("memory")
-                .with_attribute(("unit", "GiB"))
-                .write_text_content(BytesText::new(&spec.memory_gib.to_string()))?;
+                .with_attribute(("unit", "KiB"))
+                .write_text_content(BytesText::new(&memory_kib.to_string()))?;
             text(w, "vcpu", &spec.vcpus.to_string())?;
 
             w.create_element("os")
@@ -242,7 +254,7 @@ mod tests {
         DomainSpec {
             name: "sbgh-job1",
             vcpus: 4,
-            memory_gib: 8,
+            memory_bytes: 8u64 * 1024 * 1024 * 1024, // 8 GiB
             boot_disk_path: Path::new("/var/lib/sbgh/jobs/job1/boot.qcow2"),
             chainstate_dev_path: Path::new("/dev/sbgh-vg/sbgh-job1-chainstate"),
             source_disk_path: Path::new("/var/lib/sbgh/jobs/job1/source.raw"),
@@ -262,7 +274,9 @@ mod tests {
         // sanity: well-formed structure
         assert!(xml.starts_with("<domain type=\"kvm\">"));
         assert!(xml.contains("<name>sbgh-job1</name>"));
-        assert!(xml.contains("<memory unit=\"GiB\">8</memory>"));
+        // Memory is rendered in KiB (libvirt's smallest universally
+        // supported unit). 8 GiB == 8 * 1024 * 1024 KiB.
+        assert!(xml.contains("<memory unit=\"KiB\">8388608</memory>"));
         assert!(xml.contains("<vcpu>4</vcpu>"));
         // disks
         assert!(xml.contains("/var/lib/sbgh/jobs/job1/boot.qcow2"));

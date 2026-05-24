@@ -20,6 +20,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub enum Phase {
     Starting,
     Building,
+    /// Build VM finished a successful `cargo build`. Terminal for the
+    /// build VM only — orchestrator transitions to the bench VM after
+    /// seeing this. NOT terminal for the bench VM (bench finishes on
+    /// `Done`).
+    BuildDone,
     Running,
     Collecting,
     Done,
@@ -27,15 +32,41 @@ pub enum Phase {
     Other(String),
 }
 
+/// Which phase counts as "successful completion" for the current VM.
+/// Used by the orchestrator's two-phase lifecycle to distinguish the
+/// build VM (succeeds on BuildDone) from the bench VM (succeeds on Done).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollMode {
+    Build,
+    Bench,
+}
+
 impl Phase {
+    /// True when this phase ends the *bench* VM's lifecycle (the
+    /// "final" terminal — the run is over either way). Kept as
+    /// `is_terminal` for back-compat with existing callers; new
+    /// callers should prefer `is_success_for(mode)` when they need to
+    /// distinguish build-success from bench-success.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Phase::Done | Phase::Error)
+    }
+
+    /// True when this phase is a successful completion for the given
+    /// `PollMode`. `Phase::Error` always counts as completion (failed
+    /// completion) regardless of mode — the orchestrator's poll loop
+    /// uses this to decide when to stop polling.
+    pub fn is_success_for(&self, mode: PollMode) -> bool {
+        match mode {
+            PollMode::Build => matches!(self, Phase::BuildDone),
+            PollMode::Bench => matches!(self, Phase::Done),
+        }
     }
 
     pub fn label(&self) -> &str {
         match self {
             Phase::Starting => "starting",
             Phase::Building => "building",
+            Phase::BuildDone => "build_done",
             Phase::Running => "running",
             Phase::Collecting => "collecting",
             Phase::Done => "done",
@@ -51,6 +82,7 @@ impl FromStr for Phase {
         Ok(match s.trim() {
             "starting" => Phase::Starting,
             "building" => Phase::Building,
+            "build_done" => Phase::BuildDone,
             "running" => Phase::Running,
             "collecting" => Phase::Collecting,
             "done" => Phase::Done,
