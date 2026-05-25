@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Install the orchestrator binary + systemd unit into their canonical
-# system paths. Idempotent — safe to re-run after every `just build`.
+# system paths. Idempotent — safe to re-run after every change.
 #
-# Usage: from the repo root, after `just build`:
-#   sudo ./scripts/install-orchestrator.sh
+# Usage: from the repo root:
+#   sudo ./scripts/install-orchestrator.sh           # build + install
+#   sudo ./scripts/install-orchestrator.sh --no-build # use existing binary
 #
 # What it does:
-#   1. Copies target/release/sbgh-orchestrator to /usr/local/bin/
-#   2. Installs systemd/sbgh-orchestrator.service to /etc/systemd/system/
-#   3. systemctl daemon-reload
-#   4. systemctl enable + start (only on first install; subsequent runs
+#   1. Builds target/release/sbgh-orchestrator as the invoking user
+#      (skipped with --no-build)
+#   2. Copies it to /usr/local/bin/
+#   3. Installs systemd/sbgh-orchestrator.service to /etc/systemd/system/
+#   4. systemctl daemon-reload
+#   5. systemctl enable + start (only on first install; subsequent runs
 #      just restart so the new binary takes effect)
 
 set -euo pipefail
@@ -20,13 +23,16 @@ BINARY_DEST=/usr/local/bin/sbgh-orchestrator
 UNIT_SRC="$REPO_ROOT/systemd/sbgh-orchestrator.service"
 UNIT_DEST=/etc/systemd/system/sbgh-orchestrator.service
 
+DO_BUILD=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-build) DO_BUILD=0 ;;
+        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "Must run as root (use sudo)." >&2
-    exit 1
-fi
-
-if [[ ! -x "$BINARY_SRC" ]]; then
-    echo "Binary not found at $BINARY_SRC — run \`just build\` first." >&2
     exit 1
 fi
 
@@ -35,22 +41,43 @@ if [[ ! -f "$UNIT_SRC" ]]; then
     exit 1
 fi
 
-echo "[1/4] Installing binary to $BINARY_DEST..."
+if [[ $DO_BUILD -eq 1 ]]; then
+    # Build as the invoking user so target/ stays owned by them — building
+    # as root would break subsequent `just build` runs with permission errors.
+    BUILD_USER="${SUDO_USER:-}"
+    if [[ -z "$BUILD_USER" || "$BUILD_USER" == "root" ]]; then
+        echo "Refusing to cargo build as root (would clobber target/ ownership)." >&2
+        echo "Either run via sudo from a non-root shell, or pass --no-build." >&2
+        exit 1
+    fi
+    echo "[1/5] Building release binary as $BUILD_USER..."
+    sudo -u "$BUILD_USER" -H sh -c \
+        "cd '$REPO_ROOT' && cargo build --locked --release -p sbgh-orchestrator"
+else
+    echo "[1/5] Skipping build (--no-build)."
+fi
+
+if [[ ! -x "$BINARY_SRC" ]]; then
+    echo "Binary not found at $BINARY_SRC after build step." >&2
+    exit 1
+fi
+
+echo "[2/5] Installing binary to $BINARY_DEST..."
 install -m 0755 "$BINARY_SRC" "$BINARY_DEST"
 
-echo "[2/4] Installing unit file to $UNIT_DEST..."
+echo "[3/5] Installing unit file to $UNIT_DEST..."
 install -m 0644 "$UNIT_SRC" "$UNIT_DEST"
 
-echo "[3/4] Reloading systemd..."
+echo "[4/5] Reloading systemd..."
 systemctl daemon-reload
 
 # First-install vs upgrade: if the unit isn't enabled yet, enable + start.
 # Otherwise just restart so the new binary picks up.
 if ! systemctl is-enabled --quiet sbgh-orchestrator.service; then
-    echo "[4/4] First install — enabling + starting service..."
+    echo "[5/5] First install — enabling + starting service..."
     systemctl enable --now sbgh-orchestrator.service
 else
-    echo "[4/4] Restarting service to pick up the new binary..."
+    echo "[5/5] Restarting service to pick up the new binary..."
     systemctl restart sbgh-orchestrator.service
 fi
 
