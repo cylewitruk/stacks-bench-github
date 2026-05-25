@@ -14,13 +14,29 @@
 
 use serde::Deserialize;
 
+/// Top-level envelope written by `stacks-bench bench run --json`. The
+/// envelope's `duration_secs` is the full wall-clock time (setup +
+/// chainstate copy avoidance + replay); the detail block under `data`
+/// carries the bench-only metrics. We surface envelope duration as the
+/// headline "Run duration" because it matches what an operator sees
+/// from the orchestrator's perspective.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct RunResult {
+    pub success: Option<bool>,
+    pub duration_secs: Option<f64>,
+    pub data: Option<RunData>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RunData {
     pub run_id: Option<i64>,
     pub blocks: Option<u64>,
     pub warmup_blocks: Option<u64>,
     pub measured_blocks: Option<u64>,
+    /// Replay-only duration (excludes setup). Distinct from envelope
+    /// `duration_secs`.
     pub duration_secs: Option<f64>,
     pub interrupted: Option<bool>,
     pub summary: Option<RunSummary>,
@@ -105,7 +121,10 @@ pub fn render_pr_comment(
     out.push_str(archive_dir);
     out.push('\n');
     out.push_str("./stacks-bench --db . bench list\n");
-    if let Some(rid) = result.and_then(|r| r.run_id) {
+    if let Some(rid) = result
+        .and_then(|r| r.data.as_ref())
+        .and_then(|d| d.run_id)
+    {
         out.push_str(&format!("./stacks-bench --db . bench summary {rid}\n"));
     }
     out.push_str("```\n\n");
@@ -119,8 +138,12 @@ pub fn render_pr_comment(
 fn metric_table(r: &RunResult) -> String {
     let mut rows: Vec<(String, String)> = Vec::new();
 
-    if let Some(m) = r.measured_blocks {
-        let warmup = r.warmup_blocks.unwrap_or(0);
+    let data = r.data.as_ref();
+
+    if let Some(m) = data.and_then(|d| d.measured_blocks) {
+        let warmup = data
+            .and_then(|d| d.warmup_blocks)
+            .unwrap_or(0);
         rows.push((
             "Blocks measured".to_string(),
             format!("{} ({} warmup)", thousands(m), thousands(warmup)),
@@ -129,15 +152,18 @@ fn metric_table(r: &RunResult) -> String {
     if let Some(d) = r.duration_secs {
         rows.push(("Run duration".to_string(), format_duration(d)));
     }
+    if let Some(d) = data.and_then(|d| d.duration_secs) {
+        rows.push(("Replay duration".to_string(), format_duration(d)));
+    }
 
-    if let Some(s) = r.summary.as_ref() {
+    if let Some(s) = data.and_then(|d| d.summary.as_ref()) {
         if let Some(tx) = s.transactions {
             rows.push(("Transactions replayed".to_string(), thousands(tx)));
         }
 
         // Per-block averages — only meaningful if we have a divisor.
-        let divisor = r
-            .measured_blocks
+        let divisor = data
+            .and_then(|d| d.measured_blocks)
             .filter(|m| *m > 0);
         if let Some(setup) = s.setup_duration_us {
             rows.push(("Setup".to_string(), avg_us_per(setup, divisor)));
@@ -163,7 +189,7 @@ fn metric_table(r: &RunResult) -> String {
         }
     }
 
-    if r.interrupted == Some(true) {
+    if data.and_then(|d| d.interrupted) == Some(true) {
         rows.push(("Interrupted".to_string(), "**yes** (partial measurements)".to_string()));
     }
 
@@ -241,48 +267,62 @@ mod tests {
 
     #[test]
     fn parse_full_payload() {
+        // Mirrors the real envelope shape: top-level success+duration_secs,
+        // detail under `data`.
         let json = br#"{
-            "run_id": 42,
-            "blocks": 5000,
-            "warmup_blocks": 1000,
-            "measured_blocks": 4000,
-            "duration_secs": 454.5,
-            "interrupted": false,
-            "summary": {
-                "total_duration_us": 100000000,
-                "setup_duration_us": 9380000,
-                "execution_duration_us": 72940000,
-                "commit_duration_us": 18280000,
-                "transactions": 12345,
-                "clarity_runtime": 9876543210,
-                "write_length": 89000000,
-                "read_length": 245000000
+            "success": true,
+            "duration_secs": 2203.8,
+            "data": {
+                "run_id": 42,
+                "blocks": 5000,
+                "warmup_blocks": 1000,
+                "measured_blocks": 4000,
+                "duration_secs": 1964.9,
+                "interrupted": false,
+                "summary": {
+                    "total_duration_us": 100000000,
+                    "setup_duration_us": 9380000,
+                    "execution_duration_us": 72940000,
+                    "commit_duration_us": 18280000,
+                    "transactions": 12345,
+                    "clarity_runtime": 9876543210,
+                    "write_length": 89000000,
+                    "read_length": 245000000
+                }
             }
         }"#;
         let r = RunResult::from_bytes(json).unwrap();
-        assert_eq!(r.run_id, Some(42));
-        assert_eq!(r.measured_blocks, Some(4000));
-        let s = r.summary.as_ref().unwrap();
+        assert_eq!(r.success, Some(true));
+        assert_eq!(r.duration_secs, Some(2203.8));
+        let d = r.data.as_ref().unwrap();
+        assert_eq!(d.run_id, Some(42));
+        assert_eq!(d.measured_blocks, Some(4000));
+        let s = d.summary.as_ref().unwrap();
         assert_eq!(s.transactions, Some(12345));
     }
 
     #[test]
     fn parse_minimal_payload_keeps_unknown_fields_none() {
-        let json = br#"{ "run_id": 1 }"#;
+        let json = br#"{ "data": { "run_id": 1 } }"#;
         let r = RunResult::from_bytes(json).unwrap();
-        assert_eq!(r.run_id, Some(1));
-        assert!(r.summary.is_none());
-        assert!(r.measured_blocks.is_none());
+        let d = r.data.as_ref().unwrap();
+        assert_eq!(d.run_id, Some(1));
+        assert!(d.summary.is_none());
+        assert!(d.measured_blocks.is_none());
     }
 
     #[test]
     fn parse_ignores_unknown_fields_for_forward_compat() {
-        let json =
-            br#"{ "run_id": 7, "future_field": "we_dont_know_yet", "summary": { "transactions": 9 } }"#;
+        let json = br#"{
+            "future_envelope_field": true,
+            "data": { "run_id": 7, "future_field": "we_dont_know_yet", "summary": { "transactions": 9 } }
+        }"#;
         let r = RunResult::from_bytes(json).unwrap();
-        assert_eq!(r.run_id, Some(7));
+        let d = r.data.as_ref().unwrap();
+        assert_eq!(d.run_id, Some(7));
         assert_eq!(
-            r.summary
+            d.summary
+                .as_ref()
                 .unwrap()
                 .transactions,
             Some(9)
@@ -298,20 +338,24 @@ mod tests {
     #[test]
     fn render_includes_table_when_metrics_present() {
         let r = RunResult {
-            run_id: Some(42),
-            measured_blocks: Some(5000),
-            warmup_blocks: Some(1000),
-            duration_secs: Some(454.5),
-            summary: Some(RunSummary {
-                transactions: Some(12345),
-                setup_duration_us: Some(9_380_000),
-                execution_duration_us: Some(72_940_000),
-                commit_duration_us: Some(18_280_000),
-                read_length: Some(245_000_000),
-                write_length: Some(89_000_000),
+            success: Some(true),
+            duration_secs: Some(2203.8),
+            data: Some(RunData {
+                run_id: Some(42),
+                measured_blocks: Some(5000),
+                warmup_blocks: Some(1000),
+                duration_secs: Some(1964.9),
+                summary: Some(RunSummary {
+                    transactions: Some(12345),
+                    setup_duration_us: Some(9_380_000),
+                    execution_duration_us: Some(72_940_000),
+                    commit_duration_us: Some(18_280_000),
+                    read_length: Some(245_000_000),
+                    write_length: Some(89_000_000),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
-            ..Default::default()
         };
         let md = render_pr_comment("job-1", "abc123", "/var/lib/sbgh/results/job-1", Some(&r));
 
@@ -319,6 +363,8 @@ mod tests {
         assert!(md.contains("(commit `abc123`)"));
         assert!(md.contains("| Metric | Value |"));
         assert!(md.contains("5,000 (1,000 warmup)"));
+        assert!(md.contains("Run duration"));
+        assert!(md.contains("Replay duration"));
         assert!(md.contains("12,345"));
         assert!(md.contains("µs avg"));
         // Investigate-locally block always included; bench summary uses run_id when
@@ -353,8 +399,11 @@ mod tests {
     #[test]
     fn render_marks_interrupted_runs() {
         let r = RunResult {
-            interrupted: Some(true),
-            measured_blocks: Some(100),
+            data: Some(RunData {
+                interrupted: Some(true),
+                measured_blocks: Some(100),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let md = render_pr_comment("j", "h", "/p", Some(&r));
