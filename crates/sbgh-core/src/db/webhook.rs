@@ -50,13 +50,21 @@ pub struct ClaimedWebhook {
 #[async_trait]
 pub trait WebhookInbox: Send + Sync + 'static {
     /// Atomically claim the oldest row in `received` or
-    /// `retryable_error` whose `next_attempt_at` is in the past.
-    /// Sets status=`processing`, claimed_at=NOW, allocates a fresh
+    /// `retryable_error` whose `next_attempt_at` is in the past AND
+    /// whose `event_type` is in the supplied filter list. Sets
+    /// status=`processing`, claimed_at=NOW, allocates a fresh
     /// `claim_token`. Returns `None` if nothing is claimable.
+    ///
+    /// The event-type filter prevents the processor from terminalizing
+    /// rows for event types it doesn't yet know how to classify
+    /// (e.g., a slice-2b processor passes `["issue_comment"]` so
+    /// `installation.created` rows survive in `received` for the
+    /// slice-3 processor to consume). Passing an empty slice claims
+    /// nothing.
     ///
     /// Postgres impl uses `FOR UPDATE SKIP LOCKED` so concurrent
     /// processors safely pick disjoint rows.
-    async fn claim_next(&self) -> Result<Option<ClaimedWebhook>>;
+    async fn claim_next(&self, event_types: &[&str]) -> Result<Option<ClaimedWebhook>>;
 
     /// Mark a claimed row terminal with the given outcome. Status is
     /// derived via `outcome.terminal_status()`. Conditional on

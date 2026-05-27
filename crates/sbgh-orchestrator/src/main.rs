@@ -2,10 +2,6 @@ mod bench_summary;
 mod libvirt;
 mod progress;
 mod runner;
-// Slice 2a: webhook processor scaffold. Compiled in, NOT yet wired
-// into the runtime — slice 2b will start the loop alongside the
-// existing job runner once a real Classifier is implemented.
-#[allow(dead_code)]
 mod webhook_processor;
 
 use std::path::{Path, PathBuf};
@@ -14,13 +10,14 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use sbgh_core::config::OrchestratorConfig;
-use sbgh_core::db::{self, PostgresJobStore};
+use sbgh_core::db::{self, PostgresJobStore, PostgresWebhookInbox};
 use sbgh_core::github::{AppCredentials, InstallationTokenCache, OctocrabClient};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::libvirt::SystemShell;
 use crate::runner::Runner;
+use crate::webhook_processor::{BasicClassifier, ProcessorConfig, WebhookProcessor};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "stacks-bench job orchestrator (libvirt benchmark runner)")]
@@ -54,11 +51,24 @@ async fn main() -> anyhow::Result<()> {
             .clone(),
     );
     let gh = Arc::new(OctocrabClient::new(tokens));
-    let jobs = Arc::new(PostgresJobStore::new(pool));
+    let jobs = Arc::new(PostgresJobStore::new(pool.clone()));
     let shell = Arc::new(SystemShell::new(&config.paths.sudo_binary));
 
+    // Slice 2b: webhook processor runs concurrently with the legacy
+    // job runner. Both loop indefinitely; if either returns Err the
+    // orchestrator crashes and systemd restarts it.
+    let webhook_inbox = Arc::new(PostgresWebhookInbox::new(pool));
+    let processor =
+        WebhookProcessor::new(webhook_inbox, Arc::new(BasicClassifier), ProcessorConfig::default());
+
     let runner = Runner::new(config, jobs, gh, shell);
-    runner.run().await?;
+
+    tokio::try_join!(runner.run(), async {
+        processor
+            .run()
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
     Ok(())
 }
 

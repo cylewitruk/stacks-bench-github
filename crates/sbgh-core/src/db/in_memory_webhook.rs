@@ -151,18 +151,24 @@ impl InMemoryWebhookInbox {
 
 #[async_trait]
 impl WebhookInbox for InMemoryWebhookInbox {
-    async fn claim_next(&self) -> Result<Option<ClaimedWebhook>> {
+    async fn claim_next(&self, event_types: &[&str]) -> Result<Option<ClaimedWebhook>> {
+        if event_types.is_empty() {
+            return Ok(None);
+        }
         let now = Utc::now();
         let token = Uuid::new_v4();
         let mut rows = self.rows.lock().unwrap();
         // Pick the oldest claimable row (received OR retryable_error,
-        // next_attempt_at in the past).
+        // next_attempt_at in the past, event_type in the filter).
         let idx = rows
             .iter()
             .enumerate()
             .filter(|(_, r)| {
                 matches!(r.status, WebhookStatus::Received | WebhookStatus::RetryableError)
                     && r.next_attempt_at <= now
+                    && event_types
+                        .iter()
+                        .any(|et| *et == r.event_type)
             })
             .min_by(|a, b| (a.1.next_attempt_at, a.1.id).cmp(&(b.1.next_attempt_at, b.1.id)))
             .map(|(i, _)| i);

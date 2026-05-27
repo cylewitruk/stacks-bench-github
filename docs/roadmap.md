@@ -169,9 +169,9 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Initial implementation completed
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice)
 
 **Todo's:**
 
@@ -183,7 +183,41 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If none, just write "None").
+- **`BasicClassifier` is now the production classifier.** Lives in `crates/sbgh-orchestrator/src/webhook_processor.rs` alongside the slice 2a `WebhookProcessor` + `NoopClassifier` (the latter is now `#[cfg(test)]`-gated since `BasicClassifier` is the real production wiring).
+- **`WebhookProcessor::run()` is now wired into the orchestrator's `main()`.** Runs concurrently with the legacy job `Runner` via `tokio::try_join!`. Either loop returning Err crashes the binary so systemd restarts cleanly. Both share the same Postgres pool (cloned once).
+- **Classification matrix for Phase 1**:
+  - `issue_comment` with non-`created` action → `ignored_action`
+  - `issue_comment.created` on a non-PR issue → `ignored_action`
+  - `issue_comment.created` on a PR without `/benchmark` → `ignored_no_command`
+  - `issue_comment.created` on a PR with malformed `/benchmark` args → `ignored_no_command` (schema has no distinct "malformed command" outcome; bucketed with no-command for now)
+  - `issue_comment.created` on a PR with valid `/benchmark` → `ignored_action` in Phase 1; slice 9 changes this branch to `enqueued_job` + creates new `job` row. Legacy handler→`jobs` path continues to actually run the bench in the meantime.
+  - `push` / `pull_request` / `create` / `installation` / `installation_repositories` → **NOT claimed by BasicClassifier; rows stay in `received`** waiting for the slice (3-7) that adds their classifier branch. This is intentional: terminalizing them now would prevent later slices from consuming the events they need (an `installation.created` ignored here would never create its `github_installation` row in slice 3). Fixed mid-slice per Codex review.
+  - Anything else, if it somehow reaches the classifier → `error`. The claim filter restricts to `issue_comment`, but the catch-all defends against direct calls / future-slice misconfiguration.
+- **Payload-parse failures**: `issue_comment` with NULL payload (handler stored only metadata) or with JSON that doesn't match the typed event shape → `error`. Other event types don't require a parse in slice 2b, so they tolerate NULL payload — but they're also not claimed, so it doesn't matter yet.
+- **`ClassifyOutcome::Retryable` is `#[allow(dead_code)]`** for now — `BasicClassifier` never emits it. Later slices that hit GitHub APIs will use it for transient network/rate-limit failures.
+- **Payload-clearing on terminal rows** (todo #4): the schema's payload-retention contract already permits the orchestrator to NULL out `payload` on terminal `ignored` / `denied` / `failed` rows. `WebhookInbox`'s current methods don't do this proactively yet — would be a tiny enhancement (a `cleared_payload` flag on the SQL UPDATE), but slice 2b deliberately keeps the payload around for observability during the early observation period. Can land as a follow-up when post-cutover storage growth warrants.
+- **Grants**: no changes to `sbgh-migrate/src/main.rs`. Slice 1 already granted `sbgh_orch` full `SELECT, UPDATE` on `github_webhook`, which is everything the processor needs.
+- **Tests** (8 new BasicClassifier tests, total 131 → 140):
+  - `basic_issue_comment_non_created_is_ignored_action`
+  - `basic_issue_comment_on_non_pr_is_ignored_action`
+  - `basic_issue_comment_pr_no_command_is_ignored_no_command`
+  - `basic_issue_comment_pr_with_benchmark_is_ignored_action_in_phase1` (pins the Phase 1 behavior; slice 9 will change the assertion to `enqueued_job`)
+  - `basic_issue_comment_null_payload_is_error`
+  - `basic_issue_comment_bad_typed_shape_is_error`
+  - `basic_classifier_supported_types_is_issue_comment_only` (pins the slice 2b contract — replaces the original `basic_other_supported_events_are_ignored_action` test, which asserted the wrong behavior per Codex review)
+  - `basic_classifier_leaves_future_slice_events_in_received` (Codex high finding: end-to-end proof that `installation` rows are NOT claimed/terminalized by slice 2b)
+  - `basic_unsupported_event_is_error` (defensive)
+- **Dead-code cleanup** as part of wiring: `NoopClassifier` → `#[cfg(test)]` (production now uses `BasicClassifier`); `ScriptedClassifier::seen()` test helper removed (never called); `ClassifyOutcome::Retryable` marked `#[allow(dead_code)]` with a forward-looking doc note.
+- **Fixed mid-slice per Codex review**:
+  - **High**: BasicClassifier was terminalizing rows for `push` / `pull_request` / `create` / `installation` / `installation_repositories` as `ignored_action`, which would have prevented slices 3-7 from consuming the events they need (e.g., an `installation.created` ignored here would never produce a `github_installation` row in slice 3). Fixed by adding `Classifier::supported_event_types()` + threading the filter through `WebhookInbox::claim_next(&[&str])`. BasicClassifier now declares only `["issue_comment"]` as supported; other event types stay `received` for later slices to claim. Tested end-to-end by `basic_classifier_leaves_future_slice_events_in_received`.
+  - **Medium**: `WebhookProcessor::run()` previously swallowed all errors forever, making `tokio::try_join!` in `main.rs` unreachable on persistent infrastructure failures (DB down, grants revoked, schema drift). Added `ProcessorConfig::max_consecutive_errors` (default 10) with TWO independent counters — `consecutive_process_errors` and `consecutive_sweep_errors`. Either reaching the threshold bails `run()` and forces a systemd restart. Counters reset on their own category's success, so a persistently-broken sweep can't be masked by an otherwise-healthy process loop (the original single-counter design had this bug — Codex caught it on the follow-up review).
+  - **Low**: roadmap operational note had the dominant outcome inverted — see updated note below.
+- Verification: `just build --no-sccache` (clean release build), `just lint --no-sccache` (clean after `just fix` rustfmt pass + dropping one useless-conversion `map_err`), `just test --summary --no-sccache` (140 tests, 0 failures).
+- **Operational note for the slice 2b deploy**: the processor will start consuming accumulated `issue_comment` inbox rows from slice 1's deploy window on first start; rows for other event types stay in `received` until their slice. Expected mix in the `github_webhook` table:
+  - `status='ignored'` with `outcome IN ('ignored_action', 'ignored_no_command')` — issue_comment rows the classifier terminalized.
+  - `status='received'` for `event_type IN ('push', 'pull_request', 'create', 'installation', 'installation_repositories')` — slices 3-7 will start consuming these.
+  - `status='processed'` should be empty until slice 9 starts producing `enqueued_job` outcomes.
+  - Anything in `status='failed'` (i.e., `outcome='error'`) is the signal to investigate — typically a classifier bug or malformed payload from GH.
 
 ##### Slice 3: Allowed Installer
 

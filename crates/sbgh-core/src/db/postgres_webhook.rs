@@ -27,12 +27,24 @@ impl PostgresWebhookInbox {
 
 #[async_trait]
 impl WebhookInbox for PostgresWebhookInbox {
-    async fn claim_next(&self) -> Result<Option<ClaimedWebhook>> {
+    async fn claim_next(&self, event_types: &[&str]) -> Result<Option<ClaimedWebhook>> {
+        // Empty filter = nothing claimable. Saves a DB round-trip when
+        // the processor's classifier doesn't yet support anything.
+        if event_types.is_empty() {
+            return Ok(None);
+        }
         // Subquery picks the oldest claimable row with FOR UPDATE SKIP
-        // LOCKED so concurrent processors get disjoint rows. The outer
-        // UPDATE then transitions it to `processing` and stamps the
-        // claim. Single round-trip; sqlx returns the row via RETURNING.
+        // LOCKED so concurrent processors get disjoint rows. event_type
+        // filter restricts to rows the caller can classify; others
+        // stay `received` for a future processor with a wider filter.
+        // Single round-trip; sqlx returns the row via RETURNING.
         let claim_token = Uuid::new_v4();
+        // sqlx requires owned Strings for TEXT[] binding; the slice is
+        // small (≤handful of event types) so the allocation is trivial.
+        let event_types_vec: Vec<String> = event_types
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let row: Option<(
             i64,
             String,
@@ -53,6 +65,7 @@ impl WebhookInbox for PostgresWebhookInbox {
                 SELECT id FROM github_webhook
                 WHERE status IN ('received', 'retryable_error')
                   AND next_attempt_at <= NOW()
+                  AND event_type = ANY($2)
                 ORDER BY next_attempt_at, id
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -63,6 +76,7 @@ impl WebhookInbox for PostgresWebhookInbox {
             "#,
         )
         .bind(claim_token)
+        .bind(&event_types_vec)
         .fetch_optional(&self.pool)
         .await?;
 
