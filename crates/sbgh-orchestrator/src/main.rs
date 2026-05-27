@@ -2,6 +2,11 @@ mod bench_summary;
 mod libvirt;
 mod progress;
 mod runner;
+// Slice 2a: webhook processor scaffold. Compiled in, NOT yet wired
+// into the runtime — slice 2b will start the loop alongside the
+// existing job runner once a real Classifier is implemented.
+#[allow(dead_code)]
+mod webhook_processor;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

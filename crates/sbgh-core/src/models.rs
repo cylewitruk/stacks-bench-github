@@ -14,6 +14,59 @@ pub enum JobStatus {
     Cancelled,
 }
 
+/// Lifecycle dimension for `github_webhook` rows. Mirrors the
+/// `github_webhook_status` DB enum. Distinct from `WebhookOutcome`:
+/// status is the queue/processing state; outcome is the specific
+/// terminal decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "github_webhook_status", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookStatus {
+    Received,
+    Processing,
+    Processed,
+    Ignored,
+    Denied,
+    RetryableError,
+    Failed,
+}
+
+/// Specific processor decision attached to a terminal webhook row.
+/// Mirrors the `github_webhook_outcome` DB enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "github_webhook_outcome", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookOutcome {
+    EnqueuedJob,
+    IgnoredAction,
+    IgnoredNoCommand,
+    IgnoredUnknownInstallation,
+    IgnoredUnsupportedLineage,
+    DeniedInstallAllowlist,
+    DeniedTargetPolicy,
+    DeniedSourcePolicy,
+    DeniedUnauthorized,
+    Error,
+}
+
+impl WebhookOutcome {
+    /// Terminal status that pairs with this outcome.
+    pub fn terminal_status(self) -> WebhookStatus {
+        match self {
+            Self::EnqueuedJob => WebhookStatus::Processed,
+            Self::IgnoredAction
+            | Self::IgnoredNoCommand
+            | Self::IgnoredUnknownInstallation
+            | Self::IgnoredUnsupportedLineage => WebhookStatus::Ignored,
+            Self::DeniedInstallAllowlist
+            | Self::DeniedTargetPolicy
+            | Self::DeniedSourcePolicy
+            | Self::DeniedUnauthorized => WebhookStatus::Denied,
+            Self::Error => WebhookStatus::Failed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Job {
     pub id: Uuid,

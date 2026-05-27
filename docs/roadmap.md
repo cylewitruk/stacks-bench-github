@@ -122,9 +122,9 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Initial implementation completed
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice)
 
 **Todo's:**
 
@@ -136,7 +136,34 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If none, just write "None").
+- **Scaffold ships compiled-in but unwired.** The `webhook_processor` module is added to `sbgh-orchestrator/src/main.rs` with `#[allow(dead_code)]` and `main()` does NOT call `WebhookProcessor::run()`. Slice 2b plugs in a real `Classifier` and spawns the loop alongside the existing job `Runner`. Production behavior at the slice 2a deploy is identical to slice 1's — inbox accumulates rows; nothing reads them yet. This matches the "deploy each slice as soon as it lands" goal without driving any new runtime effects.
+- **Data layer (sbgh-core)**:
+  - New types in `models.rs`: `WebhookStatus` and `WebhookOutcome` enums (sqlx mappings to the DB enums from slice 0), plus `WebhookOutcome::terminal_status()` for the outcome→status mapping.
+  - New module `db/webhook.rs`: `WebhookInbox` trait + `ClaimedWebhook` struct.
+  - Postgres impl `db/postgres_webhook.rs`: claim uses single-statement `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING ...`. All mutating ops conditional on `claim_token` matching + status='processing', so stale-claim writes (sweeper raced ahead) become no-ops. Sweep uses `make_interval(secs => $1)` to parameterize the lease cleanly.
+  - In-memory impl `db/in_memory_webhook.rs` (feature-gated `test-support`): mirrors the state machine using a single `Mutex` for serialization. Includes test helpers `seed()`, `set_next_attempt_at()`, `set_claimed_at()` so tests don't need to poke private fields.
+- **Processor (sbgh-orchestrator)**:
+  - `Classifier` trait with two outcomes: `ClassifyOutcome::Terminal(WebhookOutcome)` and `ClassifyOutcome::Retryable(String)`.
+  - `NoopClassifier`: production-safe default that returns `Terminal(IgnoredAction)` for everything. Useful as a slice-2b starting point (replace, don't add).
+  - `WebhookProcessor::process_one()` is the unit-testable atom (claim → classify → write transition); `WebhookProcessor::run()` composes it with periodic sweeps and idle backoff in a fault-tolerant loop (errors logged + swallowed).
+  - Backoff: exponential `base * 2^(attempt-1)` capped at `backoff_max`. `ProcessorConfig::default()` picks 30s base / 15min cap / 5min claim_lease / 5 max attempts — tunable for production via slice 2b config plumbing.
+  - Attempts-exhaustion semantics: classifier returns `Retryable` → if `claimed.attempts + 1 >= max_attempts`, promote to `record_permanent_failure` (status=failed, outcome=error) instead of `record_retryable_error`.
+- **Tests** (9 new, total 122 → 131):
+  - `process_one_terminates_with_outcome`: full claim → terminal cycle.
+  - `process_one_returns_false_when_empty`: idle behavior.
+  - `retryable_increments_attempts_and_sets_backoff`: first-retry semantics + backoff_base honored.
+  - `attempts_exhausted_promotes_to_permanent_failure`: max_attempts threshold respected, AND `attempts` is incremented on the permanent failure path so the final count is accurate (fixed mid-slice per Codex review).
+  - `sweep_resets_stuck_processing_rows`: stuck-claim recovery actually transitions rows.
+  - `concurrent_claims_pick_disjoint_rows`: two `claim_next` calls return different ids (the `FOR UPDATE SKIP LOCKED` invariant in Postgres terms, here proven via the in-memory Mutex serialization).
+  - `stale_claim_writes_are_no_ops`: a processor whose lease was reset by the sweeper cannot corrupt the row's new state via late writes.
+  - `complete_clears_last_error_from_prior_retries`: a row that transient-failed then succeeded ends with `last_error = NULL` (no stale error string lingers on the terminal row).
+  - `backoff_doubles_until_cap`: unit test for the `backoff_delay` math (covers cap behavior).
+- **Fixed mid-slice per Codex review**:
+  - `record_permanent_failure` now increments `attempts` (matching `record_retryable_error`'s behavior), so a row that fails after N attempts shows `attempts = N` instead of `N-1`. Affects both Postgres and in-memory impls.
+  - `complete` now clears `last_error = NULL`. Previously, a row that transient-errored once and then succeeded would carry the stale error string forever, misleading any ops query scanning for active error states. If we ever want "historical last transient error" semantics, that's a separate column — the in-active row shouldn't carry an error in its primary error field.
+- **Coverage limitation carried forward from slice 1**: in-memory inbox has no real Postgres semantics. The `claim_next` concurrency test proves the Mutex-serialized version, but the actual `FOR UPDATE SKIP LOCKED` guarantee on real Postgres remains unproven by these unit tests. Tracked under the same "test-DB harness" gap noted in slice 1.
+- **Cargo.toml**: `sbgh-orchestrator` `[dev-dependencies]` now pulls `sbgh-core` with `features = ["test-support"]` so the in-memory inbox is available to tests.
+- Verification: `just build --no-sccache` (clean release build), `just lint --no-sccache` (clean after `just fix` rustfmt pass), `just test --summary --no-sccache` (131 tests, 0 failures).
 
 ##### Slice 2b: Basic Inbox Classification
 
