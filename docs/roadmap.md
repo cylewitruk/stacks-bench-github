@@ -89,9 +89,9 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Initial implementation completed
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice)
 
 **Todo's:**
 
@@ -104,7 +104,19 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If none, just write "None").
+- Migration file: `migrations/20260527000002_slice1_webhook_inbox.sql`. Creates the `github_webhook` table with the claim index. The `status` / `outcome` enums were already created in slice 0, so todo #1 was partially redundant — only the table itself is new in this slice.
+- `github_installation_id BIGINT REFERENCES github_installation (id)` column is INTENTIONALLY DEFERRED to slice 3. The FK target doesn't exist yet, and no code path writes that column until slice 3 anyway. Handler writes only `payload_installation_id` (the raw payload value, no FK).
+- New persistence boundary: `IngestStore` trait in [crates/sbgh-core/src/db/ingest.rs](../crates/sbgh-core/src/db/ingest.rs), with `PostgresIngestStore` and `InMemoryIngestStore` impls. Two methods: `ingest_webhook` (inbox-only) and `ingest_webhook_and_job` (real transactional dual-write into webhook + legacy `jobs`). `JobStore` remains untouched — orchestrator still uses it for queue claim/transition.
+- `IngestOutcome::Recorded { job_id: Option<Uuid> }` distinguishes "webhook + new job" from "webhook + legacy job conflict-skipped" (the latter only happens for deliveries that existed in `jobs` before slice 1 rolled out). Both are success from GitHub's perspective.
+- Handler refactored to use `IngestStore`. New event allowlist (`SUPPORTED_EVENT_TYPES = [issue_comment, push, pull_request, create, installation, installation_repositories]`) drops unsupported events at the wire with no DB row. `ping` continues to short-circuit with no DB write. All supported events get a webhook row; only authorized `/benchmark` on a PR also gets a legacy job row.
+- All previously-existing handler response strings preserved (`pong`, `ignored`, `not a PR`, `no command`, `unauthorized`, `queued`, `duplicate`). New responses: `recorded` (supported event accepted into inbox without legacy job), `missing delivery id` (BAD_REQUEST when X-GitHub-Delivery header is absent on a supported event).
+- Webhook-only payload requirement: `delivery_id` becomes mandatory for supported events (was previously optional). Returns 400 if missing — without it, dedup is impossible.
+- Grants added in `sbgh-migrate/src/main.rs`: handler gets INSERT on the 6 columns it writes (`delivery_id`, `event_type`, `action`, `payload_installation_id`, `payload`, `payload_size_bytes`) + SELECT on `(id, delivery_id)` for `ON CONFLICT ... RETURNING id`. Plus `USAGE ON SEQUENCE github_webhook_id_seq` for the BIGSERIAL default to fire. Orchestrator gets full `SELECT, UPDATE` (anticipating the slice 2a claim path).
+- Tests updated: harness uses `InMemoryIngestStore`; existing assertions extended to also check `webhook_count()` / `webhooks()`. Five new tests added: `drops_unsupported_event_type_without_inbox_row`, `rejects_missing_delivery_id`, `supported_event_records_webhook_only` (push event path), `duplicate_delivery_on_webhook_only_path_dedupes`, `malformed_issue_comment_payload_still_records_webhook`. Test count: 117 → 122.
+- **Rollback atomicity coverage gap**: the Postgres impl in `postgres_ingest.rs` uses a real transaction (`pool.begin()` → conditional `tx.commit()`), so a failed legacy job INSERT correctly rolls back the inbox INSERT. But the in-memory test impl has no transaction semantics (webhook is committed before job enqueue), so the slice-1 unit tests cannot prove the rollback property. Validating it requires a Postgres integration test — deferred until we stand up a test-DB harness (likely slice 2a or a dedicated test-infrastructure slice). Acknowledged limitation rather than a code defect.
+- **Malformed `issue_comment` payload bypass** (fixed mid-slice per Codex review): the typed-parse failure path originally returned 400 before inserting the inbox row, breaking both the "all supported events get an inbox row post-HMAC" invariant and GitHub redelivery dedup (a 400 makes GH retry an un-dedupable delivery indefinitely). Fixed by restructuring `handle_issue_comment` to define the `webhook_only` closure before the typed parse, so the parse-failure branch records the inbox row and returns 2xx "bad payload".
+- **NULL payload binding** (fixed mid-slice per Codex review): `NewWebhook.payload` changed from `Value` to `Option<Value>` so unparseable bodies bind SQL NULL (not JSON `null`). Lets ops queries use `payload IS NULL` to detect missing/cleared payloads without false matches on legitimately-null JSON bodies.
+- Verification: `just build --no-sccache` (clean release build), `just lint --no-sccache` (clean after `just fix` rustfmt pass), `just test --summary --no-sccache` (122 tests, 0 failures). No DB integration test run locally; the docker-compose stack would validate the migration applies against live Postgres.
 
 ##### Slice 2a: Processor Scaffold
 

@@ -128,6 +128,43 @@ async fn apply_roles(
         .execute(&mut *tx)
         .await?;
 
+    // Slice 1: webhook inbox grants.
+    //
+    // Handler writes only the columns it can know at HTTP-receipt time:
+    // delivery_id, event_type, action, payload_installation_id, payload,
+    // payload_size_bytes. Server-side DEFAULTs fire for id, status,
+    // received_at, next_attempt_at, attempts. SELECT on (id, delivery_id)
+    // supports `INSERT ... ON CONFLICT (delivery_id) DO NOTHING RETURNING
+    // id` semantics. By NOT granting status/outcome/claimed_at/etc., a
+    // compromised handler can't mark webhooks processed or fabricate
+    // terminal outcomes — those columns are processor-only.
+    sqlx::query("REVOKE ALL ON TABLE github_webhook FROM sbgh_handler")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "GRANT INSERT (delivery_id, event_type, action, payload_installation_id, payload, \
+         payload_size_bytes) ON TABLE github_webhook TO sbgh_handler",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("GRANT SELECT (id, delivery_id) ON TABLE github_webhook TO sbgh_handler")
+        .execute(&mut *tx)
+        .await?;
+    // Handler needs USAGE on the implicit sequence backing the BIGSERIAL
+    // id column so the server-side default can fire on its INSERTs.
+    sqlx::query("GRANT USAGE ON SEQUENCE github_webhook_id_seq TO sbgh_handler")
+        .execute(&mut *tx)
+        .await?;
+
+    // sbgh_orch: full inbox claim/processing access. Same shape as for
+    // `jobs` — SELECT + UPDATE, no INSERT, no DELETE.
+    sqlx::query("REVOKE ALL ON TABLE github_webhook FROM sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, UPDATE ON TABLE github_webhook TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
     // USAGE on the schema is required even with table-level grants. CONNECT
     // on the database is implicit for any login role; no need to grant
     // explicitly.

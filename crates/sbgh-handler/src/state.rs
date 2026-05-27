@@ -1,16 +1,18 @@
 use std::sync::Arc;
 
 use sbgh_core::config::HandlerConfig;
-use sbgh_core::db::JobStore;
+use sbgh_core::db::IngestStore;
 
 /// Handler state.
 ///
 /// Deliberately omits any GitHub-API client: the handler verifies HMAC
-/// signatures and enqueues jobs, nothing else. All GitHub API I/O happens
-/// from the orchestrator (which holds the App private key). This is the
-/// security boundary the role split is built around — keep it.
+/// signatures and writes to the inbox (and, for `/benchmark` from
+/// authorized users, atomically also enqueues a legacy `jobs` row via
+/// the IngestStore's dual-write). All GitHub API I/O happens from the
+/// orchestrator (which holds the App private key). This is the security
+/// boundary the role split is built around — keep it.
 #[derive(Clone)]
 pub struct AppState {
     pub config: HandlerConfig,
-    pub jobs: Arc<dyn JobStore>,
+    pub ingest: Arc<dyn IngestStore>,
 }

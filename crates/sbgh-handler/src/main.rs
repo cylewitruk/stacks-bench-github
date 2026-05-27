@@ -9,7 +9,7 @@ use anyhow::Context;
 use axum::Router;
 use clap::Parser;
 use sbgh_core::config::HandlerConfig;
-use sbgh_core::db::{self, PostgresJobStore};
+use sbgh_core::db::{self, PostgresIngestStore};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&config.server.database_url)
         .await
         .context("connecting to postgres")?;
-    let jobs = Arc::new(PostgresJobStore::new(pool));
+    let ingest = Arc::new(PostgresIngestStore::new(pool));
 
     let bind_addr: SocketAddr = config
         .server
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("parsing server.bind_addr")?;
 
-    let state = AppState { config, jobs };
+    let state = AppState { config, ingest };
 
     let app = Router::new()
         .merge(routes::router())
