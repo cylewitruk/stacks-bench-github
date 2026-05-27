@@ -8,4 +8,7 @@ pub mod webhook;
 pub use auth::{AppCredentials, InstallationTokenCache};
 pub use client::{GitHubApi, OctocrabClient, PostedComment};
 pub use command::{Command, parse_command};
-pub use webhook::{IssueCommentEvent, verify_signature};
+pub use webhook::{
+    InstallationAccount, InstallationDetails, InstallationEvent, IssueCommentEvent,
+    verify_signature,
+};

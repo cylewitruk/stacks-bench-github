@@ -225,8 +225,8 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 - [x] Initial implementation completed
 - [x] Integration coverage added (or N/A justified)
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice)
 
 **Todo's:**
 
@@ -258,9 +258,9 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
-- [ ] Review in progress (with Codex)
+- [x] Initial implementation completed
+- [x] Integration coverage added (or N/A justified)
+- [x] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
 **Todo's:**
@@ -275,7 +275,31 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If none, just write "None").
+- **Crate rename `sbgh-migrate` → `sbgh-cli`** (forward-looking restructure): the old single-purpose binary becomes a clap subcommand router. `sbgh-cli migrate` (the default subcommand, equivalent to the legacy bin's behavior) keeps the schema+grants one-shot path; `sbgh-cli installer {allow,disable,list}` adds the slice 3 admin commands. Docker image renamed to `sbgh-cli:latest`; compose `migrate` service container renamed `sbgh-cli-migrate` and now passes `command: ["migrate"]`. sanity-check.sh, host-bringup.md, .env.example updated accordingly. Crate dir moved via `git mv` so history is preserved.
+- **Migration file**: `migrations/20260527000003_slice3_install_allowlist.sql`. Creates `allowed_installer` + `github_installation` tables (with `set_updated_at` touch triggers), `ALTER TYPE github_webhook_outcome ADD VALUE 'processed_installation'`, and `ALTER TABLE github_webhook ADD COLUMN github_installation_id ... REFERENCES github_installation(id)` — the deferred FK column the slice 1 migration comment promised.
+- **New outcome `processed_installation`** added to the `github_webhook_outcome` enum (and `WebhookOutcome::ProcessedInstallation` in Rust, mapping to `WebhookStatus::Processed`). Distinguishes "we created/updated install state" from `IgnoredAction` (event handled but no material state change). Used for every successful `installation.{created,suspend,unsuspend,deleted}` branch.
+- **Classifier refactored from a monolith into a router + per-event handlers**: new `EventHandler` trait (one impl per event_type, owns its own DB/API deps); `BasicClassifier` becomes a `HashMap<&str, Arc<dyn EventHandler>>` router built via `BasicClassifier::builder().with_handler(...).build()`. `Classifier::supported_event_types()` signature changed from `&'static [&'static str]` to `&[&'static str]` so the router can compose the list from registered handlers at runtime. `IssueCommentHandler` (slice 2b logic moved out unchanged) + `InstallationHandler` (new, slice 3) are the two production handlers; slices 4-7 register their own as they ship.
+- **Builder panics on duplicate event_type registration** (caught at startup, not silently shadowed at runtime). Tested.
+- **InstallationStore trait** (`sbgh-core/src/db/installation.rs`) with `PostgresInstallationStore` and `InMemoryInstallationStore` impls. Four methods: `lookup_allowed`, `upsert_installation`, `set_suspended`, `delete_installation`. The `set_suspended` returning `Option<...>` and `delete_installation` returning `bool` both encode "no row existed" as a successful no-op so the processor doesn't have to special-case "we never accepted this install" (it gets `ignored_unknown_installation` instead).
+- **`installation.deleted` does a hard DELETE in slice 3** (no dependent tables exist yet). Slices 4-5 will replace this with soft-revoke of memberships + policies in the same transaction once those tables ship. A test in `postgres_installation.rs` pins the slice 3 behavior so the slice-4 change becomes visible.
+- **No GitHub API client extension needed by the processor** — the `installation` webhook payload includes `installation.account.{id,login,type}`, so the handler reads everything from the payload. The CLI's `installer allow` and `installer disable --login` commands DO need the API to resolve login → id; they call GitHub's unauthenticated `GET /users/{login}` endpoint directly (60/hr per IP is plenty for operator one-shots). No `GitHubApi` trait change, no App credentials needed in the CLI's env. See the Codex review fix-ups below for why this is unauthenticated rather than App-JWT-signed.
+- **InstallationEvent typed payload** added to `sbgh-core::github::webhook` (`pub struct InstallationEvent { action, installation: InstallationDetails }` with nested `InstallationAccount`). Only deserialises the fields slice 3 reads; `repositories` is intentionally NOT parsed (slice 4 consumes `installation_repositories` events for that).
+- **Grants** (in `sbgh-cli/src/lib.rs::apply_roles`): orch gets `SELECT` on `allowed_installer` (read-only; the allowlist is operator-curated and a compromised processor must not be able to allowlist itself) and full CRUD (`SELECT, INSERT, UPDATE, DELETE`) on `github_installation`. Handler gets nothing on either table — it doesn't know either exists.
+- **CLI installer subcommand**: `sbgh-cli installer allow --login foo [--note ...]`, `... disable {--login foo | --account-id 42}`, `... list`. Both `allow` and `disable --login` resolve the login → numeric id via GitHub's `/users/{login}` first, then hit the SQL path. `disable --account-id` is the emergency fallback that skips the API entirely (works during GH outages / rate-limit, or when the operator already has the id from `installer list`). Tests: pure-SQL paths covered directly; the login-resolution paths covered via an in-process axum mock of `/users/{login}` in `sbgh-cli/tests/installer.rs` — including the rename-collision regression that pins "disable hits the resolved id, not whichever row happens to share the stale display login."
+- **Tests added** (50 net new, total 191 → 241):
+  - `webhook_processor.rs` unit tests (12 new for slice 3): InstallationHandler covering allowed/denied/disabled-allowlist creates, idempotent re-delivery, suspend/unsuspend roundtrip, suspend-for-unknown-install ignored, deleted removes row, deleted-for-unknown ignored, unknown action ignored_action, null payload error, bad typed shape error, unknown account type error. Plus 3 router tests: only-lists-registered-handlers, leaves-unregistered-event-types-in-received, duplicate-handler-panics.
+  - `postgres_installation.rs` (8 new integration tests): lookup_allowed returns disabled rows, lookup returns None for unknown, FK rejects upsert without allowlist row, upsert updates on PK conflict (without clobbering suspended_at), set_suspended None-for-unknown, set_suspended roundtrips via clear, delete returns false for unknown, delete succeeds + second delete is Ok(false).
+  - `processor_e2e.rs` (5 new + 1 modified): installation-created-allowed materialises install row, installation-created-unknown is denied (no row created), installation-suspend sets suspended_at, installation-deleted removes row, and the renamed `pipeline_leaves_unregistered_event_types_in_received` (now uses `push` since `installation` IS registered in slice 3).
+  - `grants.rs` (5 new integration tests in sbgh-cli): orch can SELECT allowed_installer, orch CANNOT INSERT/UPDATE allowed_installer (security invariant), handler CANNOT touch allowed_installer, orch CRUD on github_installation works, handler CANNOT touch github_installation.
+  - `installer.rs` (5 new integration tests in sbgh-cli): list returns rows sorted by login, disable flips is_enabled, disable lookup is case-insensitive, disable returns AccountNotFound for missing login, disable is idempotent.
+- **Container start retry timeout bumped** from 3s → 30s in `test_support.rs::wait_for_port_exposed`, AND added `.config/nextest.toml` with a `testcontainers` test-group capped at `max-threads = 8`. With 246 testcontainers spinning up concurrently (vs 191 before slice 3), the previous 3s budget *and* 15s bump occasionally tripped the `PortNotExposed` race on a busy docker daemon. The combined fix (longer per-container timeout + cap on concurrent containers) is empirically stable across repeated runs.
+- Verification: `just build` (clean release build), `just lint` (clean after one `just fix` rustfmt pass), `just test --summary` (246 tests, 0 failures, ~13s wall-clock).
+- **Fixed mid-slice per Codex review**:
+  - **High (Docker `installer allow` blocked by missing env)**: resolved transitively by the JWT fix below — once `installer` no longer needs App credentials, the existing compose `migrate` service config has everything it needs for any `sbgh-cli installer ...` invocation via `docker compose run --rm migrate ...`.
+  - **High (App JWT auth on `/users/{login}` is wrong)**: dropped the App-JWT auth from `installer.rs::resolve_account` per the GitHub REST docs (the "Get a user" endpoint accepts user/installation tokens or fine-grained PATs, not App JWTs). Now uses an unauthenticated GET — 60/hr per IP is plenty for an operator one-shot. Removed `SBGH_GH_CLIENT_ID` / `SBGH_GH_PRIVATE_KEY_PATH` from the CLI env requirements; updated docs in `crates/sbgh-cli/src/main.rs` header + `docs/host-bringup.md`.
+  - **Medium (login-keyed disable is racy under recycled/renamed logins)**: `disable_installer(pool, login)` now resolves `login → numeric account id` via the same `/users/{login}` path, then delegates to a new `disable_installer_by_account_id(pool, id)` that targets the numeric PK. Added integration tests with an in-process axum mock of `/users/{login}` proving: (a) the resolve-then-disable flow works end-to-end, (b) when two rows share a stale display login but only one has the currently-resolved id, ONLY the resolved row is disabled (`disable_installer_targets_resolved_id_even_after_login_collision`), and (c) disabling a resolved id not on the allowlist surfaces `NotOnAllowlist` rather than silently no-op.
+  - **Medium (`github_webhook.github_installation_id` unpopulated FK conflicts with slice 3's hard install delete)**: added `ON DELETE SET NULL` to the FK in the slice 3 migration. Slice 3 has no writer for the column (none needed yet; populating requires the same lookup the install handler runs at create time), but the FK semantic is now pinned for slice 4+ writers. Regression test `delete_installation_nulls_resolved_fk_on_dependent_webhook_rows` simulates a populated column + verifies the install-row DELETE leaves the webhook row in place with the FK column NULL'd.
+- Test count after Codex fixes: 246 (was 241 — net +5 from the additional installer e2e tests with the axum mock + the `ON DELETE SET NULL` regression test).
 
 ##### Slice 4: Repo Lineage + Installation Membership
 

@@ -522,7 +522,7 @@ else
                 "SELECT count(*) FROM jobs WHERE status='running'" 2>/dev/null)
             info "queued=${queued:-?}  running=${running:-?}"
         else
-            warn "'jobs' table not present — sbgh-migrate hasn't run yet"
+            warn "'jobs' table not present — sbgh-cli migrate hasn't run yet"
         fi
 
         # Verify the three roles exist and have the expected grants. Use
@@ -533,7 +533,7 @@ else
                     "SELECT 1 FROM pg_roles WHERE rolname='$role'" 2>/dev/null | grep -q '^1$'; then
                 pass "role '$role' exists"
             else
-                fail "role '$role' missing — sbgh-migrate hasn't applied roles yet"
+                fail "role '$role' missing — sbgh-cli migrate hasn't applied roles yet"
             fi
         done
 
@@ -693,12 +693,12 @@ if command -v docker >/dev/null; then
                 warn "$svc container is NOT running (docker compose up -d ?)"
             fi
         done
-        if docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null | grep -q '^sbgh-migrate\b'; then
-            migrate_status=$(docker ps -a --format '{{.Names}}\t{{.Status}}' | grep '^sbgh-migrate\b' | cut -f2)
+        if docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null | grep -q '^sbgh-cli-migrate\b'; then
+            migrate_status=$(docker ps -a --format '{{.Names}}\t{{.Status}}' | grep '^sbgh-cli-migrate\b' | cut -f2)
             if [[ "$migrate_status" =~ ^Exited\ \(0\) ]]; then
-                pass "sbgh-migrate completed successfully ($migrate_status)"
+                pass "sbgh-cli-migrate completed successfully ($migrate_status)"
             else
-                warn "sbgh-migrate status: $migrate_status (expected 'Exited (0) ...')"
+                warn "sbgh-cli-migrate status: $migrate_status (expected 'Exited (0) ...')"
             fi
         fi
 

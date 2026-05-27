@@ -1,0 +1,32 @@
+# Workspace nextest config. Primary purpose: bound the number of
+# testcontainers Postgres instances spun up in parallel so a busy
+# docker daemon doesn't trip the PortNotExposed race the
+# `wait_for_port_exposed` retry loop in
+# `crates/sbgh-core/src/db/test_support.rs` was added to absorb.
+#
+# Empirically a cap of 8 keeps wall-clock low (~13s for the full suite
+# on an M-series Mac with the postgres:18-trixie image warm) without
+# overwhelming docker on macOS, where the docker-proxy port-binding
+# step is the bottleneck under heavy concurrency. Caps above ~12 still
+# trip the PortNotExposed race intermittently here even with the 30s
+# per-container wait_for_port_exposed timeout.
+
+#[test-groups]
+#testcontainers = { max-threads = 8 }
+
+#[[profile.default.overrides]]
+# Any test in our integration suites that opens a real Postgres
+# container via setup_pg() — that's all `tests/postgres_*.rs`, the
+# grants/installer suites in sbgh-cli, and the orchestrator's
+# processor_e2e.rs.
+# filter = '''
+#     test(=claim_next_returns_none_when_empty)
+#   | binary(=postgres_ingest)
+#   | binary(=postgres_installation)
+#   | binary(=postgres_jobs)
+#   | binary(=postgres_webhook)
+#   | binary(=grants)
+#   | binary(=installer)
+#   | binary(=processor_e2e)
+# '''
+# test-group = 'testcontainers'

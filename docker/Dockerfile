@@ -1,10 +1,10 @@
-# Multi-stage build for the handler, migrate, and smee binaries. Build the
+# Multi-stage build for the handler, cli, and smee binaries. Build the
 # workspace once, then carve out a slim runtime image per binary via separate
 # targets.
 #
 # Build either with:
 #   docker build -f docker/Dockerfile --target handler -t sbgh-handler .
-#   docker build -f docker/Dockerfile --target migrate -t sbgh-migrate .
+#   docker build -f docker/Dockerfile --target cli     -t sbgh-cli     .
 #   docker build -f docker/Dockerfile --target smee    -t sbgh-smee    .
 # Or via docker-compose, which picks the right `target` for each service.
 
@@ -27,9 +27,9 @@ COPY migrations ./migrations
 # Build only the binaries packaged into the runtime images.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release -p sbgh-handler -p sbgh-migrate -p sbgh-smee && \
+    cargo build --release -p sbgh-handler -p sbgh-cli -p sbgh-smee && \
     cp target/release/sbgh-handler /usr/local/bin/sbgh-handler && \
-    cp target/release/sbgh-migrate /usr/local/bin/sbgh-migrate && \
+    cp target/release/sbgh-cli     /usr/local/bin/sbgh-cli && \
     cp target/release/sbgh-smee    /usr/local/bin/sbgh-smee
 
 # ─── 2. Common runtime layer ────────────────────────────────────────────
@@ -64,13 +64,15 @@ RUN apt-get update \
 USER sbgh
 WORKDIR /home/sbgh
 
-# ─── 3a. sbgh-migrate image ─────────────────────────────────────────────
-# One-shot binary. Runs as the DB *owner* role (`sbgh`) to apply schema
-# migrations and (re)create the two narrow runtime roles. Compose wires
-# the handler + orchestrator to wait on this completing successfully.
-FROM runtime AS migrate
-COPY --from=builder /usr/local/bin/sbgh-migrate /usr/local/bin/sbgh-migrate
-ENTRYPOINT ["/usr/local/bin/sbgh-migrate"]
+# ─── 3a. sbgh-cli image ─────────────────────────────────────────────────
+# Operator CLI: `sbgh-cli migrate` (one-shot at deploy time, runs as the
+# DB *owner* role to apply schema + (re)create runtime roles) and
+# `sbgh-cli installer ...` (admin commands for the allowed_installer
+# allowlist). Compose wires the handler + orchestrator to wait on the
+# `migrate` subcommand completing successfully.
+FROM runtime AS cli
+COPY --from=builder /usr/local/bin/sbgh-cli /usr/local/bin/sbgh-cli
+ENTRYPOINT ["/usr/local/bin/sbgh-cli"]
 
 # ─── 3b. sbgh-handler image ─────────────────────────────────────────────
 FROM runtime AS handler

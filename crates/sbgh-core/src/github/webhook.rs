@@ -84,6 +84,38 @@ pub struct Installation {
     pub id: i64,
 }
 
+/// Subset of the `installation` webhook payload the processor needs.
+/// GitHub's full payload is large; we deserialise only the fields slice 3
+/// actually reads. `installation.account` is the GH account that installed
+/// the App — that's what we check against `allowed_installer`.
+///
+/// `repositories` (the initial-install repo list) is intentionally NOT
+/// parsed here — slice 4 will consume `installation_repositories` events
+/// to materialise membership rows; the `installation.created` payload
+/// only needs to give us enough to gate the install itself.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstallationEvent {
+    pub action: String,
+    pub installation: InstallationDetails,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstallationDetails {
+    pub id: i64,
+    pub account: InstallationAccount,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstallationAccount {
+    pub id: i64,
+    pub login: String,
+    /// GitHub returns `"User"`, `"Organization"`, or `"Bot"`. Lowercased
+    /// in the model layer via `GithubAccountType` — we keep the raw
+    /// string here and translate at the classifier boundary.
+    #[serde(rename = "type")]
+    pub account_type: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -361,16 +361,38 @@ image).
 
 | DB role | Holds password | Grants | Used by |
 | ---- | ---- | ---- | ---- |
-| `sbgh` | `POSTGRES_OWNER_PASSWORD` | full ownership of the `sbgh` database | `sbgh-migrate` one-shot only |
-| `sbgh_handler` | `SBGH_HANDLER_DB_PASSWORD` | `USAGE` on schema, `INSERT` on `jobs` | handler container |
-| `sbgh_orch` | `SBGH_ORCH_DB_PASSWORD` | `USAGE` on schema, `SELECT, UPDATE` on `jobs` | host orchestrator |
+| `sbgh` | `POSTGRES_OWNER_PASSWORD` | full ownership of the `sbgh` database | `sbgh-cli migrate` one-shot + `sbgh-cli installer ...` admin |
+| `sbgh_handler` | `SBGH_HANDLER_DB_PASSWORD` | `USAGE` on schema, `INSERT` on `jobs`/`github_webhook` (column-level) | handler container |
+| `sbgh_orch` | `SBGH_ORCH_DB_PASSWORD` | `USAGE` on schema, `SELECT`/`UPDATE` on `jobs`/`github_webhook`; `SELECT` on `allowed_installer`; CRUD on `github_installation` | host orchestrator |
 
 Roles + grants are (re)applied on every `docker compose up` by the
-`sbgh-migrate` service (Rust binary, `crates/sbgh-migrate`). It connects
-as the owner, runs schema migrations, then upserts the two narrow roles
-with whatever passwords are currently in `docker/.env`. Handler + smee
+`migrate` service (the Rust binary `sbgh-cli`, `crates/sbgh-cli`,
+invoked with the `migrate` subcommand). It connects as the owner, runs
+schema migrations, then upserts the two narrow roles with whatever
+passwords are currently in `docker/.env`. Handler + smee
 `depends_on: service_completed_successfully` so they never see a
 half-migrated schema or a role without grants.
+
+The same `sbgh-cli` binary also provides operator admin commands for
+the `allowed_installer` allowlist (slice 3+). Logins are resolved to
+numeric account ids via GitHub's unauthenticated `/users/{login}`
+endpoint (60/hr per IP — plenty for operator one-shots), so no App
+private-key plumbing is needed in the CLI's env beyond what `migrate`
+already has:
+
+```bash
+# Add a GH account to the allowlist. Resolves login → numeric id via
+# the GH API, then upserts allowed_installer with is_enabled=TRUE.
+docker compose -f docker/docker-compose.yml run --rm migrate installer allow --login some-org
+
+# Soft-disable an allowed installer (sets is_enabled=FALSE; row preserved
+# for audit). Resolves login → id first, then disables by numeric id
+# — display logins aren't unique across renames/recycling.
+docker compose -f docker/docker-compose.yml run --rm migrate installer disable --login some-org
+
+# Dump the allowlist.
+docker compose -f docker/docker-compose.yml run --rm migrate installer list
+```
 
 ### One-time setup
 
@@ -413,7 +435,7 @@ What gets built + run:
 | Service | Image | Listens | DB role | Talks to |
 | ---- | ---- | ---- | ---- | ---- |
 | `sbgh-postgres` | `postgres:18-trixie` (uid `${POSTGRES_UID:-900}`) | 127.0.0.1:5432 | — | — |
-| `sbgh-migrate` | local `migrate` target (one-shot) | — | `sbgh` (owner) | `postgres:5432` |
+| `sbgh-cli-migrate` | local `cli` target (one-shot) | — | `sbgh` (owner) | `postgres:5432` |
 | `sbgh-handler` | local `handler` target (uid `${SBGH_UID:-901}`) | 127.0.0.1:8080 | `sbgh_handler` | `postgres:5432` (INSERT only) |
 | `sbgh-smee` | local `smee` target (uid `${SBGH_SMEE_UID:-903}`) | — | — | smee.io (SSE in), `handler:8080` (HTTP out) |
 

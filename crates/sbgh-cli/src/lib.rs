@@ -1,10 +1,16 @@
-//! Library half of the `sbgh-migrate` crate. The bin (`src/main.rs`)
-//! is a thin CLI shell; the actual role/grant logic lives here so
-//! integration tests in `sbgh-migrate/tests/grants.rs` can exercise
-//! it against an ephemeral testcontainers Postgres without shelling
-//! out to the binary.
+//! Library half of the `sbgh-cli` crate. The bin (`src/main.rs`)
+//! is the clap subcommand shell; the actual role/grant logic + the
+//! installer admin operations live here so integration tests in
+//! `sbgh-cli/tests/*.rs` can exercise them against an ephemeral
+//! testcontainers Postgres without shelling out to the binary.
+
+pub mod installer;
 
 use anyhow::Context;
+pub use installer::{
+    InstallerError, allow_installer, disable_installer, disable_installer_by_account_id,
+    list_installers,
+};
 use sbgh_core::db::Pool;
 
 /// Create (if missing) and reset passwords + grants for the two narrow
@@ -103,6 +109,30 @@ pub async fn apply_roles(
         .execute(&mut *tx)
         .await?;
     sqlx::query("GRANT SELECT, UPDATE ON TABLE github_webhook TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
+    // Slice 3: allowed_installer + github_installation.
+    //
+    // allowed_installer is operator-curated — only the owner (and the CLI
+    // running as owner) writes it. Orchestrator only needs SELECT to
+    // evaluate "is this installer allowed?" on installation.created. No
+    // INSERT/UPDATE — a compromised processor must NOT be able to add a
+    // hostile account to the allowlist.
+    sqlx::query("REVOKE ALL ON TABLE allowed_installer FROM sbgh_handler, sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT ON TABLE allowed_installer TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
+    // github_installation is processor-owned: the processor creates rows
+    // on installation.created, updates suspended_at on suspend/unsuspend,
+    // deletes on installation.deleted. Handler never touches it.
+    sqlx::query("REVOKE ALL ON TABLE github_installation FROM sbgh_handler, sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE github_installation TO sbgh_orch")
         .execute(&mut *tx)
         .await?;
 

@@ -1,4 +1,4 @@
-//! Integration tests for the role/grant setup that `sbgh-migrate`
+//! Integration tests for the role/grant setup that `sbgh-cli migrate`
 //! applies. Boots a fresh testcontainers Postgres, runs migrations,
 //! calls `apply_roles()`, then connects AS the narrow roles and
 //! asserts each can do what it's supposed to — and is REJECTED on
@@ -9,8 +9,8 @@
 //! "compromised orchestrator can't insert webhooks." Both rest on
 //! the column-level GRANT specificity that's easy to drift on.
 
+use sbgh_cli::apply_roles;
 use sbgh_core::db::{self, Pool, setup_pg};
-use sbgh_migrate::apply_roles;
 use sqlx::Row;
 
 const HANDLER_PW: &str = "handler-test-pw";
@@ -355,6 +355,146 @@ async fn handler_cannot_select_webhook_payload() {
         status_result.is_err(),
         "handler SELECT status MUST be rejected; got: {status_result:?}"
     );
+}
+
+// ─── Slice 3: allowed_installer + github_installation grants ───────────
+
+#[tokio::test]
+async fn orch_can_select_allowed_installer() {
+    // The processor's installation.created path SELECTs allowed_installer
+    // to evaluate the allowlist. Grant must permit this.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    // Seed as owner.
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (42, 'octo', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM allowed_installer")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on allowed_installer must succeed");
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn orch_cannot_insert_or_update_allowed_installer() {
+    // The allowlist is operator-curated. A compromised orchestrator
+    // must NOT be able to add itself to the allowlist or flip an
+    // existing row to is_enabled=TRUE.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type, \
+         is_enabled) VALUES (42, 'octo', 'organization', FALSE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    let insert_result = sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (99, 'evil', 'user')",
+    )
+    .execute(&orch)
+    .await;
+    assert!(insert_result.is_err(), "orch INSERT on allowed_installer MUST be rejected");
+
+    let update_result =
+        sqlx::query("UPDATE allowed_installer SET is_enabled = TRUE WHERE github_account_id = 42")
+            .execute(&orch)
+            .await;
+    assert!(update_result.is_err(), "orch UPDATE on allowed_installer MUST be rejected");
+}
+
+#[tokio::test]
+async fn handler_cannot_touch_allowed_installer() {
+    // Handler has no business knowing the allowlist exists.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let handler = handler_pool(&pool).await;
+
+    let select_result = sqlx::query("SELECT 1 FROM allowed_installer LIMIT 1")
+        .fetch_optional(&handler)
+        .await;
+    assert!(select_result.is_err(), "handler SELECT on allowed_installer MUST be rejected");
+}
+
+#[tokio::test]
+async fn orch_can_crud_github_installation() {
+    // Processor needs INSERT (on installation.created), UPDATE (on
+    // suspend/unsuspend), DELETE (on installation.deleted), SELECT
+    // (on lookups). All four must be granted.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    // FK to allowed_installer — seed parent first.
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (42, 'octo', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (100, 42, 'octo', 'organization')",
+    )
+    .execute(&orch)
+    .await
+    .expect("orch INSERT on github_installation must succeed");
+    sqlx::query("UPDATE github_installation SET suspended_at = NOW() WHERE id = 100")
+        .execute(&orch)
+        .await
+        .expect("orch UPDATE on github_installation must succeed");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_installation")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on github_installation must succeed");
+    assert_eq!(count, 1);
+    sqlx::query("DELETE FROM github_installation WHERE id = 100")
+        .execute(&orch)
+        .await
+        .expect("orch DELETE on github_installation must succeed");
+}
+
+#[tokio::test]
+async fn handler_cannot_touch_github_installation() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let handler = handler_pool(&pool).await;
+
+    let select_result = sqlx::query("SELECT 1 FROM github_installation LIMIT 1")
+        .fetch_optional(&handler)
+        .await;
+    assert!(select_result.is_err(), "handler SELECT on github_installation MUST be rejected");
 }
 
 #[tokio::test]

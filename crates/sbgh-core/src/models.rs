@@ -38,6 +38,11 @@ pub enum WebhookStatus {
 #[serde(rename_all = "snake_case")]
 pub enum WebhookOutcome {
     EnqueuedJob,
+    /// Slice 3+: terminal "we materialised installation state" — the
+    /// processor created/updated a `github_installation` row in response
+    /// to an `installation.*` event. Distinct from `IgnoredAction` so
+    /// ops queries can separate "no-op event" from "install state changed".
+    ProcessedInstallation,
     IgnoredAction,
     IgnoredNoCommand,
     IgnoredUnknownInstallation,
@@ -53,7 +58,7 @@ impl WebhookOutcome {
     /// Terminal status that pairs with this outcome.
     pub fn terminal_status(self) -> WebhookStatus {
         match self {
-            Self::EnqueuedJob => WebhookStatus::Processed,
+            Self::EnqueuedJob | Self::ProcessedInstallation => WebhookStatus::Processed,
             Self::IgnoredAction
             | Self::IgnoredNoCommand
             | Self::IgnoredUnknownInstallation
@@ -65,6 +70,47 @@ impl WebhookOutcome {
             Self::Error => WebhookStatus::Failed,
         }
     }
+}
+
+/// GH account kind, mirrors the `github_account_type` DB enum. Bot is
+/// included for completeness even though the App is unlikely to be
+/// installed by a bot in practice — present so we don't panic if the
+/// API ever hands us one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "github_account_type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum GithubAccountType {
+    User,
+    Organization,
+    Bot,
+}
+
+/// Operator-curated allowlist row. PK is the GitHub-assigned numeric
+/// account id — stable across renames and case.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AllowedInstaller {
+    pub github_account_id: i64,
+    pub account_login: String,
+    pub account_type: GithubAccountType,
+    pub is_enabled: bool,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A GitHub App installation we've accepted. `id` is GitHub's numeric
+/// installation id, used as the FK target by membership / policy /
+/// inbox tables. FK to `allowed_installer.github_account_id` enforces
+/// "installation must be backed by a current allowlist entry".
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubInstallation {
+    pub id: i64,
+    pub github_account_id: i64,
+    pub account_login: String,
+    pub account_type: GithubAccountType,
+    pub suspended_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

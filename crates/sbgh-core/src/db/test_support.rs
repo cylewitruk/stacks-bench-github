@@ -20,8 +20,12 @@ use tokio::time::sleep;
 use crate::db::{self, Pool};
 
 /// Upper bound on the "container started but port not yet bound" race.
-/// Generous compared to typical (<200ms) to absorb parallel-test load.
-const PORT_READY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Generous compared to typical (<200ms) to absorb parallel-test load —
+/// 50+ containers spinning up at once on the same docker daemon can
+/// stretch port-binding past 20s under sustained load. The polling
+/// interval is small enough that the fast path (port ready first poll)
+/// pays almost nothing for the headroom.
+const PORT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Tuple returned by `setup_pg`. Keep the container handle alive for
@@ -59,6 +63,7 @@ pub async fn setup_pg() -> Option<TestPg> {
     wait_for_tcp_accept(port)
         .await
         .expect("postgres host port exposed but never accepted TCP connections");
+    tokio::time::sleep(Duration::from_millis(250)).await; // extra buffer for Postgres to finish startup after accepting TCP
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let pool = db::connect(&url)
         .await

@@ -10,14 +10,16 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use sbgh_core::config::OrchestratorConfig;
-use sbgh_core::db::{self, PostgresJobStore, PostgresWebhookInbox};
+use sbgh_core::db::{self, PostgresInstallationStore, PostgresJobStore, PostgresWebhookInbox};
 use sbgh_core::github::{AppCredentials, InstallationTokenCache, OctocrabClient};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::libvirt::SystemShell;
 use crate::runner::Runner;
-use crate::webhook_processor::{BasicClassifier, ProcessorConfig, WebhookProcessor};
+use crate::webhook_processor::{
+    BasicClassifier, InstallationHandler, IssueCommentHandler, ProcessorConfig, WebhookProcessor,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "stacks-bench job orchestrator (libvirt benchmark runner)")]
@@ -37,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = OrchestratorConfig::load().context("loading config")?;
     // Connect using the narrow `sbgh_orch` role — SELECT + UPDATE on jobs.
-    // Schema setup runs in the separate `sbgh-migrate` binary as the DB
+    // Schema setup runs in the separate `sbgh-cli migrate` binary as the DB
     // owner, never here.
     let pool = db::connect(&config.server.database_url).await?;
 
@@ -57,9 +59,20 @@ async fn main() -> anyhow::Result<()> {
     // Slice 2b: webhook processor runs concurrently with the legacy
     // job runner. Both loop indefinitely; if either returns Err the
     // orchestrator crashes and systemd restarts it.
-    let webhook_inbox = Arc::new(PostgresWebhookInbox::new(pool));
+    //
+    // The classifier is composed from per-event-type EventHandlers
+    // (slice 3 router refactor). Each slice 3-7 adds more handlers
+    // here as they ship — the set of registered handlers is what
+    // determines which event types the processor will claim from the
+    // inbox (others stay `received` for a future slice).
+    let webhook_inbox = Arc::new(PostgresWebhookInbox::new(pool.clone()));
+    let installation_store = Arc::new(PostgresInstallationStore::new(pool));
+    let classifier = BasicClassifier::builder()
+        .with_handler(Arc::new(IssueCommentHandler))
+        .with_handler(Arc::new(InstallationHandler::new(installation_store)))
+        .build();
     let processor =
-        WebhookProcessor::new(webhook_inbox, Arc::new(BasicClassifier), ProcessorConfig::default());
+        WebhookProcessor::new(webhook_inbox, Arc::new(classifier), ProcessorConfig::default());
 
     let runner = Runner::new(config, jobs, gh, shell);
 

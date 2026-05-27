@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = HandlerConfig::load().context("loading config")?;
     // Connect using the narrow `sbgh_handler` role — INSERT-only. The
-    // database schema is established by `sbgh-migrate` (running as the
+    // database schema is established by `sbgh-cli migrate` (running as the
     // owner role) before this binary starts.
     let pool = db::connect(&config.server.database_url)
         .await

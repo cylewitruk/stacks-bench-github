@@ -7,7 +7,8 @@
 #   - postgres            runs as uid ${POSTGRES_UID:-900}, overriding the
 #                         image baseline of 999 so we don't share the
 #                         host's dnsmasq uid.
-#   - sbgh-migrate        runs as the DB *owner* role (full access). One-shot.
+#   - sbgh-cli (migrate)  runs as the DB *owner* role (full access). One-shot
+#                         via the `migrate` subcommand at deploy time.
 #   - sbgh-handler        runs as uid ${SBGH_UID:-901} and connects as
 #                         `sbgh_handler` — INSERT on jobs only. Holds the
 #                         webhook HMAC secret; NO GitHub App credentials.
@@ -78,27 +79,30 @@ services:
     networks: [sbgh-net]
 
   # One-shot: apply schema migrations + (re)create the narrow runtime roles
-  # with the passwords from .env. Handler + smee wait for this to exit
-  # cleanly before they start, so handler always opens its pool against a
-  # fully-grants'd `sbgh_handler` role.
+  # with the passwords from .env. Invokes the `migrate` subcommand of
+  # `sbgh-cli` (the default when no subcommand is given — matches the
+  # legacy `sbgh-migrate` binary's behavior). Handler + smee wait for
+  # this to exit cleanly before they start, so handler always opens its
+  # pool against a fully-grants'd `sbgh_handler` role.
   migrate:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-      target: migrate
-    image: sbgh-migrate:latest
-    container_name: sbgh-migrate
+      target: cli
+    image: sbgh-cli:latest
+    container_name: sbgh-cli-migrate
     restart: "no"
     depends_on:
       postgres:
         condition: service_healthy
+    command: ["migrate"]
     environment:
-      # Owner DSN — full access. Lives only in the migrate container's env;
+      # Owner DSN — full access. Lives only in this container's env;
       # never given to the handler or orchestrator.
       DATABASE_URL: postgres://sbgh:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD must be set in docker/.env}@postgres:5432/sbgh
       SBGH_HANDLER_DB_PASSWORD: ${SBGH_HANDLER_DB_PASSWORD:?SBGH_HANDLER_DB_PASSWORD must be set in docker/.env}
       SBGH_ORCH_DB_PASSWORD: ${SBGH_ORCH_DB_PASSWORD:?SBGH_ORCH_DB_PASSWORD must be set in docker/.env}
-      RUST_LOG: ${RUST_LOG:-info,sbgh_migrate=debug,sqlx=warn}
+      RUST_LOG: ${RUST_LOG:-info,sbgh_cli=debug,sqlx=warn}
     networks: [sbgh-net]
 
   handler:

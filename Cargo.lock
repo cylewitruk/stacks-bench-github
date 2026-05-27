@@ -2539,6 +2539,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "sbgh-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "dotenvy",
+ "reqwest",
+ "sbgh-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "sbgh-core"
 version = "0.1.0"
 dependencies = [
@@ -2587,22 +2607,6 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "sbgh-migrate"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "dotenvy",
- "sbgh-core",
- "serde_json",
- "sqlx",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",

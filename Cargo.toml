@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/sbgh-core",
     "crates/sbgh-handler",
-    "crates/sbgh-migrate",
+    "crates/sbgh-cli",
     "crates/sbgh-orchestrator",
     "crates/sbgh-smee",
 ]
