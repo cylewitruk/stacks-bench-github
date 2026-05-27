@@ -64,9 +64,9 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Initial implementation completed
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice)
 
 **Todo's:**
 
@@ -79,7 +79,11 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If non, just write "None").
+- Migration file: `migrations/20260527000001_slice0_foundations.sql`. Contains: `pgcrypto` extension, `set_updated_at()` trigger function, 9 enum types (`github_account_type`, `user_role`, `job_kind`, `trigger_kind`, `git_ref_kind`, `job_event_kind`, `job_event_status`, `github_webhook_status`, `github_webhook_outcome`).
+- `job_status` enum intentionally NOT re-created — the legacy `20260521000001_init.sql` already defines it with values identical to the target schema (`'queued', 'running', 'completed', 'failed', 'cancelled'`). Later slices reuse it directly.
+- Roles `sbgh_handler` and `sbgh_orch` already existed from the original setup. No changes to `sbgh-migrate/src/main.rs` were needed — slice 0 adds only types (not tables/columns), and per-table grants ship with their respective tables in later slices.
+- Verification: `just build --no-sccache` (clean release build, migration embedded via `sqlx::migrate!`), `just lint --no-sccache` (clean), `just test --summary --no-sccache` (117 tests pass). No DB integration test run locally — the full docker-compose stack would be needed to verify the migration applies against a live Postgres; deferred until slice 1 where there's actual schema to validate.
+- Compose stack untouched — services will pick up the migration on next `docker compose -f docker/docker-compose.yml up -d migrate`.
 
 ##### Slice 1: Webhook Inbox + Handler Dual Write
 
