@@ -439,17 +439,17 @@ async fn handler_cannot_touch_allowed_installer() {
 }
 
 #[tokio::test]
-async fn orch_can_crud_github_installation() {
-    // Processor needs INSERT (on installation.created), UPDATE (on
-    // suspend/unsuspend), DELETE (on installation.deleted), SELECT
-    // (on lookups). All four must be granted.
+async fn orch_can_select_insert_update_github_installation_but_not_delete() {
+    // Slice 4 changed install.deleted from hard-DELETE to soft-delete
+    // (UPDATE sets deleted_at). DELETE is intentionally NOT granted —
+    // a compromised processor must not be able to nuke history that
+    // slice 5+ policy + slice 8+ job FKs depend on.
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
     apply_roles(&pool, HANDLER_PW, ORCH_PW)
         .await
         .unwrap();
-    // FK to allowed_installer — seed parent first.
     sqlx::query(
         "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
          (42, 'octo', 'organization')",
@@ -470,15 +470,24 @@ async fn orch_can_crud_github_installation() {
         .execute(&orch)
         .await
         .expect("orch UPDATE on github_installation must succeed");
+    sqlx::query("UPDATE github_installation SET deleted_at = NOW() WHERE id = 100")
+        .execute(&orch)
+        .await
+        .expect("orch UPDATE deleted_at (the slice 4 soft-delete) must succeed");
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_installation")
         .fetch_one(&orch)
         .await
         .expect("orch SELECT on github_installation must succeed");
     assert_eq!(count, 1);
-    sqlx::query("DELETE FROM github_installation WHERE id = 100")
+
+    let delete_result = sqlx::query("DELETE FROM github_installation WHERE id = 100")
         .execute(&orch)
-        .await
-        .expect("orch DELETE on github_installation must succeed");
+        .await;
+    assert!(
+        delete_result.is_err(),
+        "orch DELETE on github_installation MUST be rejected — slice 4 switched to soft-delete to \
+         preserve historical FK targets"
+    );
 }
 
 #[tokio::test]
@@ -495,6 +504,172 @@ async fn handler_cannot_touch_github_installation() {
         .fetch_optional(&handler)
         .await;
     assert!(select_result.is_err(), "handler SELECT on github_installation MUST be rejected");
+}
+
+// ─── Slice 4: github_repo + supported_repo_root + github_installation_repo
+
+#[tokio::test]
+async fn orch_can_select_insert_update_github_repo() {
+    // Processor inserts identity + lineage rows; UPDATE refreshes mutable
+    // fields on later encounters. NO DELETE — repo identity is forever.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let orch = orch_pool(&pool).await;
+
+    sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r1')")
+        .execute(&orch)
+        .await
+        .expect("orch INSERT on github_repo must succeed");
+    sqlx::query("UPDATE github_repo SET default_branch = 'main' WHERE id = 10")
+        .execute(&orch)
+        .await
+        .expect("orch UPDATE on github_repo must succeed");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_repo")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on github_repo must succeed");
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn orch_can_select_supported_repo_root_but_not_insert_or_update() {
+    // supported_repo_root is operator-curated. Compromised processor
+    // must NOT be able to allowlist a new repo family.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO github_repo (id, owner, name) VALUES (10, 'stacks-network', 'stacks-core')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO supported_repo_root (github_repo_id) VALUES (10)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    // SELECT must succeed (processor reads the gate).
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM supported_repo_root")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on supported_repo_root must succeed");
+    assert_eq!(count, 1);
+
+    // INSERT must be rejected.
+    sqlx::query(
+        "INSERT INTO github_repo (id, owner, name) VALUES (99, 'evil', 'new'); INSERT INTO \
+         supported_repo_root (github_repo_id) VALUES (99)",
+    )
+    .execute(&orch)
+    .await
+    .expect_err("orch INSERT on supported_repo_root MUST be rejected");
+
+    // UPDATE must be rejected too — orch can't flip is_enabled.
+    sqlx::query("UPDATE supported_repo_root SET is_enabled = FALSE WHERE github_repo_id = 10")
+        .execute(&orch)
+        .await
+        .expect_err("orch UPDATE on supported_repo_root MUST be rejected");
+}
+
+#[tokio::test]
+async fn handler_cannot_touch_supported_repo_root_or_github_repo() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let handler = handler_pool(&pool).await;
+
+    sqlx::query("SELECT 1 FROM supported_repo_root LIMIT 1")
+        .fetch_optional(&handler)
+        .await
+        .expect_err("handler SELECT on supported_repo_root MUST be rejected");
+    sqlx::query("SELECT 1 FROM github_repo LIMIT 1")
+        .fetch_optional(&handler)
+        .await
+        .expect_err("handler SELECT on github_repo MUST be rejected");
+}
+
+#[tokio::test]
+async fn orch_can_select_insert_update_github_installation_repo() {
+    // INSERT on installation_repositories.added, UPDATE revoked_at on
+    // .removed + bulk on installation.deleted. NO DELETE — membership
+    // history is permanent.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (42, 'octo', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (100, 42, 'octo', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r1')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    sqlx::query(
+        "INSERT INTO github_installation_repo (github_installation_id, github_repo_id) VALUES \
+         (100, 10)",
+    )
+    .execute(&orch)
+    .await
+    .expect("orch INSERT on github_installation_repo must succeed");
+    sqlx::query(
+        "UPDATE github_installation_repo SET revoked_at = NOW() WHERE github_installation_id = \
+         100 AND github_repo_id = 10",
+    )
+    .execute(&orch)
+    .await
+    .expect("orch UPDATE on github_installation_repo must succeed");
+
+    let delete_result =
+        sqlx::query("DELETE FROM github_installation_repo WHERE github_installation_id = 100")
+            .execute(&orch)
+            .await;
+    assert!(
+        delete_result.is_err(),
+        "orch DELETE on github_installation_repo MUST be rejected (membership history is \
+         permanent — preserved for slice 5+ policy + slice 8+ job FKs)"
+    );
+}
+
+#[tokio::test]
+async fn handler_cannot_touch_github_installation_repo() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let handler = handler_pool(&pool).await;
+    sqlx::query("SELECT 1 FROM github_installation_repo LIMIT 1")
+        .fetch_optional(&handler)
+        .await
+        .expect_err("handler SELECT on github_installation_repo MUST be rejected");
 }
 
 #[tokio::test]

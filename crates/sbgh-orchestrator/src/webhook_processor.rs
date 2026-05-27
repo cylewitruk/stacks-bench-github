@@ -26,8 +26,14 @@ use std::time::Instant;
 use async_trait::async_trait;
 use chrono::Utc;
 use sbgh_core::Result;
-use sbgh_core::db::{ClaimedWebhook, InstallationStore, NewInstallation, WebhookInbox};
-use sbgh_core::github::{InstallationEvent, IssueCommentEvent, parse_command};
+use sbgh_core::db::{
+    ClaimedWebhook, InstallationStore, NewInstallation, NewRepoIdentity, NewRepoLineage, RepoStore,
+    WebhookInbox,
+};
+use sbgh_core::github::{
+    GitHubApi, InstallationEvent, InstallationRepositoriesEvent, IssueCommentEvent, RepoRef,
+    RepoSummary, parse_command,
+};
 use sbgh_core::models::{GithubAccountType, WebhookOutcome};
 
 /// What a [`Classifier`] decides to do with a claimed webhook.
@@ -276,9 +282,12 @@ impl EventHandler for IssueCommentHandler {
 ///   `ignored_unknown_installation` (we never accepted this install).
 /// - `unsuspend` → clear `suspended_at` on the install row → same as suspend
 ///   for the missing case.
-/// - `deleted` → delete the install row → `processed_installation`. Slices 4-5
-///   will replace the hard DELETE with soft-revoke of dependent memberships +
-///   policies in the same transaction.
+/// - `deleted` → transactionally soft-delete the install row (sets `deleted_at
+///   = NOW()`) AND bulk-revoke every active membership in
+///   `github_installation_repo`. The install row is preserved so slice 8+ job
+///   FKs remain valid. Slice 5+ policy tables will be soft-disabled in the same
+///   transaction once they ship. Outcome: `processed_installation`; missing
+///   install → `ignored_unknown_installation`.
 /// - any other action → `ignored_action` (forward-compat: GitHub may add new
 ///   actions; record-and-skip beats retry-forever).
 ///
@@ -286,12 +295,24 @@ impl EventHandler for IssueCommentHandler {
 /// `ClassifyOutcome::Retryable`; the processor schedules a backoff
 /// retry.
 pub struct InstallationHandler {
-    store: Arc<dyn InstallationStore>,
+    install_store: Arc<dyn InstallationStore>,
+    repo_store: Arc<dyn RepoStore>,
+    gh: Arc<dyn GitHubApi>,
 }
 
 impl InstallationHandler {
-    pub fn new(store: Arc<dyn InstallationStore>) -> Self {
-        Self { store }
+    /// Slice 4 widened the constructor to take the repo store + GH
+    /// client so `installation.created` can materialise initial
+    /// memberships from the payload's `repositories` array (Codex's
+    /// slice-4 high-finding fix). Slice 3 callers can pass
+    /// `Arc::new(InMemoryRepoStore::new())` + `Arc::new(FakeGitHub::new())`
+    /// in tests that don't exercise the initial-repos path.
+    pub fn new(
+        install_store: Arc<dyn InstallationStore>,
+        repo_store: Arc<dyn RepoStore>,
+        gh: Arc<dyn GitHubApi>,
+    ) -> Self {
+        Self { install_store, repo_store, gh }
     }
 }
 
@@ -322,19 +343,28 @@ impl EventHandler for InstallationHandler {
         };
 
         match event.action.as_str() {
-            "created" => handle_created(self.store.as_ref(), &event, account_type).await,
+            "created" => {
+                handle_created(
+                    self.install_store.as_ref(),
+                    self.repo_store.as_ref(),
+                    self.gh.as_ref(),
+                    &event,
+                    account_type,
+                )
+                .await
+            }
             "suspend" => {
                 handle_set_suspended(
-                    self.store.as_ref(),
+                    self.install_store.as_ref(),
                     event.installation.id,
                     Some(webhook.received_at),
                 )
                 .await
             }
             "unsuspend" => {
-                handle_set_suspended(self.store.as_ref(), event.installation.id, None).await
+                handle_set_suspended(self.install_store.as_ref(), event.installation.id, None).await
             }
-            "deleted" => handle_deleted(self.store.as_ref(), event.installation.id).await,
+            "deleted" => handle_deleted(self.install_store.as_ref(), event.installation.id).await,
             // Forward-compat: anything we don't recognise (e.g., a future
             // `installation.new_permissions_accepted`) is recorded and
             // skipped rather than failing.
@@ -344,11 +374,13 @@ impl EventHandler for InstallationHandler {
 }
 
 async fn handle_created(
-    store: &dyn InstallationStore,
+    install_store: &dyn InstallationStore,
+    repo_store: &dyn RepoStore,
+    gh: &dyn GitHubApi,
     event: &InstallationEvent,
     account_type: GithubAccountType,
 ) -> ClassifyOutcome {
-    let allowed = match store
+    let allowed = match install_store
         .lookup_allowed(event.installation.account.id)
         .await
     {
@@ -375,13 +407,58 @@ async fn handle_created(
             .clone(),
         account_type,
     };
-    match store
+    if let Err(e) = install_store
         .upsert_installation(&new)
         .await
     {
-        Ok(_) => ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation),
-        Err(e) => ClassifyOutcome::Retryable(format!("upsert_installation: {e}")),
+        return ClassifyOutcome::Retryable(format!("upsert_installation: {e}"));
     }
+
+    // Slice 4 high-finding fix: materialise initial memberships from
+    // the payload's `repositories` array. Without this, a fresh install
+    // would have NO `github_installation_repo` rows until a later
+    // `installation_repositories.added` event fired. Per-repo outcomes
+    // are recorded into membership rows; the webhook-level outcome
+    // stays `ProcessedInstallation` regardless of per-repo lineage
+    // results (the install creation itself succeeded). Retryable
+    // errors during the lineage walk DO propagate so a network blip
+    // doesn't drop the initial-repos materialisation on the floor.
+    for repo in &event.repositories {
+        match materialise_repo_membership(
+            repo_store,
+            install_store,
+            gh,
+            event.installation.id,
+            repo,
+        )
+        .await
+        {
+            RepoMembershipOutcome::Added
+            | RepoMembershipOutcome::UnsupportedLineage
+            | RepoMembershipOutcome::IdMismatch
+            | RepoMembershipOutcome::MalformedFullName => {
+                // All non-retryable per-repo outcomes; the install is
+                // still considered processed.
+            }
+            RepoMembershipOutcome::InstallationNotActive => {
+                // We JUST upserted the install row above; this branch
+                // is only reachable if a concurrent processor
+                // soft-deleted it between our upsert and the membership
+                // probe — exceedingly unlikely (two distinct webhooks
+                // racing), and the right response is to surface it
+                // rather than silently swallow.
+                tracing::warn!(
+                    installation_id = event.installation.id,
+                    "installation.created: install was concurrently soft-deleted during \
+                     initial-repos materialisation"
+                );
+                return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnknownInstallation);
+            }
+            RepoMembershipOutcome::Retryable(e) => return ClassifyOutcome::Retryable(e),
+        }
+    }
+
+    ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
 }
 
 async fn handle_set_suspended(
@@ -403,12 +480,27 @@ async fn handle_set_suspended(
 }
 
 async fn handle_deleted(store: &dyn InstallationStore, installation_id: i64) -> ClassifyOutcome {
+    // Slice 4 changed the underlying semantic: instead of hard-deleting
+    // the install row, the store transactionally soft-deletes it (sets
+    // deleted_at) AND bulk-revokes every active membership. The outcome
+    // mapping stays the same as slice 3 — install_found maps to
+    // ProcessedInstallation, missing-install to IgnoredUnknownInstallation
+    // — but we now have a `memberships_revoked` count for logs/ops.
     match store
         .delete_installation(installation_id)
         .await
     {
-        Ok(true) => ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation),
-        Ok(false) => ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnknownInstallation),
+        Ok(outcome) if outcome.install_found => {
+            if outcome.memberships_revoked > 0 {
+                tracing::info!(
+                    installation_id,
+                    memberships_revoked = outcome.memberships_revoked,
+                    "installation.deleted: soft-deleted install + revoked memberships"
+                );
+            }
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        }
+        Ok(_) => ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnknownInstallation),
         Err(e) => ClassifyOutcome::Retryable(format!("delete_installation: {e}")),
     }
 }
@@ -419,6 +511,317 @@ fn parse_account_type(s: &str) -> Option<GithubAccountType> {
         "Organization" => Some(GithubAccountType::Organization),
         "Bot" => Some(GithubAccountType::Bot),
         _ => None,
+    }
+}
+
+// ─── InstallationRepositoriesHandler (slice 4) ─────────────────────────
+
+/// Materialises (or revokes) `github_installation_repo` rows in response
+/// to `installation_repositories.{added,removed}` webhooks. Slice 4 actions:
+///
+/// - `added`   → for each repo: cache-miss-fetch lineage from GH API, upsert
+///   `github_repo`, check `is_supported_lineage`, and (if supported)
+///   `add_or_restore_membership`. Per-repo decisions roll up to a single
+///   webhook outcome: any supported & membership change →
+///   `ProcessedInstallation` else any unsupported lineage →
+///   `IgnoredUnsupportedLineage` else (e.g. all already-active) →
+///   `IgnoredAction`
+/// - `removed` → for each repo: `revoke_membership`. Any transition →
+///   `ProcessedInstallation`; else `IgnoredAction`.
+///
+/// GH API failures during the lineage walk become `Retryable` so a
+/// network blip doesn't drop accepted repos on the floor.
+pub struct InstallationRepositoriesHandler {
+    repo_store: Arc<dyn RepoStore>,
+    membership_store: Arc<dyn InstallationStore>,
+    gh: Arc<dyn GitHubApi>,
+}
+
+impl InstallationRepositoriesHandler {
+    pub fn new(
+        repo_store: Arc<dyn RepoStore>,
+        membership_store: Arc<dyn InstallationStore>,
+        gh: Arc<dyn GitHubApi>,
+    ) -> Self {
+        Self {
+            repo_store,
+            membership_store,
+            gh,
+        }
+    }
+}
+
+#[async_trait]
+impl EventHandler for InstallationRepositoriesHandler {
+    fn event_type(&self) -> &'static str {
+        "installation_repositories"
+    }
+
+    async fn handle(&self, webhook: &ClaimedWebhook) -> ClassifyOutcome {
+        let Some(payload) = webhook.payload.as_ref() else {
+            return ClassifyOutcome::Terminal(WebhookOutcome::Error);
+        };
+        let event: InstallationRepositoriesEvent = match serde_json::from_value(payload.clone()) {
+            Ok(e) => e,
+            Err(_) => return ClassifyOutcome::Terminal(WebhookOutcome::Error),
+        };
+
+        let install_id = event.installation.id;
+
+        match event.action.as_str() {
+            "added" => {
+                handle_repos_added(
+                    self.repo_store.as_ref(),
+                    self.membership_store.as_ref(),
+                    self.gh.as_ref(),
+                    install_id,
+                    &event.repositories_added,
+                )
+                .await
+            }
+            "removed" => {
+                handle_repos_removed(
+                    self.membership_store.as_ref(),
+                    install_id,
+                    &event.repositories_removed,
+                )
+                .await
+            }
+            // Forward-compat: any other action we don't recognize is
+            // recorded-and-skipped rather than retried forever.
+            _ => ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction),
+        }
+    }
+}
+
+/// Per-repo outcome of `materialise_repo_membership`. The caller
+/// aggregates these into a single webhook-level outcome.
+enum RepoMembershipOutcome {
+    /// Membership row created or restored.
+    Added,
+    /// Repo's lineage doesn't trace to an enabled `supported_repo_root`.
+    /// Identity row is still cached for audit.
+    UnsupportedLineage,
+    /// Skipped because the payload's `repo.id` didn't match what GH's
+    /// `/repos/{owner}/{name}` resolved to — webhook is stale across a
+    /// rename / name-reuse and we'd risk granting membership to the
+    /// wrong repo. The mismatched ids are already logged at the
+    /// detection site; the variant is a flag, not a carrier.
+    IdMismatch,
+    /// Skipped because `full_name` had no `/`.
+    MalformedFullName,
+    /// `github_installation` has `deleted_at IS NOT NULL` (or the row
+    /// doesn't exist at all). Detected at the membership-write boundary;
+    /// the entire batch should bail to `IgnoredUnknownInstallation`.
+    InstallationNotActive,
+    /// Transient infra failure. Propagates up as `Retryable`.
+    Retryable(String),
+}
+
+/// Resolve one repo from a webhook payload, walk its lineage, gate on
+/// support, and add membership if accepted. Shared between
+/// `InstallationHandler` (slice 4 high-finding fix: initial repos from
+/// `installation.created.repositories`) and
+/// `InstallationRepositoriesHandler` (`.added` events).
+async fn materialise_repo_membership(
+    repo_store: &dyn RepoStore,
+    membership_store: &dyn InstallationStore,
+    gh: &dyn GitHubApi,
+    install_id: i64,
+    payload_repo: &sbgh_core::github::InstallationRepository,
+) -> RepoMembershipOutcome {
+    let Some((owner, name)) = split_full_name(&payload_repo.full_name) else {
+        tracing::warn!(
+            full_name = payload_repo
+                .full_name
+                .as_str(),
+            "repo materialisation: malformed full_name, skipping"
+        );
+        return RepoMembershipOutcome::MalformedFullName;
+    };
+
+    // 1. Fetch + verify identity. The payload carries `id`; we cross-check against
+    //    what /repos/{owner}/{name} resolves to. A mismatch means the webhook is
+    //    stale across a rename or recycled name — granting membership for
+    //    `summary.id` would point at a different repo than the one GitHub reported
+    //    in the event.
+    let summary = match gh
+        .get_repository(install_id, owner, name)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return RepoMembershipOutcome::Retryable(format!(
+                "get_repository({owner}/{name}): {e}"
+            ));
+        }
+    };
+    if summary.id != payload_repo.id {
+        tracing::warn!(
+            installation_id = install_id,
+            full_name = payload_repo
+                .full_name
+                .as_str(),
+            payload_id = payload_repo.id,
+            resolved_id = summary.id,
+            "repo materialisation: payload repo.id doesn't match /repos lookup — likely stale \
+             webhook across a rename, skipping membership"
+        );
+        return RepoMembershipOutcome::IdMismatch;
+    }
+
+    // 2. Upsert lineage.
+    let lineage = lineage_from_summary(&summary);
+    if let Err(e) = repo_store
+        .upsert_repo_lineage(&lineage)
+        .await
+    {
+        return RepoMembershipOutcome::Retryable(format!(
+            "upsert_repo_lineage({owner}/{name}): {e}"
+        ));
+    }
+
+    // 3. Check support gate.
+    let supported = match repo_store
+        .is_supported_lineage(summary.id)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return RepoMembershipOutcome::Retryable(format!(
+                "is_supported_lineage({}): {e}",
+                summary.id
+            ));
+        }
+    };
+    if !supported {
+        tracing::info!(
+            installation_id = install_id,
+            repo_id = summary.id,
+            full_name = payload_repo
+                .full_name
+                .as_str(),
+            "repo materialisation: lineage unsupported, skipping membership"
+        );
+        return RepoMembershipOutcome::UnsupportedLineage;
+    }
+
+    // 4. Add/restore membership — defensive against a concurrently soft-deleted
+    //    install (None signals deleted_at IS NOT NULL).
+    match membership_store
+        .add_or_restore_membership(install_id, summary.id)
+        .await
+    {
+        Ok(Some(_)) => RepoMembershipOutcome::Added,
+        Ok(None) => RepoMembershipOutcome::InstallationNotActive,
+        Err(e) => RepoMembershipOutcome::Retryable(format!(
+            "add_or_restore_membership({install_id}, {repo_id}): {e}",
+            repo_id = summary.id,
+        )),
+    }
+}
+
+async fn handle_repos_added(
+    repo_store: &dyn RepoStore,
+    membership_store: &dyn InstallationStore,
+    gh: &dyn GitHubApi,
+    install_id: i64,
+    repos: &[sbgh_core::github::InstallationRepository],
+) -> ClassifyOutcome {
+    let mut any_supported = false;
+    let mut any_unsupported = false;
+
+    for repo in repos {
+        match materialise_repo_membership(repo_store, membership_store, gh, install_id, repo).await
+        {
+            RepoMembershipOutcome::Added => any_supported = true,
+            RepoMembershipOutcome::UnsupportedLineage | RepoMembershipOutcome::IdMismatch => {
+                any_unsupported = true
+            }
+            RepoMembershipOutcome::MalformedFullName => {} // already logged, no aggregate change
+            RepoMembershipOutcome::InstallationNotActive => {
+                // Whole batch bails: subsequent repos would all hit the
+                // same install-deleted gate, no point iterating.
+                return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnknownInstallation);
+            }
+            RepoMembershipOutcome::Retryable(e) => return ClassifyOutcome::Retryable(e),
+        }
+    }
+
+    if any_supported {
+        ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+    } else if any_unsupported {
+        ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnsupportedLineage)
+    } else {
+        ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
+    }
+}
+
+async fn handle_repos_removed(
+    membership_store: &dyn InstallationStore,
+    install_id: i64,
+    repos: &[sbgh_core::github::InstallationRepository],
+) -> ClassifyOutcome {
+    let mut any_revoked = false;
+    for repo in repos {
+        match membership_store
+            .revoke_membership(install_id, repo.id)
+            .await
+        {
+            Ok(Some(_)) => {
+                any_revoked = true;
+            }
+            // Already-revoked OR never-known: idempotent skip. The
+            // schema FK guarantees we know about every repo that ever
+            // had a membership, so an unknown id here just means GitHub
+            // sent us a `removed` for a repo whose `added` we never
+            // saw (rare, possible during an outage backfill).
+            Ok(None) => {}
+            Err(e) => {
+                return ClassifyOutcome::Retryable(format!(
+                    "revoke_membership({install_id}, {}): {e}",
+                    repo.id
+                ));
+            }
+        }
+    }
+    if any_revoked {
+        ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+    } else {
+        ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
+    }
+}
+
+fn split_full_name(full_name: &str) -> Option<(&str, &str)> {
+    full_name.split_once('/')
+}
+
+fn lineage_from_summary(summary: &RepoSummary) -> NewRepoLineage {
+    NewRepoLineage {
+        repo: NewRepoIdentity {
+            id: summary.id,
+            owner: summary.owner.clone(),
+            name: summary.name.clone(),
+            default_branch: summary.default_branch.clone(),
+        },
+        is_fork: summary.is_fork,
+        parent: summary
+            .parent
+            .as_ref()
+            .map(repo_ref_to_identity),
+        source: summary
+            .source
+            .as_ref()
+            .map(repo_ref_to_identity),
+    }
+}
+
+fn repo_ref_to_identity(r: &RepoRef) -> NewRepoIdentity {
+    NewRepoIdentity {
+        id: r.id,
+        owner: r.owner.clone(),
+        name: r.name.clone(),
+        default_branch: None,
     }
 }
 
@@ -1078,7 +1481,7 @@ mod tests {
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         let with_install = BasicClassifier::builder()
             .with_handler(Arc::new(IssueCommentHandler))
-            .with_handler(Arc::new(InstallationHandler::new(store)))
+            .with_handler(Arc::new(make_install_handler(store)))
             .build();
         assert_eq!(with_install.supported_event_types(), &["installation", "issue_comment"]);
     }
@@ -1173,6 +1576,23 @@ mod tests {
         account_id: i64,
         account_type: &str,
     ) -> serde_json::Value {
+        installation_payload_with_repos(action, install_id, account_id, account_type, &[])
+    }
+
+    /// Same as `installation_payload`, but with a `repositories` array
+    /// for the slice 4 high-finding-fix path (`installation.created`
+    /// materialises initial memberships from this list).
+    fn installation_payload_with_repos(
+        action: &str,
+        install_id: i64,
+        account_id: i64,
+        account_type: &str,
+        repos: &[(i64, &str)],
+    ) -> serde_json::Value {
+        let repos_json: Vec<serde_json::Value> = repos
+            .iter()
+            .map(|(id, fname)| serde_json::json!({ "id": id, "full_name": fname }))
+            .collect();
         serde_json::json!({
             "action": action,
             "installation": {
@@ -1182,7 +1602,8 @@ mod tests {
                     "login": "octo-org",
                     "type": account_type,
                 }
-            }
+            },
+            "repositories": repos_json,
         })
     }
 
@@ -1201,11 +1622,27 @@ mod tests {
         }
     }
 
+    /// Build an `InstallationHandler` with stub repo store + FakeGitHub
+    /// for tests that don't exercise the slice 4 high-finding fix
+    /// (initial-repos materialisation from
+    /// `installation.created.repositories`). The new() signature widened to
+    /// take three args; this keeps the existing single-store tests
+    /// readable.
+    fn make_install_handler(
+        store: Arc<sbgh_core::db::InMemoryInstallationStore>,
+    ) -> InstallationHandler {
+        InstallationHandler::new(
+            store,
+            Arc::new(sbgh_core::db::InMemoryRepoStore::new()),
+            Arc::new(sbgh_core::github::test_support::FakeGitHub::new()),
+        )
+    }
+
     #[tokio::test]
     async fn installation_created_for_allowed_account_upserts_and_processes() {
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
         let w = installation_webhook(
             "created",
             installation_payload("created", 100, 42, "Organization"),
@@ -1228,7 +1665,7 @@ mod tests {
     #[tokio::test]
     async fn installation_created_for_unknown_account_is_denied() {
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
         let w = installation_webhook("created", installation_payload("created", 100, 42, "User"));
 
         let outcome = h.handle(&w).await;
@@ -1251,7 +1688,7 @@ mod tests {
         // to "never approved" from the App's perspective.
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         store.seed_allowed(42, "octo-org", GithubAccountType::Organization, false);
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
         let w = installation_webhook(
             "created",
             installation_payload("created", 100, 42, "Organization"),
@@ -1275,7 +1712,7 @@ mod tests {
         // for the same install id must be a no-op upsert, not a new row.
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
         let w = installation_webhook(
             "created",
             installation_payload("created", 100, 42, "Organization"),
@@ -1296,7 +1733,7 @@ mod tests {
     async fn installation_suspend_sets_suspended_at() {
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
         // First materialise the install.
         h.handle(&installation_webhook(
             "created",
@@ -1324,7 +1761,7 @@ mod tests {
     async fn installation_unsuspend_clears_suspended_at() {
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
         h.handle(&installation_webhook(
             "created",
             installation_payload("created", 100, 42, "Organization"),
@@ -1357,7 +1794,7 @@ mod tests {
         // A suspend for an install we never accepted (allowlist denied
         // at create) must not materialise a row; it's harmless to skip.
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
 
         let outcome = h
             .handle(&installation_webhook(
@@ -1377,10 +1814,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installation_deleted_removes_install_row() {
+    async fn installation_deleted_soft_deletes_install_row() {
+        // Slice 4: install.deleted is a soft-delete (sets deleted_at) so
+        // membership FKs and future job FKs stay valid. The row is NOT
+        // removed.
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
         h.handle(&installation_webhook(
             "created",
             installation_payload("created", 100, 42, "Organization"),
@@ -1397,18 +1837,16 @@ mod tests {
             outcome,
             ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
         ));
-        assert!(
-            store
-                .installation(100)
-                .is_none(),
-            "deleted MUST remove the install row"
-        );
+        let row = store
+            .installation(100)
+            .expect("soft-delete must keep the row");
+        assert!(row.deleted_at.is_some(), "deleted MUST set deleted_at");
     }
 
     #[tokio::test]
     async fn installation_deleted_for_unknown_install_is_ignored() {
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        let h = InstallationHandler::new(store.clone());
+        let h = make_install_handler(store.clone());
 
         let outcome = h
             .handle(&installation_webhook(
@@ -1428,7 +1866,7 @@ mod tests {
         // (or whatever GH adds) records-and-skips, not retries forever.
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        let h = InstallationHandler::new(store);
+        let h = make_install_handler(store);
 
         let outcome = h
             .handle(&installation_webhook(
@@ -1442,7 +1880,7 @@ mod tests {
     #[tokio::test]
     async fn installation_null_payload_is_error() {
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        let h = InstallationHandler::new(store);
+        let h = make_install_handler(store);
         let mut w = installation_webhook("created", serde_json::Value::Null);
         w.payload = None;
 
@@ -1453,7 +1891,7 @@ mod tests {
     #[tokio::test]
     async fn installation_bad_typed_shape_is_error() {
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        let h = InstallationHandler::new(store);
+        let h = make_install_handler(store);
         let w = installation_webhook("created", serde_json::json!({ "action": "created" }));
 
         let outcome = h.handle(&w).await;
@@ -1466,7 +1904,7 @@ mod tests {
         // Better to record-and-investigate than guess.
         let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
         store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        let h = InstallationHandler::new(store);
+        let h = make_install_handler(store);
         let w = installation_webhook(
             "created",
             installation_payload("created", 100, 42, "GalaxyBrain"),
@@ -1474,6 +1912,745 @@ mod tests {
 
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::Error)));
+    }
+
+    // ─── Slice 4 review-fix tests: install.created initial repos ────────
+
+    /// Build a full InstallationHandler with seeded repo support, for
+    /// tests that exercise the slice-4 high-finding fix
+    /// (initial-repos materialisation from installation.created).
+    async fn make_install_handler_with_supported(
+        root_repo_id: i64,
+        root_owner: &'static str,
+        root_name: &'static str,
+    ) -> (
+        InstallationHandler,
+        Arc<sbgh_core::db::InMemoryInstallationStore>,
+        Arc<sbgh_core::db::InMemoryRepoStore>,
+        sbgh_core::github::test_support::FakeGitHub,
+    ) {
+        let install_store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
+        install_store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let repo_store = Arc::new(sbgh_core::db::InMemoryRepoStore::new());
+        repo_store.seed_supported_root(root_repo_id, root_owner, root_name, true);
+        let gh = sbgh_core::github::test_support::FakeGitHub::new();
+        let handler = InstallationHandler::new(
+            install_store.clone(),
+            repo_store.clone(),
+            Arc::new(gh.clone()),
+        );
+        (handler, install_store, repo_store, gh)
+    }
+
+    #[tokio::test]
+    async fn installation_created_with_supported_initial_repos_creates_memberships() {
+        // Codex slice-4 high finding: a fresh install must materialise
+        // memberships from the payload's `repositories` array; otherwise
+        // there'd be no `github_installation_repo` rows until a later
+        // `installation_repositories.added` event happened.
+        let (h, install_store, _repo_store, gh) =
+            make_install_handler_with_supported(10, "stacks-network", "stacks-core").await;
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+        let w = installation_webhook(
+            "created",
+            installation_payload_with_repos(
+                "created",
+                100,
+                42,
+                "Organization",
+                &[(10, "stacks-network/stacks-core")],
+            ),
+        );
+
+        let outcome = h.handle(&w).await;
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        let m = install_store
+            .membership(100, 10)
+            .expect("initial membership must be materialised by installation.created");
+        assert!(m.revoked_at.is_none(), "fresh membership is active");
+    }
+
+    #[tokio::test]
+    async fn installation_created_with_unsupported_initial_repos_still_processed() {
+        // Install creation itself succeeded; per-repo unsupported
+        // results are reflected in the membership table (none created)
+        // but the webhook-level outcome stays ProcessedInstallation —
+        // ops query "was this install ingested" should answer yes.
+        let (h, install_store, _repo_store, gh) =
+            make_install_handler_with_supported(10, "stacks-network", "stacks-core").await;
+        // 99 is NOT under any supported root.
+        gh.set_repo_canonical("randos", "unrelated", 99);
+        let w = installation_webhook(
+            "created",
+            installation_payload_with_repos(
+                "created",
+                100,
+                42,
+                "Organization",
+                &[(99, "randos/unrelated")],
+            ),
+        );
+
+        let outcome = h.handle(&w).await;
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        assert!(
+            install_store
+                .membership(100, 99)
+                .is_none(),
+            "unsupported initial repo must NOT get a membership row"
+        );
+        // Install row itself created.
+        assert!(
+            install_store
+                .installation(100)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn installation_created_with_id_mismatch_in_initial_repos_skips_membership() {
+        // Codex slice-4 M2: the payload says repo.id=10, but GH's
+        // /repos lookup resolves to id=99 (rename/recycling staleness).
+        // Membership must NOT be granted — otherwise we'd grant on the
+        // wrong repo.
+        let (h, install_store, _repo_store, gh) =
+            make_install_handler_with_supported(10, "stacks-network", "stacks-core").await;
+        // GH resolves "stacks-network/stacks-core" → id=99 (NOT 10).
+        gh.set_repo_canonical("stacks-network", "stacks-core", 99);
+        let w = installation_webhook(
+            "created",
+            installation_payload_with_repos(
+                "created",
+                100,
+                42,
+                "Organization",
+                &[(10, "stacks-network/stacks-core")],
+            ),
+        );
+
+        h.handle(&w).await;
+        assert!(
+            install_store
+                .membership(100, 10)
+                .is_none()
+        );
+        assert!(
+            install_store
+                .membership(100, 99)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn installation_created_with_no_repositories_still_processed_as_before() {
+        // Slice 3 contract preserved: an install.created with no
+        // repositories array (e.g. parsed from a payload that omits
+        // the field) still upserts the install and returns
+        // ProcessedInstallation without doing any membership work.
+        let (h, install_store, _repo_store, _gh) =
+            make_install_handler_with_supported(10, "stacks-network", "stacks-core").await;
+        let w = installation_webhook(
+            "created",
+            installation_payload("created", 100, 42, "Organization"),
+        );
+
+        let outcome = h.handle(&w).await;
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        assert!(
+            install_store
+                .installation(100)
+                .is_some()
+        );
+        assert!(
+            install_store
+                .memberships()
+                .is_empty()
+        );
+    }
+
+    // ─── InstallationRepositoriesHandler (slice 4) ──────────────────────
+
+    use sbgh_core::db::InMemoryRepoStore;
+    use sbgh_core::github::test_support::FakeGitHub;
+
+    fn repos_event_payload(
+        action: &str,
+        install_id: i64,
+        added: &[(i64, &str)],
+        removed: &[(i64, &str)],
+    ) -> serde_json::Value {
+        let mk = |arr: &[(i64, &str)]| -> Vec<serde_json::Value> {
+            arr.iter()
+                .map(|(id, fname)| serde_json::json!({ "id": id, "full_name": fname }))
+                .collect()
+        };
+        serde_json::json!({
+            "action": action,
+            "installation": {
+                "id": install_id,
+                "account": { "id": 42, "login": "octo-org", "type": "Organization" }
+            },
+            "repositories_added": mk(added),
+            "repositories_removed": mk(removed),
+        })
+    }
+
+    fn repos_webhook(action: &str, payload: serde_json::Value) -> ClaimedWebhook {
+        ClaimedWebhook {
+            id: 1,
+            claim_token: uuid::Uuid::new_v4(),
+            delivery_id: "d-repos".into(),
+            event_type: "installation_repositories".into(),
+            action: Some(action.into()),
+            payload_installation_id: Some(100),
+            payload: Some(payload),
+            payload_size_bytes: 0,
+            attempts: 0,
+            received_at: Utc::now(),
+        }
+    }
+
+    /// Build a handler wired against in-memory stores + a FakeGitHub.
+    /// Seeds an install (id=100) and an allowed account so memberships
+    /// can be inserted without FK errors. The caller seeds whatever
+    /// supported_repo_root rows + GH-API responses the test needs.
+    async fn make_repos_handler() -> (
+        InstallationRepositoriesHandler,
+        Arc<InMemoryRepoStore>,
+        Arc<sbgh_core::db::InMemoryInstallationStore>,
+        FakeGitHub,
+    ) {
+        let repo_store = Arc::new(InMemoryRepoStore::new());
+        let install_store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
+        install_store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        install_store
+            .upsert_installation(&NewInstallation {
+                id: 100,
+                github_account_id: 42,
+                account_login: "octo-org".into(),
+                account_type: GithubAccountType::Organization,
+            })
+            .await
+            .unwrap();
+        let gh = FakeGitHub::new();
+        let handler = InstallationRepositoriesHandler::new(
+            repo_store.clone(),
+            install_store.clone(),
+            Arc::new(gh.clone()),
+        );
+        (handler, repo_store, install_store, gh)
+    }
+
+    #[tokio::test]
+    async fn repos_added_for_canonical_supported_repo_creates_membership() {
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        // Repo 10 is the canonical root + on the supported list.
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(10, "stacks-network/stacks-core")], &[]),
+            ))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        let m = install_store
+            .membership(100, 10)
+            .expect("membership must be created");
+        assert!(m.revoked_at.is_none(), "new membership is active");
+    }
+
+    #[tokio::test]
+    async fn repos_added_for_fork_of_supported_root_creates_membership() {
+        // Fork whose `source` is the supported canonical. Lineage walk
+        // must record both the fork + the source as github_repo rows;
+        // the support gate must accept via fork_root_github_repo_id.
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        let root = RepoRef {
+            id: 10,
+            owner: "stacks-network".into(),
+            name: "stacks-core".into(),
+        };
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+        gh.set_repo_fork("alice", "stacks-core-fork", 20, root.clone(), root);
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(20, "alice/stacks-core-fork")], &[]),
+            ))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        let fork = repo_store
+            .repo(20)
+            .expect("fork must be upserted");
+        assert_eq!(fork.fork_root_github_repo_id, Some(10));
+        assert!(
+            install_store
+                .membership(100, 20)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_added_for_fork_of_fork_walks_to_root() {
+        // Fork-of-fork: B forks A which forks canonical R. GitHub's
+        // /repos response gives us source=R + parent=A in one call, so
+        // we only need ONE API request to record the whole chain — the
+        // lineage walk inserts R and A as identity rows, then B with
+        // fork_root=R.
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        let root_ref = RepoRef {
+            id: 10,
+            owner: "stacks-network".into(),
+            name: "stacks-core".into(),
+        };
+        let mid_ref = RepoRef {
+            id: 20,
+            owner: "alice".into(),
+            name: "stacks-core".into(),
+        };
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+        gh.set_repo_fork("bob", "stacks-core", 30, mid_ref, root_ref);
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(30, "bob/stacks-core")], &[]),
+            ))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        let leaf = repo_store
+            .repo(30)
+            .expect("leaf must be upserted");
+        assert_eq!(leaf.fork_root_github_repo_id, Some(10));
+        assert_eq!(leaf.parent_github_repo_id, Some(20));
+        assert!(repo_store.repo(20).is_some(), "intermediate parent must be upserted too");
+        assert!(
+            install_store
+                .membership(100, 30)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_added_for_unsupported_lineage_skips_membership_but_caches_repo() {
+        // The repo row STILL gets recorded (audit trail of "we saw this
+        // repo and decided we don't support it") but no membership.
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        // No supported_repo_root seeded.
+        gh.set_repo_canonical("randos", "unrelated", 99);
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(99, "randos/unrelated")], &[]),
+            ))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnsupportedLineage)
+        ));
+        assert!(repo_store.repo(99).is_some(), "repo identity cached even when unsupported");
+        assert!(
+            install_store
+                .membership(100, 99)
+                .is_none(),
+            "no membership for unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_added_mixed_accepted_and_rejected_aggregates_as_processed() {
+        // Codex M-fix-style aggregation: any-accepted wins over
+        // any-rejected for the webhook-level outcome. Per-repo
+        // decisions are recorded in their respective rows.
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+        gh.set_repo_canonical("randos", "unrelated", 99);
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload(
+                    "added",
+                    100,
+                    &[(10, "stacks-network/stacks-core"), (99, "randos/unrelated")],
+                    &[],
+                ),
+            ))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        assert!(
+            install_store
+                .membership(100, 10)
+                .is_some()
+        );
+        assert!(
+            install_store
+                .membership(100, 99)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_added_with_no_repos_is_ignored_action() {
+        let (handler, _r, _i, _gh) = make_repos_handler().await;
+        let outcome = handler
+            .handle(&repos_webhook("added", repos_event_payload("added", 100, &[], &[])))
+            .await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+    }
+
+    #[tokio::test]
+    async fn repos_added_disabled_supported_root_is_unsupported() {
+        // A disabled supported_repo_root row must NOT extend support to
+        // its forks. Operator soft-disabled, processor must respect.
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", false);
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(10, "stacks-network/stacks-core")], &[]),
+            ))
+            .await;
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnsupportedLineage)
+        ));
+        assert!(
+            install_store
+                .membership(100, 10)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_added_gh_api_error_is_retryable() {
+        // FakeGitHub returns Err for repos that weren't pre-programmed
+        // (which lets us simulate API failure deterministically).
+        let (handler, _repo_store, _install_store, _gh) = make_repos_handler().await;
+        // No canned response for this repo → FakeGitHub returns Err.
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(10, "no/such")], &[]),
+            ))
+            .await;
+        assert!(matches!(outcome, ClassifyOutcome::Retryable(_)));
+    }
+
+    #[tokio::test]
+    async fn repos_added_idempotent_redelivery_restores_no_change() {
+        // Second `added` for the same already-active membership: the
+        // upsert is a no-op, the lineage walk re-runs the API call but
+        // converges to the same row, and the outcome stays
+        // ProcessedInstallation (any successful membership op).
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+        let webhook = repos_webhook(
+            "added",
+            repos_event_payload("added", 100, &[(10, "stacks-network/stacks-core")], &[]),
+        );
+
+        handler.handle(&webhook).await;
+        let first_granted_at = install_store
+            .membership(100, 10)
+            .unwrap()
+            .granted_at;
+
+        handler.handle(&webhook).await;
+        let second_granted_at = install_store
+            .membership(100, 10)
+            .unwrap()
+            .granted_at;
+        assert_eq!(first_granted_at, second_granted_at, "re-delivery must NOT change granted_at");
+    }
+
+    #[tokio::test]
+    async fn repos_removed_revokes_active_memberships() {
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+        // Seed via the add path so we exercise the realistic state.
+        handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(10, "stacks-network/stacks-core")], &[]),
+            ))
+            .await;
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "removed",
+                repos_event_payload("removed", 100, &[], &[(10, "stacks-network/stacks-core")]),
+            ))
+            .await;
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        let m = install_store
+            .membership(100, 10)
+            .unwrap();
+        assert!(m.revoked_at.is_some(), "revoked membership must have revoked_at set");
+    }
+
+    #[tokio::test]
+    async fn repos_removed_for_unknown_membership_is_ignored_action() {
+        // GitHub backfill / out-of-order delivery: a `removed` for a
+        // repo we never tracked is a no-op.
+        let (handler, _r, _i, _gh) = make_repos_handler().await;
+        let outcome = handler
+            .handle(&repos_webhook(
+                "removed",
+                repos_event_payload("removed", 100, &[], &[(99, "unknown/repo")]),
+            ))
+            .await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+    }
+
+    #[tokio::test]
+    async fn repos_unknown_action_is_ignored_action() {
+        let (handler, _r, _i, _gh) = make_repos_handler().await;
+        let outcome = handler
+            .handle(&repos_webhook(
+                "weird_action",
+                repos_event_payload("weird_action", 100, &[], &[]),
+            ))
+            .await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+    }
+
+    #[tokio::test]
+    async fn repos_null_payload_is_error() {
+        let (handler, _r, _i, _gh) = make_repos_handler().await;
+        let mut w = repos_webhook("added", serde_json::Value::Null);
+        w.payload = None;
+        let outcome = handler.handle(&w).await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::Error)));
+    }
+
+    #[tokio::test]
+    async fn repos_added_malformed_full_name_skips_the_repo() {
+        // A repo with no '/' in full_name can't be resolved (we'd need
+        // owner/name split for the GH API call). Log + skip rather than
+        // failing the batch.
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload(
+                    "added",
+                    100,
+                    &[(10, "stacks-network/stacks-core"), (99, "no-slash")],
+                    &[],
+                ),
+            ))
+            .await;
+        // The good repo still made it through.
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        assert!(
+            install_store
+                .membership(100, 10)
+                .is_some()
+        );
+        assert!(
+            install_store
+                .membership(100, 99)
+                .is_none()
+        );
+    }
+
+    // ─── Slice 4 review-fix tests: repos handler robustness ─────────────
+
+    #[tokio::test]
+    async fn repos_added_after_install_soft_deleted_is_ignored_unknown_installation() {
+        // Codex slice-4 M1: a delayed `installation_repositories.added`
+        // arriving after `installation.deleted` must NOT restore
+        // membership on a retired install. The store's
+        // `add_or_restore_membership` is the line of defense (returns
+        // None for soft-deleted installs); the handler maps that to
+        // IgnoredUnknownInstallation.
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        gh.set_repo_canonical("stacks-network", "stacks-core", 10);
+        // Soft-delete the install BEFORE the .added event arrives.
+        install_store
+            .delete_installation(100)
+            .await
+            .unwrap();
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(10, "stacks-network/stacks-core")], &[]),
+            ))
+            .await;
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnknownInstallation)
+        ));
+        assert!(
+            install_store
+                .membership(100, 10)
+                .is_none(),
+            "membership MUST NOT be resurrected on a soft-deleted install"
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_added_with_payload_id_mismatch_skips_that_repo() {
+        // Codex slice-4 M2: payload says repo.id=10, but the GH lookup
+        // for "stacks-network/stacks-core" resolves to id=99
+        // (rename/recycling staleness). Membership must NOT be created
+        // for either id. Other (consistent) repos in the same batch
+        // still process normally.
+        let (handler, repo_store, install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        // Mismatch: payload says 10, GH says 99.
+        gh.set_repo_canonical("stacks-network", "stacks-core", 99);
+        // A second repo in the same batch with consistent ids.
+        repo_store.seed_supported_root(20, "stacks-network", "other", true);
+        gh.set_repo_canonical("stacks-network", "other", 20);
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload(
+                    "added",
+                    100,
+                    &[(10, "stacks-network/stacks-core"), (20, "stacks-network/other")],
+                    &[],
+                ),
+            ))
+            .await;
+
+        // Aggregation: the second repo got membership → ProcessedInstallation.
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
+        ));
+        // The mismatched repo: NO membership for either the payload id
+        // or the resolved id.
+        assert!(
+            install_store
+                .membership(100, 10)
+                .is_none()
+        );
+        assert!(
+            install_store
+                .membership(100, 99)
+                .is_none()
+        );
+        // The consistent repo got its membership.
+        assert!(
+            install_store
+                .membership(100, 20)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_added_all_id_mismatches_aggregates_as_unsupported_lineage() {
+        // When EVERY repo in the batch was a mismatch (no membership
+        // created, no unsupported-lineage hit either), the outcome
+        // should reflect "we couldn't accept anything" — bucketed
+        // under IgnoredUnsupportedLineage which is the existing
+        // umbrella for "no membership for various reasons".
+        let (handler, repo_store, _install_store, gh) = make_repos_handler().await;
+        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        gh.set_repo_canonical("stacks-network", "stacks-core", 99); // mismatch
+
+        let outcome = handler
+            .handle(&repos_webhook(
+                "added",
+                repos_event_payload("added", 100, &[(10, "stacks-network/stacks-core")], &[]),
+            ))
+            .await;
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnsupportedLineage)
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_or_restore_membership_returns_none_for_soft_deleted_install() {
+        // Direct store-level test (in-memory) for the M1 fix invariant.
+        let store = sbgh_core::db::InMemoryInstallationStore::new();
+        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        store
+            .upsert_installation(&NewInstallation {
+                id: 100,
+                github_account_id: 42,
+                account_login: "octo-org".into(),
+                account_type: GithubAccountType::Organization,
+            })
+            .await
+            .unwrap();
+        store
+            .delete_installation(100)
+            .await
+            .unwrap();
+        // Repo doesn't even need to exist — the guard short-circuits
+        // before any FK is checked.
+        let result = store
+            .add_or_restore_membership(100, 10)
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "add_or_restore must return None for soft-deleted install (M1 fix)"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_or_restore_membership_returns_none_for_missing_install() {
+        let store = sbgh_core::db::InMemoryInstallationStore::new();
+        let result = store
+            .add_or_restore_membership(999, 10)
+            .await
+            .unwrap();
+        assert!(result.is_none(), "add_or_restore must return None when install doesn't exist");
     }
 
     #[test]

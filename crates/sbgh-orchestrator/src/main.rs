@@ -10,7 +10,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use sbgh_core::config::OrchestratorConfig;
-use sbgh_core::db::{self, PostgresInstallationStore, PostgresJobStore, PostgresWebhookInbox};
+use sbgh_core::db::{
+    self, PostgresInstallationStore, PostgresJobStore, PostgresRepoStore, PostgresWebhookInbox,
+};
 use sbgh_core::github::{AppCredentials, InstallationTokenCache, OctocrabClient};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -18,7 +20,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 use crate::libvirt::SystemShell;
 use crate::runner::Runner;
 use crate::webhook_processor::{
-    BasicClassifier, InstallationHandler, IssueCommentHandler, ProcessorConfig, WebhookProcessor,
+    BasicClassifier, InstallationHandler, InstallationRepositoriesHandler, IssueCommentHandler,
+    ProcessorConfig, WebhookProcessor,
 };
 
 #[derive(Parser, Debug)]
@@ -66,10 +69,20 @@ async fn main() -> anyhow::Result<()> {
     // determines which event types the processor will claim from the
     // inbox (others stay `received` for a future slice).
     let webhook_inbox = Arc::new(PostgresWebhookInbox::new(pool.clone()));
-    let installation_store = Arc::new(PostgresInstallationStore::new(pool));
+    let installation_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
+    let repo_store = Arc::new(PostgresRepoStore::new(pool));
     let classifier = BasicClassifier::builder()
         .with_handler(Arc::new(IssueCommentHandler))
-        .with_handler(Arc::new(InstallationHandler::new(installation_store)))
+        .with_handler(Arc::new(InstallationHandler::new(
+            installation_store.clone(),
+            repo_store.clone(),
+            gh.clone(),
+        )))
+        .with_handler(Arc::new(InstallationRepositoriesHandler::new(
+            repo_store,
+            installation_store,
+            gh.clone(),
+        )))
         .build();
     let processor =
         WebhookProcessor::new(webhook_inbox, Arc::new(classifier), ProcessorConfig::default());

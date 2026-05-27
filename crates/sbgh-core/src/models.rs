@@ -102,6 +102,12 @@ pub struct AllowedInstaller {
 /// installation id, used as the FK target by membership / policy /
 /// inbox tables. FK to `allowed_installer.github_account_id` enforces
 /// "installation must be backed by a current allowlist entry".
+///
+/// `deleted_at` is the slice 4 soft-delete marker for `installation.deleted`
+/// events — the row stays around (so historical job/membership FKs
+/// remain valid) but `deleted_at IS NOT NULL` means it's retired. The
+/// "currently active" predicate is `deleted_at IS NULL AND suspended_at IS
+/// NULL`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct GithubInstallation {
     pub id: i64,
@@ -109,8 +115,58 @@ pub struct GithubInstallation {
     pub account_login: String,
     pub account_type: GithubAccountType,
     pub suspended_at: Option<DateTime<Utc>>,
+    pub deleted_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// GitHub repository identity + fork lineage. `id` is GitHub's numeric
+/// repo id (stable across renames and transfers).
+///
+/// Lineage columns are populated from `/repos/{owner}/{repo}` on first
+/// encounter. Convention (no SQL constraint enforces it):
+///   - canonical/non-fork: `is_fork=false`, parent + fork_root NULL
+///   - fork (any depth):   `is_fork=true`,  fork_root IS NOT NULL
+///
+/// `parent_github_repo_id` is the IMMEDIATE parent;
+/// `fork_root_github_repo_id` is the ultimate non-fork ancestor
+/// (GitHub's `source` in the REST response). Both are nullable
+/// because slices 4-6 may insert a repo for identity-only purposes
+/// (PR target/source) before the lineage walk has run.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubRepo {
+    pub id: i64,
+    pub owner: String,
+    pub name: String,
+    pub default_branch: Option<String>,
+    pub is_fork: Option<bool>,
+    pub parent_github_repo_id: Option<i64>,
+    pub fork_root_github_repo_id: Option<i64>,
+    pub lineage_checked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Operator-curated canonical-root row. A repo is in-scope iff its id OR
+/// its `fork_root_github_repo_id` matches an enabled row here.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SupportedRepoRoot {
+    pub github_repo_id: i64,
+    pub is_enabled: bool,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Per-installation repo membership. `revoked_at IS NULL` means active.
+/// Composite PK doubles as the FK anchor for slice 5+ policy + slice 8+
+/// job tables that need to prove the (install, repo) pair was ever known.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubInstallationRepo {
+    pub github_installation_id: i64,
+    pub github_repo_id: i64,
+    pub granted_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

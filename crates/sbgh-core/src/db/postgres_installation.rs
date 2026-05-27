@@ -1,16 +1,16 @@
-//! Postgres-backed `InstallationStore`. Each method is one SQL statement;
-//! the `installation.created` flow that combines a lookup + upsert is
-//! sequenced by the processor (lookup_allowed → upsert_installation) so
-//! a hostile create-event on a denied account doesn't accidentally
-//! materialise an install row.
+//! Postgres-backed `InstallationStore`. Most methods are single-statement;
+//! `delete_installation` is the exception — slice 4 turned it into a
+//! transactional bulk-membership-revoke + soft-delete because the new
+//! `github_installation_repo` FK would otherwise block any hard DELETE
+//! once memberships exist.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::Result;
 use crate::db::Pool;
-use crate::db::installation::{InstallationStore, NewInstallation};
-use crate::models::{AllowedInstaller, GithubInstallation};
+use crate::db::installation::{DeleteInstallationOutcome, InstallationStore, NewInstallation};
+use crate::models::{AllowedInstaller, GithubInstallation, GithubInstallationRepo};
 
 #[derive(Clone)]
 pub struct PostgresInstallationStore {
@@ -51,7 +51,7 @@ impl InstallationStore for PostgresInstallationStore {
                     account_type  = EXCLUDED.account_type,
                     updated_at    = NOW()
             RETURNING id, github_account_id, account_login, account_type,
-                      suspended_at, created_at, updated_at
+                      suspended_at, deleted_at, created_at, updated_at
             "#,
         )
         .bind(new.id)
@@ -74,7 +74,7 @@ impl InstallationStore for PostgresInstallationStore {
                SET suspended_at = $1
              WHERE id = $2
          RETURNING id, github_account_id, account_login, account_type,
-                   suspended_at, created_at, updated_at
+                   suspended_at, deleted_at, created_at, updated_at
             "#,
         )
         .bind(suspended_at)
@@ -84,11 +84,154 @@ impl InstallationStore for PostgresInstallationStore {
         Ok(row)
     }
 
-    async fn delete_installation(&self, installation_id: i64) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM github_installation WHERE id = $1")
-            .bind(installation_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
+    async fn delete_installation(&self, installation_id: i64) -> Result<DeleteInstallationOutcome> {
+        // Lock-then-mutate. Both this path and `add_or_restore_membership`
+        // take `SELECT ... FOR UPDATE` on the install row so they
+        // serialize against each other: a concurrent add can't slip
+        // between our "is this install still active" check and our
+        // soft-delete + revoke (which is the race Codex's slice-4 review
+        // surfaced — the previous EXISTS-without-lock approach left a
+        // window in which an add could materialise an active membership
+        // on a row that was being soft-deleted in another transaction).
+        //
+        // No `deleted_at IS NULL` filter on the SELECT — we need the
+        // install_found signal even for redelivery against an
+        // already-soft-deleted row, AND we need the lock to be visible
+        // to concurrent adds regardless of current state.
+        let mut tx = self.pool.begin().await?;
+
+        // `FOR UPDATE` must be at the top-level SELECT (Postgres rejects
+        // it inside an EXISTS subquery), so probe with a plain SELECT
+        // that returns the id and treat `None` as "not found".
+        let install_found = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM github_installation WHERE id = $1 FOR UPDATE",
+        )
+        .bind(installation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+
+        if !install_found {
+            tx.commit().await?;
+            return Ok(DeleteInstallationOutcome {
+                install_found: false,
+                memberships_revoked: 0,
+            });
+        }
+
+        // Mark deleted_at FIRST. The lock guarantees no concurrent add
+        // can observe `deleted_at IS NULL` past this point, but doing
+        // the install-level marker before the membership revoke also
+        // means any reader without the lock sees "install retired,
+        // memberships being cleaned up" rather than the other way around.
+        sqlx::query(
+            r#"
+            UPDATE github_installation
+               SET deleted_at = NOW()
+             WHERE id = $1
+               AND deleted_at IS NULL
+            "#,
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Bulk-revoke memberships. Predicate `revoked_at IS NULL` makes
+        // this idempotent for redelivery — a second call revokes nothing.
+        let revoke_result = sqlx::query(
+            r#"
+            UPDATE github_installation_repo
+               SET revoked_at = NOW()
+             WHERE github_installation_id = $1
+               AND revoked_at IS NULL
+            "#,
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(DeleteInstallationOutcome {
+            install_found: true,
+            memberships_revoked: revoke_result.rows_affected(),
+        })
+    }
+
+    async fn add_or_restore_membership(
+        &self,
+        installation_id: i64,
+        github_repo_id: i64,
+    ) -> Result<Option<GithubInstallationRepo>> {
+        // `SELECT ... FOR UPDATE` on the install row, gated by
+        // `deleted_at IS NULL`. This is the actual race-closer for the
+        // Codex-flagged interleave. Postgres READ COMMITTED semantics
+        // for `FOR UPDATE` with a predicate: when a concurrent UPDATE
+        // commits, the locker re-evaluates the WHERE against the fresh
+        // row and silently skips it if the predicate no longer holds
+        // — so a concurrent `delete_installation` that sets
+        // `deleted_at = NOW()` cleanly causes our SELECT to return 0
+        // rows on re-evaluation, and we return Ok(None).
+        let mut tx = self.pool.begin().await?;
+        let active: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT id
+              FROM github_installation
+             WHERE id = $1
+               AND deleted_at IS NULL
+              FOR UPDATE
+            "#,
+        )
+        .bind(installation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if active.is_none() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        // Lock held. ON CONFLICT clears revoked_at but preserves the
+        // original granted_at — the membership's history is "first
+        // granted on date X, possibly revoked + re-added since." A
+        // re-add doesn't restart the audit clock.
+        let row = sqlx::query_as::<_, GithubInstallationRepo>(
+            r#"
+            INSERT INTO github_installation_repo
+                (github_installation_id, github_repo_id)
+            VALUES ($1, $2)
+            ON CONFLICT (github_installation_id, github_repo_id) DO UPDATE
+                SET revoked_at = NULL
+            RETURNING github_installation_id, github_repo_id, granted_at, revoked_at
+            "#,
+        )
+        .bind(installation_id)
+        .bind(github_repo_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(row))
+    }
+
+    async fn revoke_membership(
+        &self,
+        installation_id: i64,
+        github_repo_id: i64,
+    ) -> Result<Option<GithubInstallationRepo>> {
+        // `revoked_at IS NULL` guard means a second `removed` event for
+        // the same repo is a no-op (returns None) rather than
+        // overwriting the original revoke timestamp.
+        let row = sqlx::query_as::<_, GithubInstallationRepo>(
+            r#"
+            UPDATE github_installation_repo
+               SET revoked_at = NOW()
+             WHERE github_installation_id = $1
+               AND github_repo_id = $2
+               AND revoked_at IS NULL
+         RETURNING github_installation_id, github_repo_id, granted_at, revoked_at
+            "#,
+        )
+        .bind(installation_id)
+        .bind(github_repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 }

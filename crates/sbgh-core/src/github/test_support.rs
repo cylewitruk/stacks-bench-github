@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::Result;
-use crate::github::client::{GitHubApi, PostedComment};
+use crate::github::client::{GitHubApi, PostedComment, RepoRef, RepoSummary};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeCall {
@@ -33,6 +33,11 @@ pub enum FakeCall {
         repository: String,
         pr_number: u64,
     },
+    GetRepository {
+        installation_id: i64,
+        owner: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -45,6 +50,10 @@ struct FakeState {
     calls: Vec<FakeCall>,
     next_comment_id: i64,
     head_shas: HashMap<(String, u64), String>,
+    /// Pre-programmed responses for `get_repository`. Keyed by
+    /// `(owner, name)` so tests can stage the full lineage for a
+    /// fork-of-fork chain.
+    repos: HashMap<(String, String), RepoSummary>,
 }
 
 impl FakeGitHub {
@@ -62,6 +71,50 @@ impl FakeGitHub {
         let mut s = self.inner.lock().unwrap();
         s.head_shas
             .insert((repository.to_string(), pr_number), sha.to_string());
+    }
+
+    /// Pre-program a canonical (non-fork) repo response.
+    pub fn set_repo_canonical(&self, owner: &str, name: &str, id: i64) {
+        let summary = RepoSummary {
+            id,
+            owner: owner.into(),
+            name: name.into(),
+            default_branch: Some("main".into()),
+            is_fork: false,
+            parent: None,
+            source: None,
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .repos
+            .insert((owner.into(), name.into()), summary);
+    }
+
+    /// Pre-program a fork repo response. `source` is the ultimate
+    /// non-fork ancestor; for a one-hop fork pass `parent = source`.
+    pub fn set_repo_fork(
+        &self,
+        owner: &str,
+        name: &str,
+        id: i64,
+        parent: RepoRef,
+        source: RepoRef,
+    ) {
+        let summary = RepoSummary {
+            id,
+            owner: owner.into(),
+            name: name.into(),
+            default_branch: Some("main".into()),
+            is_fork: true,
+            parent: Some(parent),
+            source: Some(source),
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .repos
+            .insert((owner.into(), name.into()), summary);
     }
 
     pub fn calls(&self) -> Vec<FakeCall> {
@@ -131,5 +184,29 @@ impl GitHubApi for FakeGitHub {
             .get(&(repository.to_string(), pr_number))
             .cloned()
             .unwrap_or_else(|| "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into()))
+    }
+
+    async fn get_repository(
+        &self,
+        installation_id: i64,
+        owner: &str,
+        name: &str,
+    ) -> Result<RepoSummary> {
+        let mut s = self.inner.lock().unwrap();
+        s.calls
+            .push(FakeCall::GetRepository {
+                installation_id,
+                owner: owner.into(),
+                name: name.into(),
+            });
+        s.repos
+            .get(&(owner.into(), name.into()))
+            .cloned()
+            .ok_or_else(|| {
+                crate::Error::Config(format!(
+                    "FakeGitHub: no canned response for repo {owner}/{name} (use \
+                     set_repo_canonical / set_repo_fork to stage it)"
+                ))
+            })
     }
 }

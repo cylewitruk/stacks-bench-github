@@ -85,18 +85,24 @@ pub struct Installation {
 }
 
 /// Subset of the `installation` webhook payload the processor needs.
-/// GitHub's full payload is large; we deserialise only the fields slice 3
-/// actually reads. `installation.account` is the GH account that installed
-/// the App — that's what we check against `allowed_installer`.
+/// GitHub's full payload is large; we deserialise only the fields the
+/// slice 3 / 4 handlers actually read. `installation.account` is the
+/// GH account that installed the App — that's what we check against
+/// `allowed_installer`.
 ///
-/// `repositories` (the initial-install repo list) is intentionally NOT
-/// parsed here — slice 4 will consume `installation_repositories` events
-/// to materialise membership rows; the `installation.created` payload
-/// only needs to give us enough to gate the install itself.
+/// `repositories` is GitHub's "repos this install can access" list
+/// included on `installation.created` (and absent on the other
+/// actions; `#[serde(default)]` so suspend/unsuspend/deleted don't
+/// fail to parse). Slice 4 materialises these as initial memberships
+/// at create time — without this, a fresh install would have no
+/// `github_installation_repo` rows until a later
+/// `installation_repositories.added` event happened.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InstallationEvent {
     pub action: String,
     pub installation: InstallationDetails,
+    #[serde(default)]
+    pub repositories: Vec<InstallationRepository>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -114,6 +120,30 @@ pub struct InstallationAccount {
     /// string here and translate at the classifier boundary.
     #[serde(rename = "type")]
     pub account_type: String,
+}
+
+/// `installation_repositories.{added,removed}` event payload. GitHub
+/// includes one OR BOTH of `repositories_added` / `repositories_removed`
+/// depending on action; the handler reads whichever is relevant. The
+/// repo objects here are identity-only — we fetch full lineage from
+/// `/repos/{owner}/{repo}` separately to capture parent/source.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstallationRepositoriesEvent {
+    pub action: String,
+    pub installation: InstallationDetails,
+    #[serde(default)]
+    pub repositories_added: Vec<InstallationRepository>,
+    #[serde(default)]
+    pub repositories_removed: Vec<InstallationRepository>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstallationRepository {
+    pub id: i64,
+    /// `"owner/name"` form. We split this at the handler boundary
+    /// rather than asking GitHub to send separate owner/name fields
+    /// (which it doesn't in this payload shape).
+    pub full_name: String,
 }
 
 #[cfg(test)]

@@ -5,11 +5,16 @@
 //! testcontainers Postgres without shelling out to the binary.
 
 pub mod installer;
+pub mod repo;
 
 use anyhow::Context;
 pub use installer::{
     InstallerError, allow_installer, disable_installer, disable_installer_by_account_id,
     list_installers,
+};
+pub use repo::{
+    AllowedRepoRoot, RepoError, allow_repo_root, disable_repo_root, disable_repo_root_by_id,
+    list_repo_roots,
 };
 use sbgh_core::db::Pool;
 
@@ -128,11 +133,50 @@ pub async fn apply_roles(
 
     // github_installation is processor-owned: the processor creates rows
     // on installation.created, updates suspended_at on suspend/unsuspend,
-    // deletes on installation.deleted. Handler never touches it.
+    // soft-deletes (sets deleted_at) on installation.deleted. Handler
+    // never touches it. Slice 4 switched delete to soft-delete so the
+    // membership FK doesn't conflict; UPDATE covers all four operations.
     sqlx::query("REVOKE ALL ON TABLE github_installation FROM sbgh_handler, sbgh_orch")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE github_installation TO sbgh_orch")
+    sqlx::query("GRANT SELECT, INSERT, UPDATE ON TABLE github_installation TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
+    // Slice 4: github_repo + supported_repo_root + github_installation_repo.
+    //
+    // github_repo is processor-owned identity cache: the processor inserts
+    // rows on first encounter (both the repo itself and any parent/source
+    // in its lineage) from the GitHub API. Operator's `sbgh-cli repo allow`
+    // also inserts the canonical-root identity row (running as owner, not
+    // through orch's grant). Slices 7+ refresh mutable fields (default_branch,
+    // lineage_checked_at) on PR events.
+    sqlx::query("REVOKE ALL ON TABLE github_repo FROM sbgh_handler, sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT, UPDATE ON TABLE github_repo TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
+    // supported_repo_root is operator-curated, same shape as
+    // allowed_installer: orch SELECT-only (read the gate), CLI-as-owner
+    // writes. A compromised processor must NOT be able to add itself a
+    // new in-scope repo family.
+    sqlx::query("REVOKE ALL ON TABLE supported_repo_root FROM sbgh_handler, sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT ON TABLE supported_repo_root TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
+    // github_installation_repo is processor-owned: insert on
+    // installation_repositories.added, UPDATE revoked_at on .removed +
+    // bulk on installation.deleted. No DELETE (rows are retained as
+    // historical audit trail; FK target for slice 5+ policy + slice 8+ job).
+    sqlx::query("REVOKE ALL ON TABLE github_installation_repo FROM sbgh_handler, sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT, UPDATE ON TABLE github_installation_repo TO sbgh_orch")
         .execute(&mut *tx)
         .await?;
 

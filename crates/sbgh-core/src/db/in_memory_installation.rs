@@ -1,6 +1,6 @@
-//! In-memory `InstallationStore` for slice 3 unit tests. Maintains two
-//! `HashMap`s behind a single `Mutex`: one for the operator-curated
-//! allowlist (seeded via `seed_allowed`), one for materialised installs.
+//! In-memory `InstallationStore` for unit tests. Holds allowlist,
+//! installs, and memberships behind a single `Mutex` so concurrency
+//! semantics stay deterministic.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,8 +9,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::Result;
-use crate::db::installation::{InstallationStore, NewInstallation};
-use crate::models::{AllowedInstaller, GithubAccountType, GithubInstallation};
+use crate::db::installation::{DeleteInstallationOutcome, InstallationStore, NewInstallation};
+use crate::models::{
+    AllowedInstaller, GithubAccountType, GithubInstallation, GithubInstallationRepo,
+};
 
 #[derive(Default)]
 pub struct InMemoryInstallationStore {
@@ -21,6 +23,7 @@ pub struct InMemoryInstallationStore {
 struct State {
     allowlist: HashMap<i64, AllowedInstaller>,
     installs: HashMap<i64, GithubInstallation>,
+    memberships: HashMap<(i64, i64), GithubInstallationRepo>,
 }
 
 impl InMemoryInstallationStore {
@@ -53,7 +56,6 @@ impl InMemoryInstallationStore {
             .insert(github_account_id, row);
     }
 
-    /// Read all materialised installations (test introspection).
     pub fn installations(&self) -> Vec<GithubInstallation> {
         self.state
             .lock()
@@ -64,13 +66,32 @@ impl InMemoryInstallationStore {
             .collect()
     }
 
-    /// Fetch a specific installation by id (test introspection).
     pub fn installation(&self, id: i64) -> Option<GithubInstallation> {
         self.state
             .lock()
             .unwrap()
             .installs
             .get(&id)
+            .cloned()
+    }
+
+    /// Read all memberships (test introspection).
+    pub fn memberships(&self) -> Vec<GithubInstallationRepo> {
+        self.state
+            .lock()
+            .unwrap()
+            .memberships
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn membership(&self, install_id: i64, repo_id: i64) -> Option<GithubInstallationRepo> {
+        self.state
+            .lock()
+            .unwrap()
+            .memberships
+            .get(&(install_id, repo_id))
             .cloned()
     }
 }
@@ -104,6 +125,7 @@ impl InstallationStore for InMemoryInstallationStore {
                 account_login: new.account_login.clone(),
                 account_type: new.account_type,
                 suspended_at: None,
+                deleted_at: None,
                 created_at: now,
                 updated_at: now,
             })
@@ -130,13 +152,95 @@ impl InstallationStore for InMemoryInstallationStore {
         }
     }
 
-    async fn delete_installation(&self, installation_id: i64) -> Result<bool> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
+    async fn delete_installation(&self, installation_id: i64) -> Result<DeleteInstallationOutcome> {
+        let mut state = self.state.lock().unwrap();
+        // 1. probe
+        let install_found = state
             .installs
-            .remove(&installation_id)
-            .is_some())
+            .contains_key(&installation_id);
+        if !install_found {
+            return Ok(DeleteInstallationOutcome {
+                install_found: false,
+                memberships_revoked: 0,
+            });
+        }
+
+        // 2. bulk-revoke memberships
+        let now = Utc::now();
+        let mut memberships_revoked: u64 = 0;
+        for ((inst, _repo), row) in state.memberships.iter_mut() {
+            if *inst == installation_id && row.revoked_at.is_none() {
+                row.revoked_at = Some(now);
+                memberships_revoked += 1;
+            }
+        }
+
+        // 3. soft-delete the install (sticky on re-delivery)
+        if let Some(row) = state
+            .installs
+            .get_mut(&installation_id)
+            && row.deleted_at.is_none()
+        {
+            row.deleted_at = Some(now);
+            row.updated_at = now;
+        }
+
+        Ok(DeleteInstallationOutcome {
+            install_found: true,
+            memberships_revoked,
+        })
+    }
+
+    async fn add_or_restore_membership(
+        &self,
+        installation_id: i64,
+        github_repo_id: i64,
+    ) -> Result<Option<GithubInstallationRepo>> {
+        let mut state = self.state.lock().unwrap();
+        // Guard: install must exist AND not be soft-deleted. Mirrors
+        // the Postgres impl's `deleted_at IS NULL` predicate. Without
+        // this, a stale `installation_repositories.added` arriving
+        // after `installation.deleted` would resurrect membership on
+        // a retired install.
+        let active = state
+            .installs
+            .get(&installation_id)
+            .is_some_and(|i| i.deleted_at.is_none());
+        if !active {
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let row = state
+            .memberships
+            .entry((installation_id, github_repo_id))
+            .and_modify(|r| {
+                r.revoked_at = None; // restore preserves granted_at
+            })
+            .or_insert_with(|| GithubInstallationRepo {
+                github_installation_id: installation_id,
+                github_repo_id,
+                granted_at: now,
+                revoked_at: None,
+            })
+            .clone();
+        Ok(Some(row))
+    }
+
+    async fn revoke_membership(
+        &self,
+        installation_id: i64,
+        github_repo_id: i64,
+    ) -> Result<Option<GithubInstallationRepo>> {
+        let mut state = self.state.lock().unwrap();
+        match state
+            .memberships
+            .get_mut(&(installation_id, github_repo_id))
+        {
+            Some(row) if row.revoked_at.is_none() => {
+                row.revoked_at = Some(Utc::now());
+                Ok(Some(row.clone()))
+            }
+            _ => Ok(None),
+        }
     }
 }

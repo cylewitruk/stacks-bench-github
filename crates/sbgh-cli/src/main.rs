@@ -39,8 +39,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand};
 use sbgh_cli::{
-    allow_installer, apply_roles, disable_installer, disable_installer_by_account_id,
-    list_installers,
+    allow_installer, allow_repo_root, apply_roles, disable_installer,
+    disable_installer_by_account_id, disable_repo_root, disable_repo_root_by_id, list_installers,
+    list_repo_roots,
 };
 use sbgh_core::db;
 use tracing_subscriber::prelude::*;
@@ -69,6 +70,15 @@ enum Command {
     Installer {
         #[command(subcommand)]
         action: InstallerAction,
+    },
+
+    /// Manage the operator-curated `supported_repo_root` list — the set of
+    /// canonical repos this software knows how to benchmark. Forks of
+    /// these roots are accepted automatically; everything else is denied
+    /// with `ignored_unsupported_lineage` at processing time.
+    Repo {
+        #[command(subcommand)]
+        action: RepoAction,
     },
 }
 
@@ -101,6 +111,39 @@ enum InstallerAction {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum RepoAction {
+    /// Add (or re-enable) a canonical repo on the supported list.
+    /// Resolves owner/name → numeric id via GitHub's unauthenticated
+    /// `/repos/{owner}/{repo}` endpoint, then upserts both the
+    /// identity row (github_repo) and the operator row
+    /// (supported_repo_root) in one transaction.
+    Allow {
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Soft-disable a supported root (sets is_enabled=FALSE; row kept
+    /// for audit; forks of this root will start being denied with
+    /// `ignored_unsupported_lineage`).
+    ///
+    /// Exactly one of `--owner --name` (resolves via GH API) or
+    /// `--repo-id` (emergency / GH-outage path) must be supplied.
+    Disable {
+        #[arg(long, group = "repo_disable_target", requires = "name")]
+        owner: Option<String>,
+        #[arg(long, group = "repo_disable_target", requires = "owner")]
+        name: Option<String>,
+        #[arg(long, group = "repo_disable_target")]
+        repo_id: Option<i64>,
+    },
+    /// List every row in `supported_repo_root` joined to its identity.
+    List,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -113,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
     {
         Command::Migrate => run_migrate().await,
         Command::Installer { action } => run_installer(action).await,
+        Command::Repo { action } => run_repo(action).await,
     }
 }
 
@@ -207,6 +251,70 @@ async fn run_installer(action: InstallerAction) -> anyhow::Result<()> {
                     r.note
                         .as_deref()
                         .unwrap_or("-"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_repo(action: RepoAction) -> anyhow::Result<()> {
+    let database_url =
+        std::env::var("DATABASE_URL").context("DATABASE_URL must be set (owner DSN)")?;
+    let pool = db::connect(&database_url)
+        .await
+        .context("connect to postgres")?;
+    let api_base =
+        std::env::var("SBGH_GH_API_BASE_URL").unwrap_or_else(|_| "https://api.github.com".into());
+
+    match action {
+        RepoAction::Allow { owner, name, note } => {
+            let row = allow_repo_root(&pool, &api_base, &owner, &name, note.as_deref())
+                .await
+                .context("allow repo root")?;
+            println!(
+                "allowed: github_repo_id={} {}/{} is_enabled={}",
+                row.github_repo_id, row.owner, row.name, row.is_enabled,
+            );
+        }
+        RepoAction::Disable { owner, name, repo_id } => {
+            let row = match (owner, name, repo_id) {
+                (Some(o), Some(n), None) => disable_repo_root(&pool, &api_base, &o, &n)
+                    .await
+                    .context("disable repo root")?,
+                (None, None, Some(id)) => disable_repo_root_by_id(&pool, id)
+                    .await
+                    .context("disable repo root")?,
+                (None, None, None) => {
+                    return Err(anyhow!("exactly one of --owner+--name or --repo-id is required"));
+                }
+                _ => {
+                    // Unreachable in practice — clap's group + `requires`
+                    // enforce mutex + together-ness — but keep the arm
+                    // so the match is total.
+                    return Err(anyhow!("--owner+--name and --repo-id are mutually exclusive"));
+                }
+            };
+            println!(
+                "disabled: github_repo_id={} {}/{} is_enabled={}",
+                row.github_repo_id, row.owner, row.name, row.is_enabled,
+            );
+        }
+        RepoAction::List => {
+            let rows = list_repo_roots(&pool)
+                .await
+                .context("list repo roots")?;
+            if rows.is_empty() {
+                println!("(no supported repo roots)");
+                return Ok(());
+            }
+            for r in rows {
+                println!(
+                    "{:>12}  {}/{:<32}  {}",
+                    r.github_repo_id,
+                    r.owner,
+                    r.name,
+                    if r.is_enabled { "ENABLED " } else { "disabled" },
                 );
             }
         }
