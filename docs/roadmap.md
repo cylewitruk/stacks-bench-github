@@ -141,7 +141,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
   - New types in `models.rs`: `WebhookStatus` and `WebhookOutcome` enums (sqlx mappings to the DB enums from slice 0), plus `WebhookOutcome::terminal_status()` for the outcome→status mapping.
   - New module `db/webhook.rs`: `WebhookInbox` trait + `ClaimedWebhook` struct.
   - Postgres impl `db/postgres_webhook.rs`: claim uses single-statement `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING ...`. All mutating ops conditional on `claim_token` matching + status='processing', so stale-claim writes (sweeper raced ahead) become no-ops. Sweep uses `make_interval(secs => $1)` to parameterize the lease cleanly.
-  - In-memory impl `db/in_memory_webhook.rs` (feature-gated `test-support`): mirrors the state machine using a single `Mutex` for serialization. Includes test helpers `seed()`, `set_next_attempt_at()`, `set_claimed_at()` so tests don't need to poke private fields.
+  - In-memory impl `db/in_memory_webhook.rs` (feature-gated `testing`; was `test-support` at the time of slice 2a, renamed in slice 2.5): mirrors the state machine using a single `Mutex` for serialization. Includes test helpers `seed()`, `set_next_attempt_at()`, `set_claimed_at()` so tests don't need to poke private fields.
 - **Processor (sbgh-orchestrator)**:
   - `Classifier` trait with two outcomes: `ClassifyOutcome::Terminal(WebhookOutcome)` and `ClassifyOutcome::Retryable(String)`.
   - `NoopClassifier`: production-safe default that returns `Terminal(IgnoredAction)` for everything. Useful as a slice-2b starting point (replace, don't add).
@@ -162,7 +162,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
   - `record_permanent_failure` now increments `attempts` (matching `record_retryable_error`'s behavior), so a row that fails after N attempts shows `attempts = N` instead of `N-1`. Affects both Postgres and in-memory impls.
   - `complete` now clears `last_error = NULL`. Previously, a row that transient-errored once and then succeeded would carry the stale error string forever, misleading any ops query scanning for active error states. If we ever want "historical last transient error" semantics, that's a separate column — the in-active row shouldn't carry an error in its primary error field.
 - **Coverage limitation carried forward from slice 1**: in-memory inbox has no real Postgres semantics. The `claim_next` concurrency test proves the Mutex-serialized version, but the actual `FOR UPDATE SKIP LOCKED` guarantee on real Postgres remains unproven by these unit tests. Tracked under the same "test-DB harness" gap noted in slice 1.
-- **Cargo.toml**: `sbgh-orchestrator` `[dev-dependencies]` now pulls `sbgh-core` with `features = ["test-support"]` so the in-memory inbox is available to tests.
+- **Cargo.toml**: `sbgh-orchestrator` `[dev-dependencies]` now pulls `sbgh-core` with `features = ["testing"]` (was `test-support` at the time of slice 2a, renamed in slice 2.5) so the in-memory inbox is available to tests.
 - Verification: `just build --no-sccache` (clean release build), `just lint --no-sccache` (clean after `just fix` rustfmt pass), `just test --summary --no-sccache` (131 tests, 0 failures).
 
 ##### Slice 2b: Basic Inbox Classification
@@ -219,11 +219,47 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
   - `status='processed'` should be empty until slice 9 starts producing `enqueued_job` outcomes.
   - Anything in `status='failed'` (i.e., `outcome='error'`) is the signal to investigate — typically a classifier bug or malformed payload from GH.
 
+##### Slice 2.5: Integration Test Harness + Backfill
+
+**Status:**
+
+- [x] Initial implementation completed
+- [x] Integration coverage added (or N/A justified)
+- [ ] Review in progress (with Codex)
+- [ ] Complete (ready for next slice)
+
+**Todo's:**
+
+1. Rename existing `test-support` cargo feature to `testing` across the workspace (one unified name for test-only code).
+2. Extract a shared `setup_pg() -> Option<(ContainerAsync<Postgres>, Pool)>` helper into `sbgh-core/src/db/test_support.rs`, gated on `testing`, so all integration test files reuse one setup boilerplate + the skip-on-no-Docker pattern.
+3. Refactor `sbgh-migrate` from a binary-only crate into a `lib.rs` + `bin/sbgh-migrate.rs` shape; expose `apply_roles()` so grants tests can invoke real role setup against an ephemeral container.
+4. Add `crates/sbgh-core/tests/postgres_ingest.rs` covering slice 1: transactional dual-write rollback (job-insert failure rolls back webhook insert), `ON CONFLICT (delivery_id)` SQL-level dedup, NULL vs JSON-null payload distinction, `payload_size_bytes` round-trip.
+5. Add `crates/sbgh-core/tests/postgres_webhook.rs` covering slice 2a/2b: `FOR UPDATE SKIP LOCKED` under concurrent claimers, claim-token-guarded conditional updates (stale writes no-op against real Postgres), `sweep_stuck_claims` semantics with `make_interval`, event_type filter restricts claim correctly.
+6. Add `crates/sbgh-migrate/tests/grants.rs` (in sbgh-migrate to keep `apply_roles` co-located with its tests, and to avoid a cyclic dev-dep on sbgh-core → sbgh-migrate → sbgh-core) covering slice 1 grant correctness: `sbgh_handler` connects + INSERTs only into approved columns + is rejected on others; `sbgh_orch` SELECT/UPDATE works; webhook sequence USAGE works.
+7. Add `crates/sbgh-orchestrator/tests/processor_e2e.rs` covering the full slice 1 + 2a/2b seam: handler-shaped `IngestStore::ingest_webhook` insert → `WebhookProcessor::process_one` → assert terminal status/outcome in DB.
+8. Add a new line to the slice status block template: `- [ ] Integration coverage added (or N/A justified)` between "Initial implementation" and "Review in progress". Update all not-yet-complete slices (3-12) to use the new template.
+
+**Implementation notes/deviations:**
+
+- **Feature renamed `test-support` → `testing`**. Now activated explicitly via `dep:testcontainers` / `dep:testcontainers-modules` (moved from `[dev-dependencies]` to optional `[dependencies]`) so the shared helper can be reached from downstream crates' tests, not just from sbgh-core's own. sbgh-core gets a self-dep `sbgh-core = { path = ".", features = ["testing"] }` in `[dev-dependencies]` to activate the feature for its own integration tests.
+- **Shared helper landed**: `sbgh-core/src/db/test_support.rs` exposes `setup_pg()` returning `Option<TestPg>` with the same skip-on-no-Docker pattern as the original `postgres_jobs.rs::setup()`. Old `postgres_jobs.rs` refactored to use the shared helper.
+- **`sbgh-migrate` split into `lib.rs` + `main.rs`**: role/grant logic moved to `lib.rs::apply_roles()`; `main.rs` now a thin CLI shell that calls into the lib. `sql_string_literal` and its unit tests follow into the lib. Grants tests in `sbgh-migrate/tests/grants.rs` invoke `apply_roles()` directly against an ephemeral Postgres.
+- **`sbgh-orchestrator` stays bin-only**; `processor_e2e.rs` uses the same `#[path = "../src/webhook_processor.rs"] mod ...` include pattern the handler tests already use for `routes/mod.rs`. Added `#[allow(dead_code)]` on the path-include because the e2e test exercises a subset of the module's surface (no `run()`, no `NoopClassifier`) and would otherwise trip clippy's `-D warnings`.
+- **Tests added (slice 2.5 net)**:
+  - `postgres_ingest.rs` (7 tests): SQL-level dedup, dual-write success, **transactional rollback** when jobs INSERT fails (the slice 1 coverage gap Codex flagged), `None payload → SQL NULL` vs `Some(Value::Null) → JSON null`, `payload_size_bytes` round-trip, default `status='received'`.
+  - `postgres_webhook.rs` (10 tests): empty filter behavior, **event_type filter leaves non-matching rows in `received`** (the slice 2b high-finding invariant proven against real Postgres), real `FOR UPDATE SKIP LOCKED` concurrency proves disjoint claims, terminal transition, **stale claim-token writes are no-ops at SQL layer**, sweep recovers stuck rows via `make_interval`, sweep leaves fresh rows alone, permanent failure increments attempts (slice 2a Codex-fix invariant), complete clears `last_error`.
+  - `grants.rs` (12 tests, in `sbgh-migrate`): handler INSERT into approved jobs columns works, handler INSERT specifying `status` is rejected, handler SELECT `head_sha` is rejected, handler INSERT into approved webhook columns works, handler INSERT specifying webhook `status` is rejected, handler can use webhook sequence USAGE, **handler SELECT on webhook `payload` and `status` is rejected** (added per Codex M-finding on slice 2.5), orch SELECT/UPDATE on jobs works, orch INSERT on jobs is rejected, **orch SELECT/UPDATE on github_webhook works** (the actual slice 2b runtime path; added per Codex M-finding), **orch INSERT on github_webhook is rejected** (handler owns inbox writes; added per Codex M-finding), `apply_roles` is idempotent.
+  - `processor_e2e.rs` (4 tests, in `sbgh-orchestrator`): full pipeline `IngestStore` → `WebhookProcessor::process_one` → DB-verified terminal state for `ignored_no_command`, `ignored_action` on `/benchmark` in Phase 1 (pins slice-9 changeover point), `installation` event stays `received` (slice 2b high-finding invariant via the production code path), batch processing through multiple rows.
+  - Total test count: 140 → 191 (net new ~33 integration; the remainder are the existing testcontainers tests benefiting from the shared helper, plus path-include duplicates of the orchestrator's existing unit tests).
+- **Policy change applied**: every slice status block template (slices 2.5 and 3-12) now has a fourth checkbox `- [ ] Integration coverage added (or N/A justified)` between "Initial implementation" and "Review in progress". The "or N/A justified" wording lets pure-doc slices skip it cleanly. Slices 0, 1, 2a, 2b are NOT retroactively updated — slice 2.5 IS their integration coverage backfill.
+- **Verification**: `just build --no-sccache` (clean release build), `just lint --no-sccache` (clean after one `just fix` rustfmt pass + the path-include dead-code allow), `just test --summary --no-sccache` (191 tests, 0 failures, ~7s wall-clock — testcontainers really is sub-second per container with the image warm + nextest's parallel execution).
+
 ##### Slice 3: Allowed Installer
 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -246,6 +282,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -270,6 +307,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -291,6 +329,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -311,6 +350,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -335,6 +375,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -355,6 +396,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -375,6 +417,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -396,6 +439,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -417,6 +461,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -440,6 +485,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 **Status:**
 
 - [ ] Initial implementation completed
+- [ ] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 

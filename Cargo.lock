@@ -2550,6 +2550,7 @@ dependencies = [
  "jsonwebtoken",
  "octocrab",
  "reqwest",
+ "sbgh-core",
  "serde",
  "serde_json",
  "sha2",
@@ -2599,10 +2600,12 @@ dependencies = [
  "clap",
  "dotenvy",
  "sbgh-core",
+ "serde_json",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

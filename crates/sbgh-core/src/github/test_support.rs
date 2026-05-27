@@ -1,6 +1,6 @@
 //! Fake `GitHubApi` implementation for tests.
 //!
-//! Gated behind the `test-support` feature so it doesn't ship in release
+//! Gated behind the `testing` feature so it doesn't ship in release
 //! builds. Records every call into a `Vec` so tests can assert what the handler
 //! / orchestrator tried to do, and lets tests pre-program responses (e.g. fixed
 //! PR head SHAs).

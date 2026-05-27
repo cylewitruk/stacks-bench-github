@@ -3,7 +3,7 @@
 //! The trait `GitHubApi` is the boundary between our handler/orchestrator and
 //! GitHub itself; everything in the rest of the codebase depends on the trait,
 //! not on `octocrab`. `OctocrabClient` is the real implementation; a fake
-//! implementation lives under the `test-support` feature for use in tests.
+//! implementation lives under the `testing` feature for use in tests.
 
 use async_trait::async_trait;
 use octocrab::Octocrab;

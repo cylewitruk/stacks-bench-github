@@ -1,7 +1,7 @@
 pub mod auth;
 pub mod client;
 pub mod command;
-#[cfg(feature = "test-support")]
+#[cfg(feature = "testing")]
 pub mod test_support;
 pub mod webhook;
 

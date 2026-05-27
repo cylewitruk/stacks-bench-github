@@ -34,5 +34,5 @@ quick-xml.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
-sbgh-core = { workspace = true, features = ["test-support"] }
+sbgh-core = { workspace = true, features = ["testing"] }
 tempfile = "3"

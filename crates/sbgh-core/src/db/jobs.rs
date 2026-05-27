@@ -1,6 +1,6 @@
 //! `JobStore` trait — the boundary between business logic and persistence.
 //!
-//! The production impl is [`super::PostgresJobStore`]. The `test-support`
+//! The production impl is [`super::PostgresJobStore`]. The `testing`
 //! feature also exposes an in-memory impl ([`super::InMemoryJobStore`]) so
 //! handler/orchestrator logic can be unit-tested without a real database.
 
