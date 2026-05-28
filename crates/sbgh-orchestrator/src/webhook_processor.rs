@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sbgh_core::Result;
 use sbgh_core::db::{
-    ClaimedWebhook, InstallationStore, NewInstallation, NewRepoIdentity, NewRepoLineage, NewUser,
-    PolicyStore, RepoStore, UserStore, WebhookInbox,
+    ClaimedWebhook, InstallationStore, NewInstallation, NewPullRequest, NewRepoIdentity,
+    NewRepoLineage, NewUser, PolicyStore, PullRequestStore, RepoStore, UserStore, WebhookInbox,
 };
 use sbgh_core::github::{
     CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent, IssueCommentEvent,
@@ -244,19 +244,25 @@ pub struct IssueCommentHandler {
     policy_store: Arc<dyn PolicyStore>,
     install_store: Arc<dyn InstallationStore>,
     user_store: Arc<dyn UserStore>,
+    /// Slice 7: shared materialiser dep. Comments referencing a PR
+    /// whose `opened` event predated the new pipeline must still
+    /// produce a `github_pull_request` row so slice 9 can link the
+    /// job. `materialise_pull_request` upserts the row from the GH
+    /// API response.
+    pull_request_store: Arc<dyn PullRequestStore>,
     gh: Arc<dyn GitHubApi>,
 }
 
 impl IssueCommentHandler {
-    /// Slice 6 widened the constructor again to take `user_store` so
-    /// `/benchmark` comments run the `trigger_pr_benchmark` authz gate
-    /// before policy evaluation. Slice 5 had already added `policy_store`
-    /// + `install_store` + `gh`; slice 6 just bolts user authz on top.
+    /// Slice 7 widened the constructor to take `pull_request_store`.
+    /// Slice 6 had already added `user_store`; slice 5 added
+    /// `policy_store` + `install_store` + `gh`.
     pub fn new(
         repo_store: Arc<dyn RepoStore>,
         policy_store: Arc<dyn PolicyStore>,
         install_store: Arc<dyn InstallationStore>,
         user_store: Arc<dyn UserStore>,
+        pull_request_store: Arc<dyn PullRequestStore>,
         gh: Arc<dyn GitHubApi>,
     ) -> Self {
         Self {
@@ -264,6 +270,7 @@ impl IssueCommentHandler {
             policy_store,
             install_store,
             user_store,
+            pull_request_store,
             gh,
         }
     }
@@ -326,33 +333,37 @@ impl EventHandler for IssueCommentHandler {
                     }
                 };
 
-                // Cache base+head repo identities (slice 7+ PR
-                // materialisation will reuse these). Identity-only —
-                // lineage walking happens via the
-                // installation_repositories.added path.
-                if let Err(e) = self
-                    .repo_store
-                    .upsert_repo_identity(&NewRepoIdentity {
+                // Slice 7: materialise the PR row from the GH API
+                // response. Replaces the slice 5 inline repo-identity
+                // upserts; the shared helper also upserts the PR
+                // author so slice 9's `/benchmark` job link has all
+                // its FK targets.
+                if let Err(out) = materialise_pull_request(
+                    self.repo_store.as_ref(),
+                    self.user_store.as_ref(),
+                    self.pull_request_store
+                        .as_ref(),
+                    PullRequestRepoInput {
                         id: pr.base.repo.id,
-                        owner: pr.base.repo.owner.clone(),
-                        name: pr.base.repo.name.clone(),
-                        default_branch: None,
-                    })
-                    .await
-                {
-                    return ClassifyOutcome::Retryable(format!("upsert_repo_identity(base): {e}"));
-                }
-                if let Err(e) = self
-                    .repo_store
-                    .upsert_repo_identity(&NewRepoIdentity {
+                        owner: &pr.base.repo.owner,
+                        name: &pr.base.repo.name,
+                    },
+                    PullRequestRepoInput {
                         id: pr.head.repo.id,
-                        owner: pr.head.repo.owner.clone(),
-                        name: pr.head.repo.name.clone(),
-                        default_branch: None,
-                    })
-                    .await
+                        owner: &pr.head.repo.owner,
+                        name: &pr.head.repo.name,
+                    },
+                    pr.number as i32,
+                    &pr.title,
+                    PullRequestAuthorInput {
+                        id: pr.author.id,
+                        login: &pr.author.login,
+                        account_type: pr.author.account_type,
+                    },
+                )
+                .await
                 {
-                    return ClassifyOutcome::Retryable(format!("upsert_repo_identity(head): {e}"));
+                    return out;
                 }
 
                 // Slice 6: upsert the sender first (audit trail for
@@ -1110,6 +1121,86 @@ async fn evaluate_pr_policies(
     }
 }
 
+/// Slice 7: shared PR materialisation. Upsert base+head repo
+/// identity, the PR author, and the `github_pull_request` row in the
+/// required FK order:
+///
+///   1. `github_repo` rows for base + head (identity-only — lineage walking
+///      lives on `installation_repositories.added`)
+///   2. `github_user` row for the author
+///   3. `github_pull_request` row (target=base, source=head)
+///
+/// Called from both `PullRequestHandler` (data straight from the
+/// payload) and `IssueCommentHandler` (data from the
+/// `get_pull_request` API response — handles the case where the PR's
+/// `opened` event predates the new pipeline).
+///
+/// On any storage error, returns `Err(ClassifyOutcome)` so callers
+/// can propagate cleanly without bouncing through `?`.
+#[allow(clippy::too_many_arguments)] // 3 stores + 5 payload pieces; bundling them would just be churn.
+async fn materialise_pull_request(
+    repo_store: &dyn RepoStore,
+    user_store: &dyn UserStore,
+    pull_request_store: &dyn PullRequestStore,
+    base: PullRequestRepoInput<'_>,
+    head: PullRequestRepoInput<'_>,
+    pr_number: i32,
+    title: &str,
+    author: PullRequestAuthorInput<'_>,
+) -> Result<sbgh_core::models::GithubPullRequest, ClassifyOutcome> {
+    repo_store
+        .upsert_repo_identity(&NewRepoIdentity {
+            id: base.id,
+            owner: base.owner.into(),
+            name: base.name.into(),
+            default_branch: None,
+        })
+        .await
+        .map_err(|e| ClassifyOutcome::Retryable(format!("upsert_repo_identity(base): {e}")))?;
+    repo_store
+        .upsert_repo_identity(&NewRepoIdentity {
+            id: head.id,
+            owner: head.owner.into(),
+            name: head.name.into(),
+            default_branch: None,
+        })
+        .await
+        .map_err(|e| ClassifyOutcome::Retryable(format!("upsert_repo_identity(head): {e}")))?;
+    user_store
+        .upsert_user(&NewUser {
+            id: author.id,
+            login: author.login.into(),
+            user_type: author.account_type,
+        })
+        .await
+        .map_err(|e| ClassifyOutcome::Retryable(format!("upsert_user(pr_author): {e}")))?;
+    pull_request_store
+        .upsert_pull_request(&NewPullRequest {
+            target_github_repo_id: base.id,
+            source_github_repo_id: head.id,
+            pr_number,
+            title: title.to_string(),
+            author_github_user_id: author.id,
+        })
+        .await
+        .map_err(|e| ClassifyOutcome::Retryable(format!("upsert_pull_request: {e}")))
+}
+
+/// Slice 7 input for the shared materialiser. Borrowed so the
+/// caller can pass refs from a webhook payload or an API response
+/// without cloning.
+pub struct PullRequestRepoInput<'a> {
+    pub id: i64,
+    pub owner: &'a str,
+    pub name: &'a str,
+}
+
+pub struct PullRequestAuthorInput<'a> {
+    pub id: i64,
+    pub login: &'a str,
+    pub account_type: GithubAccountType,
+}
+
 /// Handles `pull_request.{opened,reopened,synchronize}` events. Phase 1:
 /// resolves the PR's base+head repo identities (caches them in
 /// github_repo for slice 7+ PR materialisation), evaluates target+source
@@ -1130,6 +1221,12 @@ pub struct PullRequestHandler {
     /// No authz happens here — authoring a PR doesn't require a role
     /// grant; only the `/benchmark` trigger does.
     user_store: Arc<dyn UserStore>,
+    /// Slice 7: materialise the `github_pull_request` row so slice 9's
+    /// `/benchmark` jobs can link back to a known PR. The shared
+    /// `materialise_pull_request` helper is also called from
+    /// `IssueCommentHandler` so a `/benchmark` comment can succeed
+    /// even when the PR's `opened` event predates the new pipeline.
+    pull_request_store: Arc<dyn PullRequestStore>,
 }
 
 impl PullRequestHandler {
@@ -1138,12 +1235,14 @@ impl PullRequestHandler {
         policy_store: Arc<dyn PolicyStore>,
         install_store: Arc<dyn InstallationStore>,
         user_store: Arc<dyn UserStore>,
+        pull_request_store: Arc<dyn PullRequestStore>,
     ) -> Self {
         Self {
             repo_store,
             policy_store,
             install_store,
             user_store,
+            pull_request_store,
         }
     }
 }
@@ -1163,14 +1262,65 @@ impl EventHandler for PullRequestHandler {
             Err(_) => return ClassifyOutcome::Terminal(WebhookOutcome::Error),
         };
 
-        // Only actions that REOPEN or REFRESH a PR's runnable state
-        // are policy-eval-worthy in Phase 1. labeled/unlabeled/closed/
-        // edited are noise from a benchmark-trigger POV.
-        if !matches!(event.action.as_str(), "opened" | "reopened" | "synchronize") {
+        // Slice 7 lifecycle dispatch (post-slice-7 review reordering):
+        // match on action FIRST, then only require the repo fields
+        // each branch actually uses. GH may omit `pull_request.head.repo`
+        // when a deleted fork branch leaves the PR's source orphaned;
+        // returning Error for `closed` / `labeled` / etc. in that case
+        // loses the close/no-op signal.
+        //
+        //   ignored-by-default (labeled, unlabeled, assigned, …) →
+        //     IgnoredAction immediately; no repo access needed.
+        //   closed → only base.repo needed (key for set_closed_at).
+        //     If base.repo is missing, defensively IgnoredAction —
+        //     can't locate the PR, but losing a close signal is better
+        //     than terminating as Error.
+        //   opened / reopened / synchronize → need BOTH base.repo and
+        //     head.repo for materialise + policy eval. Missing →
+        //     Error (we can't materialise the PR row).
+        //   edited → need both repos. Title-only edits refresh the
+        //     PR row but DO NOT re-run policy eval (avoiding the
+        //     "title edit starts benchmark" footgun once slice 9
+        //     flips WouldEnqueueJob to job creation). Policy eval
+        //     re-runs only when `changes.base` is present in the
+        //     payload, indicating the operator actually changed the
+        //     base ref.
+        let install_id = event.installation.id;
+
+        // Fast-path: ignored-by-default actions require no repo access.
+        if !matches!(
+            event.action.as_str(),
+            "closed" | "opened" | "reopened" | "synchronize" | "edited"
+        ) {
             return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction);
         }
 
-        let install_id = event.installation.id;
+        // Closed: only base.repo needed.
+        if event.action == "closed" {
+            let Some(base_repo) = event
+                .pull_request
+                .base
+                .repo
+                .as_ref()
+            else {
+                // Defensive: closed without base.repo is unprecedented
+                // in practice but we'd rather terminate as IgnoredAction
+                // (no DB side effect) than Error.
+                return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction);
+            };
+            if let Err(e) = self
+                .pull_request_store
+                .set_closed_at(base_repo.id, event.pull_request.number as i32, Some(Utc::now()))
+                .await
+            {
+                return ClassifyOutcome::Retryable(format!("set_closed_at: {e}"));
+            }
+            return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction);
+        }
+
+        // opened / reopened / synchronize / edited: full materialisation
+        // path. Both base.repo and head.repo are required (the PR row's
+        // source FK targets head).
         let Some(base_repo) = event
             .pull_request
             .base
@@ -1188,62 +1338,76 @@ impl EventHandler for PullRequestHandler {
             return ClassifyOutcome::Terminal(WebhookOutcome::Error);
         };
 
-        // Cache base+head repo identities (slice 7+ PR materialisation
-        // will reuse these). Identity-only — lineage walking happens
-        // when `installation_repositories.added` runs for these repos;
-        // PR events don't trigger a lineage walk.
-        if let Err(e) = self
-            .repo_store
-            .upsert_repo_identity(&NewRepoIdentity {
-                id: base_repo.id,
-                owner: split_full_name(&base_repo.full_name)
-                    .map(|(o, _)| o.to_string())
-                    .unwrap_or_default(),
-                name: split_full_name(&base_repo.full_name)
-                    .map(|(_, n)| n.to_string())
-                    .unwrap_or_default(),
-                default_branch: None,
-            })
-            .await
-        {
-            return ClassifyOutcome::Retryable(format!("upsert_repo_identity(base): {e}"));
-        }
-        if let Err(e) = self
-            .repo_store
-            .upsert_repo_identity(&NewRepoIdentity {
-                id: head_repo.id,
-                owner: split_full_name(&head_repo.full_name)
-                    .map(|(o, _)| o.to_string())
-                    .unwrap_or_default(),
-                name: split_full_name(&head_repo.full_name)
-                    .map(|(_, n)| n.to_string())
-                    .unwrap_or_default(),
-                default_branch: None,
-            })
-            .await
-        {
-            return ClassifyOutcome::Retryable(format!("upsert_repo_identity(head): {e}"));
-        }
-
-        // Slice 6: upsert the PR author so slice 7's
-        // `github_pull_request.author_github_user_id` FK target exists.
-        // Independent of policy eval — even denied PRs get the author
-        // row (cheap; ensures the user table doesn't sprout
-        // discontinuities at the cutover boundary).
+        let (base_owner, base_name) =
+            split_full_name(&base_repo.full_name).unwrap_or((&base_repo.full_name, ""));
+        let (head_owner, head_name) =
+            split_full_name(&head_repo.full_name).unwrap_or((&head_repo.full_name, ""));
         let author = &event.pull_request.user;
         let Some(author_type) = parse_account_type(&author.account_type) else {
             return ClassifyOutcome::Terminal(WebhookOutcome::Error);
         };
-        if let Err(e) = self
-            .user_store
-            .upsert_user(&NewUser {
+        if let Err(out) = materialise_pull_request(
+            self.repo_store.as_ref(),
+            self.user_store.as_ref(),
+            self.pull_request_store
+                .as_ref(),
+            PullRequestRepoInput {
+                id: base_repo.id,
+                owner: base_owner,
+                name: base_name,
+            },
+            PullRequestRepoInput {
+                id: head_repo.id,
+                owner: head_owner,
+                name: head_name,
+            },
+            event.pull_request.number as i32,
+            &event.pull_request.title,
+            PullRequestAuthorInput {
                 id: author.id,
-                login: author.login.clone(),
-                user_type: author_type,
-            })
-            .await
+                login: &author.login,
+                account_type: author_type,
+            },
+        )
+        .await
         {
-            return ClassifyOutcome::Retryable(format!("upsert_user(pr_author): {e}"));
+            return out;
+        }
+
+        // Reopened: clear any prior closed_at on the existing row.
+        // Idempotent if already None.
+        if event.action == "reopened"
+            && let Err(e) = self
+                .pull_request_store
+                .set_closed_at(base_repo.id, event.pull_request.number as i32, None)
+                .await
+        {
+            return ClassifyOutcome::Retryable(format!("set_closed_at(reopened): {e}"));
+        }
+
+        // Edited: skip policy eval unless `changes.base` is present.
+        // Title/body/etc. edits absorbed by the materialise upsert
+        // above but produce no Phase-1 enqueue signal.
+        if event.action == "edited" {
+            let base_changed = event
+                .changes
+                .as_ref()
+                .and_then(|c| c.base.as_ref())
+                .is_some();
+            if !base_changed {
+                tracing::debug!(
+                    installation_id = install_id,
+                    pr_number = event.pull_request.number,
+                    "pull_request edited: non-base change, title refreshed but policy NOT \
+                     re-evaluated"
+                );
+                return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction);
+            }
+            tracing::info!(
+                installation_id = install_id,
+                pr_number = event.pull_request.number,
+                "pull_request edited: base ref changed, re-running policy eval"
+            );
         }
 
         match evaluate_pr_policies(
@@ -1263,8 +1427,6 @@ impl EventHandler for PullRequestHandler {
                     head_repo_id = head_repo.id,
                     "pull_request: policies accepted — slice 9 will enqueue here"
                 );
-                // Phase 1: terminal `WouldEnqueueJob` (pre-slice-6
-                // checkpoint). Slice 9 flips to `EnqueuedJob`.
                 ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
             }
             PolicyEvaluation::DeniedTarget => {
@@ -1533,6 +1695,12 @@ pub struct ProcessorConfig {
     /// silently. Per-row classification errors don't count — those
     /// land as terminal `error` rows.
     pub max_consecutive_errors: u32,
+    /// Slice 7 (pre-slice-6 checkpoint todo): how long to keep
+    /// payloads on terminal `ignored` / `denied` / `failed` rows
+    /// before NULL-ing the `payload` JSONB. `payload_size_bytes`
+    /// and `last_error` survive the clear. Default 24h gives ops
+    /// a full day of observation before the payload goes.
+    pub payload_retention: chrono::Duration,
 }
 
 impl Default for ProcessorConfig {
@@ -1545,6 +1713,7 @@ impl Default for ProcessorConfig {
             idle_sleep: std::time::Duration::from_secs(2),
             sweep_interval: std::time::Duration::from_secs(60),
             max_consecutive_errors: 10,
+            payload_retention: chrono::Duration::hours(24),
         }
     }
 }
@@ -1658,6 +1827,26 @@ impl WebhookProcessor {
                         consecutive_sweep_errors += 1;
                     }
                 }
+                // Slice 7: NULL payload on terminal rows past the
+                // retention window in the same sweep tick. Cheap
+                // SQL, no contention with claim path (different
+                // status filter). Shares the sweep_errors counter
+                // with sweep_stuck_claims — both are "background
+                // housekeeping" from the loop's POV.
+                match self
+                    .inbox
+                    .clear_terminal_payloads(self.config.payload_retention)
+                    .await
+                {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(cleared = n, "terminal payloads cleared");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = ?e, "terminal-payload clear failed");
+                        consecutive_sweep_errors += 1;
+                    }
+                }
                 last_sweep = Instant::now();
             }
 
@@ -1741,6 +1930,7 @@ mod tests {
             idle_sleep: std::time::Duration::from_millis(10),
             sweep_interval: std::time::Duration::from_millis(50),
             max_consecutive_errors: 10,
+            payload_retention: chrono::Duration::hours(24),
         }
     }
 
@@ -2181,11 +2371,14 @@ mod tests {
         user_store.seed_user(42, "alice", GithubAccountType::User);
         user_store.seed_role(42, 1, Some(10), UserRole::TriggerPrBenchmark);
 
+        let pull_request_store = Arc::new(sbgh_core::db::InMemoryPullRequestStore::new());
+
         let handler = IssueCommentHandler::new(
             repo_store,
             policy_store.clone(),
             install_store.clone(),
             user_store.clone(),
+            pull_request_store,
             Arc::new(gh.clone()),
         );
         (handler, gh, policy_store, install_store, user_store)
@@ -2652,6 +2845,7 @@ mod tests {
             Arc::new(sbgh_core::db::InMemoryPolicyStore::new()),
             Arc::new(sbgh_core::db::InMemoryInstallationStore::new()),
             Arc::new(sbgh_core::db::InMemoryUserStore::new()),
+            Arc::new(sbgh_core::db::InMemoryPullRequestStore::new()),
             Arc::new(sbgh_core::github::test_support::FakeGitHub::new()),
         )
     }
@@ -3702,12 +3896,15 @@ mod tests {
         base_repo_id: i64,
         head_repo_id: i64,
     ) -> serde_json::Value {
+        // Slice 7: payload now includes `title` for `github_pull_request`
+        // materialisation.
         serde_json::json!({
             "action": action,
             "installation": { "id": install_id },
             "repository": { "id": base_repo_id, "full_name": "o/r" },
             "pull_request": {
                 "number": 1,
+                "title": "test pr title",
                 "user": { "id": 42, "login": "alice", "type": "User" },
                 "head": { "ref": "feat", "sha": "headsha",
                           "repo": { "id": head_repo_id, "full_name": "alice/r" } },
@@ -3744,6 +3941,7 @@ mod tests {
         Arc<sbgh_core::db::InMemoryPolicyStore>,
         Arc<sbgh_core::db::InMemoryInstallationStore>,
         Arc<sbgh_core::db::InMemoryUserStore>,
+        Arc<sbgh_core::db::InMemoryPullRequestStore>,
     ) {
         let repo_store = Arc::new(sbgh_core::db::InMemoryRepoStore::new());
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
@@ -3763,16 +3961,19 @@ mod tests {
             .await
             .unwrap();
         let user_store = Arc::new(sbgh_core::db::InMemoryUserStore::new());
+        let pull_request_store = Arc::new(sbgh_core::db::InMemoryPullRequestStore::new());
         (
             PullRequestHandler::new(
                 repo_store,
                 policy_store.clone(),
                 install_store.clone(),
                 user_store.clone(),
+                pull_request_store.clone(),
             ),
             policy_store,
             install_store,
             user_store,
+            pull_request_store,
         )
     }
 
@@ -3781,7 +3982,7 @@ mod tests {
         // Pre-slice-6 checkpoint: PR with target+source policies
         // enabled terminates as `WouldEnqueueJob` (Phase 1 shadow
         // accept). Slice 9 flips to `EnqueuedJob`.
-        let (h, policy_store, _install_store, _user_store) = make_pr_handler().await;
+        let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, true);
         policy_store.seed_source(100, 20, true);
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
@@ -3794,7 +3995,7 @@ mod tests {
         // Slice 6: PullRequestHandler upserts the PR author so slice
         // 7's `github_pull_request.author_github_user_id` FK target
         // exists. Independent of policy eval — even denied PRs upsert.
-        let (h, _policy_store, _install_store, user_store) = make_pr_handler().await;
+        let (h, _policy_store, _install_store, user_store, _pr_store) = make_pr_handler().await;
         // No policies seeded → DeniedTargetPolicy.
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let _ = h.handle(&w).await;
@@ -3806,9 +4007,227 @@ mod tests {
         assert_eq!(author.unwrap().login, "alice");
     }
 
+    // ─── Slice 7 PR-row materialisation tests ───────────────────────────
+
+    #[tokio::test]
+    async fn pr_opened_materialises_pull_request_row() {
+        // Slice 7: PullRequestHandler materialises the
+        // github_pull_request row via the shared helper.
+        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
+        let _ = h.handle(&w).await;
+        let pr = pr_store
+            .lookup_pull_request(10, 1)
+            .await
+            .unwrap();
+        let pr = pr.expect("PR row must be materialised by opened");
+        assert_eq!(pr.target_github_repo_id, 10);
+        assert_eq!(pr.source_github_repo_id, 20);
+        assert_eq!(pr.title, "test pr title");
+        assert!(pr.closed_at.is_none(), "fresh PR is active");
+    }
+
+    #[tokio::test]
+    async fn pr_edited_title_only_refreshes_title_but_terminates_ignored_action() {
+        // Slice 7 review fix: an edit that only touches the title
+        // MUST NOT re-run policy eval (otherwise slice 9 would turn
+        // typo fixes into benchmark triggers). The PR row's title
+        // still refreshes via the materialise upsert; the outcome
+        // is IgnoredAction, not WouldEnqueueJob.
+        let (h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        policy_store.seed_target(100, 10, true);
+        policy_store.seed_source(100, 20, true);
+        // First opened to materialise.
+        let w_open = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
+        let _ = h.handle(&w_open).await;
+
+        // Edited with title-only change (no `changes.base`).
+        let mut edited_payload = pr_event_payload("edited", 100, 10, 20);
+        edited_payload["pull_request"]["title"] = "edited title".into();
+        edited_payload["changes"] = serde_json::json!({ "title": { "from": "test pr title" } });
+        let w_edit = pr_webhook("edited", edited_payload);
+        let outcome = h.handle(&w_edit).await;
+        // CRITICAL: title-only edits MUST NOT signal a would-enqueue.
+        assert!(
+            matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)),
+            "title-only edits must terminate IgnoredAction, not WouldEnqueueJob"
+        );
+        let pr = pr_store
+            .lookup_pull_request(10, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pr.title, "edited title", "title must still refresh");
+    }
+
+    #[tokio::test]
+    async fn pr_edited_with_base_changed_re_runs_policy_eval() {
+        // Slice 7 review fix: only when `changes.base` is present
+        // does an edited event re-run policy eval. This covers the
+        // rare case where the operator changes the PR's base ref,
+        // which can shift the target repo identity.
+        let (h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        policy_store.seed_target(100, 10, true);
+        policy_store.seed_source(100, 20, true);
+        let w_open = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
+        let _ = h.handle(&w_open).await;
+
+        let mut edited_payload = pr_event_payload("edited", 100, 10, 20);
+        edited_payload["pull_request"]["title"] = "edited base too".into();
+        edited_payload["changes"] = serde_json::json!({
+            "base": { "ref": { "from": "develop" }, "sha": { "from": "deadbeef" } }
+        });
+        let w_edit = pr_webhook("edited", edited_payload);
+        let outcome = h.handle(&w_edit).await;
+        assert!(
+            matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)),
+            "edited + changes.base must re-run policy eval"
+        );
+        let pr = pr_store
+            .lookup_pull_request(10, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pr.title, "edited base too");
+    }
+
+    #[tokio::test]
+    async fn pr_closed_without_head_repo_still_sets_closed_at() {
+        // Slice 7 review fix: GH may omit head.repo on a deleted-fork
+        // PR. The original handler returned Error for closed in this
+        // case, losing the close signal. The dispatch reordering means
+        // closed only needs base.repo.
+        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        // Materialise first via opened (which DOES need head.repo).
+        let _ = h
+            .handle(&pr_webhook("opened", pr_event_payload("opened", 100, 10, 20)))
+            .await;
+
+        // Now build a closed payload with head.repo MISSING.
+        let mut closed_payload = pr_event_payload("closed", 100, 10, 20);
+        closed_payload["pull_request"]["head"]["repo"] = serde_json::Value::Null;
+        let w = pr_webhook("closed", closed_payload);
+        let outcome = h.handle(&w).await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        let pr = pr_store
+            .lookup_pull_request(10, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pr.closed_at.is_some(),
+            "closed must still set closed_at even when head.repo is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_labeled_without_head_repo_terminates_ignored_action() {
+        // Slice 7 review fix: ignored-by-default actions terminate as
+        // IgnoredAction WITHOUT requiring head.repo (or base.repo).
+        let (h, _policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
+        let mut payload = pr_event_payload("labeled", 100, 10, 20);
+        payload["pull_request"]["head"]["repo"] = serde_json::Value::Null;
+        payload["pull_request"]["base"]["repo"] = serde_json::Value::Null;
+        let w = pr_webhook("labeled", payload);
+        let outcome = h.handle(&w).await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+    }
+
+    #[tokio::test]
+    async fn pr_closed_sets_closed_at_and_terminates_ignored_action() {
+        // Slice 7: closed sets closed_at on the existing PR row,
+        // terminates as IgnoredAction (no policy eval, no enqueue
+        // signal — closing isn't a benchmark trigger).
+        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        // Materialise via opened first.
+        let w_open = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
+        let _ = h.handle(&w_open).await;
+
+        let w_close = pr_webhook("closed", pr_event_payload("closed", 100, 10, 20));
+        let outcome = h.handle(&w_close).await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        let pr = pr_store
+            .lookup_pull_request(10, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pr.closed_at.is_some(), "closed event must set closed_at");
+    }
+
+    #[tokio::test]
+    async fn pr_reopened_clears_closed_at_and_re_runs_policy_eval() {
+        // Slice 7: reopened clears closed_at on the existing row AND
+        // re-runs policy eval (policies may have changed since the
+        // close).
+        let (h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        policy_store.seed_target(100, 10, true);
+        policy_store.seed_source(100, 20, true);
+        // Materialise then close.
+        let _ = h
+            .handle(&pr_webhook("opened", pr_event_payload("opened", 100, 10, 20)))
+            .await;
+        let _ = h
+            .handle(&pr_webhook("closed", pr_event_payload("closed", 100, 10, 20)))
+            .await;
+        let closed = pr_store
+            .lookup_pull_request(10, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(closed.closed_at.is_some());
+
+        // Now reopen.
+        let w_reopen = pr_webhook("reopened", pr_event_payload("reopened", 100, 10, 20));
+        let outcome = h.handle(&w_reopen).await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
+        let reopened = pr_store
+            .lookup_pull_request(10, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reopened.closed_at.is_none(), "reopened event must clear closed_at");
+    }
+
+    #[tokio::test]
+    async fn pr_synchronize_keeps_pr_row_present() {
+        // Slice 7 + slice 5: synchronize refreshes head metadata (via
+        // upsert) AND re-runs policy eval. The PR row must remain
+        // present even with no policies (denied path).
+        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        let w_open = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
+        let _ = h.handle(&w_open).await;
+        let w_sync = pr_webhook("synchronize", pr_event_payload("synchronize", 100, 10, 20));
+        let outcome = h.handle(&w_sync).await;
+        // No policies seeded → DeniedTargetPolicy on synchronize.
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)));
+        let pr = pr_store
+            .lookup_pull_request(10, 1)
+            .await
+            .unwrap();
+        assert!(pr.is_some(), "PR row must remain after synchronize even on denied path");
+    }
+
+    #[tokio::test]
+    async fn pr_closed_for_unseen_pr_is_idempotent_no_op() {
+        // closed for a PR whose opened event we never saw is a
+        // graceful no-op (no row to update; terminal IgnoredAction).
+        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        let w = pr_webhook("closed", pr_event_payload("closed", 100, 10, 20));
+        let outcome = h.handle(&w).await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        assert!(
+            pr_store
+                .lookup_pull_request(10, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "closed for an unseen PR must not materialise a row"
+        );
+    }
+
     #[tokio::test]
     async fn pr_opened_missing_target_is_denied_target_policy() {
-        let (h, _policy_store, _install_store, _user_store) = make_pr_handler().await;
+        let (h, _policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)));
@@ -3816,7 +4235,7 @@ mod tests {
 
     #[tokio::test]
     async fn pr_opened_disabled_target_is_denied_target_policy() {
-        let (h, policy_store, _install_store, _user_store) = make_pr_handler().await;
+        let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, false);
         policy_store.seed_source(100, 20, true);
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
@@ -3826,7 +4245,7 @@ mod tests {
 
     #[tokio::test]
     async fn pr_opened_missing_source_is_denied_source_policy() {
-        let (h, policy_store, _install_store, _user_store) = make_pr_handler().await;
+        let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, true);
         // No source.
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
@@ -3835,11 +4254,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pr_non_trigger_action_is_ignored_without_policy_lookup() {
-        // labeled/unlabeled/closed/edited are skipped — no policy
-        // lookup happens, no repo identity cached.
-        let (h, _policy_store, _install_store, _user_store) = make_pr_handler().await;
-        for action in ["labeled", "unlabeled", "closed", "edited"] {
+    async fn pr_labeled_or_unlabeled_actions_are_ignored_without_side_effects() {
+        // Slice 7 lifecycle dispatch: labeled / unlabeled / assigned
+        // / etc. are ignored with no DB side effects. closed and
+        // edited do have side effects (closed sets closed_at, edited
+        // runs materialise + policy eval) and are covered by
+        // dedicated tests below.
+        let (h, _policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
+        for action in ["labeled", "unlabeled", "assigned"] {
             let w = pr_webhook(action, pr_event_payload(action, 100, 10, 20));
             let outcome = h.handle(&w).await;
             assert!(
@@ -3851,7 +4273,7 @@ mod tests {
 
     #[tokio::test]
     async fn pr_null_payload_is_error() {
-        let (h, _ps, _install_store, _user_store) = make_pr_handler().await;
+        let (h, _ps, _install_store, _user_store, _pr_store) = make_pr_handler().await;
         let mut w = pr_webhook("opened", serde_json::Value::Null);
         w.payload = None;
         let outcome = h.handle(&w).await;
@@ -3863,7 +4285,7 @@ mod tests {
         // synchronize fires on every new push to a PR's head — should
         // re-evaluate policies (a previously-accepted PR's source repo
         // might have been disabled in the meantime).
-        let (h, policy_store, _install_store, _user_store) = make_pr_handler().await;
+        let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, true);
         // No source enabled.
         let w = pr_webhook("synchronize", pr_event_payload("synchronize", 100, 10, 20));
@@ -3878,7 +4300,7 @@ mod tests {
         // Codex slice-5 review High #1: a target_repo_policy row with
         // is_enabled=TRUE must NOT cause acceptance if the membership
         // has been revoked since the policy was created.
-        let (h, policy_store, install_store, _user_store) = make_pr_handler().await;
+        let (h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, true);
         policy_store.seed_source(100, 20, true);
         // Revoke the membership AFTER the policies are seeded.
@@ -3896,7 +4318,7 @@ mod tests {
 
     #[tokio::test]
     async fn pr_with_enabled_target_but_suspended_install_is_denied_target_policy() {
-        let (h, policy_store, install_store, _user_store) = make_pr_handler().await;
+        let (h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, true);
         policy_store.seed_source(100, 20, true);
         install_store
@@ -3910,7 +4332,7 @@ mod tests {
 
     #[tokio::test]
     async fn pr_with_enabled_target_but_soft_deleted_install_is_denied_target_policy() {
-        let (h, policy_store, install_store, _user_store) = make_pr_handler().await;
+        let (h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, true);
         policy_store.seed_source(100, 20, true);
         install_store

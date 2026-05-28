@@ -522,6 +522,12 @@ WHERE
 -- ─── Pull requests ───────────────────────────────────────────────────────
 -- Distinct source/target repos for cross-fork PRs. pr_number is unique
 -- only within the target repo.
+--
+-- Soft-close via `closed_at` mirrors the lifecycle pattern used by
+-- `github_installation_repo.revoked_at` and `github_user_role.revoked_at`:
+-- close sets it to NOW(); reopen clears it back to NULL. PRs are
+-- historical subjects so the row is preserved for slice 8+ job FKs
+-- even after close.
 CREATE TABLE github_pull_request (
     id bigserial PRIMARY KEY,
     target_github_repo_id bigint NOT NULL REFERENCES github_repo (id),
@@ -529,6 +535,7 @@ CREATE TABLE github_pull_request (
     pr_number integer NOT NULL,
     title text NOT NULL,
     author_github_user_id bigint NOT NULL REFERENCES github_user (id),
+    closed_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     updated_at timestamptz NOT NULL DEFAULT NOW(),
     UNIQUE (target_github_repo_id, pr_number)

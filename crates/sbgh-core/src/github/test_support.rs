@@ -128,7 +128,11 @@ impl FakeGitHub {
     }
 
     /// Pre-program a PR response keyed on `("owner/name", pr_number)`.
-    /// `base` is the target side; `head` is the source side.
+    /// `base` is the target side; `head` is the source side. Slice 7
+    /// kept this helper minimal — title defaults to a placeholder and
+    /// author to `("alice", id=42, User)` so existing slice 5/6 tests
+    /// don't need to plumb new args. Tests that exercise the slice 7
+    /// PR-row materialisation should use `set_pull_request_full`.
     pub fn set_pull_request(
         &self,
         repository: &str,
@@ -136,13 +140,45 @@ impl FakeGitHub {
         base: PullRequestSide,
         head: PullRequestSide,
     ) {
+        self.set_pull_request_full(
+            repository,
+            pr_number,
+            base,
+            head,
+            "test pr title",
+            crate::github::PullRequestAuthor {
+                id: 42,
+                login: "alice".into(),
+                account_type: crate::models::GithubAccountType::User,
+            },
+        );
+    }
+
+    /// Slice 7: pre-program a PR response with explicit title +
+    /// author so PR materialisation tests can assert against the
+    /// upserted `github_pull_request` row.
+    pub fn set_pull_request_full(
+        &self,
+        repository: &str,
+        pr_number: u64,
+        base: PullRequestSide,
+        head: PullRequestSide,
+        title: &str,
+        author: crate::github::PullRequestAuthor,
+    ) {
         self.inner
             .lock()
             .unwrap()
             .prs
             .insert(
                 (repository.into(), pr_number),
-                PullRequestSummary { number: pr_number, base, head },
+                PullRequestSummary {
+                    number: pr_number,
+                    base,
+                    head,
+                    title: title.into(),
+                    author,
+                },
             );
     }
 

@@ -263,6 +263,26 @@ impl WebhookInbox for InMemoryWebhookInbox {
         Ok(())
     }
 
+    async fn clear_terminal_payloads(&self, retention: chrono::Duration) -> Result<u64> {
+        let cutoff = Utc::now() - retention;
+        let mut rows = self.rows.lock().unwrap();
+        let mut cleared = 0u64;
+        for r in rows.iter_mut() {
+            if matches!(
+                r.status,
+                WebhookStatus::Ignored | WebhookStatus::Denied | WebhookStatus::Failed
+            ) && r.payload.is_some()
+                && r.processed_at
+                    .map(|t| t < cutoff)
+                    .unwrap_or(false)
+            {
+                r.payload = None;
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    }
+
     async fn sweep_stuck_claims(&self, lease: chrono::Duration) -> Result<u64> {
         let cutoff = Utc::now() - lease;
         let mut rows = self.rows.lock().unwrap();

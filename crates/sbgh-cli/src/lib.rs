@@ -245,6 +245,24 @@ pub async fn apply_roles(
         .execute(&mut *tx)
         .await?;
 
+    // Slice 7: github_pull_request.
+    //
+    // PR rows are materialised by the processor on opened/reopened/
+    // synchronize/edited and refreshed on edited (title) and
+    // closed/reopened (closed_at). Orch needs SELECT + INSERT +
+    // UPDATE. No DELETE — slice 8+ job FKs depend on PR rows
+    // sticking around, and closed PRs use soft-close (`closed_at`).
+    // Handler never touches this table.
+    sqlx::query("REVOKE ALL ON TABLE github_pull_request FROM sbgh_handler, sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT, UPDATE ON TABLE github_pull_request TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT USAGE ON SEQUENCE github_pull_request_id_seq TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
     // USAGE on the schema is required even with table-level grants. CONNECT
     // on the database is implicit for any login role; no need to grant
     // explicitly.

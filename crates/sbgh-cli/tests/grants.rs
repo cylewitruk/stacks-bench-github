@@ -925,6 +925,68 @@ async fn orch_can_select_github_user_role_but_not_write() {
         .expect_err("orch DELETE on github_user_role MUST be rejected");
 }
 
+// ─── Slice 7: github_pull_request grants ──────────────────────────────
+
+#[tokio::test]
+async fn orch_can_select_insert_update_github_pull_request_but_not_delete() {
+    // Slice 7: PR rows are materialised by the processor on
+    // opened/reopened/synchronize/edited and refreshed via UPDATE
+    // (title on edited, closed_at on closed/reopened). No DELETE —
+    // slice 8+ job FKs depend on PR rows sticking around.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    // Seed identity FK targets.
+    sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO github_user (id, login, user_type) VALUES (42, 'alice', 'user')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let orch = orch_pool(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO github_pull_request (target_github_repo_id, source_github_repo_id, \
+         pr_number, title, author_github_user_id) VALUES (10, 10, 1, 't', 42)",
+    )
+    .execute(&orch)
+    .await
+    .expect("orch INSERT on github_pull_request must succeed");
+    sqlx::query("UPDATE github_pull_request SET title = 't2' WHERE pr_number = 1")
+        .execute(&orch)
+        .await
+        .expect("orch UPDATE on github_pull_request must succeed");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_pull_request")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on github_pull_request must succeed");
+    assert_eq!(count, 1);
+    sqlx::query("DELETE FROM github_pull_request WHERE pr_number = 1")
+        .execute(&orch)
+        .await
+        .expect_err("orch DELETE on github_pull_request MUST be rejected");
+}
+
+#[tokio::test]
+async fn handler_cannot_touch_github_pull_request() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let handler = handler_pool(&pool).await;
+    sqlx::query("SELECT 1 FROM github_pull_request LIMIT 1")
+        .fetch_optional(&handler)
+        .await
+        .expect_err("handler SELECT on github_pull_request MUST be rejected");
+}
+
 #[tokio::test]
 async fn handler_cannot_touch_user_or_role_tables() {
     let Some((_c, pool)) = setup_pg().await else {

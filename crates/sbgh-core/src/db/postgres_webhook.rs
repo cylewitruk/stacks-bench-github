@@ -188,6 +188,30 @@ impl WebhookInbox for PostgresWebhookInbox {
         Ok(())
     }
 
+    async fn clear_terminal_payloads(&self, retention: chrono::Duration) -> Result<u64> {
+        // `status IN ('ignored', 'denied', 'failed')` selects every
+        // terminal outcome where slice 9+ wouldn't need the payload
+        // anymore. `processed` is excluded (see trait doc).
+        // `processed_at IS NOT NULL` is implied for terminal rows,
+        // but we filter explicitly to be safe against future status
+        // additions.
+        let retention_seconds = retention.num_seconds();
+        let result = sqlx::query(
+            r#"
+            UPDATE github_webhook
+               SET payload = NULL
+             WHERE status IN ('ignored', 'denied', 'failed')
+               AND payload IS NOT NULL
+               AND processed_at IS NOT NULL
+               AND processed_at < NOW() - make_interval(secs => $1)
+            "#,
+        )
+        .bind(retention_seconds as f64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn sweep_stuck_claims(&self, lease: chrono::Duration) -> Result<u64> {
         // Anything claimed for longer than the lease window is presumed
         // dead; revert it to retryable_error so it can be re-claimed.

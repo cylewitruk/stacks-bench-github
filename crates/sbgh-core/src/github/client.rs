@@ -97,11 +97,28 @@ pub trait GitHubApi: Send + Sync + 'static {
 /// branch; `base` is the target repo + branch. Both `RepoRef`s have
 /// `id`, `owner`, `name` — enough to (a) upsert identity and (b)
 /// look up policy rows by the FK columns.
+///
+/// Slice 7 added `title` and `author` so the shared PR materialisation
+/// helper (`materialise_pr` in webhook_processor) can populate
+/// `github_pull_request` from a single API call when the `/benchmark`
+/// comment predates the new pipeline's `pull_request.opened` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestSummary {
     pub number: u64,
     pub head: PullRequestSide,
     pub base: PullRequestSide,
+    pub title: String,
+    pub author: PullRequestAuthor,
+}
+
+/// PR author identity. Slice 7 needs id + login + account type so the
+/// shared materialisation helper can lazy-upsert the user before
+/// inserting the PR row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestAuthor {
+    pub id: i64,
+    pub login: String,
+    pub account_type: crate::models::GithubAccountType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +250,18 @@ impl GitHubApi for OctocrabClient {
             .repo
             .as_ref()
             .ok_or_else(|| Error::Config("PR base missing repo".into()))?;
+        let author = pr.user.as_ref();
+        // GH's REST response uses `User`/`Organization`/`Bot`; map to
+        // our typed enum at the boundary (same rationale as elsewhere
+        // — bogus type → Error rather than silent default).
+        let account_type = match author.r#type.as_str() {
+            "User" => crate::models::GithubAccountType::User,
+            "Organization" => crate::models::GithubAccountType::Organization,
+            "Bot" => crate::models::GithubAccountType::Bot,
+            other => {
+                return Err(Error::Config(format!("unsupported PR author type: {other}")));
+            }
+        };
         Ok(PullRequestSummary {
             number: pr_number,
             head: PullRequestSide {
@@ -244,6 +273,12 @@ impl GitHubApi for OctocrabClient {
                 repo: repo_ref_from_octocrab(base_repo),
                 sha: pr.base.sha.clone(),
                 branch: pr.base.ref_field.clone(),
+            },
+            title: pr.title.clone(),
+            author: crate::github::PullRequestAuthor {
+                id: author.id.0 as i64,
+                login: author.login.clone(),
+                account_type,
             },
         })
     }

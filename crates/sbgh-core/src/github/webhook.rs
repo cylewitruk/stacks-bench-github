@@ -168,6 +168,24 @@ pub struct PullRequestEvent {
     pub installation: Installation,
     pub repository: PullRequestRepo,
     pub pull_request: PullRequestBody,
+    /// Slice 7 review fix: GH includes a `changes` object on
+    /// `pull_request.edited` describing which fields the user actually
+    /// modified. Title-only edits should NOT re-run policy eval
+    /// (otherwise a typo fix becomes a `WouldEnqueueJob` signal, which
+    /// turns into a real "title edit starts benchmark" bug once slice
+    /// 9 flips the outcome to job creation). Re-eval only when the
+    /// PR's base ref actually changed.
+    #[serde(default)]
+    pub changes: Option<PullRequestChanges>,
+}
+
+/// Slice 7 review fix: the `changes` object on `pull_request.edited`.
+/// Only `base` is meaningful for policy eval — a base ref change can
+/// shift the target repo identity. Title/body/etc. edits are absorbed
+/// by the upsert path but do not warrant re-running policy.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequestChanges {
+    pub base: Option<serde_json::Value>,
 }
 
 /// Subset of GitHub's repository field that PR-related webhooks ship
@@ -188,6 +206,9 @@ pub struct PullRequestBody {
     /// PR author. Slice 6 upserts this into `github_user` so slice 7's
     /// `github_pull_request.author_github_user_id` FK target exists.
     pub user: User,
+    /// PR title. Slice 7 persists this as `github_pull_request.title`
+    /// and refreshes on `pull_request.edited`.
+    pub title: String,
 }
 
 /// PR head/base entry. `repo` is `Option` because GitHub may omit it

@@ -387,3 +387,131 @@ async fn complete_clears_last_error() {
         "complete must clear last_error from prior retries; got {last_error:?}"
     );
 }
+
+// ─── Slice 7: clear_terminal_payloads ─────────────────────────────────
+
+#[tokio::test]
+async fn clear_terminal_payloads_nulls_old_terminal_rows() {
+    // Slice 7 retention sweep: terminal `ignored` / `denied` / `failed`
+    // rows past the retention window get `payload = NULL`;
+    // `payload_size_bytes` + `last_error` survive; in-flight rows are
+    // untouched.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_webhook(&pool, "retain-1", "issue_comment").await;
+    let inbox = PostgresWebhookInbox::new(pool.clone());
+    let claimed = inbox
+        .claim_next(&["issue_comment"])
+        .await
+        .unwrap()
+        .unwrap();
+    inbox
+        .complete(claimed.id, claimed.claim_token, WebhookOutcome::IgnoredNoCommand)
+        .await
+        .unwrap();
+    // Backdate processed_at so the retention predicate matches.
+    sqlx::query(
+        "UPDATE github_webhook SET processed_at = NOW() - INTERVAL '48 hours' WHERE delivery_id = \
+         'retain-1'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run the retention sweep with a 24h window.
+    let cleared = inbox
+        .clear_terminal_payloads(chrono::Duration::hours(24))
+        .await
+        .unwrap();
+    assert_eq!(cleared, 1);
+
+    // Confirm payload NULL, size bytes preserved.
+    let (payload, size): (Option<serde_json::Value>, i32) = sqlx::query_as(
+        "SELECT payload, payload_size_bytes FROM github_webhook WHERE delivery_id = 'retain-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(payload.is_none(), "payload must be NULL after clear");
+    assert!(size > 0, "payload_size_bytes must be preserved");
+}
+
+#[tokio::test]
+async fn clear_terminal_payloads_skips_in_flight_rows() {
+    // Rows still in `received` / `processing` / `retryable_error` must
+    // NOT have their payload cleared — they're either pending or
+    // mid-retry.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_webhook(&pool, "in-flight-1", "issue_comment").await;
+    let inbox = PostgresWebhookInbox::new(pool.clone());
+
+    let cleared = inbox
+        .clear_terminal_payloads(chrono::Duration::seconds(0))
+        .await
+        .unwrap();
+    assert_eq!(cleared, 0, "received row must not be touched");
+}
+
+#[tokio::test]
+async fn clear_terminal_payloads_skips_processed_status_rows() {
+    // `processed` outcomes (enqueued_job / would_enqueue_job /
+    // processed_installation) are intentionally NOT cleared — slice
+    // 9+ may want the payload for job-context construction.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_webhook(&pool, "processed-1", "issue_comment").await;
+    let inbox = PostgresWebhookInbox::new(pool.clone());
+    let claimed = inbox
+        .claim_next(&["issue_comment"])
+        .await
+        .unwrap()
+        .unwrap();
+    inbox
+        .complete(claimed.id, claimed.claim_token, WebhookOutcome::WouldEnqueueJob)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE github_webhook SET processed_at = NOW() - INTERVAL '48 hours' WHERE delivery_id = \
+         'processed-1'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let cleared = inbox
+        .clear_terminal_payloads(chrono::Duration::hours(24))
+        .await
+        .unwrap();
+    assert_eq!(cleared, 0, "processed-status rows MUST NOT be cleared");
+}
+
+#[tokio::test]
+async fn clear_terminal_payloads_respects_retention_window() {
+    // A row processed RECENTLY (younger than the window) must NOT
+    // be cleared.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_webhook(&pool, "young-1", "issue_comment").await;
+    let inbox = PostgresWebhookInbox::new(pool.clone());
+    let claimed = inbox
+        .claim_next(&["issue_comment"])
+        .await
+        .unwrap()
+        .unwrap();
+    inbox
+        .complete(claimed.id, claimed.claim_token, WebhookOutcome::IgnoredNoCommand)
+        .await
+        .unwrap();
+    // processed_at = NOW() (fresh).
+
+    let cleared = inbox
+        .clear_terminal_payloads(chrono::Duration::hours(24))
+        .await
+        .unwrap();
+    assert_eq!(cleared, 0, "fresh row must not be cleared");
+}

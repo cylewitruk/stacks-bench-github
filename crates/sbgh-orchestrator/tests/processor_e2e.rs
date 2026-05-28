@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use sbgh_core::db::{
     IngestStore, NewWebhook, Pool, PostgresIngestStore, PostgresInstallationStore,
-    PostgresPolicyStore, PostgresRepoStore, PostgresUserStore, PostgresWebhookInbox, setup_pg,
+    PostgresPolicyStore, PostgresPullRequestStore, PostgresRepoStore, PostgresUserStore,
+    PostgresWebhookInbox, setup_pg,
 };
 use sbgh_core::github::RepoRef;
 use sbgh_core::github::test_support::FakeGitHub;
@@ -125,12 +126,14 @@ fn build_processor_with_gh(pool: &Pool, gh: Arc<FakeGitHub>) -> WebhookProcessor
     let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
     let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
     let user_store = Arc::new(PostgresUserStore::new(pool.clone()));
+    let pull_request_store = Arc::new(PostgresPullRequestStore::new(pool.clone()));
     let classifier = BasicClassifier::builder()
         .with_handler(Arc::new(IssueCommentHandler::new(
             repo_store.clone(),
             policy_store.clone(),
             installation_store.clone(),
             user_store.clone(),
+            pull_request_store.clone(),
             gh.clone(),
         )))
         .with_handler(Arc::new(InstallationHandler::new(
@@ -150,6 +153,7 @@ fn build_processor_with_gh(pool: &Pool, gh: Arc<FakeGitHub>) -> WebhookProcessor
             policy_store.clone(),
             installation_store.clone(),
             user_store,
+            pull_request_store,
         )))
         .with_handler(Arc::new(PushHandler::new(policy_store.clone(), installation_store.clone())))
         .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store)))
@@ -265,8 +269,12 @@ async fn pipeline_classifies_pr_benchmark_as_would_enqueue_job_in_phase1() {
         .unwrap();
 
     let gh = Arc::new(FakeGitHub::new());
-    // issue_comment_webhook hardcodes repository=o/r and PR number 1.
-    gh.set_pull_request(
+    // issue_comment_webhook hardcodes sender=alice (id=99). Use
+    // set_pull_request_full so the PR author matches that user —
+    // FakeGitHub's default uses id=42 / login=alice which would
+    // collide with the seeded sender row on the lower(login) unique
+    // index (slice 7 materialisation upserts the author).
+    gh.set_pull_request_full(
         "o/r",
         1,
         sbgh_core::github::PullRequestSide {
@@ -281,11 +289,17 @@ async fn pipeline_classifies_pr_benchmark_as_would_enqueue_job_in_phase1() {
         sbgh_core::github::PullRequestSide {
             repo: sbgh_core::github::RepoRef {
                 id: 20,
-                owner: "alice".into(),
+                owner: "alice-fork".into(),
                 name: "r".into(),
             },
             sha: "headsha".into(),
             branch: "feat".into(),
+        },
+        "e2e pr title",
+        sbgh_core::github::PullRequestAuthor {
+            id: 99,
+            login: "alice".into(),
+            account_type: sbgh_core::models::GithubAccountType::User,
         },
     );
     let processor = build_processor_with_gh(&pool, gh);
@@ -297,6 +311,16 @@ async fn pipeline_classifies_pr_benchmark_as_would_enqueue_job_in_phase1() {
     let (status, outcome) = read_row_status(&pool, "e2e-bench").await;
     assert_eq!(status, WebhookStatus::Processed);
     assert_eq!(outcome, Some(WebhookOutcome::WouldEnqueueJob));
+
+    // Slice 7: confirm the PR row was materialised by the shared
+    // helper invoked from IssueCommentHandler.
+    let pr_title: String = sqlx::query_scalar(
+        "SELECT title FROM github_pull_request WHERE target_github_repo_id = 10 AND pr_number = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pr_title, "e2e pr title");
 }
 
 #[tokio::test]
@@ -353,7 +377,10 @@ async fn pipeline_benchmark_without_role_grant_is_denied_unauthorized() {
         .unwrap();
 
     let gh = Arc::new(FakeGitHub::new());
-    gh.set_pull_request(
+    // See the happy-path test for why we use set_pull_request_full
+    // with author id=99 (matches the issue_comment sender; avoids
+    // login collision on the lower(login) unique index).
+    gh.set_pull_request_full(
         "o/r",
         1,
         sbgh_core::github::PullRequestSide {
@@ -368,11 +395,17 @@ async fn pipeline_benchmark_without_role_grant_is_denied_unauthorized() {
         sbgh_core::github::PullRequestSide {
             repo: sbgh_core::github::RepoRef {
                 id: 20,
-                owner: "alice".into(),
+                owner: "alice-fork".into(),
                 name: "r".into(),
             },
             sha: "headsha".into(),
             branch: "feat".into(),
+        },
+        "e2e unauth pr title",
+        sbgh_core::github::PullRequestAuthor {
+            id: 99,
+            login: "alice".into(),
+            account_type: sbgh_core::models::GithubAccountType::User,
         },
     );
     let processor = build_processor_with_gh(&pool, gh);
@@ -1069,6 +1102,7 @@ fn pull_request_webhook(
         "repository": { "id": base_repo_id, "full_name": "o/r" },
         "pull_request": {
             "number": 1,
+            "title": "test pr title",
             "user": { "id": 99, "login": "alice", "type": "User" },
             "head": {
                 "ref": "feat",

@@ -96,4 +96,26 @@ pub trait WebhookInbox: Send + Sync + 'static {
     /// number of rows recovered. Run periodically by the processor's
     /// outer loop.
     async fn sweep_stuck_claims(&self, lease: chrono::Duration) -> Result<u64>;
+
+    /// Slice 7 (pre-slice-6 checkpoint todo): NULL the `payload` JSONB
+    /// on terminal rows whose `processed_at` is older than the
+    /// supplied retention window. Honours the inbox's "bounded
+    /// payload retention" principle: we keep payloads while a row is
+    /// in-flight, but a closed-book terminal row only needs the
+    /// outcome + last_error (we never re-evaluate from the payload
+    /// once an outcome is committed).
+    ///
+    /// `payload_size_bytes` and `last_error` are preserved — ops
+    /// queries still see distribution metrics and failure reasons
+    /// after the payload itself is gone.
+    ///
+    /// Eligible rows: `status IN ('ignored', 'denied', 'failed')`
+    /// AND `payload IS NOT NULL` AND `processed_at < NOW() - $1`.
+    /// `processed`-status rows (the `enqueued_job` / `would_enqueue_job`
+    /// outcomes) are intentionally NOT cleared — slice 9+ may want
+    /// the payload for job-context construction, and we can revisit
+    /// once that flow is real.
+    ///
+    /// Returns the number of rows whose payload was cleared.
+    async fn clear_terminal_payloads(&self, retention: chrono::Duration) -> Result<u64>;
 }

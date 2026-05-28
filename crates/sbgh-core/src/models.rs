@@ -307,6 +307,24 @@ pub struct GithubUserRole {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// Slice 7: PR subject row. Materialised on the first
+/// `pull_request.opened` (or first `/benchmark` comment referencing
+/// the PR if the opened event predates the new pipeline). Soft-close
+/// via `closed_at`; closed PRs stay in the table so slice 8+ job FKs
+/// remain valid.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubPullRequest {
+    pub id: i64,
+    pub target_github_repo_id: i64,
+    pub source_github_repo_id: i64,
+    pub pr_number: i32,
+    pub title: String,
+    pub author_github_user_id: i64,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Job {
     pub id: Uuid,

@@ -539,8 +539,8 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
+- [x] Initial implementation completed
+- [x] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -560,7 +560,41 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If none, just write "None").
+- **Migration file**: `migrations/20260527000008_slice7_pull_request.sql`. Creates `github_pull_request` per the target schema: `(id bigserial, target_repo, source_repo, pr_number, title, author, closed_at, created_at, updated_at)` with UNIQUE on `(target_repo, pr_number)`. Includes the `set_updated_at` trigger.
+- **Pre-slice-7 design QA decisions applied**:
+  - **closed**: soft-close via `closed_at TIMESTAMPTZ`. Mirrors the lifecycle pattern from `github_installation_repo.revoked_at` and `github_user_role.revoked_at`. Reopen clears `closed_at`. Closed PRs are preserved (slice 8+ job FKs).
+  - **synchronize**: refresh head metadata via upsert + re-run policy eval (source repo's policy may have changed since last sync).
+  - **PR API surface**: extended `GitHubApi::get_pull_request` to return `PullRequestSummary { number, head, base, title, author }` so the shared materialisation helper can populate `github_pull_request` from one API call — needed for the `/benchmark` path on PRs whose `opened` event predates the new pipeline.
+  - **edited**: refresh title via the materialise upsert; re-run policy eval ONLY when the payload's `changes.base` is present (the rare case where the operator actually changed the PR's base ref). Title/body/etc. edits absorb into the upsert and terminate as `IgnoredAction` — a typo fix MUST NOT generate a `WouldEnqueueJob` signal, otherwise slice 9 would turn it into a real "title edit starts benchmark" bug. (Original pre-Codex-review design was "always re-run policy eval"; corrected during slice 7 review.)
+- **Shared materialiser**: `materialise_pull_request` in `webhook_processor.rs` is the single upsert path. Takes `&dyn RepoStore + UserStore + PullRequestStore` plus a tiny `PullRequestRepoInput` / `PullRequestAuthorInput` borrow shape. Upserts in FK order: base repo identity, head repo identity, author user, PR row. Both `PullRequestHandler` (data from payload) and `IssueCommentHandler` /benchmark (data from GH API response) call it.
+- **PullRequestHandler dispatch** (post-Codex-review action-first ordering — repo fields are unwrapped only by the branches that actually need them, since GH may omit `pull_request.head.repo` for deleted-fork PRs):
+  - ignored-by-default (labeled, unlabeled, assigned, …) → `IgnoredAction` with no repo access at all.
+  - `closed` → only `base.repo` needed (key for `set_closed_at`). `set_closed_at(Some(NOW()))`, terminal `IgnoredAction`. closed for an unseen PR is a graceful no-op; if even `base.repo` is missing, defensively `IgnoredAction` rather than `Error`.
+  - `opened` / `reopened` / `synchronize` → require both `base.repo` and `head.repo`; materialise PR + re-run policy eval. `reopened` also clears `closed_at` (idempotent if already None).
+  - `edited` → require both repos; always materialise (title refresh); re-run policy eval ONLY when `changes.base` is present in the payload; otherwise terminate as `IgnoredAction` (title-only edits don't produce enqueue signals).
+- **IssueCommentHandler /benchmark**: the slice 5 inline repo-identity upserts were replaced with a `materialise_pull_request` call. Slice 7's shared helper produces the same identity rows plus the author + PR-subject rows, so slice 9 can link a job to the PR by primary key.
+- **`User` payload struct** grew a `title: String` field on `PullRequestBody`. All slice 1-6 test fixtures using PR payloads updated to include it.
+- **`FakeGitHub::set_pull_request`** kept backward-compat (defaults to `title="test pr title"` + `author=(42, "alice", User)`); a new `set_pull_request_full` takes explicit `title` and `author` for tests that materialise PRs and need to override defaults — especially e2e tests where the issue_comment sender's login could collide with the default PR author on the `lower(login)` unique index.
+- **`PullRequestStore` trait** (sbgh-core/src/db/pull_request.rs): `upsert_pull_request`, `lookup_pull_request`, `set_closed_at`. Postgres impl uses `INSERT ... ON CONFLICT (target_repo, pr_number) DO UPDATE SET title = EXCLUDED.title, updated_at = NOW()`. `closed_at` is NOT touched by upsert — only `set_closed_at` writes it; a late opened/edited event won't silently reopen a closed PR.
+- **Grants** (in `sbgh-cli/src/lib.rs::apply_roles`): orch gets `SELECT, INSERT, UPDATE` on `github_pull_request` + USAGE on `github_pull_request_id_seq`. No DELETE — slice 8+ job FKs need PR rows to stick around, and closed PRs use soft-close. Handler nothing.
+- **Slice 7 payload retention** (pre-slice-6 checkpoint item, landed in this slice): new `WebhookInbox::clear_terminal_payloads(retention)` method NULLs `payload` on `status IN ('ignored', 'denied', 'failed')` rows past the retention window. Invoked from the processor's existing sweep loop alongside `sweep_stuck_claims`. `payload_size_bytes` and `last_error` are preserved. `processed` rows are intentionally NOT cleared — slice 9+ may want the payload for job-context construction. Default retention 24h via `ProcessorConfig::payload_retention`. Wired into both Postgres + in-memory inbox impls.
+- **Tests added** (~26 net new, total 476 → 502):
+  - `postgres_pull_request.rs` (+8): upsert creates+refreshes title only, upsert never clears closed_at, `(target_repo, pr_number)` uniqueness, author + repo FK enforcement, `set_closed_at` toggle (set/re-set/clear) idempotency, lookup for unknown returns None, internal PR (target == source repo) works.
+  - `webhook_processor.rs` unit tests (+6 at slice 7 land; the edited test was later split during the Codex review fix — see `pr_edited_title_only_*` and `pr_edited_with_base_changed_*` below): `pr_opened_materialises_pull_request_row`, `pr_closed_sets_closed_at_and_terminates_ignored_action`, `pr_reopened_clears_closed_at_and_re_runs_policy_eval`, `pr_synchronize_keeps_pr_row_present`, `pr_closed_for_unseen_pr_is_idempotent_no_op`, plus the edited test that was rewritten during review.
+  - `postgres_webhook.rs` (+4): `clear_terminal_payloads_nulls_old_terminal_rows`, `clear_terminal_payloads_skips_in_flight_rows`, `clear_terminal_payloads_skips_processed_status_rows`, `clear_terminal_payloads_respects_retention_window`.
+  - `grants.rs` (+2): orch can SELECT+INSERT+UPDATE on `github_pull_request` (DELETE rejected), handler rejected on `github_pull_request`.
+  - `processor_e2e.rs` (modified): the `pipeline_classifies_pr_benchmark_as_would_enqueue_job_in_phase1` test now uses `set_pull_request_full` with an explicit author matching the issue_comment sender (avoids the `lower(login)` collision) AND asserts the materialised PR row's title.
+  - Existing slice 5 test `pr_non_trigger_action_is_ignored_without_policy_lookup` was renamed/restricted to `pr_labeled_or_unlabeled_actions_are_ignored_without_side_effects` since `closed` and `edited` now have intentional side effects under slice 7.
+- **Verification**: `just build` (clean release build), `just lint` (clean after `just fix` + one `#[allow(clippy::too_many_arguments)]` on `materialise_pull_request`), `just test --summary` (502 tests, 0 failures, ~31s wall-clock).
+- **Fixed mid-slice per Codex review**:
+  - **Medium (handler errored when GH omits `head.repo`)**: the original dispatch unwrapped both `base.repo` and `head.repo` BEFORE matching on action, so `closed` / `labeled` / `assigned` / etc. terminalized as `Error` for PRs whose source fork branch had been deleted (GH documents head.repo as optional in that case). Reordered the dispatch: action match first, then conditional repo unwraps. ignored-by-default actions (labeled, unlabeled, assigned, …) need no repo data; `closed` only needs `base.repo` (defensively returns `IgnoredAction` if even that's missing rather than `Error`); opened/reopened/synchronize/edited still require both and return `Error` if either is missing.
+  - **Medium (title-only edits would trigger benchmarks at slice 9)**: `pull_request.edited` originally re-ran policy eval unconditionally and emitted `WouldEnqueueJob` for any edit, including title-only fixes. Once slice 9 flips `WouldEnqueueJob` to job creation, every typo edit would start a benchmark. Refined: `edited` always refreshes the title via the materialise upsert, but policy eval ONLY re-runs when `changes.base` is present in the payload (the case where the operator actually changed the PR's base ref, which can shift target repo identity). Title/body/etc. edits absorb into the upsert and terminate as `IgnoredAction`. Required a new `PullRequestChanges` payload type with `base: Option<serde_json::Value>` on `PullRequestEvent`.
+- **Regression tests added** (6 net new, 502 → 508; the previous `pr_edited_refreshes_title_and_re_runs_policy_eval` was replaced):
+  - `pr_edited_title_only_refreshes_title_but_terminates_ignored_action` (CRITICAL: pins the "title edit doesn't start benchmark" invariant)
+  - `pr_edited_with_base_changed_re_runs_policy_eval` (defensive re-eval on base ref change)
+  - `pr_closed_without_head_repo_still_sets_closed_at` (M1 fix: deleted-fork close path)
+  - `pr_labeled_without_head_repo_terminates_ignored_action` (M1 fix: ignored-by-default actions need no repo data)
+- **Verification after review fixes**: `just lint` clean, `just test --summary` (508 tests, 0 failures, ~32s wall-clock).
 
 ## Phase 2 — Cutover
 
