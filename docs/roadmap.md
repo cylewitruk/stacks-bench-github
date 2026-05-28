@@ -419,6 +419,46 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
     - `create_tag_with_matching_trigger_but_disabled_parent_target_is_ignored` (CreateHandler).
 - Verification after second-pass fixes: `just test --summary` (423 tests, 0 failures, ~23s wall-clock).
 
+##### Pre-slice-6 Design Checkpoint
+
+**Status:**
+
+- [ ] Items 1-3 (architectural) landed before slice 6 starts
+- [ ] Items 4-5 captured as inline todos in their target slices
+- [ ] Item 6 rationale recorded; no action
+
+**Why this checkpoint exists:** Codex's roadmap meta-review (after slice 5) surfaced six items that could become expensive to retrofit once Phase 1 finishes. Items 1-3 are *architectural* and want to land before any new code in slice 6 commits to a shape we'd then have to reverse. Items 4-5 are *acknowledged-but-deferred* (real, but cheap to address inside their target slices). Item 6 is a deliberate accept-the-tradeoff so we don't re-litigate it later.
+
+**Pre-slice-6 actions (must land first):**
+
+1. **Role scope decision: per-installation, optionally repo-narrowed.** `github_user_role` will be scoped `(github_user_id, github_installation_id NOT NULL, github_repo_id NULLABLE, granted_role)`. This honours the "installation is the tenant boundary" principle ([roadmap.md:16](../docs/roadmap.md)) that every prior policy table already follows. `github_repo_id IS NULL` means install-wide; `IS NOT NULL` means repo-narrowed within that install. There is no cross-installation grant shape — granting one user the same role across N installs is N rows on purpose. Target schema already updated to reflect this; slice 6 migration must match.
+
+2. **New outcome `would_enqueue_job`.** Added to `github_webhook_outcome` so Phase 1 shadow-accepted decisions (slice 5's `/benchmark` / push / tag-trigger accept paths) are queryable in DB rather than collapsed into `ignored_action`. Preserves the Phase 1 verifiability promise ([roadmap.md:38](../docs/roadmap.md)). Slice 5 handlers must be updated to emit it on the accept branch instead of `IgnoredAction`; slice 6 user-authz logging-only path uses the same outcome. Slice 9 will then change the same branches to emit `enqueued_job` once new jobs land. Target schema already updated.
+    - **Implementation note**: `WebhookOutcome::terminal_status()` should map `would_enqueue_job` to `WebhookStatus::Processed` (same as `enqueued_job` / `processed_installation`) — a shadow-accept is a successful terminal outcome, not an ignored/denied one. Distinguishing accepted-but-shadow from accepted-and-enqueued lives in the outcome enum, not status.
+
+3. **Target schema refresh.** Done as part of this checkpoint:
+    - `github_installation.deleted_at` added (slice 4 drift).
+    - `github_webhook.github_installation_id` FK marked `ON DELETE SET NULL` (slice 3 drift; dormant under soft-delete but kept defensively).
+    - `github_webhook_outcome` includes `would_enqueue_job` and `processed_installation` (slice 3+ drift).
+    - `github_user_role` restructured per item 1.
+
+**Inline todos to add to their target slices:**
+
+1. **Slice 7 — shared PR materialization helper.** Slice 9 needs PR/job links the moment a `/benchmark` comment arrives. A comment can reference a PR whose `pull_request.opened` event predates the new pipeline. Slice 7 must expose a single "materialize PR from GitHub API" helper that both `PullRequestHandler` and `IssueCommentHandler` call, so the comment path doesn't depend on a prior PR event having been seen by the new processor. `GitHubApi::get_pull_request` already exists from slice 5; slice 7 just needs to make it the shared materialization primitive. Add as a todo to slice 7.
+
+2. **Slice 7 or 8 — payload retention for terminal rows.** The "bounded inbox" principle from slice 2b is intact in spirit (the 2 MiB body cap in [main.rs:55](../crates/sbgh-handler/src/main.rs#L55) bounds per-row growth) but the deferred cleanup of payloads on terminal `ignored` / `denied` / `failed` rows has been outstanding since slice 2b. Land it as one of: a small SQL `UPDATE github_webhook SET payload = NULL WHERE status IN ('ignored','denied','failed') AND payload IS NOT NULL AND processed_at < NOW() - INTERVAL '24h'` job invoked by the processor sweep loop, OR a tiny `WebhookInbox::clear_terminal_payloads()` method called by the existing sweep. Preserve `last_error` on failed rows; preserve `payload_size_bytes` always. Add as a todo to slice 7 (cheap) or slice 8 (if the operator wants more observation time first).
+
+**Decision recorded (no action):**
+
+1. **`github_user_login_lower_uniq` + `github_repo_owner_name_lower_uniq` kept.** Codex flagged these as risky given the "GH numeric IDs are natural keys; display names are display-only" principle, since GH login reuse (after 90-day deletion) and rare repo owner+name reuse could 23505 a legitimate insert.
+
+    **Accepted tradeoff:** keep both indexes. Rationale:
+    - Login reuse risk is real but our writers all use `INSERT ... ON CONFLICT (id) DO UPDATE login = EXCLUDED.login`, so the stale row's display login is overwritten the next time we encounter the original numeric id. The remaining failure window — a webhook for the *new* user lands before the stale row is updated — surfaces as a loud 23505 → `error` outcome that's trivial to diagnose and fix manually.
+    - Repo owner+name reuse requires the *same owner* to recreate a deleted repo with the same name, which has never been observed in practice for our target repos.
+    - Removing the indexes loses the "we already cached this (owner, name) under a different numeric id" signal — a genuine data-quality red flag the index currently surfaces loudly.
+
+    If either index ever does fire 23505 in production, that's the signal to revisit; the loud failure is by design.
+
 ##### Slice 6: Users + Roles
 
 **Status:**
@@ -459,7 +499,9 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 6. Processor handles `pull_request.edited` by refreshing mutable PR fields such as title.
 7. Processor handles `pull_request.synchronize` by refreshing source/head metadata needed for future job ref resolution.
 8. Decide whether `pull_request.closed` is a no-op or needs a future state column; current schema keeps PRs as historical subjects.
-9. Tests for internal PR, cross-fork PR, fork-of-fork source, PR title/author updates, and synchronize refresh.
+9. **Per pre-slice-6 checkpoint item:** expose a single `materialize_pr_from_github_api` helper that both `PullRequestHandler` and `IssueCommentHandler` call, so slice 9's `/benchmark` PR/job linking doesn't depend on having seen the PR's `opened` event through the new pipeline. `GitHubApi::get_pull_request` already exists from slice 5; this is wiring + a shared upsert path.
+10. **Per pre-slice-6 checkpoint item:** add `WebhookInbox::clear_terminal_payloads()` (NULLs `payload` on rows where `status IN ('ignored','denied','failed') AND processed_at < NOW() - INTERVAL '24h'`), invoke it from the processor's existing sweep loop. Preserve `last_error` and `payload_size_bytes`. Defer to slice 8 if more observation time is wanted first.
+11. Tests for internal PR, cross-fork PR, fork-of-fork source, PR title/author updates, and synchronize refresh.
 
 **Implementation notes/deviations:**
 

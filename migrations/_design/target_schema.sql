@@ -125,6 +125,8 @@ CREATE TYPE github_webhook_status AS ENUM (
 -- because the event type was handled but the action wasn't.
 CREATE TYPE github_webhook_outcome AS ENUM (
     'enqueued_job',
+    'would_enqueue_job', -- Phase 1 shadow accept: the new pipeline would have created a job at slice 9; legacy handler is still the actual job source
+    'processed_installation', -- install/membership/policy state mutated successfully (no job)
     'ignored_action',
     'ignored_no_command',
     'ignored_unknown_installation', -- webhook from an installation we have no row for
@@ -174,12 +176,19 @@ CREATE TRIGGER allowed_installer_set_updated_at
 -- allowed_installer enforces that every installation came through the
 -- gate (matches our soft-disable-only lifecycle: an allowed_installer
 -- row with installations against it can't be deleted, only disabled).
+--
+-- deleted_at is the soft-delete column; an uninstall webhook sets it to
+-- NOW() rather than DELETEing the row, because slice-4 onwards
+-- github_installation_repo (and slice-5+ policies) FK back at us and
+-- we want their history preserved. Active iff deleted_at IS NULL AND
+-- suspended_at IS NULL — app-layer check.
 CREATE TABLE github_installation (
     id bigint PRIMARY KEY,
     github_account_id bigint NOT NULL REFERENCES allowed_installer (github_account_id),
     account_login text NOT NULL,
     account_type github_account_type NOT NULL,
     suspended_at timestamptz,
+    deleted_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     updated_at timestamptz NOT NULL DEFAULT NOW()
 );
@@ -348,19 +357,28 @@ CREATE TRIGGER github_user_set_updated_at
 
 CREATE UNIQUE INDEX github_user_login_lower_uniq ON github_user (lower(login));
 
--- Per-(user, scope, granted_role) grant. github_repo_id NULL = global grant.
+-- Per-(user, installation, optional repo, granted_role) grant.
+-- Scope hierarchy: installation is the tenant boundary (matches
+-- allowed_installer / target_repo_policy / source_repo_policy /
+-- trigger_policy), so every grant is scoped to ONE installation;
+-- github_repo_id NULL = install-wide grant, github_repo_id NOT NULL =
+-- repo-narrowed grant within that install. A grant for "this user on
+-- every installation" requires N rows on purpose — there is no
+-- cross-installation grant shape, by design.
+--
 -- Column is `granted_role` (not `role`) to avoid the reserved-keyword
 -- collision with PostgreSQL's CREATE ROLE / GRANT TO ROLE syntax.
 CREATE TABLE github_user_role (
     id bigserial PRIMARY KEY,
     github_user_id bigint NOT NULL REFERENCES github_user (id),
+    github_installation_id bigint NOT NULL REFERENCES github_installation (id),
     github_repo_id bigint REFERENCES github_repo (id),
     granted_role user_role NOT NULL,
     granted_at timestamptz NOT NULL DEFAULT NOW(),
     granted_by_github_user_id bigint REFERENCES github_user (id)
 );
 
-CREATE UNIQUE INDEX github_user_role_uniq ON github_user_role (github_user_id, github_repo_id, granted_role) NULLS NOT DISTINCT;
+CREATE UNIQUE INDEX github_user_role_uniq ON github_user_role (github_user_id, github_installation_id, github_repo_id, granted_role) NULLS NOT DISTINCT;
 
 -- ─── Trigger policy ─────────────────────────────────────────────────────
 -- Per-installation subscriptions for auto-triggered job kinds
@@ -461,7 +479,10 @@ CREATE TABLE github_webhook (
     event_type text NOT NULL,
     action text,
     payload_installation_id bigint,
-    github_installation_id bigint REFERENCES github_installation (id),
+    -- ON DELETE SET NULL is dormant under the slice-4+ soft-delete
+    -- lifecycle (install rows aren't DELETEd anymore) but kept defensively
+    -- so a future hard-delete operator action can't strand orphan rows.
+    github_installation_id bigint REFERENCES github_installation (id) ON DELETE SET NULL,
     received_at timestamptz NOT NULL DEFAULT NOW(),
     payload jsonb,
     payload_size_bytes integer NOT NULL CHECK (payload_size_bytes >= 0),
