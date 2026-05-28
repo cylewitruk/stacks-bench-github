@@ -80,6 +80,7 @@ testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 reqwest-eventsource = "0.6"
 clap = { version = "4", features = ["derive"] }
+regex = "1"
 
 [profile.release]
 lto = "thin"

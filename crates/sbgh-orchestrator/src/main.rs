@@ -11,7 +11,8 @@ use anyhow::Context;
 use clap::Parser;
 use sbgh_core::config::OrchestratorConfig;
 use sbgh_core::db::{
-    self, PostgresInstallationStore, PostgresJobStore, PostgresRepoStore, PostgresWebhookInbox,
+    self, PostgresInstallationStore, PostgresJobStore, PostgresPolicyStore, PostgresRepoStore,
+    PostgresWebhookInbox,
 };
 use sbgh_core::github::{AppCredentials, InstallationTokenCache, OctocrabClient};
 use tracing_subscriber::prelude::*;
@@ -20,8 +21,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 use crate::libvirt::SystemShell;
 use crate::runner::Runner;
 use crate::webhook_processor::{
-    BasicClassifier, InstallationHandler, InstallationRepositoriesHandler, IssueCommentHandler,
-    ProcessorConfig, WebhookProcessor,
+    BasicClassifier, CreateHandler, InstallationHandler, InstallationRepositoriesHandler,
+    IssueCommentHandler, ProcessorConfig, PullRequestHandler, PushHandler, WebhookProcessor,
 };
 
 #[derive(Parser, Debug)]
@@ -70,19 +71,33 @@ async fn main() -> anyhow::Result<()> {
     // inbox (others stay `received` for a future slice).
     let webhook_inbox = Arc::new(PostgresWebhookInbox::new(pool.clone()));
     let installation_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
-    let repo_store = Arc::new(PostgresRepoStore::new(pool));
+    let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
+    let policy_store = Arc::new(PostgresPolicyStore::new(pool));
     let classifier = BasicClassifier::builder()
-        .with_handler(Arc::new(IssueCommentHandler))
+        .with_handler(Arc::new(IssueCommentHandler::new(
+            repo_store.clone(),
+            policy_store.clone(),
+            installation_store.clone(),
+            gh.clone(),
+        )))
         .with_handler(Arc::new(InstallationHandler::new(
             installation_store.clone(),
             repo_store.clone(),
             gh.clone(),
         )))
         .with_handler(Arc::new(InstallationRepositoriesHandler::new(
-            repo_store,
-            installation_store,
+            repo_store.clone(),
+            installation_store.clone(),
+            policy_store.clone(),
             gh.clone(),
         )))
+        .with_handler(Arc::new(PullRequestHandler::new(
+            repo_store,
+            policy_store.clone(),
+            installation_store.clone(),
+        )))
+        .with_handler(Arc::new(PushHandler::new(policy_store.clone(), installation_store.clone())))
+        .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store)))
         .build();
     let processor =
         WebhookProcessor::new(webhook_inbox, Arc::new(classifier), ProcessorConfig::default());

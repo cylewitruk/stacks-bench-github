@@ -5,12 +5,18 @@
 //! testcontainers Postgres without shelling out to the binary.
 
 pub mod installer;
+pub mod policy;
 pub mod repo;
 
 use anyhow::Context;
 pub use installer::{
     InstallerError, allow_installer, disable_installer, disable_installer_by_account_id,
     list_installers,
+};
+pub use policy::{
+    PolicyError, add_trigger_policy, allow_source_policy, allow_target_policy,
+    disable_source_policy, disable_target_policy, disable_trigger_policy, list_source_policies,
+    list_target_policies, list_trigger_policies,
 };
 pub use repo::{
     AllowedRepoRoot, RepoError, allow_repo_root, disable_repo_root, disable_repo_root_by_id,
@@ -177,6 +183,34 @@ pub async fn apply_roles(
         .execute(&mut *tx)
         .await?;
     sqlx::query("GRANT SELECT, INSERT, UPDATE ON TABLE github_installation_repo TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
+    // Slice 5: target_repo_policy + source_repo_policy + trigger_policy.
+    //
+    // Target/source policies are operator-curated AND processor-managed:
+    // the CLI (running as owner) writes them on operator approval, and
+    // the processor UPDATEs `is_enabled = FALSE` on install.deleted's
+    // bulk-disable path. Orchestrator gets SELECT + UPDATE (no INSERT,
+    // no DELETE). A compromised processor cannot allowlist a new
+    // (install, repo) policy pair; it can only flip existing rows'
+    // enabled bit — and even that is bounded to the install.deleted
+    // cleanup branch in the codebase.
+    //
+    // Handler never touches these tables.
+    sqlx::query(
+        "REVOKE ALL ON TABLE target_repo_policy, source_repo_policy, trigger_policy FROM \
+         sbgh_handler, sbgh_orch",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("GRANT SELECT, UPDATE ON TABLE target_repo_policy TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, UPDATE ON TABLE source_repo_policy TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, UPDATE ON TABLE trigger_policy TO sbgh_orch")
         .execute(&mut *tx)
         .await?;
 

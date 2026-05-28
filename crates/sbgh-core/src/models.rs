@@ -169,6 +169,87 @@ pub struct GithubInstallationRepo {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// Slice 5: triggers the processor watches for in `branch_push` /
+/// `tag_created` event handling. Each `trigger_policy` row carries one
+/// of these in `match_spec`. App-layer validated (the DB stores it as
+/// arbitrary JSONB; this enum is the contract).
+///
+/// `branch_name` is an EXACT match against the inbound ref; `tag_pattern`
+/// is a Rust regex pattern (matched with `regex::Regex::is_match` at
+/// evaluation time). Globs would be more operator-friendly but regex
+/// composes better with the eventual job-rerun-on-historical-tag flows
+/// slice 9+ may introduce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerMatchSpec {
+    BranchPush { branch_name: String },
+    TagCreated { tag_pattern: String },
+}
+
+/// `trigger_kind` enum mirror. Slice 5 only USES `BranchPush` and
+/// `TagCreated`; `PrComment` is the implicit /benchmark path
+/// (no trigger_policy row needed). `Scheduled` and `Manual` are
+/// reserved for post-slice-9 work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "trigger_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerKind {
+    PrComment,
+    BranchPush,
+    TagCreated,
+    Scheduled,
+    Manual,
+}
+
+/// Per-installation target-repo opt-in (the operator says "this install
+/// will benchmark PRs against this repo"). Composite PK + FK to
+/// `github_installation_repo` enforces "the (install, repo) pair must
+/// exist as a membership row" — but currently-active access is a
+/// separate app-level join on `revoked_at IS NULL`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TargetRepoPolicy {
+    pub github_installation_id: i64,
+    pub github_repo_id: i64,
+    pub is_enabled: bool,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Per-installation source-repo trust (the operator says "this install
+/// trusts this repo as the source side of a PR — its code may execute
+/// in our benchmark VM"). Unlike `TargetRepoPolicy`, no membership FK
+/// — sources can be arbitrary forks the install doesn't own.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SourceRepoPolicy {
+    pub github_installation_id: i64,
+    pub github_repo_id: i64,
+    pub is_enabled: bool,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Per-installation auto-trigger subscription. Multiple rows per
+/// (install, repo) — one per `trigger_kind` + `match_spec` combo.
+/// `bench_args` (optional) is forwarded to the eventual job as
+/// CLI args once slice 9 starts creating jobs.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TriggerPolicy {
+    pub id: i64,
+    pub github_installation_id: i64,
+    pub github_repo_id: i64,
+    pub trigger_kind: TriggerKind,
+    /// Stored as JSONB; deserialise into `TriggerMatchSpec` for typed
+    /// matching at evaluation time.
+    pub match_spec: sqlx::types::Json<serde_json::Value>,
+    pub bench_args: Option<String>,
+    pub is_enabled: bool,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Job {
     pub id: Uuid,

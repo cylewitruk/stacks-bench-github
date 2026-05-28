@@ -672,6 +672,191 @@ async fn handler_cannot_touch_github_installation_repo() {
         .expect_err("handler SELECT on github_installation_repo MUST be rejected");
 }
 
+// ─── Slice 5: target_repo_policy + source_repo_policy + trigger_policy ──
+
+async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
+    // Seed allowlist + install + repo + membership so policy FKs are
+    // satisfiable.
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         ($1, 'octo', 'organization') ON CONFLICT DO NOTHING",
+    )
+    .bind(install_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES ($1, $1, 'octo', 'organization') ON CONFLICT DO NOTHING",
+    )
+    .bind(install_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_repo (id, owner, name) VALUES ($1, 'o', 'r') ON CONFLICT DO NOTHING",
+    )
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation_repo (github_installation_id, github_repo_id) VALUES \
+         ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(install_id)
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn orch_can_select_and_update_target_repo_policy_but_not_insert_or_delete() {
+    // Operator-curated: CLI (owner) inserts, processor only SELECTs +
+    // UPDATEs (for the install.deleted bulk-disable path). No INSERT
+    // → compromised processor can't add itself a new policy. No
+    // DELETE → policy history is permanent.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    seed_install_repo(&pool, 100, 10).await;
+    // Seed a row as owner.
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM target_repo_policy")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on target_repo_policy must succeed");
+    assert_eq!(count, 1);
+    // UPDATE must succeed (install.deleted bulk-disable path).
+    sqlx::query(
+        "UPDATE target_repo_policy SET is_enabled = FALSE WHERE github_installation_id = 100",
+    )
+    .execute(&orch)
+    .await
+    .expect("orch UPDATE on target_repo_policy must succeed");
+    // INSERT must be rejected.
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id) VALUES (100, 10)",
+    )
+    .execute(&orch)
+    .await
+    .expect_err("orch INSERT on target_repo_policy MUST be rejected");
+    // DELETE must be rejected.
+    sqlx::query("DELETE FROM target_repo_policy WHERE github_installation_id = 100")
+        .execute(&orch)
+        .await
+        .expect_err("orch DELETE on target_repo_policy MUST be rejected");
+}
+
+#[tokio::test]
+async fn orch_can_select_and_update_source_repo_policy_but_not_insert_or_delete() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    seed_install_repo(&pool, 100, 10).await;
+    sqlx::query(
+        "INSERT INTO source_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    sqlx::query("SELECT COUNT(*) FROM source_repo_policy")
+        .fetch_optional(&orch)
+        .await
+        .expect("orch SELECT on source_repo_policy must succeed");
+    sqlx::query(
+        "UPDATE source_repo_policy SET is_enabled = FALSE WHERE github_installation_id = 100",
+    )
+    .execute(&orch)
+    .await
+    .expect("orch UPDATE on source_repo_policy must succeed");
+    sqlx::query(
+        "INSERT INTO source_repo_policy (github_installation_id, github_repo_id) VALUES (100, 10)",
+    )
+    .execute(&orch)
+    .await
+    .expect_err("orch INSERT on source_repo_policy MUST be rejected");
+}
+
+#[tokio::test]
+async fn orch_can_select_and_update_trigger_policy_but_not_insert_or_delete() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    seed_install_repo(&pool, 100, 10).await;
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO trigger_policy (github_installation_id, github_repo_id, trigger_kind, \
+         match_spec) VALUES (100, 10, 'branch_push', \
+         '{\"kind\":\"branch_push\",\"branch_name\":\"main\"}'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    sqlx::query("SELECT COUNT(*) FROM trigger_policy")
+        .fetch_optional(&orch)
+        .await
+        .expect("orch SELECT on trigger_policy must succeed");
+    sqlx::query("UPDATE trigger_policy SET is_enabled = FALSE WHERE github_installation_id = 100")
+        .execute(&orch)
+        .await
+        .expect("orch UPDATE on trigger_policy must succeed");
+    sqlx::query(
+        "INSERT INTO trigger_policy (github_installation_id, github_repo_id, trigger_kind, \
+         match_spec) VALUES (100, 10, 'branch_push', '{}'::jsonb)",
+    )
+    .execute(&orch)
+    .await
+    .expect_err("orch INSERT on trigger_policy MUST be rejected");
+}
+
+#[tokio::test]
+async fn handler_cannot_touch_any_policy_table() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let handler = handler_pool(&pool).await;
+    for table in ["target_repo_policy", "source_repo_policy", "trigger_policy"] {
+        let q = format!("SELECT 1 FROM {table} LIMIT 1");
+        sqlx::query(&q)
+            .fetch_optional(&handler)
+            .await
+            .expect_err(&format!("handler SELECT on {table} MUST be rejected"));
+    }
+}
+
 #[tokio::test]
 async fn apply_roles_is_idempotent() {
     // Re-running apply_roles MUST be safe — the deploy invokes it on

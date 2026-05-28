@@ -146,6 +146,80 @@ pub struct InstallationRepository {
     pub full_name: String,
 }
 
+// ─── Slice 5: pull_request / push / create webhook payloads ────────────
+
+/// `pull_request.{opened,reopened,synchronize,...}` event payload.
+/// Slice 5 reads `action`, `installation.id`, and the head/base repo
+/// identities (for target+source policy evaluation). The PR's own ref
+/// + SHA is captured for slice 7+ when we materialise PR subject rows.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequestEvent {
+    pub action: String,
+    pub installation: Installation,
+    pub repository: PullRequestRepo,
+    pub pull_request: PullRequestBody,
+}
+
+/// Subset of GitHub's repository field that PR-related webhooks ship
+/// at top level. Includes `id` (which slice 4's `IssueCommentEvent`'s
+/// existing `Repository` deliberately omits — we don't widen that
+/// struct to avoid breaking its test fixtures).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequestRepo {
+    pub id: i64,
+    pub full_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequestBody {
+    pub number: i64,
+    pub head: PullRequestBranchRef,
+    pub base: PullRequestBranchRef,
+}
+
+/// PR head/base entry. `repo` is `Option` because GitHub may omit it
+/// when a PR's branch was deleted from a fork (rare, but documented).
+/// The handler treats a missing repo as a payload error.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequestBranchRef {
+    /// Branch name (GitHub field is `ref`; Rust keyword conflict so
+    /// we rename via serde).
+    #[serde(rename = "ref")]
+    pub branch: String,
+    pub sha: String,
+    pub repo: Option<PullRequestRepo>,
+}
+
+/// `push` event payload. Slice 5 reads `ref` (the pushed branch path,
+/// `"refs/heads/<name>"`), `repository.id`, and `installation.id`.
+/// `forced` lets later slices distinguish push from force-push if
+/// needed; not used in slice 5.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PushEvent {
+    /// Full ref path, e.g. `"refs/heads/develop"`. The handler strips
+    /// the `refs/heads/` prefix before comparing to a
+    /// `TriggerMatchSpec::BranchPush.branch_name`.
+    #[serde(rename = "ref")]
+    pub ref_field: String,
+    pub installation: Installation,
+    pub repository: PullRequestRepo,
+}
+
+/// `create` event payload (fires on branch + tag creation). The
+/// `ref_type` field distinguishes them; slice 5 evaluates
+/// `trigger_kind = 'tag_created'` only when `ref_type == "tag"`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateEvent {
+    /// Branch or tag name (NOT `refs/heads/...` prefixed — `create`
+    /// payloads send the short name).
+    #[serde(rename = "ref")]
+    pub ref_field: String,
+    /// `"tag"` or `"branch"` — slice 5 only acts on `"tag"`.
+    pub ref_type: String,
+    pub installation: Installation,
+    pub repository: PullRequestRepo,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

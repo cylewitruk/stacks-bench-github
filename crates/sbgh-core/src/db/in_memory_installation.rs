@@ -226,6 +226,26 @@ impl InstallationStore for InMemoryInstallationStore {
         Ok(Some(row))
     }
 
+    async fn is_membership_active(
+        &self,
+        installation_id: i64,
+        github_repo_id: i64,
+    ) -> Result<bool> {
+        let state = self.state.lock().unwrap();
+        let install_active = state
+            .installs
+            .get(&installation_id)
+            .is_some_and(|i| i.deleted_at.is_none() && i.suspended_at.is_none());
+        if !install_active {
+            return Ok(false);
+        }
+        let membership_active = state
+            .memberships
+            .get(&(installation_id, github_repo_id))
+            .is_some_and(|m| m.revoked_at.is_none());
+        Ok(membership_active)
+    }
+
     async fn revoke_membership(
         &self,
         installation_id: i64,

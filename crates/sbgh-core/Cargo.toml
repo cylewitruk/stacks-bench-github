@@ -33,6 +33,8 @@ uuid.workspace = true
 chrono.workspace = true
 url.workspace = true
 toml.workspace = true
+# Slice 5 trigger_policy: regex matching for tag_pattern triggers.
+regex.workspace = true
 
 # Test-only deps activated by the `testing` feature. Marked optional so
 # they don't bloat release builds, but reachable from downstream crates

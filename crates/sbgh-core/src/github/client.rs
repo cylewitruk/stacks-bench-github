@@ -77,6 +77,38 @@ pub trait GitHubApi: Send + Sync + 'static {
         owner: &str,
         name: &str,
     ) -> Result<RepoSummary>;
+
+    /// Fetch a PR's head + base repo info in one call. Used by the
+    /// slice 5 IssueCommentHandler /benchmark branch: the
+    /// `issue_comment` payload only carries the PR's url, not its
+    /// head/base repo ids — those are needed to evaluate
+    /// target/source policies. `repository` is `"owner/name"` form
+    /// (matches the payload's `repository.full_name`).
+    async fn get_pull_request(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        pr_number: u64,
+    ) -> Result<PullRequestSummary>;
+}
+
+/// Subset of the `/repos/{owner}/{repo}/pulls/{number}` response the
+/// slice 5 PR + comment handlers need. `head` is the source repo +
+/// branch; `base` is the target repo + branch. Both `RepoRef`s have
+/// `id`, `owner`, `name` — enough to (a) upsert identity and (b)
+/// look up policy rows by the FK columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSummary {
+    pub number: u64,
+    pub head: PullRequestSide,
+    pub base: PullRequestSide,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSide {
+    pub repo: RepoRef,
+    pub sha: String,
+    pub branch: String,
 }
 
 /// Production `GitHubApi` implementation backed by `octocrab`.
@@ -171,6 +203,49 @@ impl GitHubApi for OctocrabClient {
             .get()
             .await?;
         Ok(repo_summary_from_octocrab(&repo))
+    }
+
+    async fn get_pull_request(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        pr_number: u64,
+    ) -> Result<PullRequestSummary> {
+        let (owner, repo) = split_repo(repository)?;
+        let client = self
+            .installation_client(installation_id)
+            .await?;
+        let pr = client
+            .pulls(owner, repo)
+            .get(pr_number)
+            .await?;
+        // octocrab's PullRequest exposes head/base as distinct concrete
+        // types (Head vs Base) even though they share fields. Extract
+        // the bits we care about manually rather than fight the
+        // generics.
+        let head_repo = pr
+            .head
+            .repo
+            .as_ref()
+            .ok_or_else(|| Error::Config("PR head missing repo (orphaned ref?)".into()))?;
+        let base_repo = pr
+            .base
+            .repo
+            .as_ref()
+            .ok_or_else(|| Error::Config("PR base missing repo".into()))?;
+        Ok(PullRequestSummary {
+            number: pr_number,
+            head: PullRequestSide {
+                repo: repo_ref_from_octocrab(head_repo),
+                sha: pr.head.sha.clone(),
+                branch: pr.head.ref_field.clone(),
+            },
+            base: PullRequestSide {
+                repo: repo_ref_from_octocrab(base_repo),
+                sha: pr.base.sha.clone(),
+                branch: pr.base.ref_field.clone(),
+            },
+        })
     }
 }
 

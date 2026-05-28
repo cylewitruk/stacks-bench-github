@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use sbgh_core::db::{
     IngestStore, NewWebhook, Pool, PostgresIngestStore, PostgresInstallationStore,
-    PostgresRepoStore, PostgresWebhookInbox, setup_pg,
+    PostgresPolicyStore, PostgresRepoStore, PostgresWebhookInbox, setup_pg,
 };
 use sbgh_core::github::RepoRef;
 use sbgh_core::github::test_support::FakeGitHub;
@@ -33,8 +33,8 @@ use sbgh_core::models::{GithubAccountType, WebhookOutcome, WebhookStatus};
 mod webhook_processor;
 
 use webhook_processor::{
-    BasicClassifier, InstallationHandler, InstallationRepositoriesHandler, IssueCommentHandler,
-    ProcessorConfig, WebhookProcessor,
+    BasicClassifier, CreateHandler, InstallationHandler, InstallationRepositoriesHandler,
+    IssueCommentHandler, ProcessorConfig, PullRequestHandler, PushHandler, WebhookProcessor,
 };
 
 async fn read_row_status(pool: &Pool, delivery: &str) -> (WebhookStatus, Option<WebhookOutcome>) {
@@ -123,18 +123,32 @@ fn build_processor_with_gh(pool: &Pool, gh: Arc<FakeGitHub>) -> WebhookProcessor
     let inbox = Arc::new(PostgresWebhookInbox::new(pool.clone()));
     let installation_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
     let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
+    let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
     let classifier = BasicClassifier::builder()
-        .with_handler(Arc::new(IssueCommentHandler))
+        .with_handler(Arc::new(IssueCommentHandler::new(
+            repo_store.clone(),
+            policy_store.clone(),
+            installation_store.clone(),
+            gh.clone(),
+        )))
         .with_handler(Arc::new(InstallationHandler::new(
             installation_store.clone(),
             repo_store.clone(),
             gh.clone(),
         )))
         .with_handler(Arc::new(InstallationRepositoriesHandler::new(
-            repo_store,
-            installation_store,
+            repo_store.clone(),
+            installation_store.clone(),
+            policy_store.clone(),
             gh,
         )))
+        .with_handler(Arc::new(PullRequestHandler::new(
+            repo_store,
+            policy_store.clone(),
+            installation_store.clone(),
+        )))
+        .with_handler(Arc::new(PushHandler::new(policy_store.clone(), installation_store.clone())))
+        .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store)))
         .build();
     WebhookProcessor::new(inbox, Arc::new(classifier), ProcessorConfig::default())
 }
@@ -178,17 +192,85 @@ async fn pipeline_classifies_pr_no_command_as_ignored_no_command() {
 
 #[tokio::test]
 async fn pipeline_classifies_pr_benchmark_as_ignored_action_in_phase1() {
-    // Slice 9 will change this to `enqueued_job` + create a `job` row.
+    // Slice 5 rewrite: /benchmark on a PR now evaluates target+source
+    // policies. With both policies enabled, the outcome stays
+    // IgnoredAction in Phase 1 (legacy handler still runs the bench;
+    // slice 9 will change this to EnqueuedJob). The handler fetches
+    // the PR via GH API to find the base+head repo ids, so we stage
+    // a canned response on the FakeGitHub.
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
+    // Identity rows for base + head (FK targets for the policies).
+    sqlx::query(
+        "INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r'), (20, 'alice', 'r')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_allowed_org(&pool, 42, "octo-org").await;
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (42, 42, 'octo-org', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Membership for the target repo (FK target of target_repo_policy).
+    sqlx::query(
+        "INSERT INTO github_installation_repo (github_installation_id, github_repo_id) VALUES \
+         (42, 10)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Both policies enabled.
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (42, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (42, 20, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let ingest = PostgresIngestStore::new(pool.clone());
     ingest
         .ingest_webhook(&issue_comment_webhook("e2e-bench", "/benchmark run", true))
         .await
         .unwrap();
 
-    let processor = build_processor(&pool);
+    let gh = Arc::new(FakeGitHub::new());
+    // issue_comment_webhook hardcodes repository=o/r and PR number 1.
+    gh.set_pull_request(
+        "o/r",
+        1,
+        sbgh_core::github::PullRequestSide {
+            repo: sbgh_core::github::RepoRef {
+                id: 10,
+                owner: "o".into(),
+                name: "r".into(),
+            },
+            sha: "basesha".into(),
+            branch: "main".into(),
+        },
+        sbgh_core::github::PullRequestSide {
+            repo: sbgh_core::github::RepoRef {
+                id: 20,
+                owner: "alice".into(),
+                name: "r".into(),
+            },
+            sha: "headsha".into(),
+            branch: "feat".into(),
+        },
+    );
+    let processor = build_processor_with_gh(&pool, gh);
     processor
         .process_one()
         .await
@@ -203,22 +285,26 @@ async fn pipeline_classifies_pr_benchmark_as_ignored_action_in_phase1() {
 async fn pipeline_leaves_unregistered_event_types_in_received() {
     // Slice 2b high-finding-fix invariant, proven end-to-end against
     // real Postgres: rows for event types with no registered handler
-    // stay `received` for a future slice to consume.
+    // stay `received` indefinitely.
     //
-    // (Slice 2b used `installation` for this test, but slice 3 now
-    // registers an InstallationHandler; `push` is the current
-    // unregistered placeholder until slice 4-7 add it.)
+    // History: slice 2b used `installation`; slice 3 registered that.
+    // Slice 4 used `push`; slice 5 registered that. After slice 5, the
+    // handler-level allowlist (slice 1's SUPPORTED_EVENT_TYPES) and
+    // the orchestrator handler set are the SAME. To still pin this
+    // invariant, we directly seed an `unknown_event_type` row via the
+    // IngestStore — which bypasses the handler allowlist — and assert
+    // the processor doesn't claim it. Defense in depth.
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
     let ingest = PostgresIngestStore::new(pool.clone());
     ingest
         .ingest_webhook(&NewWebhook {
-            delivery_id: "e2e-push".into(),
-            event_type: "push".into(),
-            action: None,
+            delivery_id: "e2e-unknown".into(),
+            event_type: "star".into(),
+            action: Some("created".into()),
             payload_installation_id: Some(42),
-            payload: Some(serde_json::json!({ "ref": "refs/heads/main" })),
+            payload: Some(serde_json::json!({ "action": "created" })),
             payload_size_bytes: 24,
         })
         .await
@@ -230,14 +316,14 @@ async fn pipeline_leaves_unregistered_event_types_in_received() {
             .process_one()
             .await
             .unwrap(),
-        "processor must NOT claim a `push` row in slice 3"
+        "processor must NOT claim a row for an event type with no registered handler"
     );
 
-    let (status, outcome) = read_row_status(&pool, "e2e-push").await;
+    let (status, outcome) = read_row_status(&pool, "e2e-unknown").await;
     assert_eq!(
         status,
         WebhookStatus::Received,
-        "push row must remain `received` for a future slice's processor"
+        "unregistered-event row must remain `received` indefinitely"
     );
     assert!(outcome.is_none());
 }
@@ -853,4 +939,398 @@ async fn pipeline_installation_deleted_revokes_all_memberships_transactionally()
         revoked_at.is_some(),
         "membership must be bulk-revoked in the same transaction as install soft-delete"
     );
+}
+
+// ─── Slice 5: pull_request / push / create policy evaluation ──────────
+
+fn pull_request_webhook(
+    delivery: &str,
+    action: &str,
+    install_id: i64,
+    base_repo_id: i64,
+    head_repo_id: i64,
+) -> NewWebhook {
+    let payload = serde_json::json!({
+        "action": action,
+        "installation": { "id": install_id },
+        "repository": { "id": base_repo_id, "full_name": "o/r" },
+        "pull_request": {
+            "number": 1,
+            "head": {
+                "ref": "feat",
+                "sha": "headsha",
+                "repo": { "id": head_repo_id, "full_name": "alice/r" }
+            },
+            "base": {
+                "ref": "main",
+                "sha": "basesha",
+                "repo": { "id": base_repo_id, "full_name": "o/r" }
+            }
+        }
+    });
+    let size = serde_json::to_vec(&payload)
+        .unwrap()
+        .len() as i32;
+    NewWebhook {
+        delivery_id: delivery.into(),
+        event_type: "pull_request".into(),
+        action: Some(action.into()),
+        payload_installation_id: Some(install_id),
+        payload: Some(payload),
+        payload_size_bytes: size,
+    }
+}
+
+fn push_webhook(delivery: &str, install_id: i64, repo_id: i64, branch: &str) -> NewWebhook {
+    let payload = serde_json::json!({
+        "ref": format!("refs/heads/{branch}"),
+        "installation": { "id": install_id },
+        "repository": { "id": repo_id, "full_name": "o/r" }
+    });
+    let size = serde_json::to_vec(&payload)
+        .unwrap()
+        .len() as i32;
+    NewWebhook {
+        delivery_id: delivery.into(),
+        event_type: "push".into(),
+        action: None,
+        payload_installation_id: Some(install_id),
+        payload: Some(payload),
+        payload_size_bytes: size,
+    }
+}
+
+fn create_tag_webhook(delivery: &str, install_id: i64, repo_id: i64, tag: &str) -> NewWebhook {
+    let payload = serde_json::json!({
+        "ref": tag,
+        "ref_type": "tag",
+        "installation": { "id": install_id },
+        "repository": { "id": repo_id, "full_name": "o/r" }
+    });
+    let size = serde_json::to_vec(&payload)
+        .unwrap()
+        .len() as i32;
+    NewWebhook {
+        delivery_id: delivery.into(),
+        event_type: "create".into(),
+        action: None,
+        payload_installation_id: Some(install_id),
+        payload: Some(payload),
+        payload_size_bytes: size,
+    }
+}
+
+/// Seed install + base repo + head repo + membership for the base
+/// (since target_repo_policy FKs to membership). Returns nothing; the
+/// caller seeds the policies it wants.
+async fn seed_install_with_base_and_head(
+    pool: &Pool,
+    install_id: i64,
+    base_repo_id: i64,
+    head_repo_id: i64,
+) {
+    seed_allowed_org(pool, 42, "octo-org").await;
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES ($1, 42, 'octo-org', 'organization')",
+    )
+    .bind(install_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_repo (id, owner, name) VALUES ($1, 'o', 'r'), ($2, 'alice', 'r')",
+    )
+    .bind(base_repo_id)
+    .bind(head_repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation_repo (github_installation_id, github_repo_id) VALUES \
+         ($1, $2)",
+    )
+    .bind(install_id)
+    .bind(base_repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pipeline_pull_request_with_both_policies_enabled_is_ignored_action_in_phase1() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_with_base_and_head(&pool, 100, 10, 20).await;
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 20, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ingest = PostgresIngestStore::new(pool.clone());
+    ingest
+        .ingest_webhook(&pull_request_webhook("e2e-pr-ok", "opened", 100, 10, 20))
+        .await
+        .unwrap();
+
+    let processor = build_processor(&pool);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (status, outcome) = read_row_status(&pool, "e2e-pr-ok").await;
+    assert_eq!(status, WebhookStatus::Ignored);
+    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+}
+
+#[tokio::test]
+async fn pipeline_pull_request_target_denied_is_denied_target_policy() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_with_base_and_head(&pool, 100, 10, 20).await;
+    // No target policy seeded → denied.
+    let ingest = PostgresIngestStore::new(pool.clone());
+    ingest
+        .ingest_webhook(&pull_request_webhook("e2e-pr-deny", "opened", 100, 10, 20))
+        .await
+        .unwrap();
+
+    let processor = build_processor(&pool);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (status, outcome) = read_row_status(&pool, "e2e-pr-deny").await;
+    assert_eq!(status, WebhookStatus::Denied);
+    assert_eq!(outcome, Some(WebhookOutcome::DeniedTargetPolicy));
+}
+
+#[tokio::test]
+async fn pipeline_pull_request_source_denied_is_denied_source_policy() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_with_base_and_head(&pool, 100, 10, 20).await;
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // No source policy → denied.
+
+    let ingest = PostgresIngestStore::new(pool.clone());
+    ingest
+        .ingest_webhook(&pull_request_webhook("e2e-pr-srcdeny", "opened", 100, 10, 20))
+        .await
+        .unwrap();
+
+    let processor = build_processor(&pool);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (_status, outcome) = read_row_status(&pool, "e2e-pr-srcdeny").await;
+    assert_eq!(outcome, Some(WebhookOutcome::DeniedSourcePolicy));
+}
+
+#[tokio::test]
+async fn pipeline_pull_request_non_trigger_action_is_ignored_action() {
+    // `labeled` shouldn't trigger policy evaluation.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_with_base_and_head(&pool, 100, 10, 20).await;
+    let ingest = PostgresIngestStore::new(pool.clone());
+    ingest
+        .ingest_webhook(&pull_request_webhook("e2e-pr-labeled", "labeled", 100, 10, 20))
+        .await
+        .unwrap();
+
+    let processor = build_processor(&pool);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (status, outcome) = read_row_status(&pool, "e2e-pr-labeled").await;
+    assert_eq!(status, WebhookStatus::Ignored);
+    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+}
+
+#[tokio::test]
+async fn pipeline_push_with_matching_branch_trigger_is_ignored_action_in_phase1() {
+    // Push to a watched branch logs "would enqueue" but doesn't
+    // actually enqueue in Phase 1 → terminates as IgnoredAction.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_with_base_and_head(&pool, 100, 10, 20).await;
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO trigger_policy (github_installation_id, github_repo_id, trigger_kind, \
+         match_spec, is_enabled) VALUES (100, 10, 'branch_push', \
+         '{\"kind\":\"branch_push\",\"branch_name\":\"develop\"}'::jsonb, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ingest = PostgresIngestStore::new(pool.clone());
+    ingest
+        .ingest_webhook(&push_webhook("e2e-push-match", 100, 10, "develop"))
+        .await
+        .unwrap();
+
+    let processor = build_processor(&pool);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (status, outcome) = read_row_status(&pool, "e2e-push-match").await;
+    assert_eq!(status, WebhookStatus::Ignored);
+    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+}
+
+#[tokio::test]
+async fn pipeline_push_with_no_matching_trigger_is_ignored_action() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_with_base_and_head(&pool, 100, 10, 20).await;
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO trigger_policy (github_installation_id, github_repo_id, trigger_kind, \
+         match_spec, is_enabled) VALUES (100, 10, 'branch_push', \
+         '{\"kind\":\"branch_push\",\"branch_name\":\"develop\"}'::jsonb, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ingest = PostgresIngestStore::new(pool.clone());
+    // Push to a DIFFERENT branch → no trigger matches.
+    ingest
+        .ingest_webhook(&push_webhook("e2e-push-nomatch", 100, 10, "feature-x"))
+        .await
+        .unwrap();
+
+    let processor = build_processor(&pool);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (_status, outcome) = read_row_status(&pool, "e2e-push-nomatch").await;
+    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+}
+
+#[tokio::test]
+async fn pipeline_create_tag_with_matching_pattern_trigger_is_ignored_action() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_with_base_and_head(&pool, 100, 10, 20).await;
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO trigger_policy (github_installation_id, github_repo_id, trigger_kind, \
+         match_spec, is_enabled) VALUES (100, 10, 'tag_created', \
+         '{\"kind\":\"tag_created\",\"tag_pattern\":\"^release/\\\\d+\\\\.\\\\d+$\"}'::jsonb, \
+         TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ingest = PostgresIngestStore::new(pool.clone());
+    ingest
+        .ingest_webhook(&create_tag_webhook("e2e-tag-match", 100, 10, "release/1.2"))
+        .await
+        .unwrap();
+
+    let processor = build_processor(&pool);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (_status, outcome) = read_row_status(&pool, "e2e-tag-match").await;
+    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+}
+
+#[tokio::test]
+async fn pipeline_create_branch_is_ignored_no_trigger_eval() {
+    // `create` for ref_type=branch should be silently skipped — those
+    // events fire alongside an actual `push`, which is what we
+    // evaluate triggers on.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_with_base_and_head(&pool, 100, 10, 20).await;
+    let ingest = PostgresIngestStore::new(pool.clone());
+    let payload = serde_json::json!({
+        "ref": "new-feature",
+        "ref_type": "branch",
+        "installation": { "id": 100 },
+        "repository": { "id": 10, "full_name": "o/r" }
+    });
+    let size = serde_json::to_vec(&payload)
+        .unwrap()
+        .len() as i32;
+    ingest
+        .ingest_webhook(&NewWebhook {
+            delivery_id: "e2e-create-branch".into(),
+            event_type: "create".into(),
+            action: None,
+            payload_installation_id: Some(100),
+            payload: Some(payload),
+            payload_size_bytes: size,
+        })
+        .await
+        .unwrap();
+
+    let processor = build_processor(&pool);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (status, outcome) = read_row_status(&pool, "e2e-create-branch").await;
+    assert_eq!(status, WebhookStatus::Ignored);
+    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
 }

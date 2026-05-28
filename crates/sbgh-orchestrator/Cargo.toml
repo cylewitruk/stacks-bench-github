@@ -32,6 +32,8 @@ uuid.workspace = true
 chrono.workspace = true
 quick-xml.workspace = true
 clap.workspace = true
+# Slice 5 trigger_policy: regex matching for tag_pattern matchers.
+regex.workspace = true
 
 [dev-dependencies]
 sbgh-core = { workspace = true, features = ["testing"] }

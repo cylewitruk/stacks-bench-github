@@ -150,6 +150,46 @@ impl InstallationStore for PostgresInstallationStore {
         .execute(&mut *tx)
         .await?;
 
+        // Slice 5: also disable every active policy for this install in
+        // the same transaction. Ordering matters via the FK chain:
+        // trigger_policy FKs to target_repo_policy (composite), so we
+        // disable triggers FIRST in case slice 8+ adds CASCADE-on-disable
+        // semantics. All three statements are idempotent (predicate `is_enabled
+        // = TRUE` skips already-disabled rows on redelivery).
+        sqlx::query(
+            r#"
+            UPDATE trigger_policy
+               SET is_enabled = FALSE
+             WHERE github_installation_id = $1
+               AND is_enabled = TRUE
+            "#,
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE target_repo_policy
+               SET is_enabled = FALSE
+             WHERE github_installation_id = $1
+               AND is_enabled = TRUE
+            "#,
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE source_repo_policy
+               SET is_enabled = FALSE
+             WHERE github_installation_id = $1
+               AND is_enabled = TRUE
+            "#,
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(DeleteInstallationOutcome {
             install_found: true,
@@ -208,6 +248,37 @@ impl InstallationStore for PostgresInstallationStore {
         .await?;
         tx.commit().await?;
         Ok(Some(row))
+    }
+
+    async fn is_membership_active(
+        &self,
+        installation_id: i64,
+        github_repo_id: i64,
+    ) -> Result<bool> {
+        // Single EXISTS query joining the install + membership tables
+        // with the slice-5 "currently active" predicates on both.
+        // Cheaper than two round-trips; Postgres can answer from the
+        // (id) PK and the composite PK index without a full scan.
+        let active: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                  FROM github_installation i
+                  JOIN github_installation_repo m
+                    ON m.github_installation_id = i.id
+                 WHERE i.id = $1
+                   AND m.github_repo_id = $2
+                   AND i.deleted_at IS NULL
+                   AND i.suspended_at IS NULL
+                   AND m.revoked_at IS NULL
+            )
+            "#,
+        )
+        .bind(installation_id)
+        .bind(github_repo_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(active)
     }
 
     async fn revoke_membership(

@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::Result;
-use crate::github::client::{GitHubApi, PostedComment, RepoRef, RepoSummary};
+use crate::github::client::{
+    GitHubApi, PostedComment, PullRequestSide, PullRequestSummary, RepoRef, RepoSummary,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeCall {
@@ -38,6 +40,11 @@ pub enum FakeCall {
         owner: String,
         name: String,
     },
+    GetPullRequest {
+        installation_id: i64,
+        repository: String,
+        pr_number: u64,
+    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -54,6 +61,9 @@ struct FakeState {
     /// `(owner, name)` so tests can stage the full lineage for a
     /// fork-of-fork chain.
     repos: HashMap<(String, String), RepoSummary>,
+    /// Pre-programmed responses for `get_pull_request`. Keyed by
+    /// `("owner/name", pr_number)`.
+    prs: HashMap<(String, u64), PullRequestSummary>,
 }
 
 impl FakeGitHub {
@@ -115,6 +125,25 @@ impl FakeGitHub {
             .unwrap()
             .repos
             .insert((owner.into(), name.into()), summary);
+    }
+
+    /// Pre-program a PR response keyed on `("owner/name", pr_number)`.
+    /// `base` is the target side; `head` is the source side.
+    pub fn set_pull_request(
+        &self,
+        repository: &str,
+        pr_number: u64,
+        base: PullRequestSide,
+        head: PullRequestSide,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .prs
+            .insert(
+                (repository.into(), pr_number),
+                PullRequestSummary { number: pr_number, base, head },
+            );
     }
 
     pub fn calls(&self) -> Vec<FakeCall> {
@@ -206,6 +235,30 @@ impl GitHubApi for FakeGitHub {
                 crate::Error::Config(format!(
                     "FakeGitHub: no canned response for repo {owner}/{name} (use \
                      set_repo_canonical / set_repo_fork to stage it)"
+                ))
+            })
+    }
+
+    async fn get_pull_request(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        pr_number: u64,
+    ) -> Result<PullRequestSummary> {
+        let mut s = self.inner.lock().unwrap();
+        s.calls
+            .push(FakeCall::GetPullRequest {
+                installation_id,
+                repository: repository.into(),
+                pr_number,
+            });
+        s.prs
+            .get(&(repository.into(), pr_number))
+            .cloned()
+            .ok_or_else(|| {
+                crate::Error::Config(format!(
+                    "FakeGitHub: no canned response for PR {repository}#{pr_number} (use \
+                     set_pull_request to stage it)"
                 ))
             })
     }

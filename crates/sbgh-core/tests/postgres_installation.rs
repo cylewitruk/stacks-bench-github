@@ -282,6 +282,116 @@ async fn delete_installation_redelivery_is_idempotent() {
 }
 
 #[tokio::test]
+async fn delete_installation_disables_all_policy_rows_in_same_transaction() {
+    // Slice 5: install.deleted must ALSO soft-disable every policy
+    // row belonging to the install — target, source, trigger — in the
+    // same transaction as the membership revoke + install soft-delete.
+    // Otherwise a delete-then-recreate cycle would silently inherit
+    // stale policies the operator didn't re-approve.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_allowed(&pool, 42, "octo", true).await;
+    let store = PostgresInstallationStore::new(pool.clone());
+    store
+        .upsert_installation(&NewInstallation {
+            id: 100,
+            github_account_id: 42,
+            account_login: "octo".into(),
+            account_type: GithubAccountType::Organization,
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    store
+        .add_or_restore_membership(100, 10)
+        .await
+        .unwrap();
+    // Seed enabled policies of all three kinds for this install.
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (100, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO trigger_policy (github_installation_id, github_repo_id, trigger_kind, \
+         match_spec, is_enabled) VALUES (100, 10, 'branch_push', \
+         '{\"kind\":\"branch_push\",\"branch_name\":\"main\"}'::jsonb, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Also seed a policy for a DIFFERENT install to verify the
+    // delete doesn't scope-creep.
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (43, 'other', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (200, 43, 'other', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation_repo (github_installation_id, github_repo_id) VALUES \
+         (200, 10)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (200, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    store
+        .delete_installation(100)
+        .await
+        .unwrap();
+
+    // All three policy types for install 100 disabled.
+    for table in ["target_repo_policy", "source_repo_policy", "trigger_policy"] {
+        let q = format!(
+            "SELECT COUNT(*) FROM {table} WHERE github_installation_id = 100 AND is_enabled = TRUE"
+        );
+        let count: i64 = sqlx::query_scalar(&q)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table} for install 100 must be all disabled");
+    }
+    // Install 200's policy is UNTOUCHED.
+    let other_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM target_repo_policy WHERE github_installation_id = 200 AND \
+         is_enabled = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(other_count, 1, "policy for OTHER install must not be scope-creep-disabled");
+}
+
+#[tokio::test]
 async fn delete_installation_bulk_revokes_active_memberships_transactionally() {
     // Slice 4 invariant: installation.deleted must soft-delete the
     // install AND revoke every active membership for it in one tx.
@@ -556,6 +666,132 @@ async fn add_and_delete_race_never_leaves_orphan_active_membership() {
              UPDATE serialization is broken",
         );
     }
+}
+
+#[tokio::test]
+async fn is_membership_active_returns_true_only_for_active_install_and_membership() {
+    // Slice 5 review fix: this is the runtime gate used by every
+    // policy-evaluating handler. Truth table:
+    //   install active + membership active     → true
+    //   install soft-deleted                   → false
+    //   install suspended                      → false
+    //   no install row                         → false
+    //   no membership row                      → false
+    //   membership revoked                     → false
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_allowed(&pool, 42, "octo", true).await;
+    let store = PostgresInstallationStore::new(pool.clone());
+    store
+        .upsert_installation(&NewInstallation {
+            id: 100,
+            github_account_id: 42,
+            account_login: "octo".into(),
+            account_type: GithubAccountType::Organization,
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // No membership yet.
+    assert!(
+        !store
+            .is_membership_active(100, 10)
+            .await
+            .unwrap()
+    );
+
+    store
+        .add_or_restore_membership(100, 10)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .is_membership_active(100, 10)
+            .await
+            .unwrap(),
+        "active install + active membership → true"
+    );
+
+    // Suspend the install.
+    store
+        .set_suspended(100, Some(chrono::Utc::now()))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .is_membership_active(100, 10)
+            .await
+            .unwrap(),
+        "suspended install → false"
+    );
+
+    // Unsuspend → true again.
+    store
+        .set_suspended(100, None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .is_membership_active(100, 10)
+            .await
+            .unwrap()
+    );
+
+    // Revoke membership.
+    store
+        .revoke_membership(100, 10)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .is_membership_active(100, 10)
+            .await
+            .unwrap(),
+        "revoked membership → false"
+    );
+
+    // Restore membership.
+    store
+        .add_or_restore_membership(100, 10)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .is_membership_active(100, 10)
+            .await
+            .unwrap()
+    );
+
+    // Soft-delete the install.
+    store
+        .delete_installation(100)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .is_membership_active(100, 10)
+            .await
+            .unwrap(),
+        "soft-deleted install → false"
+    );
+}
+
+#[tokio::test]
+async fn is_membership_active_returns_false_for_unknown_pair() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    let store = PostgresInstallationStore::new(pool);
+    assert!(
+        !store
+            .is_membership_active(999, 999)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

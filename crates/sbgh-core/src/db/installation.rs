@@ -118,4 +118,18 @@ pub trait InstallationStore: Send + Sync + 'static {
         installation_id: i64,
         github_repo_id: i64,
     ) -> Result<Option<GithubInstallationRepo>>;
+
+    /// Slice 5 runtime gate: is the `(install, repo)` pair currently
+    /// authorized for benchmark work? True iff:
+    ///   - `github_installation` exists with `deleted_at IS NULL AND
+    ///     suspended_at IS NULL`
+    ///   - `github_installation_repo` exists with `revoked_at IS NULL`
+    ///
+    /// Used by every slice-5 handler that evaluates a policy: even
+    /// if `target_repo_policy.is_enabled = TRUE`, the handler must
+    /// confirm membership before treating the policy as authoritative.
+    /// Otherwise a stale inbox row from before a `.removed` event
+    /// could be classified as accepted.
+    async fn is_membership_active(&self, installation_id: i64, github_repo_id: i64)
+    -> Result<bool>;
 }

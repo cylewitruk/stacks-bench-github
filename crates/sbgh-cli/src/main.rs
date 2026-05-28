@@ -39,11 +39,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand};
 use sbgh_cli::{
-    allow_installer, allow_repo_root, apply_roles, disable_installer,
-    disable_installer_by_account_id, disable_repo_root, disable_repo_root_by_id, list_installers,
-    list_repo_roots,
+    add_trigger_policy, allow_installer, allow_repo_root, allow_source_policy, allow_target_policy,
+    apply_roles, disable_installer, disable_installer_by_account_id, disable_repo_root,
+    disable_repo_root_by_id, disable_source_policy, disable_target_policy, disable_trigger_policy,
+    list_installers, list_repo_roots, list_source_policies, list_target_policies,
+    list_trigger_policies,
 };
 use sbgh_core::db;
+use sbgh_core::models::TriggerKind;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -79,6 +82,16 @@ enum Command {
     Repo {
         #[command(subcommand)]
         action: RepoAction,
+    },
+
+    /// Manage the slice 5 per-installation policy tables that gate
+    /// which PR / push / tag events will trigger a benchmark job.
+    /// Three nested groups: `target` (which repos are benchmark
+    /// targets), `source` (which repos are trusted as PR sources),
+    /// `trigger` (which branches / tag patterns auto-trigger jobs).
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
     },
 }
 
@@ -144,6 +157,119 @@ enum RepoAction {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum PolicyAction {
+    /// Per-installation target-repo opt-in: "this install will
+    /// benchmark PRs against this repo." Requires a current
+    /// `github_installation_repo` membership row (FK).
+    Target {
+        #[command(subcommand)]
+        action: PolicyTargetAction,
+    },
+    /// Per-installation source-repo trust: "this install trusts this
+    /// repo as a PR source — its code may execute in our bench VM."
+    /// Unlike target, no membership FK — sources can be arbitrary
+    /// forks.
+    Source {
+        #[command(subcommand)]
+        action: PolicySourceAction,
+    },
+    /// Per-installation auto-trigger subscriptions for `push` /
+    /// `create` events. Multiple per (install, repo) — each row is one
+    /// trigger_kind + match_spec + bench_args.
+    Trigger {
+        #[command(subcommand)]
+        action: PolicyTriggerAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyTargetAction {
+    /// Allow (or re-enable) a (install, repo) pair as a benchmark
+    /// target. Operator pulls the ids from `installer list` +
+    /// `repo list` first.
+    Allow {
+        #[arg(long)]
+        install_id: i64,
+        #[arg(long)]
+        repo_id: i64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Soft-disable a target policy row.
+    Disable {
+        #[arg(long)]
+        install_id: i64,
+        #[arg(long)]
+        repo_id: i64,
+    },
+    /// List target policies. Optional `--install-id` filter.
+    List {
+        #[arg(long)]
+        install_id: Option<i64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicySourceAction {
+    Allow {
+        #[arg(long)]
+        install_id: i64,
+        #[arg(long)]
+        repo_id: i64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    Disable {
+        #[arg(long)]
+        install_id: i64,
+        #[arg(long)]
+        repo_id: i64,
+    },
+    List {
+        #[arg(long)]
+        install_id: Option<i64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyTriggerAction {
+    /// Add a new trigger_policy row. `--kind` is `branch_push` or
+    /// `tag_created`; `--match` is the JSON match_spec (e.g.
+    /// `'{"kind":"branch_push","branch_name":"develop"}'`); `--args`
+    /// is forwarded to the eventual job as CLI args in slice 9+.
+    Add {
+        #[arg(long)]
+        install_id: i64,
+        #[arg(long)]
+        repo_id: i64,
+        /// `branch_push` or `tag_created` (other trigger_kind variants
+        /// are reserved for post-slice-9).
+        #[arg(long)]
+        kind: String,
+        /// JSON match_spec validated against `TriggerMatchSpec` at
+        /// insert time.
+        #[arg(long = "match")]
+        match_spec: String,
+        #[arg(long = "args")]
+        bench_args: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Soft-disable a trigger row by its bigserial id.
+    Disable {
+        #[arg(long)]
+        id: i64,
+    },
+    /// List triggers. Optional filters; both None = list everything.
+    List {
+        #[arg(long)]
+        install_id: Option<i64>,
+        #[arg(long)]
+        repo_id: Option<i64>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -157,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => run_migrate().await,
         Command::Installer { action } => run_installer(action).await,
         Command::Repo { action } => run_repo(action).await,
+        Command::Policy { action } => run_policy(action).await,
     }
 }
 
@@ -315,6 +442,178 @@ async fn run_repo(action: RepoAction) -> anyhow::Result<()> {
                     r.owner,
                     r.name,
                     if r.is_enabled { "ENABLED " } else { "disabled" },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_policy(action: PolicyAction) -> anyhow::Result<()> {
+    let database_url =
+        std::env::var("DATABASE_URL").context("DATABASE_URL must be set (owner DSN)")?;
+    let pool = db::connect(&database_url)
+        .await
+        .context("connect to postgres")?;
+
+    match action {
+        PolicyAction::Target { action } => run_policy_target(&pool, action).await,
+        PolicyAction::Source { action } => run_policy_source(&pool, action).await,
+        PolicyAction::Trigger { action } => run_policy_trigger(&pool, action).await,
+    }
+}
+
+async fn run_policy_target(
+    pool: &sbgh_core::db::Pool,
+    action: PolicyTargetAction,
+) -> anyhow::Result<()> {
+    match action {
+        PolicyTargetAction::Allow { install_id, repo_id, note } => {
+            let row = allow_target_policy(pool, install_id, repo_id, note.as_deref())
+                .await
+                .context("allow target policy")?;
+            println!(
+                "allowed: install={} repo={} is_enabled={}",
+                row.github_installation_id, row.github_repo_id, row.is_enabled,
+            );
+        }
+        PolicyTargetAction::Disable { install_id, repo_id } => {
+            let row = disable_target_policy(pool, install_id, repo_id)
+                .await
+                .context("disable target policy")?;
+            println!(
+                "disabled: install={} repo={} is_enabled={}",
+                row.github_installation_id, row.github_repo_id, row.is_enabled,
+            );
+        }
+        PolicyTargetAction::List { install_id } => {
+            let rows = list_target_policies(pool, install_id)
+                .await
+                .context("list target policies")?;
+            if rows.is_empty() {
+                println!("(no target policies)");
+                return Ok(());
+            }
+            for r in rows {
+                println!(
+                    "{:>12} {:>12}  {}",
+                    r.github_installation_id,
+                    r.github_repo_id,
+                    if r.is_enabled { "ENABLED " } else { "disabled" },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_policy_source(
+    pool: &sbgh_core::db::Pool,
+    action: PolicySourceAction,
+) -> anyhow::Result<()> {
+    match action {
+        PolicySourceAction::Allow { install_id, repo_id, note } => {
+            let row = allow_source_policy(pool, install_id, repo_id, note.as_deref())
+                .await
+                .context("allow source policy")?;
+            println!(
+                "allowed: install={} repo={} is_enabled={}",
+                row.github_installation_id, row.github_repo_id, row.is_enabled,
+            );
+        }
+        PolicySourceAction::Disable { install_id, repo_id } => {
+            let row = disable_source_policy(pool, install_id, repo_id)
+                .await
+                .context("disable source policy")?;
+            println!(
+                "disabled: install={} repo={} is_enabled={}",
+                row.github_installation_id, row.github_repo_id, row.is_enabled,
+            );
+        }
+        PolicySourceAction::List { install_id } => {
+            let rows = list_source_policies(pool, install_id)
+                .await
+                .context("list source policies")?;
+            if rows.is_empty() {
+                println!("(no source policies)");
+                return Ok(());
+            }
+            for r in rows {
+                println!(
+                    "{:>12} {:>12}  {}",
+                    r.github_installation_id,
+                    r.github_repo_id,
+                    if r.is_enabled { "ENABLED " } else { "disabled" },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_policy_trigger(
+    pool: &sbgh_core::db::Pool,
+    action: PolicyTriggerAction,
+) -> anyhow::Result<()> {
+    match action {
+        PolicyTriggerAction::Add {
+            install_id,
+            repo_id,
+            kind,
+            match_spec,
+            bench_args,
+            note,
+        } => {
+            // Parse `--kind` to the typed enum. Reject anything not
+            // valid for slice 5's auto-trigger surface.
+            let trigger_kind = match kind.as_str() {
+                "branch_push" => TriggerKind::BranchPush,
+                "tag_created" => TriggerKind::TagCreated,
+                other => {
+                    return Err(anyhow!(
+                        "--kind must be `branch_push` or `tag_created` (got `{other}`)"
+                    ));
+                }
+            };
+            let row = add_trigger_policy(
+                pool,
+                install_id,
+                repo_id,
+                trigger_kind,
+                &match_spec,
+                bench_args.as_deref(),
+                note.as_deref(),
+            )
+            .await
+            .context("add trigger policy")?;
+            println!(
+                "added: id={} install={} repo={} kind={:?}",
+                row.id, row.github_installation_id, row.github_repo_id, row.trigger_kind,
+            );
+        }
+        PolicyTriggerAction::Disable { id } => {
+            let row = disable_trigger_policy(pool, id)
+                .await
+                .context("disable trigger policy")?;
+            println!("disabled: id={} is_enabled={}", row.id, row.is_enabled);
+        }
+        PolicyTriggerAction::List { install_id, repo_id } => {
+            let rows = list_trigger_policies(pool, install_id, repo_id)
+                .await
+                .context("list trigger policies")?;
+            if rows.is_empty() {
+                println!("(no trigger policies)");
+                return Ok(());
+            }
+            for r in rows {
+                println!(
+                    "{:>6} {:>12} {:>12}  {:<12}  {}  spec={}",
+                    r.id,
+                    r.github_installation_id,
+                    r.github_repo_id,
+                    format!("{:?}", r.trigger_kind),
+                    if r.is_enabled { "ENABLED " } else { "disabled" },
+                    r.match_spec.0,
                 );
             }
         }
