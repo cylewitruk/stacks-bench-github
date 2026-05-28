@@ -226,10 +226,11 @@ impl Classifier for BasicClassifier {
 /// - `created` on a PR with malformed `/benchmark` → `ignored_no_command`
 ///   (schema has no distinct "malformed command" outcome; bucketed with
 ///   no-command for now)
-/// - `created` on a PR with valid `/benchmark` → `ignored_action` in Phase 1.
-///   Slice 9 changes this branch to `enqueued_job` + creates the new `job` row.
-///   The legacy handler→`jobs` path continues to actually run the bench in the
-///   meantime.
+/// - `created` on a PR with valid `/benchmark` → policy evaluation. Accept
+///   (target + source both enabled, membership active) → `would_enqueue_job`
+///   (Phase 1 shadow accept; the legacy handler→`jobs` path still runs the
+///   actual bench). Slice 9 flips this branch to `enqueued_job` + creates the
+///   new `job` row. Deny → `denied_target_policy` / `denied_source_policy`.
 /// - NULL / unparseable payload → `error` (can't classify; better terminal than
 ///   infinite retry)
 pub struct IssueCommentHandler {
@@ -364,11 +365,13 @@ impl EventHandler for IssueCommentHandler {
                             "issue_comment /benchmark: policies accepted — slice 9 will enqueue \
                              here (Phase 1 legacy path still runs the actual bench)"
                         );
-                        // Phase 1: log only. Slice 9 changes this to
-                        // `EnqueuedJob` + creates the new-schema job
-                        // row. Until then, the legacy handler→jobs
-                        // path is what actually runs benches.
-                        ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
+                        // Phase 1: terminal `WouldEnqueueJob` (pre-slice-6
+                        // checkpoint). Slice 9 flips this to `EnqueuedJob`
+                        // + creates the new-schema job row. Until then,
+                        // the legacy handler→jobs path is what actually
+                        // runs benches; the outcome here is the queryable
+                        // signal that the new pipeline agreed.
+                        ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
                     }
                     PolicyEvaluation::DeniedTarget => {
                         ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)
@@ -1154,8 +1157,9 @@ impl EventHandler for PullRequestHandler {
                     head_repo_id = head_repo.id,
                     "pull_request: policies accepted — slice 9 will enqueue here"
                 );
-                // Phase 1: log only. Slice 9 changes this to `EnqueuedJob`.
-                ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
+                // Phase 1: terminal `WouldEnqueueJob` (pre-slice-6
+                // checkpoint). Slice 9 flips to `EnqueuedJob`.
+                ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
             }
             PolicyEvaluation::DeniedTarget => {
                 ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)
@@ -1171,8 +1175,8 @@ impl EventHandler for PullRequestHandler {
 /// Handles `push` events. Phase 1: looks up `trigger_kind = branch_push`
 /// rows for (install, repo), matches each `match_spec.branch_name`
 /// against the stripped ref. Any match → log "would enqueue" + terminate
-/// as `IgnoredAction` (slice 9 will turn this into `EnqueuedJob`). No
-/// match → `IgnoredAction` with no log.
+/// as `WouldEnqueueJob` (slice 9 flips this to `EnqueuedJob`). No match
+/// → `IgnoredAction` with no log.
 ///
 /// Refs come in as `refs/heads/<name>` from GitHub; we strip the prefix
 /// before matching. Non-branch refs (rare on `push`, but possible for
@@ -1253,9 +1257,11 @@ impl EventHandler for PushHandler {
                 );
             }
         }
-        // Phase 1 always terminates as IgnoredAction; the tracing log
-        // above is the observability surface.
-        if !any_match {
+        if any_match {
+            // Phase 1 shadow accept (pre-slice-6 checkpoint). Slice 9
+            // flips this to `EnqueuedJob`.
+            ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
+        } else {
             tracing::debug!(
                 installation_id = event.installation.id,
                 repo_id = event.repository.id,
@@ -1263,8 +1269,8 @@ impl EventHandler for PushHandler {
                 trigger_count = triggers.len(),
                 "push: no branch_push trigger matched"
             );
+            ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
         }
-        ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
     }
 }
 
@@ -1355,7 +1361,11 @@ impl EventHandler for CreateHandler {
                 }
             }
         }
-        if !any_match {
+        if any_match {
+            // Phase 1 shadow accept (pre-slice-6 checkpoint). Slice 9
+            // flips this to `EnqueuedJob`.
+            ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
+        } else {
             tracing::debug!(
                 installation_id = event.installation.id,
                 repo_id = event.repository.id,
@@ -1363,8 +1373,8 @@ impl EventHandler for CreateHandler {
                 trigger_count = triggers.len(),
                 "create: no tag_created trigger matched"
             );
+            ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
         }
-        ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
     }
 }
 
@@ -2061,11 +2071,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn benchmark_with_both_policies_enabled_is_ignored_action_in_phase1() {
-        // Slice 5: /benchmark on a PR evaluates target+source policies.
-        // Both enabled → accepted, but Phase 1 doesn't enqueue (legacy
-        // handler→jobs path still runs the actual bench). Slice 9 will
-        // change this to `EnqueuedJob`.
+    async fn benchmark_with_both_policies_enabled_is_would_enqueue_job_in_phase1() {
+        // Slice 5 + pre-slice-6 checkpoint: /benchmark on a PR
+        // evaluates target+source policies. Both enabled → accepted →
+        // terminal `WouldEnqueueJob`. Phase 1 doesn't actually enqueue
+        // (legacy handler→jobs path still runs the bench), but the
+        // outcome value is the queryable signal that the new pipeline
+        // agreed. Slice 9 will flip this to `EnqueuedJob`.
         let (h, _gh, policy_store, _install_store) = make_benchmark_handler().await;
         policy_store.seed_target(1, 10, true); // base
         policy_store.seed_source(1, 20, true); // head
@@ -2076,7 +2088,7 @@ mod tests {
             Some(issue_comment_payload("created", "/benchmark run", true)),
         );
         let outcome = h.handle(&webhook).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
     }
 
     #[tokio::test]
@@ -3457,13 +3469,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pr_opened_with_both_policies_enabled_is_ignored_action_in_phase1() {
+    async fn pr_opened_with_both_policies_enabled_is_would_enqueue_job_in_phase1() {
+        // Pre-slice-6 checkpoint: PR with target+source policies
+        // enabled terminates as `WouldEnqueueJob` (Phase 1 shadow
+        // accept). Slice 9 flips to `EnqueuedJob`.
         let (h, policy_store, _install_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, true);
         policy_store.seed_source(100, 20, true);
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let outcome = h.handle(&w).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
     }
 
     #[tokio::test]
@@ -3710,8 +3725,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_with_matching_branch_trigger_is_ignored_action_phase1() {
+    async fn push_with_matching_branch_trigger_is_would_enqueue_job_phase1() {
+        // Pre-slice-6 checkpoint: matching trigger terminates as
+        // `WouldEnqueueJob` (Phase 1 shadow accept). Slice 9 flips to
+        // `EnqueuedJob`.
+        //
+        // Parent target must be enabled — slice 5 second-pass runtime
+        // gate in `list_enabled_triggers` joins through
+        // `target_repo_policy` and filters disabled/missing parents.
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
+        policy_store.seed_target(100, 10, true);
         policy_store.seed_trigger(
             100,
             10,
@@ -3723,7 +3746,7 @@ mod tests {
         let h = PushHandler::new(policy_store, install_store);
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
     }
 
     #[tokio::test]
@@ -3758,9 +3781,10 @@ mod tests {
         let h = PushHandler::new(policy_store, install_store);
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
-        // Outcome is identical to no-match case (always IgnoredAction
-        // in Phase 1), but the assertion is that the disabled trigger
-        // didn't get logged as a match.
+        // Disabled trigger doesn't surface in list_enabled_triggers, so
+        // outcome falls through to no-match `IgnoredAction` — NOT
+        // `WouldEnqueueJob` (which would mean the disabled trigger
+        // mistakenly counted as a match).
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
     }
 
@@ -3813,8 +3837,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_tag_matching_pattern_is_ignored_action_phase1() {
+    async fn create_tag_matching_pattern_is_would_enqueue_job_phase1() {
+        // Pre-slice-6 checkpoint: matching tag regex terminates as
+        // `WouldEnqueueJob` (Phase 1 shadow accept). Slice 9 flips to
+        // `EnqueuedJob`.
+        //
+        // Parent target must be enabled — slice 5 second-pass runtime
+        // gate filters triggers whose parent target is disabled / missing.
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
+        policy_store.seed_target(100, 10, true);
         policy_store.seed_trigger(
             100,
             10,
@@ -3828,7 +3859,7 @@ mod tests {
         let h = CreateHandler::new(policy_store, install_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "release/1.2", "tag"));
         let outcome = h.handle(&w).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
     }
 
     #[tokio::test]

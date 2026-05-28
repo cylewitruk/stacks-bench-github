@@ -38,6 +38,17 @@ pub enum WebhookStatus {
 #[serde(rename_all = "snake_case")]
 pub enum WebhookOutcome {
     EnqueuedJob,
+    /// Pre-slice-6 design checkpoint: Phase 1 shadow accept. The new
+    /// pipeline's policy/trigger evaluation said "this would enqueue a
+    /// job", but slice 9 hasn't landed yet so no `job` row is created
+    /// and the legacy handler→jobs path is what actually runs the
+    /// bench. Slice 9 flips the four accept paths
+    /// (`IssueCommentHandler` /benchmark, `PullRequestHandler`,
+    /// `PushHandler`, `CreateHandler`) to emit `EnqueuedJob` instead.
+    /// Same status bucket as `EnqueuedJob` / `ProcessedInstallation`
+    /// (= `Processed`) — a shadow accept is a successful terminal
+    /// outcome, not an ignored/denied one.
+    WouldEnqueueJob,
     /// Slice 3+: terminal "we materialised installation state" — the
     /// processor created/updated a `github_installation` row in response
     /// to an `installation.*` event. Distinct from `IgnoredAction` so
@@ -58,7 +69,9 @@ impl WebhookOutcome {
     /// Terminal status that pairs with this outcome.
     pub fn terminal_status(self) -> WebhookStatus {
         match self {
-            Self::EnqueuedJob | Self::ProcessedInstallation => WebhookStatus::Processed,
+            Self::EnqueuedJob | Self::WouldEnqueueJob | Self::ProcessedInstallation => {
+                WebhookStatus::Processed
+            }
             Self::IgnoredAction
             | Self::IgnoredNoCommand
             | Self::IgnoredUnknownInstallation

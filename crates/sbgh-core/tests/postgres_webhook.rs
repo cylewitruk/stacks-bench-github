@@ -179,6 +179,32 @@ async fn complete_transitions_row_to_terminal_status() {
 }
 
 #[tokio::test]
+async fn complete_round_trips_would_enqueue_job_outcome() {
+    // Pre-slice-6 checkpoint: verify the new `would_enqueue_job` enum
+    // value survives a round-trip through Postgres (binding via sqlx +
+    // reading back via `FromRow`) AND maps to `Processed` status via
+    // the `terminal_status()` rule baked into `complete`.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_webhook(&pool, "would-enqueue-1", "issue_comment").await;
+    let inbox = PostgresWebhookInbox::new(pool.clone());
+    let claimed = inbox
+        .claim_next(&["issue_comment"])
+        .await
+        .unwrap()
+        .unwrap();
+    inbox
+        .complete(claimed.id, claimed.claim_token, WebhookOutcome::WouldEnqueueJob)
+        .await
+        .unwrap();
+
+    let (status, outcome) = read_row_status(&pool, "would-enqueue-1").await;
+    assert_eq!(status, WebhookStatus::Processed);
+    assert_eq!(outcome, Some(WebhookOutcome::WouldEnqueueJob));
+}
+
+#[tokio::test]
 async fn complete_with_stale_claim_token_is_noop() {
     // The slice 2a stale-claim invariant pinned against real Postgres:
     // if the sweeper has reset the row mid-flight and re-claimed it

@@ -190,7 +190,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
   - `issue_comment.created` on a non-PR issue → `ignored_action`
   - `issue_comment.created` on a PR without `/benchmark` → `ignored_no_command`
   - `issue_comment.created` on a PR with malformed `/benchmark` args → `ignored_no_command` (schema has no distinct "malformed command" outcome; bucketed with no-command for now)
-  - `issue_comment.created` on a PR with valid `/benchmark` → `ignored_action` in Phase 1; slice 9 changes this branch to `enqueued_job` + creates new `job` row. Legacy handler→`jobs` path continues to actually run the bench in the meantime.
+  - `issue_comment.created` on a PR with valid `/benchmark` → `ignored_action` in slice 2b; **pre-slice-6 checkpoint flipped this to `would_enqueue_job`** once slice 5 added real policy evaluation. Slice 9 will then change it to `enqueued_job` + create the new-schema `job` row. Legacy handler→`jobs` path continues to actually run the bench in the meantime.
   - `push` / `pull_request` / `create` / `installation` / `installation_repositories` → **NOT claimed by BasicClassifier; rows stay in `received`** waiting for the slice (3-7) that adds their classifier branch. This is intentional: terminalizing them now would prevent later slices from consuming the events they need (an `installation.created` ignored here would never create its `github_installation` row in slice 3). Fixed mid-slice per Codex review.
   - Anything else, if it somehow reaches the classifier → `error`. The claim filter restricts to `issue_comment`, but the catch-all defends against direct calls / future-slice misconfiguration.
 - **Payload-parse failures**: `issue_comment` with NULL payload (handler stored only metadata) or with JSON that doesn't match the typed event shape → `error`. Other event types don't require a parse in slice 2b, so they tolerate NULL payload — but they're also not claimed, so it doesn't matter yet.
@@ -201,7 +201,7 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
   - `basic_issue_comment_non_created_is_ignored_action`
   - `basic_issue_comment_on_non_pr_is_ignored_action`
   - `basic_issue_comment_pr_no_command_is_ignored_no_command`
-  - `basic_issue_comment_pr_with_benchmark_is_ignored_action_in_phase1` (pins the Phase 1 behavior; slice 9 will change the assertion to `enqueued_job`)
+  - `basic_issue_comment_pr_with_benchmark_is_ignored_action_in_phase1` (pins the Phase 1 behavior; renamed by the pre-slice-6 checkpoint to `..._is_would_enqueue_job_in_phase1` once slice 5 added real policy evaluation; slice 9 will flip the assertion again to `enqueued_job`)
   - `basic_issue_comment_null_payload_is_error`
   - `basic_issue_comment_bad_typed_shape_is_error`
   - `basic_classifier_supported_types_is_issue_comment_only` (pins the slice 2b contract — replaces the original `basic_other_supported_events_are_ignored_action` test, which asserted the wrong behavior per Codex review)
@@ -388,11 +388,11 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 - **`delete_installation` extension**: the slice-4 transactional cleanup now ALSO bulk-disables every active row in all three policy tables for the install — `trigger_policy` first (FK chain order), then `target_repo_policy`, then `source_repo_policy`. All three statements are predicate-guarded on `is_enabled = TRUE` so re-delivery is idempotent. A new e2e test (`delete_installation_disables_all_policy_rows_in_same_transaction`) pins this behaviour AND verifies other installs' policies stay untouched (no scope-creep disable).
 - **`GitHubApi::get_pull_request`** added — returns `PullRequestSummary { head, base }` with each side's `RepoRef { id, owner, name }` + sha + branch. Used by the slice-5 extension to `IssueCommentHandler`'s /benchmark path (need the base+head repo ids to evaluate target+source policies; the issue_comment payload only carries the PR's URL).
 - **Three new event handlers**: `PullRequestHandler` (registers `pull_request`, evaluates target+source on `opened`/`reopened`/`synchronize`, ignores other actions), `PushHandler` (registers `push`, strips `refs/heads/` prefix + matches `branch_push` triggers), `CreateHandler` (registers `create`, only acts on `ref_type=tag`, regex-matches `tag_created` triggers).
-- **`IssueCommentHandler` was widened** (was a unit struct in slice 2b): now takes `RepoStore`, `PolicyStore`, `GitHubApi`. The `/benchmark` PR branch now fetches the PR via GH API, caches base/head identities, evaluates target+source policies, and emits the corresponding outcome. Phase 1 "accepted policies" still terminates as `IgnoredAction` (legacy handler→jobs path runs the actual bench); slice 9 will flip it to `EnqueuedJob` + create new-schema jobs.
-- **Phase 1 logging convention for the new path**: accepted policy → `tracing::info!` with `{installation_id, pr_number, base_repo_id, head_repo_id}` + `IgnoredAction` outcome. Denied → `DeniedTargetPolicy` / `DeniedSourcePolicy`. The legacy handler may still run benches that the inbox would have denied — the inbox row reflects "what the new pipeline would have decided," which is the slice-11 cutover signal.
+- **`IssueCommentHandler` was widened** (was a unit struct in slice 2b): now takes `RepoStore`, `PolicyStore`, `GitHubApi`. The `/benchmark` PR branch now fetches the PR via GH API, caches base/head identities, evaluates target+source policies, and emits the corresponding outcome. Phase 1 "accepted policies" terminated as `IgnoredAction` at slice 5 land; the pre-slice-6 checkpoint flipped this to `WouldEnqueueJob` so the shadow accept is queryable. Slice 9 will flip it again to `EnqueuedJob` + create new-schema jobs.
+- **Phase 1 logging convention for the new path**: accepted policy → `tracing::info!` with `{installation_id, pr_number, base_repo_id, head_repo_id}` + `WouldEnqueueJob` outcome (after the pre-slice-6 checkpoint; was `IgnoredAction` at slice 5 land). Denied → `DeniedTargetPolicy` / `DeniedSourcePolicy`. The legacy handler may still run benches that the inbox would have denied — the inbox row reflects "what the new pipeline would have decided," which is the slice-11 cutover signal.
 - **CLI**: nested `sbgh-cli policy {target,source,trigger} {allow,disable,list}` (trigger uses `add`/`disable`/`list`). Numeric ids only — operator pulls them from `installer list` / `repo list` first. `policy trigger add --kind branch_push --match '<json>' [--args <bench-args>]` validates JSON against `TriggerMatchSpec` at the CLI boundary AND pre-checks that `target_repo_policy` exists for the (install, repo) pair, returning a friendlier error than a raw FK violation.
 - **Grants** (in `sbgh-cli/src/lib.rs::apply_roles`): orch gets `SELECT, UPDATE` on all three policy tables (UPDATE needed for the install.deleted bulk-disable path). No INSERT (operator-curated; compromised processor can't add itself a new policy). No DELETE (policy history permanent). Handler nothing.
-- **Slice 4 tests updated**: `pipeline_classifies_pr_benchmark_as_ignored_action_in_phase1` (slice 2b/4 test) now seeds policies + canned PR response since the /benchmark path now does real policy work. `pipeline_leaves_unregistered_event_types_in_received` switched from `push` (now registered) to `star` (handler-allowlist drops at wire; this test seeds directly via IngestStore as defense-in-depth coverage for "unregistered event types stay received").
+- **Slice 4 tests updated**: `pipeline_classifies_pr_benchmark_as_ignored_action_in_phase1` (slice 2b/4 test; renamed by the pre-slice-6 checkpoint to `..._as_would_enqueue_job_in_phase1`) now seeds policies + canned PR response since the /benchmark path now does real policy work. `pipeline_leaves_unregistered_event_types_in_received` switched from `push` (now registered) to `star` (handler-allowlist drops at wire; this test seeds directly via IngestStore as defense-in-depth coverage for "unregistered event types stay received").
 - **Tests added** (61 net new, total 336 → 397):
   - `webhook_processor.rs` unit tests (~17 new): IssueCommentHandler /benchmark branch — both-enabled / target-denied / disabled-target / source-denied / GH-API-failure-retryable. PullRequestHandler — both-enabled / target-denied / source-denied / non-trigger-action-ignored / synchronize-re-evaluates / null-payload-error. PushHandler — matching/non-matching/disabled-trigger / non-branch-ref. CreateHandler — matching-pattern / non-matching / branch-ref-skipped / malformed-regex-skips-one-trigger-not-batch / null-payload.
   - `postgres_policy.rs` (8 new): membership-FK rejection, target upsert + disable round-trip with note preservation, source-doesn't-require-membership, trigger requires target FK, list_enabled_triggers respects kind filter + is_enabled, list_triggers includes disabled rows for CLI list.
@@ -423,24 +423,32 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Status:**
 
-- [ ] Items 1-3 (architectural) landed before slice 6 starts
-- [ ] Items 4-5 captured as inline todos in their target slices
-- [ ] Item 6 rationale recorded; no action
+- [x] Items 1-3 (architectural) landed before slice 6 starts
+- [x] Items 4-5 captured as inline todos in their target slices
+- [x] Item 6 rationale recorded; no action
 
 **Why this checkpoint exists:** Codex's roadmap meta-review (after slice 5) surfaced six items that could become expensive to retrofit once Phase 1 finishes. Items 1-3 are *architectural* and want to land before any new code in slice 6 commits to a shape we'd then have to reverse. Items 4-5 are *acknowledged-but-deferred* (real, but cheap to address inside their target slices). Item 6 is a deliberate accept-the-tradeoff so we don't re-litigate it later.
 
 **Pre-slice-6 actions (must land first):**
 
 1. **Role scope decision: per-installation, optionally repo-narrowed.** `github_user_role` will be scoped `(github_user_id, github_installation_id NOT NULL, github_repo_id NULLABLE, granted_role)`. This honours the "installation is the tenant boundary" principle ([roadmap.md:16](../docs/roadmap.md)) that every prior policy table already follows. `github_repo_id IS NULL` means install-wide; `IS NOT NULL` means repo-narrowed within that install. There is no cross-installation grant shape — granting one user the same role across N installs is N rows on purpose. Target schema already updated to reflect this; slice 6 migration must match.
+    - **Status**: design captured in [target_schema.sql](../migrations/_design/target_schema.sql) — slice 6's migration must match.
 
 2. **New outcome `would_enqueue_job`.** Added to `github_webhook_outcome` so Phase 1 shadow-accepted decisions (slice 5's `/benchmark` / push / tag-trigger accept paths) are queryable in DB rather than collapsed into `ignored_action`. Preserves the Phase 1 verifiability promise ([roadmap.md:38](../docs/roadmap.md)). Slice 5 handlers must be updated to emit it on the accept branch instead of `IgnoredAction`; slice 6 user-authz logging-only path uses the same outcome. Slice 9 will then change the same branches to emit `enqueued_job` once new jobs land. Target schema already updated.
     - **Implementation note**: `WebhookOutcome::terminal_status()` should map `would_enqueue_job` to `WebhookStatus::Processed` (same as `enqueued_job` / `processed_installation`) — a shadow-accept is a successful terminal outcome, not an ignored/denied one. Distinguishing accepted-but-shadow from accepted-and-enqueued lives in the outcome enum, not status.
+    - **Status**: implemented.
+      - Migration: `migrations/20260527000006_pre_slice6_would_enqueue.sql` (`ALTER TYPE github_webhook_outcome ADD VALUE 'would_enqueue_job';`).
+      - `WebhookOutcome::WouldEnqueueJob` variant added; `terminal_status()` maps to `WebhookStatus::Processed`.
+      - Four accept paths flipped: `IssueCommentHandler` `/benchmark`, `PullRequestHandler` opened/reopened/synchronize, `PushHandler` matching `branch_push`, `CreateHandler` matching `tag_created` — each emits `WouldEnqueueJob` instead of `IgnoredAction` on the accept branch.
+      - Tests renamed + flipped: `*_is_ignored_action_in_phase1` → `*_is_would_enqueue_job_in_phase1` (4 unit, 3 e2e). New Postgres round-trip test `complete_round_trips_would_enqueue_job_outcome` pins the enum-value bind/read path. Slice 5 unit tests that previously asserted `IgnoredAction` on accept paths were latent-broken (passing because no parent `target_repo_policy` was seeded → runtime gate sent them through the no-match path) — fixed by seeding the parent target alongside the trigger.
+      - Verification: `just lint` clean, `just test --summary` 424/424 (423 → 424; +1 from the round-trip test).
 
 3. **Target schema refresh.** Done as part of this checkpoint:
     - `github_installation.deleted_at` added (slice 4 drift).
     - `github_webhook.github_installation_id` FK marked `ON DELETE SET NULL` (slice 3 drift; dormant under soft-delete but kept defensively).
     - `github_webhook_outcome` includes `would_enqueue_job` and `processed_installation` (slice 3+ drift).
     - `github_user_role` restructured per item 1.
+    - **Status**: applied to [target_schema.sql](../migrations/_design/target_schema.sql).
 
 **Inline todos to add to their target slices:**
 

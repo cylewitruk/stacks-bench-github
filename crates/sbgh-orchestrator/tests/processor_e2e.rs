@@ -191,13 +191,13 @@ async fn pipeline_classifies_pr_no_command_as_ignored_no_command() {
 }
 
 #[tokio::test]
-async fn pipeline_classifies_pr_benchmark_as_ignored_action_in_phase1() {
-    // Slice 5 rewrite: /benchmark on a PR now evaluates target+source
-    // policies. With both policies enabled, the outcome stays
-    // IgnoredAction in Phase 1 (legacy handler still runs the bench;
-    // slice 9 will change this to EnqueuedJob). The handler fetches
-    // the PR via GH API to find the base+head repo ids, so we stage
-    // a canned response on the FakeGitHub.
+async fn pipeline_classifies_pr_benchmark_as_would_enqueue_job_in_phase1() {
+    // Slice 5 + pre-slice-6 checkpoint: /benchmark on a PR evaluates
+    // target+source policies. With both policies enabled, the outcome
+    // is `WouldEnqueueJob` (Phase 1 shadow accept; legacy handler still
+    // runs the bench; slice 9 flips this to `EnqueuedJob`). The handler
+    // fetches the PR via GH API to find the base+head repo ids, so we
+    // stage a canned response on the FakeGitHub.
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
@@ -277,8 +277,8 @@ async fn pipeline_classifies_pr_benchmark_as_ignored_action_in_phase1() {
         .unwrap();
 
     let (status, outcome) = read_row_status(&pool, "e2e-bench").await;
-    assert_eq!(status, WebhookStatus::Ignored);
-    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+    assert_eq!(status, WebhookStatus::Processed);
+    assert_eq!(outcome, Some(WebhookOutcome::WouldEnqueueJob));
 }
 
 #[tokio::test]
@@ -1058,7 +1058,10 @@ async fn seed_install_with_base_and_head(
 }
 
 #[tokio::test]
-async fn pipeline_pull_request_with_both_policies_enabled_is_ignored_action_in_phase1() {
+async fn pipeline_pull_request_with_both_policies_enabled_is_would_enqueue_job_in_phase1() {
+    // Pre-slice-6 checkpoint: PR with target+source policies enabled
+    // terminates as `WouldEnqueueJob` (Phase 1 shadow accept). Slice 9
+    // flips to `EnqueuedJob`.
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
@@ -1091,8 +1094,8 @@ async fn pipeline_pull_request_with_both_policies_enabled_is_ignored_action_in_p
         .unwrap();
 
     let (status, outcome) = read_row_status(&pool, "e2e-pr-ok").await;
-    assert_eq!(status, WebhookStatus::Ignored);
-    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+    assert_eq!(status, WebhookStatus::Processed);
+    assert_eq!(outcome, Some(WebhookOutcome::WouldEnqueueJob));
 }
 
 #[tokio::test]
@@ -1175,9 +1178,10 @@ async fn pipeline_pull_request_non_trigger_action_is_ignored_action() {
 }
 
 #[tokio::test]
-async fn pipeline_push_with_matching_branch_trigger_is_ignored_action_in_phase1() {
-    // Push to a watched branch logs "would enqueue" but doesn't
-    // actually enqueue in Phase 1 → terminates as IgnoredAction.
+async fn pipeline_push_with_matching_branch_trigger_is_would_enqueue_job_in_phase1() {
+    // Push to a watched branch terminates as `WouldEnqueueJob` (Phase 1
+    // shadow accept; pre-slice-6 checkpoint). Slice 9 flips to
+    // `EnqueuedJob`.
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
@@ -1211,8 +1215,8 @@ async fn pipeline_push_with_matching_branch_trigger_is_ignored_action_in_phase1(
         .unwrap();
 
     let (status, outcome) = read_row_status(&pool, "e2e-push-match").await;
-    assert_eq!(status, WebhookStatus::Ignored);
-    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+    assert_eq!(status, WebhookStatus::Processed);
+    assert_eq!(outcome, Some(WebhookOutcome::WouldEnqueueJob));
 }
 
 #[tokio::test]
@@ -1255,7 +1259,7 @@ async fn pipeline_push_with_no_matching_trigger_is_ignored_action() {
 }
 
 #[tokio::test]
-async fn pipeline_create_tag_with_matching_pattern_trigger_is_ignored_action() {
+async fn pipeline_create_tag_with_matching_pattern_trigger_is_would_enqueue_job() {
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
@@ -1289,8 +1293,9 @@ async fn pipeline_create_tag_with_matching_pattern_trigger_is_ignored_action() {
         .await
         .unwrap();
 
-    let (_status, outcome) = read_row_status(&pool, "e2e-tag-match").await;
-    assert_eq!(outcome, Some(WebhookOutcome::IgnoredAction));
+    let (status, outcome) = read_row_status(&pool, "e2e-tag-match").await;
+    assert_eq!(status, WebhookStatus::Processed);
+    assert_eq!(outcome, Some(WebhookOutcome::WouldEnqueueJob));
 }
 
 #[tokio::test]
