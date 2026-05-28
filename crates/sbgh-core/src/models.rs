@@ -263,6 +263,50 @@ pub struct TriggerPolicy {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Slice 6: the three role values an operator can grant. Mirrors the
+/// `user_role` DB enum from slice 0. Phase 1 only acts on
+/// `TriggerPrBenchmark` (the `/benchmark` authz gate); `Admin` and
+/// `ViewResults` are present for forward-compat but unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "user_role", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum UserRole {
+    Admin,
+    TriggerPrBenchmark,
+    ViewResults,
+}
+
+/// Lazily upserted identity row for a GH user we've encountered.
+/// `login` is display-only; the natural key is the numeric `id`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubUser {
+    pub id: i64,
+    pub login: String,
+    pub user_type: GithubAccountType,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Operator-curated grant: this user has this role on this installation,
+/// optionally narrowed to a specific repo within the installation
+/// (`github_repo_id IS NULL` = install-wide). `revoked_at IS NULL` = active.
+///
+/// Soft-revoke (post-slice-6 review fix): a revoke sets `revoked_at`
+/// rather than deleting the row, and a subsequent re-grant clears
+/// `revoked_at` on the existing row — preserving the original
+/// `granted_at` audit timestamp across the cycle.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubUserRole {
+    pub id: i64,
+    pub github_user_id: i64,
+    pub github_installation_id: i64,
+    pub github_repo_id: Option<i64>,
+    pub granted_role: UserRole,
+    pub granted_at: DateTime<Utc>,
+    pub granted_by_github_user_id: Option<i64>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Job {
     pub id: Uuid,

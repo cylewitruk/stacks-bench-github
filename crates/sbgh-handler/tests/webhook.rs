@@ -79,12 +79,16 @@ fn issue_comment_payload(
     } else {
         serde_json::Value::Null
     };
+    // Slice 6 grew the User struct to require numeric id + GH account
+    // type. Handler tests don't care about either field beyond "the
+    // typed deserialiser accepts the payload" — pick stable
+    // placeholders.
     serde_json::to_vec(&serde_json::json!({
         "action": "created",
         "comment": {
             "id": 9999,
             "body": body,
-            "user": { "login": sender },
+            "user": { "id": 1234, "login": sender, "type": "User" },
             "author_association": association,
         },
         "issue": {
@@ -92,7 +96,7 @@ fn issue_comment_payload(
             "pull_request": pull_request,
         },
         "repository": { "full_name": repo },
-        "sender": { "login": sender },
+        "sender": { "id": 1234, "login": sender, "type": "User" },
         "installation": { "id": 7 },
     }))
     .unwrap()

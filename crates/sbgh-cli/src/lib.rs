@@ -4,9 +4,11 @@
 //! `sbgh-cli/tests/*.rs` can exercise them against an ephemeral
 //! testcontainers Postgres without shelling out to the binary.
 
+pub mod gh_resolve;
 pub mod installer;
 pub mod policy;
 pub mod repo;
+pub mod user;
 
 use anyhow::Context;
 pub use installer::{
@@ -23,6 +25,10 @@ pub use repo::{
     list_repo_roots,
 };
 use sbgh_core::db::Pool;
+pub use user::{
+    UserError, grant_role, grant_role_by_user_id, list_roles, list_users, revoke_role,
+    revoke_role_by_user_id,
+};
 
 /// Create (if missing) and reset passwords + grants for the two narrow
 /// roles the runtime services use.
@@ -211,6 +217,31 @@ pub async fn apply_roles(
         .execute(&mut *tx)
         .await?;
     sqlx::query("GRANT SELECT, UPDATE ON TABLE trigger_policy TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
+    // Slice 6: github_user + github_user_role.
+    //
+    // github_user is lazy-upserted by the processor on first sighting
+    // of a sender / PR author — orch needs INSERT + UPDATE (the UPSERT
+    // refreshes `login` + `user_type` on PK conflict). SELECT for the
+    // CLI's `user list` join + the handler's `has_role` path. No
+    // DELETE: user identity is forever (same rationale as github_repo).
+    //
+    // github_user_role is OPERATOR-CURATED. Orch gets SELECT only — a
+    // compromised processor must NOT be able to grant itself a role
+    // (especially `trigger_pr_benchmark`, which is the `/benchmark`
+    // gate). All writes happen via `sbgh-cli user {grant,revoke}`
+    // running as the DB owner.
+    //
+    // Handler never touches either table.
+    sqlx::query("REVOKE ALL ON TABLE github_user, github_user_role FROM sbgh_handler, sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT, UPDATE ON TABLE github_user TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT ON TABLE github_user_role TO sbgh_orch")
         .execute(&mut *tx)
         .await?;
 

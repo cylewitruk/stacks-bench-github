@@ -392,6 +392,114 @@ async fn delete_installation_disables_all_policy_rows_in_same_transaction() {
 }
 
 #[tokio::test]
+async fn delete_installation_soft_revokes_all_user_role_grants() {
+    // Slice 6 third-pass review fix: install.deleted must ALSO
+    // soft-revoke every active github_user_role row for the install
+    // — both install-wide and repo-scoped grants — in the same
+    // transaction. Otherwise, a delete-then-recreate cycle would
+    // silently inherit stale role grants the operator didn't
+    // re-approve.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_allowed(&pool, 42, "octo", true).await;
+    let store = PostgresInstallationStore::new(pool.clone());
+    store
+        .upsert_installation(&NewInstallation {
+            id: 100,
+            github_account_id: 42,
+            account_login: "octo".into(),
+            account_type: GithubAccountType::Organization,
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    store
+        .add_or_restore_membership(100, 10)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO github_user (id, login, user_type) VALUES (42, 'alice', 'user')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Three active grants: install-wide, repo-scoped, plus a grant
+    // on a DIFFERENT install (must not be scope-creeped).
+    sqlx::query(
+        "INSERT INTO github_user_role (github_user_id, github_installation_id, granted_role) \
+         VALUES (42, 100, 'trigger_pr_benchmark')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_user_role (github_user_id, github_installation_id, github_repo_id, \
+         granted_role) VALUES (42, 100, 10, 'admin')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Cross-install grant.
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (43, 'other', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (200, 43, 'other', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_user_role (github_user_id, github_installation_id, granted_role) \
+         VALUES (42, 200, 'trigger_pr_benchmark')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    store
+        .delete_installation(100)
+        .await
+        .unwrap();
+
+    // Both grants on install=100 must be soft-revoked.
+    let install_100_active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM github_user_role WHERE github_installation_id = 100 AND revoked_at \
+         IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(install_100_active, 0, "all grants on deleted install must be soft-revoked");
+
+    // BOTH grants must still exist (soft, not hard).
+    let install_100_total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM github_user_role WHERE github_installation_id = 100",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(install_100_total, 2, "soft-revoke must preserve audit rows");
+
+    // Cross-install grant on install=200 must be UNTOUCHED.
+    let install_200_active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM github_user_role WHERE github_installation_id = 200 AND revoked_at \
+         IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(install_200_active, 1, "grant on OTHER install must survive");
+}
+
+#[tokio::test]
 async fn delete_installation_bulk_revokes_active_memberships_transactionally() {
     // Slice 4 invariant: installation.deleted must soft-delete the
     // install AND revoke every active membership for it in one tx.

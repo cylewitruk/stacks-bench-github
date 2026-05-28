@@ -42,11 +42,12 @@ use sbgh_cli::{
     add_trigger_policy, allow_installer, allow_repo_root, allow_source_policy, allow_target_policy,
     apply_roles, disable_installer, disable_installer_by_account_id, disable_repo_root,
     disable_repo_root_by_id, disable_source_policy, disable_target_policy, disable_trigger_policy,
-    list_installers, list_repo_roots, list_source_policies, list_target_policies,
-    list_trigger_policies,
+    grant_role, grant_role_by_user_id, list_installers, list_repo_roots, list_roles,
+    list_source_policies, list_target_policies, list_trigger_policies, list_users, revoke_role,
+    revoke_role_by_user_id,
 };
 use sbgh_core::db;
-use sbgh_core::models::TriggerKind;
+use sbgh_core::models::{TriggerKind, UserRole};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -93,6 +94,85 @@ enum Command {
         #[command(subcommand)]
         action: PolicyAction,
     },
+
+    /// Slice 6: manage per-installation role grants. `grant` /
+    /// `revoke` / `list` mirror the installer/repo/policy shape.
+    /// Each grant is `(user, install, optional repo, role)`; `--repo`
+    /// narrows to a single repo within the install, omitting it
+    /// grants install-wide.
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum UserAction {
+    /// Grant a role to a user on an installation. Resolves login → id
+    /// via the GitHub `/users/{login}` endpoint (same path
+    /// `installer allow` uses) and upserts the `github_user` row
+    /// before recording the grant.
+    ///
+    /// `--repo` narrows the grant to one repo within the install;
+    /// omit it to grant install-wide. Exactly one of `--login` or
+    /// `--user-id` (emergency / GH-outage path) must be supplied.
+    Grant {
+        #[arg(long, group = "user_grant_target")]
+        login: Option<String>,
+        #[arg(long, group = "user_grant_target")]
+        user_id: Option<i64>,
+        #[arg(long)]
+        install: i64,
+        #[arg(long)]
+        repo: Option<i64>,
+        #[arg(long, value_enum)]
+        role: RoleArg,
+    },
+    /// Revoke a previously granted role. Match criteria are
+    /// (user, install, repo, role) — `--repo` MUST exactly match
+    /// the grant being revoked (NULL grants are NOT matched by a
+    /// repo-narrowed revoke).
+    Revoke {
+        #[arg(long, group = "user_revoke_target")]
+        login: Option<String>,
+        #[arg(long, group = "user_revoke_target")]
+        user_id: Option<i64>,
+        #[arg(long)]
+        install: i64,
+        #[arg(long)]
+        repo: Option<i64>,
+        #[arg(long, value_enum)]
+        role: RoleArg,
+    },
+    /// List grants, optionally filtered by install id. With
+    /// `--users` instead, lists every known `github_user` row
+    /// (independent of role grants).
+    List {
+        #[arg(long, conflicts_with = "users")]
+        install: Option<i64>,
+        #[arg(long)]
+        users: bool,
+    },
+}
+
+/// Clap-facing copy of `sbgh_core::models::UserRole` so the CLI can
+/// surface `--help`-friendly choices without making sbgh-core depend
+/// on clap. Three variants total; the conversion is trivial.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum RoleArg {
+    Admin,
+    TriggerPrBenchmark,
+    ViewResults,
+}
+
+impl From<RoleArg> for UserRole {
+    fn from(r: RoleArg) -> Self {
+        match r {
+            RoleArg::Admin => UserRole::Admin,
+            RoleArg::TriggerPrBenchmark => UserRole::TriggerPrBenchmark,
+            RoleArg::ViewResults => UserRole::ViewResults,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -284,6 +364,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Installer { action } => run_installer(action).await,
         Command::Repo { action } => run_repo(action).await,
         Command::Policy { action } => run_policy(action).await,
+        Command::User { action } => run_user(action).await,
     }
 }
 
@@ -615,6 +696,137 @@ async fn run_policy_trigger(
                     if r.is_enabled { "ENABLED " } else { "disabled" },
                     r.match_spec.0,
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_user(action: UserAction) -> anyhow::Result<()> {
+    let database_url =
+        std::env::var("DATABASE_URL").context("DATABASE_URL must be set (owner DSN)")?;
+    let pool = db::connect(&database_url)
+        .await
+        .context("connect to postgres")?;
+    let api_base =
+        std::env::var("SBGH_GH_API_BASE_URL").unwrap_or_else(|_| "https://api.github.com".into());
+
+    match action {
+        UserAction::Grant {
+            login,
+            user_id,
+            install,
+            repo,
+            role,
+        } => {
+            let outcome = match (login, user_id) {
+                (Some(l), None) => grant_role(&pool, &api_base, &l, install, repo, role.into())
+                    .await
+                    .context("grant role")?,
+                (None, Some(id)) => grant_role_by_user_id(&pool, id, install, repo, role.into())
+                    .await
+                    .context("grant role")?,
+                (None, None) => {
+                    return Err(anyhow!("exactly one of --login or --user-id is required"));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(anyhow!("--login and --user-id are mutually exclusive"));
+                }
+            };
+            let scope = outcome
+                .role
+                .github_repo_id
+                .map(|r| format!("repo={r}"))
+                .unwrap_or_else(|| "install-wide".into());
+            // Three message shapes:
+            //   - created=true → "granted" (new row)
+            //   - created=false, was revoked → "reactivated" (cleared revoked_at)
+            //   - created=false, was active → "already granted" (no-op)
+            // The post-soft-revoke store always returns revoked_at=NULL
+            // on success, so distinguishing reactivated from
+            // already-active needs the pre-call state — which we don't
+            // have here without a SELECT. Keep the two-state output
+            // for now; a future enhancement could return the prior
+            // revoked_at from grant_role for the precise message.
+            let verb = if outcome.created { "granted" } else { "granted (or reactivated)" };
+            println!(
+                "{}: id={} user={} install={} {} role={:?}",
+                verb,
+                outcome.role.id,
+                outcome.role.github_user_id,
+                outcome
+                    .role
+                    .github_installation_id,
+                scope,
+                outcome.role.granted_role,
+            );
+        }
+        UserAction::Revoke {
+            login,
+            user_id,
+            install,
+            repo,
+            role,
+        } => {
+            let row = match (login, user_id) {
+                (Some(l), None) => revoke_role(&pool, &api_base, &l, install, repo, role.into())
+                    .await
+                    .context("revoke role")?,
+                (None, Some(id)) => revoke_role_by_user_id(&pool, id, install, repo, role.into())
+                    .await
+                    .context("revoke role")?,
+                (None, None) => {
+                    return Err(anyhow!("exactly one of --login or --user-id is required"));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(anyhow!("--login and --user-id are mutually exclusive"));
+                }
+            };
+            println!(
+                "revoked: id={} user={} install={} repo={:?} role={:?}",
+                row.id,
+                row.github_user_id,
+                row.github_installation_id,
+                row.github_repo_id,
+                row.granted_role,
+            );
+        }
+        UserAction::List { install, users } => {
+            if users {
+                let rows = list_users(&pool)
+                    .await
+                    .context("list users")?;
+                if rows.is_empty() {
+                    println!("(no users known)");
+                    return Ok(());
+                }
+                for u in rows {
+                    println!("{:>12}  {:<24}  type={:?}", u.id, u.login, u.user_type);
+                }
+            } else {
+                let rows = list_roles(&pool, install)
+                    .await
+                    .context("list roles")?;
+                if rows.is_empty() {
+                    println!("(no grants matched)");
+                    return Ok(());
+                }
+                for r in rows {
+                    let scope = r
+                        .github_repo_id
+                        .map(|id| format!("repo={id}"))
+                        .unwrap_or_else(|| "install-wide".into());
+                    let status = if r.revoked_at.is_some() { "REVOKED " } else { "active  " };
+                    println!(
+                        "id={:<6} {} user={:>12} install={:>12} {:<20} role={:?}",
+                        r.id,
+                        status,
+                        r.github_user_id,
+                        r.github_installation_id,
+                        scope,
+                        r.granted_role,
+                    );
+                }
             }
         }
     }

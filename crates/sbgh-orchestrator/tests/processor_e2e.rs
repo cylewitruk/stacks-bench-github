@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use sbgh_core::db::{
     IngestStore, NewWebhook, Pool, PostgresIngestStore, PostgresInstallationStore,
-    PostgresPolicyStore, PostgresRepoStore, PostgresWebhookInbox, setup_pg,
+    PostgresPolicyStore, PostgresRepoStore, PostgresUserStore, PostgresWebhookInbox, setup_pg,
 };
 use sbgh_core::github::RepoRef;
 use sbgh_core::github::test_support::FakeGitHub;
@@ -56,7 +56,7 @@ fn issue_comment_webhook(delivery: &str, body: &str, is_pr: bool) -> NewWebhook 
         "comment": {
             "id": 1,
             "body": body,
-            "user": { "login": "alice" },
+            "user": { "id": 99, "login": "alice", "type": "User" },
             "author_association": "MEMBER",
         },
         "issue": {
@@ -64,7 +64,7 @@ fn issue_comment_webhook(delivery: &str, body: &str, is_pr: bool) -> NewWebhook 
             "pull_request": pull_request,
         },
         "repository": { "full_name": "o/r" },
-        "sender": { "login": "alice" },
+        "sender": { "id": 99, "login": "alice", "type": "User" },
         "installation": { "id": 42 },
     });
     let size = serde_json::to_vec(&payload)
@@ -124,11 +124,13 @@ fn build_processor_with_gh(pool: &Pool, gh: Arc<FakeGitHub>) -> WebhookProcessor
     let installation_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
     let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
     let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
+    let user_store = Arc::new(PostgresUserStore::new(pool.clone()));
     let classifier = BasicClassifier::builder()
         .with_handler(Arc::new(IssueCommentHandler::new(
             repo_store.clone(),
             policy_store.clone(),
             installation_store.clone(),
+            user_store.clone(),
             gh.clone(),
         )))
         .with_handler(Arc::new(InstallationHandler::new(
@@ -140,12 +142,14 @@ fn build_processor_with_gh(pool: &Pool, gh: Arc<FakeGitHub>) -> WebhookProcessor
             repo_store.clone(),
             installation_store.clone(),
             policy_store.clone(),
+            user_store.clone(),
             gh,
         )))
         .with_handler(Arc::new(PullRequestHandler::new(
             repo_store,
             policy_store.clone(),
             installation_store.clone(),
+            user_store,
         )))
         .with_handler(Arc::new(PushHandler::new(policy_store.clone(), installation_store.clone())))
         .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store)))
@@ -239,6 +243,20 @@ async fn pipeline_classifies_pr_benchmark_as_would_enqueue_job_in_phase1() {
     .execute(&pool)
     .await
     .unwrap();
+    // Slice 6: /benchmark sender (alice, id=99 from
+    // issue_comment_webhook) needs the trigger_pr_benchmark role on
+    // the target install/repo for the new authz gate to accept.
+    sqlx::query("INSERT INTO github_user (id, login, user_type) VALUES (99, 'alice', 'user')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO github_user_role (github_user_id, github_installation_id, github_repo_id, \
+         granted_role) VALUES (99, 42, 10, 'trigger_pr_benchmark')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let ingest = PostgresIngestStore::new(pool.clone());
     ingest
@@ -279,6 +297,101 @@ async fn pipeline_classifies_pr_benchmark_as_would_enqueue_job_in_phase1() {
     let (status, outcome) = read_row_status(&pool, "e2e-bench").await;
     assert_eq!(status, WebhookStatus::Processed);
     assert_eq!(outcome, Some(WebhookOutcome::WouldEnqueueJob));
+}
+
+#[tokio::test]
+async fn pipeline_benchmark_without_role_grant_is_denied_unauthorized() {
+    // Slice 6 e2e: same setup as the happy-path test above, EXCEPT no
+    // `github_user_role` row is seeded. The outcome flips from
+    // `WouldEnqueueJob` to `DeniedUnauthorized`. The user is still
+    // upserted (audit trail for the denied attempt).
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r'), (20, 'alice', 'r')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_allowed_org(&pool, 42, "octo-org").await;
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (42, 42, 'octo-org', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation_repo (github_installation_id, github_repo_id) VALUES \
+         (42, 10)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO target_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (42, 10, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_repo_policy (github_installation_id, github_repo_id, is_enabled) \
+         VALUES (42, 20, TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // NO github_user_role row — alice (id=99) is unknown to the
+    // authz table.
+
+    let ingest = PostgresIngestStore::new(pool.clone());
+    ingest
+        .ingest_webhook(&issue_comment_webhook("e2e-unauth", "/benchmark run", true))
+        .await
+        .unwrap();
+
+    let gh = Arc::new(FakeGitHub::new());
+    gh.set_pull_request(
+        "o/r",
+        1,
+        sbgh_core::github::PullRequestSide {
+            repo: sbgh_core::github::RepoRef {
+                id: 10,
+                owner: "o".into(),
+                name: "r".into(),
+            },
+            sha: "basesha".into(),
+            branch: "main".into(),
+        },
+        sbgh_core::github::PullRequestSide {
+            repo: sbgh_core::github::RepoRef {
+                id: 20,
+                owner: "alice".into(),
+                name: "r".into(),
+            },
+            sha: "headsha".into(),
+            branch: "feat".into(),
+        },
+    );
+    let processor = build_processor_with_gh(&pool, gh);
+    processor
+        .process_one()
+        .await
+        .unwrap();
+
+    let (status, outcome) = read_row_status(&pool, "e2e-unauth").await;
+    assert_eq!(status, WebhookStatus::Denied);
+    assert_eq!(outcome, Some(WebhookOutcome::DeniedUnauthorized));
+
+    // Audit trail invariant: even denied attempts upsert the user.
+    let upserted: Option<String> =
+        sqlx::query_scalar("SELECT login FROM github_user WHERE id = 99")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(upserted.as_deref(), Some("alice"));
 }
 
 #[tokio::test]
@@ -956,6 +1069,7 @@ fn pull_request_webhook(
         "repository": { "id": base_repo_id, "full_name": "o/r" },
         "pull_request": {
             "number": 1,
+            "user": { "id": 99, "login": "alice", "type": "User" },
             "head": {
                 "ref": "feat",
                 "sha": "headsha",

@@ -33,7 +33,7 @@ CREATE TYPE github_account_type AS ENUM (
 );
 
 CREATE TYPE user_role AS ENUM (
-    'admin', -- full control
+    'admin', -- IMPLIES all other roles within the same grant scope (install or repo)
     'trigger_pr_benchmark', -- can post /benchmark on PRs
     'view_results' -- read-only
 );
@@ -368,6 +368,18 @@ CREATE UNIQUE INDEX github_user_login_lower_uniq ON github_user (lower(login));
 --
 -- Column is `granted_role` (not `role`) to avoid the reserved-keyword
 -- collision with PostgreSQL's CREATE ROLE / GRANT TO ROLE syntax.
+--
+-- Soft-revoke: revoke sets revoked_at = NOW() rather than DELETEing
+-- the row, matching the "operator-curated rows soft-disable only"
+-- principle. Re-grants clear revoked_at on the existing row
+-- (preserving granted_at). has_role at runtime filters
+-- revoked_at IS NULL.
+--
+-- Role implication: an `admin` grant implies all other roles within
+-- the SAME scope (install-wide admin → also has trigger_pr_benchmark
+-- on any repo in that install; repo-scoped admin → only on that
+-- repo). Encoded in `has_role`'s WHERE clause, not in this table —
+-- admin grants are stored as their own rows for auditability.
 CREATE TABLE github_user_role (
     id bigserial PRIMARY KEY,
     github_user_id bigint NOT NULL REFERENCES github_user (id),
@@ -375,10 +387,14 @@ CREATE TABLE github_user_role (
     github_repo_id bigint REFERENCES github_repo (id),
     granted_role user_role NOT NULL,
     granted_at timestamptz NOT NULL DEFAULT NOW(),
-    granted_by_github_user_id bigint REFERENCES github_user (id)
+    granted_by_github_user_id bigint REFERENCES github_user (id),
+    revoked_at timestamptz
 );
 
 CREATE UNIQUE INDEX github_user_role_uniq ON github_user_role (github_user_id, github_installation_id, github_repo_id, granted_role) NULLS NOT DISTINCT;
+
+-- Partial index on the active-grants subset for has_role.
+CREATE INDEX github_user_role_active_idx ON github_user_role (github_user_id, github_installation_id, granted_role) WHERE revoked_at IS NULL;
 
 -- ─── Trigger policy ─────────────────────────────────────────────────────
 -- Per-installation subscriptions for auto-triggered job kinds

@@ -74,9 +74,19 @@ pub struct Repository {
     pub full_name: String,
 }
 
+/// GH user/account reference shipped on the `sender` of every event and
+/// on PR `user` (author). Slice 6 reads `id` + `account_type` for the
+/// `github_user` upsert; pre-slice-6 only `login` was needed. GitHub
+/// returns `"User"` / `"Organization"` / `"Bot"` for `type`; we keep
+/// the raw string here and translate at the classifier boundary so
+/// payloads with unexpected casing surface a clear error rather than
+/// failing deserialisation silently.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct User {
+    pub id: i64,
     pub login: String,
+    #[serde(rename = "type")]
+    pub account_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -175,6 +185,9 @@ pub struct PullRequestBody {
     pub number: i64,
     pub head: PullRequestBranchRef,
     pub base: PullRequestBranchRef,
+    /// PR author. Slice 6 upserts this into `github_user` so slice 7's
+    /// `github_pull_request.author_github_user_id` FK target exists.
+    pub user: User,
 }
 
 /// PR head/base entry. `repo` is `Option` because GitHub may omit it

@@ -839,6 +839,110 @@ async fn orch_can_select_and_update_trigger_policy_but_not_insert_or_delete() {
     .expect_err("orch INSERT on trigger_policy MUST be rejected");
 }
 
+// ─── Slice 6: github_user + github_user_role grants ───────────────────
+
+#[tokio::test]
+async fn orch_can_select_insert_update_github_user_but_not_delete() {
+    // Lazy upsert: orch INSERTs on first sighting and UPDATEs on PK
+    // conflict (display field refresh). No DELETE — user identity
+    // is forever (same rationale as github_repo).
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let orch = orch_pool(&pool).await;
+
+    sqlx::query("INSERT INTO github_user (id, login, user_type) VALUES (42, 'alice', 'user')")
+        .execute(&orch)
+        .await
+        .expect("orch INSERT on github_user must succeed (lazy upsert path)");
+    sqlx::query("UPDATE github_user SET login = 'alice-renamed' WHERE id = 42")
+        .execute(&orch)
+        .await
+        .expect("orch UPDATE on github_user must succeed (display refresh)");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_user WHERE id = 42")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on github_user must succeed");
+    assert_eq!(count, 1);
+    sqlx::query("DELETE FROM github_user WHERE id = 42")
+        .execute(&orch)
+        .await
+        .expect_err("orch DELETE on github_user MUST be rejected");
+}
+
+#[tokio::test]
+async fn orch_can_select_github_user_role_but_not_write() {
+    // Operator-curated: only the CLI (owner) may grant or revoke
+    // roles. A compromised processor MUST NOT be able to grant
+    // itself trigger_pr_benchmark.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    seed_install_repo(&pool, 100, 10).await;
+    // Seed as owner.
+    sqlx::query("INSERT INTO github_user (id, login, user_type) VALUES (42, 'alice', 'user')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO github_user_role (github_user_id, github_installation_id, granted_role) \
+         VALUES (42, 100, 'trigger_pr_benchmark')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let orch = orch_pool(&pool).await;
+    // SELECT must succeed (processor's has_role path).
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_user_role")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on github_user_role must succeed");
+    assert_eq!(count, 1);
+    // INSERT must be rejected.
+    sqlx::query(
+        "INSERT INTO github_user_role (github_user_id, github_installation_id, granted_role) \
+         VALUES (42, 100, 'admin')",
+    )
+    .execute(&orch)
+    .await
+    .expect_err("orch INSERT on github_user_role MUST be rejected");
+    // UPDATE must be rejected.
+    sqlx::query("UPDATE github_user_role SET granted_role = 'admin' WHERE github_user_id = 42")
+        .execute(&orch)
+        .await
+        .expect_err("orch UPDATE on github_user_role MUST be rejected");
+    // DELETE must be rejected.
+    sqlx::query("DELETE FROM github_user_role WHERE github_user_id = 42")
+        .execute(&orch)
+        .await
+        .expect_err("orch DELETE on github_user_role MUST be rejected");
+}
+
+#[tokio::test]
+async fn handler_cannot_touch_user_or_role_tables() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let handler = handler_pool(&pool).await;
+    for table in ["github_user", "github_user_role"] {
+        let q = format!("SELECT 1 FROM {table} LIMIT 1");
+        sqlx::query(&q)
+            .fetch_optional(&handler)
+            .await
+            .expect_err(&format!("handler SELECT on {table} MUST be rejected"));
+    }
+}
+
 #[tokio::test]
 async fn handler_cannot_touch_any_policy_table() {
     let Some((_c, pool)) = setup_pg().await else {

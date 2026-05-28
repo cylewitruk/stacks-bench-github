@@ -190,6 +190,25 @@ impl InstallationStore for PostgresInstallationStore {
         .execute(&mut *tx)
         .await?;
 
+        // Slice 6 post-review fix: also soft-revoke every active
+        // `github_user_role` row for this install (both repo-scoped
+        // and install-wide grants). Without this, a grant made while
+        // the install was active would survive the install delete
+        // AND re-create — the operator would have to explicitly
+        // revoke every prior grant before reinstalling, or the new
+        // install would inherit them silently.
+        sqlx::query(
+            r#"
+            UPDATE github_user_role
+               SET revoked_at = NOW()
+             WHERE github_installation_id = $1
+               AND revoked_at IS NULL
+            "#,
+        )
+        .bind(installation_id)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(DeleteInstallationOutcome {
             install_found: true,

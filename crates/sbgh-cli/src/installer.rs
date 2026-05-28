@@ -18,11 +18,11 @@
 //! not found, GitHub API rejected the request, etc.) without
 //! string-matching.
 
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use sbgh_core::db::Pool;
-use sbgh_core::models::{AllowedInstaller, GithubAccountType};
-use serde::Deserialize;
+use sbgh_core::models::AllowedInstaller;
 use thiserror::Error;
+
+use crate::gh_resolve::{ResolveError, resolve_account};
 
 #[derive(Debug, Error)]
 pub enum InstallerError {
@@ -38,6 +38,17 @@ pub enum InstallerError {
     Db(#[from] sqlx::Error),
     #[error("unsupported GitHub account type: {0}")]
     UnsupportedAccountType(String),
+}
+
+impl From<ResolveError> for InstallerError {
+    fn from(e: ResolveError) -> Self {
+        match e {
+            ResolveError::AccountNotFound(s) => Self::AccountNotFound(s),
+            ResolveError::GithubRejected { status, body } => Self::GithubRejected { status, body },
+            ResolveError::Http(e) => Self::Http(e),
+            ResolveError::UnsupportedAccountType(s) => Self::UnsupportedAccountType(s),
+        }
+    }
 }
 
 /// Resolve `login` → `(account_id, account_type)` via GitHub's `/users/{login}`
@@ -124,60 +135,4 @@ pub async fn list_installers(pool: &Pool) -> Result<Vec<AllowedInstaller>, Insta
     .fetch_all(pool)
     .await?;
     Ok(rows)
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedAccount {
-    id: i64,
-    login: String,
-    account_type: GithubAccountType,
-}
-
-async fn resolve_account(
-    api_base_url: &str,
-    login: &str,
-) -> Result<ResolvedAccount, InstallerError> {
-    let url = format!("{}/users/{}", api_base_url.trim_end_matches('/'), login);
-
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
-    headers.insert(USER_AGENT, HeaderValue::from_static("sbgh-cli"));
-
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .headers(headers)
-        .send()
-        .await?;
-
-    if resp.status().as_u16() == 404 {
-        return Err(InstallerError::AccountNotFound(login.to_string()));
-    }
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_default();
-        return Err(InstallerError::GithubRejected { status, body });
-    }
-
-    #[derive(Deserialize)]
-    struct UserResp {
-        id: i64,
-        login: String,
-        #[serde(rename = "type")]
-        kind: String,
-    }
-    let body: UserResp = resp.json().await?;
-    let account_type = match body.kind.as_str() {
-        "User" => GithubAccountType::User,
-        "Organization" => GithubAccountType::Organization,
-        "Bot" => GithubAccountType::Bot,
-        other => return Err(InstallerError::UnsupportedAccountType(other.to_string())),
-    };
-    Ok(ResolvedAccount {
-        id: body.id,
-        login: body.login,
-        account_type,
-    })
 }

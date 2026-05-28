@@ -12,7 +12,7 @@ use clap::Parser;
 use sbgh_core::config::OrchestratorConfig;
 use sbgh_core::db::{
     self, PostgresInstallationStore, PostgresJobStore, PostgresPolicyStore, PostgresRepoStore,
-    PostgresWebhookInbox,
+    PostgresUserStore, PostgresWebhookInbox,
 };
 use sbgh_core::github::{AppCredentials, InstallationTokenCache, OctocrabClient};
 use tracing_subscriber::prelude::*;
@@ -72,12 +72,14 @@ async fn main() -> anyhow::Result<()> {
     let webhook_inbox = Arc::new(PostgresWebhookInbox::new(pool.clone()));
     let installation_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
     let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
-    let policy_store = Arc::new(PostgresPolicyStore::new(pool));
+    let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
+    let user_store = Arc::new(PostgresUserStore::new(pool));
     let classifier = BasicClassifier::builder()
         .with_handler(Arc::new(IssueCommentHandler::new(
             repo_store.clone(),
             policy_store.clone(),
             installation_store.clone(),
+            user_store.clone(),
             gh.clone(),
         )))
         .with_handler(Arc::new(InstallationHandler::new(
@@ -89,12 +91,14 @@ async fn main() -> anyhow::Result<()> {
             repo_store.clone(),
             installation_store.clone(),
             policy_store.clone(),
+            user_store.clone(),
             gh.clone(),
         )))
         .with_handler(Arc::new(PullRequestHandler::new(
             repo_store,
             policy_store.clone(),
             installation_store.clone(),
+            user_store,
         )))
         .with_handler(Arc::new(PushHandler::new(policy_store.clone(), installation_store.clone())))
         .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store)))
