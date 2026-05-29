@@ -263,6 +263,59 @@ pub async fn apply_roles(
         .execute(&mut *tx)
         .await?;
 
+    // Slice 8: new-schema job tables.
+    //
+    // `job` is populated by the slice 9 processor (INSERT on create,
+    // UPDATE on claim → running → terminal transitions, UPDATE on
+    // stuck-claim sweep). No DELETE — completed jobs are historical
+    // records.
+    //
+    // `job_event` is append-only timeline writes (INSERT only); the
+    // processor + orchestrator both write to it.
+    //
+    // `job_metric`, `job_result` are write-once outcome companions
+    // (orchestrator INSERT after successful execution).
+    //
+    // `github_pull_request_job`, `github_webhook_job`, `github_user_job`
+    // are subject relations the slice 9 processor INSERTs alongside
+    // the job creation. UNIQUE constraints catch double-insert.
+    //
+    // Handler never touches any of these tables.
+    //
+    // Bigserial sequences: `job_event_id_seq` needs USAGE for the
+    // INSERT path; the other tables use UUID PKs (no sequence) or
+    // composite PKs (no sequence on the link tables).
+    sqlx::query(
+        "REVOKE ALL ON TABLE job, job_event, job_metric, job_result, github_pull_request_job, \
+         github_webhook_job, github_user_job FROM sbgh_handler, sbgh_orch",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("GRANT SELECT, INSERT, UPDATE ON TABLE job TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT ON TABLE job_event TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT USAGE ON SEQUENCE job_event_id_seq TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT ON TABLE job_metric TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT ON TABLE job_result TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT ON TABLE github_pull_request_job TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT ON TABLE github_webhook_job TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("GRANT SELECT, INSERT ON TABLE github_user_job TO sbgh_orch")
+        .execute(&mut *tx)
+        .await?;
+
     // USAGE on the schema is required even with table-level grants. CONNECT
     // on the database is implicit for any login role; no need to grant
     // explicitly.

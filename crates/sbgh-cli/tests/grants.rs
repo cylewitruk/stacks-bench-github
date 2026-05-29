@@ -987,6 +987,228 @@ async fn handler_cannot_touch_github_pull_request() {
         .expect_err("handler SELECT on github_pull_request MUST be rejected");
 }
 
+// ─── Slice 8: new-schema job tables ────────────────────────────────────
+
+#[tokio::test]
+async fn orch_can_select_insert_update_job_but_not_delete() {
+    // Slice 8: `job` is processor-written. INSERT on create + UPDATE
+    // on claim → running → terminal transitions + UPDATE on
+    // stuck-claim sweep. No DELETE.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    // Seed install/repo/membership so the job FK chain resolves.
+    seed_install_repo(&pool, 100, 10).await;
+    let orch = orch_pool(&pool).await;
+
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO job (github_installation_id, github_repo_id, job_kind, trigger_kind, \
+         git_ref_kind, git_ref_display) VALUES (100, 10, 'ad_hoc', 'pr_comment', 'branch', \
+         'main') RETURNING id",
+    )
+    .fetch_one(&orch)
+    .await
+    .expect("orch INSERT on job must succeed");
+    sqlx::query("UPDATE job SET status = 'claimed' WHERE id = $1")
+        .bind(id)
+        .execute(&orch)
+        .await
+        .expect("orch UPDATE on job must succeed");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job")
+        .fetch_one(&orch)
+        .await
+        .expect("orch SELECT on job must succeed");
+    assert_eq!(count, 1);
+    sqlx::query("DELETE FROM job WHERE id = $1")
+        .bind(id)
+        .execute(&orch)
+        .await
+        .expect_err("orch DELETE on job MUST be rejected");
+}
+
+#[tokio::test]
+async fn orch_can_select_insert_job_event_but_not_update_or_delete() {
+    // job_event is append-only.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    seed_install_repo(&pool, 100, 10).await;
+    let orch = orch_pool(&pool).await;
+    let job_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO job (github_installation_id, github_repo_id, job_kind, trigger_kind, \
+         git_ref_kind, git_ref_display) VALUES (100, 10, 'ad_hoc', 'pr_comment', 'branch', \
+         'main') RETURNING id",
+    )
+    .fetch_one(&orch)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO job_event (job_id, event_kind, event_status) VALUES ($1, 'queued', 'success')",
+    )
+    .bind(job_id)
+    .execute(&orch)
+    .await
+    .expect("orch INSERT on job_event must succeed");
+    sqlx::query("UPDATE job_event SET remark = 'oops' WHERE job_id = $1")
+        .bind(job_id)
+        .execute(&orch)
+        .await
+        .expect_err("orch UPDATE on job_event MUST be rejected (append-only)");
+    sqlx::query("DELETE FROM job_event WHERE job_id = $1")
+        .bind(job_id)
+        .execute(&orch)
+        .await
+        .expect_err("orch DELETE on job_event MUST be rejected");
+}
+
+#[tokio::test]
+async fn orch_can_insert_write_once_metric_and_result_but_not_update() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    seed_install_repo(&pool, 100, 10).await;
+    let orch = orch_pool(&pool).await;
+    let job_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO job (github_installation_id, github_repo_id, job_kind, trigger_kind, \
+         git_ref_kind, git_ref_display) VALUES (100, 10, 'ad_hoc', 'pr_comment', 'branch', \
+         'main') RETURNING id",
+    )
+    .fetch_one(&orch)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO job_metric (job_id, envelope_duration_us, replay_duration_us, \
+         total_duration_us, setup_duration_us, execution_duration_us, commit_duration_us, \
+         clarity_runtime, transactions, read_length, write_length, measured_blocks, \
+         warmup_blocks) VALUES ($1, 1,1,1,1,1,1,1,1,1,1,1,1)",
+    )
+    .bind(job_id)
+    .execute(&orch)
+    .await
+    .expect("orch INSERT on job_metric must succeed");
+    sqlx::query("UPDATE job_metric SET transactions = 99 WHERE job_id = $1")
+        .bind(job_id)
+        .execute(&orch)
+        .await
+        .expect_err("orch UPDATE on job_metric MUST be rejected (write-once)");
+
+    sqlx::query("INSERT INTO job_result (job_id, archive_dir) VALUES ($1, '/runs/x')")
+        .bind(job_id)
+        .execute(&orch)
+        .await
+        .expect("orch INSERT on job_result must succeed");
+    sqlx::query("UPDATE job_result SET archive_dir = '/runs/y' WHERE job_id = $1")
+        .bind(job_id)
+        .execute(&orch)
+        .await
+        .expect_err("orch UPDATE on job_result MUST be rejected (write-once)");
+}
+
+#[tokio::test]
+async fn orch_can_select_insert_subject_relation_tables_but_not_update() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    seed_install_repo(&pool, 100, 10).await;
+    let orch = orch_pool(&pool).await;
+    let job_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO job (github_installation_id, github_repo_id, job_kind, trigger_kind, \
+         git_ref_kind, git_ref_display) VALUES (100, 10, 'ad_hoc', 'pr_comment', 'branch', \
+         'main') RETURNING id",
+    )
+    .fetch_one(&orch)
+    .await
+    .unwrap();
+    // Seed FK targets via owner-pool so orch's restricted grants don't
+    // block.
+    let webhook_id: i64 = sqlx::query_scalar(
+        "INSERT INTO github_webhook (delivery_id, event_type, payload_size_bytes) VALUES \
+         ('grants-1', 'issue_comment', 0) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO github_user (id, login, user_type) VALUES (42, 'alice', 'user')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pr_id: i64 = sqlx::query_scalar(
+        "INSERT INTO github_pull_request (target_github_repo_id, source_github_repo_id, \
+         pr_number, title, author_github_user_id) VALUES (10, 10, 1, 't', 42) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("INSERT INTO github_webhook_job (github_webhook_id, job_id) VALUES ($1, $2)")
+        .bind(webhook_id)
+        .bind(job_id)
+        .execute(&orch)
+        .await
+        .expect("orch INSERT on github_webhook_job must succeed");
+    sqlx::query("INSERT INTO github_user_job (github_user_id, job_id) VALUES (42, $1)")
+        .bind(job_id)
+        .execute(&orch)
+        .await
+        .expect("orch INSERT on github_user_job must succeed");
+    sqlx::query(
+        "INSERT INTO github_pull_request_job (job_id, github_pull_request_id) VALUES ($1, $2)",
+    )
+    .bind(job_id)
+    .bind(pr_id)
+    .execute(&orch)
+    .await
+    .expect("orch INSERT on github_pull_request_job must succeed");
+
+    // No UPDATE on any of the link tables — they're insert-only audit
+    // records.
+    sqlx::query("UPDATE github_webhook_job SET created_at = NOW() WHERE job_id = $1")
+        .bind(job_id)
+        .execute(&orch)
+        .await
+        .expect_err("orch UPDATE on github_webhook_job MUST be rejected");
+}
+
+#[tokio::test]
+async fn handler_cannot_touch_any_slice_8_table() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    apply_roles(&pool, HANDLER_PW, ORCH_PW)
+        .await
+        .unwrap();
+    let handler = handler_pool(&pool).await;
+    for table in [
+        "job",
+        "job_event",
+        "job_metric",
+        "job_result",
+        "github_pull_request_job",
+        "github_webhook_job",
+        "github_user_job",
+    ] {
+        let q = format!("SELECT 1 FROM {table} LIMIT 1");
+        sqlx::query(&q)
+            .fetch_optional(&handler)
+            .await
+            .expect_err(&format!("handler SELECT on {table} MUST be rejected"));
+    }
+}
+
 #[tokio::test]
 async fn handler_cannot_touch_user_or_role_tables() {
     let Some((_c, pool)) = setup_pg().await else {

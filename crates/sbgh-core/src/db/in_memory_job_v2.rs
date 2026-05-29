@@ -1,0 +1,440 @@
+//! In-memory `JobV2Store` for unit tests. Single Mutex serialises
+//! access; mirrors the Postgres semantics for queued-state
+//! invariants, claim handoff, stuck-claim sweep, and the
+//! conditional `(id, claim_token)` writes.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use async_trait::async_trait;
+use chrono::{Duration, Utc};
+use uuid::Uuid;
+
+use crate::Result;
+use crate::db::job_v2::{CreatedJob, JobV2Store};
+use crate::models::{
+    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, JobCreationRequest, JobEvent,
+    JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, JobV2, NewJobEvent, NewJobV2,
+    ResolvedCommit, TerminalJobStatus,
+};
+
+#[derive(Default)]
+pub struct InMemoryJobV2Store {
+    state: Mutex<State>,
+    next_event_id: AtomicI64,
+}
+
+#[derive(Default)]
+struct State {
+    jobs: HashMap<Uuid, JobV2>,
+    /// Insertion order — `claim_next_queued` walks in (created_at, id)
+    /// order, so we sort on demand.
+    insertion_order: Vec<Uuid>,
+    events: Vec<JobEvent>,
+    metrics: HashMap<Uuid, JobMetric>,
+    results: HashMap<Uuid, JobResult>,
+    webhook_links: Vec<GithubWebhookJob>,
+    user_links: Vec<GithubUserJob>,
+    pr_links: Vec<GithubPullRequestJob>,
+}
+
+impl InMemoryJobV2Store {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            next_event_id: AtomicI64::new(1),
+        }
+    }
+
+    /// Test-only accessor: returns true iff a `github_webhook_job`
+    /// link exists for the given job_id right now. Used by the
+    /// concurrent-visibility regression test (slice 8 second-pass
+    /// review fix) to assert that when a parallel `claim_next_queued`
+    /// observed a job, the corresponding webhook link was also
+    /// already visible — i.e. there was no partial-commit window.
+    pub fn has_webhook_link_for_job(&self, job_id: Uuid) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .webhook_links
+            .iter()
+            .any(|l| l.job_id == job_id)
+    }
+}
+
+#[async_trait]
+impl JobV2Store for InMemoryJobV2Store {
+    async fn insert_job(&self, new: &NewJobV2) -> Result<JobV2> {
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        let job = JobV2 {
+            id,
+            github_installation_id: new.github_installation_id,
+            github_repo_id: new.github_repo_id,
+            status: JobStatus::Queued,
+            job_kind: new.job_kind,
+            trigger_kind: new.trigger_kind,
+            git_ref_kind: new.git_ref_kind,
+            git_ref_display: new.git_ref_display.clone(),
+            git_commit_hash: new.git_commit_hash.clone(),
+            git_committed_at: new.git_committed_at,
+            claim_token: None,
+            claimed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut s = self.state.lock().unwrap();
+        s.jobs.insert(id, job.clone());
+        s.insertion_order.push(id);
+        Ok(job)
+    }
+
+    async fn create_job_with_links(&self, request: &JobCreationRequest) -> Result<CreatedJob> {
+        // Post-second-review M1 fix: take the mutex ONCE for the entire
+        // creation so concurrent in-memory tests can't observe (or
+        // claim) a partially-created job between the sub-inserts.
+        // Mirrors the all-or-nothing semantic of the Postgres single
+        // transaction.
+        //
+        // Build all the rows locally first, validate the UNIQUE
+        // constraints against the still-untouched state, THEN commit
+        // every mutation at the end. No revert path needed: nothing is
+        // visible to other observers until the final commit block, so
+        // any failure during validation is a clean early-return.
+        let now = Utc::now();
+
+        // Validate UNIQUE constraints against current state (read-only).
+        let job_id = Uuid::new_v4();
+        {
+            let s = self.state.lock().unwrap();
+            if s.webhook_links
+                .iter()
+                .any(|l| l.job_id == job_id)
+            {
+                return Err(crate::Error::Other(anyhow::anyhow!(
+                    "github_webhook_job UNIQUE(job_id) impossibly conflicted: {job_id}"
+                )));
+            }
+            // No other UNIQUE pre-checks needed: job_id is freshly
+            // generated; user_link / pr_link UNIQUEs are on job_id.
+            // (Whether the user_id / pr_id FKs would resolve is an
+            // app-layer concern not modelled in the in-memory store.)
+            drop(s);
+        }
+
+        // Build all the rows locally.
+        let job = JobV2 {
+            id: job_id,
+            github_installation_id: request
+                .new_job
+                .github_installation_id,
+            github_repo_id: request.new_job.github_repo_id,
+            status: JobStatus::Queued,
+            job_kind: request.new_job.job_kind,
+            trigger_kind: request.new_job.trigger_kind,
+            git_ref_kind: request.new_job.git_ref_kind,
+            git_ref_display: request
+                .new_job
+                .git_ref_display
+                .clone(),
+            git_commit_hash: request
+                .new_job
+                .git_commit_hash
+                .clone(),
+            git_committed_at: request
+                .new_job
+                .git_committed_at,
+            claim_token: None,
+            claimed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let webhook_link = GithubWebhookJob {
+            github_webhook_id: request.github_webhook_id,
+            job_id,
+            created_at: now,
+        };
+        let user_link = request
+            .triggering_user_id
+            .map(|user_id| GithubUserJob {
+                github_user_id: user_id,
+                job_id,
+                created_at: now,
+            });
+        let pull_request_link = request
+            .pull_request_link
+            .as_ref()
+            .map(|pr| GithubPullRequestJob {
+                job_id,
+                github_pull_request_id: pr.github_pull_request_id,
+                triggering_comment_id: pr.triggering_comment_id,
+                created_at: now,
+            });
+        let queued_event = JobEvent {
+            id: self
+                .next_event_id
+                .fetch_add(1, Ordering::SeqCst),
+            job_id,
+            event_kind: JobEventKind::Queued,
+            event_status: JobEventStatus::Success,
+            occurred_at: now,
+            github_comment_id: None,
+            remark: None,
+            detail: request
+                .queued_event_detail
+                .clone()
+                .map(sqlx::types::Json),
+        };
+
+        // Commit: single mutex acquisition for ALL mutations. Nothing
+        // is visible to concurrent readers until this block returns.
+        let mut s = self.state.lock().unwrap();
+        s.jobs
+            .insert(job_id, job.clone());
+        s.insertion_order.push(job_id);
+        s.webhook_links
+            .push(webhook_link.clone());
+        if let Some(ref link) = user_link {
+            s.user_links
+                .push(link.clone());
+        }
+        if let Some(ref link) = pull_request_link {
+            s.pr_links.push(link.clone());
+        }
+        s.events
+            .push(queued_event.clone());
+
+        Ok(CreatedJob {
+            job,
+            webhook_link,
+            user_link,
+            pull_request_link,
+            queued_event,
+        })
+    }
+
+    async fn lookup_job(&self, job_id: Uuid) -> Result<Option<JobV2>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&job_id)
+            .cloned())
+    }
+
+    async fn claim_next_queued(&self, claim_token: Uuid) -> Result<Option<JobV2>> {
+        let mut s = self.state.lock().unwrap();
+        // Walk in insertion order (FIFO; mirrors the Postgres index ordering).
+        let pick = s
+            .insertion_order
+            .iter()
+            .find(|id| {
+                s.jobs
+                    .get(id)
+                    .is_some_and(|j| j.status == JobStatus::Queued)
+            })
+            .copied();
+        let Some(id) = pick else {
+            return Ok(None);
+        };
+        let job = s.jobs.get_mut(&id).unwrap();
+        job.status = JobStatus::Claimed;
+        job.claim_token = Some(claim_token);
+        job.claimed_at = Some(Utc::now());
+        job.updated_at = Utc::now();
+        Ok(Some(job.clone()))
+    }
+
+    async fn mark_running(
+        &self,
+        job_id: Uuid,
+        claim_token: Uuid,
+        resolved_commit: Option<ResolvedCommit>,
+    ) -> Result<bool> {
+        let mut s = self.state.lock().unwrap();
+        let Some(job) = s.jobs.get_mut(&job_id) else {
+            return Ok(false);
+        };
+        if job.status != JobStatus::Claimed || job.claim_token != Some(claim_token) {
+            return Ok(false);
+        }
+        job.status = JobStatus::Running;
+        if let Some(rc) = resolved_commit {
+            job.git_commit_hash = Some(rc.hash);
+            job.git_committed_at = Some(rc.committed_at);
+        }
+        job.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn mark_terminal(
+        &self,
+        job_id: Uuid,
+        claim_token: Uuid,
+        terminal_status: TerminalJobStatus,
+    ) -> Result<bool> {
+        let mut s = self.state.lock().unwrap();
+        let Some(job) = s.jobs.get_mut(&job_id) else {
+            return Ok(false);
+        };
+        if job.status != JobStatus::Running || job.claim_token != Some(claim_token) {
+            return Ok(false);
+        }
+        job.status = terminal_status.into();
+        job.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn sweep_stuck_claims(&self, lease: Duration) -> Result<u64> {
+        let cutoff = Utc::now() - lease;
+        let mut s = self.state.lock().unwrap();
+        let mut recovered = 0u64;
+        for job in s.jobs.values_mut() {
+            if job.status == JobStatus::Claimed
+                && job
+                    .claimed_at
+                    .map(|t| t < cutoff)
+                    .unwrap_or(false)
+            {
+                job.status = JobStatus::Queued;
+                job.claim_token = None;
+                job.claimed_at = None;
+                job.updated_at = Utc::now();
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
+    async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {
+        let row = JobEvent {
+            id: self
+                .next_event_id
+                .fetch_add(1, Ordering::SeqCst),
+            job_id: new.job_id,
+            event_kind: new.event_kind,
+            event_status: new.event_status,
+            occurred_at: Utc::now(),
+            github_comment_id: new.github_comment_id,
+            remark: new.remark.clone(),
+            detail: new
+                .detail
+                .clone()
+                .map(sqlx::types::Json),
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .events
+            .push(row.clone());
+        Ok(row)
+    }
+
+    async fn record_metric(&self, metric: &JobMetric) -> Result<()> {
+        // Slice 8 (post-review L1 fix): mirror the Postgres write-once
+        // PK enforcement. The original impl silently overwrote on
+        // duplicate, which could mask double-write bugs in later
+        // tests that exercise the in-memory store.
+        let mut s = self.state.lock().unwrap();
+        if s.metrics
+            .contains_key(&metric.job_id)
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "job_metric write-once: duplicate row for job_id={}",
+                metric.job_id
+            )));
+        }
+        s.metrics
+            .insert(metric.job_id, metric.clone());
+        Ok(())
+    }
+
+    async fn record_result(&self, result: &JobResult) -> Result<()> {
+        // Same write-once semantics as `record_metric`.
+        let mut s = self.state.lock().unwrap();
+        if s.results
+            .contains_key(&result.job_id)
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "job_result write-once: duplicate row for job_id={}",
+                result.job_id
+            )));
+        }
+        s.results
+            .insert(result.job_id, result.clone());
+        Ok(())
+    }
+
+    async fn link_to_webhook(&self, webhook_id: i64, job_id: Uuid) -> Result<GithubWebhookJob> {
+        // Slice 8 (post-review L1 fix): mirror the Postgres
+        // `UNIQUE (job_id)` on github_webhook_job. Postgres rejects
+        // a second link for the same job; the in-memory mirror does
+        // the same so the test surfaces the bug rather than silently
+        // accumulating duplicate links.
+        let mut s = self.state.lock().unwrap();
+        if s.webhook_links
+            .iter()
+            .any(|l| l.job_id == job_id)
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "github_webhook_job UNIQUE(job_id): duplicate link for job_id={job_id}"
+            )));
+        }
+        let row = GithubWebhookJob {
+            github_webhook_id: webhook_id,
+            job_id,
+            created_at: Utc::now(),
+        };
+        s.webhook_links
+            .push(row.clone());
+        Ok(row)
+    }
+
+    async fn link_to_user(&self, user_id: i64, job_id: Uuid) -> Result<GithubUserJob> {
+        // Mirrors `UNIQUE (job_id)` on github_user_job.
+        let mut s = self.state.lock().unwrap();
+        if s.user_links
+            .iter()
+            .any(|l| l.job_id == job_id)
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "github_user_job UNIQUE(job_id): duplicate link for job_id={job_id}"
+            )));
+        }
+        let row = GithubUserJob {
+            github_user_id: user_id,
+            job_id,
+            created_at: Utc::now(),
+        };
+        s.user_links.push(row.clone());
+        Ok(row)
+    }
+
+    async fn link_to_pull_request(
+        &self,
+        pull_request_id: i64,
+        job_id: Uuid,
+        triggering_comment_id: Option<i64>,
+    ) -> Result<GithubPullRequestJob> {
+        // Mirrors `PRIMARY KEY (job_id)` on github_pull_request_job.
+        let mut s = self.state.lock().unwrap();
+        if s.pr_links
+            .iter()
+            .any(|l| l.job_id == job_id)
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "github_pull_request_job PK(job_id): duplicate link for job_id={job_id}"
+            )));
+        }
+        let row = GithubPullRequestJob {
+            job_id,
+            github_pull_request_id: pull_request_id,
+            triggering_comment_id,
+            created_at: Utc::now(),
+        };
+        s.pr_links.push(row.clone());
+        Ok(row)
+    }
+}

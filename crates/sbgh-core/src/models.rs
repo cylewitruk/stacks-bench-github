@@ -3,15 +3,52 @@ use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 use uuid::Uuid;
 
+/// Slice 8 added `Claimed` between `Queued` and `Running` per the
+/// pre-Phase-2 checkpoint. Lifecycle for the new-schema `job` table:
+/// `queued → claimed → running → completed/failed/cancelled`. The
+/// orchestrator's claim path transitions queued→claimed (with a
+/// claim_token + claimed_at), then claimed→running when execution
+/// actually starts. `job_status` is a shared Postgres type referenced
+/// by both legacy `jobs` and new `job`, so the Rust variant lands
+/// alongside the SQL `ALTER TYPE ADD VALUE` to keep sqlx
+/// deserialisation safe from either side. Legacy `jobs` code paths
+/// MUST NOT write `Claimed` — the value is only meaningful for the
+/// new pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "job_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
+    Claimed,
     Running,
     Completed,
     Failed,
     Cancelled,
+}
+
+/// Slice 8 (post-review fix): typed terminal-only status for
+/// `JobV2Store::mark_terminal`. Without this narrowing, the API
+/// accepted any `JobStatus` — a caller bug could transition
+/// `running → queued` while preserving `claim_token`/`claimed_at`,
+/// directly violating the queued-state invariant from the
+/// pre-Phase-2 checkpoint. Restricting the type to the three
+/// genuinely-terminal values makes the bug impossible at compile
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalJobStatus {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl From<TerminalJobStatus> for JobStatus {
+    fn from(t: TerminalJobStatus) -> Self {
+        match t {
+            TerminalJobStatus::Completed => JobStatus::Completed,
+            TerminalJobStatus::Failed => JobStatus::Failed,
+            TerminalJobStatus::Cancelled => JobStatus::Cancelled,
+        }
+    }
 }
 
 /// Lifecycle dimension for `github_webhook` rows. Mirrors the
@@ -358,4 +395,235 @@ pub struct NewJob {
     /// retried webhook deliveries don't enqueue duplicate jobs. `None` is
     /// only legal for synthetic events (tests, manual replays).
     pub github_delivery_id: Option<String>,
+}
+
+// ─── Slice 8: new-schema job tables ───────────────────────────────────
+//
+// Naming: the colliding type names use a `V2` suffix until slice 12
+// drops the legacy `Job` / `NewJob` types (slice 0 + 1 vintage). The
+// suffix is a temporary marker; non-colliding types (`JobEvent`,
+// `JobMetric`, `JobResult`, `Github*Job`) ship with their final names.
+
+/// Slice 8: row shape of the new-schema `job` table. Renamed to
+/// `Job` in slice 12 once the legacy `Job` is removed. `claim_token`
+/// + `claimed_at` invariants (app-layer enforced):
+///
+///   - `status = Queued` ⇔ both NULL
+///   - `status = Claimed` ⇔ both Some
+///   - `status IN (Running, Completed, Failed, Cancelled)` → both PRESERVED as
+///     audit
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JobV2 {
+    pub id: Uuid,
+    pub github_installation_id: i64,
+    pub github_repo_id: i64,
+    pub status: JobStatus,
+    pub job_kind: JobKind,
+    pub trigger_kind: TriggerKind,
+    pub git_ref_kind: GitRefKind,
+    pub git_ref_display: String,
+    pub git_commit_hash: Option<String>,
+    pub git_committed_at: Option<DateTime<Utc>>,
+    pub claim_token: Option<Uuid>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Slice 8 insert payload for the new-schema `job` table. Slice 9
+/// uses this from the processor's job-creation path; slice 8 only
+/// exercises it via integration tests.
+#[derive(Debug, Clone)]
+pub struct NewJobV2 {
+    pub github_installation_id: i64,
+    pub github_repo_id: i64,
+    pub job_kind: JobKind,
+    pub trigger_kind: TriggerKind,
+    pub git_ref_kind: GitRefKind,
+    pub git_ref_display: String,
+    /// Slice 9 leaves this `None` for triggers that enqueue with an
+    /// unresolved commit (e.g. branch tip at queue time); the
+    /// orchestrator's claim phase resolves and passes the resolved
+    /// values to `mark_running` via `ResolvedCommit`.
+    pub git_commit_hash: Option<String>,
+    pub git_committed_at: Option<DateTime<Utc>>,
+}
+
+/// Slice 8 (post-review fix): typed handoff for the
+/// resolve-commit-during-claim path. The orchestrator's claim phase
+/// resolves a branch tip to its concrete commit; `mark_running`
+/// writes both fields atomically with the status transition while
+/// holding the claim_token guard.
+#[derive(Debug, Clone)]
+pub struct ResolvedCommit {
+    pub hash: String,
+    pub committed_at: DateTime<Utc>,
+}
+
+/// Slice 8 (post-review fix): atomic-creation request for the
+/// `JobV2Store::create_job_with_links` boundary. Captures everything
+/// the slice 9 processor needs to insert in one transaction: the
+/// `job` row, the webhook→job ingest link, the optional owner link
+/// (absent for branch_push / tag_created / scheduled), the optional
+/// PR association, and the queued `job_event` (provenance JSONB
+/// keyed off `trigger_kind`).
+#[derive(Debug, Clone)]
+pub struct JobCreationRequest {
+    pub new_job: NewJobV2,
+    pub github_webhook_id: i64,
+    /// Owner of the job; populated for pr_comment / manual triggers,
+    /// `None` for triggers with no responsible user.
+    pub triggering_user_id: Option<i64>,
+    /// PR association (target = `new_job.github_repo_id`).
+    pub pull_request_link: Option<NewPullRequestLink>,
+    /// Provenance JSONB for the queued event. Shape is a tagged Rust
+    /// enum keyed off `new_job.trigger_kind` (slice 9 defines).
+    pub queued_event_detail: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPullRequestLink {
+    pub github_pull_request_id: i64,
+    /// `comment.id` for pr_comment trigger; None for others.
+    pub triggering_comment_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "job_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    AdHoc,
+    Baseline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "git_ref_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum GitRefKind {
+    Branch,
+    Tag,
+    Commit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "job_event_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum JobEventKind {
+    Queued,
+    Claimed,
+    ProvisionStarted,
+    ProvisionFinished,
+    PhaseBuildStarted,
+    PhaseBuildFinished,
+    PhaseBenchStarted,
+    PhaseBenchFinished,
+    TeardownStarted,
+    TeardownFinished,
+    CommentPosted,
+    CommentUpdated,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "job_event_status", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum JobEventStatus {
+    Started,
+    InProgress,
+    Success,
+    Fail,
+}
+
+/// Append-only job timeline row. `detail` JSONB shape is a tagged
+/// Rust enum keyed off the parent job's `trigger_kind` (slice 9
+/// defines the queued-event provenance shape; later phases extend
+/// for the other event kinds).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JobEvent {
+    pub id: i64,
+    pub job_id: Uuid,
+    pub event_kind: JobEventKind,
+    pub event_status: JobEventStatus,
+    pub occurred_at: DateTime<Utc>,
+    pub github_comment_id: Option<i64>,
+    pub remark: Option<String>,
+    pub detail: Option<Json<serde_json::Value>>,
+}
+
+/// Slice 8 insert payload for `job_event`. occurred_at defaults to
+/// NOW() so it's not part of the payload.
+#[derive(Debug, Clone)]
+pub struct NewJobEvent {
+    pub job_id: Uuid,
+    pub event_kind: JobEventKind,
+    pub event_status: JobEventStatus,
+    pub github_comment_id: Option<i64>,
+    pub remark: Option<String>,
+    pub detail: Option<serde_json::Value>,
+}
+
+/// Write-once promoted bench metrics. Adding/removing columns
+/// requires a coordinated change with stacks-bench.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JobMetric {
+    pub job_id: Uuid,
+    pub envelope_duration_us: i64,
+    pub replay_duration_us: i64,
+    pub total_duration_us: i64,
+    pub setup_duration_us: i64,
+    pub execution_duration_us: i64,
+    pub commit_duration_us: i64,
+    pub clarity_runtime: i64,
+    pub transactions: i64,
+    pub read_length: i64,
+    pub write_length: i64,
+    pub measured_blocks: i64,
+    pub warmup_blocks: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Raw run.json + archive path. `run_json` is None for jobs that
+/// failed before producing it; `archive_dir` is required so ops
+/// can find post-mortem artefacts even on failure.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JobResult {
+    pub job_id: Uuid,
+    pub run_json: Option<Json<serde_json::Value>>,
+    pub archive_dir: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Slice 8 subject relation: this job is about a PR.
+/// `triggering_comment_id` is the slice 7 `comment.id` for
+/// pr_comment-triggered jobs; None for other PR jobs (e.g. a
+/// future "PR opened auto-bench" feature).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubPullRequestJob {
+    pub job_id: Uuid,
+    pub github_pull_request_id: i64,
+    pub triggering_comment_id: Option<i64>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Slice 8 ingest link: webhook → job. The slice-9 processor inserts
+/// the webhook row earlier (via the handler's ingest path), then
+/// creates the job + this link inside one transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubWebhookJob {
+    pub github_webhook_id: i64,
+    pub job_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Slice 8 ownership relation: which user triggered the job.
+/// Populated for pr_comment / manual triggers; absent for
+/// branch_push / tag_created / scheduled triggers (no responsible
+/// user).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GithubUserJob {
+    pub github_user_id: i64,
+    pub job_id: Uuid,
+    pub created_at: DateTime<Utc>,
 }

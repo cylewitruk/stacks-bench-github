@@ -617,12 +617,51 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 #### Phase 2 Todos
 
+##### Pre-Phase-2 Design Checkpoint
+
+**Status:**
+
+- [x] Schema drift audit (Phase 1 outputs vs target_schema.sql)
+- [x] Architectural decisions pinned before slice 8 commits to schema
+- [x] Deployment + cutover plan implications captured
+
+**Why this checkpoint exists:** Phase 1 (slices 0-7) shipped a lot of structural changes (`deleted_at` / `revoked_at` / `closed_at` lifecycle columns, admin-implies, `would_enqueue_job` outcome, PR materialisation, payload retention). Phase 2 (slices 8-12) commits to job + job_event + job_metric + job_result schema that slices 9-11 depend on; design-level questions are cheap to revisit now and expensive to revisit later. Mirrors the pre-slice-6 checkpoint pattern that surfaced role scope, would_enqueue_job, and target schema staleness in time to fix.
+
+**Schema drift audit — clean.** `target_schema.sql` already incorporates everything slices 6-7 built: `github_installation.deleted_at`, `github_installation_repo.revoked_at`, `github_user_role.revoked_at` + admin-implies semantic, `github_pull_request.closed_at`, `would_enqueue_job` + `processed_installation` outcomes, partial indexes on active grants + active triggers. The slice 8 surface (`job`, `job_event`, `job_metric`, `job_result`, three `github_*_job` subject relations) is FK-consistent with the slice 6-7 tables. No refresh required this round.
+
+**Decisions pinned (must apply to slice 8):**
+
+1. **Phase 1 deployment deferred until slices 8-10 land.** Development continues local-only through slice 10. Slice 11 (the cutover) will be the first deploy. **Consequence**: cutover validation needs to be more thorough than the original "deploy → observe → cutover" plan implied. Slice 11 prep should include (a) a controlled `/benchmark` end-to-end against staging with the full stack; (b) replaying a representative set of saved GitHub webhook payloads through the inbox + processor to verify classification matches expectations; (c) explicit verification that the legacy `jobs` path can be paused without losing in-flight work. Flag added to slice 11's todo list.
+
+2. **`job_status` enum gains a 'claimed' state.** Lifecycle becomes `queued → claimed → running → completed/failed/cancelled`. The orchestrator's claim path transitions queued → claimed (with a `claim_token` / `claimed_at`), then claimed → running when actually executing. Stuck-claim recovery targets `claimed` rows whose `claimed_at` exceeds the lease window and resets them back to `queued` (same shape as the inbox's stuck-claim sweep). **Consequence**: slice 8 migration includes `ALTER TYPE job_status ADD VALUE 'claimed';`. Target schema's enum comment updated. The Rust `JobStatus` enum gains a `Claimed` variant.
+    - **Important shared-enum note** (per Codex review): `job_status` is a single Postgres type shared by BOTH the legacy `jobs.status` column ([20260521000001_init.sql](../migrations/20260521000001_init.sql)) AND the new `job.status` column. `ALTER TYPE` adds the value to the enum globally, not per-table — so legacy `jobs` rows could technically be set to `'claimed'`. The plan is that legacy code paths never write the new value, but slice 8 MUST add `JobStatus::Claimed` to the Rust enum BEFORE any production code reads any job row from either table. Otherwise a stray `'claimed'` row in legacy `jobs` (or in new `job` after slice 9's writers exist) would crash sqlx deserialisation.
+
+3. **Slice 9 is forward-only.** New `job` rows only get created for webhook rows arriving AFTER slice 9 deploys. Accumulated `would_enqueue_job` / `received` rows from slices 5-8 stay in the inbox as audit history but do NOT retroactively produce jobs. **Consequence**: simpler slice 9 logic (no backfill code path), and the slice 11 cutover script's `TRUNCATE job CASCADE` is the explicit reset that brings the new pipeline to a clean state.
+
+**`claim_token` + `claimed_at` invariants** (per Codex review; app-layer enforced, not DB CHECKs — consistent with the project's "DB enforces structural truths; app enforces workflow rules" principle from [roadmap.md:19](../docs/roadmap.md)):
+
+- `status='queued'` ⟺ `claim_token IS NULL AND claimed_at IS NULL`
+- `status='claimed'` ⟺ `claim_token IS NOT NULL AND claimed_at IS NOT NULL`
+- `status IN ('running', 'completed', 'failed', 'cancelled')`: `claim_token` and `claimed_at` are PRESERVED (not cleared) as audit — they record which orchestrator instance picked up the job and when. Slice 10's claim → running transition does NOT touch these columns.
+- Stuck-claim sweep: `WHERE status='claimed' AND claimed_at < NOW() - lease` → resets to `queued` AND clears both `claim_token` and `claimed_at` (matching the inbox sweep's behavior on `claim_token` reset).
+
+Slice 10's `JobStore::claim_next` + `JobStore::mark_running` + stuck-claim sweep tests should pin each of these invariants explicitly.
+
+**Inline todo updates flowing from these decisions:**
+
+- Slice 8 todo: add `ALTER TYPE job_status ADD VALUE 'claimed' AFTER 'queued'` to the migration AND add `JobStatus::Claimed` to the Rust enum in the same slice (legacy `jobs.status` shares the enum; reading must not crash on the new value; positioning AFTER 'queued' matches the target schema and avoids the awkward retrofit later).
+- Slice 8 todo: add the `claim_token` (`uuid`) and `claimed_at` (`timestamptz`) columns to `job` for the orchestrator claim handoff. Slice 8 tests pin the queued-state invariant (both NULL on insert).
+- Slice 10 todo: claim path transitions `queued → claimed` (with token + claimed_at), then `claimed → running` (preserving claim_token + claimed_at as audit). Stuck-claim sweep handles `claimed → queued` recovery (clearing both columns). Tests pin each invariant.
+- Slice 11 todo: add a "deployment validation" section to the prep checklist — controlled `/benchmark` against staging + saved-webhook replay before the cutover quiet window.
+
+**target_schema.sql updates applied:** see the `user_role` / `job_status` enum sections + `job` table columns for the `claimed` state addition and the new claim handoff columns.
+
 ##### Slice 8: New Job Tables
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
+- [x] Initial implementation completed
+- [x] Integration coverage added (or N/A justified)
 - [ ] Review in progress (with Codex)
 - [ ] Complete (ready for next slice)
 
@@ -630,13 +669,53 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 1. Add `job`, `github_pull_request_job`, `github_webhook_job`, `github_user_job`.
 2. Add `job_event`, `job_result`, `job_metric`.
-3. Add indexes after dependent tables exist.
-4. Add DB repositories for new job/event/result tables.
-5. No production writers yet; integration tests only.
+3. **Per pre-Phase-2 checkpoint item:** `ALTER TYPE job_status ADD VALUE 'claimed' AFTER 'queued'` (Postgres enum ordering is awkward to retrofit; matching the target-schema position now avoids the awkward gap later) AND add `JobStatus::Claimed` to the Rust enum in the same slice. Include `claim_token uuid` + `claimed_at timestamptz` columns on the `job` table to support the slice 10 claim handoff; tests pin the queued-state invariant (both NULL on insert).
+4. Add indexes after dependent tables exist.
+5. Add DB repositories for new job/event/result tables.
+6. No production writers yet; integration tests only.
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If none, just write "None").
+- **Migration file**: `migrations/20260529000001_slice8_jobs.sql`. `ALTER TYPE job_status ADD VALUE 'claimed' AFTER 'queued'` lands first (matches the target-schema enum position; PG 15+ allows the `ADD VALUE` inside the migration transaction since the new value is not referenced until subsequent statements). Creates `job` (with the slice 10 claim handoff columns `claim_token uuid` + `claimed_at timestamptz`), `job_event`, `job_metric`, `job_result`, and the three subject-relation tables (`github_pull_request_job`, `github_webhook_job`, `github_user_job`). Indexes per the target schema: `job_queued_idx` (partial on status='queued'), `job_repo_kind_idx`, `job_baseline_commit_idx`, `job_baseline_timeline_idx`, `github_pull_request_job_pr_idx`, `github_user_job_user_idx`, `job_event_job_occurred_at_idx`, `job_event_comment_idx`. `set_updated_at` trigger on `job`.
+- **Naming convention** for the slice 8 → slice 12 window: the colliding type names use a `V2` marker (`JobV2`, `NewJobV2`, `JobV2Store`, `PostgresJobV2Store`, `InMemoryJobV2Store`). The non-colliding types ship with their final names (`JobEvent`, `JobMetric`, `JobResult`, `GithubPullRequestJob`, `GithubWebhookJob`, `GithubUserJob`, `NewJobEvent`). Slice 12 removes the legacy `Job` / `NewJob` / `JobStore` types and renames `JobV2` → `Job` etc.
+- **`JobStatus` enum** gained `Claimed` between `Queued` and `Running` in the same slice as the migration (per pre-Phase-2 checkpoint M1 fix — legacy `jobs.status` shares the Postgres enum type, so the Rust enum MUST handle the new value before any production code reads any job row from either table). Legacy `jobs` code paths must NEVER write `Claimed`; only the new pipeline uses it.
+- **`claim_token` + `claimed_at` invariants** (app-layer enforced per pre-Phase-2 checkpoint, NOT DB CHECKs): `status=Queued` ⇔ both NULL; `status=Claimed` ⇔ both Some; `status IN (Running, Completed, Failed, Cancelled)` → both PRESERVED as audit. Integration tests pin each invariant.
+- **`JobV2Store` trait** (sbgh-core/src/db/job_v2.rs): `insert_job`, `lookup_job`, `claim_next_queued`, `mark_running`, `mark_terminal`, `sweep_stuck_claims`, `insert_event`, `record_metric`, `record_result`, `link_to_webhook`, `link_to_user`, `link_to_pull_request`. Postgres + InMemory impls mirror each other for the invariants. The Postgres `claim_next_queued` is a single statement (UPDATE wrapping `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1`) so the row-pick + transition are atomic without an explicit transaction. `mark_running` / `mark_terminal` are conditional on `(id, claim_token)` so stale-claim writes (sweep raced ahead) become no-ops at the SQL layer.
+- **`mark_terminal` requires `status='running'`** — a caller can't skip from claimed → terminal. Forces the claim → run → terminal lifecycle, preserving the execution-started signal. Pinned by `mark_terminal_rejects_transitions_skipping_running`.
+- **No production writers in slice 8** — slice 9 wires the `JobV2Store` into the processor (creates the `job` + relation links + queued `job_event` in one transaction). Slice 8's integration tests exercise the data layer directly via `PostgresJobV2Store`.
+- **Grants** (in `sbgh-cli/src/lib.rs::apply_roles`):
+  - `job`: orch SELECT/INSERT/UPDATE, no DELETE (completed jobs are historical).
+  - `job_event`: orch SELECT/INSERT only — append-only timeline; UPDATE rejected by grants.
+  - `job_metric`, `job_result`: orch SELECT/INSERT — write-once outcome companions; UPDATE rejected.
+  - `github_pull_request_job`, `github_webhook_job`, `github_user_job`: orch SELECT/INSERT — link tables; UPDATE rejected. Composite + UNIQUE constraints catch double-insert at the SQL layer.
+  - `job_event_id_seq` USAGE granted to orch (BIGSERIAL backing). Other tables use UUID PKs or composite PKs (no sequences).
+  - Handler: rejected on every slice 8 table.
+- **Tests added** (~18 net new, total 508 → 526):
+  - `postgres_job_v2.rs` (+13): queued-state invariant on insert; full lifecycle queued→claimed→running→completed with audit preservation; stale-token rejection on `mark_running`; `mark_terminal` requires running; stuck-claim sweep recovery + fresh-claim skip; concurrent claims pick disjoint rows; empty queue returns None; composite FK to `github_installation_repo` rejected for unknown pair; job_event round-trip; job_metric write-once PK collision; job_result with optional run_json; subject relation link tables round-trip + UNIQUE constraint enforcement.
+  - `grants.rs` (+5): orch INSERT/UPDATE on job (no DELETE); orch INSERT on job_event but UPDATE/DELETE rejected (append-only); orch INSERT on job_metric/job_result but UPDATE rejected (write-once); orch INSERT on three subject-relation link tables but UPDATE rejected; handler rejected on every slice 8 table.
+- **Verification**: `just build` clean, `just lint` clean after `just fix` + one `doc_lazy_continuation` rewrap, `just test --summary` (526 tests, 0 failures, ~34s wall-clock).
+- **Fixed mid-slice per Codex review**:
+  - **High (`mark_terminal` accepted any `JobStatus`)**: the original signature let a caller bug transition `running → queued` while preserving `claim_token`/`claimed_at` — directly violating the queued-state invariant from the pre-Phase-2 checkpoint. Introduced a narrow `TerminalJobStatus` enum (`Completed`/`Failed`/`Cancelled`) with `From` to `JobStatus`. The compiler now rejects any non-terminal transition at the call site; `mark_terminal` takes `TerminalJobStatus` and converts on the SQL bind.
+  - **Medium (no atomic job-creation boundary)**: slice 9's docs promised "create job + webhook/user/PR links + queued event in one transaction" but the slice 8 trait only exposed the building blocks. Added `JobCreationRequest` + `NewPullRequestLink` payload types and a `create_job_with_links` trait method that runs the full insert sequence inside a single Postgres transaction. Any FK / UNIQUE failure rolls back the entire creation — no partial job rows. The InMemory mirror builds all rows locally first and then publishes job + links + queued event under a single mutex acquisition (final shape — see the second-pass review fix below; the initial first-pass implementation used staged-then-revert sub-method calls, which leaked partial visibility to concurrent readers and was reworked). Returns a `CreatedJob` bundle (job + webhook_link + optional user/PR links + queued_event) so callers don't need a follow-up lookup. Slice 9 production writers MUST use this path; the individual `insert_job` / `link_to_*` / `insert_event` methods stay on the trait for read-side flexibility and integration testing.
+  - **Medium (no way to write resolved commit during claim)**: `mark_running` now takes `Option<ResolvedCommit>` (`{ hash, committed_at }`). For triggers that enqueue with an unresolved commit (branch tip at queue time), the orchestrator resolves during the claim phase and passes the resolved values; the status transition + commit metadata write land atomically under the same `claim_token` guard. `None` for triggers with a concrete commit at enqueue (push/tag). Postgres SQL uses `COALESCE` to leave existing columns untouched when `None`.
+  - **Low (InMemory write-once / UNIQUE mismatch with Postgres)**: the in-memory `record_metric` / `record_result` silently overwrote on PK collision; `link_to_webhook` / `link_to_user` / `link_to_pull_request` silently appended duplicate links instead of mirroring the Postgres `UNIQUE (job_id)` / `PRIMARY KEY (job_id)` constraints. Updated all six paths to return `Err` on duplicate; matches the Postgres behavior so unit tests using the in-memory store can't mask a real production bug.
+- **Regression tests added** (5 net new, 526 → 531):
+  - `create_job_with_links_inserts_job_links_and_queued_event_atomically` — happy path, all five rows land.
+  - `create_job_with_links_rolls_back_on_fk_violation` — FK failure leaves zero rows.
+  - `create_job_with_links_optional_user_and_pr_links_are_skipped_when_none` — non-PR / no-responsible-user triggers.
+  - `mark_running_with_resolved_commit_writes_metadata_atomically` — resolve-during-claim path.
+  - `mark_running_without_resolved_commit_leaves_existing_metadata_untouched` — preset-commit path uses COALESCE.
+- **Verification after review fixes**: `just lint` clean, `just test --summary` (531 tests, 0 failures, ~39s wall-clock).
+- **Second-pass Codex review fix**:
+  - **Medium (InMemory `create_job_with_links` released the mutex between sub-inserts)**: the first-pass fix delegated to the individual trait methods (`insert_job`, `link_to_webhook`, etc.), each of which took and released the mutex independently. A concurrent reader could intercept the partially-created state — see the job before its webhook link existed, or even `claim_next_queued` an orphaned row. Postgres hid all of that inside the transaction; the InMemory mirror leaked it. Rewrote the InMemory `create_job_with_links` to build all rows locally first, then acquire the mutex ONCE for the commit block. Nothing is visible to other observers until the commit returns. No revert path is needed because no mutation happens until the all-or-nothing commit.
+  - **Regression tests added** (2 net new, 531 → 533):
+    - `create_job_with_links_is_atomically_visible` — basic post-call invariant.
+    - `concurrent_claim_never_observes_partial_create` — 50-iteration race between `create_job_with_links` and `claim_next_queued`. Each iteration that observes a claim verifies the corresponding webhook link is also committed. Would have failed against the first-pass impl (multi-mutex acquire) by intermittently seeing the orphaned job.
+- **Verification after second-pass fix**: `just lint` clean, `just test --summary` (533 tests, 0 failures, ~37s wall-clock).
+- **Third-pass Codex review fix**:
+  - **Low (stale "staged-then-revert" wording in the first-pass review-fix bullet)**: rewrote to describe the actual final shape — "builds all rows locally first and then publishes job + links + queued event under a single mutex acquisition." Includes a parenthetical pointer that the staged-then-revert shape was the discarded first-pass and the second-pass review fix replaced it.
+  - **Low (test strength on `concurrent_claim_never_observes_partial_create`)**: the original assertion checked `created.webhook_link.github_webhook_id == webhook_id` AFTER the create task finished — that's a post-call property and would have passed against the buggy multi-mutex impl too. The strengthened version checks `has_webhook_link_for_job(claimed.id)` INSIDE the claim task, right after the claim observed the row. That proves the link was visible AT CLAIM TIME, not just by post-task. Required a new test-only `InMemoryJobV2Store::has_webhook_link_for_job` accessor (consistent with the existing test-only accessors on other in-memory stores).
+- **Verification after third-pass fix**: `just lint` clean, `just test --summary` (533 tests, 0 failures, ~38s wall-clock).
 
 ##### Slice 9: Processor Writes New Jobs
 
@@ -676,7 +755,8 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 3. Keep production config on old `jobs`.
 4. Update tests so libvirt/runner logic can run against either job source.
 5. Expect this slice to grow: old `jobs` stores all execution context in columns, while new `job` assembles context across subject/relation/event tables.
-6. No behavior change in production.
+6. **Per pre-Phase-2 checkpoint item:** new claim path uses the slice 8 `claim_token` + `claimed_at` columns. Lifecycle: queued → claimed (via FOR UPDATE SKIP LOCKED) → running (when execution actually starts) → terminal. Stuck-claim sweep resets `claimed` rows whose `claimed_at` exceeds the lease back to `queued` (same shape as the inbox sweep).
+7. No behavior change in production.
 
 **Implementation notes/deviations:**
 
@@ -693,14 +773,15 @@ End-state of Phase 1: every webhook arriving in production produces the correct 
 
 **Todo's:**
 
-1. Quiet window: stop handler and orchestrator.
-2. Drain or intentionally discard legacy `jobs`.
-3. Run `TRUNCATE job CASCADE;` and likely `TRUNCATE github_webhook CASCADE;`.
-4. Deploy handler inbox-only behavior.
-5. Enable processor job creation and orchestrator new queue claiming.
-6. Start services and run one controlled `/benchmark`.
-7. Verify webhook, job, event, PR comment, result, and metric rows.
-8. No formal rollback plan: if cutover fails during the quiet single-user window, keep services stopped or patch forward until the controlled `/benchmark` passes.
+1. **Pre-cutover validation (per pre-Phase-2 checkpoint item):** since Phase 1 was never deployed for observation, validation requires (a) a controlled `/benchmark` end-to-end against staging with the full stack running, (b) replaying a representative set of saved real GitHub webhook payloads through the inbox + processor and verifying outcomes match expectations, (c) explicit verification that the legacy `jobs` path can be paused/drained without losing in-flight work.
+2. Quiet window: stop handler and orchestrator.
+3. Drain or intentionally discard legacy `jobs`.
+4. Run `TRUNCATE job CASCADE;` and likely `TRUNCATE github_webhook CASCADE;`.
+5. Deploy handler inbox-only behavior.
+6. Enable processor job creation and orchestrator new queue claiming.
+7. Start services and run one controlled `/benchmark`.
+8. Verify webhook, job, event, PR comment, result, and metric rows.
+9. No formal rollback plan: if cutover fails during the quiet single-user window, keep services stopped or patch forward until the controlled `/benchmark` passes.
 
 **Implementation notes/deviations:**
 

@@ -38,8 +38,14 @@ CREATE TYPE user_role AS ENUM (
     'view_results' -- read-only
 );
 
+-- Pre-Phase-2 checkpoint: `claimed` is the intermediate state between
+-- `queued` and `running`. The orchestrator's claim path transitions
+-- queued → claimed (with a claim_token), then claimed → running when
+-- execution actually starts. Stuck-claim recovery resets `claimed`
+-- rows whose claimed_at exceeds the lease back to `queued`.
 CREATE TYPE job_status AS ENUM (
     'queued',
+    'claimed',
     'running',
     'completed',
     'failed',
@@ -561,6 +567,26 @@ CREATE TRIGGER github_pull_request_set_updated_at
 -- *known*. Currently-active access (revoked_at IS NULL) is an app-layer
 -- check at enqueue/claim time — the FK alone doesn't guarantee the
 -- membership hasn't been soft-revoked.
+-- claim_token + claimed_at are the orchestrator's claim handoff.
+-- Invariants (app-layer enforced, not DB CHECKs):
+--   status='queued'                  ⟺ claim_token IS NULL AND claimed_at IS NULL
+--   status='claimed'                 ⟺ claim_token IS NOT NULL AND claimed_at IS NOT NULL
+--   status IN ('running','completed','failed','cancelled')
+--                                    : claim_token + claimed_at PRESERVED as audit
+--
+-- Lifecycle:
+--   queued: initial state (slice 9 inserts here)
+--   claimed: orchestrator picked it up via FOR UPDATE SKIP LOCKED;
+--     execution hasn't started yet
+--   running: orchestrator transitioned claimed → running once it
+--     actually started the provision phase. claim_token + claimed_at
+--     are NOT cleared — they record which orchestrator instance won
+--     the claim and when.
+--   completed/failed/cancelled: terminal
+--
+-- The stuck-claim sweep targets `claimed` rows whose claimed_at
+-- exceeds the lease window and resets them back to queued AND
+-- clears claim_token + claimed_at (matching the inbox sweep shape).
 CREATE TABLE job (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid (),
     github_installation_id bigint NOT NULL REFERENCES github_installation (id),
@@ -572,6 +598,8 @@ CREATE TABLE job (
     git_ref_display text NOT NULL,
     git_commit_hash text,
     git_committed_at timestamptz,
+    claim_token uuid,
+    claimed_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     updated_at timestamptz NOT NULL DEFAULT NOW(),
     FOREIGN KEY (github_installation_id, github_repo_id) REFERENCES github_installation_repo (github_installation_id, github_repo_id)

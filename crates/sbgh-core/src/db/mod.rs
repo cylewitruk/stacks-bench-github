@@ -3,6 +3,8 @@ pub mod in_memory_ingest;
 #[cfg(feature = "testing")]
 pub mod in_memory_installation;
 #[cfg(feature = "testing")]
+pub mod in_memory_job_v2;
+#[cfg(feature = "testing")]
 pub mod in_memory_jobs;
 #[cfg(feature = "testing")]
 pub mod in_memory_policy;
@@ -16,12 +18,14 @@ pub mod in_memory_user;
 pub mod in_memory_webhook;
 pub mod ingest;
 pub mod installation;
+pub mod job_v2;
 pub mod jobs;
 pub mod migrate;
 pub mod policy;
 pub mod pool;
 pub mod postgres_ingest;
 pub mod postgres_installation;
+pub mod postgres_job_v2;
 pub mod postgres_jobs;
 pub mod postgres_policy;
 pub mod postgres_pull_request;
@@ -40,6 +44,8 @@ pub use in_memory_ingest::InMemoryIngestStore;
 #[cfg(feature = "testing")]
 pub use in_memory_installation::InMemoryInstallationStore;
 #[cfg(feature = "testing")]
+pub use in_memory_job_v2::InMemoryJobV2Store;
+#[cfg(feature = "testing")]
 pub use in_memory_jobs::InMemoryJobStore;
 #[cfg(feature = "testing")]
 pub use in_memory_policy::InMemoryPolicyStore;
@@ -53,12 +59,14 @@ pub use in_memory_user::InMemoryUserStore;
 pub use in_memory_webhook::{InMemoryWebhookInbox, InMemoryWebhookRow, SeedWebhook};
 pub use ingest::{IngestOutcome, IngestStore, NewWebhook};
 pub use installation::{DeleteInstallationOutcome, InstallationStore, NewInstallation};
+pub use job_v2::JobV2Store;
 pub use jobs::JobStore;
 pub use migrate::migrate;
 pub use policy::PolicyStore;
 pub use pool::{Pool, connect};
 pub use postgres_ingest::PostgresIngestStore;
 pub use postgres_installation::PostgresInstallationStore;
+pub use postgres_job_v2::PostgresJobV2Store;
 pub use postgres_jobs::PostgresJobStore;
 pub use postgres_policy::PostgresPolicyStore;
 pub use postgres_pull_request::PostgresPullRequestStore;
