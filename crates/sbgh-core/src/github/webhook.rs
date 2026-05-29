@@ -226,8 +226,8 @@ pub struct PullRequestBranchRef {
 
 /// `push` event payload. Slice 5 reads `ref` (the pushed branch path,
 /// `"refs/heads/<name>"`), `repository.id`, and `installation.id`.
-/// `forced` lets later slices distinguish push from force-push if
-/// needed; not used in slice 5.
+/// Slice 9 added `head_commit` to resolve the pushed commit + its
+/// timestamp at enqueue time for `branch_push` jobs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PushEvent {
     /// Full ref path, e.g. `"refs/heads/develop"`. The handler strips
@@ -237,6 +237,22 @@ pub struct PushEvent {
     pub ref_field: String,
     pub installation: Installation,
     pub repository: PullRequestRepo,
+    /// The new head commit after the push. GitHub sends `null` for a
+    /// branch deletion (and for a push that introduces no commits), so
+    /// slice 9 treats a missing `head_commit` as "nothing to benchmark"
+    /// and does not enqueue. `#[serde(default)]` keeps older fixtures
+    /// (and non-branch refs the handler already skips) parsing.
+    #[serde(default)]
+    pub head_commit: Option<PushCommit>,
+}
+
+/// Slice 9: the `head_commit` object on a `push` payload — the commit
+/// the ref now points at. `id` is the full SHA; `timestamp` is the
+/// commit's authored time (RFC3339).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PushCommit {
+    pub id: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 /// `create` event payload (fires on branch + tag creation). The

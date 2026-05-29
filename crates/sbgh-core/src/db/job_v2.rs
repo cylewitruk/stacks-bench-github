@@ -58,6 +58,27 @@ pub struct CreatedJob {
     pub queued_event: JobEvent,
 }
 
+/// Slice 9: outcome of `create_job_with_links`, distinguishing a fresh
+/// creation from an idempotent no-op when the webhook already has a job.
+///
+/// Job creation is the first non-idempotent side effect in the classify
+/// pipeline; the inbox is at-least-once (a webhook can be reprocessed
+/// after a failed `complete()` or a swept claim lease). The
+/// `github_webhook_job` `UNIQUE (github_webhook_id)` constraint makes
+/// "one job per webhook" structural, and this outcome lets the caller
+/// treat a retry that hit the constraint as success without minting a
+/// duplicate. Mirrors the `IngestOutcome::Duplicate` pattern.
+#[derive(Debug, Clone)]
+pub enum JobCreationOutcome {
+    /// A new job (+ links + queued event) was created this call.
+    /// Boxed because `CreatedJob` dwarfs the unit `AlreadyEnqueued`
+    /// variant (clippy `large_enum_variant`).
+    Created(Box<CreatedJob>),
+    /// A job already existed for this webhook (idempotent retry). No
+    /// rows were written; the prior attempt's job stands.
+    AlreadyEnqueued,
+}
+
 #[async_trait]
 pub trait JobV2Store: Send + Sync + 'static {
     async fn insert_job(&self, new: &NewJobV2) -> Result<JobV2>;
@@ -68,12 +89,22 @@ pub trait JobV2Store: Send + Sync + 'static {
     /// UNIQUE failure on any of the link inserts ROLLs BACK the entire
     /// creation — no partial job rows.
     ///
-    /// This is the path slice 9 will wire from the processor. Slice 8
+    /// This is the path slice 9 wires from the processor. Slice 8
     /// keeps the individual `insert_job` / `link_to_*` / `insert_event`
     /// methods on the trait for read-side flexibility and stand-alone
     /// integration testing, but production writers MUST use
     /// `create_job_with_links` to honour the transactional invariant.
-    async fn create_job_with_links(&self, request: &JobCreationRequest) -> Result<CreatedJob>;
+    ///
+    /// Slice 9: idempotent on `github_webhook_id`. If a job already
+    /// exists for this webhook (a reprocessed delivery after a failed
+    /// `complete()` / swept lease), no rows are written and
+    /// `JobCreationOutcome::AlreadyEnqueued` is returned — the
+    /// `UNIQUE (github_webhook_id)` constraint makes this race-safe even
+    /// against a concurrent re-claim.
+    async fn create_job_with_links(
+        &self,
+        request: &JobCreationRequest,
+    ) -> Result<JobCreationOutcome>;
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<JobV2>>;
 

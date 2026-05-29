@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::db::Pool;
-use crate::db::job_v2::{CreatedJob, JobV2Store};
+use crate::db::job_v2::{CreatedJob, JobCreationOutcome, JobV2Store};
 use crate::models::{
     GithubPullRequestJob, GithubUserJob, GithubWebhookJob, JobCreationRequest, JobEvent,
     JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, JobV2, NewJobEvent, NewJobV2,
@@ -56,10 +56,19 @@ impl JobV2Store for PostgresJobV2Store {
         Ok(row)
     }
 
-    async fn create_job_with_links(&self, request: &JobCreationRequest) -> Result<CreatedJob> {
+    async fn create_job_with_links(
+        &self,
+        request: &JobCreationRequest,
+    ) -> Result<JobCreationOutcome> {
         // Single Postgres transaction: job insert → webhook link →
         // optional user link → optional PR link → queued event. Any FK
         // / UNIQUE / CHECK failure rolls back the entire creation.
+        //
+        // Slice 9 idempotency: the webhook-link insert uses
+        // `ON CONFLICT (github_webhook_id) DO NOTHING`. If the webhook
+        // already has a job (a reprocessed delivery), the link returns
+        // no row — we roll the whole transaction back (discarding the
+        // `job` we just inserted) and report `AlreadyEnqueued`.
         let mut tx = self.pool.begin().await?;
 
         let job: JobV2 = sqlx::query_as(
@@ -100,14 +109,22 @@ impl JobV2Store for PostgresJobV2Store {
         .fetch_one(&mut *tx)
         .await?;
 
-        let webhook_link: GithubWebhookJob = sqlx::query_as(
+        let webhook_link: Option<GithubWebhookJob> = sqlx::query_as(
             "INSERT INTO github_webhook_job (github_webhook_id, job_id) VALUES ($1, $2)
+             ON CONFLICT (github_webhook_id) DO NOTHING
              RETURNING github_webhook_id, job_id, created_at",
         )
         .bind(request.github_webhook_id)
         .bind(job.id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        let Some(webhook_link) = webhook_link else {
+            // Webhook already has a job from a prior (possibly
+            // interrupted) attempt — idempotent no-op. Roll back the
+            // job we just inserted so it doesn't orphan.
+            tx.rollback().await?;
+            return Ok(JobCreationOutcome::AlreadyEnqueued);
+        };
 
         let user_link = if let Some(user_id) = request.triggering_user_id {
             let row: GithubUserJob = sqlx::query_as(
@@ -158,13 +175,13 @@ impl JobV2Store for PostgresJobV2Store {
 
         tx.commit().await?;
 
-        Ok(CreatedJob {
+        Ok(JobCreationOutcome::Created(Box::new(CreatedJob {
             job,
             webhook_link,
             user_link,
             pull_request_link,
             queued_event,
-        })
+        })))
     }
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<JobV2>> {

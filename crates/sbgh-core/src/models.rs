@@ -77,20 +77,32 @@ pub enum WebhookOutcome {
     EnqueuedJob,
     /// Pre-slice-6 design checkpoint: Phase 1 shadow accept. The new
     /// pipeline's policy/trigger evaluation said "this would enqueue a
-    /// job", but slice 9 hasn't landed yet so no `job` row is created
-    /// and the legacy handler→jobs path is what actually runs the
-    /// bench. Slice 9 flips the four accept paths
-    /// (`IssueCommentHandler` /benchmark, `PullRequestHandler`,
-    /// `PushHandler`, `CreateHandler`) to emit `EnqueuedJob` instead.
-    /// Same status bucket as `EnqueuedJob` / `ProcessedInstallation`
-    /// (= `Processed`) — a shadow accept is a successful terminal
-    /// outcome, not an ignored/denied one.
+    /// job", but no `job` row was created and the legacy handler→jobs
+    /// path actually ran the bench. Slice 9 retired this outcome for
+    /// new rows: the three job-creating paths (`IssueCommentHandler`
+    /// /benchmark, `PushHandler` branch_push, `CreateHandler`
+    /// tag_created) now emit `EnqueuedJob`, and the `PullRequestHandler`
+    /// accept path emits `ProcessedPullRequest` (PR events don't
+    /// enqueue — no `trigger_kind` for them). The variant is retained
+    /// for historical rows written before slice 9. Same status bucket
+    /// as `EnqueuedJob` / `ProcessedInstallation` (= `Processed`).
     WouldEnqueueJob,
     /// Slice 3+: terminal "we materialised installation state" — the
     /// processor created/updated a `github_installation` row in response
     /// to an `installation.*` event. Distinct from `IgnoredAction` so
     /// ops queries can separate "no-op event" from "install state changed".
     ProcessedInstallation,
+    /// Slice 9: terminal "we materialised/updated PR state but did NOT
+    /// enqueue a job". A `pull_request.{opened,reopened,synchronize}`
+    /// event with accepted policies upserts the `github_pull_request`
+    /// row (so a later `/benchmark` comment can link to it) but does
+    /// NOT create a job — there is no `trigger_kind` for PR-event
+    /// auto-benchmarking, and auto-benching every PR push is a separate
+    /// product decision. Distinct from `IgnoredAction` so ops queries
+    /// can separate "PR state changed" from a true no-op, and distinct
+    /// from `WouldEnqueueJob` because we have decided this path does NOT
+    /// enqueue (vs. the slice-5 shadow-accept that implied it would).
+    ProcessedPullRequest,
     IgnoredAction,
     IgnoredNoCommand,
     IgnoredUnknownInstallation,
@@ -106,9 +118,10 @@ impl WebhookOutcome {
     /// Terminal status that pairs with this outcome.
     pub fn terminal_status(self) -> WebhookStatus {
         match self {
-            Self::EnqueuedJob | Self::WouldEnqueueJob | Self::ProcessedInstallation => {
-                WebhookStatus::Processed
-            }
+            Self::EnqueuedJob
+            | Self::WouldEnqueueJob
+            | Self::ProcessedInstallation
+            | Self::ProcessedPullRequest => WebhookStatus::Processed,
             Self::IgnoredAction
             | Self::IgnoredNoCommand
             | Self::IgnoredUnknownInstallation
@@ -550,6 +563,38 @@ pub struct JobEvent {
     pub github_comment_id: Option<i64>,
     pub remark: Option<String>,
     pub detail: Option<Json<serde_json::Value>>,
+}
+
+/// Slice 9: typed provenance for the `queued` job_event's `detail`
+/// JSONB. Tagged by `trigger` (mirrors `job.trigger_kind`) so the
+/// audit/inspection reader knows which envelope caused the enqueue
+/// without inspecting `job` columns. Per the SUBJECT-vs-PROVENANCE
+/// design principle, this is provenance — `bench_args` lives here
+/// (and is what slice 10's orchestrator reads to assemble the run's
+/// CLI args) because the `job` table has no dedicated column for it.
+///
+/// Only the three slice-9 job-creating triggers have variants;
+/// `scheduled` / `manual` arrive in later work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "trigger", rename_all = "snake_case")]
+pub enum QueuedEventDetail {
+    /// `/benchmark` comment on a PR. `bench_args` is the parsed
+    /// command tail (subcommand + args), forwarded to the eventual run.
+    PrComment {
+        sender_id: i64,
+        sender_login: String,
+        comment_id: i64,
+        pr_number: i64,
+        subcommand: Option<String>,
+        bench_args: Vec<String>,
+    },
+    /// Watched branch advanced. `trigger_id` is the matched
+    /// `trigger_policy.id`; `bench_args` its configured args.
+    BranchPush { branch: String, trigger_id: i64, bench_args: Option<String> },
+    /// Watched tag pattern appeared. The tag's commit is resolved by
+    /// the orchestrator during the claim phase (the create event
+    /// carries no SHA), so no commit fields here.
+    TagCreated { tag: String, trigger_id: i64, bench_args: Option<String> },
 }
 
 /// Slice 8 insert payload for `job_event`. occurred_at defaults to

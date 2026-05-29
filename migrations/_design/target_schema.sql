@@ -133,6 +133,7 @@ CREATE TYPE github_webhook_outcome AS ENUM (
     'enqueued_job',
     'would_enqueue_job', -- Phase 1 shadow accept: the new pipeline would have created a job at slice 9; legacy handler is still the actual job source
     'processed_installation', -- install/membership/policy state mutated successfully (no job)
+    'processed_pull_request', -- slice 9: PR row materialised/updated on an accepted pull_request event, but NO job enqueued (no trigger_kind for PR-event auto-bench)
     'ignored_action',
     'ignored_no_command',
     'ignored_unknown_installation', -- webhook from an installation we have no row for
@@ -640,8 +641,9 @@ CREATE TABLE github_pull_request_job (
 
 CREATE INDEX github_pull_request_job_pr_idx ON github_pull_request_job (github_pull_request_id);
 
--- Webhook→job ingest link. Many jobs per webhook is allowed; at most
--- one webhook per job (enforced by UNIQUE on job_id).
+-- Webhook→job ingest link. At most one webhook per job (UNIQUE on
+-- job_id) and — since slice 9 — at most one job per webhook
+-- (UNIQUE on github_webhook_id).
 --
 -- Under the inbox model, the webhook row is inserted earlier by the
 -- handler; the processor later creates the job and link in a single
@@ -650,12 +652,22 @@ CREATE INDEX github_pull_request_job_pr_idx ON github_pull_request_job (github_p
 -- crash between webhook claim and job-creation transaction is recovered
 -- via the webhook's status going back to 'retryable_error' on the
 -- next stuck-claim sweep.
+--
+-- Slice 9 idempotency: `UNIQUE (github_webhook_id)` makes "one job per
+-- webhook" a structural truth so a webhook reprocessed after a failed
+-- `complete()` / lease sweep can't mint a duplicate job — job creation
+-- is the only non-idempotent classify side effect, and this is how it
+-- becomes idempotent (`ON CONFLICT (github_webhook_id) DO NOTHING`).
+-- Slice 8 originally allowed many jobs per webhook (for deferred
+-- multi-trigger fan-out); when fan-out lands it drops this UNIQUE and
+-- adopts a per-trigger idempotency key.
 CREATE TABLE github_webhook_job (
     github_webhook_id bigint NOT NULL REFERENCES github_webhook (id) ON DELETE CASCADE,
     job_id uuid NOT NULL REFERENCES job (id) ON DELETE CASCADE,
     created_at timestamptz NOT NULL DEFAULT NOW(),
     PRIMARY KEY (github_webhook_id, job_id),
-    UNIQUE (job_id)
+    UNIQUE (job_id),
+    UNIQUE (github_webhook_id) -- slice 9: one job per webhook (idempotency guard)
 );
 
 -- User→job ownership for UI ("my jobs"). Triggering user lives here as

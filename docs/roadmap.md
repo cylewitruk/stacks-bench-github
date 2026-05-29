@@ -662,8 +662,8 @@ Slice 10's `JobStore::claim_next` + `JobStore::mark_running` + stuck-claim sweep
 
 - [x] Initial implementation completed
 - [x] Integration coverage added (or N/A justified)
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice)
 
 **Todo's:**
 
@@ -716,15 +716,16 @@ Slice 10's `JobStore::claim_next` + `JobStore::mark_running` + stuck-claim sweep
   - **Low (stale "staged-then-revert" wording in the first-pass review-fix bullet)**: rewrote to describe the actual final shape — "builds all rows locally first and then publishes job + links + queued event under a single mutex acquisition." Includes a parenthetical pointer that the staged-then-revert shape was the discarded first-pass and the second-pass review fix replaced it.
   - **Low (test strength on `concurrent_claim_never_observes_partial_create`)**: the original assertion checked `created.webhook_link.github_webhook_id == webhook_id` AFTER the create task finished — that's a post-call property and would have passed against the buggy multi-mutex impl too. The strengthened version checks `has_webhook_link_for_job(claimed.id)` INSIDE the claim task, right after the claim observed the row. That proves the link was visible AT CLAIM TIME, not just by post-task. Required a new test-only `InMemoryJobV2Store::has_webhook_link_for_job` accessor (consistent with the existing test-only accessors on other in-memory stores).
 - **Verification after third-pass fix**: `just lint` clean, `just test --summary` (533 tests, 0 failures, ~38s wall-clock).
+- **Finalization review (Opus 4.8)**: independent re-review of the full slice 8 surface (migration, trait, Postgres + InMemory impls, grants, tests) found no issues beyond the three Codex passes already resolved. Confirmed: (a) the migration never *uses* the newly-added `'claimed'` enum value in the same transaction that adds it (avoids the PG "unsafe use of new enum value" error) — verified empirically since `setup_pg` runs migrations against real Postgres; (b) all claim_token/claimed_at invariants are enforced at the SQL predicate level + `TerminalJobStatus` compile-time narrowing; (c) grants withhold UPDATE/DELETE to enforce append-only / write-once. Acknowledged non-defect boundary: the InMemory `create_job_with_links` can't model FK existence, so FK-rollback paths are Postgres-only (documented in-code, correct). Final verification: `just build` clean, `just test` (533/533, 36.4s), `just lint` clean. Slice 8 marked complete.
 
 ##### Slice 9: Processor Writes New Jobs
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Initial implementation completed
+- [x] Integration coverage added (or N/A justified)
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice)
 
 **Todo's:**
 
@@ -737,7 +738,28 @@ Slice 10's `JobStore::claim_next` + `JobStore::mark_running` + stuck-claim sweep
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If none, just write "None").
+- **Three job-creating paths, not four (design decision, Codex-confirmed).** The slice-5 notes listed FOUR accept paths to flip (`IssueCommentHandler` /benchmark, `PullRequestHandler` opened/reopened/synchronize, `PushHandler` branch_push, `CreateHandler` tag_created). But `trigger_kind` has no value for PR-event auto-benchmarking, and auto-benching every PR open/synchronize is a distinct product decision with different cost/noise implications. So slice 9 creates jobs for only the **three** triggers with a clean `trigger_kind`: `pr_comment`, `branch_push`, `tag_created`. The `PullRequestHandler` accept path still materialises/updates the PR row (so a later `/benchmark` can link it) but does NOT enqueue — see the new outcome below. A future `pr_updated`/`pr_auto` trigger + installation policy knob can add PR-event auto-bench deliberately.
+- **New outcome `processed_pull_request`** (`migrations/20260529000002_slice9_processed_pull_request.sql`, `ALTER TYPE github_webhook_outcome ADD VALUE`). The `PullRequestHandler` accept path now terminates here instead of `WouldEnqueueJob` — neither a misleading "would enqueue" (it won't) nor a no-op `IgnoredAction` (PR state changed). Maps to `WebhookStatus::Processed`. `WouldEnqueueJob` is now emitter-less for new rows (all four old emitters flipped: three → `EnqueuedJob`, one → `ProcessedPullRequest`); the value is retained for historical rows.
+- **One job per accepted webhook (retry-safety).** `enqueue_job` makes exactly one `create_job_with_links` call per accept. A loop over multiple matching triggers would risk **duplicate jobs on retry** (job 1 commits, job 2 fails → `Retryable` → job 1 recreated). Push/tag handlers select the first matching trigger and `tracing::warn!` when more than one matched — multi-trigger fan-out is deferred, logged not silently dropped. In practice at most one `branch_push` trigger matches a given branch; overlapping `tag_created` regexes are the only realistic multi-match.
+- **Job creation goes through the slice-8 `create_job_with_links` atomic boundary** (job + webhook link + optional user/PR links + queued `job_event` in one transaction). A store error → `ClassifyOutcome::Retryable`; since the boundary is all-or-nothing, a failed attempt leaves zero rows and the webhook reprocesses cleanly. All link FK targets are materialised earlier in each handler, so a persistent FK failure (a bug) is promoted to terminal `error` by the max-attempts ceiling rather than looping forever.
+- **Per-trigger job shape:**
+  - `pr_comment` (`IssueCommentHandler`): `job_kind=ad_hoc`, `github_repo_id` = PR **target/base** repo (the membership/policy-gated side), `git_ref_kind=branch`, `git_ref_display` = PR **head** branch, `git_commit_hash` = head SHA (known from the `get_pull_request` API; `git_committed_at` left NULL), owner link = the commenter, PR link = the materialised PR + triggering comment id.
+  - `branch_push` (`PushHandler`): `job_kind=baseline`, repo = pushed repo, `git_ref_kind=branch`, ref = stripped branch, commit + timestamp resolved at enqueue from the new `push.head_commit` (a branch deletion / commit-less push has no `head_commit` → `IgnoredAction`, no enqueue). No owner/PR link.
+  - `tag_created` (`CreateHandler`): `job_kind=baseline`, `git_ref_kind=tag`, ref = tag name, commit **unresolved** (`create` events carry no SHA) — the orchestrator resolves it during the claim phase via slice 8's `mark_running(Some(ResolvedCommit))`. No owner/PR link.
+- **Queued-event provenance** is a tagged `QueuedEventDetail` enum (`models.rs`) keyed by `trigger` (`pr_comment` / `branch_push` / `tag_created`), serialised into `job_event.detail` JSONB. Carries `bench_args` (parsed `/benchmark` command tail for `pr_comment`; the matched trigger's `bench_args` for push/tag) — slice 10's orchestrator reads this to assemble the run's CLI args (the `job` table has no dedicated column, per the SUBJECT-vs-PROVENANCE principle).
+- **`PushEvent` gained `head_commit: Option<PushCommit>`** (`{ id, timestamp }`) — slice 5 only needed `ref`/`repository`/`installation`. `#[serde(default)]` keeps older payloads parsing; `None` signals "nothing to benchmark".
+- **No production writers removed.** The legacy handler→`jobs` dual-write still runs; new `job` rows accumulate unconsumed (the slice-11 cutover `TRUNCATE job CASCADE` resets them). New jobs sit at `queued` — the new orchestrator claim path is slice 10/11, so nothing executes them yet.
+- **Todo 5 (inspection queries) deferred to slice 10/11 prep** — there are no new `job` rows in any deployed environment yet (Phase 1 was never deployed; see pre-Phase-2 checkpoint item 1), so an old-vs-new comparison query has nothing to compare against until the slice-11 staging validation. Flagged here so it isn't lost.
+- **Tests** (unit + e2e):
+  - Unit (`webhook_processor.rs`): `/benchmark` accept now asserts `EnqueuedJob` + one `ad_hoc`/`pr_comment` job against the target repo, head-branch ref + head SHA, user + PR links, and `PrComment` provenance (subcommand + bench_args). Admin-implies + install-wide-grant authorized paths flipped to `EnqueuedJob`. `push` match asserts `EnqueuedJob` + `baseline`/`branch_push` job with the resolved `head_commit` SHA and no user/PR link. `create` tag match asserts `EnqueuedJob` + `baseline`/`tag_created` job with an **unresolved** commit. `PullRequestHandler` opened + edited-base-changed flipped to `ProcessedPullRequest`.
+  - e2e (`processor_e2e.rs`, real Postgres): `pipeline_classifies_pr_benchmark_as_enqueued_job` verifies the full job + all three links + queued-event provenance in the DB; push/tag e2e verify the job rows + link presence/absence; `pipeline_pull_request_..._is_processed_pull_request` verifies the new outcome AND that `job` stays empty while the PR row is materialised. The PR-event and `processed_pull_request` outcome bind/read round-trips through real Postgres.
+  - New in-memory `JobV2Store` test accessors: `all_jobs`, `all_events`, `user_links`, `pr_links`.
+  - One net-new unit test (`push_matching_trigger_without_head_commit_does_not_enqueue`) pins the branch-deletion guard; the rest of the surface was covered by flipping existing accept-path tests in place.
+- **Verification**: `just build` clean, `just lint` clean (after `just fix`), `just test --summary` 535/535 (533 → 535; the +2 is the one new unit test compiled into both the bin and `processor_e2e` targets, which both include `webhook_processor.rs`).
+- **Codex review fixes (round 1):**
+  - **High — job creation was not idempotent across webhook retries.** Job creation is the FIRST non-idempotent side effect in the classify pipeline (every other handler upserts). The inbox is at-least-once: if `complete()` fails after a job is committed, or a slow-but-alive processor's claim lease is swept and the row re-claimed, the webhook is reprocessed — and slice 8's `github_webhook_job` only had `UNIQUE (job_id)` (a fresh UUID never trips it), so the retry minted a SECOND job for the same webhook, breaking the "one job per accepted webhook" claim. **Fix:** added `UNIQUE (github_webhook_id)` to `github_webhook_job` (slice 9 migration) and made `create_job_with_links` idempotent on it — the webhook-link insert uses `ON CONFLICT (github_webhook_id) DO NOTHING`; on conflict the whole transaction rolls back (discarding the just-inserted job) and returns the new `JobCreationOutcome::AlreadyEnqueued`. `enqueue_job` maps both `Created` and `AlreadyEnqueued` to terminal `EnqueuedJob`, so a reprocessed webhook terminalizes idempotently with no duplicate. The constraint temporarily tightens slice 8's "many jobs per webhook" allowance (unused while fan-out is deferred); when fan-out lands, that slice drops it for a per-trigger key. `create_job_with_links` return type changed `CreatedJob` → `JobCreationOutcome` (mirrors `IngestOutcome::Duplicate`); the InMemory store mirrors the guard under its single commit-lock (and `link_to_webhook` mirrors the new UNIQUE). Slice-8 `create_job_with_links` tests updated to unwrap `Created`. New tests: `create_job_with_links_is_idempotent_on_webhook_id` (Postgres + InMemory data-layer), `benchmark_reprocessed_webhook_does_not_duplicate_job` (handler-level reprocess → one job).
+  - **Low — stale `WouldEnqueueJob` doc.** The doc comment still said slice 9 flips four paths (incl. `PullRequestHandler`) to `EnqueuedJob`; rewritten to describe the actual split (three → `EnqueuedJob`, PR-event → `ProcessedPullRequest`) and that the variant is retained only for historical rows.
+- **Verification after review fixes**: `just lint` clean, `just test --summary` 539/539 (535 → 539; +4 idempotency tests: Postgres + InMemory data-layer, plus the handler-reprocess test compiled into both the bin and e2e targets).
 
 ##### Slice 10: Orchestrator JobStore Refactor
 

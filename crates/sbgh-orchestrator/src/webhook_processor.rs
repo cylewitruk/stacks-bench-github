@@ -27,15 +27,17 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sbgh_core::Result;
 use sbgh_core::db::{
-    ClaimedWebhook, InstallationStore, NewInstallation, NewPullRequest, NewRepoIdentity,
-    NewRepoLineage, NewUser, PolicyStore, PullRequestStore, RepoStore, UserStore, WebhookInbox,
+    ClaimedWebhook, InstallationStore, JobCreationOutcome, JobV2Store, NewInstallation,
+    NewPullRequest, NewRepoIdentity, NewRepoLineage, NewUser, PolicyStore, PullRequestStore,
+    RepoStore, UserStore, WebhookInbox,
 };
 use sbgh_core::github::{
     CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent, IssueCommentEvent,
     PullRequestEvent, PushEvent, RepoRef, RepoSummary, parse_command,
 };
 use sbgh_core::models::{
-    GithubAccountType, TriggerKind, TriggerMatchSpec, UserRole, WebhookOutcome,
+    GitRefKind, GithubAccountType, JobCreationRequest, JobKind, NewJobV2, NewPullRequestLink,
+    QueuedEventDetail, TriggerKind, TriggerMatchSpec, TriggerPolicy, UserRole, WebhookOutcome,
 };
 
 /// What a [`Classifier`] decides to do with a claimed webhook.
@@ -251,12 +253,15 @@ pub struct IssueCommentHandler {
     /// API response.
     pull_request_store: Arc<dyn PullRequestStore>,
     gh: Arc<dyn GitHubApi>,
+    /// Slice 9: the accept path creates a `pr_comment` `job` row instead
+    /// of emitting the Phase-1 `WouldEnqueueJob` shadow signal.
+    job_store: Arc<dyn JobV2Store>,
 }
 
 impl IssueCommentHandler {
-    /// Slice 7 widened the constructor to take `pull_request_store`.
-    /// Slice 6 had already added `user_store`; slice 5 added
-    /// `policy_store` + `install_store` + `gh`.
+    /// Slice 9 widened the constructor to take `job_store`. Slice 7
+    /// added `pull_request_store`; slice 6 added `user_store`; slice 5
+    /// added `policy_store` + `install_store` + `gh`.
     pub fn new(
         repo_store: Arc<dyn RepoStore>,
         policy_store: Arc<dyn PolicyStore>,
@@ -264,6 +269,7 @@ impl IssueCommentHandler {
         user_store: Arc<dyn UserStore>,
         pull_request_store: Arc<dyn PullRequestStore>,
         gh: Arc<dyn GitHubApi>,
+        job_store: Arc<dyn JobV2Store>,
     ) -> Self {
         Self {
             repo_store,
@@ -272,6 +278,7 @@ impl IssueCommentHandler {
             user_store,
             pull_request_store,
             gh,
+            job_store,
         }
     }
 }
@@ -307,7 +314,7 @@ impl EventHandler for IssueCommentHandler {
         match parse_command(&event.comment.body) {
             // No /benchmark command → no policy work needed.
             Ok(None) | Err(_) => ClassifyOutcome::Terminal(WebhookOutcome::IgnoredNoCommand),
-            Ok(Some(_)) => {
+            Ok(Some(cmd)) => {
                 // Slice 5: a `/benchmark` PR comment triggers the same
                 // target+source policy evaluation as `pull_request`
                 // events. We have to fetch the PR via GH API first to
@@ -337,8 +344,9 @@ impl EventHandler for IssueCommentHandler {
                 // response. Replaces the slice 5 inline repo-identity
                 // upserts; the shared helper also upserts the PR
                 // author so slice 9's `/benchmark` job link has all
-                // its FK targets.
-                if let Err(out) = materialise_pull_request(
+                // its FK targets. Slice 9 captures the returned PR row
+                // so the job's PR link can reference it by primary key.
+                let pr_row = match materialise_pull_request(
                     self.repo_store.as_ref(),
                     self.user_store.as_ref(),
                     self.pull_request_store
@@ -363,8 +371,9 @@ impl EventHandler for IssueCommentHandler {
                 )
                 .await
                 {
-                    return out;
-                }
+                    Ok(row) => row,
+                    Err(out) => return out,
+                };
 
                 // Slice 6: upsert the sender first (audit trail for
                 // denied attempts), then check `trigger_pr_benchmark`
@@ -426,16 +435,42 @@ impl EventHandler for IssueCommentHandler {
                             pr_number,
                             base_repo_id = pr.base.repo.id,
                             head_repo_id = pr.head.repo.id,
-                            "issue_comment /benchmark: policies accepted — slice 9 will enqueue \
-                             here (Phase 1 legacy path still runs the actual bench)"
+                            "issue_comment /benchmark: policies accepted — creating job"
                         );
-                        // Phase 1: terminal `WouldEnqueueJob` (pre-slice-6
-                        // checkpoint). Slice 9 flips this to `EnqueuedJob`
-                        // + creates the new-schema job row. Until then,
-                        // the legacy handler→jobs path is what actually
-                        // runs benches; the outcome here is the queryable
-                        // signal that the new pipeline agreed.
-                        ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
+                        // Slice 9: create the `pr_comment` ad-hoc job.
+                        // The benchmark runs against the PR's HEAD; the
+                        // job's repo is the TARGET (base) repo, which is
+                        // the membership/policy-gated side. Head SHA is
+                        // known from the PR API; committed_at is left for
+                        // the orchestrator to backfill if needed.
+                        let detail = QueuedEventDetail::PrComment {
+                            sender_id: event.sender.id,
+                            sender_login: event.sender.login.clone(),
+                            comment_id: event.comment.id,
+                            pr_number: event.issue.number,
+                            subcommand: cmd.subcommand.clone(),
+                            bench_args: cmd.args.clone(),
+                        };
+                        let request = JobCreationRequest {
+                            new_job: NewJobV2 {
+                                github_installation_id: install_id,
+                                github_repo_id: pr.base.repo.id,
+                                job_kind: JobKind::AdHoc,
+                                trigger_kind: TriggerKind::PrComment,
+                                git_ref_kind: GitRefKind::Branch,
+                                git_ref_display: pr.head.branch.clone(),
+                                git_commit_hash: Some(pr.head.sha.clone()),
+                                git_committed_at: None,
+                            },
+                            github_webhook_id: webhook.id,
+                            triggering_user_id: Some(event.sender.id),
+                            pull_request_link: Some(NewPullRequestLink {
+                                github_pull_request_id: pr_row.id,
+                                triggering_comment_id: Some(event.comment.id),
+                            }),
+                            queued_event_detail: queued_detail(detail),
+                        };
+                        enqueue_job(self.job_store.as_ref(), request).await
                     }
                     PolicyEvaluation::DeniedTarget => {
                         ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)
@@ -1121,6 +1156,65 @@ async fn evaluate_pr_policies(
     }
 }
 
+/// Slice 9: create a new-schema `job` (+ webhook/user/PR links + queued
+/// `job_event`) through the atomic `create_job_with_links` boundary and
+/// map the result to a terminal `EnqueuedJob`.
+///
+/// Any store error becomes `Retryable`: `create_job_with_links` is
+/// all-or-nothing, so a failure leaves zero job rows and the webhook is
+/// safely reprocessed. All FK targets (install/repo membership, webhook,
+/// user, PR) are materialised earlier in each handler, so a persistent
+/// FK failure here signals a bug — the max-attempts ceiling then
+/// promotes it to a permanent `error` rather than looping forever.
+///
+/// `enqueue` deliberately creates exactly ONE job per accepted webhook:
+/// a single all-or-nothing transaction is retry-safe (a partial-failure
+/// loop over multiple `create_job_with_links` calls could duplicate
+/// already-created jobs on retry). Push/tag handlers log when more than
+/// one trigger matched so multi-trigger fan-out isn't silently dropped.
+async fn enqueue_job(job_store: &dyn JobV2Store, request: JobCreationRequest) -> ClassifyOutcome {
+    match job_store
+        .create_job_with_links(&request)
+        .await
+    {
+        Ok(JobCreationOutcome::Created(created)) => {
+            tracing::info!(
+                job_id = %created.job.id,
+                trigger_kind = ?created.job.trigger_kind,
+                job_kind = ?created.job.job_kind,
+                "slice 9: enqueued new-schema job"
+            );
+            ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
+        }
+        // Idempotent retry: a prior (interrupted) attempt already created
+        // the job for this webhook. Terminalize as EnqueuedJob WITHOUT
+        // minting a duplicate (the UNIQUE(github_webhook_id) guard +
+        // ON CONFLICT made the second create a no-op).
+        Ok(JobCreationOutcome::AlreadyEnqueued) => {
+            tracing::info!(
+                webhook_id = request.github_webhook_id,
+                "slice 9: webhook already has a job (idempotent reprocess); no duplicate created"
+            );
+            ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
+        }
+        Err(e) => ClassifyOutcome::Retryable(format!("create_job_with_links: {e}")),
+    }
+}
+
+/// Serialise a queued-event provenance payload to JSONB. Serialisation
+/// of these small, owned structs is infallible in practice; on the
+/// impossible error we log and fall back to `None` (the job + links
+/// still get created — the provenance detail is audit-only).
+fn queued_detail(detail: QueuedEventDetail) -> Option<serde_json::Value> {
+    match serde_json::to_value(&detail) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to serialise queued-event detail; omitting");
+            None
+        }
+    }
+}
+
 /// Slice 7: shared PR materialisation. Upsert base+head repo
 /// identity, the PR author, and the `github_pull_request` row in the
 /// required FK order:
@@ -1420,14 +1514,24 @@ impl EventHandler for PullRequestHandler {
         .await
         {
             PolicyEvaluation::Accepted => {
+                // Slice 9: pull_request events do NOT create jobs. There
+                // is no `trigger_kind` for PR-event auto-benchmarking,
+                // and auto-benching every PR push is a separate product
+                // decision (a future `pr_updated`/`pr_auto` trigger +
+                // policy knob). The PR row has been materialised/updated
+                // above so a later `/benchmark` comment can link to it;
+                // we terminate as `ProcessedPullRequest` — neither a
+                // no-op `IgnoredAction` nor the now-misleading
+                // `WouldEnqueueJob`.
                 tracing::info!(
                     installation_id = install_id,
                     pr_number = event.pull_request.number,
                     base_repo_id = base_repo.id,
                     head_repo_id = head_repo.id,
-                    "pull_request: policies accepted — slice 9 will enqueue here"
+                    "pull_request: policies accepted — PR state materialised, no job (use \
+                     /benchmark to enqueue)"
                 );
-                ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
+                ClassifyOutcome::Terminal(WebhookOutcome::ProcessedPullRequest)
             }
             PolicyEvaluation::DeniedTarget => {
                 ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)
@@ -1452,14 +1556,22 @@ impl EventHandler for PullRequestHandler {
 pub struct PushHandler {
     policy_store: Arc<dyn PolicyStore>,
     install_store: Arc<dyn InstallationStore>,
+    /// Slice 9: a matched `branch_push` trigger creates a `baseline`
+    /// job instead of emitting the Phase-1 `WouldEnqueueJob` signal.
+    job_store: Arc<dyn JobV2Store>,
 }
 
 impl PushHandler {
     pub fn new(
         policy_store: Arc<dyn PolicyStore>,
         install_store: Arc<dyn InstallationStore>,
+        job_store: Arc<dyn JobV2Store>,
     ) -> Self {
-        Self { policy_store, install_store }
+        Self {
+            policy_store,
+            install_store,
+            job_store,
+        }
     }
 }
 
@@ -1512,24 +1624,11 @@ impl EventHandler for PushHandler {
             Err(e) => return ClassifyOutcome::Retryable(format!("list_enabled_triggers: {e}")),
         };
 
-        let mut any_match = false;
-        for t in &triggers {
-            if matches_branch_push(&t.match_spec.0, branch) {
-                any_match = true;
-                tracing::info!(
-                    installation_id = event.installation.id,
-                    repo_id = event.repository.id,
-                    branch,
-                    trigger_id = t.id,
-                    "push: branch_push trigger matched — slice 9 will enqueue here"
-                );
-            }
-        }
-        if any_match {
-            // Phase 1 shadow accept (pre-slice-6 checkpoint). Slice 9
-            // flips this to `EnqueuedJob`.
-            ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
-        } else {
+        let matched: Vec<&TriggerPolicy> = triggers
+            .iter()
+            .filter(|t| matches_branch_push(&t.match_spec.0, branch))
+            .collect();
+        let Some(trigger) = matched.first().copied() else {
             tracing::debug!(
                 installation_id = event.installation.id,
                 repo_id = event.repository.id,
@@ -1537,8 +1636,64 @@ impl EventHandler for PushHandler {
                 trigger_count = triggers.len(),
                 "push: no branch_push trigger matched"
             );
-            ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
+            return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction);
+        };
+        // Slice 9 creates one job per accepted webhook (see `enqueue_job`);
+        // surface multi-trigger matches rather than silently dropping them.
+        if matched.len() > 1 {
+            tracing::warn!(
+                installation_id = event.installation.id,
+                repo_id = event.repository.id,
+                branch,
+                matched = matched.len(),
+                used_trigger_id = trigger.id,
+                "push: multiple branch_push triggers matched; slice 9 enqueues one job for the \
+                 first (multi-trigger fan-out deferred)"
+            );
         }
+
+        // A branch deletion (or a push introducing no commits) has no
+        // head_commit — nothing to benchmark, so don't enqueue.
+        let Some(head_commit) = event.head_commit.as_ref() else {
+            tracing::info!(
+                installation_id = event.installation.id,
+                repo_id = event.repository.id,
+                branch,
+                "push: branch_push trigger matched but no head_commit (deletion?) — not enqueuing"
+            );
+            return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction);
+        };
+
+        tracing::info!(
+            installation_id = event.installation.id,
+            repo_id = event.repository.id,
+            branch,
+            trigger_id = trigger.id,
+            "push: branch_push trigger matched — creating job"
+        );
+        let detail = QueuedEventDetail::BranchPush {
+            branch: branch.to_string(),
+            trigger_id: trigger.id,
+            bench_args: trigger.bench_args.clone(),
+        };
+        let request = JobCreationRequest {
+            new_job: NewJobV2 {
+                github_installation_id: event.installation.id,
+                github_repo_id: event.repository.id,
+                job_kind: JobKind::Baseline,
+                trigger_kind: TriggerKind::BranchPush,
+                git_ref_kind: GitRefKind::Branch,
+                git_ref_display: branch.to_string(),
+                git_commit_hash: Some(head_commit.id.clone()),
+                git_committed_at: Some(head_commit.timestamp),
+            },
+            github_webhook_id: webhook.id,
+            // No responsible user for an automated branch-push trigger.
+            triggering_user_id: None,
+            pull_request_link: None,
+            queued_event_detail: queued_detail(detail),
+        };
+        enqueue_job(self.job_store.as_ref(), request).await
     }
 }
 
@@ -1549,14 +1704,24 @@ impl EventHandler for PushHandler {
 pub struct CreateHandler {
     policy_store: Arc<dyn PolicyStore>,
     install_store: Arc<dyn InstallationStore>,
+    /// Slice 9: a matched `tag_created` trigger creates a `baseline`
+    /// job. The create event carries no SHA, so the job is queued with
+    /// an unresolved commit and the orchestrator resolves the tag to
+    /// its commit during the claim phase.
+    job_store: Arc<dyn JobV2Store>,
 }
 
 impl CreateHandler {
     pub fn new(
         policy_store: Arc<dyn PolicyStore>,
         install_store: Arc<dyn InstallationStore>,
+        job_store: Arc<dyn JobV2Store>,
     ) -> Self {
-        Self { policy_store, install_store }
+        Self {
+            policy_store,
+            install_store,
+            job_store,
+        }
     }
 }
 
@@ -1602,19 +1767,10 @@ impl EventHandler for CreateHandler {
             Err(e) => return ClassifyOutcome::Retryable(format!("list_enabled_triggers: {e}")),
         };
 
-        let mut any_match = false;
+        let mut matched: Vec<&TriggerPolicy> = Vec::new();
         for t in &triggers {
             match matches_tag_created(&t.match_spec.0, &event.ref_field) {
-                Ok(true) => {
-                    any_match = true;
-                    tracing::info!(
-                        installation_id = event.installation.id,
-                        repo_id = event.repository.id,
-                        tag = event.ref_field.as_str(),
-                        trigger_id = t.id,
-                        "create: tag_created trigger matched — slice 9 will enqueue here"
-                    );
-                }
+                Ok(true) => matched.push(t),
                 Ok(false) => {}
                 Err(msg) => {
                     // Malformed operator-supplied regex. Log + skip
@@ -1629,11 +1785,7 @@ impl EventHandler for CreateHandler {
                 }
             }
         }
-        if any_match {
-            // Phase 1 shadow accept (pre-slice-6 checkpoint). Slice 9
-            // flips this to `EnqueuedJob`.
-            ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
-        } else {
+        let Some(trigger) = matched.first().copied() else {
             tracing::debug!(
                 installation_id = event.installation.id,
                 repo_id = event.repository.id,
@@ -1641,8 +1793,54 @@ impl EventHandler for CreateHandler {
                 trigger_count = triggers.len(),
                 "create: no tag_created trigger matched"
             );
-            ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)
+            return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction);
+        };
+        // Slice 9 creates one job per accepted webhook (see `enqueue_job`);
+        // surface multi-trigger matches rather than silently dropping them.
+        if matched.len() > 1 {
+            tracing::warn!(
+                installation_id = event.installation.id,
+                repo_id = event.repository.id,
+                tag = event.ref_field.as_str(),
+                matched = matched.len(),
+                used_trigger_id = trigger.id,
+                "create: multiple tag_created triggers matched; slice 9 enqueues one job for the \
+                 first (multi-trigger fan-out deferred)"
+            );
         }
+
+        tracing::info!(
+            installation_id = event.installation.id,
+            repo_id = event.repository.id,
+            tag = event.ref_field.as_str(),
+            trigger_id = trigger.id,
+            "create: tag_created trigger matched — creating job"
+        );
+        let detail = QueuedEventDetail::TagCreated {
+            tag: event.ref_field.clone(),
+            trigger_id: trigger.id,
+            bench_args: trigger.bench_args.clone(),
+        };
+        let request = JobCreationRequest {
+            new_job: NewJobV2 {
+                github_installation_id: event.installation.id,
+                github_repo_id: event.repository.id,
+                job_kind: JobKind::Baseline,
+                trigger_kind: TriggerKind::TagCreated,
+                git_ref_kind: GitRefKind::Tag,
+                git_ref_display: event.ref_field.clone(),
+                // The create event carries no SHA; the orchestrator
+                // resolves the tag → commit during the claim phase
+                // (slice 8's `mark_running(Some(ResolvedCommit))`).
+                git_commit_hash: None,
+                git_committed_at: None,
+            },
+            github_webhook_id: webhook.id,
+            triggering_user_id: None,
+            pull_request_link: None,
+            queued_event_detail: queued_detail(detail),
+        };
+        enqueue_job(self.job_store.as_ref(), request).await
     }
 }
 
@@ -2304,16 +2502,19 @@ mod tests {
     }
 
     /// Build an `IssueCommentHandler` with policy/repo state already
-    /// seeded for a /benchmark eval. Returns `(handler, FakeGitHub,
-    /// PolicyStore)` so each test can stage exactly which policies
-    /// (target / source) are enabled. The FakeGitHub is pre-seeded
-    /// with the standard PR response (base id=10, head id=20).
+    /// seeded for a /benchmark eval. Returns the handler, the
+    /// `FakeGitHub`, the policy/install/user stores (so each test can
+    /// stage exactly which policies are enabled), and the slice-9
+    /// `InMemoryJobV2Store` (so the accept-path test can assert a job
+    /// was created). The FakeGitHub is pre-seeded with the standard PR
+    /// response (base id=10, head id=20).
     async fn make_benchmark_handler() -> (
         IssueCommentHandler,
         sbgh_core::github::test_support::FakeGitHub,
         Arc<sbgh_core::db::InMemoryPolicyStore>,
         Arc<sbgh_core::db::InMemoryInstallationStore>,
         Arc<sbgh_core::db::InMemoryUserStore>,
+        Arc<sbgh_core::db::InMemoryJobV2Store>,
     ) {
         let repo_store = Arc::new(sbgh_core::db::InMemoryRepoStore::new());
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
@@ -2372,6 +2573,7 @@ mod tests {
         user_store.seed_role(42, 1, Some(10), UserRole::TriggerPrBenchmark);
 
         let pull_request_store = Arc::new(sbgh_core::db::InMemoryPullRequestStore::new());
+        let job_store = Arc::new(sbgh_core::db::InMemoryJobV2Store::new());
 
         let handler = IssueCommentHandler::new(
             repo_store,
@@ -2380,29 +2582,106 @@ mod tests {
             user_store.clone(),
             pull_request_store,
             Arc::new(gh.clone()),
+            job_store.clone(),
         );
-        (handler, gh, policy_store, install_store, user_store)
+        (handler, gh, policy_store, install_store, user_store, job_store)
     }
 
     #[tokio::test]
-    async fn benchmark_with_both_policies_enabled_is_would_enqueue_job_in_phase1() {
-        // Slice 5 + pre-slice-6 checkpoint: /benchmark on a PR
-        // evaluates target+source policies. Both enabled → accepted →
-        // terminal `WouldEnqueueJob`. Phase 1 doesn't actually enqueue
-        // (legacy handler→jobs path still runs the bench), but the
-        // outcome value is the queryable signal that the new pipeline
-        // agreed. Slice 9 will flip this to `EnqueuedJob`.
-        let (h, _gh, policy_store, _install_store, _user_store) = make_benchmark_handler().await;
+    async fn benchmark_with_both_policies_enabled_enqueues_pr_comment_job() {
+        // Slice 9: /benchmark on a PR with target+source policies enabled
+        // + an authorized user → accepted → creates a `pr_comment`
+        // ad-hoc job (+ webhook/user/PR links + queued event) and
+        // terminates as `EnqueuedJob`.
+        let (h, _gh, policy_store, _install_store, _user_store, job_store) =
+            make_benchmark_handler().await;
         policy_store.seed_target(1, 10, true); // base
         policy_store.seed_source(1, 20, true); // head
 
         let webhook = make_claimed(
             "issue_comment",
             Some("created"),
-            Some(issue_comment_payload("created", "/benchmark run", true)),
+            Some(issue_comment_payload("created", "/benchmark run --iters=3", true)),
         );
         let outcome = h.handle(&webhook).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
+
+        // One job created, with the expected subject identity. The job's
+        // repo is the TARGET (base, id=10); the ref is the PR HEAD.
+        let jobs = job_store.all_jobs();
+        assert_eq!(jobs.len(), 1, "exactly one job created");
+        let job = &jobs[0];
+        assert_eq!(job.github_repo_id, 10, "job runs against the target (base) repo");
+        assert_eq!(job.job_kind, sbgh_core::models::JobKind::AdHoc);
+        assert_eq!(job.trigger_kind, TriggerKind::PrComment);
+        assert_eq!(job.git_ref_kind, GitRefKind::Branch);
+        assert_eq!(job.git_ref_display, "feat", "PR head branch");
+        assert_eq!(job.git_commit_hash.as_deref(), Some("headsha"));
+        assert_eq!(job.status, sbgh_core::models::JobStatus::Queued);
+
+        // Links: triggering user (the commenter) + the PR.
+        assert_eq!(job_store.user_links().len(), 1);
+        assert_eq!(job_store.user_links()[0].github_user_id, 42);
+        assert_eq!(job_store.pr_links().len(), 1);
+        assert_eq!(
+            job_store.pr_links()[0].triggering_comment_id,
+            Some(1),
+            "links the triggering comment id"
+        );
+
+        // Queued event carries the pr_comment provenance with bench args.
+        let events = job_store.all_events();
+        assert_eq!(events.len(), 1);
+        let detail: sbgh_core::models::QueuedEventDetail = serde_json::from_value(
+            events[0]
+                .detail
+                .clone()
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        match detail {
+            sbgh_core::models::QueuedEventDetail::PrComment {
+                sender_login,
+                subcommand,
+                bench_args,
+                ..
+            } => {
+                assert_eq!(sender_login, "alice");
+                assert_eq!(subcommand.as_deref(), Some("run"));
+                assert_eq!(bench_args, vec!["--iters=3"]);
+            }
+            other => panic!("expected PrComment provenance, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_reprocessed_webhook_does_not_duplicate_job() {
+        // Slice 9 (review fix): job creation is the only non-idempotent
+        // classify side effect, and the inbox is at-least-once — a
+        // webhook can be reprocessed after a failed complete() / swept
+        // claim lease. Handling the SAME webhook twice must yield
+        // EnqueuedJob both times but only ONE job (idempotent on
+        // github_webhook_id).
+        let (h, _gh, policy_store, _install_store, _user_store, job_store) =
+            make_benchmark_handler().await;
+        policy_store.seed_target(1, 10, true);
+        policy_store.seed_source(1, 20, true);
+        let webhook = make_claimed(
+            "issue_comment",
+            Some("created"),
+            Some(issue_comment_payload("created", "/benchmark run", true)),
+        );
+
+        let first = h.handle(&webhook).await;
+        assert!(matches!(first, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
+        // Same webhook re-delivered to the handler (same webhook.id).
+        let second = h.handle(&webhook).await;
+        assert!(
+            matches!(second, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)),
+            "reprocess must still terminalize as EnqueuedJob (idempotent)"
+        );
+        assert_eq!(job_store.all_jobs().len(), 1, "reprocess must NOT create a duplicate job");
     }
 
     #[tokio::test]
@@ -2412,7 +2691,8 @@ mod tests {
         // surfaces the denial — even though the legacy handler may
         // still run the bench in Phase 1, the inbox row signals "the
         // new pipeline would have denied this."
-        let (h, _gh, _policy_store, _install_store, _user_store) = make_benchmark_handler().await;
+        let (h, _gh, _policy_store, _install_store, _user_store, _job_store) =
+            make_benchmark_handler().await;
         // No target policy seeded.
         let webhook = make_claimed(
             "issue_comment",
@@ -2427,7 +2707,8 @@ mod tests {
     async fn benchmark_with_disabled_target_policy_is_denied_target_policy() {
         // Soft-disabled target (operator paused) takes the same deny
         // path as a missing target row.
-        let (h, _gh, policy_store, _install_store, _user_store) = make_benchmark_handler().await;
+        let (h, _gh, policy_store, _install_store, _user_store, _job_store) =
+            make_benchmark_handler().await;
         policy_store.seed_target(1, 10, false);
         policy_store.seed_source(1, 20, true);
         let webhook = make_claimed(
@@ -2441,7 +2722,8 @@ mod tests {
 
     #[tokio::test]
     async fn benchmark_with_no_source_policy_is_denied_source_policy() {
-        let (h, _gh, policy_store, _install_store, _user_store) = make_benchmark_handler().await;
+        let (h, _gh, policy_store, _install_store, _user_store, _job_store) =
+            make_benchmark_handler().await;
         policy_store.seed_target(1, 10, true);
         // No source policy.
         let webhook = make_claimed(
@@ -2460,7 +2742,8 @@ mod tests {
     /// or assert that the unauthorized path fires.
     async fn make_benchmark_handler_without_role_grant()
     -> (IssueCommentHandler, Arc<sbgh_core::db::InMemoryUserStore>) {
-        let (h, _gh, policy_store, _install_store, user_store) = make_benchmark_handler().await;
+        let (h, _gh, policy_store, _install_store, user_store, _job_store) =
+            make_benchmark_handler().await;
         policy_store.seed_target(1, 10, true);
         policy_store.seed_source(1, 20, true);
         // Wipe the role seeded by `make_benchmark_handler` so the
@@ -2505,7 +2788,7 @@ mod tests {
             Some(issue_comment_payload("created", "/benchmark run", true)),
         );
         let outcome = h.handle(&webhook).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
     }
 
     #[tokio::test]
@@ -2541,7 +2824,7 @@ mod tests {
             Some(issue_comment_payload("created", "/benchmark run", true)),
         );
         let outcome = h.handle(&webhook).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
     }
 
     #[tokio::test]
@@ -2614,7 +2897,8 @@ mod tests {
     async fn benchmark_gh_api_failure_is_retryable() {
         // If we can't fetch the PR (GH API down, install token expired,
         // etc.), the policy eval can't complete → Retryable.
-        let (h, _gh, _policy_store, _install_store, _user_store) = make_benchmark_handler().await;
+        let (h, _gh, _policy_store, _install_store, _user_store, _job_store) =
+            make_benchmark_handler().await;
         // Build a webhook for a DIFFERENT PR than the canned one, so
         // FakeGitHub returns an error.
         let payload = serde_json::json!({
@@ -2847,6 +3131,7 @@ mod tests {
             Arc::new(sbgh_core::db::InMemoryUserStore::new()),
             Arc::new(sbgh_core::db::InMemoryPullRequestStore::new()),
             Arc::new(sbgh_core::github::test_support::FakeGitHub::new()),
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
         )
     }
 
@@ -3978,16 +4263,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pr_opened_with_both_policies_enabled_is_would_enqueue_job_in_phase1() {
-        // Pre-slice-6 checkpoint: PR with target+source policies
-        // enabled terminates as `WouldEnqueueJob` (Phase 1 shadow
-        // accept). Slice 9 flips to `EnqueuedJob`.
+    async fn pr_opened_with_both_policies_enabled_is_processed_pull_request() {
+        // Slice 9: a pull_request event with both policies enabled
+        // materialises PR state but does NOT enqueue a job — there is no
+        // trigger_kind for PR-event auto-bench. It terminates as
+        // `ProcessedPullRequest` (not `WouldEnqueueJob`, which would
+        // imply a job is coming, and not `IgnoredAction`, which would
+        // hide that PR state changed).
         let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
         policy_store.seed_target(100, 10, true);
         policy_store.seed_source(100, 20, true);
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let outcome = h.handle(&w).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::ProcessedPullRequest)));
     }
 
     #[tokio::test]
@@ -4080,8 +4368,9 @@ mod tests {
         let w_edit = pr_webhook("edited", edited_payload);
         let outcome = h.handle(&w_edit).await;
         assert!(
-            matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)),
-            "edited + changes.base must re-run policy eval"
+            matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::ProcessedPullRequest)),
+            "edited + changes.base must re-run policy eval (accepted → ProcessedPullRequest, no \
+             job)"
         );
         let pr = pr_store
             .lookup_pull_request(10, 1)
@@ -4179,7 +4468,8 @@ mod tests {
         // Now reopen.
         let w_reopen = pr_webhook("reopened", pr_event_payload("reopened", 100, 10, 20));
         let outcome = h.handle(&w_reopen).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
+        // Slice 9: accepted PR events do not enqueue → ProcessedPullRequest.
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::ProcessedPullRequest)));
         let reopened = pr_store
             .lookup_pull_request(10, 1)
             .await
@@ -4482,7 +4772,11 @@ mod tests {
         serde_json::json!({
             "ref": format!("refs/heads/{branch}"),
             "installation": { "id": install_id },
-            "repository": { "id": repo_id, "full_name": "o/r" }
+            "repository": { "id": repo_id, "full_name": "o/r" },
+            "head_commit": {
+                "id": "pushsha",
+                "timestamp": "2026-05-29T10:00:00Z"
+            }
         })
     }
 
@@ -4527,9 +4821,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_with_matching_branch_trigger_is_would_enqueue_job_phase1() {
-        // Pre-slice-6 checkpoint: matching trigger terminates as
-        // `WouldEnqueueJob` (Phase 1 shadow accept). Slice 9 flips to
+    async fn push_with_matching_branch_trigger_enqueues_baseline_job() {
+        // Slice 9: a matching branch_push trigger creates a `baseline`
+        // job (resolved commit from head_commit) and terminates as
         // `EnqueuedJob`.
         //
         // Parent target must be enabled — slice 5 second-pass runtime
@@ -4545,10 +4839,68 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = PushHandler::new(policy_store, install_store);
+        let job_store = Arc::new(sbgh_core::db::InMemoryJobV2Store::new());
+        let h = PushHandler::new(policy_store, install_store, job_store.clone());
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
+
+        let jobs = job_store.all_jobs();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.github_repo_id, 10);
+        assert_eq!(job.job_kind, sbgh_core::models::JobKind::Baseline);
+        assert_eq!(job.trigger_kind, TriggerKind::BranchPush);
+        assert_eq!(job.git_ref_kind, GitRefKind::Branch);
+        assert_eq!(job.git_ref_display, "develop");
+        assert_eq!(job.git_commit_hash.as_deref(), Some("pushsha"), "resolved at enqueue");
+        assert!(job.git_committed_at.is_some());
+        // Automated trigger → no responsible user, no PR link.
+        assert!(
+            job_store
+                .user_links()
+                .is_empty()
+        );
+        assert!(
+            job_store
+                .pr_links()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn push_matching_trigger_without_head_commit_does_not_enqueue() {
+        // Slice 9: a branch deletion (or a commit-less push) arrives with
+        // `head_commit: null`. Even when a branch_push trigger matches the
+        // ref, there is nothing to benchmark — terminate as IgnoredAction
+        // and create NO job (vs. enqueuing one with no resolvable commit).
+        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
+        policy_store.seed_target(100, 10, true);
+        policy_store.seed_trigger(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+            true,
+        );
+        let install_store = make_active_install_store().await;
+        let job_store = Arc::new(sbgh_core::db::InMemoryJobV2Store::new());
+        let h = PushHandler::new(policy_store, install_store, job_store.clone());
+        // No `head_commit` key → parses as None.
+        let payload = serde_json::json!({
+            "ref": "refs/heads/develop",
+            "installation": { "id": 100 },
+            "repository": { "id": 10, "full_name": "o/r" }
+        });
+        let w = push_webhook_claimed(payload);
+        let outcome = h.handle(&w).await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        assert!(
+            job_store
+                .all_jobs()
+                .is_empty(),
+            "branch deletion must not enqueue a job"
+        );
     }
 
     #[tokio::test]
@@ -4562,7 +4914,11 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = PushHandler::new(policy_store, install_store);
+        let h = PushHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = push_webhook_claimed(push_event_payload(100, 10, "feature-x"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4580,7 +4936,11 @@ mod tests {
             false, // disabled
         );
         let install_store = make_active_install_store().await;
-        let h = PushHandler::new(policy_store, install_store);
+        let h = PushHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         // Disabled trigger doesn't surface in list_enabled_triggers, so
@@ -4596,7 +4956,11 @@ mod tests {
         // policy lookup. Rare in practice but defensive.
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
         let install_store = make_active_install_store().await;
-        let h = PushHandler::new(policy_store, install_store);
+        let h = PushHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let payload = serde_json::json!({
             "ref": "refs/tags/v1.0",
             "installation": { "id": 100 },
@@ -4639,10 +5003,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_tag_matching_pattern_is_would_enqueue_job_phase1() {
-        // Pre-slice-6 checkpoint: matching tag regex terminates as
-        // `WouldEnqueueJob` (Phase 1 shadow accept). Slice 9 flips to
-        // `EnqueuedJob`.
+    async fn create_tag_matching_pattern_enqueues_baseline_job_with_unresolved_commit() {
+        // Slice 9: a matching tag regex creates a `baseline` job. The
+        // create event carries no SHA, so the job is queued with an
+        // UNRESOLVED commit (the orchestrator resolves it during claim).
+        // Terminates as `EnqueuedJob`.
         //
         // Parent target must be enabled — slice 5 second-pass runtime
         // gate filters triggers whose parent target is disabled / missing.
@@ -4658,10 +5023,24 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(policy_store, install_store);
+        let job_store = Arc::new(sbgh_core::db::InMemoryJobV2Store::new());
+        let h = CreateHandler::new(policy_store, install_store, job_store.clone());
         let w = create_webhook_claimed(create_event_payload(100, 10, "release/1.2", "tag"));
         let outcome = h.handle(&w).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
+
+        let jobs = job_store.all_jobs();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.job_kind, sbgh_core::models::JobKind::Baseline);
+        assert_eq!(job.trigger_kind, TriggerKind::TagCreated);
+        assert_eq!(job.git_ref_kind, GitRefKind::Tag);
+        assert_eq!(job.git_ref_display, "release/1.2");
+        assert!(
+            job.git_commit_hash.is_none(),
+            "create event carries no SHA — orchestrator resolves during claim"
+        );
+        assert!(job.git_committed_at.is_none());
     }
 
     #[tokio::test]
@@ -4677,7 +5056,11 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(policy_store, install_store);
+        let h = CreateHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = create_webhook_claimed(create_event_payload(100, 10, "feature/foo", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4689,7 +5072,11 @@ mod tests {
         // already covered by `push`.
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(policy_store, install_store);
+        let h = CreateHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = create_webhook_claimed(create_event_payload(100, 10, "new-branch", "branch"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4718,7 +5105,11 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(policy_store, install_store);
+        let h = CreateHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         // The good trigger still got to match.
@@ -4729,7 +5120,11 @@ mod tests {
     async fn create_null_payload_is_error() {
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(policy_store, install_store);
+        let h = CreateHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let mut w = create_webhook_claimed(serde_json::Value::Null);
         w.payload = None;
         let outcome = h.handle(&w).await;
@@ -4756,7 +5151,11 @@ mod tests {
             .revoke_membership(100, 10)
             .await
             .unwrap();
-        let h = PushHandler::new(policy_store, install_store);
+        let h = PushHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4777,7 +5176,11 @@ mod tests {
             .delete_installation(100)
             .await
             .unwrap();
-        let h = PushHandler::new(policy_store, install_store);
+        let h = PushHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4798,7 +5201,11 @@ mod tests {
             .revoke_membership(100, 10)
             .await
             .unwrap();
-        let h = CreateHandler::new(policy_store, install_store);
+        let h = CreateHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4827,7 +5234,11 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = PushHandler::new(policy_store, install_store);
+        let h = PushHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4845,7 +5256,11 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = PushHandler::new(policy_store, install_store);
+        let h = PushHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4863,7 +5278,11 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(policy_store, install_store);
+        let h = CreateHandler::new(
+            policy_store,
+            install_store,
+            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
+        );
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));

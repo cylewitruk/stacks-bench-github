@@ -12,7 +12,7 @@ use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::Result;
-use crate::db::job_v2::{CreatedJob, JobV2Store};
+use crate::db::job_v2::{CreatedJob, JobCreationOutcome, JobV2Store};
 use crate::models::{
     GithubPullRequestJob, GithubUserJob, GithubWebhookJob, JobCreationRequest, JobEvent,
     JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, JobV2, NewJobEvent, NewJobV2,
@@ -61,6 +61,47 @@ impl InMemoryJobV2Store {
             .iter()
             .any(|l| l.job_id == job_id)
     }
+
+    /// Test-only accessor: snapshot of all `job` rows. Slice 9 handler
+    /// unit tests assert how many jobs an accept path created and
+    /// inspect their subject identity / commit fields.
+    pub fn all_jobs(&self) -> Vec<JobV2> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Test-only accessor: snapshot of all `job_event` rows (slice 9
+    /// asserts the queued event + its provenance detail).
+    pub fn all_events(&self) -> Vec<JobEvent> {
+        self.state
+            .lock()
+            .unwrap()
+            .events
+            .clone()
+    }
+
+    /// Test-only accessor: snapshot of all `github_user_job` links.
+    pub fn user_links(&self) -> Vec<GithubUserJob> {
+        self.state
+            .lock()
+            .unwrap()
+            .user_links
+            .clone()
+    }
+
+    /// Test-only accessor: snapshot of all `github_pull_request_job` links.
+    pub fn pr_links(&self) -> Vec<GithubPullRequestJob> {
+        self.state
+            .lock()
+            .unwrap()
+            .pr_links
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -90,38 +131,24 @@ impl JobV2Store for InMemoryJobV2Store {
         Ok(job)
     }
 
-    async fn create_job_with_links(&self, request: &JobCreationRequest) -> Result<CreatedJob> {
+    async fn create_job_with_links(
+        &self,
+        request: &JobCreationRequest,
+    ) -> Result<JobCreationOutcome> {
         // Post-second-review M1 fix: take the mutex ONCE for the entire
         // creation so concurrent in-memory tests can't observe (or
         // claim) a partially-created job between the sub-inserts.
         // Mirrors the all-or-nothing semantic of the Postgres single
         // transaction.
         //
-        // Build all the rows locally first, validate the UNIQUE
-        // constraints against the still-untouched state, THEN commit
-        // every mutation at the end. No revert path needed: nothing is
-        // visible to other observers until the final commit block, so
-        // any failure during validation is a clean early-return.
+        // Build all the rows locally first, THEN — under a single mutex
+        // acquisition — re-check the slice-9 `UNIQUE (github_webhook_id)`
+        // idempotency guard and commit every mutation. The check must
+        // hold the SAME lock as the commit so a concurrent re-claim
+        // can't slip a second job in between (mirrors the Postgres
+        // `ON CONFLICT (github_webhook_id)` race-safety).
         let now = Utc::now();
-
-        // Validate UNIQUE constraints against current state (read-only).
         let job_id = Uuid::new_v4();
-        {
-            let s = self.state.lock().unwrap();
-            if s.webhook_links
-                .iter()
-                .any(|l| l.job_id == job_id)
-            {
-                return Err(crate::Error::Other(anyhow::anyhow!(
-                    "github_webhook_job UNIQUE(job_id) impossibly conflicted: {job_id}"
-                )));
-            }
-            // No other UNIQUE pre-checks needed: job_id is freshly
-            // generated; user_link / pr_link UNIQUEs are on job_id.
-            // (Whether the user_id / pr_id FKs would resolve is an
-            // app-layer concern not modelled in the in-memory store.)
-            drop(s);
-        }
 
         // Build all the rows locally.
         let job = JobV2 {
@@ -187,9 +214,19 @@ impl JobV2Store for InMemoryJobV2Store {
                 .map(sqlx::types::Json),
         };
 
-        // Commit: single mutex acquisition for ALL mutations. Nothing
-        // is visible to concurrent readers until this block returns.
+        // Commit: single mutex acquisition for ALL mutations (and the
+        // idempotency check). Nothing is visible to concurrent readers
+        // until this block returns.
         let mut s = self.state.lock().unwrap();
+        // Slice 9 idempotency guard — mirror Postgres
+        // `UNIQUE (github_webhook_id)`: if this webhook already has a
+        // job, this is a reprocessed delivery; write nothing.
+        if s.webhook_links
+            .iter()
+            .any(|l| l.github_webhook_id == request.github_webhook_id)
+        {
+            return Ok(JobCreationOutcome::AlreadyEnqueued);
+        }
         s.jobs
             .insert(job_id, job.clone());
         s.insertion_order.push(job_id);
@@ -205,13 +242,13 @@ impl JobV2Store for InMemoryJobV2Store {
         s.events
             .push(queued_event.clone());
 
-        Ok(CreatedJob {
+        Ok(JobCreationOutcome::Created(Box::new(CreatedJob {
             job,
             webhook_link,
             user_link,
             pull_request_link,
             queued_event,
-        })
+        })))
     }
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<JobV2>> {
@@ -372,7 +409,8 @@ impl JobV2Store for InMemoryJobV2Store {
         // `UNIQUE (job_id)` on github_webhook_job. Postgres rejects
         // a second link for the same job; the in-memory mirror does
         // the same so the test surfaces the bug rather than silently
-        // accumulating duplicate links.
+        // accumulating duplicate links. Slice 9 added
+        // `UNIQUE (github_webhook_id)` — mirror that too.
         let mut s = self.state.lock().unwrap();
         if s.webhook_links
             .iter()
@@ -380,6 +418,15 @@ impl JobV2Store for InMemoryJobV2Store {
         {
             return Err(crate::Error::Other(anyhow::anyhow!(
                 "github_webhook_job UNIQUE(job_id): duplicate link for job_id={job_id}"
+            )));
+        }
+        if s.webhook_links
+            .iter()
+            .any(|l| l.github_webhook_id == webhook_id)
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "github_webhook_job UNIQUE(github_webhook_id): duplicate link for \
+                 webhook_id={webhook_id}"
             )));
         }
         let row = GithubWebhookJob {

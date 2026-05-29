@@ -13,13 +13,25 @@
 use std::sync::Arc;
 
 use chrono::Duration;
-use sbgh_core::db::{JobV2Store, NewInstallation, Pool, PostgresJobV2Store, setup_pg};
+use sbgh_core::db::{
+    CreatedJob, JobCreationOutcome, JobV2Store, NewInstallation, Pool, PostgresJobV2Store, setup_pg,
+};
 use sbgh_core::models::{
     GitRefKind, GithubAccountType, JobCreationRequest, JobEventKind, JobEventStatus, JobKind,
     JobMetric, JobResult, JobStatus, NewJobEvent, NewJobV2, NewPullRequestLink, ResolvedCommit,
     TerminalJobStatus, TriggerKind,
 };
 use uuid::Uuid;
+
+/// Unwrap a `JobCreationOutcome` expected to be a fresh creation.
+fn expect_created(outcome: JobCreationOutcome) -> CreatedJob {
+    match outcome {
+        JobCreationOutcome::Created(c) => *c,
+        JobCreationOutcome::AlreadyEnqueued => {
+            panic!("expected a fresh Created job, got AlreadyEnqueued")
+        }
+    }
+}
 
 /// Seed install + repo + membership so `job`'s composite FK to
 /// `github_installation_repo` is satisfiable.
@@ -519,19 +531,21 @@ async fn create_job_with_links_inserts_job_links_and_queued_event_atomically() {
     .await
     .unwrap();
 
-    let created = store
-        .create_job_with_links(&JobCreationRequest {
-            new_job: make_new_job(100, 10),
-            github_webhook_id: webhook_id,
-            triggering_user_id: Some(42),
-            pull_request_link: Some(NewPullRequestLink {
-                github_pull_request_id: pr_id,
-                triggering_comment_id: Some(9001),
-            }),
-            queued_event_detail: Some(serde_json::json!({"trigger": "pr_comment"})),
-        })
-        .await
-        .unwrap();
+    let created = expect_created(
+        store
+            .create_job_with_links(&JobCreationRequest {
+                new_job: make_new_job(100, 10),
+                github_webhook_id: webhook_id,
+                triggering_user_id: Some(42),
+                pull_request_link: Some(NewPullRequestLink {
+                    github_pull_request_id: pr_id,
+                    triggering_comment_id: Some(9001),
+                }),
+                queued_event_detail: Some(serde_json::json!({"trigger": "pr_comment"})),
+            })
+            .await
+            .unwrap(),
+    );
 
     assert_eq!(created.job.status, JobStatus::Queued);
     assert_eq!(
@@ -617,25 +631,90 @@ async fn create_job_with_links_optional_user_and_pr_links_are_skipped_when_none(
     .fetch_one(&pool)
     .await
     .unwrap();
-    let created = store
-        .create_job_with_links(&JobCreationRequest {
-            new_job: NewJobV2 {
-                trigger_kind: TriggerKind::BranchPush,
-                ..make_new_job(100, 10)
-            },
-            github_webhook_id: webhook_id,
-            triggering_user_id: None,
-            pull_request_link: None,
-            queued_event_detail: None,
-        })
-        .await
-        .unwrap();
+    let created = expect_created(
+        store
+            .create_job_with_links(&JobCreationRequest {
+                new_job: NewJobV2 {
+                    trigger_kind: TriggerKind::BranchPush,
+                    ..make_new_job(100, 10)
+                },
+                github_webhook_id: webhook_id,
+                triggering_user_id: None,
+                pull_request_link: None,
+                queued_event_detail: None,
+            })
+            .await
+            .unwrap(),
+    );
     assert!(created.user_link.is_none());
     assert!(
         created
             .pull_request_link
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn create_job_with_links_is_idempotent_on_webhook_id() {
+    // Slice 9 (review fix): job creation is the first non-idempotent
+    // classify side effect, and the inbox is at-least-once. A webhook
+    // reprocessed after a failed complete() / swept lease MUST NOT mint
+    // a second job. The UNIQUE(github_webhook_id) guard +
+    // ON CONFLICT DO NOTHING makes the retry a no-op returning
+    // AlreadyEnqueued, leaving exactly one job.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobV2Store::new(pool.clone());
+    let webhook_id: i64 = sqlx::query_scalar(
+        "INSERT INTO github_webhook (delivery_id, event_type, payload_size_bytes) VALUES \
+         ('idempotent-1', 'push', 0) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let request = JobCreationRequest {
+        new_job: NewJobV2 {
+            trigger_kind: TriggerKind::BranchPush,
+            ..make_new_job(100, 10)
+        },
+        github_webhook_id: webhook_id,
+        triggering_user_id: None,
+        pull_request_link: None,
+        queued_event_detail: None,
+    };
+
+    // First create succeeds.
+    let first = store
+        .create_job_with_links(&request)
+        .await
+        .unwrap();
+    assert!(matches!(first, JobCreationOutcome::Created(_)));
+
+    // Reprocess the SAME webhook → idempotent no-op.
+    let second = store
+        .create_job_with_links(&request)
+        .await
+        .unwrap();
+    assert!(
+        matches!(second, JobCreationOutcome::AlreadyEnqueued),
+        "second create for the same webhook must be AlreadyEnqueued, not a duplicate"
+    );
+
+    // Exactly one job + one link, no orphan from the rolled-back retry.
+    let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(job_count, 1, "retry must not create a second job");
+    let link_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM github_webhook_job WHERE github_webhook_id = $1")
+            .bind(webhook_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(link_count, 1);
 }
 
 #[tokio::test]

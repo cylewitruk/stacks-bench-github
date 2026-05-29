@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use sbgh_core::db::{InMemoryJobV2Store, JobV2Store};
+use sbgh_core::db::{InMemoryJobV2Store, JobCreationOutcome, JobV2Store};
 use sbgh_core::models::{
     GitRefKind, JobCreationRequest, JobKind, JobStatus, NewJobV2, NewPullRequestLink, TriggerKind,
 };
@@ -42,10 +42,13 @@ async fn create_job_with_links_is_atomically_visible() {
     // After the call returns Ok, ALL related rows must be present
     // — never a job without its webhook link or queued event.
     let store = InMemoryJobV2Store::new();
-    let created = store
+    let JobCreationOutcome::Created(created) = store
         .create_job_with_links(&make_request(1))
         .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("expected a fresh Created job");
+    };
 
     // Job present, status=Queued.
     let job = store
@@ -62,6 +65,29 @@ async fn create_job_with_links_is_atomically_visible() {
             .is_some(),
         "PR link must be present in the return bundle"
     );
+}
+
+#[tokio::test]
+async fn create_job_with_links_is_idempotent_on_webhook_id() {
+    // Slice 9 (review fix): the in-memory store mirrors the Postgres
+    // UNIQUE(github_webhook_id) idempotency guard. Reprocessing the same
+    // webhook returns AlreadyEnqueued and leaves exactly one job.
+    let store = InMemoryJobV2Store::new();
+    let first = store
+        .create_job_with_links(&make_request(7))
+        .await
+        .unwrap();
+    assert!(matches!(first, JobCreationOutcome::Created(_)));
+
+    let second = store
+        .create_job_with_links(&make_request(7))
+        .await
+        .unwrap();
+    assert!(
+        matches!(second, JobCreationOutcome::AlreadyEnqueued),
+        "reprocessing the same webhook must be AlreadyEnqueued"
+    );
+    assert_eq!(store.all_jobs().len(), 1, "retry must not create a second job");
 }
 
 #[tokio::test]
