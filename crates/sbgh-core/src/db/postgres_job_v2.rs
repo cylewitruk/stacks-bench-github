@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::db::Pool;
-use crate::db::job_v2::{CreatedJob, JobCreationOutcome, JobV2Store};
+use crate::db::job_v2::{CreatedJob, JobCompletion, JobCreationOutcome, JobFailure, JobV2Store};
 use crate::models::{
     GithubPullRequestJob, GithubUserJob, GithubWebhookJob, JobCreationRequest, JobEvent,
     JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, JobV2, NewJobEvent, NewJobV2,
@@ -267,7 +267,7 @@ impl JobV2Store for PostgresJobV2Store {
         .bind(
             resolved_commit
                 .as_ref()
-                .map(|r| r.committed_at),
+                .and_then(|r| r.committed_at),
         )
         .execute(&self.pool)
         .await?;
@@ -323,6 +323,136 @@ impl JobV2Store for PostgresJobV2Store {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn complete_job(&self, completion: &JobCompletion) -> Result<bool> {
+        // Single transaction: guarded running→completed, then the
+        // write-once result (+ optional metric) + the completed event.
+        // The guard (claim_token + status='running') makes a stale
+        // finish racing the sweep a clean no-op (rolls back, returns
+        // false) instead of corrupting a reclaimed row.
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE job SET status = 'completed'
+             WHERE id = $1 AND claim_token = $2 AND status = 'running'",
+        )
+        .bind(completion.job_id)
+        .bind(completion.claim_token)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        let r = &completion.result;
+        sqlx::query("INSERT INTO job_result (job_id, run_json, archive_dir) VALUES ($1, $2, $3)")
+            .bind(r.job_id)
+            .bind(&r.run_json)
+            .bind(&r.archive_dir)
+            .execute(&mut *tx)
+            .await?;
+
+        if let Some(m) = completion.metric.as_ref() {
+            sqlx::query(
+                r#"
+                INSERT INTO job_metric
+                    (job_id, envelope_duration_us, replay_duration_us, total_duration_us,
+                     setup_duration_us, execution_duration_us, commit_duration_us,
+                     clarity_runtime, transactions, read_length, write_length,
+                     measured_blocks, warmup_blocks)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                "#,
+            )
+            .bind(m.job_id)
+            .bind(m.envelope_duration_us)
+            .bind(m.replay_duration_us)
+            .bind(m.total_duration_us)
+            .bind(m.setup_duration_us)
+            .bind(m.execution_duration_us)
+            .bind(m.commit_duration_us)
+            .bind(m.clarity_runtime)
+            .bind(m.transactions)
+            .bind(m.read_length)
+            .bind(m.write_length)
+            .bind(m.measured_blocks)
+            .bind(m.warmup_blocks)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO job_event (job_id, event_kind, event_status, detail)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(completion.job_id)
+        .bind(JobEventKind::Completed)
+        .bind(JobEventStatus::Success)
+        .bind(&completion.event_detail)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn fail_job(&self, failure: &JobFailure) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE job SET status = 'failed'
+             WHERE id = $1 AND claim_token = $2 AND status = 'running'",
+        )
+        .bind(failure.job_id)
+        .bind(failure.claim_token)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        if let Some(r) = failure.result.as_ref() {
+            sqlx::query(
+                "INSERT INTO job_result (job_id, run_json, archive_dir) VALUES ($1, $2, $3)",
+            )
+            .bind(r.job_id)
+            .bind(&r.run_json)
+            .bind(&r.archive_dir)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO job_event (job_id, event_kind, event_status, remark, detail)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(failure.job_id)
+        .bind(JobEventKind::Failed)
+        .bind(JobEventStatus::Fail)
+        .bind(&failure.remark)
+        .bind(&failure.event_detail)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn queued_event(&self, job_id: Uuid) -> Result<Option<JobEvent>> {
+        let row = sqlx::query_as::<_, JobEvent>(
+            r#"
+            SELECT id, job_id, event_kind, event_status, occurred_at,
+                   github_comment_id, remark, detail
+              FROM job_event
+             WHERE job_id = $1 AND event_kind = 'queued'
+          ORDER BY occurred_at, id
+             LIMIT 1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {

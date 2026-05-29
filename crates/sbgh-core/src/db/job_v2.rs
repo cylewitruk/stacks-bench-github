@@ -45,6 +45,40 @@ use crate::models::{
     JobResult, JobV2, NewJobEvent, NewJobV2, ResolvedCommit, TerminalJobStatus,
 };
 
+/// Slice 10: atomic "the run completed" write. Bundles the terminal
+/// status transition + the write-once outcome companions + the terminal
+/// timeline event so they all land in ONE transaction. Without the
+/// transaction, a crash between (say) `record_result` and `mark_terminal`
+/// would leave a half-finished job that the write-once `job_result` PK
+/// then blocks from being re-finished on retry.
+///
+/// `metric` is `None` when `run.json` was missing/unparseable or didn't
+/// carry the full promoted-metric set (the columns are NOT NULL) — the
+/// result row + archive path still land so the run is debuggable.
+#[derive(Debug, Clone)]
+pub struct JobCompletion {
+    pub job_id: uuid::Uuid,
+    pub claim_token: Uuid,
+    pub result: JobResult,
+    pub metric: Option<JobMetric>,
+    /// `completed` event provenance (forensics summary blob).
+    pub event_detail: Option<serde_json::Value>,
+}
+
+/// Slice 10: atomic "the run failed" write. Mirrors [`JobCompletion`]
+/// but transitions to `failed` and persists an optional forensics
+/// `result` (archive path is recorded even on failure so operators can
+/// find post-mortem artefacts). `remark` is the short human error stored
+/// on the `failed` event.
+#[derive(Debug, Clone)]
+pub struct JobFailure {
+    pub job_id: uuid::Uuid,
+    pub claim_token: Uuid,
+    pub result: Option<JobResult>,
+    pub remark: String,
+    pub event_detail: Option<serde_json::Value>,
+}
+
 /// Slice 8 (post-review): typed bundle returned by
 /// `create_job_with_links` so callers (slice 9) can chain follow-up
 /// operations against the freshly-created job + links + queued event
@@ -148,6 +182,26 @@ pub trait JobV2Store: Send + Sync + 'static {
     /// the inbox sweep's `claim_token` reset). Returns the recovered
     /// row count.
     async fn sweep_stuck_claims(&self, lease: Duration) -> Result<u64>;
+
+    /// Slice 10: atomic run-completion. In ONE transaction: transition
+    /// `running → completed` (guarded by `(job_id, claim_token,
+    /// status='running')`, same stale-claim guard as `mark_terminal`),
+    /// insert `job_result`, optionally insert `job_metric`, and append the
+    /// `completed` `job_event`. Returns `Ok(false)` if the guard didn't
+    /// match (a stale claim raced the sweep) — nothing is written.
+    async fn complete_job(&self, completion: &JobCompletion) -> Result<bool>;
+
+    /// Slice 10: atomic run-failure. In ONE transaction: transition
+    /// `running → failed` (same guard), optionally insert a forensics
+    /// `job_result`, and append the `failed` `job_event`. Returns
+    /// `Ok(false)` on a stale-claim guard miss.
+    async fn fail_job(&self, failure: &JobFailure) -> Result<bool>;
+
+    /// Slice 10: read the `queued` timeline event for a job (carries the
+    /// trigger provenance + `bench_args` the orchestrator forwards to
+    /// the run). `None` if the job has no queued event (shouldn't happen
+    /// for jobs created via `create_job_with_links`).
+    async fn queued_event(&self, job_id: Uuid) -> Result<Option<JobEvent>>;
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 

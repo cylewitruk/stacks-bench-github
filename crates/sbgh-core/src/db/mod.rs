@@ -59,7 +59,7 @@ pub use in_memory_user::InMemoryUserStore;
 pub use in_memory_webhook::{InMemoryWebhookInbox, InMemoryWebhookRow, SeedWebhook};
 pub use ingest::{IngestOutcome, IngestStore, NewWebhook};
 pub use installation::{DeleteInstallationOutcome, InstallationStore, NewInstallation};
-pub use job_v2::{CreatedJob, JobCreationOutcome, JobV2Store};
+pub use job_v2::{CreatedJob, JobCompletion, JobCreationOutcome, JobFailure, JobV2Store};
 pub use jobs::JobStore;
 pub use migrate::migrate;
 pub use policy::PolicyStore;

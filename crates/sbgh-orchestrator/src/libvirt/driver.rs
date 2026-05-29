@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sbgh_core::config::OrchestratorConfig;
-use sbgh_core::models::Job;
 
+use crate::job_source::RunnableJob;
 use crate::libvirt::boot::BootDisk;
 use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitCommon};
 use crate::libvirt::domain::{self, DomainSpec};
@@ -133,7 +133,7 @@ impl LibvirtDriver {
 
     pub async fn run_benchmark(
         &self,
-        job: &Job,
+        job: &RunnableJob,
         listener: &dyn PhaseListener,
     ) -> anyhow::Result<BenchmarkOutcome> {
         let job_id = job.id.to_string();
@@ -278,7 +278,7 @@ impl LibvirtDriver {
         let duration_secs = started.elapsed().as_secs();
         let summary = serde_json::json!({
             "job_id": job.id,
-            "head_sha": job.head_sha,
+            "head_sha": job.commit,
             "repository": job.repository,
             "duration_secs": duration_secs,
             "finish_reason": match &inner_result {
@@ -329,7 +329,7 @@ impl LibvirtDriver {
 
     async fn provision_define_start_poll(
         &self,
-        job: &Job,
+        job: &RunnableJob,
         job_id: &str,
         job_dir: &Path,
         domain_name: &str,
@@ -396,7 +396,7 @@ impl LibvirtDriver {
     /// tmpfs) + the two cidata ISOs.
     async fn provision_artifacts(
         &self,
-        job: &Job,
+        job: &RunnableJob,
         job_id: &str,
         job_dir: &Path,
         arts: &mut JobArtifacts,
@@ -404,8 +404,7 @@ impl LibvirtDriver {
         // Git mirror.
         let repo_url = format!("https://github.com/{}.git", job.repository);
         git_mirror::ensure(self.shell.as_ref(), &self.config.paths, &repo_url).await?;
-        git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, &job.head_sha)
-            .await?;
+        git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, &job.commit).await?;
 
         // Boot disk — single qcow2 overlay reused across both phases.
         // The bench VM boots from the same disk the build VM left
@@ -426,7 +425,7 @@ impl LibvirtDriver {
                 &self.config.paths,
                 job_dir,
                 &source_mount,
-                &job.head_sha,
+                &job.commit,
                 &self
                     .config
                     .server
@@ -473,7 +472,7 @@ impl LibvirtDriver {
             job_dir,
             &CloudInitCommon {
                 job_id,
-                head_sha: &job.head_sha,
+                head_sha: &job.commit,
                 chainstate_mount: "/var/lib/stacks-chainstate",
                 source_mount: "/opt/stacks-core",
                 results_share_tag: RESULTS_SHARE_TAG,
@@ -736,33 +735,23 @@ impl LibvirtDriver {
     }
 }
 
-fn derive_stacks_bench_args(job: &Job, default: &str) -> String {
-    if let Some(arr) = job.args.0["args"].as_array()
-        && !arr.is_empty()
-    {
-        return arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
-    default.to_string()
+fn derive_stacks_bench_args(job: &RunnableJob, default: &str) -> String {
+    if job.bench_args.is_empty() { default.to_string() } else { job.bench_args.join(" ") }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use chrono::Utc;
     use sbgh_core::config::{
-        GitHubConfig, LvmConfig, OrchestratorServerConfig, PathsConfig, StacksBenchConfig, VmConfig,
+        GitHubConfig, JobSource, JobsConfig, LvmConfig, OrchestratorServerConfig, PathsConfig,
+        StacksBenchConfig, VmConfig,
     };
-    use sbgh_core::models::{Job, JobStatus};
-    use sqlx::types::Json;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
+    use crate::job_source::ProgressTarget;
     use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
 
     fn test_config(tmp: &TempDir) -> OrchestratorConfig {
@@ -811,27 +800,23 @@ mod tests {
                 chainstate_snapshot_size_gib: None,
             },
             stacks_bench: StacksBenchConfig { default_args: String::new() },
+            jobs: JobsConfig { source: JobSource::Legacy },
         }
     }
 
-    fn fake_job() -> Job {
-        Job {
+    fn fake_job() -> RunnableJob {
+        RunnableJob {
             id: Uuid::new_v4(),
-            status: JobStatus::Running,
             repository: "acme/widgets".into(),
-            pr_number: 42,
-            head_sha: "abc123def456".into(),
-            requested_by: "alice".into(),
-            command: "run".into(),
-            args: Json(serde_json::json!({ "args": ["--iters=2"] })),
+            commit: "abc123def456".into(),
+            git_ref_display: "PR #42".into(),
             installation_id: 7,
-            comment_id: Some(1000),
-            github_delivery_id: Some("fake-delivery".into()),
-            queued_at: Utc::now(),
-            started_at: Some(Utc::now()),
-            finished_at: None,
-            result: None,
-            error: None,
+            bench_args: vec!["--iters=2".into()],
+            progress: ProgressTarget::PullRequestComment {
+                pr_number: 42,
+                comment_id: Some(1000),
+            },
+            claim_token: None,
         }
     }
 

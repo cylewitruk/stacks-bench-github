@@ -12,7 +12,7 @@ use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::Result;
-use crate::db::job_v2::{CreatedJob, JobCreationOutcome, JobV2Store};
+use crate::db::job_v2::{CreatedJob, JobCompletion, JobCreationOutcome, JobFailure, JobV2Store};
 use crate::models::{
     GithubPullRequestJob, GithubUserJob, GithubWebhookJob, JobCreationRequest, JobEvent,
     JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, JobV2, NewJobEvent, NewJobV2,
@@ -300,7 +300,11 @@ impl JobV2Store for InMemoryJobV2Store {
         job.status = JobStatus::Running;
         if let Some(rc) = resolved_commit {
             job.git_commit_hash = Some(rc.hash);
-            job.git_committed_at = Some(rc.committed_at);
+            // `None` committed_at leaves the existing value (mirrors the
+            // Postgres COALESCE).
+            if let Some(ts) = rc.committed_at {
+                job.git_committed_at = Some(ts);
+            }
         }
         job.updated_at = Utc::now();
         Ok(true)
@@ -343,6 +347,96 @@ impl JobV2Store for InMemoryJobV2Store {
             }
         }
         Ok(recovered)
+    }
+
+    async fn complete_job(&self, completion: &JobCompletion) -> Result<bool> {
+        // Mirror the Postgres transaction under a single lock: guarded
+        // running→completed, then result (+ optional metric) + completed
+        // event, all-or-nothing. The status guard prevents a double
+        // finish, so the write-once companions can't collide here.
+        let mut s = self.state.lock().unwrap();
+        match s.jobs.get(&completion.job_id) {
+            Some(j)
+                if j.status == JobStatus::Running
+                    && j.claim_token == Some(completion.claim_token) => {}
+            _ => return Ok(false),
+        }
+        let now = Utc::now();
+        let event = JobEvent {
+            id: self
+                .next_event_id
+                .fetch_add(1, Ordering::SeqCst),
+            job_id: completion.job_id,
+            event_kind: JobEventKind::Completed,
+            event_status: JobEventStatus::Success,
+            occurred_at: now,
+            github_comment_id: None,
+            remark: None,
+            detail: completion
+                .event_detail
+                .clone()
+                .map(sqlx::types::Json),
+        };
+        let job = s
+            .jobs
+            .get_mut(&completion.job_id)
+            .unwrap();
+        job.status = JobStatus::Completed;
+        job.updated_at = now;
+        s.results
+            .insert(completion.result.job_id, completion.result.clone());
+        if let Some(m) = completion.metric.as_ref() {
+            s.metrics
+                .insert(m.job_id, m.clone());
+        }
+        s.events.push(event);
+        Ok(true)
+    }
+
+    async fn fail_job(&self, failure: &JobFailure) -> Result<bool> {
+        let mut s = self.state.lock().unwrap();
+        match s.jobs.get(&failure.job_id) {
+            Some(j)
+                if j.status == JobStatus::Running && j.claim_token == Some(failure.claim_token) => {
+            }
+            _ => return Ok(false),
+        }
+        let now = Utc::now();
+        let event = JobEvent {
+            id: self
+                .next_event_id
+                .fetch_add(1, Ordering::SeqCst),
+            job_id: failure.job_id,
+            event_kind: JobEventKind::Failed,
+            event_status: JobEventStatus::Fail,
+            occurred_at: now,
+            github_comment_id: None,
+            remark: Some(failure.remark.clone()),
+            detail: failure
+                .event_detail
+                .clone()
+                .map(sqlx::types::Json),
+        };
+        let job = s
+            .jobs
+            .get_mut(&failure.job_id)
+            .unwrap();
+        job.status = JobStatus::Failed;
+        job.updated_at = now;
+        if let Some(r) = failure.result.as_ref() {
+            s.results
+                .insert(r.job_id, r.clone());
+        }
+        s.events.push(event);
+        Ok(true)
+    }
+
+    async fn queued_event(&self, job_id: Uuid) -> Result<Option<JobEvent>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.events
+            .iter()
+            .find(|e| e.job_id == job_id && e.event_kind == JobEventKind::Queued)
+            .cloned())
     }
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {

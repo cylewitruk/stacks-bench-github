@@ -160,6 +160,42 @@ pub struct OrchestratorConfig {
     pub paths: PathsConfig,
     pub lvm: LvmConfig,
     pub stacks_bench: StacksBenchConfig,
+    /// Slice 10: which job queue the orchestrator claims from. Defaults
+    /// to `legacy`; the new `job` family becomes the production source at
+    /// the slice 11 cutover.
+    pub jobs: JobsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsConfig {
+    pub source: JobSource,
+}
+
+/// Which persistence backend the orchestrator's runner claims from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobSource {
+    /// Legacy `jobs` table (production default through slice 10).
+    Legacy,
+    /// New-schema `job` family (slice 8/9). Selectable for staging /
+    /// the slice 11 cutover; not the production default yet.
+    V2,
+}
+
+impl std::str::FromStr for JobSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "legacy" => Ok(JobSource::Legacy),
+            "v2" | "new" => Ok(JobSource::V2),
+            other => Err(format!("invalid job source {other:?} (expected 'legacy' or 'v2')")),
+        }
+    }
 }
 
 /// Orchestrator-specific server bits. No `bind_addr` (it doesn't listen).
@@ -294,6 +330,13 @@ struct RawOrchestrator {
     paths: RawPaths,
     lvm: RawLvm,
     stacks_bench: RawStacksBench,
+    jobs: RawJobs,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawJobs {
+    source: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -431,6 +474,8 @@ impl RawOrchestrator {
                 .stacks_bench
                 .default_args,
         );
+
+        merge_opt(&mut self.jobs.source, other.jobs.source);
     }
 
     fn apply_env(&mut self) {
@@ -489,6 +534,8 @@ impl RawOrchestrator {
         );
 
         env_into(&mut self.stacks_bench.default_args, "SBGH_STACKS_BENCH_ARGS");
+
+        env_into(&mut self.jobs.source, "SBGH_JOBS_SOURCE");
     }
 
     fn into_config(self) -> Result<OrchestratorConfig> {
@@ -616,6 +663,18 @@ impl RawOrchestrator {
                     .stacks_bench
                     .default_args
                     .unwrap_or_default(),
+            },
+            jobs: JobsConfig {
+                // Default to the legacy queue; an invalid value is a hard
+                // error rather than a silent fallback (a typo here would
+                // otherwise quietly keep the orchestrator on the wrong
+                // backend across the cutover).
+                source: match self.jobs.source {
+                    Some(s) => s
+                        .parse()
+                        .map_err(|e: String| Error::Config(format!("[jobs].source: {e}")))?,
+                    None => JobSource::Legacy,
+                },
             },
         })
     }
@@ -867,6 +926,33 @@ mod tests {
     #[test]
     fn orchestrator_missing_required_field_errors() {
         let _g = EnvGuard::set(&[("SBGH_GH_CLIENT_ID", "Iv23litest")]);
+        let err = OrchestratorConfig::load_layered(None).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn orchestrator_jobs_source_defaults_to_legacy() {
+        let _g = EnvGuard::set(&orch_env());
+        let cfg = OrchestratorConfig::load_layered(None).unwrap();
+        assert_eq!(cfg.jobs.source, JobSource::Legacy);
+    }
+
+    #[test]
+    fn orchestrator_jobs_source_v2_via_env() {
+        let mut env = orch_env();
+        env.push(("SBGH_JOBS_SOURCE", "v2"));
+        let _g = EnvGuard::set(&env);
+        let cfg = OrchestratorConfig::load_layered(None).unwrap();
+        assert_eq!(cfg.jobs.source, JobSource::V2);
+    }
+
+    #[test]
+    fn orchestrator_invalid_jobs_source_errors() {
+        // A typo must be a hard error, not a silent fallback to legacy —
+        // otherwise the cutover could quietly stay on the wrong backend.
+        let mut env = orch_env();
+        env.push(("SBGH_JOBS_SOURCE", "leagcy"));
+        let _g = EnvGuard::set(&env);
         let err = OrchestratorConfig::load_layered(None).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }

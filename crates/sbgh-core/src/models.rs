@@ -465,12 +465,19 @@ pub struct NewJobV2 {
 /// Slice 8 (post-review fix): typed handoff for the
 /// resolve-commit-during-claim path. The orchestrator's claim phase
 /// resolves a branch tip to its concrete commit; `mark_running`
-/// writes both fields atomically with the status transition while
-/// holding the claim_token guard.
+/// writes the present fields atomically with the status transition
+/// while holding the claim_token guard.
+///
+/// Slice 10 (review fix): `committed_at` is `Option` because some
+/// resolution paths recover only the SHA (e.g. resolving a PR head via
+/// the pulls API yields the commit id but not its authored date). A
+/// `None` here leaves `job.git_committed_at` untouched (`mark_running`
+/// `COALESCE`s) — far better than fabricating the claim time, which
+/// would corrupt baseline-timeline ordering.
 #[derive(Debug, Clone)]
 pub struct ResolvedCommit {
     pub hash: String,
-    pub committed_at: DateTime<Utc>,
+    pub committed_at: Option<DateTime<Utc>>,
 }
 
 /// Slice 8 (post-review fix): atomic-creation request for the

@@ -1,4 +1,5 @@
 mod bench_summary;
+mod job_source;
 mod libvirt;
 mod progress;
 mod runner;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use sbgh_core::config::OrchestratorConfig;
+use sbgh_core::config::{JobSource, OrchestratorConfig};
 use sbgh_core::db::{
     self, PostgresInstallationStore, PostgresJobStore, PostgresJobV2Store, PostgresPolicyStore,
     PostgresPullRequestStore, PostgresRepoStore, PostgresUserStore, PostgresWebhookInbox,
@@ -18,6 +19,7 @@ use sbgh_core::github::{AppCredentials, InstallationTokenCache, OctocrabClient};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
+use crate::job_source::{JobV2Source, LegacyJobSource, RunnableJobStore};
 use crate::libvirt::SystemShell;
 use crate::runner::Runner;
 use crate::webhook_processor::{
@@ -57,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
             .clone(),
     );
     let gh = Arc::new(OctocrabClient::new(tokens));
-    let jobs = Arc::new(PostgresJobStore::new(pool.clone()));
+    let legacy_jobs = Arc::new(PostgresJobStore::new(pool.clone()));
     let shell = Arc::new(SystemShell::new(&config.paths.sudo_binary));
 
     // Slice 2b: webhook processor runs concurrently with the legacy
@@ -101,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
             gh.clone(),
         )))
         .with_handler(Arc::new(PullRequestHandler::new(
-            repo_store,
+            repo_store.clone(),
             policy_store.clone(),
             installation_store.clone(),
             user_store,
@@ -112,12 +114,32 @@ async fn main() -> anyhow::Result<()> {
             installation_store.clone(),
             job_v2_store.clone(),
         )))
-        .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store, job_v2_store)))
+        .with_handler(Arc::new(CreateHandler::new(
+            policy_store,
+            installation_store,
+            job_v2_store.clone(),
+        )))
         .build();
     let processor =
         WebhookProcessor::new(webhook_inbox, Arc::new(classifier), ProcessorConfig::default());
 
-    let runner = Runner::new(config, jobs, gh, shell);
+    // Slice 10: select the runner's queue backend. Production defaults to
+    // `legacy`; `v2` claims from the new `job` family (staging / cutover).
+    let runnable_jobs: Arc<dyn RunnableJobStore> = match config.jobs.source {
+        JobSource::Legacy => {
+            tracing::info!("runner claiming from legacy `jobs` table");
+            Arc::new(LegacyJobSource::new(legacy_jobs))
+        }
+        JobSource::V2 => {
+            tracing::warn!(
+                "runner claiming from new `job` family (slice 10 V2 source); progress is log-only \
+                 until slice 11"
+            );
+            Arc::new(JobV2Source::new(job_v2_store, repo_store))
+        }
+    };
+
+    let runner = Runner::new(config, runnable_jobs, gh, shell);
 
     tokio::try_join!(runner.run(), async {
         processor

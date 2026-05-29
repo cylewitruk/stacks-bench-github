@@ -9,9 +9,12 @@
 
 use std::sync::Arc;
 
-use sbgh_core::db::{InMemoryJobV2Store, JobCreationOutcome, JobV2Store};
+use sbgh_core::db::{
+    InMemoryJobV2Store, JobCompletion, JobCreationOutcome, JobFailure, JobV2Store,
+};
 use sbgh_core::models::{
-    GitRefKind, JobCreationRequest, JobKind, JobStatus, NewJobV2, NewPullRequestLink, TriggerKind,
+    GitRefKind, JobCreationRequest, JobKind, JobResult, JobStatus, NewJobV2, NewPullRequestLink,
+    TriggerKind,
 };
 use uuid::Uuid;
 
@@ -150,4 +153,98 @@ async fn concurrent_claim_never_observes_partial_create() {
             );
         }
     }
+}
+
+/// Helper: insert → claim → mark_running, returning (job_id, claim_token).
+/// `webhook_id` must be distinct per call (the slice-9 idempotency guard
+/// rejects a second job for the same webhook).
+async fn run_job(store: &InMemoryJobV2Store, webhook_id: i64) -> (Uuid, Uuid) {
+    let JobCreationOutcome::Created(created) = store
+        .create_job_with_links(&make_request(webhook_id))
+        .await
+        .unwrap()
+    else {
+        panic!("expected Created");
+    };
+    let token = Uuid::new_v4();
+    let claimed = store
+        .claim_next_queued(token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, created.job.id);
+    store
+        .mark_running(claimed.id, token, None)
+        .await
+        .unwrap();
+    (claimed.id, token)
+}
+
+#[tokio::test]
+async fn complete_job_and_fail_job_mirror_postgres_guard() {
+    // complete_job: happy path flips to Completed + records result.
+    let store = InMemoryJobV2Store::new();
+    let (job_id, token) = run_job(&store, 11).await;
+    let ok = store
+        .complete_job(&JobCompletion {
+            job_id,
+            claim_token: token,
+            result: JobResult {
+                job_id,
+                run_json: None,
+                archive_dir: "/d".into(),
+                created_at: chrono::Utc::now(),
+            },
+            metric: None,
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+    assert!(ok);
+    assert_eq!(
+        store
+            .lookup_job(job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        JobStatus::Completed
+    );
+
+    // Stale-claim guard: fail_job on a now-completed (not running) job is
+    // a no-op, mirroring the Postgres status guard.
+    let stale = store
+        .fail_job(&JobFailure {
+            job_id,
+            claim_token: token,
+            result: None,
+            remark: "late".into(),
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+    assert!(!stale, "fail_job on a non-running job must be a no-op");
+
+    // fail_job happy path on a fresh running job (distinct webhook id).
+    let (job2, token2) = run_job(&store, 12).await;
+    let ok = store
+        .fail_job(&JobFailure {
+            job_id: job2,
+            claim_token: token2,
+            result: None,
+            remark: "boom".into(),
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+    assert!(ok);
+    assert_eq!(
+        store
+            .lookup_job(job2)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        JobStatus::Failed
+    );
 }

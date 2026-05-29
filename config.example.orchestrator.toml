@@ -112,3 +112,13 @@ chainstate_base_prefix = "mainnet-"
 # Tune the start-at / count for your chainstate's height and for what
 # you're trying to measure.
 default_args = "--start-at 7800000 --count 5000 --warmup 1000 --no-profiler-kv --bench-spans-only"
+
+[jobs]
+# Which queue the orchestrator's runner claims from (slice 10):
+#   "legacy" (default) — the original `jobs` table.
+#   "v2"               — the new `job` family (slices 8/9). Selectable for
+#                        staging / the slice 11 cutover. NOTE: new-schema
+#                        progress is currently log + job_event timeline
+#                        only (no PR comment) until slice 11.
+# An invalid value is a hard error (no silent fallback). Env: SBGH_JOBS_SOURCE.
+source = "legacy"

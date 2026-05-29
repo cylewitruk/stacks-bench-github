@@ -13,15 +13,24 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sbgh_core::config::OrchestratorConfig;
-use sbgh_core::db::JobStore;
 use sbgh_core::github::GitHubApi;
-use sbgh_core::models::Job;
+use sbgh_core::models::ResolvedCommit;
 use tokio::sync::Mutex;
 
+use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, OutcomeStatus, Phase, PhaseListener, Shell, format_elapsed};
 use crate::progress::ProgressReporter;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Lease after which a job stranded in `claimed` (claimed but never
+/// transitioned to `running` — orchestrator crashed or preflight errored
+/// between `claim_next` and `start_running`) is reclaimed to `queued` by
+/// the stuck-claim sweep. The claim→running window is normally
+/// sub-second (a GH API call at most), so a few minutes is ample slack
+/// without leaving a crashed claim stuck for long. Only the new-schema
+/// `JobV2Source` has a `claimed` state; legacy's sweep is a no-op.
+const CLAIM_LEASE_MINUTES: i64 = 5;
 
 /// Minimum interval between PR-comment edits driven by the
 /// `CommentPhaseListener`. Phase transitions and heartbeats both go
@@ -37,7 +46,7 @@ const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Runner {
     config: Arc<OrchestratorConfig>,
-    jobs: Arc<dyn JobStore>,
+    jobs: Arc<dyn RunnableJobStore>,
     gh: Arc<dyn GitHubApi>,
     shell: Arc<dyn Shell>,
 }
@@ -45,7 +54,7 @@ pub struct Runner {
 impl Runner {
     pub fn new(
         config: OrchestratorConfig,
-        jobs: Arc<dyn JobStore>,
+        jobs: Arc<dyn RunnableJobStore>,
         gh: Arc<dyn GitHubApi>,
         shell: Arc<dyn Shell>,
     ) -> Self {
@@ -59,44 +68,85 @@ impl Runner {
 
     pub async fn run(self) -> anyhow::Result<()> {
         tracing::info!("orchestrator started");
+        let lease = chrono::Duration::minutes(CLAIM_LEASE_MINUTES);
         loop {
-            match self.jobs.claim_next().await {
-                Ok(Some(job)) => {
-                    if let Err(e) = self.execute(job).await {
-                        // Setup-time failure (couldn't resolve SHA, mkdir
-                        // failed, etc.). VM-side failures come back via
-                        // `BenchmarkOutcome::Failed` instead.
-                        tracing::error!(error = ?e, "job setup failed");
-                    }
+            // Recover jobs stranded in `claimed` (crash / preflight error
+            // between claim and start_running) before claiming the next.
+            // No-op for the legacy backend. A single job runs to
+            // completion before the loop turns over, so this fires
+            // between jobs and at startup — exactly when a stranded
+            // claim from a prior (crashed) run needs reclaiming.
+            match self
+                .jobs
+                .sweep_stuck_claims(lease)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::warn!(recovered = n, "recovered stuck `claimed` jobs")
                 }
-                Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = ?e, "stuck-claim sweep failed"),
+            }
+
+            match self.run_once().await {
+                Ok(true) => {}
+                Ok(false) => tokio::time::sleep(POLL_INTERVAL).await,
                 Err(e) => {
-                    tracing::error!(error = ?e, "queue claim failed");
+                    // Setup-time failure (claim failed, couldn't resolve
+                    // SHA, mkdir failed, etc.). VM-side failures come
+                    // back via `BenchmarkOutcome::Failed` and are NOT
+                    // errors here. Log and keep looping.
+                    tracing::error!(error = ?e, "job iteration failed");
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
             }
         }
     }
 
-    /// Owns the job by value so we can attach the resolved head_sha + the
+    /// Claim + execute one job. Returns `Ok(true)` if a job was
+    /// processed, `Ok(false)` if the queue was empty. Split out from
+    /// `run` so the claim→execute→terminal lifecycle is testable against
+    /// any [`RunnableJobStore`] without the infinite poll loop.
+    pub async fn run_once(&self) -> anyhow::Result<bool> {
+        match self.jobs.claim_next().await? {
+            Some(job) => {
+                self.execute(job).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Owns the job by value so we can attach the resolved commit + the
     /// posted comment_id to the in-memory copy before handing it to the
     /// reporter and the driver (both want them populated).
-    async fn execute(&self, mut job: Job) -> anyhow::Result<()> {
+    async fn execute(&self, mut job: RunnableJob) -> anyhow::Result<()> {
         tracing::info!(job_id = %job.id, repo = %job.repository, "starting job");
 
-        // Pre-flight: resolve head SHA + post the initial PR comment.
-        // Errors here are reported back to the user (via fail) before we
-        // give up — the user otherwise sees a silent "/benchmark went
-        // nowhere" because the handler doesn't write a comment any more.
-        if let Err(e) = self.preflight(&mut job).await {
-            let msg = format!("pre-flight failed: {e}");
-            tracing::error!(job_id = %job.id, error = ?e, "pre-flight failed");
-            let _ = self
-                .jobs
-                .fail(job.id, &msg, None)
-                .await;
-            return Err(e);
-        }
+        // Pre-flight: resolve the commit + post the initial PR comment.
+        // Returns the commit if newly resolved (so `start_running` can
+        // persist it). Errors here are reported back via `fail` — the
+        // user otherwise sees a silent "/benchmark went nowhere" because
+        // the handler doesn't write a comment any more.
+        let resolved_commit = match self.preflight(&mut job).await {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("pre-flight failed: {e}");
+                tracing::error!(job_id = %job.id, error = ?e, "pre-flight failed");
+                let _ = self
+                    .jobs
+                    .fail(&job, &msg, None)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        // Transition to running, persisting the resolved commit. Legacy
+        // is already `running` (this just writes the SHA); the new schema
+        // does `claimed → running` here.
+        self.jobs
+            .start_running(&job, resolved_commit)
+            .await?;
 
         let reporter = ProgressReporter::new(self.gh.as_ref(), &job);
         reporter.started().await?;
@@ -120,7 +170,7 @@ impl Runner {
                 let msg = format!("{e:#}");
                 let _ = self
                     .jobs
-                    .fail(job.id, &msg, None)
+                    .fail(&job, &msg, None)
                     .await;
                 let _ = reporter.failed(&msg).await;
                 return Err(e);
@@ -130,7 +180,7 @@ impl Runner {
         match outcome.status {
             OutcomeStatus::Ok => {
                 self.jobs
-                    .complete(job.id, outcome.summary.clone())
+                    .complete(&job, &outcome.summary)
                     .await?;
                 reporter
                     .completed(&outcome.summary)
@@ -150,7 +200,7 @@ impl Runner {
                     "benchmark failed",
                 );
                 self.jobs
-                    .fail(job.id, &err, Some(outcome.summary.clone()))
+                    .fail(&job, &err, Some(&outcome.summary))
                     .await?;
                 reporter.failed(&err).await?;
             }
@@ -158,44 +208,63 @@ impl Runner {
         Ok(())
     }
 
-    /// Resolve the head SHA + post the initial PR comment, mutating `job` in
-    /// place so the caller's reporter/listener see populated values. Both
-    /// steps are idempotent on retry: empty `head_sha`/`None` `comment_id`
-    /// trigger the work; populated values are kept as-is.
-    async fn preflight(&self, job: &mut Job) -> anyhow::Result<()> {
-        if job.head_sha.is_empty() {
+    /// Resolve the commit + post the initial PR comment, mutating `job`
+    /// in place so the caller's reporter/listener see populated values.
+    /// Returns `Some(ResolvedCommit)` when the commit was newly resolved
+    /// (so the caller persists it via `start_running`), `None` otherwise.
+    /// The PR-head resolve yields only a SHA, so `committed_at` is `None`
+    /// — the resolver doesn't know the commit's authored date, and
+    /// fabricating one would corrupt baseline-timeline ordering.
+    ///
+    /// Commit resolution + comment posting are PR-comment-job concerns
+    /// (the legacy production path). New-schema jobs are `LogOnly` with a
+    /// commit already resolved at enqueue (`pr_comment`/`branch_push`) —
+    /// `tag_created` jobs resolve at claim time, which is wired in slice
+    /// 11; for now an unresolved new-schema commit is logged and left.
+    async fn preflight(&self, job: &mut RunnableJob) -> anyhow::Result<Option<ResolvedCommit>> {
+        let ProgressTarget::PullRequestComment { pr_number, comment_id } = job.progress else {
+            if job.commit.is_empty() {
+                tracing::warn!(
+                    job_id = %job.id,
+                    git_ref = %job.git_ref_display,
+                    "new-schema job has no resolved commit; claim-time resolution lands in slice \
+                     11 — running with empty commit",
+                );
+            }
+            return Ok(None);
+        };
+
+        let resolved = if job.commit.is_empty() {
             let sha = self
                 .gh
-                .pr_head_sha(job.installation_id, &job.repository, job.pr_number as u64)
+                .pr_head_sha(job.installation_id, &job.repository, pr_number as u64)
                 .await?;
-            self.jobs
-                .set_head_sha(job.id, &sha)
-                .await?;
-            job.head_sha = sha;
-        }
+            job.commit = sha.clone();
+            Some(ResolvedCommit { hash: sha, committed_at: None })
+        } else {
+            None
+        };
 
-        if job.comment_id.is_none() {
+        if comment_id.is_none() {
             let body = format!(
                 ":construction: starting benchmark `{id}` (commit `{sha}`)…",
                 id = job.id,
-                sha = job.head_sha,
+                sha = job.commit,
             );
             let posted = self
                 .gh
-                .create_pr_comment(
-                    job.installation_id,
-                    &job.repository,
-                    job.pr_number as u64,
-                    &body,
-                )
+                .create_pr_comment(job.installation_id, &job.repository, pr_number as u64, &body)
                 .await?;
             self.jobs
-                .set_comment_id(job.id, posted.id)
+                .set_comment_id(job, posted.id)
                 .await?;
-            job.comment_id = Some(posted.id);
+            job.progress = ProgressTarget::PullRequestComment {
+                pr_number,
+                comment_id: Some(posted.id),
+            };
         }
 
-        Ok(())
+        Ok(resolved)
     }
 }
 
@@ -215,7 +284,7 @@ impl Runner {
 /// something happen immediately when they `/benchmark`.
 struct CommentPhaseListener {
     gh: Arc<dyn GitHubApi>,
-    job: Job,
+    job: RunnableJob,
     state: Mutex<CommentState>,
 }
 
@@ -225,7 +294,7 @@ struct CommentState {
 }
 
 impl CommentPhaseListener {
-    fn new(gh: Arc<dyn GitHubApi>, job: Job) -> Self {
+    fn new(gh: Arc<dyn GitHubApi>, job: RunnableJob) -> Self {
         Self {
             gh,
             job,
@@ -234,7 +303,15 @@ impl CommentPhaseListener {
     }
 
     async fn try_update(&self, phase: &Phase, elapsed: Duration, force: bool) {
-        let Some(comment_id) = self.job.comment_id else {
+        // Only PR-comment jobs with a posted comment get GitHub edits.
+        // New-schema (LogOnly) jobs surface phase changes via logs only
+        // in slice 10; both comment posting and intermediate phase
+        // `job_event` rows are slice-11 concerns.
+        let ProgressTarget::PullRequestComment {
+            comment_id: Some(comment_id), ..
+        } = self.job.progress
+        else {
+            tracing::debug!(job_id = %self.job.id, phase = %phase, "phase (log-only)");
             return;
         };
 
@@ -261,7 +338,7 @@ impl CommentPhaseListener {
             id = self.job.id,
             phase = phase,
             elapsed = format_elapsed(elapsed),
-            sha = self.job.head_sha,
+            sha = self.job.commit,
         );
         if let Err(e) = self
             .gh
@@ -294,5 +371,201 @@ impl PhaseListener for CommentPhaseListener {
         // "still alive" signal and missing one is fine.
         self.try_update(phase, elapsed, false)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+
+    use sbgh_core::config::{
+        GitHubConfig, JobSource, JobsConfig, LvmConfig, OrchestratorServerConfig, PathsConfig,
+        StacksBenchConfig, VmConfig,
+    };
+    use sbgh_core::github::test_support::FakeGitHub;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::job_source::ProgressTarget;
+    use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
+
+    /// A [`RunnableJobStore`] fake that hands out a single pre-staged job
+    /// then goes empty, and records which lifecycle methods the runner
+    /// called. Backend-neutral — used to prove the runner drives the
+    /// abstraction (not the legacy store) to a terminal call.
+    struct FakeSource {
+        job: StdMutex<Option<RunnableJob>>,
+        calls: StdMutex<Vec<&'static str>>,
+    }
+
+    impl FakeSource {
+        fn new(job: RunnableJob) -> Self {
+            Self {
+                job: StdMutex::new(Some(job)),
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+        fn record(&self, m: &'static str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(m);
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls
+                .lock()
+                .unwrap()
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl RunnableJobStore for FakeSource {
+        async fn claim_next(&self) -> anyhow::Result<Option<RunnableJob>> {
+            Ok(self
+                .job
+                .lock()
+                .unwrap()
+                .take())
+        }
+        async fn start_running(
+            &self,
+            _job: &RunnableJob,
+            _resolved_commit: Option<ResolvedCommit>,
+        ) -> anyhow::Result<()> {
+            self.record("start_running");
+            Ok(())
+        }
+        async fn complete(
+            &self,
+            _job: &RunnableJob,
+            _summary: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            self.record("complete");
+            Ok(())
+        }
+        async fn fail(
+            &self,
+            _job: &RunnableJob,
+            _error: &str,
+            _summary: Option<&serde_json::Value>,
+        ) -> anyhow::Result<()> {
+            self.record("fail");
+            Ok(())
+        }
+        async fn set_comment_id(&self, _job: &RunnableJob, _comment_id: i64) -> anyhow::Result<()> {
+            self.record("set_comment_id");
+            Ok(())
+        }
+        async fn sweep_stuck_claims(&self, _lease: chrono::Duration) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn test_config(tmp: &TempDir) -> OrchestratorConfig {
+        let p = tmp.path();
+        OrchestratorConfig {
+            server: OrchestratorServerConfig {
+                database_url: "postgres://unused".into(),
+                service_user: "sbgh".into(),
+            },
+            github: GitHubConfig {
+                client_id: "Iv23litest".into(),
+                api_base_url: "https://api.github.test".into(),
+                private_key_path: PathBuf::from("/dev/null"),
+            },
+            vm: VmConfig {
+                golden_image: p.join("golden.qcow2"),
+                build_vcpus: 4,
+                bench_vcpus: 2,
+                build_memory: sbgh_core::memory::MemorySize::from_gib(16),
+                bench_memory: sbgh_core::memory::MemorySize::from_gib(8),
+                boot_disk_gib: 64,
+                job_timeout_secs: 30,
+                network: "default".into(),
+                poll_interval_secs: 1,
+                heartbeat_interval_secs: 60,
+            },
+            paths: PathsConfig {
+                jobs_dir: p.join("jobs"),
+                git_mirror: p.join("mirror.git"),
+                results_tmpfs_root: p.join("tmpfs"),
+                results_archive_dir: p.join("archive"),
+                sccache_dir: p.join("sccache"),
+                virsh_binary: "/usr/bin/virsh".into(),
+                sudo_binary: "/usr/bin/sudo".into(),
+                qemu_img_binary: "/usr/bin/qemu-img".into(),
+                cloud_localds_binary: "/usr/bin/cloud-localds".into(),
+                git_binary: "/usr/bin/git".into(),
+            },
+            lvm: LvmConfig {
+                vg_name: "sbgh-vg".into(),
+                thinpool: "thinpool".into(),
+                chainstate_base_prefix: "mainnet-".into(),
+                chainstate_snapshot_size_gib: None,
+            },
+            stacks_bench: StacksBenchConfig { default_args: String::new() },
+            jobs: JobsConfig { source: JobSource::Legacy },
+        }
+    }
+
+    /// The runner drives ANY `RunnableJobStore` (here a new-schema-shaped
+    /// `LogOnly` job, no PR) through `start_running` and, when the driver
+    /// reports failure, `fail` — proving the runner is backend-agnostic
+    /// and the log-only progress path doesn't touch GitHub.
+    #[tokio::test]
+    async fn run_once_drives_log_only_job_to_terminal_fail() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(), // pre-resolved → preflight is a no-op
+            git_ref_display: "develop".into(),
+            installation_id: 7,
+            bench_args: vec![],
+            progress: ProgressTarget::LogOnly,
+            claim_token: Some(Uuid::new_v4()),
+        };
+        let source = Arc::new(FakeSource::new(job));
+
+        // FakeGitHub must never be called for a LogOnly job; a recording
+        // shell that fails the first provisioning command drives the
+        // driver to a Failed outcome.
+        let gh = Arc::new(FakeGitHub::new());
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom: git fetch failed"));
+
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        let processed = runner
+            .run_once()
+            .await
+            .unwrap();
+        assert!(processed, "claimed + executed one job");
+
+        // Lifecycle: transitioned to running, then failed (driver setup
+        // error → Failed outcome). No comment work for a LogOnly job.
+        assert_eq!(source.calls(), vec!["start_running", "fail"]);
+        assert!(
+            !gh.calls()
+                .iter()
+                .any(|c| matches!(
+                    c,
+                    sbgh_core::github::test_support::FakeCall::CreateComment { .. }
+                        | sbgh_core::github::test_support::FakeCall::UpdateComment { .. }
+                )),
+            "LogOnly job must not post or edit a GitHub comment"
+        );
+
+        // Queue now empty.
+        assert!(
+            !runner
+                .run_once()
+                .await
+                .unwrap()
+        );
     }
 }

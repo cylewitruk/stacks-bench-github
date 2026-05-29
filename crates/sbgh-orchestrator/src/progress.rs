@@ -3,17 +3,17 @@
 use std::path::Path;
 
 use sbgh_core::github::GitHubApi;
-use sbgh_core::models::Job;
 
 use crate::bench_summary::{self, RunResult};
+use crate::job_source::{ProgressTarget, RunnableJob};
 
 pub struct ProgressReporter<'a> {
     gh: &'a dyn GitHubApi,
-    job: &'a Job,
+    job: &'a RunnableJob,
 }
 
 impl<'a> ProgressReporter<'a> {
-    pub fn new(gh: &'a dyn GitHubApi, job: &'a Job) -> Self {
+    pub fn new(gh: &'a dyn GitHubApi, job: &'a RunnableJob) -> Self {
         Self { gh, job }
     }
 
@@ -21,7 +21,7 @@ impl<'a> ProgressReporter<'a> {
         self.update(&format!(
             ":rocket: benchmark `{id}` is running on commit `{sha}`.",
             id = self.job.id,
-            sha = self.job.head_sha,
+            sha = self.job.commit,
         ))
         .await
     }
@@ -45,7 +45,7 @@ impl<'a> ProgressReporter<'a> {
 
         let body = bench_summary::render_pr_comment(
             &self.job.id.to_string(),
-            &self.job.head_sha,
+            &self.job.commit,
             archive_dir,
             parsed.as_ref(),
         );
@@ -69,14 +69,34 @@ impl<'a> ProgressReporter<'a> {
     }
 
     async fn update(&self, body: &str) -> anyhow::Result<()> {
-        let Some(comment_id) = self.job.comment_id else {
-            tracing::warn!(job_id = %self.job.id, "no comment id; skipping update");
-            return Ok(());
-        };
-        self.gh
-            .update_pr_comment(self.job.installation_id, &self.job.repository, comment_id, body)
-            .await?;
-        Ok(())
+        match self.job.progress {
+            ProgressTarget::PullRequestComment {
+                comment_id: Some(comment_id), ..
+            } => {
+                self.gh
+                    .update_pr_comment(
+                        self.job.installation_id,
+                        &self.job.repository,
+                        comment_id,
+                        body,
+                    )
+                    .await?;
+                Ok(())
+            }
+            ProgressTarget::PullRequestComment { comment_id: None, .. } => {
+                tracing::warn!(job_id = %self.job.id, "no comment id; skipping update");
+                Ok(())
+            }
+            // Slice 10: new-schema jobs report progress to logs only —
+            // no GitHub comment, and no intermediate phase `job_event`
+            // rows yet (both deferred to slice 11). The queued + terminal
+            // events are still persisted elsewhere. Log at debug so it's
+            // visible without being noisy.
+            ProgressTarget::LogOnly => {
+                tracing::debug!(job_id = %self.job.id, body, "progress (log-only)");
+                Ok(())
+            }
+        }
     }
 }
 

@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use chrono::Duration;
 use sbgh_core::db::{
-    CreatedJob, JobCreationOutcome, JobV2Store, NewInstallation, Pool, PostgresJobV2Store, setup_pg,
+    CreatedJob, JobCompletion, JobCreationOutcome, JobFailure, JobV2Store, NewInstallation, Pool,
+    PostgresJobV2Store, setup_pg,
 };
 use sbgh_core::models::{
     GitRefKind, GithubAccountType, JobCreationRequest, JobEventKind, JobEventStatus, JobKind,
@@ -752,7 +753,7 @@ async fn mark_running_with_resolved_commit_writes_metadata_atomically() {
             token,
             Some(ResolvedCommit {
                 hash: "deadbeef".into(),
-                committed_at: now,
+                committed_at: Some(now),
             }),
         )
         .await
@@ -803,4 +804,195 @@ async fn mark_running_without_resolved_commit_leaves_existing_metadata_untouched
         .unwrap()
         .unwrap();
     assert_eq!(row.git_commit_hash.as_deref(), Some("preset-sha"));
+}
+
+// ─── Slice 10: transactional finish ────────────────────────────────────
+
+/// Claim + run a freshly-inserted job, returning `(job_id, claim_token)`
+/// in the `running` state ready for `complete_job` / `fail_job`.
+async fn claim_and_run(store: &PostgresJobV2Store, install: i64, repo: i64) -> (Uuid, Uuid) {
+    store
+        .insert_job(&make_new_job(install, repo))
+        .await
+        .unwrap();
+    let token = Uuid::new_v4();
+    let claimed = store
+        .claim_next_queued(token)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .mark_running(claimed.id, token, None)
+        .await
+        .unwrap();
+    (claimed.id, token)
+}
+
+fn sample_metric(job_id: Uuid) -> JobMetric {
+    JobMetric {
+        job_id,
+        envelope_duration_us: 100,
+        replay_duration_us: 90,
+        total_duration_us: 80,
+        setup_duration_us: 5,
+        execution_duration_us: 60,
+        commit_duration_us: 15,
+        clarity_runtime: 42,
+        transactions: 7,
+        read_length: 3,
+        write_length: 2,
+        measured_blocks: 4,
+        warmup_blocks: 1,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn complete_job_writes_status_result_metric_and_event_atomically() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobV2Store::new(pool.clone());
+    let (job_id, token) = claim_and_run(&store, 100, 10).await;
+
+    let ok = store
+        .complete_job(&JobCompletion {
+            job_id,
+            claim_token: token,
+            result: JobResult {
+                job_id,
+                run_json: Some(sqlx::types::Json(serde_json::json!({"ok": true}))),
+                archive_dir: "/var/runs/done".into(),
+                created_at: chrono::Utc::now(),
+            },
+            metric: Some(sample_metric(job_id)),
+            event_detail: Some(serde_json::json!({"finish_reason": "phase_done"})),
+        })
+        .await
+        .unwrap();
+    assert!(ok);
+
+    let row = store
+        .lookup_job(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, JobStatus::Completed);
+    // Audit columns preserved.
+    assert_eq!(row.claim_token, Some(token));
+
+    let metric_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_metric WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(metric_count, 1);
+    let result_dir: String =
+        sqlx::query_scalar("SELECT archive_dir FROM job_result WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(result_dir, "/var/runs/done");
+    let event_kind: String = sqlx::query_scalar(
+        "SELECT event_kind::text FROM job_event WHERE job_id = $1 AND event_kind = 'completed'",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_kind, "completed");
+}
+
+#[tokio::test]
+async fn complete_job_with_stale_claim_is_noop() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobV2Store::new(pool.clone());
+    let (job_id, _token) = claim_and_run(&store, 100, 10).await;
+
+    let stale = Uuid::new_v4();
+    let ok = store
+        .complete_job(&JobCompletion {
+            job_id,
+            claim_token: stale,
+            result: JobResult {
+                job_id,
+                run_json: None,
+                archive_dir: "/x".into(),
+                created_at: chrono::Utc::now(),
+            },
+            metric: None,
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+    assert!(!ok, "stale claim_token must be a no-op");
+    // Nothing written, job still running.
+    let row = store
+        .lookup_job(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, JobStatus::Running);
+    let result_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_result WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(result_count, 0, "rollback leaves no result row");
+}
+
+#[tokio::test]
+async fn fail_job_writes_status_result_and_event() {
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobV2Store::new(pool.clone());
+    let (job_id, token) = claim_and_run(&store, 100, 10).await;
+
+    let ok = store
+        .fail_job(&JobFailure {
+            job_id,
+            claim_token: token,
+            result: Some(JobResult {
+                job_id,
+                run_json: None,
+                archive_dir: "/var/runs/failed".into(),
+                created_at: chrono::Utc::now(),
+            }),
+            remark: "VM powered off before phase=done".into(),
+            event_detail: Some(serde_json::json!({"finish_reason": "shut_off"})),
+        })
+        .await
+        .unwrap();
+    assert!(ok);
+
+    let row = store
+        .lookup_job(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, JobStatus::Failed);
+    let (event_kind, remark): (String, Option<String>) = sqlx::query_as(
+        "SELECT event_kind::text, remark FROM job_event WHERE job_id = $1 AND event_kind = \
+         'failed'",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_kind, "failed");
+    assert_eq!(remark.as_deref(), Some("VM powered off before phase=done"));
+    // Forensics result row recorded even on failure.
+    let result_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_result WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(result_count, 1);
 }
