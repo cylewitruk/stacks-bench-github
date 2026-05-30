@@ -1,11 +1,11 @@
 //! Main orchestrator loop.
 //!
 //! On pickup the orchestrator:
-//!   1. Resolves the PR head SHA via the GitHub API (the handler can't — it has
-//!      no App credentials) and writes it back to the job row.
-//!   2. Posts the initial "starting" PR comment and persists the returned
-//!      comment id, so the phase-progress listener has somewhere to push
-//!      updates.
+//!   1. Resolves the commit via the GitHub API (the handler can't — no App
+//!      credentials): a PR-comment job's head SHA, or a `tag_created` job's tag
+//!      → commit. Writes it back to the job row.
+//!   2. For PR jobs, posts the initial "starting" PR comment and persists the
+//!      returned comment id so the phase-progress listener can edit it.
 //!   3. Runs the benchmark.
 
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sbgh_core::config::OrchestratorConfig;
 use sbgh_core::github::GitHubApi;
-use sbgh_core::models::ResolvedCommit;
+use sbgh_core::models::{GitRefKind, ResolvedCommit};
 use tokio::sync::Mutex;
 
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
@@ -153,10 +153,10 @@ impl Runner {
         // Defensive: a job with no resolved commit can't be benchmarked
         // (an empty SHA would produce a confusing `git fetch ''`). In
         // practice this shouldn't trigger — `pr_comment` + `branch_push`
-        // resolve their commit at enqueue, and `tag_created` job creation
-        // is gated off until claim-time tag resolution lands. If it ever
-        // does, fail terminally now that we're `running` so the failure
-        // records a terminal state instead of looping via the sweep.
+        // carry their commit from enqueue, and `tag_created` jobs resolve
+        // it in preflight above. If a commit is somehow still empty, fail
+        // terminally now that we're `running` so it records a terminal
+        // state instead of looping via the stuck-claim sweep.
         if job.commit.is_empty() {
             let msg = "no resolved commit; cannot benchmark";
             tracing::error!(job_id = %job.id, git_ref = %job.git_ref_display, "{msg}");
@@ -226,22 +226,44 @@ impl Runner {
         Ok(())
     }
 
-    /// Resolve the commit + post the initial PR comment, mutating `job`
-    /// in place so the caller's reporter/listener see populated values.
-    /// Returns `Some(ResolvedCommit)` when the commit was newly resolved
-    /// (so the caller persists it via `start_running`), `None` otherwise.
-    /// The PR-head resolve yields only a SHA, so `committed_at` is `None`
-    /// — the resolver doesn't know the commit's authored date, and
-    /// fabricating one would corrupt baseline-timeline ordering.
+    /// Resolve the commit + (for PR-comment jobs) post the initial PR
+    /// comment, mutating `job` in place so the caller's reporter/listener
+    /// see populated values. Returns `Some(ResolvedCommit)` when the
+    /// commit was newly resolved so the caller persists it via
+    /// `start_running`.
     ///
-    /// Commit resolution + comment posting are PR-comment-job concerns.
-    /// `LogOnly` (new-schema baseline) jobs carry a commit already
-    /// resolved at enqueue (`branch_push`); they need no preflight work.
-    /// (An empty commit here is unexpected — `tag_created` job creation
-    /// is gated off until claim-time resolution lands — but is caught by
-    /// the empty-commit guard in `execute` rather than run blindly.)
+    /// Commit resolution covers two cases when `commit` is empty:
+    ///   - a PR-comment job → the PR head SHA (`pr_head_sha`). The authored
+    ///     date is unknown so `committed_at` stays `None` (fabricating one
+    ///     would corrupt baseline-timeline ordering).
+    ///   - a `tag_created` baseline job → resolve the tag ref to its commit +
+    ///     authored date (`resolve_commit`). `branch_push` jobs carry their
+    ///     commit from enqueue and skip this.
+    ///
+    /// A resolution failure propagates (`?`): the runner then `fail`s the
+    /// still-`claimed` job, which now terminalizes cleanly rather than
+    /// looping (the `fail_job` claimed-or-running guard).
     async fn preflight(&self, job: &mut RunnableJob) -> anyhow::Result<Option<ResolvedCommit>> {
         let ProgressTarget::PullRequestComment { pr_number, comment_id } = job.progress else {
+            // Non-PR (baseline) job. Resolve a tag's commit if needed;
+            // branch_push jobs already carry their commit. Resolve via
+            // GitHub's canonical qualified form `tags/<name>` so it
+            // unambiguously targets the tag (not a same-named branch).
+            if job.commit.is_empty() && job.git_ref_kind == GitRefKind::Tag {
+                let tag_ref = format!("tags/{}", job.git_ref_display);
+                let resolved = self
+                    .gh
+                    .resolve_commit(job.installation_id, &job.repository, &tag_ref)
+                    .await?;
+                tracing::info!(
+                    job_id = %job.id,
+                    tag = %job.git_ref_display,
+                    commit = %resolved.hash,
+                    "resolved tag to commit at claim time",
+                );
+                job.commit = resolved.hash.clone();
+                return Ok(Some(resolved));
+            }
             if job.commit.is_empty() {
                 tracing::warn!(
                     job_id = %job.id,
@@ -416,6 +438,9 @@ mod tests {
     struct FakeSource {
         job: StdMutex<Option<RunnableJob>>,
         calls: StdMutex<Vec<&'static str>>,
+        /// The commit `start_running` was called with (for asserting
+        /// claim-time tag resolution).
+        started_commit: StdMutex<Option<ResolvedCommit>>,
     }
 
     impl FakeSource {
@@ -423,6 +448,7 @@ mod tests {
             Self {
                 job: StdMutex::new(Some(job)),
                 calls: StdMutex::new(Vec::new()),
+                started_commit: StdMutex::new(None),
             }
         }
         fn record(&self, m: &'static str) {
@@ -433,6 +459,12 @@ mod tests {
         }
         fn calls(&self) -> Vec<&'static str> {
             self.calls
+                .lock()
+                .unwrap()
+                .clone()
+        }
+        fn started_commit(&self) -> Option<ResolvedCommit> {
+            self.started_commit
                 .lock()
                 .unwrap()
                 .clone()
@@ -451,8 +483,12 @@ mod tests {
         async fn start_running(
             &self,
             _job: &RunnableJob,
-            _resolved_commit: Option<ResolvedCommit>,
+            resolved_commit: Option<ResolvedCommit>,
         ) -> anyhow::Result<()> {
+            *self
+                .started_commit
+                .lock()
+                .unwrap() = resolved_commit;
             self.record("start_running");
             Ok(())
         }
@@ -543,6 +579,7 @@ mod tests {
             repository: "acme/widgets".into(),
             commit: "abc123".into(), // pre-resolved → preflight is a no-op
             git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
             bench_args: vec![],
             progress: ProgressTarget::LogOnly,
@@ -584,6 +621,66 @@ mod tests {
                 .run_once()
                 .await
                 .unwrap()
+        );
+    }
+
+    /// A `tag_created` job is enqueued with no commit; the runner
+    /// resolves the tag → commit at claim time (via `resolve_commit`) and
+    /// hands the resolved commit (with its authored date) to
+    /// `start_running`. Proves the claim-time tag-resolution path.
+    #[tokio::test]
+    async fn run_once_resolves_tag_commit_in_preflight() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "octo/core".into(),
+            commit: String::new(), // unresolved — a tag job
+            git_ref_display: "release/1.2".into(),
+            git_ref_kind: GitRefKind::Tag,
+            installation_id: 7,
+            bench_args: vec![],
+            progress: ProgressTarget::LogOnly,
+            claim_token: Some(Uuid::new_v4()),
+        };
+        let source = Arc::new(FakeSource::new(job));
+
+        let date = chrono::DateTime::parse_from_rfc3339("2026-05-30T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let gh = Arc::new(FakeGitHub::new());
+        // The runner resolves via the canonical qualified `tags/<name>`
+        // form (note the slashy tag name `release/1.2`).
+        gh.set_commit("octo/core", "tags/release/1.2", "tagsha123", Some(date));
+        // Shell fails the first command → Failed outcome; we only care
+        // that resolution ran before the run.
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom"));
+
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        assert!(
+            runner
+                .run_once()
+                .await
+                .unwrap()
+        );
+
+        // The tag was resolved and the resolved commit (+ date) handed to
+        // start_running.
+        let resolved = source
+            .started_commit()
+            .expect("start_running received a resolved commit");
+        assert_eq!(resolved.hash, "tagsha123");
+        assert_eq!(resolved.committed_at, Some(date));
+        assert!(
+            gh.calls()
+                .iter()
+                .any(|c| matches!(
+                    c,
+                    sbgh_core::github::test_support::FakeCall::ResolveCommit { .. }
+                )),
+            "runner must call resolve_commit for a tag job"
         );
     }
 }

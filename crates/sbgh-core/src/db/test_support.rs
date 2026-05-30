@@ -8,23 +8,23 @@
 //! container start failure — that's the "no Docker daemon" case we
 //! want to skip rather than fail.
 
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use testcontainers::core::ContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
-use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 use crate::db::{self, Pool};
 
-/// Upper bound on the "container started but port not yet bound" race.
+/// Upper bound on the "container started but not yet reachable" race.
 /// Generous compared to typical (<200ms) to absorb parallel-test load —
 /// 50+ containers spinning up at once on the same docker daemon can
-/// stretch port-binding past 20s under sustained load. The polling
-/// interval is small enough that the fast path (port ready first poll)
-/// pays almost nothing for the headroom.
+/// stretch port-binding and Postgres startup past 20s under sustained
+/// load. The polling interval is small enough that the fast path (ready
+/// on the first poll) pays almost nothing for the headroom.
 const PORT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -34,11 +34,14 @@ pub type TestPg = (ContainerAsync<Postgres>, Pool);
 
 /// Start a fresh Postgres container, connect, run migrations.
 ///
-/// Returns `None` (with a printed notice) only when the container
-/// itself fails to start — the "no Docker daemon" case. Once the
-/// container is up, port lookup / pool connect / migrations MUST
-/// succeed; we panic on those so they show up as test failures (not
-/// skips).
+/// Returns `None` (with a printed notice) only when the container itself
+/// fails to start — the "no Docker daemon" case. Once it's up, the
+/// readiness gate (port lookup → connect) MUST succeed within the
+/// timeout; we panic otherwise so a genuine, persistent problem surfaces
+/// as a test failure rather than a silent skip. Both readiness steps
+/// surface the LAST underlying error in the panic, so a real failure is
+/// diagnosable (daemon-busy vs. container-exited vs. auth-not-ready)
+/// instead of a bare "never became available".
 ///
 /// Pins `postgres:18-trixie` to match docker-compose so tests catch
 /// behavior that differs from production. Uses `with_mapped_port(0,
@@ -59,49 +62,67 @@ pub async fn setup_pg() -> Option<TestPg> {
     };
     let port = wait_for_port_exposed(&container)
         .await
-        .expect("postgres container started but host port never became available");
-    wait_for_tcp_accept(port)
-        .await
-        .expect("postgres host port exposed but never accepted TCP connections");
-    tokio::time::sleep(Duration::from_millis(250)).await; // extra buffer for Postgres to finish startup after accepting TCP
+        .unwrap_or_else(|e| panic!("postgres host port never became available: {e}"));
+    // The only true readiness signal is an accepted connection. Polling
+    // `db::connect` until it succeeds replaces the old TCP-probe + fixed
+    // 250ms sleep, which only guessed at "Postgres is ready" and lost the
+    // race under parallel-test load (the pool connected before Postgres
+    // had finished startup / begun accepting auth).
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool = db::connect(&url)
+    let pool = connect_when_ready(&url)
         .await
-        .expect("connect to ephemeral postgres failed");
+        .unwrap_or_else(|e| panic!("postgres never accepted a connection on {url}: {e}"));
     db::migrate(&pool)
         .await
         .expect("migrations failed against ephemeral postgres");
     Some((container, pool))
 }
 
-/// Poll `get_host_port_ipv4` until Docker reports the host-side binding.
-/// Closes the race between "container started" (per the testcontainers
-/// runtime) and the daemon actually publishing the port.
-async fn wait_for_port_exposed(container: &ContainerAsync<Postgres>) -> Option<u16> {
-    let deadline = Instant::now() + PORT_READY_TIMEOUT;
-    loop {
-        match container
+/// Poll `get_host_port_ipv4` until Docker reports the host-side binding,
+/// or the deadline passes. Closes the race between "container started"
+/// (per the testcontainers runtime) and the daemon publishing the port.
+/// Returns the last error on timeout so the caller can report WHY (e.g.
+/// the container exited) instead of a bare "not available".
+async fn wait_for_port_exposed(container: &ContainerAsync<Postgres>) -> Result<u16, String> {
+    poll_until_ready(|| async {
+        container
             .get_host_port_ipv4(5432)
             .await
-        {
-            Ok(p) => return Some(p),
-            Err(_) if Instant::now() < deadline => sleep(POLL_INTERVAL).await,
-            Err(_) => return None,
-        }
-    }
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
-/// TCP-probe `(127.0.0.1, port)` until a connect succeeds. Defends
-/// against the "port is bound by docker-proxy but Postgres isn't yet
-/// listening behind it" gap, which would otherwise surface as a sqlx
-/// connect error on the very first test that hits a fresh container.
-async fn wait_for_tcp_accept(port: u16) -> Result<(), ()> {
+/// Poll `db::connect` until Postgres accepts a connection — the true
+/// readiness signal (port bound, listener up, AND startup/auth complete)
+/// — or the deadline passes. Returns the last connect error on timeout.
+/// This is the readiness gate, not a fixed sleep.
+async fn connect_when_ready(url: &str) -> Result<Pool, String> {
+    poll_until_ready(|| async {
+        db::connect(url)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Retry `op` every [`POLL_INTERVAL`] until it returns `Ok` or
+/// [`PORT_READY_TIMEOUT`] elapses, surfacing the last error on timeout.
+async fn poll_until_ready<T, F, Fut>(mut op: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
     let deadline = Instant::now() + PORT_READY_TIMEOUT;
     loop {
-        match TcpStream::connect(("127.0.0.1", port)).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => sleep(POLL_INTERVAL).await,
-            Err(_) => return Err(()),
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+                sleep(POLL_INTERVAL).await;
+            }
         }
     }
 }

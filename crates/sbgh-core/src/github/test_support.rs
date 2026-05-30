@@ -14,6 +14,7 @@ use crate::Result;
 use crate::github::client::{
     GitHubApi, PostedComment, PullRequestSide, PullRequestSummary, RepoRef, RepoSummary,
 };
+use crate::models::ResolvedCommit;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeCall {
@@ -45,6 +46,11 @@ pub enum FakeCall {
         repository: String,
         pr_number: u64,
     },
+    ResolveCommit {
+        installation_id: i64,
+        repository: String,
+        git_ref: String,
+    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -64,6 +70,9 @@ struct FakeState {
     /// Pre-programmed responses for `get_pull_request`. Keyed by
     /// `("owner/name", pr_number)`.
     prs: HashMap<(String, u64), PullRequestSummary>,
+    /// Pre-programmed responses for `resolve_commit`. Keyed by
+    /// `("owner/name", git_ref)`.
+    commits: HashMap<(String, String), ResolvedCommit>,
 }
 
 impl FakeGitHub {
@@ -182,6 +191,24 @@ impl FakeGitHub {
             );
     }
 
+    /// Pre-program the commit a ref (tag/branch) resolves to.
+    pub fn set_commit(
+        &self,
+        repository: &str,
+        git_ref: &str,
+        sha: &str,
+        committed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .insert(
+                (repository.into(), git_ref.into()),
+                ResolvedCommit { hash: sha.into(), committed_at },
+            );
+    }
+
     pub fn calls(&self) -> Vec<FakeCall> {
         self.inner
             .lock()
@@ -295,6 +322,30 @@ impl GitHubApi for FakeGitHub {
                 crate::Error::Config(format!(
                     "FakeGitHub: no canned response for PR {repository}#{pr_number} (use \
                      set_pull_request to stage it)"
+                ))
+            })
+    }
+
+    async fn resolve_commit(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        git_ref: &str,
+    ) -> Result<ResolvedCommit> {
+        let mut s = self.inner.lock().unwrap();
+        s.calls
+            .push(FakeCall::ResolveCommit {
+                installation_id,
+                repository: repository.into(),
+                git_ref: git_ref.into(),
+            });
+        s.commits
+            .get(&(repository.into(), git_ref.into()))
+            .cloned()
+            .ok_or_else(|| {
+                crate::Error::Config(format!(
+                    "FakeGitHub: no canned response for ref {repository}@{git_ref} (use \
+                     set_commit to stage it)"
                 ))
             })
     }

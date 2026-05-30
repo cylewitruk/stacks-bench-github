@@ -810,6 +810,7 @@ mod tests {
             repository: "acme/widgets".into(),
             commit: "abc123def456".into(),
             git_ref_display: "PR #42".into(),
+            git_ref_kind: sbgh_core::models::GitRefKind::Branch,
             installation_id: 7,
             bench_args: vec!["--iters=2".into()],
             progress: ProgressTarget::PullRequestComment {

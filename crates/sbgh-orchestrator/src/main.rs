@@ -114,7 +114,11 @@ async fn main() -> anyhow::Result<()> {
             installation_store.clone(),
             job_v2_store.clone(),
         )))
-        .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store)))
+        .with_handler(Arc::new(CreateHandler::new(
+            policy_store,
+            installation_store,
+            job_v2_store.clone(),
+        )))
         .build();
     let processor =
         WebhookProcessor::new(webhook_inbox, Arc::new(classifier), ProcessorConfig::default());

@@ -162,7 +162,7 @@ fn build_processor_with_gh(pool: &Pool, gh: Arc<FakeGitHub>) -> WebhookProcessor
             installation_store.clone(),
             job_v2_store.clone(),
         )))
-        .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store)))
+        .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store, job_v2_store)))
         .build();
     WebhookProcessor::new(inbox, Arc::new(classifier), ProcessorConfig::default())
 }
@@ -1540,11 +1540,10 @@ async fn pipeline_push_with_no_matching_trigger_is_ignored_action() {
 }
 
 #[tokio::test]
-async fn pipeline_create_tag_with_matching_pattern_trigger_is_would_enqueue_job() {
-    // Slice 11 review fix: a matching tag terminates `WouldEnqueueJob`
-    // (matched/accepted, NO job) — tag job creation is gated off until
-    // claim-time tag→commit resolution lands. So the `job` table stays
-    // empty for tag triggers.
+async fn pipeline_create_tag_with_matching_pattern_trigger_enqueues_baseline_job() {
+    // A matching tag creates a `baseline` job with an UNRESOLVED commit
+    // (the create event has no SHA — the orchestrator resolves the tag
+    // → commit at claim time) and terminates as `EnqueuedJob`.
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
@@ -1580,13 +1579,26 @@ async fn pipeline_create_tag_with_matching_pattern_trigger_is_would_enqueue_job(
 
     let (status, outcome) = read_row_status(&pool, "e2e-tag-match").await;
     assert_eq!(status, WebhookStatus::Processed);
-    assert_eq!(outcome, Some(WebhookOutcome::WouldEnqueueJob));
+    assert_eq!(outcome, Some(WebhookOutcome::EnqueuedJob));
 
-    let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(job_count, 0, "tag triggers do not create jobs until resolution lands");
+    let (kind, trigger, ref_kind, ref_display, commit): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT job_kind::text, trigger_kind::text, git_ref_kind::text, git_ref_display, \
+         git_commit_hash FROM job",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("exactly one job");
+    assert_eq!(kind, "baseline");
+    assert_eq!(trigger, "tag_created");
+    assert_eq!(ref_kind, "tag");
+    assert_eq!(ref_display, "release/1.2");
+    assert!(commit.is_none(), "tag job queued with unresolved commit");
 }
 
 #[tokio::test]

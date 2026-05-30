@@ -8,9 +8,45 @@
 use async_trait::async_trait;
 use octocrab::Octocrab;
 use octocrab::models::CommentId;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
 use crate::github::auth::InstallationTokenCache;
+use crate::models::ResolvedCommit;
 use crate::{Error, Result};
+
+/// Characters to percent-encode inside a single path segment of a git
+/// ref. Covers the URL-structural / unsafe set — most importantly `#`
+/// (fragment) and `%` (escape), which a valid git ref CAN contain and
+/// which would otherwise corrupt the request. `/` is NOT in the set: we
+/// encode per-segment and keep slashes as path separators so GitHub's
+/// `commits/{ref}` greedy-captures the multi-segment ref.
+const REF_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|')
+    .add(b'^')
+    .add(b'\\')
+    .add(b'[')
+    .add(b']');
+
+/// Percent-encode a (possibly slashy) git ref for use in a URL path,
+/// encoding URL-unsafe characters within each segment while preserving
+/// `/` as a path separator.
+fn encode_ref_path(git_ref: &str) -> String {
+    git_ref
+        .split('/')
+        .map(|seg| utf8_percent_encode(seg, REF_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostedComment {
@@ -90,6 +126,25 @@ pub trait GitHubApi: Send + Sync + 'static {
         repository: &str,
         pr_number: u64,
     ) -> Result<PullRequestSummary>;
+
+    /// Resolve a git ref (branch/tag/SHA) to its commit SHA + authored
+    /// date. Used by the orchestrator to resolve `tag_created` jobs at
+    /// claim time — the `create` webhook carries the tag name but no
+    /// SHA. GitHub dereferences annotated tags to the underlying commit.
+    /// `repository` is `"owner/name"` form.
+    ///
+    /// Ref encoding: `GET /repos/{owner}/{repo}/commits/{ref}`
+    /// greedy-captures everything after `/commits/` as the ref (the
+    /// GitHub docs spell refs as `heads/NAME` / `tags/NAME` directly in
+    /// the path), so slashes are kept as path separators. The implementor
+    /// percent-encodes the OTHER URL-unsafe characters a valid git ref
+    /// can contain (`#`, `%`, …) per segment — see `encode_ref_path`.
+    async fn resolve_commit(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        git_ref: &str,
+    ) -> Result<ResolvedCommit>;
 }
 
 /// Subset of the `/repos/{owner}/{repo}/pulls/{number}` response the
@@ -282,6 +337,43 @@ impl GitHubApi for OctocrabClient {
             },
         })
     }
+
+    async fn resolve_commit(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        git_ref: &str,
+    ) -> Result<ResolvedCommit> {
+        let (owner, repo) = split_repo(repository)?;
+        let client = self
+            .installation_client(installation_id)
+            .await?;
+        // GET /repos/{owner}/{repo}/commits/{ref} — GitHub resolves the
+        // ref (dereferencing annotated tags) to the underlying commit.
+        // octocrab formats the ref into the route verbatim, so we
+        // percent-encode URL-unsafe characters first (a valid git ref
+        // can contain `#`/`%`/…), preserving `/` as a path separator.
+        let commit = client
+            .commits(owner, repo)
+            .get(encode_ref_path(git_ref))
+            .await?;
+        // Prefer the committer date (when the commit landed); fall back
+        // to the author date. Either may be absent on unusual commits —
+        // `committed_at` is Optional, so a missing date is fine.
+        let committed_at = commit
+            .commit
+            .committer
+            .as_ref()
+            .and_then(|c| c.date)
+            .or_else(|| {
+                commit
+                    .commit
+                    .author
+                    .as_ref()
+                    .and_then(|a| a.date)
+            });
+        Ok(ResolvedCommit { hash: commit.sha, committed_at })
+    }
 }
 
 fn repo_summary_from_octocrab(repo: &octocrab::models::Repository) -> RepoSummary {
@@ -322,4 +414,34 @@ fn split_repo(full_name: &str) -> Result<(&str, &str)> {
     full_name
         .split_once('/')
         .ok_or_else(|| Error::Config(format!("invalid repository: {full_name}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_ref_path;
+
+    #[test]
+    fn encode_ref_preserves_slashes() {
+        // `/` is a path separator (GitHub greedy-captures the ref), so a
+        // slashy release tag passes through unchanged.
+        assert_eq!(encode_ref_path("tags/release/1.2"), "tags/release/1.2");
+    }
+
+    #[test]
+    fn encode_ref_escapes_url_structural_chars() {
+        // `#` (fragment) and `%` (escape) are valid in git refs but MUST
+        // be encoded so the request targets the right ref. Slashes stay.
+        assert_eq!(encode_ref_path("tags/v1#foo"), "tags/v1%23foo");
+        // A literal `%2F` in the ref name → the `%` is encoded to `%25`
+        // so GitHub decodes it back to a literal `%` (not a slash).
+        assert_eq!(encode_ref_path("tags/v1%2Ffoo"), "tags/v1%252Ffoo");
+        assert_eq!(encode_ref_path("tags/a b"), "tags/a%20b");
+    }
+
+    #[test]
+    fn encode_ref_leaves_ordinary_chars_alone() {
+        // Unreserved + path-safe sub-delims are not encoded (keeps refs
+        // readable in logs / requests).
+        assert_eq!(encode_ref_path("tags/v1.2.3-rc_4"), "tags/v1.2.3-rc_4");
+    }
 }

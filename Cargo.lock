@@ -2569,6 +2569,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "octocrab",
+ "percent-encoding",
  "regex",
  "reqwest",
  "sbgh-core",

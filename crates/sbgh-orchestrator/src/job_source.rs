@@ -22,10 +22,12 @@
 //! PR-comment posting: `pr_comment` jobs post/edit a PR comment (the
 //! comment id is recorded on a `comment_posted` `job_event`, read back
 //! on re-claim). Baseline jobs (`branch_push`/`tag_created`) have no PR
-//! and stay [`ProgressTarget::LogOnly`]. STILL deferred: the intermediate
-//! phase-event timeline (provision/build/bench `job_event` rows — phase
-//! changes are logged only) and `tag_created` claim-time commit
-//! resolution.
+//! and stay [`ProgressTarget::LogOnly`]. `tag_created` jobs are enqueued
+//! with no commit and resolved to their commit at claim time (the runner
+//! calls [`sbgh_core::github::GitHubApi::resolve_commit`] in preflight).
+//! STILL deferred: the intermediate phase-event timeline
+//! (provision/build/bench `job_event` rows — phase changes are logged
+//! only).
 
 use std::sync::Arc;
 
@@ -33,7 +35,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sbgh_core::db::{JobCompletion, JobFailure, JobStore, JobV2Store, PullRequestStore, RepoStore};
 use sbgh_core::models::{
-    JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent, QueuedEventDetail,
+    GitRefKind, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent, QueuedEventDetail,
     ResolvedCommit,
 };
 use uuid::Uuid;
@@ -66,15 +68,18 @@ pub struct RunnableJob {
     /// `owner/name`. Drives the git clone URL + (legacy) GitHub API calls.
     pub repository: String,
     /// Resolved commit/SHA to benchmark. Empty when unresolved at claim
-    /// time — legacy enqueues without it (the runner resolves the PR head
-    /// SHA in preflight). New-schema `pr_comment`/`branch_push` jobs carry
-    /// it from enqueue; `tag_created` creation is gated off until
-    /// claim-time tag resolution lands, so a v2 job is never empty here in
-    /// practice.
+    /// time, which the runner resolves in preflight: legacy + new
+    /// `pr_comment` via the PR head SHA, `tag_created` via the tag ref.
+    /// New `branch_push` carries its commit from enqueue.
     pub commit: String,
     /// Human-readable ref label (PR head branch / watched branch / tag),
     /// for logs + new-schema progress. Legacy jobs use a `PR #N` label.
     pub git_ref_display: String,
+    /// What kind of ref `git_ref_display` is. Drives commit resolution
+    /// when `commit` is empty: a `Tag` resolves via
+    /// `GitHubApi::resolve_commit`. Legacy jobs are always `Branch` (a PR
+    /// head).
+    pub git_ref_kind: GitRefKind,
     pub installation_id: i64,
     /// Resolved `stacks-bench` CLI args. Empty → the driver falls back to
     /// the configured `default_args`.
@@ -161,6 +166,8 @@ impl RunnableJobStore for LegacyJobSource {
             repository: job.repository,
             commit: job.head_sha,
             git_ref_display: format!("PR #{}", job.pr_number),
+            // Legacy jobs are always a PR head (a branch).
+            git_ref_kind: GitRefKind::Branch,
             installation_id: job.installation_id,
             bench_args: legacy_bench_args(&job.args.0),
             progress: ProgressTarget::PullRequestComment {
@@ -341,6 +348,7 @@ impl RunnableJobStore for JobV2Source {
                 .git_commit_hash
                 .unwrap_or_default(),
             git_ref_display: job.git_ref_display,
+            git_ref_kind: job.git_ref_kind,
             installation_id: job.github_installation_id,
             bench_args,
             progress,

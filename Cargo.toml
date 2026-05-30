@@ -73,6 +73,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 dotenvy = "0.15"
 url = "2"
+percent-encoding = "2"
 toml = "1"
 quick-xml = "0.40"
 testcontainers = "0.27"
