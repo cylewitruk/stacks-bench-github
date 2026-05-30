@@ -49,35 +49,18 @@ pub async fn apply_roles(
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
-    // sbgh_handler: column-level grants.
+    // sbgh_handler: NO access to legacy `jobs`.
     //
-    // Columns it CAN INSERT into = exactly the fields the handler's
-    // `PostgresJobStore::enqueue` writes. By NOT granting INSERT on
-    // `status`, `result`, `started_at`, `finished_at`, `error`, etc.,
-    // a compromised handler cannot fabricate a `status='completed'`
-    // row with a fake result blob — those columns can only be written
-    // by sbgh_orch's UPDATE. Server-side DEFAULTs (gen_random_uuid for
-    // `id`, 'queued' for `status`, NOW() for `queued_at`) still fire
-    // normally for omitted columns; you only need INSERT grant on a
-    // column to *specify a value* for it.
-    //
-    // Columns it CAN SELECT = the two referenced by enqueue's SQL:
-    //   - `id`                 read back by the RETURNING clause
-    //   - `github_delivery_id` referenced by the ON CONFLICT predicate
-    // Granting SELECT on these two specifically — not the whole table —
-    // means a compromised handler still can't enumerate other PRs'
-    // job rows (head_sha, args, result, …).
+    // Slice 11 cutover made the handler inbox-only — it records webhooks
+    // and never writes legacy `jobs` (the processor creates new-schema
+    // `job` rows from the inbox). Revoking the handler's old column-level
+    // INSERT/SELECT here closes the privilege boundary too: a compromised
+    // handler role can't enqueue a legacy job, and the rollback hazard
+    // (someone flipping `[jobs].source = "legacy"` later, then the legacy
+    // runner consuming handler-injected jobs) is gone. The legacy table
+    // itself is dropped in slice 12.
     upsert_role(&mut tx, "sbgh_handler", handler_password).await?;
     sqlx::query("REVOKE ALL ON TABLE jobs FROM sbgh_handler")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "GRANT INSERT (repository, pr_number, head_sha, requested_by, command, args, \
-         installation_id, github_delivery_id) ON TABLE jobs TO sbgh_handler",
-    )
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("GRANT SELECT (id, github_delivery_id) ON TABLE jobs TO sbgh_handler")
         .execute(&mut *tx)
         .await?;
 

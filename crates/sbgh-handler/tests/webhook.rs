@@ -1,9 +1,9 @@
-//! End-to-end handler tests. Asserts the handler is restricted to: signature
-//! verification, event-type filtering, authorization, webhook-inbox
-//! recording, and (for authorized `/benchmark`) atomic dual-write of an
-//! inbox row + legacy `jobs` row. Any GitHub API call from the handler
-//! would be a regression — the handler holds no App credentials. The
-//! orchestrator is responsible for all GitHub-side I/O.
+//! End-to-end handler tests. Slice 11 made the handler **inbox-only**:
+//! it is restricted to signature verification, event-type filtering, and
+//! webhook-inbox recording. It does NOT parse `/benchmark`, authorize, or
+//! enqueue a legacy `jobs` row — the processor owns all of that. Any
+//! GitHub API call OR legacy-job write from the handler would be a
+//! regression (the `.jobs()`-empty assertions pin the latter).
 
 use std::sync::Arc;
 
@@ -13,7 +13,6 @@ use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use sbgh_core::config::{AuthorizationConfig, HandlerConfig, ServerConfig, WebhookConfig};
 use sbgh_core::db::InMemoryIngestStore;
-use sbgh_core::models::JobStatus;
 use sha2::Sha256;
 use tower::ServiceExt;
 
@@ -259,126 +258,67 @@ async fn supported_event_records_webhook_only() {
 }
 
 #[tokio::test]
-async fn issue_comment_non_pr_records_webhook_only() {
+async fn issue_comment_records_webhook_only_no_job() {
+    // Inbox-only (slice 11): a `/benchmark` issue_comment is recorded
+    // like any other event — NO legacy job, NO authz, NO command parse.
+    // The processor handles all of that from the inbox. The empty
+    // `.jobs()` is the load-bearing assertion: the handler must never
+    // write legacy `jobs` post-cutover (else a rollback to the legacy
+    // backend could re-run them).
     let h = setup();
-    let body = issue_comment_payload("acme/widgets", "/benchmark", "alice", "MEMBER", false);
-    let sig = sign(&body);
-    let (status, text) = post_webhook(&h.router, "issue_comment", body, Some(&sig)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "not a PR");
-    // Slice 1: webhook recorded for audit even though no job enqueued.
-    assert_eq!(h.ingest.webhook_count(), 1);
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn issue_comment_no_command_records_webhook_only() {
-    let h = setup();
-    let body = issue_comment_payload("acme/widgets", "looks good!", "alice", "MEMBER", true);
-    let sig = sign(&body);
-    let (status, text) = post_webhook(&h.router, "issue_comment", body, Some(&sig)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "no command");
-    assert_eq!(h.ingest.webhook_count(), 1);
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn unauthorized_command_records_webhook_only() {
-    let h = setup();
-    let body = issue_comment_payload("acme/widgets", "/benchmark", "bob", "NONE", true);
-    let sig = sign(&body);
-    let (status, text) = post_webhook(&h.router, "issue_comment", body, Some(&sig)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "unauthorized");
-    assert_eq!(h.ingest.webhook_count(), 1);
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn disallowed_repo_records_webhook_only() {
-    let h = setup();
-    let body = issue_comment_payload("evil/repo", "/benchmark", "alice", "OWNER", true);
-    let sig = sign(&body);
-    let (status, text) = post_webhook(&h.router, "issue_comment", body, Some(&sig)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "unauthorized");
-    assert_eq!(h.ingest.webhook_count(), 1);
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty()
-    );
-}
-
-// ─── Dual-write path ─────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn happy_path_records_webhook_and_enqueues_job() {
-    // Pinning the post-refactor contract: the handler dual-writes a
-    // webhook inbox row AND a legacy job row in one transaction. job
-    // is enqueued with an empty head_sha and NULL comment_id; the
-    // orchestrator fills both in on pickup. A regression here would
-    // either drop the inbox row, drop the job row, or re-introduce a
-    // GitHub API call — fail the test instead.
-    let h = setup();
-
     let body =
         issue_comment_payload("acme/widgets", "/benchmark run --iters=5", "alice", "MEMBER", true);
     let sig = sign(&body);
     let (status, text) = post_webhook(&h.router, "issue_comment", body, Some(&sig)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "queued");
+    assert_eq!(text, "recorded");
 
-    // Inbox side.
     assert_eq!(h.ingest.webhook_count(), 1);
     let webhook = &h.ingest.webhooks()[0];
     assert_eq!(webhook.event_type, "issue_comment");
     assert_eq!(webhook.action.as_deref(), Some("created"));
     assert_eq!(webhook.payload_installation_id, Some(7));
-
-    // Legacy job side.
-    let jobs = h.ingest.jobs().snapshot();
-    assert_eq!(jobs.len(), 1);
-    let job = &jobs[0];
-    assert_eq!(job.status, JobStatus::Queued);
-    assert_eq!(job.repository, "acme/widgets");
-    assert_eq!(job.pr_number, 42);
-    assert_eq!(job.requested_by, "alice");
-    assert_eq!(job.command, "run");
-    assert_eq!(job.installation_id, 7);
-    assert_eq!(job.args.0, serde_json::json!({ "args": ["--iters=5"] }));
     assert!(
-        job.head_sha.is_empty(),
-        "handler must not resolve head_sha (no App credentials); got {:?}",
-        job.head_sha
+        h.ingest
+            .jobs()
+            .snapshot()
+            .is_empty(),
+        "inbox-only handler must NOT enqueue a legacy job"
     );
-    assert!(job.comment_id.is_none(), "handler must not post a comment");
 }
 
 #[tokio::test]
-async fn duplicate_delivery_id_dedupes_both_sides() {
-    // GitHub redelivers on 5xx and on operator "Redeliver" clicks. Same
-    // X-GitHub-Delivery means same logical webhook, even across retries.
-    // Both the inbox and the legacy job must dedupe.
-    let h = setup();
+async fn issue_comment_recorded_regardless_of_authz_or_command() {
+    // The handler no longer gates on authz / command shape — every
+    // signature-valid issue_comment is recorded for the processor.
+    // (Cases that used to short-circuit as "unauthorized" / "no command"
+    // / "not a PR" now all just record.)
+    for body in [
+        issue_comment_payload("acme/widgets", "looks good!", "alice", "MEMBER", true), /* no command */
+        issue_comment_payload("acme/widgets", "/benchmark", "bob", "NONE", true), // "unauthorized"
+        issue_comment_payload("evil/repo", "/benchmark", "alice", "OWNER", true), /* disallowed
+                                                                                   * repo */
+        issue_comment_payload("acme/widgets", "/benchmark", "alice", "MEMBER", false), // not a PR
+    ] {
+        let h = setup();
+        let sig = sign(&body);
+        let (status, text) = post_webhook(&h.router, "issue_comment", body, Some(&sig)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "recorded");
+        assert_eq!(h.ingest.webhook_count(), 1);
+        assert!(
+            h.ingest
+                .jobs()
+                .snapshot()
+                .is_empty()
+        );
+    }
+}
 
+#[tokio::test]
+async fn duplicate_issue_comment_delivery_dedupes() {
+    // Same X-GitHub-Delivery → same logical webhook → one inbox row.
+    let h = setup();
     let body = issue_comment_payload("acme/widgets", "/benchmark", "alice", "MEMBER", true);
     let sig = sign(&body);
 
@@ -391,7 +331,7 @@ async fn duplicate_delivery_id_dedupes_both_sides() {
     )
     .await;
     assert_eq!(s1, StatusCode::OK);
-    assert_eq!(b1, "queued");
+    assert_eq!(b1, "recorded");
 
     let (s2, b2) =
         post_webhook_with_delivery(&h.router, "issue_comment", body, Some(&sig), Some("repeat-me"))
@@ -400,29 +340,26 @@ async fn duplicate_delivery_id_dedupes_both_sides() {
     assert_eq!(b2, "duplicate");
 
     assert_eq!(h.ingest.webhook_count(), 1, "second delivery must not record a second webhook");
-    assert_eq!(
+    assert!(
         h.ingest
             .jobs()
             .snapshot()
-            .len(),
-        1,
-        "second delivery must not enqueue a second job"
+            .is_empty()
     );
 }
 
 #[tokio::test]
 async fn malformed_issue_comment_payload_still_records_webhook() {
-    // Body is signature-verified but doesn't decode into the typed
-    // IssueCommentEvent shape (truncated, schema drift, etc.). Slice 1
-    // invariant: GH gets a 2xx and the inbox row exists so a redelivery
-    // is dedup-able. Returning 4xx here would trigger un-dedupable GH
-    // retry storms.
+    // Body is signature-verified but isn't a well-formed issue_comment.
+    // Inbox-only still records it (valid JSON → payload stored) so GH
+    // redeliveries dedupe against the inbox row. Returning 4xx here would
+    // trigger un-dedupable GH retry storms.
     let h = setup();
     let bad_body = br#"{"action": "created", "this is": "not an issue_comment"}"#.to_vec();
     let sig = sign(&bad_body);
     let (status, text) = post_webhook(&h.router, "issue_comment", bad_body, Some(&sig)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "bad payload");
+    assert_eq!(text, "recorded");
     assert_eq!(h.ingest.webhook_count(), 1);
     let webhook = &h.ingest.webhooks()[0];
     assert_eq!(webhook.event_type, "issue_comment");

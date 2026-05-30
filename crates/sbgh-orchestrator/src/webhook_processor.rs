@@ -1704,24 +1704,18 @@ impl EventHandler for PushHandler {
 pub struct CreateHandler {
     policy_store: Arc<dyn PolicyStore>,
     install_store: Arc<dyn InstallationStore>,
-    /// Slice 9: a matched `tag_created` trigger creates a `baseline`
-    /// job. The create event carries no SHA, so the job is queued with
-    /// an unresolved commit and the orchestrator resolves the tag to
-    /// its commit during the claim phase.
-    job_store: Arc<dyn JobV2Store>,
+    // Slice 11 review fix: no `job_store` — `tag_created` job creation
+    // is gated OFF until claim-time tag→commit resolution lands (a matched
+    // tag terminates `WouldEnqueueJob`, not a job). The dep returns when
+    // resolution does.
 }
 
 impl CreateHandler {
     pub fn new(
         policy_store: Arc<dyn PolicyStore>,
         install_store: Arc<dyn InstallationStore>,
-        job_store: Arc<dyn JobV2Store>,
     ) -> Self {
-        Self {
-            policy_store,
-            install_store,
-            job_store,
-        }
+        Self { policy_store, install_store }
     }
 }
 
@@ -1809,38 +1803,22 @@ impl EventHandler for CreateHandler {
             );
         }
 
+        // Slice 11 (review fix): `tag_created` job creation is gated OFF
+        // until claim-time tag→commit resolution lands. A `create` event
+        // carries no SHA, and (post-cutover) the orchestrator can't yet
+        // resolve a tag ref to its commit — so enqueuing here would
+        // produce a guaranteed-failed job. Keep it observational
+        // (`WouldEnqueueJob` = matched/accepted, no job) until resolution
+        // exists. `pr_comment` (head SHA at enqueue) and `branch_push`
+        // (push `head_commit`) are unaffected — those resolve at enqueue.
         tracing::info!(
             installation_id = event.installation.id,
             repo_id = event.repository.id,
             tag = event.ref_field.as_str(),
             trigger_id = trigger.id,
-            "create: tag_created trigger matched — creating job"
+            "create: tag_created trigger matched — NOT enqueuing (tag commit resolution pending)"
         );
-        let detail = QueuedEventDetail::TagCreated {
-            tag: event.ref_field.clone(),
-            trigger_id: trigger.id,
-            bench_args: trigger.bench_args.clone(),
-        };
-        let request = JobCreationRequest {
-            new_job: NewJobV2 {
-                github_installation_id: event.installation.id,
-                github_repo_id: event.repository.id,
-                job_kind: JobKind::Baseline,
-                trigger_kind: TriggerKind::TagCreated,
-                git_ref_kind: GitRefKind::Tag,
-                git_ref_display: event.ref_field.clone(),
-                // The create event carries no SHA; the orchestrator
-                // resolves the tag → commit during the claim phase
-                // (slice 8's `mark_running(Some(ResolvedCommit))`).
-                git_commit_hash: None,
-                git_committed_at: None,
-            },
-            github_webhook_id: webhook.id,
-            triggering_user_id: None,
-            pull_request_link: None,
-            queued_event_detail: queued_detail(detail),
-        };
-        enqueue_job(self.job_store.as_ref(), request).await
+        ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)
     }
 }
 
@@ -5003,11 +4981,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_tag_matching_pattern_enqueues_baseline_job_with_unresolved_commit() {
-        // Slice 9: a matching tag regex creates a `baseline` job. The
-        // create event carries no SHA, so the job is queued with an
-        // UNRESOLVED commit (the orchestrator resolves it during claim).
-        // Terminates as `EnqueuedJob`.
+    async fn create_tag_matching_pattern_is_would_enqueue_job_until_resolution_lands() {
+        // Slice 11 review fix: a matching tag terminates `WouldEnqueueJob`
+        // (matched/accepted, NO job) — tag job creation is gated off until
+        // claim-time tag→commit resolution exists, since a `create` event
+        // carries no SHA and the orchestrator can't yet resolve it.
         //
         // Parent target must be enabled — slice 5 second-pass runtime
         // gate filters triggers whose parent target is disabled / missing.
@@ -5023,24 +5001,10 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let job_store = Arc::new(sbgh_core::db::InMemoryJobV2Store::new());
-        let h = CreateHandler::new(policy_store, install_store, job_store.clone());
+        let h = CreateHandler::new(policy_store, install_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "release/1.2", "tag"));
         let outcome = h.handle(&w).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
-
-        let jobs = job_store.all_jobs();
-        assert_eq!(jobs.len(), 1);
-        let job = &jobs[0];
-        assert_eq!(job.job_kind, sbgh_core::models::JobKind::Baseline);
-        assert_eq!(job.trigger_kind, TriggerKind::TagCreated);
-        assert_eq!(job.git_ref_kind, GitRefKind::Tag);
-        assert_eq!(job.git_ref_display, "release/1.2");
-        assert!(
-            job.git_commit_hash.is_none(),
-            "create event carries no SHA — orchestrator resolves during claim"
-        );
-        assert!(job.git_committed_at.is_none());
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::WouldEnqueueJob)));
     }
 
     #[tokio::test]
@@ -5056,11 +5020,7 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
-        );
+        let h = CreateHandler::new(policy_store, install_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "feature/foo", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5072,11 +5032,7 @@ mod tests {
         // already covered by `push`.
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
-        );
+        let h = CreateHandler::new(policy_store, install_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "new-branch", "branch"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5105,11 +5061,7 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
-        );
+        let h = CreateHandler::new(policy_store, install_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         // The good trigger still got to match.
@@ -5120,11 +5072,7 @@ mod tests {
     async fn create_null_payload_is_error() {
         let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
-        );
+        let h = CreateHandler::new(policy_store, install_store);
         let mut w = create_webhook_claimed(serde_json::Value::Null);
         w.payload = None;
         let outcome = h.handle(&w).await;
@@ -5201,11 +5149,7 @@ mod tests {
             .revoke_membership(100, 10)
             .await
             .unwrap();
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
-        );
+        let h = CreateHandler::new(policy_store, install_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5278,11 +5222,7 @@ mod tests {
             true,
         );
         let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobV2Store::new()),
-        );
+        let h = CreateHandler::new(policy_store, install_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));

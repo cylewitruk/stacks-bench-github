@@ -149,6 +149,24 @@ impl Runner {
             .await?;
 
         let reporter = ProgressReporter::new(self.gh.as_ref(), &job);
+
+        // Defensive: a job with no resolved commit can't be benchmarked
+        // (an empty SHA would produce a confusing `git fetch ''`). In
+        // practice this shouldn't trigger — `pr_comment` + `branch_push`
+        // resolve their commit at enqueue, and `tag_created` job creation
+        // is gated off until claim-time tag resolution lands. If it ever
+        // does, fail terminally now that we're `running` so the failure
+        // records a terminal state instead of looping via the sweep.
+        if job.commit.is_empty() {
+            let msg = "no resolved commit; cannot benchmark";
+            tracing::error!(job_id = %job.id, git_ref = %job.git_ref_display, "{msg}");
+            self.jobs
+                .fail(&job, msg, None)
+                .await?;
+            let _ = reporter.failed(msg).await;
+            return Ok(());
+        }
+
         reporter.started().await?;
 
         let driver = LibvirtDriver::new(self.config.clone(), self.shell.clone());
@@ -216,19 +234,19 @@ impl Runner {
     /// — the resolver doesn't know the commit's authored date, and
     /// fabricating one would corrupt baseline-timeline ordering.
     ///
-    /// Commit resolution + comment posting are PR-comment-job concerns
-    /// (the legacy production path). New-schema jobs are `LogOnly` with a
-    /// commit already resolved at enqueue (`pr_comment`/`branch_push`) —
-    /// `tag_created` jobs resolve at claim time, which is wired in slice
-    /// 11; for now an unresolved new-schema commit is logged and left.
+    /// Commit resolution + comment posting are PR-comment-job concerns.
+    /// `LogOnly` (new-schema baseline) jobs carry a commit already
+    /// resolved at enqueue (`branch_push`); they need no preflight work.
+    /// (An empty commit here is unexpected — `tag_created` job creation
+    /// is gated off until claim-time resolution lands — but is caught by
+    /// the empty-commit guard in `execute` rather than run blindly.)
     async fn preflight(&self, job: &mut RunnableJob) -> anyhow::Result<Option<ResolvedCommit>> {
         let ProgressTarget::PullRequestComment { pr_number, comment_id } = job.progress else {
             if job.commit.is_empty() {
                 tracing::warn!(
                     job_id = %job.id,
                     git_ref = %job.git_ref_display,
-                    "new-schema job has no resolved commit; claim-time resolution lands in slice \
-                     11 — running with empty commit",
+                    "new-schema job has no resolved commit; the empty-commit guard will fail it",
                 );
             }
             return Ok(None);

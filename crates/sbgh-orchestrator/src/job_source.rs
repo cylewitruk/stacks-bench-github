@@ -8,28 +8,34 @@
 //!
 //!   - [`RunnableJob`] — a backend-neutral execution view (everything the
 //!     driver + progress reporter need), assembled from whichever schema.
-//!   - [`RunnableJobStore`] — claim + lifecycle, implemented by
-//!     [`LegacyJobSource`] (over `JobStore`, the production default) and
-//!     [`JobV2Source`] (over `JobV2Store`, test-only until slice 11).
+//!   - [`RunnableJobStore`] — claim + lifecycle, implemented by [`JobV2Source`]
+//!     (over `JobV2Store`, the production default since the slice 11 cutover)
+//!     and [`LegacyJobSource`] (over `JobStore`, the retained escape hatch
+//!     until slice 12).
 //!
 //! Slice 10 scope (per the Phase-2 plan): prove the new backend can
 //! claim → run → finish and persist the `queued` (slice 9) + terminal
 //! (`completed`/`failed`) `job_event` rows plus `job_metric` /
-//! `job_result`. Two things are explicitly DEFERRED to slice 11: the
-//! intermediate phase-event timeline (provision/build/bench
-//! `job_event` rows) and GitHub **comment** posting. `JobV2Source` jobs
-//! carry [`ProgressTarget::LogOnly`] — phase changes go to logs only
-//! (no comment AND no phase `job_event` yet) — so "no PR comment" reads
-//! as a deliberate decision, not an omission. Production stays on
-//! `legacy` (see `[jobs].source` config), so there is no user-visible
-//! change this slice.
+//! `job_result`.
+//!
+//! Slice 11 (cutover) made `v2` the production backend and added
+//! PR-comment posting: `pr_comment` jobs post/edit a PR comment (the
+//! comment id is recorded on a `comment_posted` `job_event`, read back
+//! on re-claim). Baseline jobs (`branch_push`/`tag_created`) have no PR
+//! and stay [`ProgressTarget::LogOnly`]. STILL deferred: the intermediate
+//! phase-event timeline (provision/build/bench `job_event` rows — phase
+//! changes are logged only) and `tag_created` claim-time commit
+//! resolution.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use sbgh_core::db::{JobCompletion, JobFailure, JobStore, JobV2Store, RepoStore};
-use sbgh_core::models::{JobMetric, JobResult, QueuedEventDetail, ResolvedCommit};
+use sbgh_core::db::{JobCompletion, JobFailure, JobStore, JobV2Store, PullRequestStore, RepoStore};
+use sbgh_core::models::{
+    JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent, QueuedEventDetail,
+    ResolvedCommit,
+};
 use uuid::Uuid;
 
 use crate::bench_summary::RunResult;
@@ -38,15 +44,13 @@ use crate::bench_summary::RunResult;
 #[derive(Debug, Clone)]
 pub enum ProgressTarget {
     /// Edit a PR comment (legacy jobs always; new-schema `pr_comment`
-    /// jobs once slice 11 wires comment posting). `comment_id` is `None`
-    /// until the orchestrator posts the initial comment.
+    /// jobs). `comment_id` is `None` until the orchestrator posts the
+    /// initial comment.
     PullRequestComment { pr_number: i64, comment_id: Option<i64> },
-    /// Phase progress goes to LOGS ONLY. New-schema baseline jobs
-    /// (`branch_push`/`tag_created`) have no PR by nature; in slice 10
-    /// ALL new-schema jobs are `LogOnly`. Slice 10 does NOT yet write
-    /// intermediate phase `job_event` rows or post/edit a GitHub comment
-    /// — both land in slice 11 (the latter via
-    /// `job_event.github_comment_id`). The `queued` + terminal
+    /// Phase progress goes to LOGS ONLY — new-schema baseline jobs
+    /// (`branch_push`/`tag_created`) have no PR. STILL deferred for these
+    /// (slice 11 left them): intermediate phase `job_event` rows (phase
+    /// changes are logged only). The `queued` + terminal
     /// (`completed`/`failed`) events ARE persisted (slice 9's processor
     /// and `complete_job`/`fail_job`). The loud variant name keeps the
     /// missing comment deliberate (vs. an accidental bug).
@@ -62,8 +66,11 @@ pub struct RunnableJob {
     /// `owner/name`. Drives the git clone URL + (legacy) GitHub API calls.
     pub repository: String,
     /// Resolved commit/SHA to benchmark. Empty when unresolved at claim
-    /// time (legacy enqueues without it; new `tag_created` jobs resolve
-    /// during the claim phase) — the runner resolves it in preflight.
+    /// time — legacy enqueues without it (the runner resolves the PR head
+    /// SHA in preflight). New-schema `pr_comment`/`branch_push` jobs carry
+    /// it from enqueue; `tag_created` creation is gated off until
+    /// claim-time tag resolution lands, so a v2 job is never empty here in
+    /// practice.
     pub commit: String,
     /// Human-readable ref label (PR head branch / watched branch / tag),
     /// for logs + new-schema progress. Legacy jobs use a `PR #N` label.
@@ -127,11 +134,12 @@ pub trait RunnableJobStore: Send + Sync + 'static {
     async fn set_comment_id(&self, job: &RunnableJob, comment_id: i64) -> anyhow::Result<()>;
 }
 
-// ─── Legacy adapter (production default) ───────────────────────────────
+// ─── Legacy adapter (escape hatch until slice 12) ──────────────────────
 
 /// [`RunnableJobStore`] over the legacy `jobs` table. Thin mapping onto
-/// the existing [`JobStore`]; preserves the exact production behaviour
-/// (every legacy job is a PR-comment job).
+/// the existing [`JobStore`]; preserves the pre-cutover behaviour (every
+/// legacy job is a PR-comment job). Selectable via `[jobs].source =
+/// "legacy"` until slice 12 removes the legacy path.
 pub struct LegacyJobSource {
     jobs: Arc<dyn JobStore>,
 }
@@ -227,25 +235,32 @@ fn legacy_bench_args(args: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-// ─── New-schema adapter (test-only until slice 11) ─────────────────────
+// ─── New-schema adapter ────────────────────────────────────────────────
 
 /// [`RunnableJobStore`] over the new `job` family. Composes
 /// [`JobV2Store`] (claim + lifecycle) with [`RepoStore`] (resolve
-/// `github_repo_id → owner/name`) and reads the queued `job_event` for
-/// the run's `bench_args`.
+/// `github_repo_id → owner/name`) and [`PullRequestStore`] (resolve a
+/// `pr_comment` job's PR number for comment posting), and reads the
+/// queued `job_event` for the run's `bench_args`.
 ///
-/// Slice 10: production does not select this backend. It exists to prove
-/// the new schema can drive a run end-to-end (claim → running → terminal
-/// with durable `job_event`/`job_metric`/`job_result`), exercised by
-/// integration tests. Progress is [`ProgressTarget::LogOnly`].
+/// Slice 11 made this the production backend (`[jobs].source = "v2"`):
+/// `pr_comment` jobs post/edit a PR comment (the comment id is recorded
+/// as a `comment_posted` `job_event`, read back on re-claim for
+/// idempotency); baseline jobs (`branch_push`/`tag_created`) have no PR
+/// and stay [`ProgressTarget::LogOnly`].
 pub struct JobV2Source {
     jobs: Arc<dyn JobV2Store>,
     repos: Arc<dyn RepoStore>,
+    pull_requests: Arc<dyn PullRequestStore>,
 }
 
 impl JobV2Source {
-    pub fn new(jobs: Arc<dyn JobV2Store>, repos: Arc<dyn RepoStore>) -> Self {
-        Self { jobs, repos }
+    pub fn new(
+        jobs: Arc<dyn JobV2Store>,
+        repos: Arc<dyn RepoStore>,
+        pull_requests: Arc<dyn PullRequestStore>,
+    ) -> Self {
+        Self { jobs, repos, pull_requests }
     }
 }
 
@@ -286,6 +301,39 @@ impl RunnableJobStore for JobV2Source {
             .map(|d| bench_args_from_detail(&d.0))
             .unwrap_or_default();
 
+        // PR-linked jobs (`pr_comment`) report progress on the PR
+        // comment; baseline jobs (`branch_push`/`tag_created`) have no PR
+        // → log-only. On (re-)claim, an already-posted comment id is read
+        // back so a reclaimed job edits rather than double-posts.
+        let progress = match self
+            .jobs
+            .pull_request_link(job.id)
+            .await?
+        {
+            Some(link) => {
+                let pr = self
+                    .pull_requests
+                    .lookup_by_id(link.github_pull_request_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "job {} links unknown github_pull_request {}",
+                            job.id,
+                            link.github_pull_request_id
+                        )
+                    })?;
+                let comment_id = self
+                    .jobs
+                    .latest_comment_id(job.id)
+                    .await?;
+                ProgressTarget::PullRequestComment {
+                    pr_number: pr.pr_number as i64,
+                    comment_id,
+                }
+            }
+            None => ProgressTarget::LogOnly,
+        };
+
         Ok(Some(RunnableJob {
             id: job.id,
             repository: format!("{}/{}", repo.owner, repo.name),
@@ -295,8 +343,7 @@ impl RunnableJobStore for JobV2Source {
             git_ref_display: job.git_ref_display,
             installation_id: job.github_installation_id,
             bench_args,
-            // Slice 10: new-schema progress is log + timeline only.
-            progress: ProgressTarget::LogOnly,
+            progress,
             claim_token: Some(claim_token),
         }))
     }
@@ -372,31 +419,36 @@ impl RunnableJobStore for JobV2Source {
             })
             .await?;
         if !ok {
-            // Guard miss: the job wasn't `running` under our token —
-            // either preflight failed before `start_running` (still
-            // `claimed`) or the sweep reclaimed our lease. Either way the
-            // stuck-claim sweep will recover it; recording a terminal
-            // failure isn't possible (and shouldn't clobber a reclaim),
-            // so warn rather than erroring the loop.
+            // Guard miss: the job is neither `claimed` nor `running`
+            // under our token — the sweep already reclaimed our lease (so
+            // it's back to `queued` or held by another claim). Don't
+            // clobber that; the sweep/next claim handles it. (`fail_job`
+            // DOES terminalize a `claimed` job under our token, so a
+            // pre-`start_running` preflight failure does NOT reach here —
+            // it terminalizes cleanly rather than looping.)
             tracing::warn!(
                 job_id = %job.id,
-                "fail_job was a no-op (job not running under our claim); leaving for sweep recovery"
+                "fail_job was a no-op (lost our claim to the sweep); leaving for re-claim"
             );
         }
         Ok(())
     }
 
     async fn set_comment_id(&self, job: &RunnableJob, comment_id: i64) -> anyhow::Result<()> {
-        // Slice 10 guardrail: new-schema comment posting is deferred to
-        // slice 11. This should not be reached (the runner only calls it
-        // for PullRequestComment jobs, and new jobs are LogOnly), so log
-        // loudly rather than silently dropping it.
-        tracing::warn!(
-            job_id = %job.id,
-            comment_id,
-            "JobV2Source::set_comment_id called but new-schema comment posting is disabled until \
-             cutover (slice 11); ignoring"
-        );
+        // Slice 11: the new schema has no `comment_id` column — the
+        // comment identity lives on a `comment_posted` timeline event.
+        // `latest_comment_id` reads it back on (re-)claim so a reclaimed
+        // job edits the existing comment instead of posting a duplicate.
+        self.jobs
+            .insert_event(&NewJobEvent {
+                job_id: job.id,
+                event_kind: JobEventKind::CommentPosted,
+                event_status: JobEventStatus::Success,
+                github_comment_id: Some(comment_id),
+                remark: None,
+                detail: None,
+            })
+            .await?;
         Ok(())
     }
 }

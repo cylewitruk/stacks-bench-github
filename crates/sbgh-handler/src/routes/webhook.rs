@@ -4,10 +4,15 @@
 //!   1. Reads the raw body (signature is over the bytes, not parsed JSON).
 //!   2. Verifies the HMAC-SHA256 signature against the webhook secret.
 //!   3. Drops unsupported event types at the wire (no DB row).
-//!   4. For supported events, records a webhook inbox row.
-//!   5. For `issue_comment` specifically: parses the `/benchmark` command,
-//!      checks the authorization allowlist, and atomically enqueues a legacy
-//!      `jobs` row alongside the inbox row when authorized.
+//!   4. For supported events, records a webhook inbox row — and nothing else.
+//!
+//! Slice 11 (cutover) made the handler **inbox-only**: it no longer
+//! parses `/benchmark`, checks the authorization allowlist, or enqueues
+//! a legacy `jobs` row. The processor (running in the orchestrator) owns
+//! ALL classification, authorization, and job creation from the inbox.
+//! This is also what makes the cutover reversible — the handler stops
+//! writing legacy `jobs`, so flipping back to the legacy backend can't
+//! consume jobs created after the cutover.
 //!
 //! Notably absent: any GitHub API call. The handler holds NO App
 //! credentials. Head-SHA resolution and the initial PR comment are both
@@ -19,10 +24,8 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use sbgh_core::config::AuthorizationConfig;
 use sbgh_core::db::{IngestOutcome, NewWebhook};
-use sbgh_core::github::{IssueCommentEvent, parse_command, verify_signature};
-use sbgh_core::models::NewJob;
+use sbgh_core::github::verify_signature;
 use serde_json::Value;
 
 use crate::state::AppState;
@@ -116,12 +119,9 @@ pub async fn handle(
         payload_size_bytes: body.len() as i32,
     };
 
-    // issue_comment is the only event that may trigger a legacy job
-    // enqueue. Everything else goes through the webhook-only path.
-    if event == "issue_comment" {
-        return handle_issue_comment(state, &webhook, &body, &delivery_id).await;
-    }
-
+    // Inbox-only: every supported event (issue_comment included) is just
+    // recorded. The processor owns command parsing, authorization, and
+    // job creation from the inbox.
     match state
         .ingest
         .ingest_webhook(&webhook)
@@ -137,164 +137,4 @@ pub async fn handle(
             (StatusCode::INTERNAL_SERVER_ERROR, "ingest error").into_response()
         }
     }
-}
-
-async fn handle_issue_comment(
-    state: AppState,
-    webhook: &NewWebhook,
-    body: &[u8],
-    delivery_id: &str,
-) -> axum::response::Response {
-    // For any non-success path (typed-parse failure, wrong action, no
-    // command, unauthorized, etc.), we still record the webhook (audit
-    // + future processor input + GH redelivery dedupe) and return 2xx.
-    // Crucial: GH never sees a 4xx that would trigger an un-dedupable
-    // retry storm — the inbox row IS the dedup key.
-    let webhook_only = |reason: &'static str| {
-        let state = state.clone();
-        let webhook = webhook.clone();
-        let delivery_id = delivery_id.to_string();
-        async move {
-            match state
-                .ingest
-                .ingest_webhook(&webhook)
-                .await
-            {
-                Ok(IngestOutcome::Recorded { .. }) | Ok(IngestOutcome::Duplicate) => {
-                    (StatusCode::OK, reason).into_response()
-                }
-                Err(e) => {
-                    tracing::error!(error = ?e, delivery = %delivery_id, "failed to record webhook");
-                    (StatusCode::INTERNAL_SERVER_ERROR, "ingest error").into_response()
-                }
-            }
-        }
-    };
-
-    let event: IssueCommentEvent = match serde_json::from_slice(body) {
-        Ok(e) => e,
-        Err(e) => {
-            // Body is signature-verified but doesn't match the typed
-            // shape (truncated, GH schema drift, etc.). Record the
-            // webhook anyway so GH redeliveries dedupe against the
-            // inbox row. If the body was syntactically valid JSON but
-            // had the wrong shape, the stored payload is inspectable
-            // later; if it was syntactically invalid, payload is SQL
-            // NULL (only event_type/delivery_id/size survive for
-            // forensics).
-            tracing::warn!(error = %e, delivery = %delivery_id, "issue_comment payload decode failed");
-            return webhook_only("bad payload").await;
-        }
-    };
-
-    if event.action != "created" {
-        return webhook_only("ignored").await;
-    }
-    if event
-        .issue
-        .pull_request
-        .is_none()
-    {
-        return webhook_only("not a PR").await;
-    }
-
-    let command = match parse_command(&event.comment.body) {
-        Ok(Some(c)) => c,
-        Ok(None) => return webhook_only("no command").await,
-        Err(e) => {
-            tracing::info!(error = %e, "malformed command");
-            return webhook_only("malformed command").await;
-        }
-    };
-
-    if let Err(reason) = authorized(&state.config.authorization, &event) {
-        tracing::warn!(
-            user = %event.sender.login,
-            repo = %event.repository.full_name,
-            %reason,
-            "rejecting unauthorized command"
-        );
-        return webhook_only("unauthorized").await;
-    }
-
-    // head_sha is left empty: only the orchestrator (which holds the App
-    // private key) can hit `GET /repos/{}/pulls/{}` to resolve it. It does
-    // so on job pickup and writes back via JobStore::set_head_sha.
-    let new = NewJob {
-        repository: event
-            .repository
-            .full_name
-            .clone(),
-        pr_number: event.issue.number,
-        head_sha: String::new(),
-        requested_by: event.sender.login.clone(),
-        command: command
-            .subcommand
-            .unwrap_or_else(|| "default".into()),
-        args: serde_json::json!({ "args": command.args }),
-        installation_id: event.installation.id,
-        github_delivery_id: Some(delivery_id.to_string()),
-    };
-
-    match state
-        .ingest
-        .ingest_webhook_and_job(webhook, &new)
-        .await
-    {
-        Ok(IngestOutcome::Recorded { job_id: Some(_), .. }) => {
-            (StatusCode::OK, "queued").into_response()
-        }
-        Ok(IngestOutcome::Recorded { job_id: None, .. }) => {
-            // Webhook recorded; legacy job conflict-skipped (delivery
-            // already existed in `jobs` from before slice 1). Treat as
-            // success for GH (no retry needed).
-            tracing::info!(
-                delivery = %delivery_id,
-                "webhook recorded but legacy job already existed for this delivery"
-            );
-            (StatusCode::OK, "recorded").into_response()
-        }
-        Ok(IngestOutcome::Duplicate) => {
-            tracing::info!(
-                delivery = %delivery_id,
-                repo = %event.repository.full_name,
-                pr = event.issue.number,
-                "duplicate webhook delivery"
-            );
-            (StatusCode::OK, "duplicate").into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to ingest webhook + job");
-            (StatusCode::INTERNAL_SERVER_ERROR, "ingest error").into_response()
-        }
-    }
-}
-
-fn authorized(cfg: &AuthorizationConfig, event: &IssueCommentEvent) -> Result<(), &'static str> {
-    if !cfg
-        .allowed_repositories
-        .is_empty()
-        && !cfg
-            .allowed_repositories
-            .contains(&event.repository.full_name)
-    {
-        return Err("repo not in allowlist");
-    }
-    if cfg
-        .allowed_users
-        .contains(&event.sender.login)
-    {
-        return Ok(());
-    }
-    if cfg
-        .allowed_associations
-        .contains(
-            &event
-                .comment
-                .author_association,
-        )
-    {
-        return Ok(());
-    }
-    Err("user not in allowlist and association not permitted")
 }

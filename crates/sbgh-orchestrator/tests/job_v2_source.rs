@@ -9,10 +9,12 @@ use std::io::Write;
 use std::sync::Arc;
 
 use sbgh_core::db::{
-    JobCreationOutcome, JobV2Store, Pool, PostgresJobV2Store, PostgresRepoStore, setup_pg,
+    JobCreationOutcome, JobV2Store, Pool, PostgresJobV2Store, PostgresPullRequestStore,
+    PostgresRepoStore, setup_pg,
 };
 use sbgh_core::models::{
-    GitRefKind, JobCreationRequest, JobKind, NewJobV2, QueuedEventDetail, TriggerKind,
+    GitRefKind, JobCreationRequest, JobKind, NewJobV2, NewPullRequestLink, QueuedEventDetail,
+    TriggerKind,
 };
 
 // Orchestrator is a bin-only crate; pull in the modules under test via
@@ -110,7 +112,11 @@ async fn v2_source_claims_assembles_and_completes_with_metric_and_result() {
     let store = Arc::new(PostgresJobV2Store::new(pool.clone()));
     enqueue_branch_push(&store, webhook_id).await;
 
-    let source = JobV2Source::new(store.clone(), Arc::new(PostgresRepoStore::new(pool.clone())));
+    let source = JobV2Source::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+    );
 
     // Claim assembles the execution view from across the schema.
     let job = source
@@ -210,7 +216,11 @@ async fn v2_source_fail_records_event_and_forensics_result() {
     let webhook_id = seed(&pool, 100, 10).await;
     let store = Arc::new(PostgresJobV2Store::new(pool.clone()));
     enqueue_branch_push(&store, webhook_id).await;
-    let source = JobV2Source::new(store.clone(), Arc::new(PostgresRepoStore::new(pool.clone())));
+    let source = JobV2Source::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+    );
 
     let job = source
         .claim_next()
@@ -267,7 +277,11 @@ async fn v2_source_sweeps_stuck_claimed_jobs() {
     let webhook_id = seed(&pool, 100, 10).await;
     let store = Arc::new(PostgresJobV2Store::new(pool.clone()));
     enqueue_branch_push(&store, webhook_id).await;
-    let source = JobV2Source::new(store.clone(), Arc::new(PostgresRepoStore::new(pool.clone())));
+    let source = JobV2Source::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+    );
 
     // Claim → claimed, then simulate a crash by NOT calling start_running
     // and backdating claimed_at past the lease.
@@ -294,4 +308,118 @@ async fn v2_source_sweeps_stuck_claimed_jobs() {
         .await
         .unwrap();
     assert_eq!(status, "queued", "swept back to queued for re-claim");
+}
+
+#[tokio::test]
+async fn v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id() {
+    // Slice 11: a `pr_comment` job carries a PR link, so claim_next must
+    // assemble `PullRequestComment { pr_number, .. }` (resolved via
+    // PullRequestStore) — not LogOnly. set_comment_id records a
+    // `comment_posted` event; a re-claim reads that id back so the job
+    // edits the existing comment instead of double-posting.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    let webhook_id = seed(&pool, 100, 10).await;
+    let store = Arc::new(PostgresJobV2Store::new(pool.clone()));
+
+    // Author + PR row (the PR link's FK target).
+    sqlx::query("INSERT INTO github_user (id, login, user_type) VALUES (42, 'alice', 'user')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pr_id: i64 = sqlx::query_scalar(
+        "INSERT INTO github_pull_request (target_github_repo_id, source_github_repo_id, \
+         pr_number, title, author_github_user_id) VALUES (10, 10, 7, 't', 42) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // A pr_comment job linked to that PR.
+    let created = store
+        .create_job_with_links(&JobCreationRequest {
+            new_job: NewJobV2 {
+                github_installation_id: 100,
+                github_repo_id: 10,
+                job_kind: JobKind::AdHoc,
+                trigger_kind: TriggerKind::PrComment,
+                git_ref_kind: GitRefKind::Branch,
+                git_ref_display: "feat".into(),
+                git_commit_hash: Some("headsha".into()),
+                git_committed_at: None,
+            },
+            github_webhook_id: webhook_id,
+            triggering_user_id: Some(42),
+            pull_request_link: Some(NewPullRequestLink {
+                github_pull_request_id: pr_id,
+                triggering_comment_id: Some(9001),
+            }),
+            queued_event_detail: None,
+        })
+        .await
+        .unwrap();
+    let JobCreationOutcome::Created(created) = created else {
+        panic!("expected Created");
+    };
+    let job_id = created.job.id;
+
+    let source = JobV2Source::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+    );
+
+    // Claim assembles PR progress (pr_number=7, no comment yet).
+    let job = source
+        .claim_next()
+        .await
+        .unwrap()
+        .unwrap();
+    match job.progress {
+        ProgressTarget::PullRequestComment { pr_number, comment_id } => {
+            assert_eq!(pr_number, 7, "pr_number resolved from the PR link");
+            assert!(comment_id.is_none(), "no comment posted yet on first claim");
+        }
+        ProgressTarget::LogOnly => {
+            panic!("pr_comment job must assemble PullRequestComment progress")
+        }
+    }
+
+    // Record the posted comment id → a comment_posted event lands.
+    source
+        .set_comment_id(&job, 555)
+        .await
+        .unwrap();
+    let recorded: i64 = sqlx::query_scalar(
+        "SELECT github_comment_id FROM job_event WHERE job_id = $1 AND event_kind = \
+         'comment_posted'",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recorded, 555);
+
+    // Simulate a re-claim: sweep the (still-claimed) job back to queued,
+    // then claim again — the recorded comment id must be read back so the
+    // job edits rather than re-posts.
+    sqlx::query(
+        "UPDATE job SET status = 'queued', claim_token = NULL, claimed_at = NULL WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let reclaimed = source
+        .claim_next()
+        .await
+        .unwrap()
+        .unwrap();
+    match reclaimed.progress {
+        ProgressTarget::PullRequestComment { comment_id, .. } => {
+            assert_eq!(comment_id, Some(555), "re-claim reads back the posted comment id");
+        }
+        ProgressTarget::LogOnly => panic!("expected PullRequestComment on re-claim"),
+    }
 }

@@ -107,35 +107,30 @@ async fn main() -> anyhow::Result<()> {
             policy_store.clone(),
             installation_store.clone(),
             user_store,
-            pull_request_store,
+            pull_request_store.clone(),
         )))
         .with_handler(Arc::new(PushHandler::new(
             policy_store.clone(),
             installation_store.clone(),
             job_v2_store.clone(),
         )))
-        .with_handler(Arc::new(CreateHandler::new(
-            policy_store,
-            installation_store,
-            job_v2_store.clone(),
-        )))
+        .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store)))
         .build();
     let processor =
         WebhookProcessor::new(webhook_inbox, Arc::new(classifier), ProcessorConfig::default());
 
-    // Slice 10: select the runner's queue backend. Production defaults to
-    // `legacy`; `v2` claims from the new `job` family (staging / cutover).
+    // Select the runner's queue backend (slice 10 abstraction; slice 11
+    // cutover made `v2` the default). `v2` claims from the new `job`
+    // family and posts PR comments for `pr_comment` jobs; `legacy` is
+    // retained as an escape hatch until slice 12 drops it.
     let runnable_jobs: Arc<dyn RunnableJobStore> = match config.jobs.source {
         JobSource::Legacy => {
             tracing::info!("runner claiming from legacy `jobs` table");
             Arc::new(LegacyJobSource::new(legacy_jobs))
         }
         JobSource::V2 => {
-            tracing::warn!(
-                "runner claiming from new `job` family (slice 10 V2 source); progress is log-only \
-                 until slice 11"
-            );
-            Arc::new(JobV2Source::new(job_v2_store, repo_store))
+            tracing::info!("runner claiming from new `job` family (v2)");
+            Arc::new(JobV2Source::new(job_v2_store, repo_store, pull_request_store))
         }
     };
 

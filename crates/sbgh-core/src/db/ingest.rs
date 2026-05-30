@@ -1,10 +1,11 @@
 //! `IngestStore` — the boundary the handler uses to record an inbound
-//! webhook (and, for `/benchmark` from authorized users, atomically also
-//! enqueue a legacy `jobs` row).
+//! webhook into the inbox.
 //!
-//! Distinct from `JobStore`: `IngestStore` owns the dual-write
-//! transaction that slice 1 introduces. The orchestrator still uses
-//! `JobStore` for queue claim/transition operations.
+//! Since the slice 11 cutover the handler is inbox-only and only ever
+//! calls `ingest_webhook`. The `ingest_webhook_and_job` dual-write
+//! (slice 1's `/benchmark` → legacy `jobs` path) is retained on the
+//! trait until slice 12 removes the legacy table, but no production
+//! caller uses it any more.
 
 use async_trait::async_trait;
 use serde_json::Value;

@@ -394,11 +394,16 @@ impl JobV2Store for InMemoryJobV2Store {
     }
 
     async fn fail_job(&self, failure: &JobFailure) -> Result<bool> {
+        // `fail_job` accepts `claimed` OR `running` (a job can fail
+        // before it starts — preflight resolution / comment posting),
+        // unlike `complete_job` which is running-only. This is what lets
+        // a persistent preflight failure terminalize instead of looping
+        // via the stuck-claim sweep.
         let mut s = self.state.lock().unwrap();
         match s.jobs.get(&failure.job_id) {
             Some(j)
-                if j.status == JobStatus::Running && j.claim_token == Some(failure.claim_token) => {
-            }
+                if matches!(j.status, JobStatus::Claimed | JobStatus::Running)
+                    && j.claim_token == Some(failure.claim_token) => {}
             _ => return Ok(false),
         }
         let now = Utc::now();
@@ -437,6 +442,34 @@ impl JobV2Store for InMemoryJobV2Store {
             .iter()
             .find(|e| e.job_id == job_id && e.event_kind == JobEventKind::Queued)
             .cloned())
+    }
+
+    async fn pull_request_link(&self, job_id: Uuid) -> Result<Option<GithubPullRequestJob>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .pr_links
+            .iter()
+            .find(|l| l.job_id == job_id)
+            .cloned())
+    }
+
+    async fn latest_comment_id(&self, job_id: Uuid) -> Result<Option<i64>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.events
+            .iter()
+            .filter(|e| {
+                e.job_id == job_id
+                    && e.github_comment_id.is_some()
+                    && matches!(
+                        e.event_kind,
+                        JobEventKind::CommentPosted | JobEventKind::CommentUpdated
+                    )
+            })
+            // Highest event id == most recent (monotonic counter).
+            .max_by_key(|e| e.id)
+            .and_then(|e| e.github_comment_id))
     }
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {

@@ -11,10 +11,10 @@
 //! orchestrator never run with owner credentials — they each connect as their
 //! own narrow role:
 //!
-//! - `sbgh_handler` → INSERT on a small set of jobs/inbox columns + SELECT on
-//!   the columns required for `INSERT ... ON CONFLICT ... RETURNING`. No read
-//!   access to head_sha / args / payload / status, no way to fabricate a
-//!   completed/processed row.
+//! - `sbgh_handler` → inbox-only (since the slice 11 cutover): INSERT on a
+//!   small set of `github_webhook` columns + SELECT on the columns required for
+//!   `INSERT ... ON CONFLICT ... RETURNING`. NO access to legacy `jobs`, no
+//!   read access to payload / status, no way to fabricate a processed row.
 //! - `sbgh_orch` → SELECT + UPDATE on the full `jobs` and `github_webhook`
 //!   tables; SELECT + INSERT/UPDATE on the identity/policy tables it owns.
 //!

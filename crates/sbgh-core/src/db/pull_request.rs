@@ -58,6 +58,12 @@ pub trait PullRequestStore: Send + Sync + 'static {
         pr_number: i32,
     ) -> Result<Option<GithubPullRequest>>;
 
+    /// Look up a PR by its surrogate `id`. Slice 11 uses this from the
+    /// orchestrator to resolve `pr_number` for a `github_pull_request_job`
+    /// link (which carries `github_pull_request_id`, not the number) so
+    /// the new-schema runner can post/edit the PR comment.
+    async fn lookup_by_id(&self, id: i64) -> Result<Option<GithubPullRequest>>;
+
     /// Set or clear `closed_at`:
     ///   - `Some(ts)` on `pull_request.closed` (idempotent: setting an
     ///     already-closed row updates the timestamp to the new value, which

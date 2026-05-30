@@ -996,3 +996,46 @@ async fn fail_job_writes_status_result_and_event() {
         .unwrap();
     assert_eq!(result_count, 1);
 }
+
+#[tokio::test]
+async fn fail_job_terminalizes_a_claimed_job_not_yet_running() {
+    // Slice 11 review fix (High): a preflight failure (PR-head-SHA / tag
+    // resolution / comment posting) happens while the job is still
+    // `claimed`. fail_job must terminalize it — otherwise the stuck-claim
+    // sweep would requeue it and the failure would loop forever.
+    let Some((_c, pool)) = setup_pg().await else {
+        return;
+    };
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobV2Store::new(pool.clone());
+    store
+        .insert_job(&make_new_job(100, 10))
+        .await
+        .unwrap();
+    let token = Uuid::new_v4();
+    let claimed = store
+        .claim_next_queued(token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.status, JobStatus::Claimed);
+
+    // No mark_running — fail straight from `claimed`.
+    let ok = store
+        .fail_job(&JobFailure {
+            job_id: claimed.id,
+            claim_token: token,
+            result: None,
+            remark: "preflight: PR head SHA resolution failed".into(),
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+    assert!(ok, "fail_job must terminalize a claimed job");
+    let row = store
+        .lookup_job(claimed.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, JobStatus::Failed);
+}

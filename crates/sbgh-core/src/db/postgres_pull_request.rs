@@ -74,6 +74,21 @@ impl PullRequestStore for PostgresPullRequestStore {
         Ok(row)
     }
 
+    async fn lookup_by_id(&self, id: i64) -> Result<Option<GithubPullRequest>> {
+        let row = sqlx::query_as::<_, GithubPullRequest>(
+            r#"
+            SELECT id, target_github_repo_id, source_github_repo_id, pr_number,
+                   title, author_github_user_id, closed_at, created_at, updated_at
+              FROM github_pull_request
+             WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     async fn set_closed_at(
         &self,
         target_github_repo_id: i64,

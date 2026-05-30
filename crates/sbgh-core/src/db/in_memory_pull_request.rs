@@ -100,6 +100,17 @@ impl PullRequestStore for InMemoryPullRequestStore {
             .cloned())
     }
 
+    async fn lookup_by_id(&self, id: i64) -> Result<Option<GithubPullRequest>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .by_key
+            .values()
+            .find(|pr| pr.id == id)
+            .cloned())
+    }
+
     async fn set_closed_at(
         &self,
         target_github_repo_id: i64,

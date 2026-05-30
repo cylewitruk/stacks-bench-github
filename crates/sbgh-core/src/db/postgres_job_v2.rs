@@ -397,10 +397,17 @@ impl JobV2Store for PostgresJobV2Store {
     }
 
     async fn fail_job(&self, failure: &JobFailure) -> Result<bool> {
+        // Unlike `complete_job` (running-only — you can't complete a job
+        // that never ran), `fail_job` accepts `claimed` OR `running`: a
+        // job can fail BEFORE it starts running (e.g. preflight: PR head
+        // SHA / tag commit resolution or initial comment posting fails).
+        // Terminalizing a `claimed` job is what keeps a persistent
+        // preflight failure from looping forever via the stuck-claim
+        // sweep (claimed → requeued → re-claimed → fails again → ...).
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE job SET status = 'failed'
-             WHERE id = $1 AND claim_token = $2 AND status = 'running'",
+             WHERE id = $1 AND claim_token = $2 AND status IN ('claimed', 'running')",
         )
         .bind(failure.job_id)
         .bind(failure.claim_token)
@@ -453,6 +460,38 @@ impl JobV2Store for PostgresJobV2Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    async fn pull_request_link(&self, job_id: Uuid) -> Result<Option<GithubPullRequestJob>> {
+        let row = sqlx::query_as::<_, GithubPullRequestJob>(
+            "SELECT job_id, github_pull_request_id, triggering_comment_id, created_at
+               FROM github_pull_request_job
+              WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn latest_comment_id(&self, job_id: Uuid) -> Result<Option<i64>> {
+        // Most recent comment-bearing event for the job. The github
+        // comment id is stable across edits, so MAX(occurred_at) picks
+        // the live comment regardless of how many edit events exist.
+        let id: Option<i64> = sqlx::query_scalar(
+            "SELECT github_comment_id
+               FROM job_event
+              WHERE job_id = $1
+                AND github_comment_id IS NOT NULL
+                AND event_kind IN ('comment_posted', 'comment_updated')
+           ORDER BY occurred_at DESC, id DESC
+              LIMIT 1",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(id)
     }
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {

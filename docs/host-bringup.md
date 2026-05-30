@@ -362,7 +362,7 @@ image).
 | DB role | Holds password | Grants | Used by |
 | ---- | ---- | ---- | ---- |
 | `sbgh` | `POSTGRES_OWNER_PASSWORD` | full ownership of the `sbgh` database | `sbgh-cli migrate` one-shot + `sbgh-cli installer ...` admin |
-| `sbgh_handler` | `SBGH_HANDLER_DB_PASSWORD` | `USAGE` on schema, `INSERT` on `jobs`/`github_webhook` (column-level) | handler container |
+| `sbgh_handler` | `SBGH_HANDLER_DB_PASSWORD` | `USAGE` on schema, column-level `INSERT` on `github_webhook` (inbox-only since the slice 11 cutover — no access to legacy `jobs`) | handler container |
 | `sbgh_orch` | `SBGH_ORCH_DB_PASSWORD` | `USAGE` on schema, `SELECT`/`UPDATE` on `jobs`/`github_webhook`; `SELECT` on `allowed_installer`; CRUD on `github_installation` | host orchestrator |
 
 Roles + grants are (re)applied on every `docker compose up` by the
@@ -529,7 +529,7 @@ Either way, successful boot logs:
 INFO sbgh_orchestrator: orchestrator started
 ```
 
-It'll sit there polling the queue every 5 seconds. The handler in Docker writes jobs to the same Postgres; the orchestrator on the host picks them up.
+It'll sit there polling the queue every 5 seconds. The handler in Docker records webhooks into the same Postgres inbox; the orchestrator on the host processes them — the processor creates `job` rows from the inbox and the runner picks them up.
 
 ## 7. First real run
 

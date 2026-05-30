@@ -767,8 +767,8 @@ Slice 10's `JobStore::claim_next` + `JobStore::mark_running` + stuck-claim sweep
 
 - [x] Initial implementation completed
 - [x] Integration coverage added (or N/A justified)
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice)
 
 **Todo's:**
 
@@ -805,10 +805,10 @@ Slice 10's `JobStore::claim_next` + `JobStore::mark_running` + stuck-claim sweep
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
-- [ ] Review in progress (with Codex)
-- [ ] Complete (ready for next slice)
+- [x] Initial implementation completed (code-prep; operator deploy is manual)
+- [x] Integration coverage added (or N/A justified)
+- [x] Review in progress (with Codex)
+- [x] Complete (ready for next slice) — code-prep complete + reviewed; the cutover DEPLOY (run cleanup script, ship, run a `/benchmark`, verify rows) is the manual operator step.
 
 **Todo's:**
 
@@ -824,7 +824,31 @@ Slice 10's `JobStore::claim_next` + `JobStore::mark_running` + stuck-claim sweep
 
 **Implementation notes/deviations:**
 
-(Include any specific implementation notes, deviations, deferrals, findings important for future phases/slices, etc. If none, just write "None").
+- **Approach change: "go for it", no clean-cutover ceremony.** Per the operator's call, we scrapped the staged validation (1a/b/c — controlled-staging `/benchmark`, saved-webhook replay, drain verification) and quiet-window choreography. The fallback is a git revert of the cutover commit, not a runbook. So this slice is the **code-prep** that makes the new `v2` pipeline the live path; the actual deploy + cleanup-script run are manual operator steps.
+- **`v2` is now the default backend.** `[jobs].source` defaults to `v2` (was `legacy`); `legacy` stays selectable as an escape hatch until slice 12. Flipping the *default* (a code change) means the next develop-push deploy makes the cutover live and a commit revert rolls it back. (`config.rs` default + test `orchestrator_jobs_source_defaults_to_v2`; example config updated.)
+- **New-schema PR-comment posting (the core gap slice 10 deferred).** `JobV2Source::claim_next` now assembles `ProgressTarget::PullRequestComment { pr_number, comment_id }` for `pr_comment` jobs (PR number resolved via the new `PullRequestStore::lookup_by_id` from the `github_pull_request_job` link) — baseline jobs stay `LogOnly`. The new schema has no `comment_id` column, so `set_comment_id` records a `comment_posted` `job_event` carrying `github_comment_id`; `claim_next` reads the latest one back (new `JobV2Store::latest_comment_id`) so a job reclaimed after the comment was posted EDITS it instead of double-posting. The existing runner preflight/reporter/listener then post + edit the comment unchanged (they already key off `PullRequestComment`).
+- **New `JobV2Store` reads:** `pull_request_link` + `latest_comment_id`; new `PullRequestStore::lookup_by_id`. Both store impls mirror each other. `JobV2Source` gained a `PullRequestStore` dependency (wired in `main.rs`).
+- **Empty-commit guard.** A job that reaches execution with no resolved commit (only `tag_created` — its claim-time tag→commit resolution is still deferred, see below) is failed terminally AFTER `start_running` (so the `running`-guarded `fail_job` records a terminal state) with a clear message, rather than handing the driver an empty SHA or looping via the stuck-claim sweep. `pr_comment` (head SHA at enqueue) and `branch_push` (push `head_commit`) are pre-resolved, so the guard never trips for them.
+- **Cleanup script committed:** `scripts/pre-cutover-cleanup.sql` (`TRUNCATE job CASCADE; TRUNCATE github_webhook CASCADE;` + preserved-tables note). The operator runs it once during the cutover.
+- **DEFERRED (flagged):** (NOTE: the first two below were revised by the Codex review — see "Codex review fixes" — handler inbox-only landed in this slice, and `tag_created` job creation is now gated off rather than left to fail.)
+  - ~~Handler inbox-only → slice 12~~ — **done in this slice** (review fix; the "harmless dual-write" reasoning didn't hold for rollback safety).
+  - **`tag_created` claim-time commit resolution.** Needs a GH "resolve ref → commit + date" API call. Until it lands, tag job creation is **gated off** (`CreateHandler` → `WouldEnqueueJob`, no job — review fix), so no failed tag jobs. `pr_comment` + `branch_push` (the configured flows) are unaffected.
+  - **Intermediate phase `job_event` timeline** (provision/build/bench) — observability only; phase changes are logged. Carried over from slice 10.
+- **Operator steps (manual, not in this commit):** run `scripts/pre-cutover-cleanup.sql` against prod, deploy, confirm `[jobs].source` resolves to `v2`, run a `/benchmark`, eyeball the `job`/`job_event`/`job_result`/`job_metric` rows + the PR comment.
+- **Tests:** `v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id` (claim assembles `PullRequestComment` with the resolved `pr_number`; `set_comment_id` writes a `comment_posted` event; re-claim reads the id back); `PullRequestStore::lookup_by_id` + the new `JobV2Store` reads exercised through it; config default flipped test. Existing `JobV2Source` integration tests updated for the 3-arg constructor.
+- **Verification:** `just build` clean, `just lint` clean, `just test --summary` 562/562 (561 → 562; +1 `v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id`).
+- **Codex review fixes (round 1):**
+  - **High — legacy dual-write made rollback unsafe.** I'd deferred handler inbox-only as "harmless," but Codex correctly noted: with `v2` default, the handler still writing legacy `jobs` means those rows accumulate, and a rollback to `legacy` (or `[jobs].source = "legacy"`) would have the legacy runner consume post-cutover jobs → re-run benchmarks / duplicate comments. **Fix: landed handler inbox-only now.** The handler records every supported event (incl. `issue_comment`) via `ingest_webhook` and nothing else — no `/benchmark` parse, no authz allowlist, no legacy `jobs` write (the processor owns all of that). `handle_issue_comment` + `authorized` removed; handler integration tests rewritten to pin "records webhook only, never a legacy job."
+  - **High — v2 preflight failures could loop forever.** Preflight errors (PR head SHA / comment posting) call `jobs.fail` while the job is still `claimed`, but `fail_job` required `status='running'` → no-op → stuck-claim sweep requeues → repeats indefinitely. **Fix: `fail_job` now terminalizes `claimed` OR `running`** (a job can fail before it starts; `complete_job` stays running-only — you can't complete a job that never ran). Both store impls + a `fail_job_terminalizes_a_claimed_job_not_yet_running` test. This is the general fix — any pre-`start_running` preflight failure now terminalizes cleanly instead of looping.
+  - **Medium — `tag_created` jobs were live but guaranteed to fail.** With `v2` default and tag→commit resolution unimplemented, an enabled tag trigger would produce a failed job (the `create` event carries no SHA). **Fix (per Codex's "keep observational" option): gated `tag_created` job creation OFF.** `CreateHandler` now terminates a matched tag as `WouldEnqueueJob` (matched/accepted, NO job) and dropped its `job_store` dep; the job-creating path returns when claim-time tag resolution lands. `pr_comment` (head SHA at enqueue) + `branch_push` (push `head_commit`) are unaffected. Slice-9 tag unit + e2e tests updated to assert `WouldEnqueueJob` + zero jobs. The runner's empty-commit guard is now pure defense (no v2 job reaches execution without a commit).
+  - **Low — stale comments.** Fixed: `config.rs` (`jobs` field said "defaults to legacy"), `progress.rs` (LogOnly "deferred to slice 11"), `job_source.rs` (module/`RunnableJob.commit`/`LegacyJobSource` "production default" / "tag jobs resolve at claim"), runner preflight/guard wording.
+- **Verification after review fixes:** `just lint` clean, `just test --summary` 560/560 (562 → 560: handler dual-write tests collapsed into inbox-only tests, and the tag-enqueue tests folded into observational ones; net −2). (Same `setup_pg` testcontainers startup flake as prior slices can fail one Postgres test under full-suite concurrency; passes on re-run.)
+- **Codex review fixes (round 2):**
+  - **High — handler DB grants still allowed legacy `jobs` INSERT.** The round-1 inbox-only fix was code-only; the `sbgh_handler` role still had column-level `INSERT`/`SELECT` on `jobs`, so a compromised handler could still enqueue legacy jobs (and the rollback hazard survived at the privilege boundary). **Fix:** `apply_roles` now does `REVOKE ALL ON TABLE jobs FROM sbgh_handler` with no re-grant. The three handler-`jobs` grants tests collapsed into one `handler_cannot_touch_legacy_jobs` (INSERT + SELECT both rejected). `sbgh_orch` keeps `SELECT`/`UPDATE` on `jobs` (legacy escape hatch until slice 12).
+  - **Low — stale docs.** `state.rs` (handler "atomically enqueues legacy jobs"), the `apply_roles` jobs-grant comment, and `host-bringup.md`'s role/grant table all updated to inbox-only.
+  - Test count 560 → 558 (−2 from the grants test consolidation).
+- **Verification after round 2:** `just lint` clean, `just test --summary` 558/558.
+- **Codex review fixes (round 3):** doc-drift cleanup only (no behavior change, no blocking findings) — `ingest.rs` (IngestStore "dual-write" doc), `sbgh-cli/src/main.rs` (handler "jobs/inbox columns" role doc), `host-bringup.md` ("handler writes jobs"), and `architecture.md` (overview line, data-flow diagram, handler per-request steps + a top-of-file Phase-2 note; the rest of that doc is a Phase-1 snapshot being migrated incrementally). `just lint` clean.
 
 ##### Slice 12: Legacy Removal
 

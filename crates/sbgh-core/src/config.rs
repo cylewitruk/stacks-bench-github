@@ -160,9 +160,9 @@ pub struct OrchestratorConfig {
     pub paths: PathsConfig,
     pub lvm: LvmConfig,
     pub stacks_bench: StacksBenchConfig,
-    /// Slice 10: which job queue the orchestrator claims from. Defaults
-    /// to `legacy`; the new `job` family becomes the production source at
-    /// the slice 11 cutover.
+    /// Which job queue the orchestrator claims from. Defaults to `v2`
+    /// (the new `job` family) since the slice 11 cutover; `legacy` stays
+    /// selectable as an escape hatch until slice 12.
     pub jobs: JobsConfig,
 }
 
@@ -175,10 +175,11 @@ pub struct JobsConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobSource {
-    /// Legacy `jobs` table (production default through slice 10).
+    /// Legacy `jobs` table. Retained as an escape hatch post-cutover
+    /// until slice 12 removes it.
     Legacy,
-    /// New-schema `job` family (slice 8/9). Selectable for staging /
-    /// the slice 11 cutover; not the production default yet.
+    /// New-schema `job` family (slice 8/9). The production default since
+    /// the slice 11 cutover.
     V2,
 }
 
@@ -665,15 +666,16 @@ impl RawOrchestrator {
                     .unwrap_or_default(),
             },
             jobs: JobsConfig {
-                // Default to the legacy queue; an invalid value is a hard
-                // error rather than a silent fallback (a typo here would
-                // otherwise quietly keep the orchestrator on the wrong
-                // backend across the cutover).
+                // Slice 11 cutover: default to the new `v2` queue. An
+                // invalid value is a hard error rather than a silent
+                // fallback (a typo must not quietly send the orchestrator
+                // to the wrong backend). `legacy` remains selectable as
+                // an escape hatch until slice 12 drops it.
                 source: match self.jobs.source {
                     Some(s) => s
                         .parse()
                         .map_err(|e: String| Error::Config(format!("[jobs].source: {e}")))?,
-                    None => JobSource::Legacy,
+                    None => JobSource::V2,
                 },
             },
         })
@@ -931,19 +933,20 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_jobs_source_defaults_to_legacy() {
+    fn orchestrator_jobs_source_defaults_to_v2() {
+        // Slice 11 cutover flipped the default from legacy to v2.
         let _g = EnvGuard::set(&orch_env());
         let cfg = OrchestratorConfig::load_layered(None).unwrap();
-        assert_eq!(cfg.jobs.source, JobSource::Legacy);
+        assert_eq!(cfg.jobs.source, JobSource::V2);
     }
 
     #[test]
-    fn orchestrator_jobs_source_v2_via_env() {
+    fn orchestrator_jobs_source_legacy_via_env() {
         let mut env = orch_env();
-        env.push(("SBGH_JOBS_SOURCE", "v2"));
+        env.push(("SBGH_JOBS_SOURCE", "legacy"));
         let _g = EnvGuard::set(&env);
         let cfg = OrchestratorConfig::load_layered(None).unwrap();
-        assert_eq!(cfg.jobs.source, JobSource::V2);
+        assert_eq!(cfg.jobs.source, JobSource::Legacy);
     }
 
     #[test]

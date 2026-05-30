@@ -114,11 +114,11 @@ chainstate_base_prefix = "mainnet-"
 default_args = "--start-at 7800000 --count 5000 --warmup 1000 --no-profiler-kv --bench-spans-only"
 
 [jobs]
-# Which queue the orchestrator's runner claims from (slice 10):
-#   "legacy" (default) — the original `jobs` table.
-#   "v2"               — the new `job` family (slices 8/9). Selectable for
-#                        staging / the slice 11 cutover. NOTE: new-schema
-#                        progress is currently log + job_event timeline
-#                        only (no PR comment) until slice 11.
+# Which queue the orchestrator's runner claims from:
+#   "v2" (default) — the new `job` family (slices 8/9): the processor
+#                    creates jobs from the webhook inbox and the
+#                    orchestrator posts PR comments for /benchmark jobs.
+#   "legacy"       — the original `jobs` table. Escape hatch retained
+#                    until slice 12 removes the legacy path.
 # An invalid value is a hard error (no silent fallback). Env: SBGH_JOBS_SOURCE.
-source = "legacy"
+source = "v2"

@@ -87,11 +87,12 @@ impl<'a> ProgressReporter<'a> {
                 tracing::warn!(job_id = %self.job.id, "no comment id; skipping update");
                 Ok(())
             }
-            // Slice 10: new-schema jobs report progress to logs only —
-            // no GitHub comment, and no intermediate phase `job_event`
-            // rows yet (both deferred to slice 11). The queued + terminal
-            // events are still persisted elsewhere. Log at debug so it's
-            // visible without being noisy.
+            // New-schema BASELINE jobs (branch_push) have no PR, so
+            // progress goes to logs only — no comment, and no intermediate
+            // phase `job_event` rows yet (that timeline is still deferred).
+            // The queued + terminal events are persisted elsewhere.
+            // (PR-comment jobs take the branch above; comment posting for
+            // those landed in the slice 11 cutover.)
             ProgressTarget::LogOnly => {
                 tracing::debug!(job_id = %self.job.id, body, "progress (log-only)");
                 Ok(())

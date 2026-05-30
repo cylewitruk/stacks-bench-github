@@ -1,5 +1,14 @@
 # Architecture
 
+> **Note (Phase 2 cutover):** parts of this document describe the original
+> Phase-1 flow (handler writes directly to a legacy `jobs` table). Since the
+> slice 11 cutover the handler is **inbox-only** — it records webhooks into
+> `github_webhook`, and the orchestrator's **processor** classifies/authorizes
+> them and creates new-schema `job` rows that the runner executes. The legacy
+> `jobs` path is retired (removed in slice 12). The sections below are being
+> migrated to the new model; where they still say "handler enqueues a job",
+> read "handler records a webhook; the processor creates the job."
+
 ## Overview
 
 `stacks-bench-github` is a GitHub App that runs the [`stacks-bench`](https://github.com/cylewitruk/stacks-core/tree/feat/stacks-bench/stacks-bench) tool against pull requests, either automatically or in response to `/benchmark` slash-commands posted in PR comments.
@@ -9,8 +18,8 @@ The system is split into two Rust binaries plus a shared library, all in a singl
 ```text
 crates/
   sbgh-core/         shared library: config, db, github (auth/client/webhook/command), models, error
-  sbgh-handler/      axum HTTP server that receives GitHub webhooks and enqueues jobs
-  sbgh-orchestrator/ long-running worker that dequeues and executes jobs in libvirt VMs
+  sbgh-handler/      axum HTTP server that receives GitHub webhooks and records them to the inbox
+  sbgh-orchestrator/ long-running worker: processes the inbox into jobs, then executes them in libvirt VMs
 ```
 
 A Postgres database (run locally via `docker/docker-compose.yml`) is the only persistent state, and the only IPC between the two services.
@@ -21,21 +30,24 @@ A Postgres database (run locally via `docker/docker-compose.yml`) is the only pe
 PR comment "/benchmark"
         │
         ▼
-GitHub  ──webhook──►  sbgh-handler  ──INSERT──►  Postgres (jobs)
-                          │                          ▲
-                          └──comment "queued #N"─────┤
+GitHub ──webhook──► sbgh-handler ──INSERT──► Postgres (github_webhook inbox)
                                                      │
-                                              SELECT FOR UPDATE
-                                              SKIP LOCKED
+                                              processor: classify +
+                                              authorize + INSERT job
                                                      │
-                                              sbgh-orchestrator
+                                              Postgres (job, queued)
+                                                     │
+                                              runner: claim (FOR UPDATE
+                                              SKIP LOCKED) → run
                                                      │
                                               virsh + VM
                                                      │
-                          ┌──comment "running"───────┤
-                          │                          │
+                          ┌──comment "running"───────┤  (orchestrator posts/
+                          │                          │   edits the PR comment)
                           └──comment "done + result"─┘
 ```
+
+Both the processor and the runner live in `sbgh-orchestrator`.
 
 ## Components
 
@@ -46,17 +58,14 @@ GitHub  ──webhook──►  sbgh-handler  ──INSERT──►  Postgres (j
 | HTTP server | [crates/sbgh-handler/src/main.rs](../crates/sbgh-handler/src/main.rs) |
 | Webhook route | [crates/sbgh-handler/src/routes/webhook.rs](../crates/sbgh-handler/src/routes/webhook.rs) |
 | Signature verify | [crates/sbgh-core/src/github/webhook.rs](../crates/sbgh-core/src/github/webhook.rs) |
-| Command parser | [crates/sbgh-core/src/github/command.rs](../crates/sbgh-core/src/github/command.rs) |
-| Queue insert | [crates/sbgh-core/src/db/jobs.rs](../crates/sbgh-core/src/db/jobs.rs) |
+| Inbox insert | [crates/sbgh-core/src/db/ingest.rs](../crates/sbgh-core/src/db/ingest.rs) |
 
-Per request:
+Per request (inbox-only since the slice 11 cutover):
 
 1. Read raw body (signature is over bytes, not parsed JSON).
 2. Verify `X-Hub-Signature-256` (HMAC-SHA256, constant-time compare).
-3. Dispatch on `X-GitHub-Event`. Currently we act on `issue_comment` events.
-4. Parse the first line of the comment as a `/benchmark` command (strictly anchored at start of line, alphanumeric args only).
-5. Authorize the sender against the repo allowlist and association allowlist.
-6. Insert a job and reply with the queue position. Store the new comment id on the job row so the orchestrator can edit it later.
+3. Drop unsupported event types at the wire (no DB row).
+4. Record a `github_webhook` inbox row and reply 2xx. That's it — no command parsing, no authorization, no job creation. The processor (in the orchestrator) owns command parsing, authorization (DB roles), and job creation from the inbox.
 
 ### `sbgh-orchestrator`
 

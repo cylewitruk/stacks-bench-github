@@ -203,6 +203,19 @@ pub trait JobV2Store: Send + Sync + 'static {
     /// for jobs created via `create_job_with_links`).
     async fn queued_event(&self, job_id: Uuid) -> Result<Option<JobEvent>>;
 
+    /// Slice 11: the PR-subject link for a job, if any. `pr_comment`
+    /// jobs have one (so the orchestrator can post the PR comment);
+    /// baseline jobs don't. Carries `github_pull_request_id` — resolve
+    /// the PR number via `PullRequestStore::lookup_by_id`.
+    async fn pull_request_link(&self, job_id: Uuid) -> Result<Option<GithubPullRequestJob>>;
+
+    /// Slice 11: the most-recent GitHub comment id recorded on the job's
+    /// timeline (a `comment_posted` / `comment_updated` event with a
+    /// non-null `github_comment_id`). The orchestrator reads this on
+    /// (re-)claim so a job reclaimed after the comment was already posted
+    /// EDITS the existing comment instead of posting a duplicate.
+    async fn latest_comment_id(&self, job_id: Uuid) -> Result<Option<i64>>;
+
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 
     async fn record_metric(&self, metric: &JobMetric) -> Result<()>;

@@ -43,7 +43,11 @@ async fn role_pool(owner_pool: &Pool, role: &str, password: &str) -> Pool {
 }
 
 #[tokio::test]
-async fn handler_can_insert_into_jobs_approved_columns() {
+async fn handler_cannot_touch_legacy_jobs() {
+    // Slice 11 cutover: the handler is inbox-only and has NO access to
+    // legacy `jobs` — neither INSERT (can't enqueue a legacy job, even
+    // if compromised; also closes the rollback hazard of flipping back
+    // to the legacy backend) nor SELECT (can't enumerate job content).
     let Some((_c, pool)) = setup_pg().await else {
         return;
     };
@@ -52,8 +56,7 @@ async fn handler_can_insert_into_jobs_approved_columns() {
         .unwrap();
     let handler = handler_pool(&pool).await;
 
-    // INSERT into the columns the grant approves — must succeed.
-    let result = sqlx::query(
+    let insert = sqlx::query(
         "INSERT INTO jobs (repository, pr_number, head_sha, requested_by, command, args, \
          installation_id, github_delivery_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
@@ -67,61 +70,12 @@ async fn handler_can_insert_into_jobs_approved_columns() {
     .bind("grant-test-1")
     .execute(&handler)
     .await;
-    assert!(result.is_ok(), "handler INSERT into approved columns must succeed: {result:?}");
-}
+    assert!(insert.is_err(), "handler INSERT into legacy jobs MUST be rejected; got: {insert:?}");
 
-#[tokio::test]
-async fn handler_cannot_insert_status_column() {
-    // The slice-1 security argument: a compromised handler must NOT
-    // be able to fabricate a status='completed' row with a fake
-    // result blob. The column grant intentionally omits status.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
-    let handler = handler_pool(&pool).await;
-
-    let result = sqlx::query(
-        "INSERT INTO jobs (repository, pr_number, head_sha, requested_by, command, args, \
-         installation_id, github_delivery_id, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
-         'completed')",
-    )
-    .bind("acme/widgets")
-    .bind(1_i64)
-    .bind("")
-    .bind("alice")
-    .bind("run")
-    .bind(serde_json::json!({}))
-    .bind(1_i64)
-    .bind("grant-test-status")
-    .execute(&handler)
-    .await;
-    assert!(
-        result.is_err(),
-        "handler INSERT specifying `status` MUST be rejected (would let a compromised handler \
-         fabricate completed rows); got: {result:?}"
-    );
-}
-
-#[tokio::test]
-async fn handler_cannot_select_jobs_head_sha() {
-    // Handler may SELECT only id + github_delivery_id (needed for
-    // ON CONFLICT RETURNING). Reading head_sha / args / result would
-    // let a compromised handler enumerate other PRs' job content.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
-    let handler = handler_pool(&pool).await;
-
-    let result = sqlx::query("SELECT head_sha FROM jobs LIMIT 1")
+    let select = sqlx::query("SELECT head_sha FROM jobs LIMIT 1")
         .fetch_optional(&handler)
         .await;
-    assert!(result.is_err(), "handler SELECT head_sha MUST be rejected; got: {result:?}");
+    assert!(select.is_err(), "handler SELECT on legacy jobs MUST be rejected; got: {select:?}");
 }
 
 #[tokio::test]
@@ -1260,12 +1214,12 @@ async fn apply_roles_is_idempotent() {
         .await
         .expect("second apply must be idempotent");
 
-    // Smoke: handler can still INSERT into approved columns.
+    // Smoke: the handler's inbox grant survives a second apply (it can
+    // still INSERT a webhook into the approved columns).
     let handler = handler_pool(&pool).await;
     let result = sqlx::query(
-        "INSERT INTO jobs (repository, pr_number, head_sha, requested_by, command, args, \
-         installation_id, github_delivery_id) VALUES ('a/b', 1, 'sha', 'alice', 'run', \
-         '{}'::jsonb, 1, 'idem-1')",
+        "INSERT INTO github_webhook (delivery_id, event_type, payload_size_bytes) VALUES \
+         ('idem-1', 'push', 0)",
     )
     .execute(&handler)
     .await;
