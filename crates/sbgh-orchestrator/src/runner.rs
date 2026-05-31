@@ -121,7 +121,18 @@ impl Runner {
     /// posted comment_id to the in-memory copy before handing it to the
     /// reporter and the driver (both want them populated).
     async fn execute(&self, mut job: RunnableJob) -> anyhow::Result<()> {
-        tracing::info!(job_id = %job.id, repo = %job.repository, "starting job");
+        tracing::info!(
+            job_id = %job.id,
+            repo = %job.repository,
+            git_ref_kind = ?job.git_ref_kind,
+            git_ref = %job.git_ref_display,
+            commit_preresolved = !job.commit.is_empty(),
+            progress = match job.progress {
+                ProgressTarget::PullRequestComment { .. } => "pr_comment",
+                ProgressTarget::LogOnly => "log_only",
+            },
+            "claimed job; starting",
+        );
 
         // Pre-flight: resolve the commit + post the initial PR comment.
         // Returns the commit if newly resolved (so `start_running` can
@@ -144,9 +155,16 @@ impl Runner {
         // Transition to running, persisting the resolved commit. Legacy
         // is already `running` (this just writes the SHA); the new schema
         // does `claimed → running` here.
+        let commit_persisted = resolved_commit.is_some();
         self.jobs
             .start_running(&job, resolved_commit)
             .await?;
+        tracing::info!(
+            job_id = %job.id,
+            commit = %job.commit,
+            commit_persisted,
+            "job running (claimed → running)",
+        );
 
         let reporter = ProgressReporter::new(self.gh.as_ref(), &job);
 
@@ -197,9 +215,16 @@ impl Runner {
 
         match outcome.status {
             OutcomeStatus::Ok => {
+                tracing::info!(
+                    job_id = %job.id,
+                    repo = %job.repository,
+                    commit = %job.commit,
+                    "benchmark completed; persisting result",
+                );
                 self.jobs
                     .complete(&job, &outcome.summary)
                     .await?;
+                tracing::info!(job_id = %job.id, "job result persisted (status=completed)");
                 reporter
                     .completed(&outcome.summary)
                     .await?;
@@ -279,6 +304,12 @@ impl Runner {
                 .gh
                 .pr_head_sha(job.installation_id, &job.repository, pr_number as u64)
                 .await?;
+            tracing::info!(
+                job_id = %job.id,
+                pr_number,
+                sha = %sha,
+                "resolved PR head SHA at claim time",
+            );
             job.commit = sha.clone();
             Some(ResolvedCommit { hash: sha, committed_at: None })
         } else {
@@ -298,10 +329,23 @@ impl Runner {
             self.jobs
                 .set_comment_id(job, posted.id)
                 .await?;
+            tracing::info!(
+                job_id = %job.id,
+                pr_number,
+                comment_id = posted.id,
+                "posted initial PR comment",
+            );
             job.progress = ProgressTarget::PullRequestComment {
                 pr_number,
                 comment_id: Some(posted.id),
             };
+        } else {
+            tracing::debug!(
+                job_id = %job.id,
+                pr_number,
+                comment_id = ?comment_id,
+                "reusing existing PR comment (re-claim)",
+            );
         }
 
         Ok(resolved)

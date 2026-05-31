@@ -52,8 +52,56 @@ async fn main() -> Result<()> {
             }
             Ok(Event::Message(msg)) => {
                 match forward::forward(&client, &args.target, &msg.data).await {
-                    Ok(status) => info!(%status, "forwarded delivery"),
-                    Err(e) => warn!(error = %e, "forward failed"),
+                    Ok(outcome) => {
+                        let m = &outcome.meta;
+                        let status = outcome.status;
+                        let delivery = m
+                            .delivery
+                            .as_deref()
+                            .unwrap_or("-");
+                        let event = m
+                            .event
+                            .as_deref()
+                            .unwrap_or("-");
+                        let hook_id = m
+                            .hook_id
+                            .as_deref()
+                            .unwrap_or("-");
+                        let hook_target_id = m
+                            .hook_target_id
+                            .as_deref()
+                            .unwrap_or("-");
+                        let hook_target_type = m
+                            .hook_target_type
+                            .as_deref()
+                            .unwrap_or("-");
+                        if status.is_success() {
+                            info!(
+                                %status,
+                                delivery,
+                                event,
+                                hook_id,
+                                hook_target_id,
+                                hook_target_type,
+                                "forwarded delivery"
+                            );
+                        } else {
+                            // Forwarded, but the handler rejected it (bad
+                            // signature, missing delivery id, ingest error).
+                            warn!(
+                                %status,
+                                delivery,
+                                event,
+                                hook_id,
+                                hook_target_id,
+                                hook_target_type,
+                                "forwarded delivery rejected by target (non-success status)"
+                            );
+                        }
+                    }
+                    // Couldn't parse the smee payload or reach the target —
+                    // nothing was delivered.
+                    Err(e) => warn!(error = %e, "forward failed (parse or transport error)"),
                 }
             }
             Err(e) => warn!(error = %e, "sse error; auto-reconnecting"),

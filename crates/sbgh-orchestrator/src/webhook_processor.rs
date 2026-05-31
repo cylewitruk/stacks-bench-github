@@ -406,14 +406,14 @@ impl EventHandler for IssueCommentHandler {
                 {
                     Ok(true) => {}
                     Ok(false) => {
-                        tracing::info!(
+                        tracing::warn!(
                             installation_id = install_id,
                             pr_number,
                             sender_id = event.sender.id,
                             sender_login = event.sender.login.as_str(),
                             base_repo_id = pr.base.repo.id,
-                            "issue_comment /benchmark: sender lacks trigger_pr_benchmark role on \
-                             target repo"
+                            "denied /benchmark: sender lacks trigger_pr_benchmark role on target \
+                             repo"
                         );
                         return ClassifyOutcome::Terminal(WebhookOutcome::DeniedUnauthorized);
                     }
@@ -433,9 +433,12 @@ impl EventHandler for IssueCommentHandler {
                         tracing::info!(
                             installation_id = install_id,
                             pr_number,
+                            sender_id = event.sender.id,
+                            sender_login = event.sender.login.as_str(),
                             base_repo_id = pr.base.repo.id,
                             head_repo_id = pr.head.repo.id,
-                            "issue_comment /benchmark: policies accepted — creating job"
+                            "/benchmark authorized: sender has trigger role, target+source \
+                             policies accepted — creating job"
                         );
                         // Slice 9: create the `pr_comment` ad-hoc job.
                         // The benchmark runs against the PR's HEAD; the
@@ -611,7 +614,21 @@ async fn handle_created(
         // schema doesn't distinguish them, and "operator paused this
         // installer" is the same outcome as "operator never approved
         // this installer" from GitHub's perspective.
-        _ => return ClassifyOutcome::Terminal(WebhookOutcome::DeniedInstallAllowlist),
+        other => {
+            tracing::warn!(
+                installation_id = event.installation.id,
+                account_id = event.installation.account.id,
+                account_login = event
+                    .installation
+                    .account
+                    .login
+                    .as_str(),
+                disabled = other.is_some(),
+                "denied installation.created: account not on installer allowlist — `sbgh-cli \
+                 installer allow --login <account>` to approve"
+            );
+            return ClassifyOutcome::Terminal(WebhookOutcome::DeniedInstallAllowlist);
+        }
     };
 
     let new = NewInstallation {
@@ -630,6 +647,17 @@ async fn handle_created(
     {
         return ClassifyOutcome::Retryable(format!("upsert_installation: {e}"));
     }
+    tracing::info!(
+        installation_id = event.installation.id,
+        account_login = event
+            .installation
+            .account
+            .login
+            .as_str(),
+        initial_repos = event.repositories.len(),
+        "installation.created: account approved — installation row upserted, materialising \
+         initial repo memberships"
+    );
 
     // Slice 4 high-finding fix: materialise initial memberships from
     // the payload's `repositories` array. Without this, a fresh install
@@ -946,7 +974,18 @@ async fn materialise_repo_membership(
         .add_or_restore_membership(install_id, summary.id)
         .await
     {
-        Ok(Some(_)) => RepoMembershipOutcome::Added,
+        Ok(Some(_)) => {
+            tracing::info!(
+                installation_id = install_id,
+                repo_id = summary.id,
+                full_name = payload_repo
+                    .full_name
+                    .as_str(),
+                "repo membership materialised: lineage supported — not yet a benchmark target \
+                 (enable target/source policy + grant roles to allow /benchmark)"
+            );
+            RepoMembershipOutcome::Added
+        }
         Ok(None) => RepoMembershipOutcome::InstallationNotActive,
         Err(e) => RepoMembershipOutcome::Retryable(format!(
             "add_or_restore_membership({install_id}, {repo_id}): {e}",
@@ -1129,7 +1168,15 @@ async fn evaluate_pr_policies(
         .await
     {
         Ok(true) => {}
-        Ok(false) => return PolicyEvaluation::DeniedTarget,
+        Ok(false) => {
+            tracing::warn!(
+                install_id,
+                base_repo_id,
+                "policy denied (target): repo membership inactive — revoked, or install deleted / \
+                 suspended"
+            );
+            return PolicyEvaluation::DeniedTarget;
+        }
         Err(e) => return PolicyEvaluation::Retryable(format!("is_membership_active: {e}")),
     }
     let target = match policy_store
@@ -1141,7 +1188,15 @@ async fn evaluate_pr_policies(
     };
     match target {
         Some(t) if t.is_enabled => {}
-        _ => return PolicyEvaluation::DeniedTarget,
+        _ => {
+            tracing::warn!(
+                install_id,
+                base_repo_id,
+                "policy denied (target): target_repo_policy missing or disabled — `sbgh-cli \
+                 policy target allow` to enable"
+            );
+            return PolicyEvaluation::DeniedTarget;
+        }
     }
     let source = match policy_store
         .lookup_source_policy(install_id, source_repo_id)
@@ -1152,7 +1207,15 @@ async fn evaluate_pr_policies(
     };
     match source {
         Some(s) if s.is_enabled => PolicyEvaluation::Accepted,
-        _ => PolicyEvaluation::DeniedSource,
+        _ => {
+            tracing::warn!(
+                install_id,
+                source_repo_id,
+                "policy denied (source): source_repo_policy missing or disabled — `sbgh-cli \
+                 policy source allow` to enable"
+            );
+            PolicyEvaluation::DeniedSource
+        }
     }
 }
 
@@ -1178,11 +1241,17 @@ async fn enqueue_job(job_store: &dyn JobV2Store, request: JobCreationRequest) ->
         .await
     {
         Ok(JobCreationOutcome::Created(created)) => {
+            // The single "delivery X → job Y" breadcrumb: correlate the
+            // source webhook to the created job + its routing keys.
             tracing::info!(
                 job_id = %created.job.id,
+                webhook_id = request.github_webhook_id,
+                installation_id = created.job.github_installation_id,
+                repo_id = created.job.github_repo_id,
                 trigger_kind = ?created.job.trigger_kind,
                 job_kind = ?created.job.job_kind,
-                "slice 9: enqueued new-schema job"
+                git_ref = %created.job.git_ref_display,
+                "enqueued new-schema job"
             );
             ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
         }
@@ -1916,6 +1985,22 @@ impl Default for ProcessorConfig {
     }
 }
 
+/// Whether a terminal outcome warrants a `warn` (vs `info`) in the
+/// processor's per-webhook result log. Denials, policy violations, and
+/// unclassifiable-payload errors are the operationally interesting ones;
+/// everything else (ignored no-ops, processed state, enqueued jobs) is
+/// routine.
+fn is_alarming_outcome(outcome: WebhookOutcome) -> bool {
+    matches!(
+        outcome,
+        WebhookOutcome::DeniedInstallAllowlist
+            | WebhookOutcome::DeniedTargetPolicy
+            | WebhookOutcome::DeniedSourcePolicy
+            | WebhookOutcome::DeniedUnauthorized
+            | WebhookOutcome::Error
+    )
+}
+
 pub struct WebhookProcessor {
     inbox: Arc<dyn WebhookInbox>,
     classifier: Arc<dyn Classifier>,
@@ -1949,12 +2034,47 @@ impl WebhookProcessor {
         };
         let id = claimed.id;
         let token = claimed.claim_token;
+        tracing::info!(
+            webhook_id = id,
+            event = %claimed.event_type,
+            action = claimed
+                .action
+                .as_deref()
+                .unwrap_or("-"),
+            delivery = %claimed.delivery_id,
+            installation_id = ?claimed.payload_installation_id,
+            attempt = claimed.attempts + 1,
+            "claimed webhook; classifying"
+        );
         match self
             .classifier
             .classify(&claimed)
             .await
         {
             ClassifyOutcome::Terminal(outcome) => {
+                // Single place that levels EVERY webhook's result —
+                // including the early-return Error/Ignored cases the
+                // handlers don't log themselves. Deny / policy-violation
+                // / hard-error terminals are operationally interesting →
+                // warn; routine outcomes (ignored, processed, enqueued) →
+                // info.
+                if is_alarming_outcome(outcome) {
+                    tracing::warn!(
+                        webhook_id = id,
+                        event = %claimed.event_type,
+                        action = claimed.action.as_deref().unwrap_or("-"),
+                        ?outcome,
+                        "webhook classified (terminal)"
+                    );
+                } else {
+                    tracing::info!(
+                        webhook_id = id,
+                        event = %claimed.event_type,
+                        action = claimed.action.as_deref().unwrap_or("-"),
+                        ?outcome,
+                        "webhook classified (terminal)"
+                    );
+                }
                 self.inbox
                     .complete(id, token, outcome)
                     .await?;
@@ -1968,6 +2088,13 @@ impl WebhookProcessor {
                     .attempts
                     .saturating_add(1);
                 if next_attempts >= self.config.max_attempts {
+                    tracing::error!(
+                        webhook_id = id,
+                        event = %claimed.event_type,
+                        attempts = next_attempts,
+                        error = %err,
+                        "webhook permanently failed (max attempts reached)"
+                    );
                     self.inbox
                         .record_permanent_failure(id, token, &err)
                         .await?;
@@ -1978,6 +2105,14 @@ impl WebhookProcessor {
                         self.config.backoff_max,
                     );
                     let next_at = Utc::now() + delay;
+                    tracing::warn!(
+                        webhook_id = id,
+                        event = %claimed.event_type,
+                        attempt = next_attempts,
+                        retry_at = %next_at,
+                        error = %err,
+                        "webhook classification failed; will retry"
+                    );
                     self.inbox
                         .record_retryable_error(id, token, &err, next_at)
                         .await?;
@@ -2003,6 +2138,14 @@ impl WebhookProcessor {
     /// sweep would reset the shared counter and the sweep could stay
     /// broken indefinitely.
     pub async fn run(&self) -> Result<()> {
+        tracing::info!(
+            supported_events = ?self.classifier.supported_event_types(),
+            max_attempts = self.config.max_attempts,
+            claim_lease_secs = self.config.claim_lease.num_seconds(),
+            sweep_interval_secs = self.config.sweep_interval.as_secs(),
+            payload_retention_hours = self.config.payload_retention.num_hours(),
+            "webhook processor started"
+        );
         let mut last_sweep = Instant::now();
         let mut consecutive_sweep_errors: u32 = 0;
         let mut consecutive_process_errors: u32 = 0;

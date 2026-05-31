@@ -57,7 +57,10 @@ pub async fn handle(
         .and_then(|v| v.to_str().ok())
     {
         Some(s) => s,
-        None => return (StatusCode::UNAUTHORIZED, "missing signature").into_response(),
+        None => {
+            tracing::warn!("rejecting webhook: missing X-Hub-Signature-256 header");
+            return (StatusCode::UNAUTHORIZED, "missing signature").into_response();
+        }
     };
     if let Err(e) = verify_signature(&state.config.webhook.secret, &body, signature) {
         tracing::warn!(error = %e, "rejecting webhook: bad signature");
@@ -80,7 +83,7 @@ pub async fn handle(
     // touching the DB. This is the handler's only filter; everything
     // else is processor work.
     if !SUPPORTED_EVENT_TYPES.contains(&event) {
-        tracing::debug!(event, "dropping unsupported event type");
+        tracing::info!(event, "dropping unsupported event type (not recorded)");
         return (StatusCode::OK, "ignored").into_response();
     }
 
@@ -127,7 +130,16 @@ pub async fn handle(
         .ingest_webhook(&webhook)
         .await
     {
-        Ok(IngestOutcome::Recorded { .. }) => (StatusCode::OK, "recorded").into_response(),
+        Ok(IngestOutcome::Recorded { .. }) => {
+            tracing::info!(
+                delivery = %delivery_id,
+                event,
+                action = action.as_deref().unwrap_or("-"),
+                installation_id = ?payload_installation_id,
+                "recorded webhook into inbox"
+            );
+            (StatusCode::OK, "recorded").into_response()
+        }
         Ok(IngestOutcome::Duplicate) => {
             tracing::info!(delivery = %delivery_id, event, "duplicate webhook delivery");
             (StatusCode::OK, "duplicate").into_response()

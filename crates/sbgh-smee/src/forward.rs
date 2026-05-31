@@ -116,12 +116,47 @@ fn should_forward_header(name: &str) -> bool {
     )
 }
 
-pub async fn forward(
-    client: &reqwest::Client,
-    target: &str,
-    raw: &str,
-) -> Result<reqwest::StatusCode> {
+/// The GitHub webhook headers worth surfacing in logs whenever smee acts
+/// on a delivery. All optional — a non-GitHub or malformed delivery may
+/// omit any of them. Header names are matched case-insensitively.
+#[derive(Debug, Default)]
+pub struct DeliveryMeta {
+    pub delivery: Option<String>,
+    pub event: Option<String>,
+    pub hook_id: Option<String>,
+    pub hook_target_id: Option<String>,
+    pub hook_target_type: Option<String>,
+}
+
+/// Result of a forward attempt: the target's response status plus the
+/// GitHub delivery headers, so the caller can log "which delivery" at the
+/// level the status warrants.
+pub struct ForwardOutcome {
+    pub status: reqwest::StatusCode,
+    pub meta: DeliveryMeta,
+}
+
+/// Pull the GitHub delivery/event/hook headers out of the (already
+/// hop-by-hop-filtered) forward header list for logging.
+fn extract_delivery_meta(headers: &[(String, String)]) -> DeliveryMeta {
+    let get = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    DeliveryMeta {
+        delivery: get("x-github-delivery"),
+        event: get("x-github-event"),
+        hook_id: get("x-github-hook-id"),
+        hook_target_id: get("x-github-hook-installation-target-id"),
+        hook_target_type: get("x-github-hook-installation-target-type"),
+    }
+}
+
+pub async fn forward(client: &reqwest::Client, target: &str, raw: &str) -> Result<ForwardOutcome> {
     let ParsedRequest { headers, body } = parse_smee_payload(raw)?;
+    let meta = extract_delivery_meta(&headers);
 
     let mut req = client.post(target);
     for (k, v) in &headers {
@@ -136,7 +171,7 @@ pub async fn forward(
         .send()
         .await
         .context("POST to forwarding target")?;
-    Ok(resp.status())
+    Ok(ForwardOutcome { status: resp.status(), meta })
 }
 
 #[cfg(test)]
@@ -363,10 +398,19 @@ mod tests {
             "body": {"hello": "world"},
             "timestamp": 1
         }"#;
-        let status = forward(&client, &target, raw)
+        let outcome = forward(&client, &target, raw)
             .await
             .unwrap();
-        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(outcome.status, reqwest::StatusCode::OK);
+        // Delivery headers are surfaced for logging.
+        assert_eq!(
+            outcome
+                .meta
+                .delivery
+                .as_deref(),
+            Some("deliv-1")
+        );
+        assert_eq!(outcome.meta.event.as_deref(), Some("issue_comment"));
 
         server.await.unwrap();
 

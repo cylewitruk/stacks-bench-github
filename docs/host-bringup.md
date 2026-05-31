@@ -2,6 +2,8 @@
 
 Step-by-step for going from a fresh Linux host with libvirt installed to a working `/benchmark` flow on a real PR. Assumes you've already read [architecture.md](./architecture.md).
 
+> Upgrading an **existing** deployment from the legacy `jobs` queue (v1) to the new `job` family (v2)? Use [v1-to-v2-upgrade.md](./v1-to-v2-upgrade.md) instead — this doc brings a fresh host up directly on v2.
+
 ## 0. Prerequisites
 
 | Component | Version / notes |
@@ -274,7 +276,11 @@ You don't need a public domain — webhook delivery will be tunneled (next secti
     | Metadata | Read-only |
     | Pull requests | Read & write |
 
-4. **Subscribe to events**: `Issue comment` (that's the only one we need; PR comments come through this event).
+4. **Subscribe to events**:
+   - `Issue comment` — `/benchmark` PR commands (required; PR comments arrive on this event).
+   - `Push` + `Create` — only if you want auto-baselines on develop pushes / release tags (v2 `branch_push` / `tag_created` triggers). Both are covered by the existing **Contents: Read** permission.
+   - `Pull request` — optional; lets v2 pre-materialise PR rows ahead of a `/benchmark`.
+   - (`Installation` and `Installation repositories` are delivered to every GitHub App automatically — they're not in this list and need no subscription.)
 5. **Where can this GitHub App be installed?**: "Only on this account" (for dev).
 6. Click **Create GitHub App**.
 7. From the new app's settings page, copy the **Client ID** (the `Iv23li…` value listed near the top, right under "About") — that's `SBGH_GH_CLIENT_ID`. GitHub also displays an "App ID" (a numeric value); we don't use that. Both work today, but Client ID is the recommended modern form and the only one that survives if GitHub ever deprecates the legacy App ID auth path.
