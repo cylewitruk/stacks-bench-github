@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:18-trixie
+    container_name: sbgh-test-postgres
+    # A test fixture, not a service — don't resurrect it across reboots.
+    restart: "no"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    # One shared server hosts a fresh database per test (see `setup_pg_db()`);
+    # raise the connection cap well above the per-test pool size × nextest
+    # concurrency so parallel suites don't exhaust it.
+    command: ["postgres", "-c", "max_connections=200"]
+    # Host-only: the test harness connects on 127.0.0.1:5433. The container
+    # port stays the default 5432. The inter-process test-db id sequence is
+    # created lazily by `setup_pg_db()` on first use — no init script needed.
+    ports:
+      - "127.0.0.1:5433:5432"
+    # A *named* volume for PGDATA, reused across runs. Each test drops its own
+    # database on teardown (the `TestDb` guard), so nothing accumulates here
+    # and the container can be reused (idempotent `up`) without a recreate.
+    # An anonymous volume would be orphaned on every recreate; this one
+    # isn't. To wipe completely: `docker compose -f docker/docker-compose.test.yml down -v`.
+    volumes:
+      - sbgh-test-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  sbgh-test-pgdata:

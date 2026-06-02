@@ -1,0 +1,50 @@
+[package]
+name = "sbgh-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sbgh-daemon"
+path = "src/main.rs"
+
+[dependencies]
+sbgh-core.workspace = true
+sbgh-api.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+# roadmap-v3 Phase 2: the `/api` server.
+axum.workspace = true
+tower-http.workspace = true
+# Constant-time token comparison in the auth layer.
+subtle.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+thiserror.workspace = true
+anyhow.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+sqlx.workspace = true
+dotenvy.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+quick-xml.workspace = true
+clap.workspace = true
+# Slice 5 trigger_policy: regex matching for tag_pattern matchers.
+regex.workspace = true
+
+[dev-dependencies]
+sbgh-core = { workspace = true, features = ["testing"] }
+tempfile = "3"
+# `oneshot` for driving the axum router in API auth/health tests.
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"

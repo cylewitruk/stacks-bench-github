@@ -1,10 +1,10 @@
 //! Slice 5 integration tests for `PostgresPolicyStore` against a real
-//! testcontainers Postgres. Covers all three policy tables — the
+//! Postgres. Covers all three policy tables — the
 //! target/source upsert + soft-disable semantics, the FK-enforced
 //! relationship from trigger_policy → target_repo_policy, and the
 //! processor's hot-path `list_enabled_triggers` query.
 
-use sbgh_core::db::{PolicyStore, Pool, PostgresPolicyStore, setup_pg};
+use sbgh_core::db::{PolicyStore, Pool, PostgresPolicyStore, setup_pg_db};
 use sbgh_core::models::{TriggerKind, TriggerMatchSpec};
 
 /// Seed allowlist + install + repo + membership so the slice 5
@@ -46,9 +46,7 @@ async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
 
 #[tokio::test]
 async fn lookup_target_policy_returns_none_when_no_row() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresPolicyStore::new(pool);
     assert!(
         store
@@ -62,9 +60,7 @@ async fn lookup_target_policy_returns_none_when_no_row() {
 #[tokio::test]
 async fn upsert_target_policy_enforces_membership_fk() {
     // No `github_installation_repo` row for (100, 10) → FK violation.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresPolicyStore::new(pool);
     let result = store
         .upsert_target_policy(100, 10, None)
@@ -78,9 +74,7 @@ async fn upsert_target_policy_enforces_membership_fk() {
 
 #[tokio::test]
 async fn upsert_target_policy_then_disable_round_trip() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresPolicyStore::new(pool);
 
@@ -116,9 +110,7 @@ async fn upsert_target_policy_then_disable_round_trip() {
 async fn upsert_source_policy_does_not_require_membership() {
     // Source policy intentionally has no membership FK — sources can
     // be arbitrary forks the install doesn't own.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     // Need install + repo for the per-table FKs (just no membership).
     sqlx::query(
         "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
@@ -151,9 +143,7 @@ async fn upsert_source_policy_does_not_require_membership() {
 async fn add_trigger_policy_requires_target_fk() {
     // FK from trigger_policy → target_repo_policy (composite). Adding
     // a trigger before the target row must fail.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresPolicyStore::new(pool);
 
@@ -175,9 +165,7 @@ async fn add_trigger_policy_requires_target_fk() {
 
 #[tokio::test]
 async fn add_then_list_enabled_triggers_round_trip() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresPolicyStore::new(pool);
     store
@@ -239,9 +227,7 @@ async fn list_enabled_triggers_excludes_triggers_whose_parent_target_is_disabled
     // `sbgh-cli policy target disable` (which doesn't cascade through
     // the same code path as `installation_repositories.removed`) would
     // leave triggers effective.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresPolicyStore::new(pool);
     store
@@ -298,9 +284,7 @@ async fn disable_target_and_triggers_cascades_in_single_transaction() {
     // path calls this method BEFORE revoking the membership, so a
     // stale inbox event arriving later sees a disabled policy +
     // disabled triggers and correctly fails policy eval.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     // Also seed a SECOND install+repo to verify cascade doesn't
     // scope-creep.
@@ -391,9 +375,7 @@ async fn disable_target_and_triggers_cascades_in_single_transaction() {
 async fn disable_target_and_triggers_is_idempotent() {
     // Predicates filter `is_enabled = TRUE` so re-running against
     // already-disabled rows is a no-op.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresPolicyStore::new(pool);
     store
@@ -415,9 +397,7 @@ async fn disable_target_and_triggers_is_idempotent() {
 async fn list_triggers_returns_disabled_too() {
     // `list_triggers` (the CLI list path) includes disabled rows so
     // operators can see them.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresPolicyStore::new(pool);
     store

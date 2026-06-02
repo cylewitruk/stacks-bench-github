@@ -2,7 +2,7 @@
 //!
 //! Coverage split mirrors `installer.rs`:
 //! - SQL paths (`grant_role_by_user_id`, `revoke_role_by_user_id`,
-//!   `list_roles`, `list_users`) run directly against testcontainers Postgres.
+//!   `list_roles`, `list_users`) run directly against Postgres.
 //! - Login-resolution paths (`grant_role`, `revoke_role`) use an in-process
 //!   axum mock of `/users/{login}` — identical pattern to the slice 3 installer
 //!   tests so the rename-resilient lookup is covered without hitting
@@ -17,17 +17,13 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use sbgh_cli::user::UserError;
 use sbgh_cli::{
-    apply_roles, grant_role, grant_role_by_user_id, list_roles, list_users, revoke_role,
+    UserError, grant_role, grant_role_by_user_id, list_roles, list_users, revoke_role,
     revoke_role_by_user_id,
 };
-use sbgh_core::db::{Pool, setup_pg};
+use sbgh_core::db::{Pool, setup_pg_db};
 use sbgh_core::models::UserRole;
 use tokio::sync::oneshot;
-
-const HANDLER_PW: &str = "handler-test-pw";
-const ORCH_PW: &str = "orch-test-pw";
 
 /// Seed install + repo identity AND an active membership row. The
 /// membership is what slice 6's `grant_role_by_user_id` pre-check
@@ -131,12 +127,7 @@ async fn get_user(
 
 #[tokio::test]
 async fn grant_then_revoke_round_trip_by_user_id() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_user(&pool, 42, "alice").await;
 
@@ -154,12 +145,7 @@ async fn grant_then_revoke_round_trip_by_user_id() {
 
 #[tokio::test]
 async fn grant_role_by_user_id_rejects_unknown_user() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     // No github_user row seeded.
 
@@ -171,12 +157,7 @@ async fn grant_role_by_user_id_rejects_unknown_user() {
 
 #[tokio::test]
 async fn revoke_role_returns_grant_not_found_for_unmatched_quadruple() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_user(&pool, 42, "alice").await;
 
@@ -195,12 +176,7 @@ async fn revoke_role_returns_grant_not_found_for_unmatched_quadruple() {
 
 #[tokio::test]
 async fn list_roles_filters_and_list_users_lists_everyone() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 200, 10).await;
     seed_user(&pool, 42, "alice").await;
@@ -233,12 +209,7 @@ async fn grant_role_by_user_id_rejects_repo_scoped_grant_without_membership() {
     // Without this precheck, a typo would silently create a stale
     // grant that becomes active if the repo is later added to the
     // install.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_only(&pool, 100).await;
     seed_user(&pool, 42, "alice").await;
     // Seed a github_repo row but NO membership.
@@ -260,12 +231,7 @@ async fn grant_role_by_user_id_rejects_repo_scoped_grant_without_membership() {
 async fn grant_role_by_user_id_rejects_repo_scoped_grant_for_revoked_membership() {
     // Same precheck must catch the case where the membership row
     // exists but has been soft-revoked.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_user(&pool, 42, "alice").await;
     // Revoke the membership.
@@ -288,12 +254,7 @@ async fn grant_role_install_wide_does_not_require_membership() {
     // Install-wide grants apply to whichever repos the install does
     // or will have access to — the precheck deliberately skips
     // membership when repo_id is None.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_only(&pool, 100).await;
     seed_user(&pool, 42, "alice").await;
     // No memberships at all on install=100.
@@ -308,12 +269,7 @@ async fn grant_role_install_wide_does_not_require_membership() {
 
 #[tokio::test]
 async fn grant_role_resolves_login_then_upserts_user_then_grants() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
 
     let mut accounts = HashMap::new();
@@ -339,12 +295,7 @@ async fn grant_role_resolves_login_then_upserts_user_then_grants() {
 
 #[tokio::test]
 async fn grant_role_returns_account_not_found_for_unknown_login() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
 
     let (api_base, _shutdown) = start_mock_gh(HashMap::new()).await;
 
@@ -359,12 +310,7 @@ async fn revoke_role_resolves_login_and_targets_resolved_id() {
     // Rename-resilience: even if a stale `github_user` row shares the
     // login with a different numeric id, revoke targets the GH-resolved
     // id — not whichever row happens to share the display login.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
 
     // Stale row: id=999, login="alice"

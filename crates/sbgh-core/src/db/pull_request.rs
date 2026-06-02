@@ -59,7 +59,7 @@ pub trait PullRequestStore: Send + Sync + 'static {
     ) -> Result<Option<GithubPullRequest>>;
 
     /// Look up a PR by its surrogate `id`. Slice 11 uses this from the
-    /// orchestrator to resolve `pr_number` for a `github_pull_request_job`
+    /// daemon to resolve `pr_number` for a `github_pull_request_job`
     /// link (which carries `github_pull_request_id`, not the number) so
     /// the new-schema runner can post/edit the PR comment.
     async fn lookup_by_id(&self, id: i64) -> Result<Option<GithubPullRequest>>;

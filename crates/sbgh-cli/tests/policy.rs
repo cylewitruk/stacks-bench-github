@@ -3,15 +3,12 @@
 //! numeric ids directly into the CLI).
 
 use sbgh_cli::{
-    PolicyError, add_trigger_policy, allow_source_policy, allow_target_policy, apply_roles,
+    PolicyError, add_trigger_policy, allow_source_policy, allow_target_policy,
     disable_source_policy, disable_target_policy, disable_trigger_policy, list_source_policies,
     list_target_policies, list_trigger_policies,
 };
-use sbgh_core::db::{Pool, setup_pg};
+use sbgh_core::db::{Pool, setup_pg_db};
 use sbgh_core::models::TriggerKind;
-
-const HANDLER_PW: &str = "handler-test-pw";
-const ORCH_PW: &str = "orch-test-pw";
 
 async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
     sqlx::query(
@@ -53,12 +50,7 @@ async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
 
 #[tokio::test]
 async fn allow_target_policy_then_disable_round_trip() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
 
     let row = allow_target_policy(&pool, 100, 10, Some("operator note"))
@@ -79,12 +71,7 @@ async fn disable_target_policy_cascades_to_disable_matching_triggers() {
     // runtime gate in `list_enabled_triggers` would still protect us
     // (it joins on parent target), but `policy trigger list` would
     // show stale `ENABLED` flags and mislead operators.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     allow_target_policy(&pool, 100, 10, None)
         .await
@@ -119,12 +106,7 @@ async fn disable_target_policy_cascades_to_disable_matching_triggers() {
 
 #[tokio::test]
 async fn disable_target_policy_returns_not_found_for_unknown_pair() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     let err = disable_target_policy(&pool, 999, 999)
         .await
         .unwrap_err();
@@ -133,12 +115,7 @@ async fn disable_target_policy_returns_not_found_for_unknown_pair() {
 
 #[tokio::test]
 async fn allow_source_policy_does_not_require_membership() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     // Just install + repo, no membership.
     sqlx::query(
         "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
@@ -170,12 +147,7 @@ async fn allow_source_policy_does_not_require_membership() {
 
 #[tokio::test]
 async fn add_trigger_rejects_invalid_match_spec_json_at_cli_boundary() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     // Seed target so the trigger FK is satisfiable.
     allow_target_policy(&pool, 100, 10, None)
@@ -198,12 +170,7 @@ async fn add_trigger_rejects_invalid_match_spec_json_at_cli_boundary() {
 
 #[tokio::test]
 async fn add_trigger_rejects_when_target_not_yet_allowed() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     // No target seeded → CLI rejects with friendly error.
 
@@ -223,12 +190,7 @@ async fn add_trigger_rejects_when_target_not_yet_allowed() {
 
 #[tokio::test]
 async fn add_then_disable_trigger_round_trip() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     allow_target_policy(&pool, 100, 10, None)
         .await
@@ -256,12 +218,7 @@ async fn add_then_disable_trigger_round_trip() {
 
 #[tokio::test]
 async fn disable_trigger_returns_not_found_for_unknown_id() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     let err = disable_trigger_policy(&pool, 999)
         .await
         .unwrap_err();
@@ -270,12 +227,7 @@ async fn disable_trigger_returns_not_found_for_unknown_id() {
 
 #[tokio::test]
 async fn list_policies_filter_by_install_id() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 200, 10).await;
     allow_target_policy(&pool, 100, 10, None)
@@ -307,12 +259,7 @@ async fn list_policies_filter_by_install_id() {
 
 #[tokio::test]
 async fn list_triggers_filter_by_install_and_repo() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 100, 11).await;
     allow_target_policy(&pool, 100, 10, None)

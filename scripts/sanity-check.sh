@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Pre-flight check for an orchestrator host. Verifies that every piece the
+# Pre-flight check for an daemon host. Verifies that every piece the
 # benchmark driver will touch — LVM, libvirt, filesystem layout, sbgh user,
 # sudoers, golden image, GitHub App secrets, Postgres reachability — is
 # present and wired correctly. Read-only; never modifies system state.
 #
-# Run as root (or with sudo). Reads the same config the orchestrator will:
+# Run as root (or with sudo). Reads the same config the daemon will:
 #   $SBGH_CONFIG  if set,
-#   else /etc/sbgh/config.toml,
-#   else $HOME/.config/sbgh/config.toml.
+#   else /etc/sbgh/daemon/config.toml,
+#   else $HOME/.config/sbgh/daemon/config.toml.
 #
 # Exit status:
 #   0  — all checks passed (warnings allowed)
@@ -34,40 +34,40 @@ warn()    { echo "  ${YLW}[WARN]${RST} $*"; WARN_COUNT=$((WARN_COUNT+1)); }
 info()    { echo "         $*"; }
 
 # ─── locate + parse config ─────────────────────────────────────────────
-# Only the orchestrator config is parsed here — it has everything we need
+# Only the daemon config is parsed here — it has everything we need
 # to validate (LVM, VM, GitHub credentials, DB URL, paths). The handler
 # config is much narrower (webhook secret + allowlist) and is sanity-
 # checked separately in §12 (presence + ownership only).
 #
-# Search order matches `OrchestratorConfig::load`:
-#   $SBGH_CONFIG → /etc/sbgh/orchestrator/config.toml → $HOME/.config/sbgh/orchestrator/config.toml.
+# Search order matches `DaemonConfig::load`:
+#   $SBGH_CONFIG → /etc/sbgh/daemon/config.toml → $HOME/.config/sbgh/daemon/config.toml.
 SBGH_HOME=$(getent passwd sbgh 2>/dev/null | cut -d: -f6)
 
 locate_config() {
     if [[ -n "${SBGH_CONFIG:-}" ]] && [[ -r "$SBGH_CONFIG" ]]; then
         echo "$SBGH_CONFIG"; return
     fi
-    if [[ -r /etc/sbgh/orchestrator/config.toml ]]; then
-        echo /etc/sbgh/orchestrator/config.toml; return
+    if [[ -r /etc/sbgh/daemon/config.toml ]]; then
+        echo /etc/sbgh/daemon/config.toml; return
     fi
-    if [[ -n "$SBGH_HOME" ]] && [[ -r "$SBGH_HOME/.config/sbgh/orchestrator/config.toml" ]]; then
-        echo "$SBGH_HOME/.config/sbgh/orchestrator/config.toml"; return
+    if [[ -n "$SBGH_HOME" ]] && [[ -r "$SBGH_HOME/.config/sbgh/daemon/config.toml" ]]; then
+        echo "$SBGH_HOME/.config/sbgh/daemon/config.toml"; return
     fi
-    if [[ -n "${HOME:-}" ]] && [[ -r "$HOME/.config/sbgh/orchestrator/config.toml" ]]; then
-        echo "$HOME/.config/sbgh/orchestrator/config.toml"; return
+    if [[ -n "${HOME:-}" ]] && [[ -r "$HOME/.config/sbgh/daemon/config.toml" ]]; then
+        echo "$HOME/.config/sbgh/daemon/config.toml"; return
     fi
     echo ""
 }
 
 CONFIG_PATH=$(locate_config)
 if [[ -z "$CONFIG_PATH" ]]; then
-    echo "${RED}No orchestrator config file found.${RST} Looked at:" >&2
+    echo "${RED}No daemon config file found.${RST} Looked at:" >&2
     echo "  - \$SBGH_CONFIG (\"${SBGH_CONFIG:-unset}\")" >&2
-    echo "  - /etc/sbgh/orchestrator/config.toml" >&2
+    echo "  - /etc/sbgh/daemon/config.toml" >&2
     if [[ -n "$SBGH_HOME" ]]; then
-        echo "  - $SBGH_HOME/.config/sbgh/orchestrator/config.toml" >&2
+        echo "  - $SBGH_HOME/.config/sbgh/daemon/config.toml" >&2
     fi
-    echo "  - \$HOME/.config/sbgh/orchestrator/config.toml (\"${HOME:-unset}/.config/sbgh/orchestrator/config.toml\")" >&2
+    echo "  - \$HOME/.config/sbgh/daemon/config.toml (\"${HOME:-unset}/.config/sbgh/daemon/config.toml\")" >&2
     exit 2
 fi
 
@@ -77,7 +77,7 @@ if ! command -v python3 >/dev/null; then
 fi
 
 echo "${BLD}sbgh host sanity check${RST}"
-echo "Orchestrator config: $CONFIG_PATH"
+echo "Daemon config: $CONFIG_PATH"
 
 # Pull everything we need out of the TOML in one shot. tomllib is stdlib
 # from Python 3.11+ (Debian 12 / Ubuntu 24.04 both ship 3.11+).
@@ -131,7 +131,7 @@ EOF
 fi
 eval "$CONFIG_VARS"
 
-# Env can still override secrets, matching the orchestrator's loader semantics.
+# Env can still override secrets, matching the daemon's loader semantics.
 CFG_DATABASE_URL="${DATABASE_URL:-$CFG_DATABASE_URL}"
 CFG_CLIENT_ID="${SBGH_GH_CLIENT_ID:-$CFG_CLIENT_ID}"
 CFG_PRIVATE_KEY="${SBGH_GH_PRIVATE_KEY_PATH:-$CFG_PRIVATE_KEY}"
@@ -228,7 +228,7 @@ else
     fail "thin pool '$CFG_VG/$CFG_THINPOOL' not found"
 fi
 
-# Discover chainstate base LVs the orchestrator would consider.
+# Discover chainstate base LVs the daemon would consider.
 mapfile -t bases < <(lvs --noheadings -o lv_name "$CFG_VG" 2>/dev/null \
     | awk '{print $1}' \
     | grep -E "^${CFG_PREFIX}" \
@@ -239,7 +239,7 @@ if (( ${#bases[@]} == 0 )); then
 else
     pass "found ${#bases[@]} chainstate base(s) matching '$CFG_PREFIX'"
     for b in "${bases[@]}"; do info "  - $b"; done
-    info "orchestrator will pick: ${bases[-1]} (lexicographically newest)"
+    info "daemon will pick: ${bases[-1]} (lexicographically newest)"
 fi
 
 # ─── 5. Filesystem paths ───────────────────────────────────────────────
@@ -286,7 +286,7 @@ fi
 
 # Config dirs — security boundary. Each must be owned by the right user
 # (different uid each!) and mode 0700 so the other user can't read it.
-for entry in "/etc/sbgh/handler:sbgh-handler" "/etc/sbgh/orchestrator:sbgh"; do
+for entry in "/etc/sbgh/handler:sbgh-handler" "/etc/sbgh/daemon:sbgh"; do
     dir="${entry%%:*}"
     expected_owner="${entry##*:}"
     if [[ -d "$dir" ]]; then
@@ -308,7 +308,7 @@ done
 section "6. Service users"
 # Two host users, one per service. See docs/host-bringup.md §3.
 #   - sbgh-handler (uid 997): identity for the handler container
-#   - sbgh         (uid 998): runs the orchestrator binary on the host
+#   - sbgh         (uid 998): runs the daemon binary on the host
 
 # Read handler uid override from docker/.env if present.
 expected_handler_uid=901
@@ -341,7 +341,7 @@ else
     fail "user 'sbgh-handler' missing  → groupadd --system --gid 901 sbgh-handler && useradd --system --uid 901 --gid 901 --shell /usr/sbin/nologin sbgh-handler"
 fi
 
-# --- sbgh (uid 998, orchestrator) ---
+# --- sbgh (uid 998, daemon) ---
 if id "$CFG_SERVICE_USER" >/dev/null 2>&1; then
     pass "user '$CFG_SERVICE_USER' exists"
     groups=$(id -nG "$CFG_SERVICE_USER")
@@ -361,10 +361,10 @@ if id "$CFG_SERVICE_USER" >/dev/null 2>&1; then
     fi
 
     # Tripwire: the two service uids MUST differ — sharing one defeats
-    # the filesystem boundary between handler and orchestrator config.
+    # the filesystem boundary between handler and daemon config.
     if id sbgh-handler >/dev/null 2>&1; then
         if [[ "$(id -u sbgh-handler)" == "$s_uid" ]]; then
-            fail "sbgh-handler and $CFG_SERVICE_USER share uid $s_uid — orchestrator config readable from handler container!"
+            fail "sbgh-handler and $CFG_SERVICE_USER share uid $s_uid — daemon config readable from handler container!"
         fi
     fi
 else
@@ -373,9 +373,9 @@ fi
 
 # ─── 7. Sudoers ────────────────────────────────────────────────────────
 section "7. Sudoers (commands sbgh runs via sudo)"
-# Group expected privileged commands. The orchestrator hits the first group;
+# Group expected privileged commands. The daemon hits the first group;
 # the chainstate refresh script also needs the second.
-orchestrator_cmds=(
+daemon_cmds=(
     /usr/sbin/lvcreate /usr/sbin/lvremove /usr/sbin/lvs
     /usr/sbin/mkfs.ext4 /usr/sbin/losetup
     /usr/bin/mount /usr/bin/umount /usr/bin/chown
@@ -401,7 +401,7 @@ check_sudo() {
 if ! id "$CFG_SERVICE_USER" >/dev/null 2>&1; then
     warn "service user missing — skipping sudoers checks"
 else
-    for c in "${orchestrator_cmds[@]}"; do check_sudo "orchestrator" "$c"; done
+    for c in "${daemon_cmds[@]}"; do check_sudo "daemon" "$c"; done
     for c in "${chainstate_cmds[@]}";    do check_sudo "chainstate" "$c"; done
 fi
 
@@ -484,99 +484,40 @@ if [[ -z "$CFG_DATABASE_URL" ]]; then
 elif ! command -v psql >/dev/null; then
     warn "psql not installed — skipping Postgres check (apt install postgresql-client)"
 else
-    # The orchestrator's DSN should use the narrow `sbgh_orch` role. If
-    # it's still using the owner role `sbgh`, the Postgres half of the
-    # boundary is wide open.
+    # Since roadmap-v3 Phase 6 there is a single DB role: the owner `sbgh`.
+    # The daemon is the sole DB client and connects as it. The old
+    # narrow `sbgh_orch` / `sbgh_handler` roles are gone.
     db_user=""
     if [[ "$CFG_DATABASE_URL" =~ postgres://([^:@/]+)[:@] ]]; then
         db_user="${BASH_REMATCH[1]}"
     fi
     case "$db_user" in
-        sbgh_orch)
-            pass "orchestrator DSN uses the narrow 'sbgh_orch' role"
-            ;;
         sbgh)
-            fail "orchestrator DSN uses owner role 'sbgh' — role split bypassed"
-            info "→ change [server].database_url to postgres://sbgh_orch:<SBGH_ORCH_DB_PASSWORD>@.../sbgh"
+            pass "daemon DSN uses the owner role 'sbgh'"
             ;;
-        sbgh_handler)
-            fail "orchestrator DSN uses 'sbgh_handler' role — that's the *handler*'s role, INSERT-only"
+        sbgh_orch|sbgh_handler)
+            warn "daemon DSN uses legacy role '$db_user' — Phase 6 collapsed to the owner 'sbgh'"
+            info "→ change [server].database_url to postgres://sbgh:<POSTGRES_OWNER_PASSWORD>@.../sbgh"
             ;;
         "")
             warn "couldn't parse user from DATABASE_URL"
             ;;
         *)
-            warn "orchestrator DSN uses unexpected role '$db_user' (expected 'sbgh_orch')"
+            warn "daemon DSN uses unexpected role '$db_user' (expected owner 'sbgh')"
             ;;
     esac
 
     if PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc 'SELECT 1' >/dev/null 2>&1; then
         pass "can connect to Postgres as '$db_user'"
 
+        # The daemon applies migrations at startup — the schema is
+        # present once it has booted at least once.
         if PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
-                "SELECT to_regclass('public.jobs') IS NOT NULL" 2>/dev/null | grep -q '^t$'; then
-            pass "'jobs' table exists"
-            queued=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
-                "SELECT count(*) FROM jobs WHERE status='queued'" 2>/dev/null)
-            running=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
-                "SELECT count(*) FROM jobs WHERE status='running'" 2>/dev/null)
-            info "queued=${queued:-?}  running=${running:-?}"
+                "SELECT to_regclass('public.job') IS NOT NULL" 2>/dev/null | grep -q '^t$'; then
+            pass "schema present ('job' table exists)"
         else
-            warn "'jobs' table not present — sbgh-cli migrate hasn't run yet"
+            warn "'job' table not present — has the daemon booted (it migrates at startup)?"
         fi
-
-        # Verify the three roles exist and have the expected grants. Use
-        # has_table_privilege so we don't need to query pg_authid (which
-        # the orchestrator's role can't read).
-        for role in sbgh sbgh_handler sbgh_orch; do
-            if PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
-                    "SELECT 1 FROM pg_roles WHERE rolname='$role'" 2>/dev/null | grep -q '^1$'; then
-                pass "role '$role' exists"
-            else
-                fail "role '$role' missing — sbgh-cli migrate hasn't applied roles yet"
-            fi
-        done
-
-        # Tripwire: sbgh_handler's grants on `jobs` are column-level — it
-        # CAN read id + github_delivery_id (needed for INSERT ... ON
-        # CONFLICT ... RETURNING), but MUST NOT be able to read or write
-        # the sensitive columns (head_sha, args, requested_by, result,
-        # status, …). Pick a representative column from each side to
-        # check; if either side regresses the whole boundary is leaky.
-        check_col_priv() {
-            local col="$1" priv="$2" want="$3" label="$4"
-            local got
-            got=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
-                "SELECT has_column_privilege('sbgh_handler','public.jobs','$col','$priv')" \
-                2>/dev/null | tr -d '[:space:]')
-            case "$got" in
-                "$want") pass "sbgh_handler $label" ;;
-                f|t)     fail "sbgh_handler $label: got $got, expected $want" ;;
-                *)       warn "couldn't probe sbgh_handler $priv on $col (got '$got')" ;;
-            esac
-        }
-        # Must-have: needed for enqueue to actually work.
-        check_col_priv id                 SELECT t "can SELECT id (for RETURNING)"
-        check_col_priv github_delivery_id SELECT t "can SELECT github_delivery_id (for ON CONFLICT)"
-        check_col_priv repository         INSERT t "can INSERT repository"
-        check_col_priv github_delivery_id INSERT t "can INSERT github_delivery_id"
-        # Must-NOT-have: leaks of orchestrator-owned state.
-        check_col_priv head_sha    SELECT f "cannot SELECT head_sha (orchestrator-owned)"
-        check_col_priv result      SELECT f "cannot SELECT result blobs"
-        check_col_priv requested_by SELECT f "cannot SELECT requested_by"
-        check_col_priv status      INSERT f "cannot INSERT status (no fabricated 'completed' rows)"
-        check_col_priv result      INSERT f "cannot INSERT result"
-
-        for priv in SELECT UPDATE; do
-            orch_priv=$(PGCONNECT_TIMEOUT=5 psql "$CFG_DATABASE_URL" -tAc \
-                "SELECT has_table_privilege('sbgh_orch','public.jobs','$priv')" 2>/dev/null \
-                | tr -d '[:space:]')
-            if [[ "$orch_priv" == "t" ]]; then
-                pass "sbgh_orch has $priv on jobs"
-            else
-                fail "sbgh_orch missing $priv on jobs"
-            fi
-        done
     else
         fail "Postgres unreachable at $CFG_DATABASE_URL"
     fi
@@ -619,14 +560,12 @@ if command -v docker >/dev/null; then
             else
                 warn "SMEE_CHANNEL not set (or placeholder) in $compose_dir/.env"
             fi
-            for required in POSTGRES_OWNER_PASSWORD SBGH_HANDLER_DB_PASSWORD SBGH_ORCH_DB_PASSWORD; do
-                val=$(env_lookup "$required")
-                if [[ -n "$val" ]] && [[ "$val" != "REPLACE_ME" ]]; then
-                    pass "$required set in .env"
-                else
-                    fail "$required missing or placeholder in $compose_dir/.env"
-                fi
-            done
+            owner_pw=$(env_lookup "POSTGRES_OWNER_PASSWORD")
+            if [[ -n "$owner_pw" ]] && [[ "$owner_pw" != "REPLACE_ME" ]]; then
+                pass "POSTGRES_OWNER_PASSWORD set in .env"
+            else
+                fail "POSTGRES_OWNER_PASSWORD missing or placeholder in $compose_dir/.env"
+            fi
         else
             warn "$compose_dir/.env not found  → cp $compose_dir/.env.example $compose_dir/.env"
         fi
@@ -693,14 +632,8 @@ if command -v docker >/dev/null; then
                 warn "$svc container is NOT running (docker compose up -d ?)"
             fi
         done
-        if docker ps -a --format '{{.Names}}\t{{.Status}}' 2>/dev/null | grep -q '^sbgh-cli-migrate\b'; then
-            migrate_status=$(docker ps -a --format '{{.Names}}\t{{.Status}}' | grep '^sbgh-cli-migrate\b' | cut -f2)
-            if [[ "$migrate_status" =~ ^Exited\ \(0\) ]]; then
-                pass "sbgh-cli-migrate completed successfully ($migrate_status)"
-            else
-                warn "sbgh-cli-migrate status: $migrate_status (expected 'Exited (0) ...')"
-            fi
-        fi
+        # No migrate one-shot since Phase 6 — the daemon applies
+        # migrations at startup.
 
         # Verify handler ≠ smee uid at runtime (defense-in-depth — they
         # share an image but compose pins each to a distinct numeric uid).
@@ -731,9 +664,9 @@ echo "  ${YLW}warnings:${RST} $WARN_COUNT"
 echo "  ${RED}failed:${RST}  $FAIL_COUNT"
 echo
 if (( FAIL_COUNT == 0 )); then
-    echo "${GRN}${BLD}Host looks ready for the orchestrator.${RST}"
+    echo "${GRN}${BLD}Host looks ready for the daemon.${RST}"
     exit 0
 else
-    echo "${RED}${BLD}Host is NOT ready — fix the failures above before running the orchestrator.${RST}"
+    echo "${RED}${BLD}Host is NOT ready — fix the failures above before running the daemon.${RST}"
     exit 1
 fi

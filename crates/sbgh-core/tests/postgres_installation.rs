@@ -1,9 +1,9 @@
 //! Slice 3 integration tests for `PostgresInstallationStore` against a
-//! real testcontainers Postgres. Covers the allowlist-FK enforcement,
+//! real Postgres. Covers the allowlist-FK enforcement,
 //! upsert semantics, suspend/unsuspend, deletion, and the
 //! lookup-after-disable case the processor relies on.
 
-use sbgh_core::db::{InstallationStore, NewInstallation, PostgresInstallationStore, setup_pg};
+use sbgh_core::db::{InstallationStore, NewInstallation, PostgresInstallationStore, setup_pg_db};
 use sbgh_core::models::GithubAccountType;
 
 async fn seed_allowed(pool: &sbgh_core::db::Pool, account_id: i64, login: &str, is_enabled: bool) {
@@ -26,9 +26,7 @@ async fn lookup_allowed_returns_disabled_rows_too() {
     // disabled rows, a paused installer would be treated like a NEW
     // installer (potentially a different deny outcome later, or worse
     // — slipping past entirely if the deny was conflated with "missing").
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", false).await;
     let store = PostgresInstallationStore::new(pool);
 
@@ -42,9 +40,7 @@ async fn lookup_allowed_returns_disabled_rows_too() {
 
 #[tokio::test]
 async fn lookup_allowed_returns_none_for_unknown_account() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresInstallationStore::new(pool);
     assert!(
         store
@@ -63,9 +59,7 @@ async fn upsert_installation_fails_without_allowlist_row() {
     // lookup_allowed BEFORE upsert; this test verifies the DB also
     // enforces it as a backstop — if the lookup was somehow skipped,
     // the FK fails the insert.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresInstallationStore::new(pool);
 
     let result = store
@@ -85,9 +79,7 @@ async fn upsert_installation_fails_without_allowlist_row() {
 
 #[tokio::test]
 async fn upsert_installation_updates_on_pk_conflict() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool);
 
@@ -121,9 +113,7 @@ async fn upsert_installation_updates_on_pk_conflict() {
 #[tokio::test]
 async fn set_suspended_returns_none_for_unknown_install() {
     // suspend webhook for an install we never accepted is a no-op.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresInstallationStore::new(pool);
 
     let result = store
@@ -135,9 +125,7 @@ async fn set_suspended_returns_none_for_unknown_install() {
 
 #[tokio::test]
 async fn set_suspended_roundtrips_via_clear() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool);
     store
@@ -172,9 +160,7 @@ async fn set_suspended_roundtrips_via_clear() {
 
 #[tokio::test]
 async fn delete_installation_returns_install_not_found_for_unknown() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresInstallationStore::new(pool);
     let outcome = store
         .delete_installation(999)
@@ -192,9 +178,7 @@ async fn delete_installation_soft_deletes_install_and_preserves_webhook_fk() {
     // verify that path stays untouched (the webhook row's FK should
     // STILL point at the install, since the install row didn't go
     // anywhere).
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool.clone());
     store
@@ -252,9 +236,7 @@ async fn delete_installation_soft_deletes_install_and_preserves_webhook_fk() {
 
 #[tokio::test]
 async fn delete_installation_redelivery_is_idempotent() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool);
     store
@@ -288,9 +270,7 @@ async fn delete_installation_disables_all_policy_rows_in_same_transaction() {
     // same transaction as the membership revoke + install soft-delete.
     // Otherwise a delete-then-recreate cycle would silently inherit
     // stale policies the operator didn't re-approve.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool.clone());
     store
@@ -399,9 +379,7 @@ async fn delete_installation_soft_revokes_all_user_role_grants() {
     // transaction. Otherwise, a delete-then-recreate cycle would
     // silently inherit stale role grants the operator didn't
     // re-approve.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool.clone());
     store
@@ -505,9 +483,7 @@ async fn delete_installation_bulk_revokes_active_memberships_transactionally() {
     // install AND revoke every active membership for it in one tx.
     // Already-revoked memberships are skipped (no re-stamp); never-
     // owned memberships of other installs are untouched.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool.clone());
     store
@@ -579,9 +555,7 @@ async fn delete_installation_bulk_revokes_active_memberships_transactionally() {
 
 #[tokio::test]
 async fn add_or_restore_membership_clears_revoked_at_and_preserves_granted_at() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool.clone());
     store
@@ -623,9 +597,7 @@ async fn add_or_restore_membership_clears_revoked_at_and_preserves_granted_at() 
 
 #[tokio::test]
 async fn revoke_membership_is_idempotent() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool.clone());
     store
@@ -693,9 +665,7 @@ async fn add_and_delete_race_never_leaves_orphan_active_membership() {
     // The "active + revoked" combinations are valid; the bad state is
     // "deleted_at IS NOT NULL AND revoked_at IS NULL" — that's what
     // the FOR UPDATE serialization prevents.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     // Set up: allowed installer + repo identity. The install row is
     // re-created each iteration.
     sqlx::query(
@@ -786,9 +756,7 @@ async fn is_membership_active_returns_true_only_for_active_install_and_membershi
     //   no install row                         → false
     //   no membership row                      → false
     //   membership revoked                     → false
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool.clone());
     store
@@ -890,9 +858,7 @@ async fn is_membership_active_returns_true_only_for_active_install_and_membershi
 
 #[tokio::test]
 async fn is_membership_active_returns_false_for_unknown_pair() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresInstallationStore::new(pool);
     assert!(
         !store
@@ -908,9 +874,7 @@ async fn add_or_restore_membership_returns_none_for_soft_deleted_install() {
     // arriving after `installation.deleted` must NOT restore membership
     // on a retired install. The store probes `deleted_at IS NULL`
     // in-tx and returns Ok(None) when the install is gone.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_allowed(&pool, 42, "octo", true).await;
     let store = PostgresInstallationStore::new(pool.clone());
     store
@@ -955,9 +919,7 @@ async fn add_or_restore_membership_returns_none_for_soft_deleted_install() {
 
 #[tokio::test]
 async fn add_or_restore_membership_returns_none_for_missing_install() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresInstallationStore::new(pool);
     // Repo doesn't exist either, but the install guard short-circuits
     // before the FK check, so this is Ok(None) not a FK error.
@@ -970,9 +932,7 @@ async fn add_or_restore_membership_returns_none_for_missing_install() {
 
 #[tokio::test]
 async fn revoke_membership_returns_none_for_unknown_pair() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresInstallationStore::new(pool);
     assert!(
         store

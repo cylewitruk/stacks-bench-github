@@ -1,18 +1,28 @@
 //! `IngestStore` — the boundary the handler uses to record an inbound
 //! webhook into the inbox.
 //!
-//! Since the slice 11 cutover the handler is inbox-only and only ever
-//! calls `ingest_webhook`. The `ingest_webhook_and_job` dual-write
-//! (slice 1's `/benchmark` → legacy `jobs` path) is retained on the
-//! trait until slice 12 removes the legacy table, but no production
-//! caller uses it any more.
+//! Since the slice 11 cutover the handler is inbox-only: it records a
+//! `github_webhook` row and nothing else. The processor (in the
+//! daemon) owns all classification, authorization, and job creation
+//! from the inbox.
 
 use async_trait::async_trait;
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::Result;
-use crate::models::NewJob;
+
+/// GitHub event types the system records into the inbox. Anything else is
+/// dropped without a DB row (DoS-aware). Single source of truth shared by
+/// the handler's edge filter and the daemon's `POST /api/webhooks`
+/// (the canonical filter — the handler forwards everything once migrated).
+pub const SUPPORTED_WEBHOOK_EVENT_TYPES: &[&str] = &[
+    "issue_comment",
+    "push",
+    "pull_request",
+    "create",
+    "installation",
+    "installation_repositories",
+];
 
 /// Fields the handler can write at HTTP-receipt time: things derivable
 /// from the request headers + signature-verified body, with NO GitHub
@@ -35,12 +45,8 @@ pub struct NewWebhook {
 /// Result of an ingest call.
 #[derive(Debug, Clone)]
 pub enum IngestOutcome {
-    /// A webhook row was written. `job_id` is `Some` when a fresh
-    /// legacy job row was also enqueued; `None` when the call was
-    /// webhook-only OR when the legacy job's unique constraint on
-    /// `github_delivery_id` rejected the insert (only possible for
-    /// deliveries that landed in `jobs` before slice 1 rolled out).
-    Recorded { webhook_id: i64, job_id: Option<Uuid> },
+    /// A webhook row was written.
+    Recorded { webhook_id: i64 },
     /// The webhook's `delivery_id` was already present. No rows were
     /// written; nothing further to do.
     Duplicate,
@@ -48,19 +54,6 @@ pub enum IngestOutcome {
 
 #[async_trait]
 pub trait IngestStore: Send + Sync + 'static {
-    /// Insert a webhook row only. Used for supported events that don't
-    /// trigger a legacy job (push, pull_request, installation,
-    /// non-`/benchmark` issue_comments, unauthorized commands).
-    /// Idempotent on `delivery_id`.
+    /// Insert a webhook row into the inbox. Idempotent on `delivery_id`.
     async fn ingest_webhook(&self, webhook: &NewWebhook) -> Result<IngestOutcome>;
-
-    /// Insert a webhook row AND a legacy job row in a single
-    /// transaction. Used for `/benchmark` from authorized users. If
-    /// either INSERT fails, both roll back. Idempotent on the
-    /// webhook's `delivery_id`.
-    async fn ingest_webhook_and_job(
-        &self,
-        webhook: &NewWebhook,
-        new_job: &NewJob,
-    ) -> Result<IngestOutcome>;
 }

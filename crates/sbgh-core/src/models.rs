@@ -6,14 +6,9 @@ use uuid::Uuid;
 /// Slice 8 added `Claimed` between `Queued` and `Running` per the
 /// pre-Phase-2 checkpoint. Lifecycle for the new-schema `job` table:
 /// `queued → claimed → running → completed/failed/cancelled`. The
-/// orchestrator's claim path transitions queued→claimed (with a
+/// daemon's claim path transitions queued→claimed (with a
 /// claim_token + claimed_at), then claimed→running when execution
-/// actually starts. `job_status` is a shared Postgres type referenced
-/// by both legacy `jobs` and new `job`, so the Rust variant lands
-/// alongside the SQL `ALTER TYPE ADD VALUE` to keep sqlx
-/// deserialisation safe from either side. Legacy `jobs` code paths
-/// MUST NOT write `Claimed` — the value is only meaningful for the
-/// new pipeline.
+/// actually starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "job_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -27,7 +22,7 @@ pub enum JobStatus {
 }
 
 /// Slice 8 (post-review fix): typed terminal-only status for
-/// `JobV2Store::mark_terminal`. Without this narrowing, the API
+/// `JobStore::mark_terminal`. Without this narrowing, the API
 /// accepted any `JobStatus` — a caller bug could transition
 /// `running → queued` while preserving `claim_token`/`claimed_at`,
 /// directly violating the queued-state invariant from the
@@ -375,58 +370,17 @@ pub struct GithubPullRequest {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct Job {
-    pub id: Uuid,
-    pub status: JobStatus,
-    pub repository: String,
-    pub pr_number: i64,
-    pub head_sha: String,
-    pub requested_by: String,
-    pub command: String,
-    pub args: Json<serde_json::Value>,
-    pub installation_id: i64,
-    pub comment_id: Option<i64>,
-    pub github_delivery_id: Option<String>,
-    pub queued_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub finished_at: Option<DateTime<Utc>>,
-    pub result: Option<Json<serde_json::Value>>,
-    pub error: Option<String>,
-}
+// ─── Job tables ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewJob {
-    pub repository: String,
-    pub pr_number: i64,
-    pub head_sha: String,
-    pub requested_by: String,
-    pub command: String,
-    pub args: serde_json::Value,
-    pub installation_id: i64,
-    /// Value of the `X-GitHub-Delivery` header. Used as an idempotency key so
-    /// retried webhook deliveries don't enqueue duplicate jobs. `None` is
-    /// only legal for synthetic events (tests, manual replays).
-    pub github_delivery_id: Option<String>,
-}
-
-// ─── Slice 8: new-schema job tables ───────────────────────────────────
-//
-// Naming: the colliding type names use a `V2` suffix until slice 12
-// drops the legacy `Job` / `NewJob` types (slice 0 + 1 vintage). The
-// suffix is a temporary marker; non-colliding types (`JobEvent`,
-// `JobMetric`, `JobResult`, `Github*Job`) ship with their final names.
-
-/// Slice 8: row shape of the new-schema `job` table. Renamed to
-/// `Job` in slice 12 once the legacy `Job` is removed. `claim_token`
-/// + `claimed_at` invariants (app-layer enforced):
+/// Row shape of the `job` table. `claim_token` + `claimed_at` invariants
+/// (app-layer enforced):
 ///
 ///   - `status = Queued` ⇔ both NULL
 ///   - `status = Claimed` ⇔ both Some
 ///   - `status IN (Running, Completed, Failed, Cancelled)` → both PRESERVED as
 ///     audit
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct JobV2 {
+pub struct Job {
     pub id: Uuid,
     pub github_installation_id: i64,
     pub github_repo_id: i64,
@@ -447,7 +401,7 @@ pub struct JobV2 {
 /// uses this from the processor's job-creation path; slice 8 only
 /// exercises it via integration tests.
 #[derive(Debug, Clone)]
-pub struct NewJobV2 {
+pub struct NewJob {
     pub github_installation_id: i64,
     pub github_repo_id: i64,
     pub job_kind: JobKind,
@@ -456,14 +410,14 @@ pub struct NewJobV2 {
     pub git_ref_display: String,
     /// Slice 9 leaves this `None` for triggers that enqueue with an
     /// unresolved commit (e.g. branch tip at queue time); the
-    /// orchestrator's claim phase resolves and passes the resolved
+    /// daemon's claim phase resolves and passes the resolved
     /// values to `mark_running` via `ResolvedCommit`.
     pub git_commit_hash: Option<String>,
     pub git_committed_at: Option<DateTime<Utc>>,
 }
 
 /// Slice 8 (post-review fix): typed handoff for the
-/// resolve-commit-during-claim path. The orchestrator's claim phase
+/// resolve-commit-during-claim path. The daemon's claim phase
 /// resolves a branch tip to its concrete commit; `mark_running`
 /// writes the present fields atomically with the status transition
 /// while holding the claim_token guard.
@@ -481,7 +435,7 @@ pub struct ResolvedCommit {
 }
 
 /// Slice 8 (post-review fix): atomic-creation request for the
-/// `JobV2Store::create_job_with_links` boundary. Captures everything
+/// `JobStore::create_job_with_links` boundary. Captures everything
 /// the slice 9 processor needs to insert in one transaction: the
 /// `job` row, the webhook→job ingest link, the optional owner link
 /// (absent for branch_push / tag_created / scheduled), the optional
@@ -489,7 +443,7 @@ pub struct ResolvedCommit {
 /// keyed off `trigger_kind`).
 #[derive(Debug, Clone)]
 pub struct JobCreationRequest {
-    pub new_job: NewJobV2,
+    pub new_job: NewJob,
     pub github_webhook_id: i64,
     /// Owner of the job; populated for pr_comment / manual triggers,
     /// `None` for triggers with no responsible user.
@@ -577,7 +531,7 @@ pub struct JobEvent {
 /// audit/inspection reader knows which envelope caused the enqueue
 /// without inspecting `job` columns. Per the SUBJECT-vs-PROVENANCE
 /// design principle, this is provenance — `bench_args` lives here
-/// (and is what slice 10's orchestrator reads to assemble the run's
+/// (and is what slice 10's daemon reads to assemble the run's
 /// CLI args) because the `job` table has no dedicated column for it.
 ///
 /// Only the three slice-9 job-creating triggers have variants;
@@ -599,7 +553,7 @@ pub enum QueuedEventDetail {
     /// `trigger_policy.id`; `bench_args` its configured args.
     BranchPush { branch: String, trigger_id: i64, bench_args: Option<String> },
     /// Watched tag pattern appeared. The tag's commit is resolved by
-    /// the orchestrator during the claim phase (the create event
+    /// the daemon during the claim phase (the create event
     /// carries no SHA), so no commit fields here.
     TagCreated { tag: String, trigger_id: i64, bench_args: Option<String> },
 }

@@ -1,24 +1,23 @@
 //! Configuration.
 //!
-//! The handler and the orchestrator hold different secrets and so are
+//! The handler and the daemon hold different secrets and so are
 //! deliberately given separate config schemas:
 //!
-//! - [`HandlerConfig`] — webhook-facing service. Only the HMAC secret, DB URL,
-//!   and authorization allowlist. **No GitHub App credentials.**
-//! - [`OrchestratorConfig`] — host-side benchmark runner. Holds the App private
-//!   key, libvirt/LVM knobs, and everything required to run a job.
+//! - [`HandlerConfig`] — webhook-facing service. Only the HMAC secret and the
+//!   daemon `/api` URL + ingest token. **No GitHub App credentials, no DB
+//!   access, no authorization allowlist** (the daemon owns authorization).
+//! - [`DaemonConfig`] — host-side benchmark runner. Holds the App private key,
+//!   libvirt/LVM knobs, and everything required to run a job.
 //!
 //! Each binary loads its own type from its own TOML file. They never share a
 //! config dir on disk — see [`HANDLER_DEFAULT_CONFIG_PATH`] /
-//! [`ORCHESTRATOR_DEFAULT_CONFIG_PATH`].
+//! [`DAEMON_DEFAULT_CONFIG_PATH`].
 //!
 //! Loading precedence (lowest → highest):
 //!   1. compiled-in defaults
-//!   2. TOML config file (see [`HandlerConfig::load`] /
-//!      [`OrchestratorConfig::load`])
+//!   2. TOML config file (see [`HandlerConfig::load`] / [`DaemonConfig::load`])
 //!   3. environment variables (always win)
 
-use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 
@@ -30,25 +29,17 @@ use crate::{Error, Result};
 /// Default on-disk path for the handler's TOML config. Bind-mounted into the
 /// container at the same path so file refs work in both contexts.
 pub const HANDLER_DEFAULT_CONFIG_PATH: &str = "/etc/sbgh/handler/config.toml";
-/// Default on-disk path for the orchestrator's TOML config.
-pub const ORCHESTRATOR_DEFAULT_CONFIG_PATH: &str = "/etc/sbgh/orchestrator/config.toml";
+/// Default on-disk path for the daemon's TOML config.
+pub const DAEMON_DEFAULT_CONFIG_PATH: &str = "/etc/sbgh/daemon/config.toml";
 
 const HANDLER_HOME_RELATIVE: &str = ".config/sbgh/handler/config.toml";
-const ORCHESTRATOR_HOME_RELATIVE: &str = ".config/sbgh/orchestrator/config.toml";
+const DAEMON_HOME_RELATIVE: &str = ".config/sbgh/daemon/config.toml";
 
 // ─────────────────────────── Shared subtypes ───────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind_addr: String,
-    pub database_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AuthorizationConfig {
-    pub allowed_repositories: HashSet<String>,
-    pub allowed_users: HashSet<String>,
-    pub allowed_associations: HashSet<String>,
 }
 
 // ─────────────────────────── HandlerConfig ───────────────────────────
@@ -57,7 +48,7 @@ pub struct AuthorizationConfig {
 pub struct HandlerConfig {
     pub server: ServerConfig,
     pub webhook: WebhookConfig,
-    pub authorization: AuthorizationConfig,
+    pub api: HandlerApiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +57,21 @@ pub struct WebhookConfig {
     /// handler holds nothing else GitHub-related — no App ID, no private
     /// key — so a compromised handler cannot impersonate the App.
     pub secret: String,
+}
+
+/// How the handler reaches the daemon `/api` to submit verified
+/// deliveries. Replaces the handler's former direct DB access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandlerApiConfig {
+    /// Base URL of the daemon `/api` (e.g.
+    /// `http://host.docker.internal:8787`). From `[api].url` or
+    /// `SBGH_API_URL`.
+    pub url: String,
+    /// Shared static token presented for the `ingest` scope — must match
+    /// the daemon's `SBGH_API_INGEST_TOKEN`. **Env-only**
+    /// (`SBGH_API_INGEST_TOKEN`), never read from the TOML, so the secret
+    /// doesn't live in the bind-mounted config file.
+    pub ingest_token: String,
 }
 
 impl HandlerConfig {
@@ -94,14 +100,13 @@ impl HandlerConfig {
 struct RawHandler {
     server: RawServer,
     webhook: RawWebhook,
-    authorization: RawAuth,
+    api: RawHandlerApi,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawServer {
     bind_addr: Option<String>,
-    database_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -112,25 +117,29 @@ struct RawWebhook {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RawAuth {
-    allowed_repositories: Option<Vec<String>>,
-    allowed_users: Option<Vec<String>>,
-    allowed_associations: Option<Vec<String>>,
+struct RawHandlerApi {
+    url: Option<String>,
+    /// **Env-only** (`SBGH_API_INGEST_TOKEN`); `deny_unknown_fields` makes
+    /// an `ingest_token` key in `[api]` a hard error, keeping the secret
+    /// out of the bind-mounted TOML.
+    #[serde(skip)]
+    ingest_token: Option<String>,
 }
 
 impl RawHandler {
     fn merge(&mut self, other: RawHandler) {
         merge_opt(&mut self.server.bind_addr, other.server.bind_addr);
-        merge_opt(&mut self.server.database_url, other.server.database_url);
         merge_opt(&mut self.webhook.secret, other.webhook.secret);
-        merge_auth(&mut self.authorization, other.authorization);
+        merge_opt(&mut self.api.url, other.api.url);
+        // `api.ingest_token` is env-only (#[serde(skip)]); nothing to merge
+        // from a file.
     }
 
     fn apply_env(&mut self) {
         env_into(&mut self.server.bind_addr, "SBGH_BIND_ADDR");
-        env_into(&mut self.server.database_url, "DATABASE_URL");
         env_into(&mut self.webhook.secret, "SBGH_WEBHOOK_SECRET");
-        apply_auth_env(&mut self.authorization);
+        env_into(&mut self.api.url, "SBGH_API_URL");
+        env_into(&mut self.api.ingest_token, "SBGH_API_INGEST_TOKEN");
     }
 
     fn into_config(self) -> Result<HandlerConfig> {
@@ -140,70 +149,55 @@ impl RawHandler {
                     .server
                     .bind_addr
                     .unwrap_or_else(|| "0.0.0.0:8080".into()),
-                database_url: required(self.server.database_url, "DATABASE_URL")?,
             },
             webhook: WebhookConfig {
                 secret: required(self.webhook.secret, "[webhook].secret / SBGH_WEBHOOK_SECRET")?,
             },
-            authorization: build_auth(self.authorization),
+            api: HandlerApiConfig {
+                url: required(self.api.url, "[api].url / SBGH_API_URL")?,
+                ingest_token: required(self.api.ingest_token, "SBGH_API_INGEST_TOKEN")?,
+            },
         })
     }
 }
 
-// ─────────────────────────── OrchestratorConfig ───────────────────────────
+// ─────────────────────────── DaemonConfig ───────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrchestratorConfig {
-    pub server: OrchestratorServerConfig,
+pub struct DaemonConfig {
+    pub server: DaemonServerConfig,
     pub github: GitHubConfig,
     pub vm: VmConfig,
     pub paths: PathsConfig,
     pub lvm: LvmConfig,
     pub stacks_bench: StacksBenchConfig,
-    /// Which job queue the orchestrator claims from. Defaults to `v2`
-    /// (the new `job` family) since the slice 11 cutover; `legacy` stays
-    /// selectable as an escape hatch until slice 12.
-    pub jobs: JobsConfig,
+    pub api: ApiConfig,
 }
 
+/// The daemon's `/api` server (roadmap-v3). Reachable only from the
+/// local CLI (loopback) and the handler container (docker bridge) — never
+/// a public interface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobsConfig {
-    pub source: JobSource,
+pub struct ApiConfig {
+    /// Listen addresses. Loopback for the local CLI; add the docker-bridge
+    /// gateway IP so the handler container can reach the host daemon (a
+    /// container cannot reach a loopback-only bind). Never a public
+    /// interface.
+    pub listen: Vec<String>,
+    /// Where the daemon writes the operator (`admin`) cookie at startup,
+    /// mode 0600, regenerated each boot. The local CLI reads it.
+    pub cookie_path: PathBuf,
+    /// Shared static token the handler presents for the `ingest` scope.
+    /// `None` disables ingest auth (no caller can submit webhooks) — fine
+    /// until the handler is migrated onto the API.
+    pub ingest_token: Option<String>,
 }
 
-/// Which persistence backend the orchestrator's runner claims from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobSource {
-    /// Legacy `jobs` table. Retained as an escape hatch post-cutover
-    /// until slice 12 removes it.
-    Legacy,
-    /// New-schema `job` family (slice 8/9). The production default since
-    /// the slice 11 cutover.
-    V2,
-}
-
-impl std::str::FromStr for JobSource {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "legacy" => Ok(JobSource::Legacy),
-            "v2" | "new" => Ok(JobSource::V2),
-            other => Err(format!("invalid job source {other:?} (expected 'legacy' or 'v2')")),
-        }
-    }
-}
-
-/// Orchestrator-specific server bits. No `bind_addr` (it doesn't listen).
+/// Daemon-specific server bits. No `bind_addr` (it doesn't listen).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrchestratorServerConfig {
+pub struct DaemonServerConfig {
     pub database_url: String,
-    /// OS user the orchestrator runs as. Used to chown the per-job source
+    /// OS user the daemon runs as. Used to chown the per-job source
     /// mount inside libvirt.
     pub service_user: String,
 }
@@ -246,14 +240,14 @@ pub struct VmConfig {
     pub job_timeout_secs: u64,
     /// libvirt network to attach to the VM (default: `default`, NAT outbound).
     pub network: String,
-    /// How often the orchestrator polls the in-VM phase log + virsh
+    /// How often the daemon polls the in-VM phase log + virsh
     /// domstate. Each poll runs a `virsh domstate` subprocess (~50–
     /// 100ms), so lower values = more CPU on the host. 5s is the
     /// sensible floor for our workload — actual phases (`building`,
     /// `running`) last minutes to hours, so the phase-change detection
     /// latency is invisible.
     pub poll_interval_secs: u64,
-    /// How often the orchestrator emits a heartbeat log line (and a
+    /// How often the daemon emits a heartbeat log line (and a
     /// throttled PR-comment refresh) showing the current phase + elapsed
     /// time in that phase. Independent of poll interval so we can poll
     /// rarely but still surface liveness frequently (or vice versa).
@@ -300,20 +294,19 @@ pub struct StacksBenchConfig {
     pub default_args: String,
 }
 
-impl OrchestratorConfig {
+impl DaemonConfig {
     pub fn load() -> Result<Self> {
-        let path =
-            resolve_config_path(ORCHESTRATOR_DEFAULT_CONFIG_PATH, ORCHESTRATOR_HOME_RELATIVE);
+        let path = resolve_config_path(DAEMON_DEFAULT_CONFIG_PATH, DAEMON_HOME_RELATIVE);
         Self::load_layered(path.as_deref())
     }
 
     pub fn load_layered(file: Option<&std::path::Path>) -> Result<Self> {
-        let mut raw = RawOrchestrator::default();
+        let mut raw = RawDaemon::default();
         if let Some(p) = file
             && p.exists()
         {
             let body = std::fs::read_to_string(p)?;
-            let from_file: RawOrchestrator = toml::from_str(&body)
+            let from_file: RawDaemon = toml::from_str(&body)
                 .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display())))?;
             raw.merge(from_file);
         }
@@ -324,25 +317,32 @@ impl OrchestratorConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RawOrchestrator {
-    server: RawOrchServer,
+struct RawDaemon {
+    server: RawDaemonServer,
     github: RawGitHub,
     vm: RawVm,
     paths: RawPaths,
     lvm: RawLvm,
     stacks_bench: RawStacksBench,
-    jobs: RawJobs,
+    api: RawApi,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RawJobs {
-    source: Option<String>,
+struct RawApi {
+    listen: Option<Vec<String>>,
+    cookie_path: Option<PathBuf>,
+    /// **Env-only** (`SBGH_API_INGEST_TOKEN`) — never read from the TOML
+    /// file so the secret stays out of config. `#[serde(skip)]` +
+    /// `deny_unknown_fields` makes an `ingest_token` key in `[api]` a hard
+    /// error rather than silently honoring it.
+    #[serde(skip)]
+    ingest_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RawOrchServer {
+struct RawDaemonServer {
     database_url: Option<String>,
     service_user: Option<String>,
 }
@@ -400,8 +400,8 @@ struct RawStacksBench {
     default_args: Option<String>,
 }
 
-impl RawOrchestrator {
-    fn merge(&mut self, other: RawOrchestrator) {
+impl RawDaemon {
+    fn merge(&mut self, other: RawDaemon) {
         merge_opt(&mut self.server.database_url, other.server.database_url);
         merge_opt(&mut self.server.service_user, other.server.service_user);
 
@@ -476,7 +476,10 @@ impl RawOrchestrator {
                 .default_args,
         );
 
-        merge_opt(&mut self.jobs.source, other.jobs.source);
+        merge_opt(&mut self.api.listen, other.api.listen);
+        merge_opt(&mut self.api.cookie_path, other.api.cookie_path);
+        // `api.ingest_token` is env-only (#[serde(skip)]); nothing to merge
+        // from a file.
     }
 
     fn apply_env(&mut self) {
@@ -536,12 +539,14 @@ impl RawOrchestrator {
 
         env_into(&mut self.stacks_bench.default_args, "SBGH_STACKS_BENCH_ARGS");
 
-        env_into(&mut self.jobs.source, "SBGH_JOBS_SOURCE");
+        env_csv_into(&mut self.api.listen, "SBGH_API_LISTEN");
+        env_path_into(&mut self.api.cookie_path, "SBGH_API_COOKIE_PATH");
+        env_into(&mut self.api.ingest_token, "SBGH_API_INGEST_TOKEN");
     }
 
-    fn into_config(self) -> Result<OrchestratorConfig> {
-        Ok(OrchestratorConfig {
-            server: OrchestratorServerConfig {
+    fn into_config(self) -> Result<DaemonConfig> {
+        Ok(DaemonConfig {
+            server: DaemonServerConfig {
                 database_url: required(self.server.database_url, "DATABASE_URL")?,
                 service_user: self
                     .server
@@ -665,58 +670,24 @@ impl RawOrchestrator {
                     .default_args
                     .unwrap_or_default(),
             },
-            jobs: JobsConfig {
-                // Slice 11 cutover: default to the new `v2` queue. An
-                // invalid value is a hard error rather than a silent
-                // fallback (a typo must not quietly send the orchestrator
-                // to the wrong backend). `legacy` remains selectable as
-                // an escape hatch until slice 12 drops it.
-                source: match self.jobs.source {
-                    Some(s) => s
-                        .parse()
-                        .map_err(|e: String| Error::Config(format!("[jobs].source: {e}")))?,
-                    None => JobSource::V2,
-                },
+            api: ApiConfig {
+                // Loopback only by default; the operator adds the
+                // docker-bridge gateway IP for the handler hop.
+                listen: self
+                    .api
+                    .listen
+                    .unwrap_or_else(|| vec!["127.0.0.1:8787".into()]),
+                cookie_path: self
+                    .api
+                    .cookie_path
+                    .unwrap_or_else(|| PathBuf::from("/etc/sbgh/daemon/.cookie")),
+                ingest_token: self.api.ingest_token,
             },
         })
     }
 }
 
 // ─────────────────────────── Shared helpers ───────────────────────────
-
-fn merge_auth(dst: &mut RawAuth, src: RawAuth) {
-    merge_opt(&mut dst.allowed_repositories, src.allowed_repositories);
-    merge_opt(&mut dst.allowed_users, src.allowed_users);
-    merge_opt(&mut dst.allowed_associations, src.allowed_associations);
-}
-
-fn apply_auth_env(auth: &mut RawAuth) {
-    env_csv_into(&mut auth.allowed_repositories, "SBGH_ALLOWED_REPOS");
-    env_csv_into(&mut auth.allowed_users, "SBGH_ALLOWED_USERS");
-    env_csv_into(&mut auth.allowed_associations, "SBGH_ALLOWED_ASSOCIATIONS");
-}
-
-fn build_auth(raw: RawAuth) -> AuthorizationConfig {
-    AuthorizationConfig {
-        allowed_repositories: raw
-            .allowed_repositories
-            .map(set_from)
-            .unwrap_or_default(),
-        allowed_users: raw
-            .allowed_users
-            .map(set_from)
-            .unwrap_or_default(),
-        allowed_associations: raw
-            .allowed_associations
-            .map(set_from)
-            .unwrap_or_else(|| {
-                ["OWNER", "MEMBER", "COLLABORATOR"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            }),
-    }
-}
 
 fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
     if let Some(v) = src {
@@ -754,10 +725,6 @@ fn env_csv_into(dst: &mut Option<Vec<String>>, key: &str) {
                 .collect(),
         );
     }
-}
-
-fn set_from(v: Vec<String>) -> HashSet<String> {
-    v.into_iter().collect()
 }
 
 fn required<T>(value: Option<T>, name: &str) -> Result<T> {
@@ -840,7 +807,11 @@ mod tests {
     // ─── HandlerConfig ───
 
     fn handler_env() -> Vec<(&'static str, &'static str)> {
-        vec![("DATABASE_URL", "postgres://h"), ("SBGH_WEBHOOK_SECRET", "hunter2")]
+        vec![
+            ("SBGH_API_URL", "http://api:8787"),
+            ("SBGH_API_INGEST_TOKEN", "ingest-tok"),
+            ("SBGH_WEBHOOK_SECRET", "hunter2"),
+        ]
     }
 
     #[test]
@@ -848,11 +819,19 @@ mod tests {
         let _g = EnvGuard::set(&handler_env());
         let cfg = HandlerConfig::load_layered(None).unwrap();
         assert_eq!(cfg.webhook.secret, "hunter2");
-        assert!(
-            cfg.authorization
-                .allowed_associations
-                .contains("OWNER")
-        );
+        assert_eq!(cfg.api.url, "http://api:8787");
+        assert_eq!(cfg.api.ingest_token, "ingest-tok");
+    }
+
+    #[test]
+    fn handler_api_ingest_token_in_toml_is_rejected() {
+        let _g = EnvGuard::set(&handler_env());
+        // The ingest token is env-only; a TOML `ingest_token` key must be a
+        // hard error (deny_unknown_fields), keeping the secret out of the
+        // bind-mounted config file.
+        let f = write("[api]\nurl = \"http://api\"\ningest_token = \"leaked\"\n");
+        let err = HandlerConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
     }
 
     #[test]
@@ -865,29 +844,27 @@ mod tests {
             [server]
             bind_addr = "0.0.0.0:8081"
 
-            [authorization]
-            allowed_repositories = ["acme/widgets"]
+            [api]
+            url = "http://toml-api"
             "#,
         );
         let cfg = HandlerConfig::load_layered(Some(f.path())).unwrap();
         assert_eq!(cfg.server.bind_addr, "127.0.0.1:9000", "env wins over TOML");
-        assert!(
-            cfg.authorization
-                .allowed_repositories
-                .contains("acme/widgets")
-        );
+        // TOML supplies [api].url; env (handler_env) overrides it.
+        assert_eq!(cfg.api.url, "http://api:8787", "env wins over TOML for api.url");
     }
 
     #[test]
     fn handler_missing_secret_errors() {
-        let _g = EnvGuard::set(&[("DATABASE_URL", "postgres://h")]);
+        // API env present but no webhook secret → Config error.
+        let _g = EnvGuard::set(&[("SBGH_API_URL", "http://api"), ("SBGH_API_INGEST_TOKEN", "tok")]);
         let err = HandlerConfig::load_layered(None).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }
 
-    // ─── OrchestratorConfig ───
+    // ─── DaemonConfig ───
 
-    fn orch_env() -> Vec<(&'static str, &'static str)> {
+    fn daemon_env() -> Vec<(&'static str, &'static str)> {
         vec![
             ("DATABASE_URL", "postgres://o"),
             ("SBGH_GH_CLIENT_ID", "Iv23litest123"),
@@ -899,9 +876,9 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_loads_from_env_only() {
-        let _g = EnvGuard::set(&orch_env());
-        let cfg = OrchestratorConfig::load_layered(None).unwrap();
+    fn daemon_loads_from_env_only() {
+        let _g = EnvGuard::set(&daemon_env());
+        let cfg = DaemonConfig::load_layered(None).unwrap();
         assert_eq!(cfg.github.client_id, "Iv23litest123");
         assert_eq!(cfg.lvm.vg_name, "sbgh-vg");
         // Default split: 4 vCPU / 16 GiB for build, 2 vCPU / 8 GiB for bench.
@@ -912,51 +889,63 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_env_overrides_toml() {
+    fn daemon_env_overrides_toml() {
         // Env wins on collision for both vcpus AND memory; memory parses
         // the IEC short-form ("12G") the same way the TOML loader does.
-        let mut env = orch_env();
+        let mut env = daemon_env();
         env.push(("SBGH_VM_BUILD_VCPUS", "12"));
         env.push(("SBGH_VM_BUILD_MEMORY", "24G"));
         let _g = EnvGuard::set(&env);
         let f = write("[vm]\nbuild_vcpus = 4\nbuild_memory = \"16G\"\n");
-        let cfg = OrchestratorConfig::load_layered(Some(f.path())).unwrap();
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         assert_eq!(cfg.vm.build_vcpus, 12);
         assert_eq!(cfg.vm.build_memory, crate::memory::MemorySize::from_gib(24));
     }
 
     #[test]
-    fn orchestrator_missing_required_field_errors() {
+    fn daemon_missing_required_field_errors() {
         let _g = EnvGuard::set(&[("SBGH_GH_CLIENT_ID", "Iv23litest")]);
-        let err = OrchestratorConfig::load_layered(None).unwrap_err();
+        let err = DaemonConfig::load_layered(None).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }
 
     #[test]
-    fn orchestrator_jobs_source_defaults_to_v2() {
-        // Slice 11 cutover flipped the default from legacy to v2.
-        let _g = EnvGuard::set(&orch_env());
-        let cfg = OrchestratorConfig::load_layered(None).unwrap();
-        assert_eq!(cfg.jobs.source, JobSource::V2);
+    fn daemon_api_defaults() {
+        let _g = EnvGuard::set(&daemon_env());
+        let cfg = DaemonConfig::load_layered(None).unwrap();
+        assert_eq!(cfg.api.listen, vec!["127.0.0.1:8787".to_string()]);
+        assert_eq!(cfg.api.cookie_path, PathBuf::from("/etc/sbgh/daemon/.cookie"));
+        assert_eq!(cfg.api.ingest_token, None);
     }
 
     #[test]
-    fn orchestrator_jobs_source_legacy_via_env() {
-        let mut env = orch_env();
-        env.push(("SBGH_JOBS_SOURCE", "legacy"));
+    fn daemon_api_from_toml_and_env() {
+        // TOML supplies the multi-listener bind + cookie path; env supplies
+        // the ingest token (the secret stays out of the config file).
+        let mut env = daemon_env();
+        env.push(("SBGH_API_INGEST_TOKEN", "ingest-secret"));
         let _g = EnvGuard::set(&env);
-        let cfg = OrchestratorConfig::load_layered(None).unwrap();
-        assert_eq!(cfg.jobs.source, JobSource::Legacy);
+        let f = write(
+            "[api]\nlisten = [\"127.0.0.1:9000\", \"172.17.0.1:9000\"]\ncookie_path = \
+             \"/etc/sbgh/daemon/.cookie\"\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert_eq!(cfg.api.listen, vec!["127.0.0.1:9000", "172.17.0.1:9000"]);
+        assert_eq!(
+            cfg.api
+                .ingest_token
+                .as_deref(),
+            Some("ingest-secret")
+        );
     }
 
     #[test]
-    fn orchestrator_invalid_jobs_source_errors() {
-        // A typo must be a hard error, not a silent fallback to legacy —
-        // otherwise the cutover could quietly stay on the wrong backend.
-        let mut env = orch_env();
-        env.push(("SBGH_JOBS_SOURCE", "leagcy"));
-        let _g = EnvGuard::set(&env);
-        let err = OrchestratorConfig::load_layered(None).unwrap_err();
+    fn daemon_api_ingest_token_in_toml_is_rejected() {
+        // The ingest secret is env-only; a TOML `[api].ingest_token` key is
+        // an unknown field (hard error), not silently honored.
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write("[api]\ningest_token = \"should-not-be-in-config\"\n");
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }
 

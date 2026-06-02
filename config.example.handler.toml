@@ -1,27 +1,32 @@
 # Example handler config. Copy to /etc/sbgh/handler/config.toml (or wherever
 # $SBGH_CONFIG points) and fill in.
 #
-# The handler holds **no** GitHub App credentials — only the webhook HMAC
-# secret. App-side identity (client_id, private key) lives only in the
-# orchestrator's config (see config.example.orchestrator.toml).
+# The handler holds **no** GitHub App credentials and **no** database access
+# — only the webhook HMAC secret and the daemon `/api` URL + ingest
+# token. App-side identity (client_id, private key) and all persistence live
+# in the daemon (see config.example.daemon.toml).
 #
 # Secret values can also come from env:
-#   DATABASE_URL                — overrides [server].database_url
-#   SBGH_WEBHOOK_SECRET         — overrides [webhook].secret
-# The compose stack passes DATABASE_URL via env (so the password isn't in
-# this file) and sources SBGH_WEBHOOK_SECRET from secrets.env.
+#   SBGH_API_URL            — overrides [api].url
+#   SBGH_API_INGEST_TOKEN   — sets the ingest token (env-only; never in TOML)
+#   SBGH_WEBHOOK_SECRET     — overrides [webhook].secret
+# The compose stack sources SBGH_WEBHOOK_SECRET and SBGH_API_INGEST_TOKEN
+# from secrets.env so neither lands in this file.
 
 [server]
 bind_addr = "0.0.0.0:8080"
-# database_url is set via env (DATABASE_URL) by compose so the role password
-# stays in docker/.env. For host-side debugging, set it here.
-# database_url = "postgres://sbgh_handler:CHANGE_ME@127.0.0.1:5432/sbgh"
+
+[api]
+# Base URL of the daemon /api. The handler runs in a container and the
+# daemon on the host, so reach it via the docker host gateway. The
+# compose stack sets this via SBGH_API_URL.
+url = "http://host.docker.internal:8787"
+# ingest_token is env-only (SBGH_API_INGEST_TOKEN) — a key here is rejected.
 
 [webhook]
 # Set via secrets.env in the deployed stack — leave commented here.
 # secret = "<openssl rand -hex 32>"
 
-[authorization]
-allowed_repositories = ["cylewitruk/stacks-core"]
-allowed_users = []
-allowed_associations = ["OWNER", "MEMBER", "COLLABORATOR"]
+# Note: the handler no longer has an authorization allowlist. Who may
+# trigger benchmarks is enforced by the daemon (DB-backed
+# installer/repo/policy/user allowlists managed via `sbgh-cli`), not here.

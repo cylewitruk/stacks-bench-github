@@ -15,25 +15,25 @@ name = "sbgh-cli"
 path = "src/main.rs"
 
 [dependencies]
+# `sbgh-core` for the `sbgh_core::admin` re-exports (lib, test-only);
+# `sbgh-api` for the client + DTOs (bin). No DB access — the CLI is a pure
+# `/api` client since Phase 5.
 sbgh-core.workspace = true
+sbgh-api.workspace = true
 
 tokio.workspace = true
 anyhow.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
-sqlx.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
-reqwest.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 # Re-imports sbgh-core with the `testing` feature so integration tests
-# can use the shared setup_pg() helper.
+# can use the shared setup_pg_db() helper.
 sbgh-core = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["full", "test-util"] }
-uuid.workspace = true
+tokio = { workspace = true, features = ["full"] }
 # In-process mock of GitHub's /users/{login} endpoint for installer tests.
 axum.workspace = true
+# Test-only: direct SQL for seeding fixtures + asserting row state.
+sqlx.workspace = true

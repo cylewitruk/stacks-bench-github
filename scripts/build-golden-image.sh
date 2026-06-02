@@ -5,8 +5,8 @@
 # install commands, boot the cloud image as a transient libvirt VM with that
 # ISO attached, let cloud-init run, then power off. cloud-init lives inside
 # the real VM and uses libvirt's networking (the same `default` network the
-# orchestrator will use for benchmark VMs) — so any DNS / networking issues
-# we hit here are exactly the ones the orchestrator would hit, which makes
+# daemon will use for benchmark VMs) — so any DNS / networking issues
+# we hit here are exactly the ones the daemon would hit, which makes
 # this both more reliable and a useful smoke test of host networking.
 #
 # This replaces an earlier `virt-customize` approach that broke on hosts
@@ -15,7 +15,7 @@
 # and the appliance can't reach anything useful).
 #
 # Output: a qcow2 image at the path passed as $1, ready to be referenced by
-# `[vm].golden_image` in the orchestrator config.
+# `[vm].golden_image` in the daemon config.
 #
 # Requires (on the build host): qemu-utils, cloud-image-utils,
 # libvirt-daemon-system, virtinst, libguestfs-tools (for virt-sysprep),
@@ -135,7 +135,7 @@ PACKAGES=(
     zstd
     protobuf-compiler
     # sccache caches rustc output to a persistent per-host dir bind-
-    # mounted from the orchestrator via virtio-fs (tag=`sccache`,
+    # mounted from the daemon via virtio-fs (tag=`sccache`,
     # mount=/var/cache/sccache). RUSTC_WRAPPER=sccache + SCCACHE_DIR
     # are exported by sbgh-run.sh.tmpl before `cargo build`, so cold
     # builds in subsequent jobs hit the cache and finish in single-

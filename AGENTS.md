@@ -23,6 +23,21 @@ fall-back to custom tool calls if necessary.
   This is supported by `just build`, `just install`, `just lint`,
   `just fix`, and `just test`.
 
+## Database Tests
+
+Integration tests that need Postgres pick one of two helpers in
+`sbgh-core::db::test_support`:
+
+- `setup_pg_db()` (default) — a fresh, migrated database on a shared,
+  compose-managed server; the returned guard drops it on teardown. Use for
+  schema-isolated tests.
+- `setup_pg()` — a dedicated testcontainers Postgres per test, for suites
+  needing full cluster isolation. The `sbgh-cli` suites still use it, but
+  since the Phase 6 role collapse they no longer touch cluster-global
+  objects and could move to `setup_pg_db()`.
+
+`just test` auto-starts the shared server. Both require Docker.
+
 ## Coding Style
 
 Write clear, concise, idiomatic and best-practice-driven code for any given

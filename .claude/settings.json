@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check)",
+      "Bash(cargo check *)",
+      "Bash(cargo build)",
+      "Bash(cargo build *)",
+      "Bash(just lint)",
+      "Bash(just lint *)",
+      "Bash(just build)",
+      "Bash(just build *)",
+      "mcp__rust-mcp__crate_versions",
+      "mcp__rust-mcp__crate_api",
+      "mcp__rust-mcp__crate_type_info",
+      "mcp__rust-mcp__crate_intel",
+      "mcp__rust-mcp__source_search",
+      "mcp__rust-mcp__crate_search",
+      "mcp__rust-mcp__crate_compare",
+      "mcp__rust-mcp__source_read"
+    ]
+  }
+}

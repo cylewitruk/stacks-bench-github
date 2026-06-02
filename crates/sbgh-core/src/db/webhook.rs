@@ -1,4 +1,4 @@
-//! `WebhookInbox` — the data-layer trait the orchestrator's webhook
+//! `WebhookInbox` — the data-layer trait the daemon's webhook
 //! processor uses to claim, classify, and retire rows in
 //! `github_webhook`. Slice 2a introduces the trait + impls; slice 2b
 //! plugs in actual classification logic.

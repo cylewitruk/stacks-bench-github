@@ -37,26 +37,19 @@ toml.workspace = true
 # Slice 5 trigger_policy: regex matching for tag_pattern triggers.
 regex.workspace = true
 
-# Test-only deps activated by the `testing` feature. Marked optional so
-# they don't bloat release builds, but reachable from downstream crates
-# (sbgh-handler / sbgh-orchestrator) via `features = ["testing"]` —
-# which is how `tests/postgres_*.rs` get access to the shared
-# `setup_pg()` helper without each crate having to re-declare
-# testcontainers as its own dev-dep.
-testcontainers = { workspace = true, optional = true }
-testcontainers-modules = { workspace = true, optional = true }
-
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
 
 # sbgh-core's own integration tests need the `testing` feature for the
-# shared setup_pg() + in-memory stores. Self-dep is the canonical way
-# to enable features only for tests.
+# shared setup_pg_db() helper + in-memory stores. Self-dep is the canonical
+# way to enable features only for tests.
 sbgh-core = { path = ".", features = ["testing"] }
 
 [features]
 # Exposes in-memory / fake implementations of the GitHubApi and JobStore
-# traits, plus a shared `setup_pg()` testcontainers helper, for downstream
-# test code. Never enable in release builds.
-testing = ["dep:testcontainers", "dep:testcontainers-modules"]
+# traits, plus the shared `setup_pg_db()` Postgres helper, for downstream
+# test code. Never enable in release builds. (The helper talks to the
+# compose-managed test server started by the nextest setup script — no
+# extra deps.)
+testing = []

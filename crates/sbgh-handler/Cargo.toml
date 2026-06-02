@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 sbgh-core.workspace = true
+sbgh-api.workspace = true
 
 tokio.workspace = true
 
@@ -28,13 +29,10 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-sqlx.workspace = true
 dotenvy.workspace = true
-uuid.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
-sbgh-core = { workspace = true, features = ["testing"] }
 tower = { workspace = true, features = ["util"] }
 hmac.workspace = true
 sha2.workspace = true

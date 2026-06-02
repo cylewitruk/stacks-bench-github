@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Download the latest Stacks mainnet chainstate, verify SHA-256, extract into
 # a fresh dated LVM-thin volume, and (by default) lvremove older chainstate
-# baselines so the new one becomes what the orchestrator picks up.
+# baselines so the new one becomes what the daemon picks up.
 #
-# The orchestrator selects the lexicographically-newest LV matching
+# The daemon selects the lexicographically-newest LV matching
 # `[lvm].chainstate_base_prefix`, so naming the new LV with today's date
 # automatically makes it the active baseline.
 #
@@ -36,7 +36,7 @@ Options:
   --thinpool NAME      Thin pool inside the VG. Default: ${THINPOOL}.
   --prefix STR         Chainstate LV name prefix. Default: ${PREFIX}.
                        (Must match \`[lvm].chainstate_base_prefix\` in the
-                       orchestrator config.)
+                       daemon config.)
   --base-size SIZE     Virtual size of the new base LV. Default: ${BASE_SIZE}.
   --scratch-size SIZE  Virtual size of scratch LV for the .zst. Default: ${SCRATCH_SIZE}.
   --connections N      aria2 parallel connections. Default: ${CONNECTIONS}.
@@ -102,7 +102,7 @@ fi
 #     made it.
 #   - BASE_LV is the deliverable: keep on success, lvremove on failure.
 #     An empty/partial base LV is actively dangerous because the
-#     orchestrator picks the lexicographically newest mainnet-* LV at
+#     daemon picks the lexicographically newest mainnet-* LV at
 #     job pickup — leaving a poisoned LV around means every subsequent
 #     /benchmark fails with "Unable to open chainstate sqlite". So
 #     `BASE_POPULATED=1` is set ONLY after the extract pipeline returns

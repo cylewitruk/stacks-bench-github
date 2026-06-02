@@ -1,6 +1,6 @@
 //! Slice 4 integration tests for `sbgh-cli repo ...`. Pure-SQL paths
 //! (`disable_repo_root_by_id`, `list_repo_roots`) run against a real
-//! testcontainers Postgres. The login-resolution paths (`allow_repo_root`,
+//! Postgres. The login-resolution paths (`allow_repo_root`,
 //! `disable_repo_root` by owner/name) are covered via an in-process
 //! axum mock of `/repos/{owner}/{repo}`.
 
@@ -13,15 +13,11 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use sbgh_cli::repo::RepoError;
 use sbgh_cli::{
-    allow_repo_root, apply_roles, disable_repo_root, disable_repo_root_by_id, list_repo_roots,
+    RepoError, allow_repo_root, disable_repo_root, disable_repo_root_by_id, list_repo_roots,
 };
-use sbgh_core::db::{Pool, setup_pg};
+use sbgh_core::db::{Pool, setup_pg_db};
 use tokio::sync::oneshot;
-
-const HANDLER_PW: &str = "handler-test-pw";
-const ORCH_PW: &str = "orch-test-pw";
 
 async fn seed_supported_row(pool: &Pool, repo_id: i64, owner: &str, name: &str, is_enabled: bool) {
     sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES ($1, $2, $3)")
@@ -86,12 +82,7 @@ fn canonical_repo_body(id: i64, owner: &str, name: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn list_repo_roots_returns_seeded_rows_sorted_by_owner_name() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_supported_row(&pool, 1, "zorro", "zrepo", true).await;
     seed_supported_row(&pool, 2, "alice", "arepo", true).await;
     seed_supported_row(&pool, 3, "alice", "brepo", false).await;
@@ -116,12 +107,7 @@ async fn list_repo_roots_returns_seeded_rows_sorted_by_owner_name() {
 
 #[tokio::test]
 async fn disable_repo_root_by_id_flips_is_enabled_to_false() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_supported_row(&pool, 10, "stacks-network", "stacks-core", true).await;
 
     let row = disable_repo_root_by_id(&pool, 10)
@@ -133,12 +119,7 @@ async fn disable_repo_root_by_id_flips_is_enabled_to_false() {
 
 #[tokio::test]
 async fn disable_repo_root_by_id_returns_not_on_supported_list_for_unknown() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     let err = disable_repo_root_by_id(&pool, 999)
         .await
         .unwrap_err();
@@ -149,12 +130,7 @@ async fn disable_repo_root_by_id_returns_not_on_supported_list_for_unknown() {
 
 #[tokio::test]
 async fn allow_repo_root_resolves_owner_name_and_upserts_identity_and_supported() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     let (api_base, _shutdown) = start_mock_gh(HashMap::from([(
         ("stacks-network".to_string(), "stacks-core".to_string()),
         canonical_repo_body(10, "stacks-network", "stacks-core"),
@@ -183,12 +159,7 @@ async fn allow_repo_root_resolves_owner_name_and_upserts_identity_and_supported(
 
 #[tokio::test]
 async fn allow_repo_root_returns_repo_not_found_when_gh_404s() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     let (api_base, _shutdown) = start_mock_gh(HashMap::new()).await;
 
     let err = allow_repo_root(&pool, &api_base, "ghost", "repo", None)
@@ -202,12 +173,7 @@ async fn allow_repo_root_is_idempotent_on_redelivery() {
     // Re-running `allow` for an already-allowed repo refreshes
     // owner/name (in case of rename) and re-asserts is_enabled=TRUE,
     // without disturbing fork lineage columns.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     let (api_base, _shutdown) = start_mock_gh(HashMap::from([(
         ("stacks-network".to_string(), "stacks-core".to_string()),
         canonical_repo_body(10, "stacks-network", "stacks-core"),
@@ -232,12 +198,7 @@ async fn disable_repo_root_resolves_then_disables_by_id() {
     // Codex-style invariant carried forward from slice 3: the SQL
     // UPDATE must target the numeric PK that the GH API resolves to,
     // not whichever row happens to share the typed owner/name.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
-    apply_roles(&pool, HANDLER_PW, ORCH_PW)
-        .await
-        .unwrap();
+    let (_db, pool) = setup_pg_db().await;
     seed_supported_row(&pool, 10, "stacks-network", "stacks-core", true).await;
     let (api_base, _shutdown) = start_mock_gh(HashMap::from([(
         ("stacks-network".to_string(), "stacks-core".to_string()),

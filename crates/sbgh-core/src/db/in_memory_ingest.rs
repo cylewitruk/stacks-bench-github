@@ -1,19 +1,13 @@
-//! In-memory `IngestStore` for unit tests. Wraps an `InMemoryJobStore`
-//! for the legacy enqueue half of the dual-write. No real transaction
-//! semantics — webhook insertion happens first; if it succeeds, the
-//! job enqueue runs unconditionally. Good enough to exercise handler
-//! control flow including dedupe.
+//! In-memory `IngestStore` for unit tests. Records webhook rows with
+//! dedupe-on-`delivery_id`; good enough to exercise handler control flow.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
 use crate::Result;
-use crate::db::in_memory_jobs::InMemoryJobStore;
 use crate::db::ingest::{IngestOutcome, IngestStore, NewWebhook};
-use crate::db::jobs::JobStore;
-use crate::models::NewJob;
 
 /// What we keep about each ingested webhook for test assertions.
 /// Mirrors the github_webhook table's handler-written columns.
@@ -28,7 +22,6 @@ pub struct WebhookRow {
 }
 
 pub struct InMemoryIngestStore {
-    jobs: Arc<InMemoryJobStore>,
     webhooks: Mutex<Vec<WebhookRow>>,
     next_id: AtomicI64,
 }
@@ -42,14 +35,9 @@ impl Default for InMemoryIngestStore {
 impl InMemoryIngestStore {
     pub fn new() -> Self {
         Self {
-            jobs: Arc::new(InMemoryJobStore::new()),
             webhooks: Mutex::new(Vec::new()),
             next_id: AtomicI64::new(1),
         }
-    }
-
-    pub fn jobs(&self) -> &Arc<InMemoryJobStore> {
-        &self.jobs
     }
 
     pub fn webhooks(&self) -> Vec<WebhookRow> {
@@ -57,6 +45,13 @@ impl InMemoryIngestStore {
             .lock()
             .unwrap()
             .clone()
+    }
+
+    pub fn webhook_count(&self) -> usize {
+        self.webhooks
+            .lock()
+            .unwrap()
+            .len()
     }
 
     fn alloc_id(&self) -> i64 {
@@ -89,32 +84,8 @@ impl InMemoryIngestStore {
 impl IngestStore for InMemoryIngestStore {
     async fn ingest_webhook(&self, webhook: &NewWebhook) -> Result<IngestOutcome> {
         Ok(match self.insert_webhook(webhook) {
-            Some(id) => IngestOutcome::Recorded { webhook_id: id, job_id: None },
+            Some(id) => IngestOutcome::Recorded { webhook_id: id },
             None => IngestOutcome::Duplicate,
         })
-    }
-
-    async fn ingest_webhook_and_job(
-        &self,
-        webhook: &NewWebhook,
-        new_job: &NewJob,
-    ) -> Result<IngestOutcome> {
-        let Some(webhook_id) = self.insert_webhook(webhook) else {
-            return Ok(IngestOutcome::Duplicate);
-        };
-        let job_id = self
-            .jobs
-            .enqueue(new_job)
-            .await?;
-        Ok(IngestOutcome::Recorded { webhook_id, job_id })
-    }
-}
-
-impl InMemoryIngestStore {
-    pub fn webhook_count(&self) -> usize {
-        self.webhooks
-            .lock()
-            .unwrap()
-            .len()
     }
 }

@@ -4,7 +4,7 @@
 //! (set on close, cleared on reopen, idempotent), and the FK enforcement
 //! on author + repos.
 
-use sbgh_core::db::{NewPullRequest, PostgresPullRequestStore, PullRequestStore, setup_pg};
+use sbgh_core::db::{NewPullRequest, PostgresPullRequestStore, PullRequestStore, setup_pg_db};
 
 async fn seed_repo(pool: &sbgh_core::db::Pool, repo_id: i64, owner: &str, name: &str) {
     sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES ($1, $2, $3)")
@@ -27,9 +27,7 @@ async fn seed_user(pool: &sbgh_core::db::Pool, user_id: i64, login: &str) {
 
 #[tokio::test]
 async fn upsert_creates_then_refreshes_title_only() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_repo(&pool, 10, "o", "r").await;
     seed_repo(&pool, 20, "alice", "r").await;
     seed_user(&pool, 42, "alice").await;
@@ -69,9 +67,7 @@ async fn upsert_does_not_clobber_closed_at() {
     // A late opened/edited/synchronize event MUST NOT reopen a closed
     // PR. The dedicated `set_closed_at` path is the only writer of
     // closed_at.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_repo(&pool, 10, "o", "r").await;
     seed_repo(&pool, 20, "alice", "r").await;
     seed_user(&pool, 42, "alice").await;
@@ -112,9 +108,7 @@ async fn upsert_does_not_clobber_closed_at() {
 
 #[tokio::test]
 async fn unique_target_pr_number_is_enforced() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_repo(&pool, 10, "o", "r").await;
     seed_repo(&pool, 20, "alice", "r").await;
     seed_repo(&pool, 30, "bob", "r").await;
@@ -159,9 +153,7 @@ async fn unique_target_pr_number_is_enforced() {
 
 #[tokio::test]
 async fn upsert_rejects_unknown_author() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_repo(&pool, 10, "o", "r").await;
     seed_repo(&pool, 20, "alice", "r").await;
     let store = PostgresPullRequestStore::new(pool.clone());
@@ -180,9 +172,7 @@ async fn upsert_rejects_unknown_author() {
 
 #[tokio::test]
 async fn upsert_rejects_unknown_repo() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_repo(&pool, 10, "o", "r").await;
     seed_user(&pool, 42, "alice").await;
     let store = PostgresPullRequestStore::new(pool.clone());
@@ -201,9 +191,7 @@ async fn upsert_rejects_unknown_repo() {
 
 #[tokio::test]
 async fn set_closed_at_toggle_is_idempotent() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_repo(&pool, 10, "o", "r").await;
     seed_repo(&pool, 20, "alice", "r").await;
     seed_user(&pool, 42, "alice").await;
@@ -246,9 +234,7 @@ async fn set_closed_at_toggle_is_idempotent() {
 
 #[tokio::test]
 async fn set_closed_at_returns_none_for_unknown_pr() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresPullRequestStore::new(pool.clone());
     let none = store
         .set_closed_at(999, 999, Some(chrono::Utc::now()))
@@ -261,9 +247,7 @@ async fn set_closed_at_returns_none_for_unknown_pr() {
 async fn internal_pr_with_target_and_source_same_repo_works() {
     // Internal (non-cross-fork) PR: target == source. Schema allows
     // (two separate FKs to the same row), code shouldn't reject it.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_repo(&pool, 10, "o", "r").await;
     seed_user(&pool, 42, "alice").await;
     let store = PostgresPullRequestStore::new(pool.clone());

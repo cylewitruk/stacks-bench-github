@@ -3,13 +3,13 @@ mod state;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
 use clap::Parser;
+use sbgh_api::Client;
 use sbgh_core::config::HandlerConfig;
-use sbgh_core::db::{self, PostgresIngestStore};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
@@ -34,13 +34,20 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = HandlerConfig::load().context("loading config")?;
-    // Connect using the narrow `sbgh_handler` role — INSERT-only. The
-    // database schema is established by `sbgh-cli migrate` (running as the
-    // owner role) before this binary starts.
-    let pool = db::connect(&config.server.database_url)
-        .await
-        .context("connecting to postgres")?;
-    let ingest = Arc::new(PostgresIngestStore::new(pool));
+    // No DB: verified deliveries are forwarded to the daemon `/api`
+    // with the `ingest`-scope token. The daemon owns all persistence. Pin a
+    // short timeout — this is a web-facing path and a stalled daemon must
+    // not tie up handler request capacity.
+    let api = Client::with_timeout(
+        config.api.url.clone(),
+        Some(
+            config
+                .api
+                .ingest_token
+                .clone(),
+        ),
+        Duration::from_secs(10),
+    );
 
     let bind_addr: SocketAddr = config
         .server
@@ -48,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("parsing server.bind_addr")?;
 
-    let state = AppState { config, ingest };
+    let state = AppState { config, api };
 
     let app = Router::new()
         .merge(routes::router())

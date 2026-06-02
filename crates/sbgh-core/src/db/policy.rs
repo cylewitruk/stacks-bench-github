@@ -8,11 +8,13 @@
 //!      repo)`, and `list_enabled_triggers(install, repo, kind)`. Read-only, no
 //!      side effects.
 //!
-//!   2. **The CLI** seeds policies via owner credentials:
-//!      `upsert_target_policy`, `upsert_source_policy`, `add_trigger_policy`,
-//!      plus the corresponding disable / list helpers. Operator-curated;
-//!      processor never writes through the trait (its grants exclude INSERT —
-//!      see slice 5 grants in `sbgh-cli/src/lib.rs::apply_roles`).
+//!   2. **Admin writes** seed policies — the operator drives them through the
+//!      daemon `/api` (which runs `sbgh_core::admin`): `upsert_target_policy`,
+//!      `upsert_source_policy`, `add_trigger_policy`, plus the corresponding
+//!      disable / list helpers. Operator-curated; the processor only reads
+//!      through the trait (and flips `is_enabled` on install-deleted cleanup),
+//!      never seeds. Before roadmap-v3 Phase 6 a narrow DB role enforced that;
+//!      now the daemon is the single owner, so it's a code-level boundary.
 //!
 //! Disable-on-install-deleted is NOT in this trait — it lives in
 //! `InstallationStore::delete_installation` so the slice-5 cleanup

@@ -1,0 +1,167 @@
+//! `/api/policies/{target,source,triggers}` — per-installation gating of
+//! which repos are benchmark targets / trusted PR sources, and which
+//! pushes/tags auto-trigger a baseline.
+
+use axum::Json;
+use axum::extract::{Query, State};
+use sbgh_api::{
+    AddTriggerRequest, AllowPolicyRequest, DisablePolicyRequest, PolicyView, TriggerView,
+};
+use sbgh_core::admin;
+use sbgh_core::models::{SourceRepoPolicy, TargetRepoPolicy, TriggerKind, TriggerPolicy};
+use serde::Deserialize;
+
+use crate::api::conv::{enum_str, parse_enum};
+use crate::api::error::ApiErr;
+use crate::api::extract::ApiJson;
+use crate::api::state::ApiState;
+
+#[derive(Debug, Deserialize)]
+pub struct InstallFilter {
+    install_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TriggerFilter {
+    install_id: Option<i64>,
+    repo_id: Option<i64>,
+}
+
+fn target_view(r: TargetRepoPolicy) -> PolicyView {
+    PolicyView {
+        install_id: r.github_installation_id,
+        repo_id: r.github_repo_id,
+        is_enabled: r.is_enabled,
+        note: r.note,
+    }
+}
+
+fn source_view(r: SourceRepoPolicy) -> PolicyView {
+    PolicyView {
+        install_id: r.github_installation_id,
+        repo_id: r.github_repo_id,
+        is_enabled: r.is_enabled,
+        note: r.note,
+    }
+}
+
+fn trigger_view(r: TriggerPolicy) -> TriggerView {
+    TriggerView {
+        id: r.id,
+        install_id: r.github_installation_id,
+        repo_id: r.github_repo_id,
+        kind: enum_str(&r.trigger_kind),
+        match_spec: r.match_spec.0,
+        bench_args: r.bench_args,
+        is_enabled: r.is_enabled,
+        note: r.note,
+    }
+}
+
+// ─── target ────────────────────────────────────────────────────────────
+
+pub async fn list_target(
+    State(s): State<ApiState>,
+    Query(f): Query<InstallFilter>,
+) -> Result<Json<Vec<PolicyView>>, ApiErr> {
+    let rows = admin::list_target_policies(&s.pool, f.install_id).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(target_view)
+            .collect(),
+    ))
+}
+
+pub async fn allow_target(
+    State(s): State<ApiState>,
+    ApiJson(req): ApiJson<AllowPolicyRequest>,
+) -> Result<Json<PolicyView>, ApiErr> {
+    let row = admin::allow_target_policy(&s.pool, req.install_id, req.repo_id, req.note.as_deref())
+        .await?;
+    Ok(Json(target_view(row)))
+}
+
+pub async fn disable_target(
+    State(s): State<ApiState>,
+    ApiJson(req): ApiJson<DisablePolicyRequest>,
+) -> Result<Json<PolicyView>, ApiErr> {
+    let row = admin::disable_target_policy(&s.pool, req.install_id, req.repo_id).await?;
+    Ok(Json(target_view(row)))
+}
+
+// ─── source ────────────────────────────────────────────────────────────
+
+pub async fn list_source(
+    State(s): State<ApiState>,
+    Query(f): Query<InstallFilter>,
+) -> Result<Json<Vec<PolicyView>>, ApiErr> {
+    let rows = admin::list_source_policies(&s.pool, f.install_id).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(source_view)
+            .collect(),
+    ))
+}
+
+pub async fn allow_source(
+    State(s): State<ApiState>,
+    ApiJson(req): ApiJson<AllowPolicyRequest>,
+) -> Result<Json<PolicyView>, ApiErr> {
+    let row = admin::allow_source_policy(&s.pool, req.install_id, req.repo_id, req.note.as_deref())
+        .await?;
+    Ok(Json(source_view(row)))
+}
+
+pub async fn disable_source(
+    State(s): State<ApiState>,
+    ApiJson(req): ApiJson<DisablePolicyRequest>,
+) -> Result<Json<PolicyView>, ApiErr> {
+    let row = admin::disable_source_policy(&s.pool, req.install_id, req.repo_id).await?;
+    Ok(Json(source_view(row)))
+}
+
+// ─── triggers ──────────────────────────────────────────────────────────
+
+pub async fn list_triggers(
+    State(s): State<ApiState>,
+    Query(f): Query<TriggerFilter>,
+) -> Result<Json<Vec<TriggerView>>, ApiErr> {
+    let rows = admin::list_trigger_policies(&s.pool, f.install_id, f.repo_id).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(trigger_view)
+            .collect(),
+    ))
+}
+
+pub async fn add_trigger(
+    State(s): State<ApiState>,
+    ApiJson(req): ApiJson<AddTriggerRequest>,
+) -> Result<Json<TriggerView>, ApiErr> {
+    let kind: TriggerKind = parse_enum(&req.kind)
+        .ok_or_else(|| ApiErr::bad_request("`kind` must be `branch_push` or `tag_created`"))?;
+    let row = admin::add_trigger_policy(
+        &s.pool,
+        req.install_id,
+        req.repo_id,
+        kind,
+        &req.match_spec.to_string(),
+        req.bench_args.as_deref(),
+        req.note.as_deref(),
+    )
+    .await?;
+    Ok(Json(trigger_view(row)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TriggerId {
+    pub id: i64,
+}
+
+pub async fn disable_trigger(
+    State(s): State<ApiState>,
+    axum::extract::Path(TriggerId { id }): axum::extract::Path<TriggerId>,
+) -> Result<Json<TriggerView>, ApiErr> {
+    let row = admin::disable_trigger_policy(&s.pool, id).await?;
+    Ok(Json(trigger_view(row)))
+}

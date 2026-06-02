@@ -1,5 +1,6 @@
-# Run handler + smee + Postgres + one-shot migrate on the orchestrator host.
-# The orchestrator itself stays on the host (LVM + libvirt + golden image).
+# Run handler + smee + Postgres on the daemon host. The daemon
+# itself stays on the host (LVM + libvirt + golden image) and owns schema
+# migrations — it applies them at startup, so there is no migrate one-shot.
 #
 # Security boundary enforced here. Default uids picked low in the system
 # range (900–902) to avoid the common Ubuntu allocations 997/998/999 used
@@ -7,21 +8,24 @@
 #   - postgres            runs as uid ${POSTGRES_UID:-900}, overriding the
 #                         image baseline of 999 so we don't share the
 #                         host's dnsmasq uid.
-#   - sbgh-cli (migrate)  runs as the DB *owner* role (full access). One-shot
-#                         via the `migrate` subcommand at deploy time.
-#   - sbgh-handler        runs as uid ${SBGH_UID:-901} and connects as
-#                         `sbgh_handler` — INSERT on jobs only. Holds the
-#                         webhook HMAC secret; NO GitHub App credentials.
+#   - sbgh-handler        runs as uid ${SBGH_UID:-901}. Verifies the webhook
+#                         HMAC and forwards to the daemon `/api`
+#                         (ingest scope). NO database role, NO GitHub App
+#                         credentials. Holds only the HMAC secret + the
+#                         shared ingest token.
 #   - sbgh-smee           runs as uid ${SBGH_SMEE_UID:-903}. No secrets,
 #                         no mounts — distinct uid is just defense-in-
 #                         depth against a future container escape.
-#   - sbgh-orchestrator   runs ON THE HOST as uid 902, connects as
-#                         `sbgh_orch` (SELECT + UPDATE on jobs), and holds
-#                         the GitHub App private key.
+#   - sbgh-daemon         runs ON THE HOST as uid 902, connects as the DB
+#                         owner (`sbgh` — the sole DB client: it migrates,
+#                         serves /api, and runs the processor), and holds
+#                         the GitHub App private key. Since Phase 6 there is
+#                         a single DB role (the owner); the old
+#                         `sbgh_orch`/`sbgh_handler` roles are gone.
 #
 # Two config dirs on the host, never shared:
 #   ${SBGH_HANDLER_CONFIG_DIR:-/etc/sbgh/handler}      → handler container
-#   ${SBGH_ORCH_CONFIG_DIR:-/etc/sbgh/orchestrator}    → host orchestrator
+#   ${SBGH_DAEMON_CONFIG_DIR:-/etc/sbgh/daemon}        → host daemon
 #
 # Bring up:   docker compose -f docker/docker-compose.yml up -d
 # Tail logs:  docker compose -f docker/docker-compose.yml logs -f handler
@@ -30,8 +34,6 @@
 # Required in docker/.env (no sensible defaults):
 #   SMEE_CHANNEL                — your https://smee.io/<...> URL
 #   POSTGRES_OWNER_PASSWORD     — password for the `sbgh` DB owner
-#   SBGH_HANDLER_DB_PASSWORD    — password for the `sbgh_handler` role
-#   SBGH_ORCH_DB_PASSWORD       — password for the `sbgh_orch` role
 #
 # Optional knobs: SBGH_UID, SBGH_GID, RUST_LOG, POSTGRES_DATA_DIR,
 # SBGH_HANDLER_CONFIG_DIR.
@@ -54,7 +56,7 @@ services:
       POSTGRES_USER: sbgh
       POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD must be set in docker/.env}
       POSTGRES_DB: sbgh
-    # Bind to loopback so the host-side orchestrator can reach it on
+    # Bind to loopback so the host-side daemon can reach it on
     # 127.0.0.1:5432. Containers on `sbgh-net` reach it as `postgres:5432`.
     ports:
       - "127.0.0.1:5432:5432"
@@ -78,33 +80,6 @@ services:
       retries: 20
     networks: [sbgh-net]
 
-  # One-shot: apply schema migrations + (re)create the narrow runtime roles
-  # with the passwords from .env. Invokes the `migrate` subcommand of
-  # `sbgh-cli` (the default when no subcommand is given — matches the
-  # legacy `sbgh-migrate` binary's behavior). Handler + smee wait for
-  # this to exit cleanly before they start, so handler always opens its
-  # pool against a fully-grants'd `sbgh_handler` role.
-  migrate:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      target: cli
-    image: sbgh-cli:latest
-    container_name: sbgh-cli-migrate
-    restart: "no"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    command: ["migrate"]
-    environment:
-      # Owner DSN — full access. Lives only in this container's env;
-      # never given to the handler or orchestrator.
-      DATABASE_URL: postgres://sbgh:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD must be set in docker/.env}@postgres:5432/sbgh
-      SBGH_HANDLER_DB_PASSWORD: ${SBGH_HANDLER_DB_PASSWORD:?SBGH_HANDLER_DB_PASSWORD must be set in docker/.env}
-      SBGH_ORCH_DB_PASSWORD: ${SBGH_ORCH_DB_PASSWORD:?SBGH_ORCH_DB_PASSWORD must be set in docker/.env}
-      RUST_LOG: ${RUST_LOG:-info,sbgh_cli=debug,sqlx=warn}
-    networks: [sbgh-net]
-
   handler:
     build:
       context: ..
@@ -117,18 +92,23 @@ services:
     container_name: sbgh-handler
     restart: *restart
     user: "${SBGH_UID:-901}:${SBGH_GID:-901}"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
+    # No DB dependency: the handler forwards verified deliveries to the
+    # daemon `/api` and holds no database role. If the daemon is
+    # briefly unreachable it returns 502 and GitHub redelivers, so there's
+    # nothing here to wait on.
+    extra_hosts:
+      # Reach the host-side daemon `/api` from inside the container.
+      - "host.docker.internal:host-gateway"
     environment:
-      # Connect as the narrow `sbgh_handler` role — INSERT on jobs only.
-      DATABASE_URL: postgres://sbgh_handler:${SBGH_HANDLER_DB_PASSWORD:?SBGH_HANDLER_DB_PASSWORD must be set in docker/.env}@postgres:5432/sbgh
-      RUST_LOG: ${RUST_LOG:-info,sbgh_handler=debug,sqlx=warn,tower_http=warn}
-    # secrets.env holds SBGH_WEBHOOK_SECRET. The handler has nothing else
-    # security-relevant — no App ID, no PEM path — so a compromised
-    # container can't impersonate the App.
+      # Daemon /api base URL (host daemon, via the docker host
+      # gateway) for webhook submission.
+      SBGH_API_URL: ${SBGH_API_URL:-http://host.docker.internal:8787}
+      RUST_LOG: ${RUST_LOG:-info,sbgh_handler=debug,tower_http=warn}
+    # secrets.env holds SBGH_WEBHOOK_SECRET (HMAC) and SBGH_API_INGEST_TOKEN
+    # (the shared `ingest`-scope token the daemon validates). The handler
+    # has nothing else security-relevant — no App ID, no PEM path, no DB
+    # password — so a compromised container can't impersonate the App or
+    # read state.
     env_file:
       - ${SBGH_HANDLER_CONFIG_DIR:-/etc/sbgh/handler}/secrets.env
     # Bind-mount the handler-owned config dir read-only at the same path

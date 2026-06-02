@@ -5,7 +5,7 @@
 //! match a different repo" gate that the slice 6 `/benchmark` authz
 //! check depends on.
 
-use sbgh_core::db::{NewUser, PostgresUserStore, UserStore, setup_pg};
+use sbgh_core::db::{NewUser, PostgresUserStore, UserStore, setup_pg_db};
 use sbgh_core::models::{GithubAccountType, UserRole};
 
 /// Seed an install + repo so role-grant FKs are satisfiable. Slice 6
@@ -39,9 +39,7 @@ async fn seed_install_repo(pool: &sbgh_core::db::Pool, install_id: i64, repo_id:
 
 #[tokio::test]
 async fn upsert_user_is_idempotent_and_refreshes_display_fields() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresUserStore::new(pool.clone());
 
     let first = store
@@ -73,9 +71,7 @@ async fn upsert_user_is_idempotent_and_refreshes_display_fields() {
 
 #[tokio::test]
 async fn lookup_user_by_login_is_case_insensitive() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresUserStore::new(pool.clone());
     store
         .upsert_user(&NewUser {
@@ -110,9 +106,7 @@ async fn lookup_user_by_login_is_case_insensitive() {
 
 #[tokio::test]
 async fn grant_role_is_idempotent_on_exact_quadruple() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -144,9 +138,7 @@ async fn grant_role_treats_null_repo_and_specific_repo_as_distinct() {
     // bucket — different from (user, install, repo=10, role). An
     // operator who has both an install-wide grant AND a repo-scoped
     // grant ends up with two distinct rows.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -182,9 +174,7 @@ async fn grant_role_treats_null_repo_and_specific_repo_as_distinct() {
 
 #[tokio::test]
 async fn revoke_role_exact_match_only() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -224,9 +214,7 @@ async fn revoke_role_exact_match_only() {
 
 #[tokio::test]
 async fn has_role_install_wide_grant_matches_any_repo() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 100, 11).await;
     let store = PostgresUserStore::new(pool.clone());
@@ -260,9 +248,7 @@ async fn has_role_install_wide_grant_matches_any_repo() {
 
 #[tokio::test]
 async fn has_role_repo_scoped_grant_matches_only_that_repo() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 100, 11).await;
     let store = PostgresUserStore::new(pool.clone());
@@ -296,9 +282,7 @@ async fn has_role_repo_scoped_grant_matches_only_that_repo() {
 
 #[tokio::test]
 async fn has_role_does_not_cross_installation_boundary() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 200, 10).await;
     let store = PostgresUserStore::new(pool.clone());
@@ -338,9 +322,7 @@ async fn has_role_does_not_match_different_non_admin_role() {
     // (which does NOT imply anything) to assert the "different role
     // doesn't match" invariant. The admin-implies behavior gets its
     // own dedicated test below.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -380,9 +362,7 @@ async fn has_role_admin_grant_implies_trigger_pr_benchmark() {
     // control" + the CLI exposes it as grantable. `has_role` must
     // treat an `admin` grant as implying any role within the same
     // scope, or `admin` is a lie.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 100, 11).await;
     let store = PostgresUserStore::new(pool.clone());
@@ -425,9 +405,7 @@ async fn has_role_admin_grant_implies_trigger_pr_benchmark() {
 
 #[tokio::test]
 async fn has_role_repo_scoped_admin_only_implies_within_that_repo() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 100, 11).await;
     let store = PostgresUserStore::new(pool.clone());
@@ -463,9 +441,7 @@ async fn has_role_repo_scoped_admin_only_implies_within_that_repo() {
 
 #[tokio::test]
 async fn has_role_admin_does_not_cross_installation_boundary() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 200, 10).await;
     let store = PostgresUserStore::new(pool.clone());
@@ -496,9 +472,7 @@ async fn revoke_role_is_soft_and_preserves_audit_history() {
     // Post-review M2 fix: revoke sets revoked_at rather than
     // DELETEing the row. The audit trail (grant id, granted_at,
     // granted_by) survives the revoke.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -550,9 +524,7 @@ async fn revoke_role_is_soft_and_preserves_audit_history() {
 
 #[tokio::test]
 async fn revoke_role_is_idempotent_for_already_revoked_row() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -585,9 +557,7 @@ async fn grant_role_reactivates_revoked_row_preserving_audit() {
     // granted_at stays put so the original grant timestamp survives
     // the revoke/re-grant cycle. Same shape as
     // `github_installation_repo.add_or_restore_membership`.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -633,9 +603,7 @@ async fn grant_role_reactivates_revoked_row_preserving_audit() {
 
 #[tokio::test]
 async fn list_roles_includes_revoked_rows_for_audit() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -678,9 +646,7 @@ async fn revoke_repo_scoped_grants_soft_revokes_only_matching_repo() {
     // specific (install, repo) — install-wide grants, grants for
     // other repos in the same install, and grants on other installs
     // are all untouched.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 100, 11).await;
     seed_install_repo(&pool, 200, 10).await;
@@ -751,9 +717,7 @@ async fn revoke_repo_scoped_grants_soft_revokes_only_matching_repo() {
 
 #[tokio::test]
 async fn revoke_repo_scoped_grants_is_idempotent() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresUserStore::new(pool.clone());
     store
@@ -784,9 +748,7 @@ async fn revoke_repo_scoped_grants_is_idempotent() {
 
 #[tokio::test]
 async fn list_roles_filter_by_install() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     seed_install_repo(&pool, 200, 10).await;
     let store = PostgresUserStore::new(pool.clone());

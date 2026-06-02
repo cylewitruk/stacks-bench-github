@@ -78,13 +78,13 @@ You should see `cargo 1.x` and `rustc 1.x`.
 
 ## 2. Configure the host LVM layout
 
-The orchestrator needs three things from LVM, all of which usually live inside the **existing OS volume group** (typically `vg0` or one named after the hostname — whatever `sudo vgs` shows). You do **not** need a dedicated VG; renaming the OS VG is invasive (GRUB + initramfs + reboot) and not worth it.
+The daemon needs three things from LVM, all of which usually live inside the **existing OS volume group** (typically `vg0` or one named after the hostname — whatever `sudo vgs` shows). You do **not** need a dedicated VG; renaming the OS VG is invasive (GRUB + initramfs + reboot) and not worth it.
 
 | Inside the VG | Purpose | Notes |
 | ---- | ---- | ---- |
 | `sbgh-meta` | Linear XFS LV mounted at `/var/lib/sbgh` | Per-job artifacts, archived SQLite results, bare git mirror. ~50–150 GiB is plenty. |
 | `thinpool` | Thin pool | Holds base chainstate LVs and per-job snapshots. Size = total chainstate baselines you want to keep × ~2–3×. |
-| `mainnet-YYYY-MM-DD` | Thin LV, XFS | One per chainstate baseline. The orchestrator snapshots whichever is lexicographically newest. |
+| `mainnet-YYYY-MM-DD` | Thin LV, XFS | One per chainstate baseline. The daemon snapshots whichever is lexicographically newest. |
 
 ### Playbook
 
@@ -142,7 +142,7 @@ The script is idempotent across days: just rerun `sudo ./scripts/download-chains
 
 ### Thin vs thick snapshots
 
-The orchestrator creates per-job snapshots of the base chainstate LV. Two modes, controlled by `[lvm].chainstate_snapshot_size_gib` in `config.toml`:
+The daemon creates per-job snapshots of the base chainstate LV. Two modes, controlled by `[lvm].chainstate_snapshot_size_gib` in `config.toml`:
 
 - **Thin (default, leave the field unset)**: `lvcreate --snapshot` runs without `-L`, so the snapshot lives in the thin pool and grows on demand. This is what you want when the base LV is itself thin (the playbook above). Cheap, fast, no upfront allocation.
 - **Thick (set the field to a GiB value)**: `lvcreate --snapshot -L NG` allocates a fixed COW exception store outside the pool. Use only if your base chainstate LV is a thick (non-thin) volume — otherwise the result is a thick snapshot of a thin volume, which loses the cheap-snapshot property and (on some lvm2 versions) errors out.
@@ -153,8 +153,10 @@ If you're following the playbook above, leave the field unset.
 
 Two host users, one per service. Keeping them separate is the filesystem
 half of the security boundary — without it, a compromised handler
-container could read the orchestrator's bind-mounted GitHub App PEM and
-impersonate the App. (The Postgres half is in §6.)
+container could read the daemon's GitHub App PEM and impersonate the App.
+The other half is that the handler has **no** DB access and **no** App key
+at all (it's a thin `/api` client): the daemon is the sole DB client and
+holds the only App credential (see §6).
 
 Four distinct uids total. Two of them only exist *inside* containers
 (postgres and smee) and need no host user — only the host file
@@ -165,7 +167,7 @@ matters:
 | ---- | ---- | ---- | ---- |
 | postgres (container) | 900/900 | Owns `/var/lib/sbgh/postgres` on the host. | DB on disk |
 | `sbgh-handler` (host) | 901/901 | Owns `/etc/sbgh/handler` on the host. The handler container is built with this uid so the bind-mounted config is readable. | webhook HMAC secret only |
-| `sbgh` (host) | 902/902 | Runs the orchestrator on the host (libvirt, LVM, sudoers). Owns `/etc/sbgh/orchestrator`. | GitHub App private key |
+| `sbgh` (host) | 902/902 | Runs the daemon on the host (libvirt, LVM, sudoers). Owns `/etc/sbgh/daemon`. | GitHub App private key |
 | smee (container only) | 903/903 | No host user, no bind mounts, no secrets. Distinct uid only for defense-in-depth against a future container escape. | — |
 
 All four are in the system uid range (100–999) so `useradd --system`
@@ -194,7 +196,7 @@ sudo groupadd --system --gid 901 sbgh-handler
 sudo useradd  --system --uid 901 --gid 901 \
               --shell /usr/sbin/nologin sbgh-handler
 
-# Orchestrator service user. Runs the actual binary on the host.
+# Daemon service user. Runs the actual binary on the host.
 sudo groupadd --system --gid 902 sbgh
 sudo useradd  --system --uid 902 --gid 902 \
               --shell /usr/sbin/nologin sbgh
@@ -219,12 +221,12 @@ The in-container postgres uid (900) doesn't need a matching host user —
 it's only used as a numeric owner for `/var/lib/sbgh/postgres` (created
 in §6).
 
-Install the sudoers fragment. Only the orchestrator user needs sudo;
+Install the sudoers fragment. Only the daemon user needs sudo;
 `sbgh-handler` runs entirely inside an unprivileged container.
 
 ```bash
 sudo tee /etc/sudoers.d/sbgh >/dev/null <<'EOF'
-# Orchestrator (per-job VM provisioning).
+# Daemon (per-job VM provisioning).
 sbgh ALL=(root) NOPASSWD: /usr/sbin/lvcreate, /usr/sbin/lvremove, /usr/sbin/lvs
 sbgh ALL=(root) NOPASSWD: /usr/sbin/mkfs.ext4, /usr/sbin/losetup
 sbgh ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/chown
@@ -265,7 +267,7 @@ You don't need a public domain — webhook delivery will be tunneled (next secti
      ```
 
      Save this — it'll go in `/etc/sbgh/handler/secrets.env` as
-     `SBGH_WEBHOOK_SECRET` in the next section. The orchestrator never
+     `SBGH_WEBHOOK_SECRET` in the next section. The daemon never
      sees it (it doesn't need to verify webhook signatures).
 3. **Repository permissions**:
 
@@ -284,32 +286,31 @@ You don't need a public domain — webhook delivery will be tunneled (next secti
 5. **Where can this GitHub App be installed?**: "Only on this account" (for dev).
 6. Click **Create GitHub App**.
 7. From the new app's settings page, copy the **Client ID** (the `Iv23li…` value listed near the top, right under "About") — that's `SBGH_GH_CLIENT_ID`. GitHub also displays an "App ID" (a numeric value); we don't use that. Both work today, but Client ID is the recommended modern form and the only one that survives if GitHub ever deprecates the legacy App ID auth path.
-8. Scroll down → **Generate a private key**. The browser downloads a `.pem` file. Move it to the orchestrator's config dir (the handler never sees this file):
+8. Scroll down → **Generate a private key**. The browser downloads a `.pem` file. Move it to the daemon's config dir (the handler never sees this file):
 
     ```bash
-    sudo install -d -m 0700 -o sbgh -g sbgh /etc/sbgh/orchestrator
+    sudo install -d -m 0700 -o sbgh -g sbgh /etc/sbgh/daemon
     sudo install -m 0600 -o sbgh -g sbgh \
-      ~/Downloads/sbgh-dev-*.pem /etc/sbgh/orchestrator/github-app.private-key.pem
+      ~/Downloads/sbgh-dev-*.pem /etc/sbgh/daemon/github-app.private-key.pem
     ```
 
 9. In the left sidebar of the app page, click **Install App** → install on your account → choose the fork of `stacks-core` you'll be testing against. Note the **installation ID** in the URL (`/settings/installations/<N>`).
 
 ## 5. Lay out the two config directories
 
-Two disjoint dirs, one per service, owned by different users. This is
-the filesystem half of the security boundary: a compromised handler
-container can read `/etc/sbgh/handler` (its own bind mount) but not
-`/etc/sbgh/orchestrator` (owned by a different uid, never mounted into
-the handler container).
+Two disjoint dirs, one per service, owned by different users — part of
+the security boundary: a compromised handler container can read
+`/etc/sbgh/handler` (its own bind mount) but not `/etc/sbgh/daemon`
+(owned by a different uid, never mounted into the handler container).
 
 | Path | Owner / mode | Files | Read by |
 | ---- | ---- | ---- | ---- |
 | `/etc/sbgh/handler/` | `sbgh-handler:sbgh-handler` 0700 | `config.toml`, `secrets.env` | handler container |
-| `/etc/sbgh/orchestrator/` | `sbgh:sbgh` 0700 | `config.toml`, `github-app.private-key.pem` | host orchestrator |
+| `/etc/sbgh/daemon/` | `sbgh:sbgh` 0700 | `config.toml`, `github-app.private-key.pem` | host daemon |
 
 Both dirs are bind-mounted into their respective containers at the
 *same* path on both sides, so file references inside the TOML
-(`private_key_path = "/etc/sbgh/orchestrator/github-app.private-key.pem"`)
+(`private_key_path = "/etc/sbgh/daemon/github-app.private-key.pem"`)
 resolve identically on host and in container.
 
 ### 5a. Handler config
@@ -318,86 +319,105 @@ resolve identically on host and in container.
 # Directory (uid 997 from §3).
 sudo install -d -m 0700 -o sbgh-handler -g sbgh-handler /etc/sbgh/handler
 
-# config.toml: non-secret settings (allowlist, bind addr).
+# config.toml: non-secret settings (bind addr, [api].url).
 sudo install -m 0600 -o sbgh-handler -g sbgh-handler \
   config.example.handler.toml /etc/sbgh/handler/config.toml
 sudo -u sbgh-handler $EDITOR /etc/sbgh/handler/config.toml
 # Set at minimum:
-#   [authorization].allowed_repositories = ["<your-handle>/stacks-core"]
+#   [api].url = "http://host.docker.internal:8787"   (the daemon /api)
+# The benchmark allowlist is NOT configured here — it's enforced by the
+# daemon (DB-backed, via `sbgh-cli`).
 
-# secrets.env: env_file for the handler container. The webhook HMAC
-# secret is the ONLY secret the handler ever sees — no App key.
-# DATABASE_URL is overridden by compose to use the narrow sbgh_handler
-# role, so leave it out of this file.
+# secrets.env: env_file for the handler container. Two secrets, no DB
+# password and no App key:
+#   - SBGH_WEBHOOK_SECRET   : the webhook HMAC secret.
+#   - SBGH_API_INGEST_TOKEN : the shared `ingest`-scope token presented to
+#                             the daemon /api. Must MATCH the
+#                             daemon's SBGH_API_INGEST_TOKEN (set in
+#                             §5b). Generate it once, here, and reuse it.
 sudo tee /etc/sbgh/handler/secrets.env >/dev/null <<EOF
 SBGH_WEBHOOK_SECRET=<openssl rand -hex 32>
+SBGH_API_INGEST_TOKEN=<openssl rand -hex 32>
 EOF
 sudo chmod 0600 /etc/sbgh/handler/secrets.env
 sudo chown sbgh-handler:sbgh-handler /etc/sbgh/handler/secrets.env
 ```
 
-### 5b. Orchestrator config
+### 5b. Daemon config
 
 ```bash
 # Directory (uid 998 from §3). The PEM from step 4.8 already lives here.
-sudo install -d -m 0700 -o sbgh -g sbgh /etc/sbgh/orchestrator
+sudo install -d -m 0700 -o sbgh -g sbgh /etc/sbgh/daemon
 
 # config.toml: App credentials, LVM/libvirt knobs, etc.
 sudo install -m 0600 -o sbgh -g sbgh \
-  config.example.orchestrator.toml /etc/sbgh/orchestrator/config.toml
-sudo -u sbgh $EDITOR /etc/sbgh/orchestrator/config.toml
+  config.example.daemon.toml /etc/sbgh/daemon/config.toml
+sudo -u sbgh $EDITOR /etc/sbgh/daemon/config.toml
 # Set at minimum:
-#   [server].database_url       = "postgres://sbgh_orch:<SBGH_ORCH_DB_PASSWORD>@127.0.0.1:5432/sbgh"
-#                                 (use the same value you put in docker/.env in §6)
+#   [server].database_url       = "postgres://sbgh:<POSTGRES_OWNER_PASSWORD>@127.0.0.1:5432/sbgh"
+#                                 (owner DSN — the daemon serves the /api admin
+#                                  endpoints; use the same value you put in docker/.env in §6)
 #   [github].client_id          = "Iv23li..."   (from step 4.7)
-#   [github].private_key_path   = "/etc/sbgh/orchestrator/github-app.private-key.pem"
+#   [github].private_key_path   = "/etc/sbgh/daemon/github-app.private-key.pem"
+#   [api].listen                = ["127.0.0.1:8787", "172.17.0.1:8787"]
+#                                 (loopback for the CLI; the docker host-gateway IP so the
+#                                  handler container can reach /api — see config example)
 #   [lvm].vg_name               = "vg0"
 #   [lvm].thinpool              = "thinpool"
 #   [vm].golden_image           = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
+
+# secrets.env: env-only secrets for the host daemon unit (read via
+# the unit's EnvironmentFile). SBGH_API_INGEST_TOKEN must be the SAME value
+# you generated for the handler's secrets.env in §5a — it's the shared token
+# the daemon uses to authenticate the handler's webhook submissions.
+sudo tee /etc/sbgh/daemon/secrets.env >/dev/null <<EOF
+SBGH_API_INGEST_TOKEN=<same value as the handler's SBGH_API_INGEST_TOKEN>
+EOF
+sudo chmod 0600 /etc/sbgh/daemon/secrets.env
+sudo chown sbgh:sbgh /etc/sbgh/daemon/secrets.env
 ```
 
-## 6. Run handler + smee + Postgres + migrate in Docker
+## 6. Run handler + smee + Postgres in Docker
 
-The handler, smee, Postgres, and a one-shot migrate job run in containers
-via [docker/docker-compose.yml](../docker/docker-compose.yml). The
-orchestrator stays on the host (it needs LVM + libvirt + the golden
-image).
+The handler, smee, and Postgres run in containers via
+[docker/docker-compose.yml](../docker/docker-compose.yml). The daemon
+stays on the host (it needs LVM + libvirt + the golden image).
 
-### Database role split (the Postgres half of the boundary)
+### One DB role (the owner)
 
-| DB role | Holds password | Grants | Used by |
-| ---- | ---- | ---- | ---- |
-| `sbgh` | `POSTGRES_OWNER_PASSWORD` | full ownership of the `sbgh` database | `sbgh-cli migrate` one-shot + `sbgh-cli installer ...` admin |
-| `sbgh_handler` | `SBGH_HANDLER_DB_PASSWORD` | `USAGE` on schema, column-level `INSERT` on `github_webhook` (inbox-only since the slice 11 cutover — no access to legacy `jobs`) | handler container |
-| `sbgh_orch` | `SBGH_ORCH_DB_PASSWORD` | `USAGE` on schema, `SELECT`/`UPDATE` on `jobs`/`github_webhook`; `SELECT` on `allowed_installer`; CRUD on `github_installation` | host orchestrator |
+Since roadmap-v3 Phase 6 there is a **single** Postgres role: the owner
+`sbgh` (password `POSTGRES_OWNER_PASSWORD`). The daemon is the sole DB
+client — it connects as the owner and, at startup, applies any pending
+schema migrations before serving. There is **no** migrate one-shot and no
+narrow `sbgh_handler` / `sbgh_orch` roles: the handler and CLI are `/api`
+clients with no DB access. (A one-time forward migration drops the legacy
+roles if a prior deploy created them.)
 
-Roles + grants are (re)applied on every `docker compose up` by the
-`migrate` service (the Rust binary `sbgh-cli`, `crates/sbgh-cli`,
-invoked with the `migrate` subcommand). It connects as the owner, runs
-schema migrations, then upserts the two narrow roles with whatever
-passwords are currently in `docker/.env`. Handler + smee
-`depends_on: service_completed_successfully` so they never see a
-half-migrated schema or a role without grants.
+The `sbgh-cli` binary provides the operator admin + read commands. It is a
+**pure `/api` client**: no DB credential, no GitHub access. They read the
+daemon's admin cookie
+(`/etc/sbgh/daemon/.cookie`, mode 0600, owned by `sbgh`) and target
+the loopback `/api` (`http://127.0.0.1:8787`), so run them **as the `sbgh`
+user**. The daemon resolves logins/repos server-side.
 
-The same `sbgh-cli` binary also provides operator admin commands for
-the `allowed_installer` allowlist (slice 3+). Logins are resolved to
-numeric account ids via GitHub's unauthenticated `/users/{login}`
-endpoint (60/hr per IP — plenty for operator one-shots), so no App
-private-key plumbing is needed in the CLI's env beyond what `migrate`
-already has:
+Use the host-built binary (`just build` → `target/release/sbgh-cli`, or
+install it on `PATH`). Override the target with `--api-url` / `--cookie` if
+needed.
 
 ```bash
-# Add a GH account to the allowlist. Resolves login → numeric id via
-# the GH API, then upserts allowed_installer with is_enabled=TRUE.
-docker compose -f docker/docker-compose.yml run --rm migrate installer allow --login some-org
-
-# Soft-disable an allowed installer (sets is_enabled=FALSE; row preserved
-# for audit). Resolves login → id first, then disables by numeric id
-# — display logins aren't unique across renames/recycling.
-docker compose -f docker/docker-compose.yml run --rm migrate installer disable --login some-org
-
+# Allowlist a GH account (daemon resolves login → numeric id, upserts
+# is_enabled=TRUE).
+sudo -u sbgh sbgh-cli installer allow --login some-org
+# Soft-disable (row preserved for audit; resolves login → id first).
+sudo -u sbgh sbgh-cli installer disable --login some-org
 # Dump the allowlist.
-docker compose -f docker/docker-compose.yml run --rm migrate installer list
+sudo -u sbgh sbgh-cli installer list
+
+# Read-only visibility commands the /api enables:
+sudo -u sbgh sbgh-cli installation list      # known App installations
+sudo -u sbgh sbgh-cli webhook tail --limit 20 # recent inbox rows
+sudo -u sbgh sbgh-cli jobs list               # benchmark runs
+sudo -u sbgh sbgh-cli status                  # /api health + my cookie's scope
 ```
 
 ### One-time setup
@@ -407,19 +427,18 @@ docker compose -f docker/docker-compose.yml run --rm migrate installer list
 sudo apt install -y docker.io docker-compose-v2
 sudo usermod -a -G docker $USER     # log out + back in for this to take effect
 
-# Runtime env. Required values (SMEE_CHANNEL + all three DB passwords)
+# Runtime env. Required values (SMEE_CHANNEL + POSTGRES_OWNER_PASSWORD)
 # have no sensible defaults; compose will refuse to start without them.
 cp docker/.env.example docker/.env
 $EDITOR docker/.env
 
-# Generate three distinct passwords. Keep them out of shell history.
-for v in POSTGRES_OWNER_PASSWORD SBGH_HANDLER_DB_PASSWORD SBGH_ORCH_DB_PASSWORD; do
-    echo "$v=$(openssl rand -base64 32)"
-done >> docker/.env
+# Generate the owner password (hex — URL-safe inside a Postgres DSN, unlike
+# base64's `/`+`). Keep it out of shell history.
+echo "POSTGRES_OWNER_PASSWORD=$(openssl rand -hex 32)" >> docker/.env
 
-# The orchestrator config.toml needs the SBGH_ORCH_DB_PASSWORD value too
-# (host-side DB URL). Same value, two places — there is no shared file
-# the orchestrator and the migrate container both read.
+# The daemon's config.toml needs this same value in its
+# [server].database_url (owner DSN). Same value, two places — the host
+# daemon and the compose Postgres don't share a file.
 
 # Prepare the host-side Postgres data directory. We bind-mount this into
 # the container so the data survives `docker volume prune`. The container
@@ -441,11 +460,10 @@ What gets built + run:
 | Service | Image | Listens | DB role | Talks to |
 | ---- | ---- | ---- | ---- | ---- |
 | `sbgh-postgres` | `postgres:18-trixie` (uid `${POSTGRES_UID:-900}`) | 127.0.0.1:5432 | — | — |
-| `sbgh-cli-migrate` | local `cli` target (one-shot) | — | `sbgh` (owner) | `postgres:5432` |
-| `sbgh-handler` | local `handler` target (uid `${SBGH_UID:-901}`) | 127.0.0.1:8080 | `sbgh_handler` | `postgres:5432` (INSERT only) |
+| `sbgh-handler` | local `handler` target (uid `${SBGH_UID:-901}`) | 127.0.0.1:8080 | — (no DB) | host daemon `/api` via `host.docker.internal:8787` |
 | `sbgh-smee` | local `smee` target (uid `${SBGH_SMEE_UID:-903}`) | — | — | smee.io (SSE in), `handler:8080` (HTTP out) |
 
-All four containers run rootless. The handler + smee in-container uid
+All three containers run rootless. The handler + smee in-container uid
 must match the host `sbgh-handler` uid so the mode-0600 config bind-
 mounted from `/etc/sbgh/handler` is readable. Defaults to 901; override
 via `SBGH_UID` / `SBGH_GID` in `docker/.env` if your host uses a
@@ -465,25 +483,20 @@ docker compose -f docker/docker-compose.yml logs -f
 # Just the handler
 docker compose -f docker/docker-compose.yml logs -f handler
 
-# The migrate run — should have "migrate complete" then exited 0.
-docker compose -f docker/docker-compose.yml logs migrate
-
 # Quick health check
 curl -i http://127.0.0.1:8080/health    # → 200 OK
 ```
 
 The smee container picks up `SMEE_CHANNEL` from `docker/.env` and starts
 forwarding to `http://handler:8080/webhook` over the docker network.
-After `migrate` exits successfully, handler + smee start and stay up.
 
-To re-run migrations (e.g. after pulling new code that adds a SQL
-migration):
+Schema migrations are no longer a separate step: the host daemon
+applies any pending migrations at startup (it's the sole DB client). New
+code that adds a SQL migration takes effect the next time the daemon
+restarts (`sudo systemctl restart sbgh-daemon`, or the
+`install-daemon.sh` re-run that does it for you).
 
-```bash
-docker compose -f docker/docker-compose.yml run --rm migrate
-```
-
-### Why not the orchestrator too?
+### Why not the daemon too?
 
 Three reasons it stays on the host:
 
@@ -491,7 +504,7 @@ Three reasons it stays on the host:
 - It calls `virsh` — same, plus the libvirt socket is host-side.
 - It needs read access to `/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2` and write access under `/var/lib/sbgh/jobs/`, both of which are host paths the libvirt-qemu apparmor profile already knows about.
 
-### Build + run the orchestrator (host-side)
+### Build + run the daemon (host-side)
 
 ```bash
 # Build the binary.
@@ -502,40 +515,40 @@ just build
 the first manual smoke test has succeeded — see below for the manual path):
 
 ```bash
-# Installs the binary to /usr/local/bin/sbgh-orchestrator and the unit
-# file to /etc/systemd/system/sbgh-orchestrator.service, then enables +
+# Installs the binary to /usr/local/bin/sbgh-daemon and the unit
+# file to /etc/systemd/system/sbgh-daemon.service, then enables +
 # starts the service. Idempotent — re-run after every `just build` to
 # pick up new code (it'll restart the service automatically).
-sudo ./scripts/install-orchestrator.sh
+sudo ./scripts/install-daemon.sh
 
 # Tail logs:
-journalctl -u sbgh-orchestrator -f
+journalctl -u sbgh-daemon -f
 
 # Status:
-systemctl status sbgh-orchestrator
+systemctl status sbgh-daemon
 ```
 
-Unit lives at [systemd/sbgh-orchestrator.service](../systemd/sbgh-orchestrator.service)
+Unit lives at [systemd/sbgh-daemon.service](../systemd/sbgh-daemon.service)
 in the repo. To override `RUST_LOG` or other env per host, use
-`sudo systemctl edit sbgh-orchestrator` (creates a drop-in at
-`/etc/systemd/system/sbgh-orchestrator.service.d/override.conf`).
+`sudo systemctl edit sbgh-daemon` (creates a drop-in at
+`/etc/systemd/system/sbgh-daemon.service.d/override.conf`).
 
 **For first-time debugging** before installing the unit (sees errors
 immediately, easier to ctrl-C), foreground-run in a `tmux` session:
 
 ```bash
 sudo -u sbgh \
-  RUST_LOG=info,sbgh_orchestrator=debug,sqlx=warn \
-  target/release/sbgh-orchestrator
+  RUST_LOG=info,sbgh_daemon=debug,sqlx=warn \
+  target/release/sbgh-daemon
 ```
 
 Either way, successful boot logs:
 
 ```text
-INFO sbgh_orchestrator: orchestrator started
+INFO sbgh_daemon: daemon started
 ```
 
-It'll sit there polling the queue every 5 seconds. The handler in Docker records webhooks into the same Postgres inbox; the orchestrator on the host processes them — the processor creates `job` rows from the inbox and the runner picks them up.
+It'll sit there polling the queue every 5 seconds. The handler in Docker verifies each webhook's HMAC and forwards it to the daemon's `/api`; the daemon records it to the Postgres inbox, the processor creates `job` rows from the inbox, and the runner picks them up.
 
 ## 7. First real run
 
@@ -544,7 +557,7 @@ It'll sit there polling the queue every 5 seconds. The handler in Docker records
 3. Within a few seconds you should see:
    - **sbgh-smee** logs `forwarded delivery status=200`.
    - **handler** logs the inbound POST (visible at `RUST_LOG=debug` via `tower_http::trace`) and a new comment appears on the PR: *"⏳ queued at position **1** (job `<uuid>`)…"*.
-   - **orchestrator** (Linux only): claims the job, starts provisioning, defines + starts the domain. On a macOS dev machine without the orchestrator running, the row simply stays in `queued` — that's the expected handler-only mode for inbound-side validation.
+   - **daemon** (Linux only): claims the job, starts provisioning, defines + starts the domain. On a macOS dev machine without the daemon running, the row simply stays in `queued` — that's the expected handler-only mode for inbound-side validation.
 4. The PR comment updates as phases change: `building → running → collecting → done`.
 5. On success the comment becomes a ✅ with the summary JSON; on failure ❌ with the error + console tail.
 
@@ -554,7 +567,7 @@ To watch the VM serial console live during the run, before the job dir is cleane
 sudo tail -F /var/lib/sbgh/jobs/<job-id>/console.log
 ```
 
-(Path is logged by the orchestrator when the job starts.)
+(Path is logged by the daemon when the job starts.)
 
 To list domains while a job is running:
 
@@ -563,16 +576,32 @@ sudo virsh list --all
 sudo virsh dominfo sbgh-<job-id>
 ```
 
-After the job finishes, query Postgres for the full forensics blob:
+After the job finishes, the quickest look is the CLI (no DB credential —
+it's an `/api` client):
 
 ```bash
+sudo -u sbgh sbgh-cli jobs list
+```
+
+For the full forensics, query the `job` family directly. The run output +
+archive dir live in `job_result`; the phase/failure timeline in `job_event`:
+
+```bash
+# Latest jobs + their result blob.
 psql "$DATABASE_URL" -c "
-  SELECT id, status, error,
-         result->'finish_reason'   AS finish_reason,
-         result->'last_phase'      AS last_phase,
-         result->'sqlite_size_bytes' AS sqlite_size
-  FROM jobs
-  ORDER BY queued_at DESC LIMIT 5;
+  SELECT j.id, j.status, j.job_kind, j.git_ref_display,
+         r.archive_dir, r.run_json
+  FROM job j
+  LEFT JOIN job_result r ON r.job_id = j.id
+  ORDER BY j.created_at DESC LIMIT 5;
+"
+
+# Per-job event timeline — phase transitions and failures land here
+# (event_status + remark + detail JSONB).
+psql "$DATABASE_URL" -c "
+  SELECT job_id, event_kind, event_status, occurred_at, remark
+  FROM job_event
+  ORDER BY occurred_at DESC LIMIT 20;
 "
 ```
 
@@ -615,28 +644,35 @@ After fixing either, **restart the handler** (the in-memory installation token c
 - `SBGH_WEBHOOK_SECRET` in `/etc/sbgh/handler/secrets.env` must match exactly what you set in the App. No surrounding quotes, no trailing newline.
 - If you copy-pasted, regenerate with `openssl rand -hex 32` and update both sides.
 
-### `loading github app private key` error at orchestrator startup
+### `loading github app private key` error at daemon startup
 
-(The handler never loads the PEM — if you see this error, it's the orchestrator on the host.)
+(The handler never loads the PEM — if you see this error, it's the daemon on the host.)
 
-- `sudo -u sbgh ls -l /etc/sbgh/orchestrator/github-app.private-key.pem` — must be readable as user `sbgh` (mode `0600`, owner `sbgh:sbgh`).
+- `sudo -u sbgh ls -l /etc/sbgh/daemon/github-app.private-key.pem` — must be readable as user `sbgh` (mode `0600`, owner `sbgh:sbgh`).
 - PEM file must start with `-----BEGIN RSA PRIVATE KEY-----` (GitHub gives you PKCS#1; `jsonwebtoken` accepts both PKCS#1 and PKCS#8).
 
-### Handler logs `permission denied for table jobs`
+### Handler logs `failed to forward webhook to /api` / returns 502
 
-The handler is trying a query other than `INSERT`. By design `sbgh_handler` only has `INSERT` (see §6 role table). Either:
+The handler couldn't reach (or was rejected by) the daemon `/api`. The
+handler maps a transport failure or daemon 5xx to **502** (GitHub redelivers)
+and propagates a daemon **4xx** as-is. Check, in order:
 
-- A code change introduced a `SELECT`/`UPDATE` from the handler path — that's a regression of the role split; either move the query to the orchestrator or widen the grant deliberately, don't paper over it.
-- The migrate container didn't run (or ran with stale passwords). Check `docker compose logs migrate`; re-run with `docker compose run --rm migrate`.
+- Is the host daemon running and is `/api` up? `systemctl status sbgh-daemon`; `curl http://127.0.0.1:8787/api/health`.
+- Can the container reach the host? The daemon must bind the docker host-gateway IP — `[api].listen` must include `172.17.0.1:8787` (see §5b). `host.docker.internal:host-gateway` in compose resolves to that.
+- A **401** (`webhook rejected by /api`) means the ingest token mismatched: `SBGH_API_INGEST_TOKEN` in the handler's `secrets.env` must equal the daemon's (§5a/§5b). Fix both, then restart the handler **and** the daemon.
 
-### `password authentication failed for user "sbgh_handler"` (or `sbgh_orch`)
+### `password authentication failed for user "sbgh"`
 
-The role's password in Postgres no longer matches what the handler/orchestrator was given. Likely cause: someone edited `docker/.env` but didn't re-run migrate (which resets passwords to match). Fix:
+The owner role's password in Postgres no longer matches the DSN the
+daemon was given. Likely cause: someone changed
+`POSTGRES_OWNER_PASSWORD` in `docker/.env` (so Postgres reset the role's
+password on the next container init) without updating the daemon's
+`[server].database_url`. Fix — make the two match, then restart:
 
 ```bash
-docker compose -f docker/docker-compose.yml run --rm migrate
-docker compose -f docker/docker-compose.yml restart handler
-# (and restart the host orchestrator)
+# update [server].database_url in the daemon config to the new
+# password, then:
+sudo systemctl restart sbgh-daemon
 ```
 
 ### `installation token mint failed: 404`
@@ -646,7 +682,7 @@ docker compose -f docker/docker-compose.yml restart handler
 ### `no base chainstate LV found in VG ... matching prefix mainnet-`
 
 - `sudo lvs` — confirm at least one LV exists in your VG (whatever `[lvm].vg_name` is set to) with a name starting with `mainnet-`.
-- The orchestrator uses `lvs --select 'lv_name=~^mainnet-'` (regex). If your LV is in a different VG or named differently, override `chainstate_base_prefix` in the config.
+- The daemon uses `lvs --select 'lv_name=~^mainnet-'` (regex). If your LV is in a different VG or named differently, override `chainstate_base_prefix` in the config.
 
 ### `lvcreate` fails with "Snapshots of snapshots are not supported"
 
@@ -665,14 +701,14 @@ docker compose -f docker/docker-compose.yml restart handler
 
 ### Job dir was deleted before you could look at it
 
-By default the orchestrator deletes the per-job dir on completion. The console tail and last phase are persisted to Postgres (`jobs.result`) regardless, and the SQLite output goes to `paths.results_archive_dir`. For first-time bringup debugging where you need to step through the artifacts:
+By default the daemon deletes the per-job dir on completion. The console tail and last phase are persisted to Postgres (`job_result.run_json` + the `job_event` timeline) regardless, and the SQLite output goes to `paths.results_archive_dir`. For first-time bringup debugging where you need to step through the artifacts:
 
 ```bash
 # Stop teardown by setting an environment override
-SBGH_DEBUG_KEEP_JOB_DIR=1 target/release/sbgh-orchestrator
+SBGH_DEBUG_KEEP_JOB_DIR=1 target/release/sbgh-daemon
 ```
 
-(That flag isn't wired up yet — open a TODO. Until then, comment out the `remove_dir_all(job_dir)` line in [crates/sbgh-orchestrator/src/libvirt/driver.rs](../crates/sbgh-orchestrator/src/libvirt/driver.rs) during bringup.)
+(That flag isn't wired up yet — open a TODO. Until then, comment out the `remove_dir_all(job_dir)` line in [crates/sbgh-daemon/src/libvirt/driver.rs](../crates/sbgh-daemon/src/libvirt/driver.rs) during bringup.)
 
 ### Domain stuck in `paused` or `crashed`
 
@@ -681,7 +717,7 @@ sudo virsh dominfo sbgh-<job-id>
 sudo virsh dumpxml sbgh-<job-id> | less
 ```
 
-If the orchestrator died mid-job, you may have orphaned domains and LVs:
+If the daemon died mid-job, you may have orphaned domains and LVs:
 
 ```bash
 sudo virsh list --all | grep sbgh-
@@ -695,4 +731,4 @@ sudo umount /run/sbgh/jobs/<job-id> 2>/dev/null
 sudo rm -rf /var/lib/sbgh/jobs/<job-id> /run/sbgh/jobs/<job-id>
 ```
 
-(A "sweep on startup" step on the orchestrator that reaps these is on the v2 list.)
+(A "sweep on startup" step on the daemon that reaps these is on the v2 list.)

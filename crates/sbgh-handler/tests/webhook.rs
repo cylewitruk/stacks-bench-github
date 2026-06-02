@@ -1,18 +1,22 @@
-//! End-to-end handler tests. Slice 11 made the handler **inbox-only**:
-//! it is restricted to signature verification, event-type filtering, and
-//! webhook-inbox recording. It does NOT parse `/benchmark`, authorize, or
-//! enqueue a legacy `jobs` row — the processor owns all of that. Any
-//! GitHub API call OR legacy-job write from the handler would be a
-//! regression (the `.jobs()`-empty assertions pin the latter).
+//! Handler tests. Post-Phase-4 the handler is a **verify-and-forward**
+//! shim: it checks the HMAC signature, short-circuits `ping`, and forwards
+//! every other verified delivery to the daemon `/api`. It does NOT
+//! parse payloads, filter event types, authorize, or touch a DB — the
+//! daemon owns all of that. These tests drive the real route against a
+//! mock daemon and assert what the handler forwards + how it maps the
+//! daemon's response back to GitHub.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::response::IntoResponse;
+use axum::routing::post;
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
-use sbgh_core::config::{AuthorizationConfig, HandlerConfig, ServerConfig, WebhookConfig};
-use sbgh_core::db::InMemoryIngestStore;
+use sbgh_api::Client;
+use sbgh_core::config::{HandlerApiConfig, HandlerConfig, ServerConfig, WebhookConfig};
 use sha2::Sha256;
 use tower::ServiceExt;
 
@@ -24,39 +28,133 @@ mod state;
 use state::AppState;
 
 const SECRET: &str = "test-webhook-secret";
+const INGEST_TOKEN: &str = "ingest-token-xyz";
 
-fn test_config() -> HandlerConfig {
+// ─── Mock daemon `/api/webhooks` ─────────────────────────────────────────
+
+/// One captured forward, so tests can assert the handler passed through the
+/// raw body + headers + bearer token verbatim.
+#[derive(Clone, Default)]
+struct Captured {
+    authorization: Option<String>,
+    event: Option<String>,
+    delivery: Option<String>,
+    body: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct MockState {
+    captured: Arc<Mutex<Vec<Captured>>>,
+    status: StatusCode,
+    body: serde_json::Value,
+}
+
+async fn mock_submit(
+    State(s): State<MockState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let hdr = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    s.captured
+        .lock()
+        .unwrap()
+        .push(Captured {
+            authorization: hdr("authorization"),
+            event: hdr("x-github-event"),
+            delivery: hdr("x-github-delivery"),
+            body: body.to_vec(),
+        });
+    (s.status, axum::Json(s.body.clone()))
+}
+
+struct MockDaemon {
+    base_url: String,
+    captured: Arc<Mutex<Vec<Captured>>>,
+    /// Aborted on drop so the spawned server + its listener don't outlive
+    /// the test (nextest flags such leaks).
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MockDaemon {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+/// Spawn a one-shot mock daemon that records every `/api/webhooks` POST and
+/// replies with `status` + `resp` (a `WebhookSubmitResponse`-shaped value).
+async fn mock_daemon(status: StatusCode, resp: serde_json::Value) -> MockDaemon {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new()
+        .route("/api/webhooks", post(mock_submit))
+        .with_state(MockState {
+            captured: captured.clone(),
+            status,
+            body: resp,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    MockDaemon {
+        base_url: format!("http://{addr}"),
+        captured,
+        server,
+    }
+}
+
+fn ok_response(result: &str) -> serde_json::Value {
+    serde_json::json!({ "result": result })
+}
+
+// ─── Handler harness ─────────────────────────────────────────────────────
+
+fn test_config(api_url: String) -> HandlerConfig {
     HandlerConfig {
         server: ServerConfig {
-            database_url: "postgres://unused".into(),
             bind_addr: "127.0.0.1:0".into(),
         },
         webhook: WebhookConfig { secret: SECRET.into() },
-        authorization: AuthorizationConfig {
-            allowed_repositories: ["acme/widgets".into()]
-                .into_iter()
-                .collect(),
-            allowed_users: Default::default(),
-            allowed_associations: ["MEMBER".into(), "OWNER".into()]
-                .into_iter()
-                .collect(),
+        api: HandlerApiConfig {
+            url: api_url,
+            ingest_token: INGEST_TOKEN.into(),
         },
     }
 }
 
 struct Harness {
     router: axum::Router,
-    ingest: Arc<InMemoryIngestStore>,
+    daemon: MockDaemon,
 }
 
-fn setup() -> Harness {
-    let ingest = Arc::new(InMemoryIngestStore::new());
-    let state = AppState {
-        config: test_config(),
-        ingest: ingest.clone(),
-    };
-    let router = routes::router().with_state(state);
-    Harness { router, ingest }
+/// Wire the real handler route to a mock daemon that replies `status`/`resp`.
+async fn setup(status: StatusCode, resp: serde_json::Value) -> Harness {
+    let daemon = mock_daemon(status, resp).await;
+    let config = test_config(daemon.base_url.clone());
+    let api = Client::new(
+        config.api.url.clone(),
+        Some(
+            config
+                .api
+                .ingest_token
+                .clone(),
+        ),
+    );
+    let router = routes::router().with_state(AppState { config, api });
+    Harness { router, daemon }
+}
+
+/// Default success daemon (records, returns 200 `recorded`).
+async fn setup_ok() -> Harness {
+    setup(StatusCode::OK, ok_response("recorded")).await
 }
 
 fn sign(body: &[u8]) -> String {
@@ -66,56 +164,12 @@ fn sign(body: &[u8]) -> String {
     format!("sha256={}", hex::encode::<&[u8]>(bytes.as_ref()))
 }
 
-fn issue_comment_payload(
-    repo: &str,
-    body: &str,
-    sender: &str,
-    association: &str,
-    is_pr: bool,
-) -> Vec<u8> {
-    let pull_request = if is_pr {
-        serde_json::json!({ "url": format!("https://api.github.test/repos/{repo}/pulls/42") })
-    } else {
-        serde_json::Value::Null
-    };
-    // Slice 6 grew the User struct to require numeric id + GH account
-    // type. Handler tests don't care about either field beyond "the
-    // typed deserialiser accepts the payload" — pick stable
-    // placeholders.
-    serde_json::to_vec(&serde_json::json!({
-        "action": "created",
-        "comment": {
-            "id": 9999,
-            "body": body,
-            "user": { "id": 1234, "login": sender, "type": "User" },
-            "author_association": association,
-        },
-        "issue": {
-            "number": 42,
-            "pull_request": pull_request,
-        },
-        "repository": { "full_name": repo },
-        "sender": { "id": 1234, "login": sender, "type": "User" },
-        "installation": { "id": 7 },
-    }))
-    .unwrap()
-}
-
 async fn post_webhook(
     router: &axum::Router,
     event: &str,
     body: Vec<u8>,
     signature: Option<&str>,
-) -> (StatusCode, String) {
-    post_webhook_with_delivery(router, event, body, signature, Some("delivery-test-1")).await
-}
-
-async fn post_webhook_with_delivery(
-    router: &axum::Router,
-    event: &str,
-    body: Vec<u8>,
-    signature: Option<&str>,
-    delivery_id: Option<&str>,
+    delivery: Option<&str>,
 ) -> (StatusCode, String) {
     let mut req = Request::builder()
         .method("POST")
@@ -125,15 +179,15 @@ async fn post_webhook_with_delivery(
     if let Some(sig) = signature {
         req = req.header("x-hub-signature-256", sig);
     }
-    if let Some(d) = delivery_id {
+    if let Some(d) = delivery {
         req = req.header("x-github-delivery", d);
     }
-    let req = req
-        .body(Body::from(body))
-        .unwrap();
     let resp = router
         .clone()
-        .oneshot(req)
+        .oneshot(
+            req.body(Body::from(body))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = resp.status();
@@ -143,262 +197,190 @@ async fn post_webhook_with_delivery(
         .await
         .unwrap()
         .to_bytes();
-    let body = String::from_utf8(bytes.to_vec()).unwrap();
-    (status, body)
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
-// ─── Signature / wire-level gating ───────────────────────────────────────
+// ─── Signature gating: never forwards ────────────────────────────────────
 
-#[tokio::test]
-async fn rejects_missing_signature() {
-    let h = setup();
-    let (status, _) = post_webhook(&h.router, "ping", b"{}".to_vec(), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    // Slice 1 invariant: unsigned requests never reach the inbox.
-    assert_eq!(h.ingest.webhook_count(), 0);
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn rejects_bad_signature() {
-    let h = setup();
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_missing_signature_without_forwarding() {
+    let h = setup_ok().await;
     let (status, _) =
-        post_webhook(&h.router, "ping", b"{}".to_vec(), Some("sha256=deadbeef")).await;
+        post_webhook(&h.router, "issue_comment", b"{}".to_vec(), None, Some("d1")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(h.ingest.webhook_count(), 0);
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty()
+    assert_eq!(
+        h.daemon
+            .captured
+            .lock()
+            .unwrap()
+            .len(),
+        0,
+        "unsigned must not reach /api"
     );
 }
 
-#[tokio::test]
-async fn ping_returns_pong_without_inbox_row() {
-    let h = setup();
-    let body = b"{}".to_vec();
-    let sig = sign(&body);
-    let (status, text) = post_webhook(&h.router, "ping", body, Some(&sig)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "pong");
-    // ping is GitHub's connectivity probe; intentionally not recorded.
-    assert_eq!(h.ingest.webhook_count(), 0);
-}
-
-#[tokio::test]
-async fn drops_unsupported_event_type_without_inbox_row() {
-    let h = setup();
-    let body = b"{}".to_vec();
-    let sig = sign(&body);
-    let (status, text) = post_webhook(&h.router, "star", body, Some(&sig)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "ignored");
-    // Slice 1 invariant: only allowlisted event types reach the inbox.
-    assert_eq!(h.ingest.webhook_count(), 0);
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn rejects_missing_delivery_id() {
-    let h = setup();
-    let body = b"{}".to_vec();
-    let sig = sign(&body);
-    let (status, _) = post_webhook_with_delivery(
-        &h.router,
-        "push",
-        body,
-        Some(&sig),
-        None, // no X-GitHub-Delivery header
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(h.ingest.webhook_count(), 0);
-}
-
-// ─── Supported events: webhook-only path ─────────────────────────────────
-
-#[tokio::test]
-async fn supported_event_records_webhook_only() {
-    // A `push` event hits the inbox but doesn't enqueue a legacy job.
-    let h = setup();
-    let body = serde_json::to_vec(&serde_json::json!({
-        "ref": "refs/heads/develop",
-        "installation": { "id": 7 },
-    }))
-    .unwrap();
-    let sig = sign(&body);
-
-    let (status, text) =
-        post_webhook_with_delivery(&h.router, "push", body, Some(&sig), Some("push-delivery-1"))
-            .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "recorded");
-    assert_eq!(h.ingest.webhook_count(), 1);
-    let webhook = &h.ingest.webhooks()[0];
-    assert_eq!(webhook.event_type, "push");
-    assert_eq!(webhook.payload_installation_id, Some(7));
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty(),
-        "push events must NOT enqueue legacy jobs"
-    );
-}
-
-#[tokio::test]
-async fn issue_comment_records_webhook_only_no_job() {
-    // Inbox-only (slice 11): a `/benchmark` issue_comment is recorded
-    // like any other event — NO legacy job, NO authz, NO command parse.
-    // The processor handles all of that from the inbox. The empty
-    // `.jobs()` is the load-bearing assertion: the handler must never
-    // write legacy `jobs` post-cutover (else a rollback to the legacy
-    // backend could re-run them).
-    let h = setup();
-    let body =
-        issue_comment_payload("acme/widgets", "/benchmark run --iters=5", "alice", "MEMBER", true);
-    let sig = sign(&body);
-    let (status, text) = post_webhook(&h.router, "issue_comment", body, Some(&sig)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "recorded");
-
-    assert_eq!(h.ingest.webhook_count(), 1);
-    let webhook = &h.ingest.webhooks()[0];
-    assert_eq!(webhook.event_type, "issue_comment");
-    assert_eq!(webhook.action.as_deref(), Some("created"));
-    assert_eq!(webhook.payload_installation_id, Some(7));
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty(),
-        "inbox-only handler must NOT enqueue a legacy job"
-    );
-}
-
-#[tokio::test]
-async fn issue_comment_recorded_regardless_of_authz_or_command() {
-    // The handler no longer gates on authz / command shape — every
-    // signature-valid issue_comment is recorded for the processor.
-    // (Cases that used to short-circuit as "unauthorized" / "no command"
-    // / "not a PR" now all just record.)
-    for body in [
-        issue_comment_payload("acme/widgets", "looks good!", "alice", "MEMBER", true), /* no command */
-        issue_comment_payload("acme/widgets", "/benchmark", "bob", "NONE", true), // "unauthorized"
-        issue_comment_payload("evil/repo", "/benchmark", "alice", "OWNER", true), /* disallowed
-                                                                                   * repo */
-        issue_comment_payload("acme/widgets", "/benchmark", "alice", "MEMBER", false), // not a PR
-    ] {
-        let h = setup();
-        let sig = sign(&body);
-        let (status, text) = post_webhook(&h.router, "issue_comment", body, Some(&sig)).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(text, "recorded");
-        assert_eq!(h.ingest.webhook_count(), 1);
-        assert!(
-            h.ingest
-                .jobs()
-                .snapshot()
-                .is_empty()
-        );
-    }
-}
-
-#[tokio::test]
-async fn duplicate_issue_comment_delivery_dedupes() {
-    // Same X-GitHub-Delivery → same logical webhook → one inbox row.
-    let h = setup();
-    let body = issue_comment_payload("acme/widgets", "/benchmark", "alice", "MEMBER", true);
-    let sig = sign(&body);
-
-    let (s1, b1) = post_webhook_with_delivery(
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_bad_signature_without_forwarding() {
+    let h = setup_ok().await;
+    let (status, _) = post_webhook(
         &h.router,
         "issue_comment",
-        body.clone(),
-        Some(&sig),
-        Some("repeat-me"),
+        b"{}".to_vec(),
+        Some("sha256=deadbeef"),
+        Some("d1"),
     )
     .await;
-    assert_eq!(s1, StatusCode::OK);
-    assert_eq!(b1, "recorded");
-
-    let (s2, b2) =
-        post_webhook_with_delivery(&h.router, "issue_comment", body, Some(&sig), Some("repeat-me"))
-            .await;
-    assert_eq!(s2, StatusCode::OK);
-    assert_eq!(b2, "duplicate");
-
-    assert_eq!(h.ingest.webhook_count(), 1, "second delivery must not record a second webhook");
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty()
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        h.daemon
+            .captured
+            .lock()
+            .unwrap()
+            .len(),
+        0
     );
 }
 
-#[tokio::test]
-async fn malformed_issue_comment_payload_still_records_webhook() {
-    // Body is signature-verified but isn't a well-formed issue_comment.
-    // Inbox-only still records it (valid JSON → payload stored) so GH
-    // redeliveries dedupe against the inbox row. Returning 4xx here would
-    // trigger un-dedupable GH retry storms.
-    let h = setup();
-    let bad_body = br#"{"action": "created", "this is": "not an issue_comment"}"#.to_vec();
-    let sig = sign(&bad_body);
-    let (status, text) = post_webhook(&h.router, "issue_comment", bad_body, Some(&sig)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(text, "recorded");
-    assert_eq!(h.ingest.webhook_count(), 1);
-    let webhook = &h.ingest.webhooks()[0];
-    assert_eq!(webhook.event_type, "issue_comment");
-    assert!(
-        h.ingest
-            .jobs()
-            .snapshot()
-            .is_empty(),
-        "malformed payload must NOT enqueue a legacy job"
-    );
-}
-
-#[tokio::test]
-async fn duplicate_delivery_on_webhook_only_path_dedupes() {
-    // Even for webhook-only events (no job enqueue), redeliveries must
-    // be deduped on the inbox.
-    let h = setup();
-    let body = serde_json::to_vec(&serde_json::json!({
-        "ref": "refs/heads/develop",
-        "installation": { "id": 7 },
-    }))
-    .unwrap();
+#[tokio::test(flavor = "multi_thread")]
+async fn ping_returns_pong_without_forwarding() {
+    let h = setup_ok().await;
+    let body = b"{}".to_vec();
     let sig = sign(&body);
+    let (status, text) = post_webhook(&h.router, "ping", body, Some(&sig), Some("d1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "pong");
+    assert_eq!(
+        h.daemon
+            .captured
+            .lock()
+            .unwrap()
+            .len(),
+        0,
+        "ping is answered locally"
+    );
+}
 
-    let (s1, b1) = post_webhook_with_delivery(
-        &h.router,
-        "push",
-        body.clone(),
-        Some(&sig),
-        Some("redeliver-2"),
-    )
-    .await;
-    assert_eq!(s1, StatusCode::OK);
-    assert_eq!(b1, "recorded");
+// ─── Forwarding ──────────────────────────────────────────────────────────
 
-    let (s2, b2) =
-        post_webhook_with_delivery(&h.router, "push", body, Some(&sig), Some("redeliver-2")).await;
-    assert_eq!(s2, StatusCode::OK);
-    assert_eq!(b2, "duplicate");
+#[tokio::test(flavor = "multi_thread")]
+async fn forwards_raw_body_and_headers_with_ingest_token() {
+    let h = setup_ok().await;
+    // Deliberately not valid issue_comment JSON: the handler must forward
+    // the bytes verbatim, never parse them.
+    let body = br#"{"raw":"bytes","action":"created"}"#.to_vec();
+    let sig = sign(&body);
+    let (status, text) =
+        post_webhook(&h.router, "issue_comment", body.clone(), Some(&sig), Some("delivery-7"))
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "recorded", "handler echoes the daemon's result");
 
-    assert_eq!(h.ingest.webhook_count(), 1);
+    let cap = h
+        .daemon
+        .captured
+        .lock()
+        .unwrap();
+    assert_eq!(cap.len(), 1, "exactly one forward");
+    let c = &cap[0];
+    assert_eq!(c.event.as_deref(), Some("issue_comment"));
+    assert_eq!(c.delivery.as_deref(), Some("delivery-7"));
+    assert_eq!(c.body, body, "body forwarded byte-for-byte");
+    assert_eq!(
+        c.authorization.as_deref(),
+        Some(format!("Bearer {INGEST_TOKEN}").as_str()),
+        "ingest token presented to /api"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_delivery_is_forwarded_as_absent_not_empty() {
+    // A missing X-GitHub-Delivery must stay absent through the client (not
+    // become `""`), so the daemon's "supported event needs a delivery id"
+    // check fires instead of recording a blank dedup key.
+    let h = setup_ok().await;
+    let body = b"{}".to_vec();
+    let sig = sign(&body);
+    let (status, _) = post_webhook(&h.router, "push", body, Some(&sig), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let cap = h
+        .daemon
+        .captured
+        .lock()
+        .unwrap();
+    assert_eq!(cap.len(), 1);
+    assert_eq!(cap[0].delivery, None, "absent delivery header must not be sent as empty");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forwards_unsupported_event_and_echoes_ignored() {
+    // The handler no longer filters event types — it forwards `star` and
+    // echoes whatever the daemon decides ("ignored").
+    let h = setup(StatusCode::OK, ok_response("ignored")).await;
+    let body = b"{}".to_vec();
+    let sig = sign(&body);
+    let (status, text) = post_webhook(&h.router, "star", body, Some(&sig), Some("d1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "ignored");
+    assert_eq!(
+        h.daemon
+            .captured
+            .lock()
+            .unwrap()
+            .len(),
+        1,
+        "filtering is the daemon's job now"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn echoes_duplicate_result() {
+    let h = setup(StatusCode::OK, ok_response("duplicate")).await;
+    let body = b"{}".to_vec();
+    let sig = sign(&body);
+    let (status, text) = post_webhook(&h.router, "push", body, Some(&sig), Some("d1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "duplicate");
+}
+
+// ─── Daemon error mapping ────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_5xx_maps_to_502_so_github_retries() {
+    let h = setup(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "boom" })).await;
+    let body = b"{}".to_vec();
+    let sig = sign(&body);
+    let (status, _) = post_webhook(&h.router, "push", body, Some(&sig), Some("d1")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "5xx upstream → 502 (GitHub redelivers)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_4xx_is_propagated_not_retried() {
+    // A permanent client error (e.g. bad ingest token = 401) is surfaced as
+    // itself, not a 502 — no point making GitHub retry a request that can't
+    // succeed.
+    let h = setup(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": "bad token" })).await;
+    let body = b"{}".to_vec();
+    let sig = sign(&body);
+    let (status, _) = post_webhook(&h.router, "push", body, Some(&sig), Some("d1")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_unreachable_maps_to_502() {
+    // Point the handler at a dead port — no listener.
+    let config = test_config("http://127.0.0.1:1".into());
+    let api = Client::new(
+        config.api.url.clone(),
+        Some(
+            config
+                .api
+                .ingest_token
+                .clone(),
+        ),
+    );
+    let router = routes::router().with_state(AppState { config, api });
+    let body = b"{}".to_vec();
+    let sig = sign(&body);
+    let (status, _) = post_webhook(&router, "push", body, Some(&sig), Some("d1")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "transport failure → 502");
 }

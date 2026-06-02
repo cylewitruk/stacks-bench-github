@@ -39,7 +39,7 @@ CREATE TYPE user_role AS ENUM (
 );
 
 -- Pre-Phase-2 checkpoint: `claimed` is the intermediate state between
--- `queued` and `running`. The orchestrator's claim path transitions
+-- `queued` and `running`. The daemon's claim path transitions
 -- queued → claimed (with a claim_token), then claimed → running when
 -- execution actually starts. Stuck-claim recovery resets `claimed`
 -- rows whose claimed_at exceeds the lease back to `queued`.
@@ -120,7 +120,7 @@ CREATE TYPE github_webhook_status AS ENUM (
 );
 
 -- Closed vocabulary; the specific processor decision attached to a
--- terminal webhook row. Decided by the orchestrator (the processor),
+-- terminal webhook row. Decided by the daemon (the processor),
 -- NOT the web-facing handler — the handler has no GitHub credentials
 -- and so cannot evaluate allowlists, lineage, or policies.
 --
@@ -412,7 +412,7 @@ CREATE INDEX github_user_role_active_idx ON github_user_role (github_user_id, gi
 -- shape varies by trigger_kind:
 --   branch_push:  {"branch_name": "develop"}
 --   tag_created:  {"tag_pattern": "^release/\\d+\\.\\d+\\.\\d+\\.\\d+\\.\\d+$"}
--- Discipline enforced on the orchestrator side as a Rust enum keyed
+-- Discipline enforced on the daemon side as a Rust enum keyed
 -- off trigger_kind.
 --
 -- Composite FK to target_repo_policy: a trigger policy only makes
@@ -444,7 +444,7 @@ WHERE
 
 -- ─── Webhook inbox ──────────────────────────────────────────────────────
 -- Inbox/queue between the web-facing handler (token-less) and the
--- privileged processor (the orchestrator, which holds GitHub App
+-- privileged processor (the daemon, which holds GitHub App
 -- credentials).
 --
 -- Handler responsibility (minimal):
@@ -554,12 +554,12 @@ CREATE TRIGGER github_pull_request_set_updated_at
     EXECUTE FUNCTION set_updated_at ();
 
 -- ─── Jobs ────────────────────────────────────────────────────────────────
--- Subject identity + orchestrator hot-path fields. Provenance, outputs,
+-- Subject identity + daemon hot-path fields. Provenance, outputs,
 -- and history live in job_event / job_metric / job_result; PR
 -- association in github_pull_request_job.
 --
 -- git_commit_hash and git_committed_at are nullable: processor may
--- enqueue with an unresolved ref; later orchestrator phase resolves at
+-- enqueue with an unresolved ref; later daemon phase resolves at
 -- job claim. Partial indexes filter on status='completed', so they're
 -- populated at lookup.
 --
@@ -568,7 +568,7 @@ CREATE TRIGGER github_pull_request_set_updated_at
 -- *known*. Currently-active access (revoked_at IS NULL) is an app-layer
 -- check at enqueue/claim time — the FK alone doesn't guarantee the
 -- membership hasn't been soft-revoked.
--- claim_token + claimed_at are the orchestrator's claim handoff.
+-- claim_token + claimed_at are the daemon's claim handoff.
 -- Invariants (app-layer enforced, not DB CHECKs):
 --   status='queued'                  ⟺ claim_token IS NULL AND claimed_at IS NULL
 --   status='claimed'                 ⟺ claim_token IS NOT NULL AND claimed_at IS NOT NULL
@@ -577,11 +577,11 @@ CREATE TRIGGER github_pull_request_set_updated_at
 --
 -- Lifecycle:
 --   queued: initial state (slice 9 inserts here)
---   claimed: orchestrator picked it up via FOR UPDATE SKIP LOCKED;
+--   claimed: daemon picked it up via FOR UPDATE SKIP LOCKED;
 --     execution hasn't started yet
---   running: orchestrator transitioned claimed → running once it
+--   running: daemon transitioned claimed → running once it
 --     actually started the provision phase. claim_token + claimed_at
---     are NOT cleared — they record which orchestrator instance won
+--     are NOT cleared — they record which daemon instance won
 --     the claim and when.
 --   completed/failed/cancelled: terminal
 --
@@ -611,7 +611,7 @@ CREATE TRIGGER job_set_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION set_updated_at ();
 
--- Orchestrator claim path. (created_at, id) for deterministic ordering.
+-- Daemon claim path. (created_at, id) for deterministic ordering.
 CREATE INDEX job_queued_idx ON job (created_at, id)
 WHERE
     status = 'queued';

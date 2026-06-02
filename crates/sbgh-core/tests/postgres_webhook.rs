@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use sbgh_core::db::{
     IngestStore, NewWebhook, Pool, PostgresIngestStore, PostgresWebhookInbox, WebhookInbox,
-    setup_pg,
+    setup_pg_db,
 };
 use sbgh_core::models::{WebhookOutcome, WebhookStatus};
 use uuid::Uuid;
@@ -51,9 +51,7 @@ async fn read_row_status(pool: &Pool, delivery: &str) -> (WebhookStatus, Option<
 
 #[tokio::test]
 async fn claim_next_returns_none_when_empty() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let inbox = PostgresWebhookInbox::new(pool);
     let claimed = inbox
         .claim_next(&["issue_comment"])
@@ -66,9 +64,7 @@ async fn claim_next_returns_none_when_empty() {
 async fn claim_next_filters_by_event_type() {
     // Slice 2b invariant: rows for event types not in the filter
     // STAY in `received` for a future-slice processor to consume.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "issue-1", "issue_comment").await;
     seed_webhook(&pool, "install-1", "installation").await;
 
@@ -100,9 +96,7 @@ async fn claim_next_filters_by_event_type() {
 
 #[tokio::test]
 async fn claim_next_with_empty_filter_returns_none() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "any-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool);
     let claimed = inbox
@@ -118,9 +112,7 @@ async fn concurrent_claims_pick_disjoint_rows() {
     // on a pool of 2 rows must end up with distinct rows. With a plain
     // SELECT ... LIMIT 1 the second would block then re-read the same
     // row, double-claiming.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "a", "issue_comment").await;
     seed_webhook(&pool, "b", "issue_comment").await;
 
@@ -157,9 +149,7 @@ async fn concurrent_claims_pick_disjoint_rows() {
 
 #[tokio::test]
 async fn complete_transitions_row_to_terminal_status() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "term-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
 
@@ -184,9 +174,7 @@ async fn complete_round_trips_would_enqueue_job_outcome() {
     // value survives a round-trip through Postgres (binding via sqlx +
     // reading back via `FromRow`) AND maps to `Processed` status via
     // the `terminal_status()` rule baked into `complete`.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "would-enqueue-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
     let claimed = inbox
@@ -211,9 +199,7 @@ async fn complete_with_stale_claim_token_is_noop() {
     // under a new token, the original processor's late `complete` MUST
     // be a no-op. With the conditional WHERE clause on claim_token,
     // it should leave the row's new state untouched.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "stale-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
 
@@ -254,9 +240,7 @@ async fn sweep_recovers_stuck_processing_rows() {
     // Pin the make_interval(secs => $1) shape against real Postgres.
     // Seed a row, force it into `processing` with an old claimed_at,
     // call sweep with a lease shorter than the age — must recover.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "stuck-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
 
@@ -287,9 +271,7 @@ async fn sweep_recovers_stuck_processing_rows() {
 
 #[tokio::test]
 async fn sweep_leaves_fresh_processing_rows_alone() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "fresh-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
 
@@ -315,9 +297,7 @@ async fn sweep_leaves_fresh_processing_rows_alone() {
 async fn permanent_failure_increments_attempts_in_db() {
     // Pin the Postgres-side `attempts = attempts + 1` from
     // record_permanent_failure (fixed mid-slice 2a per Codex review).
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "perm-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
 
@@ -347,9 +327,7 @@ async fn permanent_failure_increments_attempts_in_db() {
 async fn complete_clears_last_error() {
     // Pin the slice 2a fix: a row that transient-errored once and
     // then succeeded must have last_error cleared.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "clear-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
 
@@ -396,9 +374,7 @@ async fn clear_terminal_payloads_nulls_old_terminal_rows() {
     // rows past the retention window get `payload = NULL`;
     // `payload_size_bytes` + `last_error` survive; in-flight rows are
     // untouched.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "retain-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
     let claimed = inbox
@@ -442,9 +418,7 @@ async fn clear_terminal_payloads_skips_in_flight_rows() {
     // Rows still in `received` / `processing` / `retryable_error` must
     // NOT have their payload cleared — they're either pending or
     // mid-retry.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "in-flight-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
 
@@ -460,9 +434,7 @@ async fn clear_terminal_payloads_skips_processed_status_rows() {
     // `processed` outcomes (enqueued_job / would_enqueue_job /
     // processed_installation) are intentionally NOT cleared — slice
     // 9+ may want the payload for job-context construction.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "processed-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
     let claimed = inbox
@@ -493,9 +465,7 @@ async fn clear_terminal_payloads_skips_processed_status_rows() {
 async fn clear_terminal_payloads_respects_retention_window() {
     // A row processed RECENTLY (younger than the window) must NOT
     // be cleared.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     seed_webhook(&pool, "young-1", "issue_comment").await;
     let inbox = PostgresWebhookInbox::new(pool.clone());
     let claimed = inbox

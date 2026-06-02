@@ -1,5 +1,25 @@
 # v1 → v2 upgrade runbook
 
+> **Historical — superseded by [roadmap-v3.md](./roadmap-v3.md).** Two waves
+> have obsoleted parts of this runbook:
+>
+> - **Phase 1** removed the legacy `jobs` code path entirely: the
+>   `[jobs].source` flag (and its `"legacy"` value) no longer exist, and the
+>   runner is unconditionally on the `job` family. Any step below that
+>   mentions `[jobs].source` is obsolete — there's nothing to set, and the
+>   runner-only "legacy" escape hatch in §9 is gone (rollback is a git
+>   revert + redeploy, as that section concludes).
+> - **Phases 4–6** removed the DB role split this runbook configures. The
+>   handler and CLI are now `/api` clients with no DB access; there is a
+>   single DB role (the owner); `apply_roles`, the `sbgh_handler` /
+>   `sbgh_orch` roles, and the `migrate` container/subcommand are gone (the
+>   daemon migrates at startup). Any step below about role grants,
+>   `SBGH_HANDLER_DB_PASSWORD` / `SBGH_ORCH_DB_PASSWORD`, or the `migrate`
+>   one-shot no longer applies.
+>
+> Kept for the historical cutover record; a current deployment is always on
+> v2 with the Phase-6 single-role topology.
+
 The end-to-end playlist for cutting a **running** deployment over from the
 legacy `jobs` queue (v1) to the new `job` family (v2). This is the
 operational counterpart to the Phase 2 cutover (roadmap slices 8–11).
@@ -21,21 +41,23 @@ is only for upgrading a host that is already serving `/benchmark` on v1.
 | ---- | ---- | ---- |
 | Handler | Verifies HMAC, parses `/benchmark`, **writes `jobs` rows** directly | Inbox-only: records every event as a `github_webhook` row, nothing else |
 | `sbgh_handler` DB grant | `INSERT`/`SELECT` on `jobs` | `INSERT` on `github_webhook` only — **all `jobs` access revoked** |
-| Job creation | Handler, synchronously | Orchestrator **processor**: classifies inbox rows → creates `job` (+ subject links) |
+| Job creation | Handler, synchronously | Daemon **processor**: classifies inbox rows → creates `job` (+ subject links) |
 | Runner source | `jobs` table | `job` family, selected by `[jobs].source = "v2"` |
 | Tag baselines | n/a | `CreateHandler` enqueues a `baseline` job; runner resolves the tag→commit at claim time |
 
 Three moving parts must all advance together: the **handler image**
 (inbox-only code), the **CLI/migrate image** (the grant revoke lives in
-`apply_roles`), and the **host orchestrator binary** (processor + v2
+`apply_roles`), and the **host daemon binary** (processor + v2
 runner). Deploy them in the order below or the handler will hit
 `permission denied for table jobs` against the new grants.
 
 ## 1. Preconditions
 
 - You're on the cutover commit (or later) — `git log --oneline -1` should
-  show the slice 11 cutover landed. Verify `config.example.orchestrator.toml`
-  contains a `[jobs]` section with `source = "v2"`.
+  show the slice 11 cutover landed. (On the original cutover commit the
+  runner backend was set via `[jobs].source = "v2"`; roadmap-v3 Phase 1
+  later removed that flag, so on current code there is nothing to verify —
+  the runner is always on the `job` family.)
 - A maintenance/quiet window: no in-flight benchmark you care about, and
   you can tolerate webhooks queuing for a few minutes.
 - DB owner access (`postgres://sbgh:$POSTGRES_OWNER_PASSWORD@...`) for the
@@ -58,11 +80,11 @@ psql "$DATABASE_URL" -c "
 "
 ```
 
-When that returns zero rows, stop the **old** host orchestrator so it
+When that returns zero rows, stop the **old** host daemon so it
 stops claiming legacy work and releases the DB connections:
 
 ```bash
-sudo systemctl stop sbgh-orchestrator
+sudo systemctl stop sbgh-daemon
 # or, if you were foreground-running it during bringup: ctrl-C that shell.
 ```
 
@@ -116,7 +138,7 @@ Expected: rows for `github_webhook` (`INSERT`), and **no rows** for
 Slices 5–10 ran the processor in shadow mode, so `job` / `github_webhook`
 already hold pre-cutover rows. Wipe them so post-cutover behaviour starts
 from a known-empty state. Run **once**, during the quiet window, after
-migrate and **before** starting the new orchestrator.
+migrate and **before** starting the new daemon.
 
 ```bash
 psql "$DATABASE_URL" -f scripts/pre-cutover-cleanup.sql
@@ -129,36 +151,36 @@ This `TRUNCATE`s `job CASCADE` (and its `job_event` / `job_metric` /
 `github_user*`, `github_pull_request`. The legacy `jobs` table is left
 intact (it's dropped later, in slice 12, after a soak).
 
-## 6. Rebuild + restart the host orchestrator (processor + v2 runner)
+## 6. Rebuild + restart the host daemon (processor + v2 runner)
 
-The orchestrator stays on the host (it needs LVM + libvirt + the golden
+The daemon stays on the host (it needs LVM + libvirt + the golden
 image). Rebuild it from the new code and reinstall the systemd unit. It
 boots reading `[jobs].source = "v2"` from
-`/etc/sbgh/orchestrator/config.toml`.
+`/etc/sbgh/daemon/config.toml`.
 
 ```bash
 # Confirm the live config selects v2 (env SBGH_JOBS_SOURCE overrides it).
-grep -A2 '^\[jobs\]' /etc/sbgh/orchestrator/config.toml
+grep -A2 '^\[jobs\]' /etc/sbgh/daemon/config.toml
 
 # Rebuild the binary and (re)install + restart the service. The script is
 # idempotent and restarts the unit automatically.
 just build
-sudo ./scripts/install-orchestrator.sh
+sudo ./scripts/install-daemon.sh
 
-journalctl -u sbgh-orchestrator -f
+journalctl -u sbgh-daemon -f
 ```
 
-Boot log should show `orchestrator started`. If `[jobs].source` is
-missing or invalid the orchestrator **hard-errors on startup** (no silent
+Boot log should show `daemon started`. If `[jobs].source` is
+missing or invalid the daemon **hard-errors on startup** (no silent
 fallback) — add the `[jobs]` block from
-`config.example.orchestrator.toml` and restart.
+`config.example.daemon.toml` and restart.
 
 ## 7. Seed the v2 authorization model
 
 This is the step the v1 instructions glossed over. v1 authorized
 `/benchmark` from the handler's `[authorization].allowed_repositories`
 config allowlist. v2 moved authorization into **DB-backed roles +
-policies** that the orchestrator evaluates — none of which a v1 host has
+policies** that the daemon evaluates — none of which a v1 host has
 populated. That's why the first post-cutover `/benchmark` is rejected with
 `sender lacks trigger_pr_benchmark role on target repo`.
 
@@ -220,7 +242,7 @@ $C repo allow --owner stacks-network --name stacks-core
 ```
 
 **Forks are accepted via lineage — don't allow the fork itself.** When the
-orchestrator processes your fork's `installation`/`installation_repositories`
+daemon processes your fork's `installation`/`installation_repositories`
 event, it calls `/repos/<owner>/<fork>`, reads GitHub's `source` (the
 network root), and stores it as the fork's `fork_root_github_repo_id`.
 `is_supported_lineage` then matches the enabled root against *either* the
@@ -252,11 +274,11 @@ psql "$DATABASE_URL" -c "
 ```
 
 **Step 3 is webhook-driven — there is no `import installation` command.**
-The orchestrator writes `github_installation` + `github_installation_repo`
+The daemon writes `github_installation` + `github_installation_repo`
 only while processing an `installation` / `installation_repositories`
 event whose repo lineage is supported. If the App was installed before the
 root was allowed, that event was recorded as `ignored_unsupported_lineage`
-and left no membership. Re-trigger it now that §6's orchestrator is
+and left no membership. Re-trigger it now that §6's daemon is
 running:
 
 - App settings → **Advanced → Recent Deliveries** → pick an `installation`
@@ -319,7 +341,7 @@ psql "$DATABASE_URL" -c "
   ORDER BY received_at DESC LIMIT 5;
 "
 
-# 2. The orchestrator processor turned the matched comment into a v2 job.
+# 2. The daemon processor turned the matched comment into a v2 job.
 psql "$DATABASE_URL" -c "
   SELECT id, job_kind, trigger_kind, status, git_commit_hash, created_at
   FROM job
@@ -338,8 +360,8 @@ psql "$DATABASE_URL" -c "
 Cross-check the logs:
 
 - **handler**: logs the inbound POST; **no** PR comment is posted by the
-  handler anymore (that moved to the orchestrator).
-- **orchestrator**: `processor` classifies the inbox row and creates a
+  handler anymore (that moved to the daemon).
+- **daemon**: `processor` classifies the inbox row and creates a
   `job`; the `runner` claims it, posts the *"⏳ queued…"* PR comment, and
   drives `building → running → collecting → done`.
 - The PR itself gets the bot comment and the ✅/❌ summary.
@@ -348,7 +370,7 @@ Tag baselines: push a release tag that matches a `trigger_policy`
 `tag_pattern`; expect a `baseline` job with `git_commit_hash` initially
 `NULL`, resolved to a real SHA once the runner claims it.
 
-If a `job` is created but no PR comment appears, check the orchestrator
+If a `job` is created but no PR comment appears, check the daemon
 holds **Issues: Read & write** and the installation accepted the
 permission (same 401 troubleshooting as
 [host-bringup.md §8](./host-bringup.md#8-troubleshooting)).
@@ -359,7 +381,7 @@ The cutover is deliberately not cleanly reversible (handler is inbox-only;
 its `jobs` grant is gone). Two recovery paths:
 
 - **Runner-only escape hatch (partial).** Set `[jobs].source = "legacy"`
-  (or `SBGH_JOBS_SOURCE=legacy`) and restart the orchestrator — the
+  (or `SBGH_JOBS_SOURCE=legacy`) and restart the daemon — the
   runner claims from `jobs` again. But the **new handler still won't
   write** legacy jobs, so no *new* legacy work is created. This only
   helps drain residual legacy rows; it is **not** a functional rollback.
@@ -371,7 +393,7 @@ its `jobs` grant is gone). Two recovery paths:
   git checkout <pre-cutover-commit>
   docker compose -f docker/docker-compose.yml down
   docker compose -f docker/docker-compose.yml up -d --build   # re-runs migrate → RESTORES handler jobs grant
-  just build && sudo ./scripts/install-orchestrator.sh         # old orchestrator, legacy runner
+  just build && sudo ./scripts/install-daemon.sh         # old daemon, legacy runner
   ```
 
   Re-running `migrate` on the old CLI image re-grants `sbgh_handler` its

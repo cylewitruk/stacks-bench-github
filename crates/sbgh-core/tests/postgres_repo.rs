@@ -1,15 +1,13 @@
 //! Slice 4 integration tests for `PostgresRepoStore` against a real
-//! testcontainers Postgres. Covers identity vs lineage upsert
+//! Postgres. Covers identity vs lineage upsert
 //! semantics, the self-referential topological insert, the support
 //! gate (id-match + fork-root-match), and the operator soft-disable.
 
-use sbgh_core::db::{NewRepoIdentity, NewRepoLineage, PostgresRepoStore, RepoStore, setup_pg};
+use sbgh_core::db::{NewRepoIdentity, NewRepoLineage, PostgresRepoStore, RepoStore, setup_pg_db};
 
 #[tokio::test]
 async fn lookup_repo_returns_none_for_unknown_id() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     assert!(
         store
@@ -25,9 +23,7 @@ async fn upsert_repo_identity_does_not_clobber_existing_lineage() {
     // CLI seed runs identity-only; a previously-walked lineage must
     // survive (otherwise a re-seed during operations would null out
     // the processor's runtime lineage cache).
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     // First populate full lineage (a fork).
     store
@@ -79,9 +75,7 @@ async fn upsert_repo_identity_does_not_clobber_existing_lineage() {
 async fn upsert_repo_lineage_inserts_ancestors_topologically() {
     // Fork-of-fork: leaf 30, parent 20, root 10. All three must end
     // up as github_repo rows; the leaf's FKs must point at 20 and 10.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     store
         .upsert_repo_lineage(&NewRepoLineage {
@@ -144,9 +138,7 @@ async fn upsert_repo_lineage_handles_one_hop_fork_without_duplicate_ancestor_ins
     // One-hop fork: parent == source. The Postgres impl checks
     // Some(par.id) != source_id to skip the duplicate INSERT — verify
     // we don't crash on a conflict from inserting the same row twice.
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     let root = NewRepoIdentity {
         id: 10,
@@ -172,9 +164,7 @@ async fn upsert_repo_lineage_handles_one_hop_fork_without_duplicate_ancestor_ins
 
 #[tokio::test]
 async fn is_supported_lineage_accepts_direct_root() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     store
         .upsert_repo_identity(&NewRepoIdentity {
@@ -200,9 +190,7 @@ async fn is_supported_lineage_accepts_direct_root() {
 
 #[tokio::test]
 async fn is_supported_lineage_accepts_fork_of_supported_root() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     // Seed root + supported entry.
     store
@@ -254,9 +242,7 @@ async fn is_supported_lineage_accepts_fork_of_supported_root() {
 
 #[tokio::test]
 async fn is_supported_lineage_rejects_disabled_root() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     store
         .upsert_repo_identity(&NewRepoIdentity {
@@ -287,9 +273,7 @@ async fn is_supported_lineage_rejects_disabled_root() {
 
 #[tokio::test]
 async fn is_supported_lineage_returns_false_for_unknown_repo() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     assert!(
         !store
@@ -301,9 +285,7 @@ async fn is_supported_lineage_returns_false_for_unknown_repo() {
 
 #[tokio::test]
 async fn disable_supported_root_returns_none_for_unknown() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     assert!(
         store
@@ -316,9 +298,7 @@ async fn disable_supported_root_returns_none_for_unknown() {
 
 #[tokio::test]
 async fn list_supported_roots_returns_join_with_owner_name() {
-    let Some((_c, pool)) = setup_pg().await else {
-        return;
-    };
+    let (_db, pool) = setup_pg_db().await;
     let store = PostgresRepoStore::new(pool);
     store
         .upsert_repo_identity(&NewRepoIdentity {

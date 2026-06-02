@@ -1,13 +1,17 @@
 # Architecture
 
-> **Note (Phase 2 cutover):** parts of this document describe the original
-> Phase-1 flow (handler writes directly to a legacy `jobs` table). Since the
-> slice 11 cutover the handler is **inbox-only** — it records webhooks into
-> `github_webhook`, and the orchestrator's **processor** classifies/authorizes
-> them and creates new-schema `job` rows that the runner executes. The legacy
-> `jobs` path is retired (removed in slice 12). The sections below are being
-> migrated to the new model; where they still say "handler enqueues a job",
-> read "handler records a webhook; the processor creates the job."
+> **Status note.** This document predates roadmap-v3; some lower sections
+> still describe older internals. The current top-level shape (roadmap-v3
+> Phases 4–6): the **handler** is a thin verify-and-forward shim — it checks
+> the webhook HMAC and forwards the raw delivery to the **daemon's** `/api`
+> (`POST /api/webhooks`, ingest token). It holds **no** DB access and **no**
+> App key. The daemon owns Postgres outright: it filters event types, writes
+> the `github_webhook` inbox, then runs the **processor** (classify /
+> authorize → create `job` rows) and the **runner** (execute in libvirt VMs).
+> `sbgh-cli` is a pure `/api` client (cookie auth). The legacy `jobs`-table
+> path was removed in Phase 1. Where a section below still says "handler
+> records a webhook to Postgres", read "handler forwards to `/api`; the
+> daemon records it."
 
 ## Overview
 
@@ -18,11 +22,11 @@ The system is split into two Rust binaries plus a shared library, all in a singl
 ```text
 crates/
   sbgh-core/         shared library: config, db, github (auth/client/webhook/command), models, error
-  sbgh-handler/      axum HTTP server that receives GitHub webhooks and records them to the inbox
-  sbgh-orchestrator/ long-running worker: processes the inbox into jobs, then executes them in libvirt VMs
+  sbgh-handler/      axum HTTP server: verifies the webhook HMAC and forwards each delivery to the daemon's /api (no DB)
+  sbgh-daemon/       long-running worker: owns Postgres — serves /api, processes the inbox into jobs, then executes them in libvirt VMs
 ```
 
-A Postgres database (run locally via `docker/docker-compose.yml`) is the only persistent state, and the only IPC between the two services.
+A Postgres database (run locally via `docker/docker-compose.yml`) is the only persistent state, and the **daemon is its sole client**. The handler and `sbgh-cli` never touch Postgres — they reach the daemon over the authenticated `/api` (see [daemon-api.md](./daemon-api.md)).
 
 ## Data flow
 
@@ -30,7 +34,11 @@ A Postgres database (run locally via `docker/docker-compose.yml`) is the only pe
 PR comment "/benchmark"
         │
         ▼
-GitHub ──webhook──► sbgh-handler ──INSERT──► Postgres (github_webhook inbox)
+GitHub ──webhook──► sbgh-handler ──HMAC verify──► daemon: POST /api/webhooks
+                                                  (ingest token)
+                                                     │
+                                              daemon filters event type +
+                                              writes github_webhook inbox
                                                      │
                                               processor: classify +
                                               authorize + INSERT job
@@ -42,12 +50,12 @@ GitHub ──webhook──► sbgh-handler ──INSERT──► Postgres (githu
                                                      │
                                               virsh + VM
                                                      │
-                          ┌──comment "running"───────┤  (orchestrator posts/
+                          ┌──comment "running"───────┤  (daemon posts/
                           │                          │   edits the PR comment)
                           └──comment "done + result"─┘
 ```
 
-Both the processor and the runner live in `sbgh-orchestrator`.
+The `/api` server, the processor, and the runner all live in `sbgh-daemon`.
 
 ## Components
 
@@ -58,23 +66,23 @@ Both the processor and the runner live in `sbgh-orchestrator`.
 | HTTP server | [crates/sbgh-handler/src/main.rs](../crates/sbgh-handler/src/main.rs) |
 | Webhook route | [crates/sbgh-handler/src/routes/webhook.rs](../crates/sbgh-handler/src/routes/webhook.rs) |
 | Signature verify | [crates/sbgh-core/src/github/webhook.rs](../crates/sbgh-core/src/github/webhook.rs) |
-| Inbox insert | [crates/sbgh-core/src/db/ingest.rs](../crates/sbgh-core/src/db/ingest.rs) |
+| `/api` client | [crates/sbgh-api/src/client.rs](../crates/sbgh-api/src/client.rs) (`submit_webhook`) |
 
-Per request (inbox-only since the slice 11 cutover):
+Per request (verify-and-forward since roadmap-v3 Phase 4):
 
 1. Read raw body (signature is over bytes, not parsed JSON).
 2. Verify `X-Hub-Signature-256` (HMAC-SHA256, constant-time compare).
-3. Drop unsupported event types at the wire (no DB row).
-4. Record a `github_webhook` inbox row and reply 2xx. That's it — no command parsing, no authorization, no job creation. The processor (in the orchestrator) owns command parsing, authorization (DB roles), and job creation from the inbox.
+3. Short-circuit `ping` → `pong` (no forward).
+4. Forward the raw body + `X-GitHub-Event` / `X-GitHub-Delivery` to the daemon's `POST /api/webhooks` (with the ingest token) and map its result back to GitHub (2xx on success; 502 if the daemon is unreachable so GitHub redelivers). That's it — **no** payload parse, event-type filtering, authorization, job creation, or DB access. The daemon owns the event allowlist, the inbox write, authorization, and job creation.
 
-### `sbgh-orchestrator`
+### `sbgh-daemon`
 
 | Concern | Where |
 | ---- | ---- |
-| Main loop | [crates/sbgh-orchestrator/src/runner.rs](../crates/sbgh-orchestrator/src/runner.rs) |
+| Main loop | [crates/sbgh-daemon/src/runner.rs](../crates/sbgh-daemon/src/runner.rs) |
 | Queue claim | [crates/sbgh-core/src/db/jobs.rs](../crates/sbgh-core/src/db/jobs.rs) |
-| Comment updates | [crates/sbgh-orchestrator/src/progress.rs](../crates/sbgh-orchestrator/src/progress.rs) |
-| libvirt driver | [crates/sbgh-orchestrator/src/libvirt/driver.rs](../crates/sbgh-orchestrator/src/libvirt/driver.rs) |
+| Comment updates | [crates/sbgh-daemon/src/progress.rs](../crates/sbgh-daemon/src/progress.rs) |
+| libvirt driver | [crates/sbgh-daemon/src/libvirt/driver.rs](../crates/sbgh-daemon/src/libvirt/driver.rs) |
 
 Single-threaded poll loop. We only run one benchmark at a time on the libvirt host, so `claim_next` uses `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1` and the loop processes the job to completion before claiming the next.
 
@@ -87,37 +95,39 @@ Two layers of credential:
 | App private key (PEM) | long-lived | the App | file on disk, mode `0600`, path in `SBGH_GH_PRIVATE_KEY_PATH` |
 | App JWT (RS256) | ≤ 10 min | the App | in-memory, minted per installation-token mint |
 | Installation access token | ~1 hour | one installation | in-memory cache, keyed by `installation_id` |
-| Webhook secret | long-lived | inbound HMAC | `SBGH_GH_WEBHOOK_SECRET` (env var) |
+| Webhook secret | long-lived | inbound HMAC | the handler's `SBGH_WEBHOOK_SECRET` (env var) |
 
 The private key never lives in an env var — env vars get into process listings, log scrapers, and crash dumps. It's a file on disk, owned by the service user, with restrictive permissions. The webhook secret is fine in an env var because it isn't a signing key for outbound calls.
 
-Installation tokens are cached in memory by [`InstallationTokenCache`](../crates/sbgh-core/src/github/auth.rs) and refreshed when less than 5 minutes remain. Both binaries share this cache implementation via `sbgh-core`.
+Installation tokens are minted + cached in memory by [`InstallationTokenCache`](../crates/sbgh-core/src/github/auth.rs), refreshed when less than 5 minutes remain. Only the **daemon** uses it — it holds the App key; the handler does not. (The implementation lives in `sbgh-core`, but the handler never instantiates it.)
 
 ## Local development
 
 ```bash
 # Start Postgres
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f docker/docker-compose.yml up -d postgres
 
-# Run migrations (requires sqlx-cli: cargo install sqlx-cli --no-default-features --features postgres,rustls)
-export DATABASE_URL=postgres://sbgh:sbgh@127.0.0.1:5432/sbgh
-sqlx migrate run
-
-# Configure env
+# Daemon env: DATABASE_URL (owner DSN), the SBGH_GH_* App secrets,
+# SBGH_API_INGEST_TOKEN, and the LVM/VM bits. See config.example.daemon.toml
+# for the full surface.
 cp .env.example .env
 chmod 0600 .env
 # edit .env, point SBGH_GH_PRIVATE_KEY_PATH at your local PEM
 
-# Run
-cargo run -p sbgh-handler
-cargo run -p sbgh-orchestrator
+# Run the daemon — it applies migrations at startup (no sqlx-cli needed),
+# serves /api, and runs the processor + runner.
+cargo run -p sbgh-daemon
+
+# The handler runs in Docker (`docker compose up -d handler`), or as a host
+# binary with its OWN env (SBGH_API_URL → the daemon, SBGH_WEBHOOK_SECRET,
+# SBGH_API_INGEST_TOKEN). `sbgh-cli` is a pure /api client (reads the cookie).
 ```
 
 For local webhook delivery from GitHub, use `smee.io` or `cloudflared tunnel` and point the App's webhook URL at the tunnel.
 
-## Orchestrator: libvirt benchmark driver
+## Daemon: libvirt benchmark driver
 
-For each job, the orchestrator runs a self-contained VM. The lifecycle is in [crates/sbgh-orchestrator/src/libvirt/driver.rs](../crates/sbgh-orchestrator/src/libvirt/driver.rs):
+For each job, the daemon runs a self-contained VM. The lifecycle is in [crates/sbgh-daemon/src/libvirt/driver.rs](../crates/sbgh-daemon/src/libvirt/driver.rs):
 
 1. **Provision** (host-side):
     - qcow2 boot overlay backed by the configured golden image.
@@ -134,7 +144,7 @@ Failure modes are surfaced as `BenchmarkOutcome { status: Failed(_), summary }` 
 
 ### In-VM startup script
 
-The VM-side script is at [crates/sbgh-orchestrator/src/libvirt/templates/sbgh-run.sh.tmpl](../crates/sbgh-orchestrator/src/libvirt/templates/sbgh-run.sh.tmpl). Phases it writes (host polls these):
+The VM-side scripts are [sbgh-build.sh.tmpl](../crates/sbgh-daemon/src/libvirt/templates/sbgh-build.sh.tmpl) (build phase) and [sbgh-bench.sh.tmpl](../crates/sbgh-daemon/src/libvirt/templates/sbgh-bench.sh.tmpl) (benchmark phase). Phases they write (host polls these):
 
 | Phase | Meaning |
 | ---- | ---- |
@@ -147,7 +157,7 @@ The VM-side script is at [crates/sbgh-orchestrator/src/libvirt/templates/sbgh-ru
 
 ## Operator setup
 
-This section is for the host that runs `sbgh-orchestrator`. The handler has none of these requirements; it can run anywhere with network access to GitHub and Postgres.
+This section is for the host that runs `sbgh-daemon`. The handler has none of these requirements; it runs in a container and only needs to receive webhook deliveries (via smee) and reach the daemon's `/api`.
 
 ### Required host packages (Debian/Ubuntu)
 
@@ -160,7 +170,7 @@ git, lvm2, util-linux, e2fsprogs
 
 ### User + sudoers
 
-The orchestrator runs as a dedicated `sbgh` user. Privileged commands are invoked via `sudo -n -- <binary> <args>`, so each binary must be allowlisted by path:
+The daemon runs as a dedicated `sbgh` user. Privileged commands are invoked via `sudo -n -- <binary> <args>`, so each binary must be allowlisted by path:
 
 ```text
 # /etc/sudoers.d/sbgh
@@ -174,7 +184,7 @@ sbgh ALL=(root) NOPASSWD: /usr/bin/virsh
 
 ### LVM layout
 
-The orchestrator does not create the thin-pool or the base chainstate LV — both are operator-managed and refreshed out-of-band.
+The daemon does not create the thin-pool or the base chainstate LV — both are operator-managed and refreshed out-of-band.
 
 ```text
 # one-time
@@ -193,21 +203,21 @@ mkfs.xfs /dev/sbgh-vg/mainnet-2026-05-21
 
 ```bash
 # Postgres
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f docker/docker-compose.yml up -d postgres
 
 # Build
 cargo build --release --workspace
 
-# Env (substitute real values)
+# Daemon env (the daemon is the only host binary). Set DATABASE_URL, the
+# SBGH_GH_* App secrets if you have an App, and SBGH_API_INGEST_TOKEN. See
+# config.example.daemon.toml for the full config surface.
 cp .env.example .env && chmod 0600 .env
-$EDITOR .env   # set SBGH_GH_* secrets, DATABASE_URL
+$EDITOR .env
 
-# Optional TOML overrides
-sudo install -m 0644 config.example.toml /etc/sbgh/config.toml
-
-# Run (handler self-applies migrations on boot)
-target/release/sbgh-handler &
-target/release/sbgh-orchestrator
+# Run the daemon — it applies migrations at startup, serves /api, and runs
+# the processor + runner. (The handler runs in Docker via docker-compose;
+# `sbgh-cli` is a pure /api client that reads the daemon's cookie.)
+target/release/sbgh-daemon
 ```
 
 ## Open design questions
@@ -215,4 +225,4 @@ target/release/sbgh-orchestrator
 - **Webhook delivery while offline**: GitHub retries failed webhook deliveries, but if the handler is down for an extended period we lose commands. Could add a periodic reconciliation that polls open PRs for missed `/benchmark` comments.
 - **Multiple installations / multi-tenant**: the current design handles N installations naturally (installation id is on the job row) but we haven't decided whether the allowlist should be per-installation.
 - **Result format**: `BenchmarkOutcome.summary` is `serde_json::Value` for now; should become a typed struct once we know what `stacks-bench` emits.
-- **VM teardown on orchestrator crash**: needs a startup sweep that destroys orphaned VMs from jobs left in `running` state.
+- **VM teardown on daemon crash**: needs a startup sweep that destroys orphaned VMs from jobs left in `running` state.

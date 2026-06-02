@@ -1,6 +1,6 @@
 //! GitHub API client abstraction.
 //!
-//! The trait `GitHubApi` is the boundary between our handler/orchestrator and
+//! The trait `GitHubApi` is the boundary between our handler/daemon and
 //! GitHub itself; everything in the rest of the codebase depends on the trait,
 //! not on `octocrab`. `OctocrabClient` is the real implementation; a fake
 //! implementation lives under the `testing` feature for use in tests.
@@ -128,7 +128,7 @@ pub trait GitHubApi: Send + Sync + 'static {
     ) -> Result<PullRequestSummary>;
 
     /// Resolve a git ref (branch/tag/SHA) to its commit SHA + authored
-    /// date. Used by the orchestrator to resolve `tag_created` jobs at
+    /// date. Used by the daemon to resolve `tag_created` jobs at
     /// claim time — the `create` webhook carries the tag name but no
     /// SHA. GitHub dereferences annotated tags to the underlying commit.
     /// `repository` is `"owner/name"` form.

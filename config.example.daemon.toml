@@ -1,0 +1,135 @@
+# Example daemon config. Copy to /etc/sbgh/daemon/config.toml
+# (or wherever $SBGH_CONFIG points) and fill in.
+#
+# The daemon runs ON THE HOST (not in a container) — it needs LVM,
+# libvirt, and the golden image. This config holds the GitHub App
+# credentials and everything the libvirt benchmark driver needs. Keep
+# it disjoint from the handler's config.
+#
+# Secret values can also come from env:
+#   DATABASE_URL                 — overrides [server].database_url
+#   SBGH_GH_PRIVATE_KEY_PATH     — overrides [github].private_key_path
+
+[server]
+# Connect as the DB **owner** (`sbgh`) — the daemon is the sole DB client.
+# roadmap-v3 Phase 3 added the `/api` admin endpoints, which write the
+# installer / repo / policy / user tables the old narrow roles had no grants
+# on, so the daemon needs owner privileges. (The `sbgh_orch`/`sbgh_handler`
+# roles were dropped in the Phase 6 collapse — there's a single role now.)
+# Compose publishes postgres on 127.0.0.1:5432; the owner password is the
+# `POSTGRES_OWNER_PASSWORD` set in docker/.env.
+database_url = "postgres://sbgh:CHANGE_ME@127.0.0.1:5432/sbgh"
+# OS user the daemon runs as. Used to chown the per-job source mount.
+service_user = "sbgh"
+
+[github]
+# App **Client ID** (the `Iv23li...` string in the App settings page, right
+# under "About"). Used as the JWT `iss` claim when minting installation
+# tokens. Both Client ID and the numeric App ID work today; standardise on
+# Client ID per GitHub's 2024 recommendation.
+client_id = "Iv23liREPLACE_ME"
+api_base_url = "https://api.github.com"
+private_key_path = "/etc/sbgh/daemon/github-app.private-key.pem"
+
+[vm]
+golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
+
+# Each job runs the same VM in two phases — build at one size, bench at
+# another (typically smaller, matching the production deployment shape).
+# Memory accepts the IEC short form: "16G", "8192M", "1024K", or bare
+# bytes. All units are binary (G ≡ Gi = 1024³). Between phases the
+# daemon powers the VM off cleanly and redefines it at the new
+# memory + vcpus, giving the bench phase a fresh kernel boot.
+#
+# Build phase: cargo wants parallelism and rustc's `lto=fat` final
+# link of `stacks-bench` peaks at ~7.6 GiB RSS. 16 GiB is the floor;
+# lower OOM-kills the build.
+build_vcpus = 4
+build_memory = "16G"
+
+# Bench phase: should mirror the production deployment shape so the
+# per-block timings are representative. stacks-node typically runs on
+# 2–4 cores / 8 GiB in prod.
+bench_vcpus = 2
+bench_memory = "8G"
+
+boot_disk_gib = 64
+job_timeout_secs = 21600   # 6 hours
+network = "default"
+# How often the daemon polls the in-VM phase journal + virsh
+# domstate. Each poll runs a `virsh domstate` subprocess (~50–100ms),
+# so smaller values = more host CPU. 5s is the sensible floor for
+# our workload; transitions are append-only and replayed in batches
+# so we never miss one even at multi-second polls.
+poll_interval_secs = 5
+# How often the daemon emits a heartbeat log line + (debounced)
+# PR-comment refresh showing the current phase and elapsed time
+# within it. Independent of poll interval — poll rarely, surface
+# liveness frequently.
+heartbeat_interval_secs = 60
+
+[paths]
+jobs_dir = "/var/lib/sbgh/jobs"
+git_mirror = "/var/lib/sbgh/git/stacks-core.git"
+results_tmpfs_root = "/run/sbgh/jobs"
+results_archive_dir = "/var/lib/sbgh/results"
+# Host-side persistent sccache cache, bind-mounted into every job VM
+# via virtio-fs. Persists rustc output across jobs so cold cargo
+# builds (~35 min) drop to ~5 min on warm cache. sccache enforces its
+# own LRU eviction inside the VM (SCCACHE_CACHE_SIZE=20G hardcoded by
+# the daemon), so this dir can't exceed that ceiling regardless
+# of how many jobs run.
+sccache_dir = "/var/lib/sbgh/sccache"
+virsh_binary = "/usr/bin/virsh"
+sudo_binary = "/usr/bin/sudo"
+qemu_img_binary = "/usr/bin/qemu-img"
+cloud_localds_binary = "/usr/bin/cloud-localds"
+git_binary = "/usr/bin/git"
+
+[lvm]
+# Most installs have a single VG that already holds root/swap (often `vg0`
+# or named after the hostname). Use whatever `vgs` shows; it does not need
+# to be dedicated.
+vg_name = "vg0"
+thinpool = "thinpool"
+chainstate_base_prefix = "mainnet-"
+# Leave commented out for the recommended thin-snapshot path (snapshot
+# lives in the same thin pool as the origin, grows on demand). Set
+# explicitly only if your base chainstate LV is a thick (non-thin) volume —
+# the value is then the COW exception-store size in GiB.
+# chainstate_snapshot_size_gib = 64
+
+[stacks_bench]
+# Default args appended to every `stacks-bench bench run` invocation when
+# a PR comment is plain `/benchmark` (no args). When the comment carries
+# args, they REPLACE this string entirely — no merging.
+#
+# The daemon injects the structural flags itself (`--json`, `--db`,
+# `bench run`, `--source`, `--dangerous-no-chainstate-copy`); only put
+# workload-control flags here. See `stacks-bench bench run --help` for
+# the full surface.
+#
+# The default below is a "smoke test" invocation: replay 5000 mainnet
+# blocks starting partway through the chain, with 1000 warmup blocks,
+# skipping the slow per-span KV persistence. Completes in tens of
+# minutes rather than hours — useful for first-time pipeline validation.
+# Tune the start-at / count for your chainstate's height and for what
+# you're trying to measure.
+default_args = "--start-at 7800000 --count 5000 --warmup 1000 --no-profiler-kv --bench-spans-only"
+
+# The `/api` server (roadmap-v3 Phase 2). Reachable only from the local CLI
+# (loopback) and the handler container (docker bridge) — never a public
+# interface.
+[api]
+# TWO binds: loopback for the local CLI, and the docker-bridge gateway IP so
+# the handler container can reach the host daemon (a container cannot reach a
+# loopback-only bind). The bridge IP is host-specific; firewall it to the
+# docker subnet. Default: loopback only. Env: SBGH_API_LISTEN (comma-separated).
+listen = ["127.0.0.1:8787", "172.17.0.1:8787"]
+# Where the daemon writes the operator `admin` cookie at startup (mode 0600,
+# regenerated each boot). `sbgh-cli` reads it. Env: SBGH_API_COOKIE_PATH.
+cookie_path = "/etc/sbgh/daemon/.cookie"
+# Shared static token the handler presents for the `ingest` scope. Keep it out
+# of this file — set it via SBGH_API_INGEST_TOKEN (same value in the handler's
+# secrets.env). Unset = webhook submission via /api is disabled.
+# ingest_token = "..."

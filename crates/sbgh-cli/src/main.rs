@@ -1,55 +1,31 @@
-//! Operator CLI: schema migrations + role grants + allowed_installer admin.
+//! Operator CLI — a pure client of the daemon `/api`.
 //!
-//! Subcommands:
-//!   - `migrate` (default) — apply schema migrations + idempotently (re)apply
-//!     the narrow Postgres role grants. Run as `service_completed` before
-//!     handler/orchestrator boot. Idempotent on re-run.
-//!   - `installer` — manage the operator-curated `allowed_installer` allowlist
-//!     that gates which GitHub accounts may install the App.
+//! `installer` / `repo` / `policy` / `user` admin plus the `installation` /
+//! `webhook` / `jobs` / `status` read commands all talk to the daemon. It
+//! authenticates with the daemon-written **admin cookie** (the `bitcoind`
+//! model): no DB credential, no GitHub access (the daemon resolves
+//! logins/repos server-side), no secret in the repo.
 //!
-//! Always runs as the DB **owner** (the `sbgh` account). The handler and
-//! orchestrator never run with owner credentials — they each connect as their
-//! own narrow role:
+//! Commands read the cookie at `--cookie` (default
+//! `/etc/sbgh/daemon/.cookie`) and target `--api-url` (default
+//! `http://127.0.0.1:8787`).
 //!
-//! - `sbgh_handler` → inbox-only (since the slice 11 cutover): INSERT on a
-//!   small set of `github_webhook` columns + SELECT on the columns required for
-//!   `INSERT ... ON CONFLICT ... RETURNING`. NO access to legacy `jobs`, no
-//!   read access to payload / status, no way to fabricate a processed row.
-//! - `sbgh_orch` → SELECT + UPDATE on the full `jobs` and `github_webhook`
-//!   tables; SELECT + INSERT/UPDATE on the identity/policy tables it owns.
-//!
-//! Required env vars (every subcommand):
-//!   - `DATABASE_URL` — owner DSN, e.g.
-//!     `postgres://sbgh:OWNER_PW@postgres/sbgh`
-//!
-//! Required env vars (`migrate` only):
-//!   - `SBGH_HANDLER_DB_PASSWORD` — password assigned to role `sbgh_handler`
-//!   - `SBGH_ORCH_DB_PASSWORD`    — password assigned to role `sbgh_orch`
-//!
-//! Optional env vars (`installer {allow,disable}` only):
-//!   - `SBGH_GH_API_BASE_URL` — defaults to `https://api.github.com`. Override
-//!     for GitHub Enterprise or tests.
-//!
-//! The `installer` subcommand resolves logins via GitHub's unauthenticated
-//! `/users/{login}` endpoint (60/hr per IP — plenty for operator one-shots).
-//! No App credentials needed.
+//! Migrations are no longer the CLI's job — the daemon applies them at
+//! startup (roadmap-v3 Phase 6 retired the `migrate` subcommand).
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use sbgh_cli::{
-    add_trigger_policy, allow_installer, allow_repo_root, allow_source_policy, allow_target_policy,
-    apply_roles, disable_installer, disable_installer_by_account_id, disable_repo_root,
-    disable_repo_root_by_id, disable_source_policy, disable_target_policy, disable_trigger_policy,
-    grant_role, grant_role_by_user_id, list_installers, list_repo_roots, list_roles,
-    list_source_policies, list_target_policies, list_trigger_policies, list_users, revoke_role,
-    revoke_role_by_user_id,
+use sbgh_api::{
+    AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest, Client,
+    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, RoleRequest, read_cookie,
 };
-use sbgh_core::db;
-use sbgh_core::models::{TriggerKind, UserRole};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
+
+const DEFAULT_API_URL: &str = "http://127.0.0.1:8787";
+const DEFAULT_COOKIE_PATH: &str = "/etc/sbgh/daemon/.cookie";
 
 #[derive(Parser, Debug)]
 #[command(version, about = "sbgh operator CLI")]
@@ -59,16 +35,22 @@ struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     env_file: Option<PathBuf>,
 
+    /// Daemon `/api` base URL (admin commands). The daemon binds this
+    /// on loopback for the local operator.
+    #[arg(long, value_name = "URL", global = true, default_value = DEFAULT_API_URL)]
+    api_url: String,
+
+    /// Path to the daemon-written admin cookie (regenerated each boot, mode
+    /// 0600). Read by the API commands to authenticate as `admin`.
+    #[arg(long, value_name = "PATH", global = true, default_value = DEFAULT_COOKIE_PATH)]
+    cookie: PathBuf,
+
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Apply schema migrations + (re)apply role grants. This is the default
-    /// when no subcommand is given (matches the legacy `sbgh-migrate` binary).
-    Migrate,
-
     /// Manage the operator-curated allowlist of GitHub accounts permitted to
     /// install the App.
     Installer {
@@ -85,35 +67,52 @@ enum Command {
         action: RepoAction,
     },
 
-    /// Manage the slice 5 per-installation policy tables that gate
-    /// which PR / push / tag events will trigger a benchmark job.
-    /// Three nested groups: `target` (which repos are benchmark
-    /// targets), `source` (which repos are trusted as PR sources),
-    /// `trigger` (which branches / tag patterns auto-trigger jobs).
+    /// Manage the per-installation policy tables that gate which PR / push /
+    /// tag events will trigger a benchmark job. Three nested groups:
+    /// `target` (which repos are benchmark targets), `source` (which repos
+    /// are trusted as PR sources), `trigger` (which branches / tag patterns
+    /// auto-trigger jobs).
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
     },
 
-    /// Slice 6: manage per-installation role grants. `grant` /
-    /// `revoke` / `list` mirror the installer/repo/policy shape.
-    /// Each grant is `(user, install, optional repo, role)`; `--repo`
-    /// narrows to a single repo within the install, omitting it
-    /// grants install-wide.
+    /// Manage per-installation role grants. `grant` / `revoke` / `list`
+    /// mirror the installer/repo/policy shape. Each grant is `(user,
+    /// install, optional repo, role)`; `--repo` narrows to a single repo
+    /// within the install, omitting it grants install-wide.
     User {
         #[command(subcommand)]
         action: UserAction,
     },
+
+    /// Read-only: list known GitHub App installations.
+    Installation {
+        #[command(subcommand)]
+        action: InstallationAction,
+    },
+
+    /// Read-only: inspect the webhook inbox.
+    Webhook {
+        #[command(subcommand)]
+        action: WebhookAction,
+    },
+
+    /// Read-only: list benchmark jobs (run visibility).
+    Jobs {
+        #[command(subcommand)]
+        action: JobsAction,
+    },
+
+    /// Probe the daemon `/api`: health + the scope the cookie resolves to.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
 enum UserAction {
-    /// Grant a role to a user on an installation. Resolves login → id
-    /// via the GitHub `/users/{login}` endpoint (same path
-    /// `installer allow` uses) and upserts the `github_user` row
-    /// before recording the grant.
-    ///
-    /// `--repo` narrows the grant to one repo within the install;
+    /// Grant a role to a user on an installation. The daemon resolves
+    /// `--login` → id server-side and upserts the user before recording the
+    /// grant. `--repo` narrows the grant to one repo within the install;
     /// omit it to grant install-wide. Exactly one of `--login` or
     /// `--user-id` (emergency / GH-outage path) must be supplied.
     Grant {
@@ -129,9 +128,8 @@ enum UserAction {
         role: RoleArg,
     },
     /// Revoke a previously granted role. Match criteria are
-    /// (user, install, repo, role) — `--repo` MUST exactly match
-    /// the grant being revoked (NULL grants are NOT matched by a
-    /// repo-narrowed revoke).
+    /// (user, install, repo, role) — `--repo` MUST exactly match the grant
+    /// being revoked (NULL grants are NOT matched by a repo-narrowed revoke).
     Revoke {
         #[arg(long, group = "user_revoke_target")]
         login: Option<String>,
@@ -144,9 +142,8 @@ enum UserAction {
         #[arg(long, value_enum)]
         role: RoleArg,
     },
-    /// List grants, optionally filtered by install id. With
-    /// `--users` instead, lists every known `github_user` row
-    /// (independent of role grants).
+    /// List grants, optionally filtered by install id. With `--users`
+    /// instead, lists every known user (independent of role grants).
     List {
         #[arg(long, conflicts_with = "users")]
         install: Option<i64>,
@@ -155,9 +152,7 @@ enum UserAction {
     },
 }
 
-/// Clap-facing copy of `sbgh_core::models::UserRole` so the CLI can
-/// surface `--help`-friendly choices without making sbgh-core depend
-/// on clap. Three variants total; the conversion is trivial.
+/// Clap-facing role choices. Mapped to the API's snake_case wire names.
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum RoleArg {
     Admin,
@@ -165,35 +160,32 @@ enum RoleArg {
     ViewResults,
 }
 
-impl From<RoleArg> for UserRole {
-    fn from(r: RoleArg) -> Self {
-        match r {
-            RoleArg::Admin => UserRole::Admin,
-            RoleArg::TriggerPrBenchmark => UserRole::TriggerPrBenchmark,
-            RoleArg::ViewResults => UserRole::ViewResults,
+impl RoleArg {
+    fn as_wire(self) -> &'static str {
+        match self {
+            RoleArg::Admin => "admin",
+            RoleArg::TriggerPrBenchmark => "trigger_pr_benchmark",
+            RoleArg::ViewResults => "view_results",
         }
     }
 }
 
 #[derive(Subcommand, Debug)]
 enum InstallerAction {
-    /// Add (or re-enable) a GitHub account on the allowlist. Resolves the
-    /// login → numeric account id via GitHub's unauthenticated
-    /// `/users/{login}` endpoint, then upserts the row.
+    /// Add (or re-enable) a GitHub account on the allowlist. The daemon
+    /// resolves the login → numeric account id, then upserts the row.
     Allow {
         #[arg(long)]
         login: String,
         #[arg(long)]
         note: Option<String>,
     },
-    /// Soft-disable an installer (sets `is_enabled=FALSE`). The row is
-    /// kept for audit; re-enable with `allow --login ...`.
+    /// Soft-disable an installer (sets `is_enabled=FALSE`). The row is kept
+    /// for audit; re-enable with `allow --login ...`.
     ///
     /// Exactly one of `--login` or `--account-id` must be supplied.
-    /// `--login` resolves through GitHub (handles rename/recycling
-    /// correctly); `--account-id` skips the API entirely and is the
-    /// emergency path when GitHub is unreachable or rate-limited, or
-    /// when the operator pulled the id from `installer list`.
+    /// `--login` resolves through GitHub (handles rename/recycling);
+    /// `--account-id` skips resolution and is the emergency path.
     Disable {
         #[arg(long, group = "disable_target")]
         login: Option<String>,
@@ -206,11 +198,9 @@ enum InstallerAction {
 
 #[derive(Subcommand, Debug)]
 enum RepoAction {
-    /// Add (or re-enable) a canonical repo on the supported list.
-    /// Resolves owner/name → numeric id via GitHub's unauthenticated
-    /// `/repos/{owner}/{repo}` endpoint, then upserts both the
-    /// identity row (github_repo) and the operator row
-    /// (supported_repo_root) in one transaction.
+    /// Add (or re-enable) a canonical repo on the supported list. The daemon
+    /// resolves owner/name → numeric id, then upserts the identity +
+    /// operator rows in one transaction.
     Allow {
         #[arg(long)]
         owner: String,
@@ -219,12 +209,11 @@ enum RepoAction {
         #[arg(long)]
         note: Option<String>,
     },
-    /// Soft-disable a supported root (sets is_enabled=FALSE; row kept
-    /// for audit; forks of this root will start being denied with
-    /// `ignored_unsupported_lineage`).
+    /// Soft-disable a supported root (sets is_enabled=FALSE; row kept for
+    /// audit; forks of this root start being denied).
     ///
-    /// Exactly one of `--owner --name` (resolves via GH API) or
-    /// `--repo-id` (emergency / GH-outage path) must be supplied.
+    /// Exactly one of `--owner --name` (resolves via the daemon) or
+    /// `--repo-id` (emergency path) must be supplied.
     Disable {
         #[arg(long, group = "repo_disable_target", requires = "name")]
         owner: Option<String>,
@@ -239,35 +228,31 @@ enum RepoAction {
 
 #[derive(Subcommand, Debug)]
 enum PolicyAction {
-    /// Per-installation target-repo opt-in: "this install will
-    /// benchmark PRs against this repo." Requires a current
-    /// `github_installation_repo` membership row (FK).
+    /// Per-installation target-repo opt-in: "this install will benchmark PRs
+    /// against this repo." Requires a current membership row (FK).
     Target {
         #[command(subcommand)]
-        action: PolicyTargetAction,
+        action: PolicyPairAction,
     },
-    /// Per-installation source-repo trust: "this install trusts this
-    /// repo as a PR source — its code may execute in our bench VM."
-    /// Unlike target, no membership FK — sources can be arbitrary
-    /// forks.
+    /// Per-installation source-repo trust: "this install trusts this repo as
+    /// a PR source — its code may execute in our bench VM."
     Source {
         #[command(subcommand)]
-        action: PolicySourceAction,
+        action: PolicyPairAction,
     },
-    /// Per-installation auto-trigger subscriptions for `push` /
-    /// `create` events. Multiple per (install, repo) — each row is one
-    /// trigger_kind + match_spec + bench_args.
+    /// Per-installation auto-trigger subscriptions for `push` / `create`
+    /// events. Multiple per (install, repo).
     Trigger {
         #[command(subcommand)]
         action: PolicyTriggerAction,
     },
 }
 
+/// Shared shape for `target` and `source` policies (same args).
 #[derive(Subcommand, Debug)]
-enum PolicyTargetAction {
-    /// Allow (or re-enable) a (install, repo) pair as a benchmark
-    /// target. Operator pulls the ids from `installer list` +
-    /// `repo list` first.
+enum PolicyPairAction {
+    /// Allow (or re-enable) a (install, repo) pair. Operator pulls the ids
+    /// from `installer list` + `repo list` first.
     Allow {
         #[arg(long)]
         install_id: i64,
@@ -276,36 +261,14 @@ enum PolicyTargetAction {
         #[arg(long)]
         note: Option<String>,
     },
-    /// Soft-disable a target policy row.
+    /// Soft-disable a policy row.
     Disable {
         #[arg(long)]
         install_id: i64,
         #[arg(long)]
         repo_id: i64,
     },
-    /// List target policies. Optional `--install-id` filter.
-    List {
-        #[arg(long)]
-        install_id: Option<i64>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum PolicySourceAction {
-    Allow {
-        #[arg(long)]
-        install_id: i64,
-        #[arg(long)]
-        repo_id: i64,
-        #[arg(long)]
-        note: Option<String>,
-    },
-    Disable {
-        #[arg(long)]
-        install_id: i64,
-        #[arg(long)]
-        repo_id: i64,
-    },
+    /// List policies. Optional `--install-id` filter.
     List {
         #[arg(long)]
         install_id: Option<i64>,
@@ -316,19 +279,15 @@ enum PolicySourceAction {
 enum PolicyTriggerAction {
     /// Add a new trigger_policy row. `--kind` is `branch_push` or
     /// `tag_created`; `--match` is the JSON match_spec (e.g.
-    /// `'{"kind":"branch_push","branch_name":"develop"}'`); `--args`
-    /// is forwarded to the eventual job as CLI args in slice 9+.
+    /// `'{"kind":"branch_push","branch_name":"develop"}'`), validated
+    /// server-side; `--args` is forwarded to the eventual job.
     Add {
         #[arg(long)]
         install_id: i64,
         #[arg(long)]
         repo_id: i64,
-        /// `branch_push` or `tag_created` (other trigger_kind variants
-        /// are reserved for post-slice-9).
         #[arg(long)]
         kind: String,
-        /// JSON match_spec validated against `TriggerMatchSpec` at
-        /// insert time.
         #[arg(long = "match")]
         match_spec: String,
         #[arg(long = "args")]
@@ -336,7 +295,7 @@ enum PolicyTriggerAction {
         #[arg(long)]
         note: Option<String>,
     },
-    /// Soft-disable a trigger row by its bigserial id.
+    /// Soft-disable a trigger row by its id.
     Disable {
         #[arg(long)]
         id: i64,
@@ -350,99 +309,95 @@ enum PolicyTriggerAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum InstallationAction {
+    /// List known installations.
+    List,
+}
+
+#[derive(Subcommand, Debug)]
+enum WebhookAction {
+    /// Show the most recent inbox rows, newest first.
+    Tail {
+        /// Filter by event type (e.g. `issue_comment`, `push`).
+        #[arg(long)]
+        event_type: Option<String>,
+        /// Filter by status (e.g. `received`, `processed`, `failed`).
+        #[arg(long)]
+        status: Option<String>,
+        /// Max rows (server default 50).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum JobsAction {
+    /// List jobs, newest first.
+    List {
+        /// Filter by status.
+        #[arg(long)]
+        status: Option<String>,
+        /// Max rows (server default 50).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     load_env(cli.env_file.as_deref())?;
     init_tracing();
 
-    match cli
-        .command
-        .unwrap_or(Command::Migrate)
-    {
-        Command::Migrate => run_migrate().await,
-        Command::Installer { action } => run_installer(action).await,
-        Command::Repo { action } => run_repo(action).await,
-        Command::Policy { action } => run_policy(action).await,
-        Command::User { action } => run_user(action).await,
+    let api_url = cli.api_url.clone();
+    let cookie = cli.cookie.clone();
+    // Build the API client (reading the admin cookie) on demand — `migrate`
+    // never needs it.
+    let mk_client = move || -> anyhow::Result<Client> {
+        let token = read_cookie(&cookie).with_context(|| {
+            format!("reading admin cookie from {} (is the daemon running?)", cookie.display())
+        })?;
+        Ok(Client::new(api_url.clone(), Some(token)))
+    };
+
+    match cli.command {
+        Command::Installer { action } => run_installer(&mk_client()?, action).await,
+        Command::Repo { action } => run_repo(&mk_client()?, action).await,
+        Command::Policy { action } => run_policy(&mk_client()?, action).await,
+        Command::User { action } => run_user(&mk_client()?, action).await,
+        Command::Installation { action } => run_installation(&mk_client()?, action).await,
+        Command::Webhook { action } => run_webhook(&mk_client()?, action).await,
+        Command::Jobs { action } => run_jobs(&mk_client()?, action).await,
+        Command::Status => run_status(&mk_client()?).await,
     }
 }
 
-async fn run_migrate() -> anyhow::Result<()> {
-    let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL must be set (owner DSN)")?;
-    let handler_pw = std::env::var("SBGH_HANDLER_DB_PASSWORD")
-        .context("SBGH_HANDLER_DB_PASSWORD must be set")?;
-    let orch_pw =
-        std::env::var("SBGH_ORCH_DB_PASSWORD").context("SBGH_ORCH_DB_PASSWORD must be set")?;
-
-    tracing::info!("connecting to postgres as owner");
-    let pool = db::connect(&database_url)
-        .await
-        .context("connect to postgres")?;
-
-    tracing::info!("applying schema migrations");
-    db::migrate(&pool)
-        .await
-        .context("schema migrations")?;
-
-    tracing::info!("(re)applying role definitions + grants");
-    apply_roles(&pool, &handler_pw, &orch_pw)
-        .await
-        .context("role/grant setup")?;
-
-    tracing::info!("migrate complete");
-    Ok(())
-}
-
-async fn run_installer(action: InstallerAction) -> anyhow::Result<()> {
-    let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL must be set (owner DSN)")?;
-    let pool = db::connect(&database_url)
-        .await
-        .context("connect to postgres")?;
-
-    let api_base =
-        std::env::var("SBGH_GH_API_BASE_URL").unwrap_or_else(|_| "https://api.github.com".into());
-
+async fn run_installer(client: &Client, action: InstallerAction) -> anyhow::Result<()> {
     match action {
         InstallerAction::Allow { login, note } => {
-            let row = allow_installer(&pool, &api_base, &login, note.as_deref())
+            let row = client
+                .allow_installer(&AllowInstallerRequest { login, note })
                 .await
                 .context("allow installer")?;
             println!(
-                "allowed: github_account_id={} login={} type={:?} is_enabled={}",
-                row.github_account_id, row.account_login, row.account_type, row.is_enabled,
+                "allowed: account_id={} login={} type={} is_enabled={}",
+                row.account_id, row.login, row.account_type, row.is_enabled,
             );
         }
         InstallerAction::Disable { login, account_id } => {
-            // clap's `group` attribute enforces mutual exclusivity; the
-            // required-exactly-one constraint is checked here so we can
-            // give an operator-friendly error instead of a clap-derived
-            // one. `disable_target` matches the group name on the args.
-            let row = match (login, account_id) {
-                (Some(l), None) => disable_installer(&pool, &api_base, &l)
-                    .await
-                    .context("disable installer")?,
-                (None, Some(id)) => disable_installer_by_account_id(&pool, id)
-                    .await
-                    .context("disable installer")?,
-                (None, None) => {
-                    return Err(anyhow!("exactly one of --login or --account-id is required"));
-                }
-                (Some(_), Some(_)) => {
-                    // Unreachable in practice — clap's group enforces
-                    // mutex — but keep the arm so the match is total.
-                    return Err(anyhow!("--login and --account-id are mutually exclusive"));
-                }
-            };
+            let row = client
+                .disable_installer(&DisableInstallerRequest { login, account_id })
+                .await
+                .context("disable installer")?;
             println!(
-                "disabled: github_account_id={} login={} is_enabled={}",
-                row.github_account_id, row.account_login, row.is_enabled,
+                "disabled: account_id={} login={} is_enabled={}",
+                row.account_id, row.login, row.is_enabled,
             );
         }
         InstallerAction::List => {
-            let rows = list_installers(&pool)
+            let rows = client
+                .list_installers()
                 .await
                 .context("list installers")?;
             if rows.is_empty() {
@@ -451,10 +406,10 @@ async fn run_installer(action: InstallerAction) -> anyhow::Result<()> {
             }
             for r in rows {
                 println!(
-                    "{:<12} {:>12}  {:<8}  {}  note={}",
-                    r.account_login,
-                    r.github_account_id,
-                    format!("{:?}", r.account_type),
+                    "{:<12} {:>12}  {:<14}  {}  note={}",
+                    r.login,
+                    r.account_id,
+                    r.account_type,
                     if r.is_enabled { "ENABLED " } else { "disabled" },
                     r.note
                         .as_deref()
@@ -466,50 +421,31 @@ async fn run_installer(action: InstallerAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_repo(action: RepoAction) -> anyhow::Result<()> {
-    let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL must be set (owner DSN)")?;
-    let pool = db::connect(&database_url)
-        .await
-        .context("connect to postgres")?;
-    let api_base =
-        std::env::var("SBGH_GH_API_BASE_URL").unwrap_or_else(|_| "https://api.github.com".into());
-
+async fn run_repo(client: &Client, action: RepoAction) -> anyhow::Result<()> {
     match action {
         RepoAction::Allow { owner, name, note } => {
-            let row = allow_repo_root(&pool, &api_base, &owner, &name, note.as_deref())
+            let row = client
+                .allow_repo(&AllowRepoRequest { owner, name, note })
                 .await
                 .context("allow repo root")?;
             println!(
-                "allowed: github_repo_id={} {}/{} is_enabled={}",
-                row.github_repo_id, row.owner, row.name, row.is_enabled,
+                "allowed: repo_id={} {}/{} is_enabled={}",
+                row.repo_id, row.owner, row.name, row.is_enabled,
             );
         }
         RepoAction::Disable { owner, name, repo_id } => {
-            let row = match (owner, name, repo_id) {
-                (Some(o), Some(n), None) => disable_repo_root(&pool, &api_base, &o, &n)
-                    .await
-                    .context("disable repo root")?,
-                (None, None, Some(id)) => disable_repo_root_by_id(&pool, id)
-                    .await
-                    .context("disable repo root")?,
-                (None, None, None) => {
-                    return Err(anyhow!("exactly one of --owner+--name or --repo-id is required"));
-                }
-                _ => {
-                    // Unreachable in practice — clap's group + `requires`
-                    // enforce mutex + together-ness — but keep the arm
-                    // so the match is total.
-                    return Err(anyhow!("--owner+--name and --repo-id are mutually exclusive"));
-                }
-            };
+            let row = client
+                .disable_repo(&DisableRepoRequest { owner, name, repo_id })
+                .await
+                .context("disable repo root")?;
             println!(
-                "disabled: github_repo_id={} {}/{} is_enabled={}",
-                row.github_repo_id, row.owner, row.name, row.is_enabled,
+                "disabled: repo_id={} {}/{} is_enabled={}",
+                row.repo_id, row.owner, row.name, row.is_enabled,
             );
         }
         RepoAction::List => {
-            let rows = list_repo_roots(&pool)
+            let rows = client
+                .list_repos()
                 .await
                 .context("list repo roots")?;
             if rows.is_empty() {
@@ -519,7 +455,7 @@ async fn run_repo(action: RepoAction) -> anyhow::Result<()> {
             for r in rows {
                 println!(
                     "{:>12}  {}/{:<32}  {}",
-                    r.github_repo_id,
+                    r.repo_id,
                     r.owner,
                     r.name,
                     if r.is_enabled { "ENABLED " } else { "disabled" },
@@ -530,56 +466,93 @@ async fn run_repo(action: RepoAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_policy(action: PolicyAction) -> anyhow::Result<()> {
-    let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL must be set (owner DSN)")?;
-    let pool = db::connect(&database_url)
-        .await
-        .context("connect to postgres")?;
-
+async fn run_policy(client: &Client, action: PolicyAction) -> anyhow::Result<()> {
     match action {
-        PolicyAction::Target { action } => run_policy_target(&pool, action).await,
-        PolicyAction::Source { action } => run_policy_source(&pool, action).await,
-        PolicyAction::Trigger { action } => run_policy_trigger(&pool, action).await,
+        PolicyAction::Target { action } => {
+            run_policy_pair(client, PolicyKind::Target, action).await
+        }
+        PolicyAction::Source { action } => {
+            run_policy_pair(client, PolicyKind::Source, action).await
+        }
+        PolicyAction::Trigger { action } => run_policy_trigger(client, action).await,
     }
 }
 
-async fn run_policy_target(
-    pool: &sbgh_core::db::Pool,
-    action: PolicyTargetAction,
+#[derive(Clone, Copy)]
+enum PolicyKind {
+    Target,
+    Source,
+}
+
+async fn run_policy_pair(
+    client: &Client,
+    kind: PolicyKind,
+    action: PolicyPairAction,
 ) -> anyhow::Result<()> {
     match action {
-        PolicyTargetAction::Allow { install_id, repo_id, note } => {
-            let row = allow_target_policy(pool, install_id, repo_id, note.as_deref())
-                .await
-                .context("allow target policy")?;
+        PolicyPairAction::Allow { install_id, repo_id, note } => {
+            let req = AllowPolicyRequest { install_id, repo_id, note };
+            let row = match kind {
+                PolicyKind::Target => {
+                    client
+                        .allow_target_policy(&req)
+                        .await
+                }
+                PolicyKind::Source => {
+                    client
+                        .allow_source_policy(&req)
+                        .await
+                }
+            }
+            .context("allow policy")?;
             println!(
                 "allowed: install={} repo={} is_enabled={}",
-                row.github_installation_id, row.github_repo_id, row.is_enabled,
+                row.install_id, row.repo_id, row.is_enabled,
             );
         }
-        PolicyTargetAction::Disable { install_id, repo_id } => {
-            let row = disable_target_policy(pool, install_id, repo_id)
-                .await
-                .context("disable target policy")?;
+        PolicyPairAction::Disable { install_id, repo_id } => {
+            let req = DisablePolicyRequest { install_id, repo_id };
+            let row = match kind {
+                PolicyKind::Target => {
+                    client
+                        .disable_target_policy(&req)
+                        .await
+                }
+                PolicyKind::Source => {
+                    client
+                        .disable_source_policy(&req)
+                        .await
+                }
+            }
+            .context("disable policy")?;
             println!(
                 "disabled: install={} repo={} is_enabled={}",
-                row.github_installation_id, row.github_repo_id, row.is_enabled,
+                row.install_id, row.repo_id, row.is_enabled,
             );
         }
-        PolicyTargetAction::List { install_id } => {
-            let rows = list_target_policies(pool, install_id)
-                .await
-                .context("list target policies")?;
+        PolicyPairAction::List { install_id } => {
+            let rows = match kind {
+                PolicyKind::Target => {
+                    client
+                        .list_target_policies(install_id)
+                        .await
+                }
+                PolicyKind::Source => {
+                    client
+                        .list_source_policies(install_id)
+                        .await
+                }
+            }
+            .context("list policies")?;
             if rows.is_empty() {
-                println!("(no target policies)");
+                println!("(no policies)");
                 return Ok(());
             }
             for r in rows {
                 println!(
                     "{:>12} {:>12}  {}",
-                    r.github_installation_id,
-                    r.github_repo_id,
+                    r.install_id,
+                    r.repo_id,
                     if r.is_enabled { "ENABLED " } else { "disabled" },
                 );
             }
@@ -588,54 +561,7 @@ async fn run_policy_target(
     Ok(())
 }
 
-async fn run_policy_source(
-    pool: &sbgh_core::db::Pool,
-    action: PolicySourceAction,
-) -> anyhow::Result<()> {
-    match action {
-        PolicySourceAction::Allow { install_id, repo_id, note } => {
-            let row = allow_source_policy(pool, install_id, repo_id, note.as_deref())
-                .await
-                .context("allow source policy")?;
-            println!(
-                "allowed: install={} repo={} is_enabled={}",
-                row.github_installation_id, row.github_repo_id, row.is_enabled,
-            );
-        }
-        PolicySourceAction::Disable { install_id, repo_id } => {
-            let row = disable_source_policy(pool, install_id, repo_id)
-                .await
-                .context("disable source policy")?;
-            println!(
-                "disabled: install={} repo={} is_enabled={}",
-                row.github_installation_id, row.github_repo_id, row.is_enabled,
-            );
-        }
-        PolicySourceAction::List { install_id } => {
-            let rows = list_source_policies(pool, install_id)
-                .await
-                .context("list source policies")?;
-            if rows.is_empty() {
-                println!("(no source policies)");
-                return Ok(());
-            }
-            for r in rows {
-                println!(
-                    "{:>12} {:>12}  {}",
-                    r.github_installation_id,
-                    r.github_repo_id,
-                    if r.is_enabled { "ENABLED " } else { "disabled" },
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn run_policy_trigger(
-    pool: &sbgh_core::db::Pool,
-    action: PolicyTriggerAction,
-) -> anyhow::Result<()> {
+async fn run_policy_trigger(client: &Client, action: PolicyTriggerAction) -> anyhow::Result<()> {
     match action {
         PolicyTriggerAction::Add {
             install_id,
@@ -645,41 +571,36 @@ async fn run_policy_trigger(
             bench_args,
             note,
         } => {
-            // Parse `--kind` to the typed enum. Reject anything not
-            // valid for slice 5's auto-trigger surface.
-            let trigger_kind = match kind.as_str() {
-                "branch_push" => TriggerKind::BranchPush,
-                "tag_created" => TriggerKind::TagCreated,
-                other => {
-                    return Err(anyhow!(
-                        "--kind must be `branch_push` or `tag_created` (got `{other}`)"
-                    ));
-                }
-            };
-            let row = add_trigger_policy(
-                pool,
-                install_id,
-                repo_id,
-                trigger_kind,
-                &match_spec,
-                bench_args.as_deref(),
-                note.as_deref(),
-            )
-            .await
-            .context("add trigger policy")?;
+            // Parse the JSON match spec client-side for a fast, clear error;
+            // the daemon validates its shape against `TriggerMatchSpec`.
+            let match_spec: serde_json::Value =
+                serde_json::from_str(&match_spec).context("--match must be valid JSON")?;
+            let row = client
+                .add_trigger(&AddTriggerRequest {
+                    install_id,
+                    repo_id,
+                    kind,
+                    match_spec,
+                    bench_args,
+                    note,
+                })
+                .await
+                .context("add trigger policy")?;
             println!(
-                "added: id={} install={} repo={} kind={:?}",
-                row.id, row.github_installation_id, row.github_repo_id, row.trigger_kind,
+                "added: id={} install={} repo={} kind={}",
+                row.id, row.install_id, row.repo_id, row.kind,
             );
         }
         PolicyTriggerAction::Disable { id } => {
-            let row = disable_trigger_policy(pool, id)
+            let row = client
+                .disable_trigger(id)
                 .await
                 .context("disable trigger policy")?;
             println!("disabled: id={} is_enabled={}", row.id, row.is_enabled);
         }
         PolicyTriggerAction::List { install_id, repo_id } => {
-            let rows = list_trigger_policies(pool, install_id, repo_id)
+            let rows = client
+                .list_triggers(install_id, repo_id)
                 .await
                 .context("list trigger policies")?;
             if rows.is_empty() {
@@ -690,11 +611,11 @@ async fn run_policy_trigger(
                 println!(
                     "{:>6} {:>12} {:>12}  {:<12}  {}  spec={}",
                     r.id,
-                    r.github_installation_id,
-                    r.github_repo_id,
-                    format!("{:?}", r.trigger_kind),
+                    r.install_id,
+                    r.repo_id,
+                    r.kind,
                     if r.is_enabled { "ENABLED " } else { "disabled" },
-                    r.match_spec.0,
+                    r.match_spec,
                 );
             }
         }
@@ -702,15 +623,7 @@ async fn run_policy_trigger(
     Ok(())
 }
 
-async fn run_user(action: UserAction) -> anyhow::Result<()> {
-    let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL must be set (owner DSN)")?;
-    let pool = db::connect(&database_url)
-        .await
-        .context("connect to postgres")?;
-    let api_base =
-        std::env::var("SBGH_GH_API_BASE_URL").unwrap_or_else(|_| "https://api.github.com".into());
-
+async fn run_user(client: &Client, action: UserAction) -> anyhow::Result<()> {
     match action {
         UserAction::Grant {
             login,
@@ -719,46 +632,30 @@ async fn run_user(action: UserAction) -> anyhow::Result<()> {
             repo,
             role,
         } => {
-            let outcome = match (login, user_id) {
-                (Some(l), None) => grant_role(&pool, &api_base, &l, install, repo, role.into())
-                    .await
-                    .context("grant role")?,
-                (None, Some(id)) => grant_role_by_user_id(&pool, id, install, repo, role.into())
-                    .await
-                    .context("grant role")?,
-                (None, None) => {
-                    return Err(anyhow!("exactly one of --login or --user-id is required"));
-                }
-                (Some(_), Some(_)) => {
-                    return Err(anyhow!("--login and --user-id are mutually exclusive"));
-                }
-            };
+            let outcome = client
+                .grant_role(&RoleRequest {
+                    login,
+                    user_id,
+                    install,
+                    repo,
+                    role: role.as_wire().into(),
+                })
+                .await
+                .context("grant role")?;
             let scope = outcome
                 .role
-                .github_repo_id
+                .repo_id
                 .map(|r| format!("repo={r}"))
                 .unwrap_or_else(|| "install-wide".into());
-            // Three message shapes:
-            //   - created=true → "granted" (new row)
-            //   - created=false, was revoked → "reactivated" (cleared revoked_at)
-            //   - created=false, was active → "already granted" (no-op)
-            // The post-soft-revoke store always returns revoked_at=NULL
-            // on success, so distinguishing reactivated from
-            // already-active needs the pre-call state — which we don't
-            // have here without a SELECT. Keep the two-state output
-            // for now; a future enhancement could return the prior
-            // revoked_at from grant_role for the precise message.
             let verb = if outcome.created { "granted" } else { "granted (or reactivated)" };
             println!(
-                "{}: id={} user={} install={} {} role={:?}",
+                "{}: id={} user={} install={} {} role={}",
                 verb,
                 outcome.role.id,
-                outcome.role.github_user_id,
-                outcome
-                    .role
-                    .github_installation_id,
+                outcome.role.user_id,
+                outcome.role.install_id,
                 scope,
-                outcome.role.granted_role,
+                outcome.role.role,
             );
         }
         UserAction::Revoke {
@@ -768,32 +665,25 @@ async fn run_user(action: UserAction) -> anyhow::Result<()> {
             repo,
             role,
         } => {
-            let row = match (login, user_id) {
-                (Some(l), None) => revoke_role(&pool, &api_base, &l, install, repo, role.into())
-                    .await
-                    .context("revoke role")?,
-                (None, Some(id)) => revoke_role_by_user_id(&pool, id, install, repo, role.into())
-                    .await
-                    .context("revoke role")?,
-                (None, None) => {
-                    return Err(anyhow!("exactly one of --login or --user-id is required"));
-                }
-                (Some(_), Some(_)) => {
-                    return Err(anyhow!("--login and --user-id are mutually exclusive"));
-                }
-            };
+            let row = client
+                .revoke_role(&RoleRequest {
+                    login,
+                    user_id,
+                    install,
+                    repo,
+                    role: role.as_wire().into(),
+                })
+                .await
+                .context("revoke role")?;
             println!(
-                "revoked: id={} user={} install={} repo={:?} role={:?}",
-                row.id,
-                row.github_user_id,
-                row.github_installation_id,
-                row.github_repo_id,
-                row.granted_role,
+                "revoked: id={} user={} install={} repo={:?} role={}",
+                row.id, row.user_id, row.install_id, row.repo_id, row.role,
             );
         }
         UserAction::List { install, users } => {
             if users {
-                let rows = list_users(&pool)
+                let rows = client
+                    .list_users()
                     .await
                     .context("list users")?;
                 if rows.is_empty() {
@@ -801,10 +691,11 @@ async fn run_user(action: UserAction) -> anyhow::Result<()> {
                     return Ok(());
                 }
                 for u in rows {
-                    println!("{:>12}  {:<24}  type={:?}", u.id, u.login, u.user_type);
+                    println!("{:>12}  {:<24}  type={}", u.id, u.login, u.user_type);
                 }
             } else {
-                let rows = list_roles(&pool, install)
+                let rows = client
+                    .list_roles(install)
                     .await
                     .context("list roles")?;
                 if rows.is_empty() {
@@ -813,23 +704,118 @@ async fn run_user(action: UserAction) -> anyhow::Result<()> {
                 }
                 for r in rows {
                     let scope = r
-                        .github_repo_id
+                        .repo_id
                         .map(|id| format!("repo={id}"))
                         .unwrap_or_else(|| "install-wide".into());
-                    let status = if r.revoked_at.is_some() { "REVOKED " } else { "active  " };
+                    let status = if r.revoked { "REVOKED " } else { "active  " };
                     println!(
-                        "id={:<6} {} user={:>12} install={:>12} {:<20} role={:?}",
-                        r.id,
-                        status,
-                        r.github_user_id,
-                        r.github_installation_id,
-                        scope,
-                        r.granted_role,
+                        "id={:<6} {} user={:>12} install={:>12} {:<20} role={}",
+                        r.id, status, r.user_id, r.install_id, scope, r.role,
                     );
                 }
             }
         }
     }
+    Ok(())
+}
+
+async fn run_installation(client: &Client, action: InstallationAction) -> anyhow::Result<()> {
+    match action {
+        InstallationAction::List => {
+            let rows = client
+                .list_installations()
+                .await
+                .context("list installations")?;
+            if rows.is_empty() {
+                println!("(no installations)");
+                return Ok(());
+            }
+            for i in rows {
+                let state = if i.deleted {
+                    "deleted "
+                } else if i.suspended {
+                    "suspended"
+                } else {
+                    "active  "
+                };
+                println!(
+                    "{:>12}  {:<20} {:<14}  {}  account_id={}  {}",
+                    i.id, i.account_login, i.account_type, state, i.account_id, i.created_at,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_webhook(client: &Client, action: WebhookAction) -> anyhow::Result<()> {
+    match action {
+        WebhookAction::Tail { event_type, status, limit } => {
+            let rows = client
+                .list_webhooks(event_type.as_deref(), status.as_deref(), limit)
+                .await
+                .context("list webhooks")?;
+            if rows.is_empty() {
+                println!("(no webhooks)");
+                return Ok(());
+            }
+            for w in rows {
+                println!(
+                    "{:>8} {:<24} {:<16} {:<10} {:>3}x  {}  {}",
+                    w.id,
+                    w.delivery_id,
+                    w.event_type,
+                    w.status,
+                    w.attempts,
+                    w.received_at,
+                    w.outcome
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
+    match action {
+        JobsAction::List { status, limit } => {
+            let rows = client
+                .list_jobs(status.as_deref(), limit)
+                .await
+                .context("list jobs")?;
+            if rows.is_empty() {
+                println!("(no jobs)");
+                return Ok(());
+            }
+            for j in rows {
+                println!(
+                    "{}  {:<12} install={:>12} repo={:>12}  {} {}  {}",
+                    j.id,
+                    j.status,
+                    j.install_id,
+                    j.repo_id,
+                    j.git_ref_kind,
+                    j.git_ref_display,
+                    j.created_at,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_status(client: &Client) -> anyhow::Result<()> {
+    let health = client
+        .health()
+        .await
+        .context("GET /api/health (is the daemon running?)")?;
+    let who = client
+        .whoami()
+        .await
+        .context("GET /api/whoami (is the cookie valid?)")?;
+    println!("api: {}   scope: {}", health.status, who.scope);
     Ok(())
 }
 

@@ -1,32 +1,41 @@
-# Workspace nextest config. Primary purpose: bound the number of
-# testcontainers Postgres instances spun up in parallel so a busy
-# docker daemon doesn't trip the PortNotExposed race the
-# `wait_for_port_exposed` retry loop in
-# `crates/sbgh-core/src/db/test_support.rs` was added to absorb.
+# Workspace nextest config.
 #
-# Empirically a cap of 8 keeps wall-clock low (~13s for the full suite
-# on an M-series Mac with the postgres:18-trixie image warm) without
-# overwhelming docker on macOS, where the docker-proxy port-binding
-# step is the bottleneck under heavy concurrency. Caps above ~12 still
-# trip the PortNotExposed race intermittently here even with the 30s
-# per-container wait_for_port_exposed timeout.
+# Every DB-backed suite uses `setup_pg_db()`
+# (crates/sbgh-core/src/db/test_support.rs): one shared, compose-managed
+# Postgres (the `postgres` setup script) with a fresh, migrated database per
+# test. Schema isolation per test is all any suite needs — the role split
+# that once forced per-test containers was removed in roadmap-v3 Phase 6.
+#
+# Filters are package-scoped on purpose: new DB tests in these crates are
+# covered automatically — no per-binary list to keep in sync.
 
-#[test-groups]
-#testcontainers = { max-threads = 8 }
+nextest-version = { required = "0.9.98", recommended = "0.9.137" }
+experimental = ["setup-scripts"]
 
-#[[profile.default.overrides]]
-# Any test in our integration suites that opens a real Postgres
-# container via setup_pg() — that's all `tests/postgres_*.rs`, the
-# grants/installer suites in sbgh-cli, and the orchestrator's
-# processor_e2e.rs.
-# filter = '''
-#     test(=claim_next_returns_none_when_empty)
-#   | binary(=postgres_ingest)
-#   | binary(=postgres_installation)
-#   | binary(=postgres_jobs)
-#   | binary(=postgres_webhook)
-#   | binary(=grants)
-#   | binary(=installer)
-#   | binary(=processor_e2e)
-# '''
-# test-group = 'testcontainers'
+[profile.default]
+# Surface the whole picture across the DB suites rather than stopping at the
+# first failure. (`fail-fast` lives on the profile, not an override.)
+fail-fast = false
+
+[scripts.setup.postgres]
+# Idempotent: a no-op when the container is already up, recreated by compose
+# only when this file changes. No `--force-recreate` — each test drops its
+# own database via the `TestDb` guard, so databases don't accumulate and the
+# server doesn't need wiping between runs (which also keeps targeted runs
+# fast and avoids orphaning anonymous volumes). `--wait` blocks until the
+# healthcheck passes so the server accepts connections before any test runs.
+command = "docker compose -f docker/docker-compose.test.yml up --wait -d postgres"
+
+# Shared Postgres for the packages whose suites touch the DB. Package-scoped
+# so new DB tests are covered without editing a list; a unit test in these
+# crates just triggers a (cheap, idempotent) `up` it doesn't use.
+[[profile.default.scripts]]
+filter = "package(=sbgh-core) | package(=sbgh-cli) | package(=sbgh-daemon)"
+setup = "postgres"
+
+# A couple of retries for the DB-backed packages — transient shared-server
+# hiccups. Harmless on the deterministic unit tests in the same crates: they
+# don't flake, so they don't retry.
+[[profile.default.overrides]]
+filter = "package(=sbgh-core) | package(=sbgh-cli) | package(=sbgh-daemon)"
+retries = 2

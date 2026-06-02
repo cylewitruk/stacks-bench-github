@@ -1,0 +1,21 @@
+//! Shared wire types + a thin typed client for the daemon's `/api`.
+//!
+//! DTOs here are deliberately **API-shaped** (not the core/DB structs) so
+//! internal columns added later don't leak into the public surface. The
+//! server (daemon) and the clients (handler, `sbgh-cli`) all depend
+//! on this crate, so a contract change breaks the build everywhere — the
+//! compile-time-contract benefit of gRPC without proto/codegen.
+
+mod client;
+mod dto;
+mod error;
+
+pub use client::{Client, ClientError, read_cookie};
+pub use dto::{
+    AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
+    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, GrantRoleResult,
+    HealthResponse, InstallationView, InstallerView, JobView, PolicyView, RepoRootView,
+    RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse, WebhookSummary,
+    WhoamiResponse,
+};
+pub use error::{ApiError, ErrorBody};
