@@ -81,6 +81,10 @@ sudo -u sbgh $EDITOR /etc/sbgh/daemon/config.toml
 #                                                          # so the handler container
 #                                                          # can reach /api
 #   cookie_path = "/etc/sbgh/daemon/.cookie"
+# REMOVE the v2 [jobs] section (e.g. `[jobs]\nsource = "v2"`). roadmap-v3
+#   Phase 1 deleted that flag, and v3 rejects unknown config keys
+#   (deny_unknown_fields) — a leftover [jobs] block fails startup with
+#   "unknown field `jobs`".
 # Also fix any file paths that referenced /etc/sbgh/orchestrator (e.g. the
 # PEM's [github].private_key_path).
 
@@ -144,7 +148,8 @@ docker compose -f docker/docker-compose.yml stop handler smee
 
 # 2. Install + start the v3 daemon. It connects as owner, applies all pending
 #    migrations (incl. the role-drop), writes the admin cookie, and serves
-#    /api. install-daemon.sh installs the renamed unit + binary and starts it.
+#    /api. install-daemon.sh installs the unit + the daemon/CLI binaries and
+#    starts it.
 sudo ./scripts/install-daemon.sh
 # Remove the stale old unit + binary now that sbgh-daemon is live.
 sudo rm -f /etc/systemd/system/sbgh-orchestrator.service /usr/local/bin/sbgh-orchestrator
@@ -245,3 +250,170 @@ psql "postgres://sbgh:$PW@127.0.0.1:5432/sbgh" \
 Either way the owner DSN and table data are intact. Don't attempt a partial
 downgrade (new daemon + old handler, or vice versa) — the role and `/api`
 boundaries changed together.
+
+---
+
+## Alternative: fresh start (wiped database)
+
+If you don't need the existing benchmark history, a wipe-and-reinstall is
+**simpler** than the in-place upgrade: a fresh DB has no v2 migration history
+to reconcile and no in-use roles to drop mid-flight, so there's no §5
+ordering dance and no §7 rollback trap.
+
+**What you lose:** the DB job history + metrics (your baseline/delta data),
+the webhook inbox, the seeded allowlists, and all installation state. The
+archived SQLite results on disk (`paths.results_archive_dir`) survive, but
+the `job_result` rows that index them don't. The host infra (LVM, libvirt,
+golden image, users, the App registration + PEM) is untouched.
+
+### A1. Stop the old services + wipe the DB
+
+Pick one. The startup migration's role-drop is a no-op on a truly-fresh
+cluster, and just cleans up the lingering roles if you keep the cluster.
+
+```bash
+PW=<POSTGRES_OWNER_PASSWORD>
+
+# (A) Keep the Postgres cluster, drop just the `sbgh` database:
+sudo systemctl disable --now sbgh-orchestrator.service        # old v2 unit
+docker compose -f docker/docker-compose.yml stop handler smee # leave postgres up
+# Two calls: DROP DATABASE can't run inside the implicit transaction psql
+# wraps a multi-statement -c in. PGPASSWORD (not a DSN) so passwords with
+# URL-special chars don't need escaping.
+export PGPASSWORD="$PW"
+psql -h 127.0.0.1 -U sbgh -d postgres -v ON_ERROR_STOP=1 \
+  -c "DROP DATABASE IF EXISTS sbgh WITH (FORCE);"
+psql -h 127.0.0.1 -U sbgh -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE DATABASE sbgh OWNER sbgh;"
+unset PGPASSWORD
+
+# (B) — or — wipe the whole data dir (fresh cluster; initdb recreates the
+# `sbgh` owner from POSTGRES_OWNER_PASSWORD on next `up`):
+#   sudo systemctl disable --now sbgh-orchestrator.service
+#   docker compose -f docker/docker-compose.yml down
+#   # POSTGRES_DATA_DIR lives in docker/.env, not your shell. Source it so the
+#   # rm targets the SAME path compose mounts — without this a customized value
+#   # silently falls back to the default below and wipes the wrong dir:
+#   set -a; . docker/.env; set +a
+#   sudo rm -rf "${POSTGRES_DATA_DIR:-/var/lib/sbgh/postgres}"/*
+#   docker compose -f docker/docker-compose.yml up -d postgres
+```
+
+### A2. Deploy v3
+
+Do the **config edits from [§2](#2-daemon-config--move--repoint-host-side) +
+[§3](#3-handler-config--drop-db-add-the-ingest-token-container-side)** (move
+the config dir, owner DSN, `[api]` section, drop the handler
+`[authorization]` block, the shared ingest token). Then:
+
+```bash
+git fetch origin && git checkout main && git pull
+just build
+sudo ./scripts/install-daemon.sh                              # boots + migrates the FRESH schema + serves /api
+sudo rm -f /etc/systemd/system/sbgh-orchestrator.service /usr/local/bin/sbgh-orchestrator
+sudo systemctl daemon-reload
+docker compose -f docker/docker-compose.yml up -d --build
+```
+
+### A3. Re-seed the authorization model
+
+The wipe cleared the allowlists + installation state. The key ordering rule:
+**policies and grants reference installation / membership / repo rows that
+the daemon only materializes from GitHub installation + PR events** — so you
+seed in this order:
+
+1. **Allowlists first** (standalone — the daemon resolves logins/repos
+   server-side):
+
+   ```bash
+   # The canonical root. Its forks are accepted via lineage.
+   sudo -u sbgh sbgh-cli repo allow --owner stacks-network --name stacks-core
+
+   # Every account that will install the App.
+   sudo -u sbgh sbgh-cli installer allow --login cylewitruk         # personal testing fork
+   sudo -u sbgh sbgh-cli installer allow --login stacks-network     # upstream org
+   sudo -u sbgh sbgh-cli installer allow --login cylewitruk-stacks  # a contributor's own fork
+   ```
+
+2. **(Re)install the App** on each account via the GitHub UI, selecting its
+   `stacks-core`. The wipe dropped the `github_installation` row, so the
+   daemon needs a fresh **`installation.created`** to rebuild installation +
+   membership state.
+
+   > **If the App is still installed from v2, uninstall it first, then install
+   > it again.** Merely reconfiguring the repo selection on an existing install
+   > fires only `installation_repositories`, which the daemon discards as noise
+   > for an unknown installation — leaving you with no `github_installation`
+   > row and `/benchmark` failing authz. (Redelivering the original
+   > `installation.created` from the App's *Advanced → Recent Deliveries* page
+   > is an equivalent alternative.)
+
+   A clean install fires `installation.created` + `installation_repositories`,
+   and the daemon records the `github_installation` (an **install-id**), the
+   `github_installation_repo` **membership**, and the `github_repo` identity
+   for each fork-of-the-root.
+
+3. **Collect the ids.** `install-id`s come from `installation list`;
+   `repo-id`s are GitHub's numeric repo ids (`gh api repos/<owner>/<name>
+   --jq .id`, or `repo list` for the root):
+
+   ```bash
+   sudo -u sbgh sbgh-cli installation list
+   sudo -u sbgh sbgh-cli repo list
+   ```
+
+4. **Per installation:** an enabled **target** policy on the base repo, a
+   **source** policy on each trusted fork, and the `trigger-pr-benchmark`
+   grants. Authz for a `/benchmark` is checked against the **base (target)
+   repo's installation**.
+
+   Worked example for the intended setup:
+
+   ```bash
+   # --- The operator's personal fork install (cylewitruk/stacks-core) ---
+   I_CYL=<cylewitruk install-id>;  R_CYL=$(gh api repos/cylewitruk/stacks-core --jq .id)
+   sudo -u sbgh sbgh-cli policy target allow --install-id $I_CYL --repo-id $R_CYL
+   sudo -u sbgh sbgh-cli policy source allow --install-id $I_CYL --repo-id $R_CYL  # internal PRs: source == base
+   sudo -u sbgh sbgh-cli user grant --login cylewitruk --install $I_CYL --role trigger-pr-benchmark
+
+   # --- The upstream install (stacks-network/stacks-core) ---
+   I_SN=<stacks-network install-id>;  R_SN=$(gh api repos/stacks-network/stacks-core --jq .id)
+   sudo -u sbgh sbgh-cli policy target allow --install-id $I_SN --repo-id $R_SN
+   # Authorize the ORG users on upstream — deliberately NOT `cylewitruk`
+   # (a role grant's absence is the denial):
+   sudo -u sbgh sbgh-cli user grant --login cylewitruk-stacks --install $I_SN --role trigger-pr-benchmark
+   # ...repeat `user grant --login <foo-stacks> --install $I_SN ...` per org contributor.
+   ```
+
+5. **Trust contributor forks as PR sources into upstream.** A PR from
+   `<fork>` into `stacks-network/stacks-core` also needs a **source** policy
+   on `(I_SN, <fork repo-id>)` — the source gate is what allows that fork's
+   code to run in the bench VM. The catch: the source policy FK needs the
+   fork's `github_repo` row to exist, which the daemon only materializes once
+   it has *seen* the fork (the fork is itself installed, or a PR from it
+   reaches the inbox). So the smooth path is event-driven:
+
+   ```bash
+   # The first /benchmark from a not-yet-trusted fork returns
+   # `denied_source_policy`; the daemon logs the fork's source_repo_id:
+   journalctl -u sbgh-daemon | grep "policy denied (source)"   # → source_repo_id=<N>
+   sudo -u sbgh sbgh-cli policy source allow --install-id $I_SN --repo-id <N>
+   # then re-run /benchmark on the PR.
+   ```
+
+   A contributor's **own** fork install (`<foo-stacks>/stacks-core`) is seeded
+   exactly like `cylewitruk`'s above (target + source on its own repo + a
+   self grant), which also materializes its `github_repo` so you can add its
+   source policy on `I_SN`.
+
+### A4. Verify
+
+```bash
+sudo -u sbgh sbgh-cli status                    # api: ok   scope: admin
+sudo -u sbgh sbgh-cli installer list
+sudo -u sbgh sbgh-cli installation list
+sudo -u sbgh sbgh-cli user list --install $I_SN # grants on the upstream install
+```
+
+Then post `/benchmark` on a PR (as an authorized user) and watch
+`journalctl -u sbgh-daemon -f` pick it up.

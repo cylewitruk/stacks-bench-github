@@ -18,6 +18,17 @@ Group=sbgh
 WorkingDirectory=/var/lib/sbgh
 ExecStart=/usr/local/bin/sbgh-daemon
 
+# Per-job result tmpfs dirs live under /run/sbgh (paths.results_tmpfs_root =
+# /run/sbgh/jobs) — and /run is a tmpfs the kernel wipes on every reboot.
+# RuntimeDirectory recreates /run/sbgh owned by sbgh:sbgh (0755) on every start
+# so the daemon's create_dir_all for /run/sbgh/jobs/<id> succeeds without a
+# manual install -d that wouldn't survive a reboot. Preserve=yes keeps it across
+# a daemon restart so restarting mid-job doesn't yank a running VM's virtio-fs
+# share. NOTE: RuntimeDirectory does NOT imply PrivateMounts (it's absent from
+# the directive list below), so it's safe with the libvirtd mount-sharing.
+RuntimeDirectory=sbgh
+RuntimeDirectoryPreserve=yes
+
 # Restart with a delay on crash so we don't tight-loop if e.g. the DB
 # config is wrong. Per-job failures don't crash the daemon (they're
 # logged + DB-recorded); a Rust panic or unwrap somewhere does.

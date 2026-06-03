@@ -7,9 +7,10 @@
 #   sudo ./scripts/install-daemon.sh --no-build # use existing binary
 #
 # What it does:
-#   1. Builds target/release/sbgh-daemon as the invoking user
+#   1. Builds target/release/{sbgh-daemon,sbgh-cli} as the invoking user
 #      (skipped with --no-build)
-#   2. Copies it to /usr/local/bin/
+#   2. Copies both to /usr/local/bin/ (the CLI is the operator's `/api`
+#      client — installer/repo/policy/user admin + read commands)
 #   3. Installs systemd/sbgh-daemon.service to /etc/systemd/system/
 #   4. systemctl daemon-reload
 #   5. systemctl enable + start (only on first install; subsequent runs
@@ -20,6 +21,8 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BINARY_SRC="$REPO_ROOT/target/release/sbgh-daemon"
 BINARY_DEST=/usr/local/bin/sbgh-daemon
+CLI_SRC="$REPO_ROOT/target/release/sbgh-cli"
+CLI_DEST=/usr/local/bin/sbgh-cli
 UNIT_SRC="$REPO_ROOT/systemd/sbgh-daemon.service"
 UNIT_DEST=/etc/systemd/system/sbgh-daemon.service
 
@@ -50,20 +53,23 @@ if [[ $DO_BUILD -eq 1 ]]; then
         echo "Either run via sudo from a non-root shell, or pass --no-build." >&2
         exit 1
     fi
-    echo "[1/5] Building release binary as $BUILD_USER..."
+    echo "[1/5] Building release binaries as $BUILD_USER..."
     sudo -u "$BUILD_USER" -H sh -c \
-        "cd '$REPO_ROOT' && cargo build --locked --release -p sbgh-daemon"
+        "cd '$REPO_ROOT' && cargo build --locked --release -p sbgh-daemon -p sbgh-cli"
 else
     echo "[1/5] Skipping build (--no-build)."
 fi
 
-if [[ ! -x "$BINARY_SRC" ]]; then
-    echo "Binary not found at $BINARY_SRC after build step." >&2
-    exit 1
-fi
+for src in "$BINARY_SRC" "$CLI_SRC"; do
+    if [[ ! -x "$src" ]]; then
+        echo "Binary not found at $src after build step." >&2
+        exit 1
+    fi
+done
 
-echo "[2/5] Installing binary to $BINARY_DEST..."
+echo "[2/5] Installing binaries to /usr/local/bin..."
 install -m 0755 "$BINARY_SRC" "$BINARY_DEST"
+install -m 0755 "$CLI_SRC" "$CLI_DEST"
 
 echo "[3/5] Installing unit file to $UNIT_DEST..."
 install -m 0644 "$UNIT_SRC" "$UNIT_DEST"
@@ -84,3 +90,4 @@ fi
 echo
 echo "Done. Tail logs with:  journalctl -u sbgh-daemon -f"
 echo "Status:                systemctl status sbgh-daemon"
+echo "Operator CLI:          sudo -u sbgh sbgh-cli status"

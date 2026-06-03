@@ -213,6 +213,11 @@ sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/git
 # dir can't run away. Hot cache is what turns a ~35-min cold build into a
 # ~5-min warm build for subsequent jobs against similar PRs.
 sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/sccache
+# /run/sbgh below is on a tmpfs the kernel wipes every reboot. This install -d
+# only seeds it for the CURRENT boot — the daemon unit's `RuntimeDirectory=sbgh`
+# recreates /run/sbgh (owned sbgh:sbgh) on every start, so it's durable across
+# reboots once the unit is installed. The manual seed is just for first bring-up
+# before the unit exists.
 sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh
 sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh/jobs
 ```
