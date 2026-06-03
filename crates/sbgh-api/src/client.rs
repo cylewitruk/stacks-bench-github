@@ -5,8 +5,8 @@ use crate::dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
     DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, GrantRoleResult,
     HealthResponse, InstallationView, InstallerView, JobView, PolicyView, RepoRootView,
-    RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse, WebhookSummary,
-    WhoamiResponse,
+    ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse,
+    WebhookSummary, WhoamiResponse,
 };
 use crate::error::ApiError;
 
@@ -250,6 +250,19 @@ impl Client {
 
     pub async fn list_installations(&self) -> Result<Vec<InstallationView>, ClientError> {
         self.get("/api/installations")
+            .await
+    }
+
+    /// `GET /api/resolve?owner=&repo=` (read scope) — resolve an
+    /// `owner/repo` slug to its active `install_id` + `repo_id`. Backs the
+    /// CLI's `--on owner/repo` sugar. Errors (404) if the daemon hasn't
+    /// materialised the install or the repo yet.
+    pub async fn resolve_repo(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<ResolveRepoResponse, ClientError> {
+        self.get_query("/api/resolve", &[("owner", owner.to_string()), ("repo", repo.to_string())])
             .await
     }
     pub async fn list_jobs(

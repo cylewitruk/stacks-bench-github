@@ -403,6 +403,106 @@ async fn api_client_round_trips_listings_and_installer() {
 }
 
 #[tokio::test]
+async fn resolve_endpoint_happy_unknown_and_suspended() {
+    let (_db, pool) = setup_pg_db().await;
+    for q in [
+        // FK chain: github_installation.github_account_id → allowed_installer.
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (100,'acme','organization')",
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (200,100,'acme','organization')",
+        "INSERT INTO github_repo (id, owner, name) VALUES (300,'acme','widgets')",
+        // A suspended install on a different account — resolved, then 409'd.
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (101,'paused','user')",
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type, \
+         suspended_at) VALUES (201,101,'paused','user', NOW())",
+        "INSERT INTO github_repo (id, owner, name) VALUES (301,'paused','widgets')",
+    ] {
+        sqlx::query(q)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let router = router_with(pool, "http://unused".into());
+
+    // Happy path — resolves install + repo; owner match is case-insensitive.
+    let (s, j) =
+        send(&router, "GET", "/api/resolve?owner=Acme&repo=widgets", Some("readtok"), None).await;
+    assert_eq!(s, StatusCode::OK, "{j:?}");
+    assert_eq!(j["install_id"], 200);
+    assert_eq!(j["repo_id"], 300);
+    assert_eq!(j["account_login"], "acme");
+    assert_eq!(j["repo_owner"], "acme");
+    assert_eq!(j["repo_name"], "widgets");
+
+    // Unknown account → 404.
+    let (s, _) =
+        send(&router, "GET", "/api/resolve?owner=nope&repo=widgets", Some("readtok"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Known account, unknown repo → 404.
+    let (s, _) =
+        send(&router, "GET", "/api/resolve?owner=acme&repo=ghost", Some("readtok"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Suspended install → 409 (distinct from "no install").
+    let (s, _) =
+        send(&router, "GET", "/api/resolve?owner=paused&repo=widgets", Some("readtok"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    // Read scope required: the ingest token is rejected.
+    let (s, _) =
+        send(&router, "GET", "/api/resolve?owner=acme&repo=widgets", Some("ingesttok"), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn api_client_resolve_repo() {
+    use sbgh_api::{Client, ClientError};
+
+    let (_db, pool) = setup_pg_db().await;
+    for q in [
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (100,'acme','organization')",
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (200,100,'acme','organization')",
+        "INSERT INTO github_repo (id, owner, name) VALUES (300,'acme','widgets')",
+    ] {
+        sqlx::query(q)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let (base, server) = spawn_api(pool, "http://unused".into()).await;
+    let client = Client::new(base, Some("admintok".to_string()));
+
+    // Full DTO round-trip across the client↔server boundary.
+    let r = client
+        .resolve_repo("acme", "widgets")
+        .await
+        .unwrap();
+    assert_eq!(r.install_id, 200);
+    assert_eq!(r.repo_id, 300);
+    assert_eq!(r.account_login, "acme");
+    assert_eq!(r.repo_owner, "acme");
+    assert_eq!(r.repo_name, "widgets");
+
+    // Unknown repo surfaces as a typed 404 (what the CLI maps to a friendly
+    // "install the App / open a PR first" message).
+    let err = client
+        .resolve_repo("acme", "ghost")
+        .await
+        .unwrap_err();
+    match err {
+        ClientError::Api { status, .. } => assert_eq!(status, 404),
+        other => panic!("expected Api error, got {other:?}"),
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn api_client_surfaces_error_envelope() {
     use sbgh_api::{Client, ClientError, DisableInstallerRequest};
 

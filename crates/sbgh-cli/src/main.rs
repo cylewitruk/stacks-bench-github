@@ -112,16 +112,20 @@ enum Command {
 enum UserAction {
     /// Grant a role to a user on an installation. The daemon resolves
     /// `--login` → id server-side and upserts the user before recording the
-    /// grant. `--repo` narrows the grant to one repo within the install;
-    /// omit it to grant install-wide. Exactly one of `--login` or
-    /// `--user-id` (emergency / GH-outage path) must be supplied.
+    /// grant. Target the install with `--on <owner>/<repo>` (repo-scoped) or
+    /// raw `--install` (+ optional `--repo`; omit `--repo` for install-wide).
+    /// Exactly one of `--login` or `--user-id` (emergency / GH-outage path)
+    /// must be supplied.
     Grant {
         #[arg(long, group = "user_grant_target")]
         login: Option<String>,
         #[arg(long, group = "user_grant_target")]
         user_id: Option<i64>,
-        #[arg(long)]
-        install: i64,
+        /// Repo-scoped grant via `owner/repo` (resolves install + repo).
+        #[arg(long, value_name = "OWNER/REPO", conflicts_with_all = ["install", "repo"])]
+        on: Option<String>,
+        #[arg(long, required_unless_present = "on")]
+        install: Option<i64>,
         #[arg(long)]
         repo: Option<i64>,
         #[arg(long, value_enum)]
@@ -251,13 +255,17 @@ enum PolicyAction {
 /// Shared shape for `target` and `source` policies (same args).
 #[derive(Subcommand, Debug)]
 enum PolicyPairAction {
-    /// Allow (or re-enable) a (install, repo) pair. Operator pulls the ids
-    /// from `installer list` + `repo list` first.
+    /// Allow (or re-enable) a (install, repo) pair. Give either
+    /// `--on <owner>/<repo>` (resolved server-side) or the raw
+    /// `--install-id` + `--repo-id`.
     Allow {
-        #[arg(long)]
-        install_id: i64,
-        #[arg(long)]
-        repo_id: i64,
+        /// Resolve install + repo from an `owner/repo` slug (same account).
+        #[arg(long, value_name = "OWNER/REPO", conflicts_with_all = ["install_id", "repo_id"])]
+        on: Option<String>,
+        #[arg(long, requires = "repo_id")]
+        install_id: Option<i64>,
+        #[arg(long, requires = "install_id")]
+        repo_id: Option<i64>,
         #[arg(long)]
         note: Option<String>,
     },
@@ -277,19 +285,30 @@ enum PolicyPairAction {
 
 #[derive(Subcommand, Debug)]
 enum PolicyTriggerAction {
-    /// Add a new trigger_policy row. `--kind` is `branch_push` or
-    /// `tag_created`; `--match` is the JSON match_spec (e.g.
-    /// `'{"kind":"branch_push","branch_name":"develop"}'`), validated
-    /// server-side; `--args` is forwarded to the eventual job.
+    /// Add a new trigger_policy row. Target with `--on <owner>/<repo>` or raw
+    /// `--install-id`/`--repo-id`. Spec with the sugar `--branch-push <branch>`
+    /// / `--tag-created <regex>`, or raw `--kind` + `--match` (JSON match_spec,
+    /// validated server-side). `--args` is forwarded to the eventual job.
     Add {
-        #[arg(long)]
-        install_id: i64,
-        #[arg(long)]
-        repo_id: i64,
-        #[arg(long)]
-        kind: String,
-        #[arg(long = "match")]
-        match_spec: String,
+        /// Resolve install + repo from an `owner/repo` slug (same account).
+        #[arg(long, value_name = "OWNER/REPO", conflicts_with_all = ["install_id", "repo_id"])]
+        on: Option<String>,
+        #[arg(long, requires = "repo_id")]
+        install_id: Option<i64>,
+        #[arg(long, requires = "install_id")]
+        repo_id: Option<i64>,
+        /// Sugar: `branch_push` trigger on an exact branch name.
+        #[arg(long, value_name = "BRANCH", conflicts_with_all = ["kind", "match_spec", "tag_created"])]
+        branch_push: Option<String>,
+        /// Sugar: `tag_created` trigger matching a tag-name regex.
+        #[arg(long, value_name = "REGEX", conflicts_with_all = ["kind", "match_spec", "branch_push"])]
+        tag_created: Option<String>,
+        /// Raw: `branch_push` or `tag_created` (use with `--match`).
+        #[arg(long, requires = "match_spec")]
+        kind: Option<String>,
+        /// Raw: JSON match_spec (use with `--kind`).
+        #[arg(long = "match", requires = "kind")]
+        match_spec: Option<String>,
         #[arg(long = "args")]
         bench_args: Option<String>,
         #[arg(long)]
@@ -484,13 +503,92 @@ enum PolicyKind {
     Source,
 }
 
+/// Split an `owner/repo` slug, with a clear error rather than a downstream
+/// 404 on a malformed value.
+fn split_slug(slug: &str) -> anyhow::Result<(String, String)> {
+    let (owner, repo) = slug
+        .split_once('/')
+        .with_context(|| format!("`{slug}` must be in <owner>/<repo> form"))?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        anyhow::bail!("`{slug}` must be in <owner>/<repo> form");
+    }
+    Ok((owner.to_string(), repo.to_string()))
+}
+
+/// Resolve a `(install_id, repo_id)` pair from either the `--on owner/repo`
+/// sugar (a server-side lookup) or the raw `--install-id`/`--repo-id` flags.
+/// clap already enforces the two are mutually exclusive and that the raw pair
+/// is supplied together; this adds the "at least one source" check + the
+/// resolve call, and echoes what `--on` resolved to.
+async fn resolve_pair(
+    client: &Client,
+    on: Option<String>,
+    install_id: Option<i64>,
+    repo_id: Option<i64>,
+) -> anyhow::Result<(i64, i64)> {
+    if let Some(slug) = on {
+        let (owner, repo) = split_slug(&slug)?;
+        let r = client
+            .resolve_repo(&owner, &repo)
+            .await
+            .with_context(|| format!("resolve --on {owner}/{repo}"))?;
+        eprintln!(
+            "resolved {}/{} → install={} repo={}",
+            r.repo_owner, r.repo_name, r.install_id, r.repo_id
+        );
+        Ok((r.install_id, r.repo_id))
+    } else {
+        match (install_id, repo_id) {
+            (Some(i), Some(r)) => Ok((i, r)),
+            _ => {
+                anyhow::bail!(
+                    "provide either --on <owner>/<repo> or both --install-id and --repo-id"
+                )
+            }
+        }
+    }
+}
+
+/// Build the trigger's `(kind, match_spec_json)` from either the
+/// `--branch-push`/`--tag-created` sugar or the raw `--kind`/`--match` flags.
+/// clap enforces mutual exclusion; this picks the supplied form.
+fn build_trigger_spec(
+    branch_push: Option<String>,
+    tag_created: Option<String>,
+    kind: Option<String>,
+    match_spec: Option<String>,
+) -> anyhow::Result<(String, serde_json::Value)> {
+    if let Some(branch) = branch_push {
+        Ok((
+            "branch_push".to_string(),
+            serde_json::json!({ "kind": "branch_push", "branch_name": branch }),
+        ))
+    } else if let Some(pattern) = tag_created {
+        Ok((
+            "tag_created".to_string(),
+            serde_json::json!({ "kind": "tag_created", "tag_pattern": pattern }),
+        ))
+    } else if let (Some(kind), Some(raw)) = (kind, match_spec) {
+        // Parse client-side for a fast, clear error; the daemon re-validates
+        // its shape against `TriggerMatchSpec`.
+        let spec: serde_json::Value =
+            serde_json::from_str(&raw).context("--match must be valid JSON")?;
+        Ok((kind, spec))
+    } else {
+        anyhow::bail!(
+            "provide one of: --branch-push <branch>, --tag-created <regex>, or --kind + --match"
+        )
+    }
+}
+
 async fn run_policy_pair(
     client: &Client,
     kind: PolicyKind,
     action: PolicyPairAction,
 ) -> anyhow::Result<()> {
     match action {
-        PolicyPairAction::Allow { install_id, repo_id, note } => {
+        PolicyPairAction::Allow { on, install_id, repo_id, note } => {
+            let (install_id, repo_id) = resolve_pair(client, on, install_id, repo_id).await?;
             let req = AllowPolicyRequest { install_id, repo_id, note };
             let row = match kind {
                 PolicyKind::Target => {
@@ -564,17 +662,19 @@ async fn run_policy_pair(
 async fn run_policy_trigger(client: &Client, action: PolicyTriggerAction) -> anyhow::Result<()> {
     match action {
         PolicyTriggerAction::Add {
+            on,
             install_id,
             repo_id,
+            branch_push,
+            tag_created,
             kind,
             match_spec,
             bench_args,
             note,
         } => {
-            // Parse the JSON match spec client-side for a fast, clear error;
-            // the daemon validates its shape against `TriggerMatchSpec`.
-            let match_spec: serde_json::Value =
-                serde_json::from_str(&match_spec).context("--match must be valid JSON")?;
+            let (install_id, repo_id) = resolve_pair(client, on, install_id, repo_id).await?;
+            let (kind, match_spec) =
+                build_trigger_spec(branch_push, tag_created, kind, match_spec)?;
             let row = client
                 .add_trigger(&AddTriggerRequest {
                     install_id,
@@ -628,10 +728,28 @@ async fn run_user(client: &Client, action: UserAction) -> anyhow::Result<()> {
         UserAction::Grant {
             login,
             user_id,
+            on,
             install,
             repo,
             role,
         } => {
+            // `--on` → a repo-scoped grant (resolves install + repo). Otherwise
+            // `--install` (clap-required without `--on`) + optional `--repo`.
+            let (install, repo) = match on {
+                Some(slug) => {
+                    let (owner, name) = split_slug(&slug)?;
+                    let r = client
+                        .resolve_repo(&owner, &name)
+                        .await
+                        .with_context(|| format!("resolve --on {owner}/{name}"))?;
+                    eprintln!(
+                        "resolved {}/{} → install={} repo={}",
+                        r.repo_owner, r.repo_name, r.install_id, r.repo_id
+                    );
+                    (r.install_id, Some(r.repo_id))
+                }
+                None => (install.expect("clap: --install is required unless --on is given"), repo),
+            };
             let outcome = client
                 .grant_role(&RoleRequest {
                     login,
@@ -837,4 +955,74 @@ fn load_env(explicit: Option<&Path>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_command_graph_is_valid() {
+        // clap's own consistency check — verifies every conflicts_with /
+        // requires / required_unless_present / group reference points at a
+        // real arg id (e.g. the `--on` exclusions on the policy/trigger/user
+        // commands), and would panic on a typo'd id.
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn split_slug_parses_owner_repo() {
+        assert_eq!(
+            split_slug("cylewitruk/stacks-core").unwrap(),
+            ("cylewitruk".to_string(), "stacks-core".to_string())
+        );
+    }
+
+    #[test]
+    fn split_slug_rejects_malformed() {
+        for bad in ["no-slash", "/leading", "trailing/", "a/b/c", ""] {
+            assert!(split_slug(bad).is_err(), "expected `{bad}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn build_trigger_spec_branch_push_sugar() {
+        let (kind, spec) = build_trigger_spec(Some("develop".into()), None, None, None).unwrap();
+        assert_eq!(kind, "branch_push");
+        assert_eq!(spec, serde_json::json!({ "kind": "branch_push", "branch_name": "develop" }));
+    }
+
+    #[test]
+    fn build_trigger_spec_tag_created_sugar() {
+        let (kind, spec) =
+            build_trigger_spec(None, Some(r"^v\d+\.\d+\.\d+$".into()), None, None).unwrap();
+        assert_eq!(kind, "tag_created");
+        assert_eq!(
+            spec,
+            serde_json::json!({ "kind": "tag_created", "tag_pattern": r"^v\d+\.\d+\.\d+$" })
+        );
+    }
+
+    #[test]
+    fn build_trigger_spec_raw_kind_match() {
+        let raw = r#"{"kind":"branch_push","branch_name":"main"}"#;
+        let (kind, spec) =
+            build_trigger_spec(None, None, Some("branch_push".into()), Some(raw.into())).unwrap();
+        assert_eq!(kind, "branch_push");
+        assert_eq!(spec, serde_json::from_str::<serde_json::Value>(raw).unwrap());
+    }
+
+    #[test]
+    fn build_trigger_spec_requires_a_spec() {
+        assert!(build_trigger_spec(None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn build_trigger_spec_raw_match_must_be_json() {
+        assert!(
+            build_trigger_spec(None, None, Some("branch_push".into()), Some("not json".into()))
+                .is_err()
+        );
+    }
 }

@@ -28,6 +28,45 @@ the handler and CLI reach the daemon over `/api`.
 - [docs/v2-to-v3-upgrade.md](docs/v2-to-v3-upgrade.md) — upgrade an existing v2 deployment to v3.
 - [docs/roadmap-v3.md](docs/roadmap-v3.md) — the API-fronted-daemon refactor (complete).
 
+## Common commands
+
+The operator CLI must run as the daemon user to read the admin cookie. The
+snippets below assume this alias:
+
+```bash
+alias sbgh='sudo -u sbgh sbgh-cli'   # runs as the daemon user (reads the 0600 cookie)
+```
+
+`--on owner/repo` resolves the install-id + repo-id server-side; raw
+`--install-id`/`--repo-id` stay available as the escape hatch.
+
+```bash
+# 1. Onboard an account, then install the App on its repo via GitHub.
+sbgh installer allow --login <account>
+sbgh repo allow --owner stacks-network --name stacks-core   # canonical root; forks via lineage
+
+# 2. Authorize PR benchmarking for an installed repo.
+sbgh policy target allow --on <owner>/<repo>
+sbgh policy source allow --on <owner>/<repo>                # internal PRs: source == target
+sbgh user grant --login <user> --on <owner>/<repo> --role trigger-pr-benchmark
+#   → comment `/benchmark` on a PR.
+
+# 3. Automatic baselines (headless jobs; results land in the DB).
+sbgh policy trigger add --on <owner>/<repo> --branch-push develop
+sbgh policy trigger add --on <owner>/<repo> --tag-created '^v\d+\.\d+\.\d+$'
+```
+
+Roles: `admin` | `trigger-pr-benchmark` | `view-results`. Cross-account source
+trust (a fork into a different org's install) uses raw `--install-id`/`--repo-id`.
+
+| Read command | Shows |
+| ---- | ---- |
+| `sbgh status` | API reachability + cookie scope |
+| `sbgh installation list` | installed accounts + install-ids |
+| `sbgh policy trigger list --install-id <id>` | configured auto-triggers |
+| `sbgh jobs list` | benchmark jobs + status |
+| `sbgh webhook tail` | recent webhook inbox rows |
+
 ## Development
 
 ```bash

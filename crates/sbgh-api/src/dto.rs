@@ -139,6 +139,20 @@ pub struct JobView {
     pub created_at: String,
 }
 
+/// Resolution of an `owner/repo` slug to the ids the policy/role commands
+/// need. `install_id` is the **active** installation on `owner`'s account
+/// (GitHub Apps install at most once per account); `repo_id` is the
+/// `github_repo` row for `owner/repo`. Both must already be known to the
+/// daemon — the resolver is a pure lookup, not a GitHub call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveRepoResponse {
+    pub install_id: i64,
+    pub account_login: String,
+    pub repo_id: i64,
+    pub repo_owner: String,
+    pub repo_name: String,
+}
+
 // ─── Request bodies ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

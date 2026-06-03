@@ -15,7 +15,7 @@ pub use dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
     DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, GrantRoleResult,
     HealthResponse, InstallationView, InstallerView, JobView, PolicyView, RepoRootView,
-    RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse, WebhookSummary,
-    WhoamiResponse,
+    ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse,
+    WebhookSummary, WhoamiResponse,
 };
 pub use error::{ApiError, ErrorBody};

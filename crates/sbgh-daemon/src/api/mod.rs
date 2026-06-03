@@ -16,6 +16,7 @@ mod installers;
 mod jobs;
 mod policies;
 mod repos;
+mod resolve;
 mod state;
 mod users;
 mod webhooks;
@@ -58,6 +59,7 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/whoami", get(health::whoami))
             .route("/api/webhooks", get(webhooks::list))
             .route("/api/installations", get(installations::list))
+            .route("/api/resolve", get(resolve::resolve))
             .route("/api/installers", get(installers::list))
             .route("/api/repos", get(repos::list))
             .route("/api/policies/target", get(policies::list_target))
