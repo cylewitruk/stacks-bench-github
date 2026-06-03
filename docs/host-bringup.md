@@ -2,7 +2,7 @@
 
 Step-by-step for going from a fresh Linux host with libvirt installed to a working `/benchmark` flow on a real PR. Assumes you've already read [architecture.md](./architecture.md).
 
-> Upgrading an **existing** deployment from the legacy `jobs` queue (v1) to the new `job` family (v2)? Use [v1-to-v2-upgrade.md](./v1-to-v2-upgrade.md) instead — this doc brings a fresh host up directly on v2.
+> This doc brings a **fresh** host up directly on v3 (the current API-fronted-daemon architecture). Upgrading an **existing** deployment instead? Use [v2-to-v3-upgrade.md](./v2-to-v3-upgrade.md) (from a v2 host) — or, if you're still on the legacy `jobs` queue (v1), run [v1-to-v2-upgrade.md](./v1-to-v2-upgrade.md) first, then v2→v3.
 
 ## 0. Prerequisites
 
