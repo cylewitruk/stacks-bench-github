@@ -12,7 +12,8 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::github::client::{
-    GitHubApi, PostedComment, PullRequestSide, PullRequestSummary, RepoRef, RepoSummary,
+    CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi, PostedCheckRun, PostedComment,
+    PullRequestSide, PullRequestSummary, RepoRef, RepoSummary,
 };
 use crate::models::ResolvedCommit;
 
@@ -51,6 +52,31 @@ pub enum FakeCall {
         repository: String,
         git_ref: String,
     },
+    CreateCheckRun {
+        installation_id: i64,
+        repository: String,
+        head_sha: String,
+        name: String,
+        external_id: String,
+        state: CheckRunState,
+        output: CheckRunOutput,
+        returned_id: i64,
+    },
+    UpdateCheckRun {
+        installation_id: i64,
+        repository: String,
+        check_run_id: i64,
+        state: CheckRunState,
+        output: CheckRunOutput,
+    },
+    FindCheckRun {
+        installation_id: i64,
+        repository: String,
+        head_sha: String,
+        name: String,
+        app_id: i64,
+        external_id: String,
+    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -73,6 +99,18 @@ struct FakeState {
     /// Pre-programmed responses for `resolve_commit`. Keyed by
     /// `("owner/name", git_ref)`.
     commits: HashMap<(String, String), ResolvedCommit>,
+    next_check_run_id: i64,
+    /// Pre-programmed `find_check_run_by_external_id` hits, keyed by
+    /// `(repository, head_sha, name, external_id)` — scoped tightly so a
+    /// runner test can't reconcile against the wrong repo/check name.
+    existing_check_runs: HashMap<(String, String, String, String), PostedCheckRun>,
+    /// Force `create_check_run` / `create_pr_comment` to error — for testing
+    /// the non-fatal reporting policy. The call is still recorded.
+    fail_create_check_run: bool,
+    fail_create_comment: bool,
+    /// Force `current_app_id` (`GET /app`) to error — for testing the
+    /// reconcile-skip + self-heal path.
+    fail_current_app_id: bool,
 }
 
 impl FakeGitHub {
@@ -80,9 +118,59 @@ impl FakeGitHub {
         Self {
             inner: Arc::new(Mutex::new(FakeState {
                 next_comment_id: 1000,
+                next_check_run_id: 5000,
                 ..Default::default()
             })),
         }
+    }
+
+    /// Make `create_check_run` error (the call is still recorded) — exercises
+    /// the non-fatal reporting policy.
+    pub fn fail_create_check_run(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_create_check_run = true;
+    }
+
+    /// Make `create_pr_comment` error (the call is still recorded).
+    pub fn fail_create_comment(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_create_comment = true;
+    }
+
+    /// Make `current_app_id` (`GET /app`) error.
+    pub fn fail_current_app_id(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_current_app_id = true;
+    }
+
+    /// Pre-program a check run that `find_check_run_by_external_id` should
+    /// return for `(repository, head_sha, name, external_id)` (the
+    /// crash-then-retry reconcile).
+    pub fn set_existing_check_run(
+        &self,
+        repository: &str,
+        head_sha: &str,
+        name: &str,
+        external_id: &str,
+        id: i64,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .existing_check_runs
+            .insert(
+                (repository.into(), head_sha.into(), name.into(), external_id.into()),
+                PostedCheckRun {
+                    id,
+                    html_url: Some(format!("https://github.test/checks/{id}")),
+                },
+            );
     }
 
     /// Pre-program the head SHA returned for a given repo+PR.
@@ -238,6 +326,9 @@ impl GitHubApi for FakeGitHub {
                 body: body.into(),
                 returned_id: id,
             });
+        if s.fail_create_comment {
+            return Err(crate::Error::Config("FakeGitHub: forced create_comment failure".into()));
+        }
         Ok(PostedComment { id })
     }
 
@@ -348,5 +439,97 @@ impl GitHubApi for FakeGitHub {
                      set_commit to stage it)"
                 ))
             })
+    }
+
+    async fn create_check_run(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        head_sha: &str,
+        name: &str,
+        external_id: &str,
+        update: CheckRunUpdate,
+    ) -> Result<PostedCheckRun> {
+        let CheckRunUpdate { state, output } = update;
+        let mut s = self.inner.lock().unwrap();
+        let id = s.next_check_run_id;
+        s.next_check_run_id += 1;
+        s.calls
+            .push(FakeCall::CreateCheckRun {
+                installation_id,
+                repository: repository.into(),
+                head_sha: head_sha.into(),
+                name: name.into(),
+                external_id: external_id.into(),
+                state,
+                output,
+                returned_id: id,
+            });
+        if s.fail_create_check_run {
+            return Err(crate::Error::Config("FakeGitHub: forced create_check_run failure".into()));
+        }
+        Ok(PostedCheckRun {
+            id,
+            html_url: Some(format!("https://github.test/checks/{id}")),
+        })
+    }
+
+    async fn update_check_run(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        check_run_id: i64,
+        update: CheckRunUpdate,
+    ) -> Result<PostedCheckRun> {
+        let CheckRunUpdate { state, output } = update;
+        let mut s = self.inner.lock().unwrap();
+        s.calls
+            .push(FakeCall::UpdateCheckRun {
+                installation_id,
+                repository: repository.into(),
+                check_run_id,
+                state,
+                output,
+            });
+        Ok(PostedCheckRun {
+            id: check_run_id,
+            html_url: Some(format!("https://github.test/checks/{check_run_id}")),
+        })
+    }
+
+    async fn find_check_run_by_external_id(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        head_sha: &str,
+        name: &str,
+        app_id: i64,
+        external_id: &str,
+    ) -> Result<Option<PostedCheckRun>> {
+        let mut s = self.inner.lock().unwrap();
+        s.calls
+            .push(FakeCall::FindCheckRun {
+                installation_id,
+                repository: repository.into(),
+                head_sha: head_sha.into(),
+                name: name.into(),
+                app_id,
+                external_id: external_id.into(),
+            });
+        Ok(s.existing_check_runs
+            .get(&(repository.into(), head_sha.into(), name.into(), external_id.into()))
+            .cloned())
+    }
+
+    async fn current_app_id(&self) -> Result<i64> {
+        if self
+            .inner
+            .lock()
+            .unwrap()
+            .fail_current_app_id
+        {
+            return Err(crate::Error::Config("FakeGitHub: forced GET /app failure".into()));
+        }
+        Ok(4242)
     }
 }

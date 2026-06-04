@@ -133,3 +133,16 @@ cookie_path = "/etc/sbgh/daemon/.cookie"
 # of this file — set it via SBGH_API_INGEST_TOKEN (same value in the handler's
 # secrets.env). Unset = webhook submission via /api is disabled.
 # ingest_token = "..."
+
+# How benchmark results are surfaced on GitHub (roadmap-v4). Requires the App's
+# `checks:write` permission for the check surfaces; until granted, the check
+# calls 403 and degrade (PR → comment, baseline → nothing) without failing the
+# run — reporting is always non-fatal. (The numeric App id needed for the check
+# reconcile is fetched automatically via `GET /app` at startup — no config.)
+[reporting]
+# PR (`/benchmark`) jobs: "both" (a Check Run on the PR head + a summary comment
+# that links to it), "check", or "comment". Default "both".
+pr_report = "both"
+# Baseline (push/tag) jobs: "check" (a commit-level Check Run on the baseline
+# commit) or "none" (headless/DB-only). Default "check".
+baseline_report = "check"

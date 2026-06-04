@@ -744,8 +744,8 @@ mod tests {
     use std::path::PathBuf;
 
     use sbgh_core::config::{
-        ApiConfig, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig, StacksBenchConfig,
-        VmConfig,
+        ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
+        PrReport, ReportingConfig, StacksBenchConfig, VmConfig,
     };
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -805,6 +805,11 @@ mod tests {
                 cookie_path: "/tmp/sbgh-test.cookie".into(),
                 ingest_token: None,
             },
+            // The driver doesn't report; value is irrelevant here.
+            reporting: ReportingConfig {
+                pr_report: PrReport::Both,
+                baseline_report: BaselineReport::Check,
+            },
         }
     }
 
@@ -817,9 +822,11 @@ mod tests {
             git_ref_kind: sbgh_core::models::GitRefKind::Branch,
             installation_id: 7,
             bench_args: vec!["--iters=2".into()],
-            progress: ProgressTarget::PullRequestComment {
+            progress: ProgressTarget::PullRequest {
                 pr_number: 42,
                 comment_id: Some(1000),
+                check_run_id: None,
+                check_run_url: None,
             },
             claim_token: None,
         }

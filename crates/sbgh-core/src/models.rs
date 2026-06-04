@@ -495,6 +495,10 @@ pub enum JobEventKind {
     TeardownFinished,
     CommentPosted,
     CommentUpdated,
+    /// A GitHub Check Run was created (roadmap-v4). Carries
+    /// `github_check_run_id` + `github_check_run_url`, read back on re-claim
+    /// so the runner updates the existing check instead of duplicating it.
+    CheckRunCreated,
     Completed,
     Failed,
     Cancelled,
@@ -522,6 +526,8 @@ pub struct JobEvent {
     pub event_status: JobEventStatus,
     pub occurred_at: DateTime<Utc>,
     pub github_comment_id: Option<i64>,
+    pub github_check_run_id: Option<i64>,
+    pub github_check_run_url: Option<String>,
     pub remark: Option<String>,
     pub detail: Option<Json<serde_json::Value>>,
 }
@@ -566,6 +572,8 @@ pub struct NewJobEvent {
     pub event_kind: JobEventKind,
     pub event_status: JobEventStatus,
     pub github_comment_id: Option<i64>,
+    pub github_check_run_id: Option<i64>,
+    pub github_check_run_url: Option<String>,
     pub remark: Option<String>,
     pub detail: Option<serde_json::Value>,
 }

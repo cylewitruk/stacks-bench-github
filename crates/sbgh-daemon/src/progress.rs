@@ -1,8 +1,12 @@
-//! Posts/edits the PR comment owned by a job as its lifecycle advances.
+//! Surfaces a job's lifecycle on its reporting target(s) — a PR comment
+//! and/or a GitHub Check Run (roadmap-v4). The whole surface is **non-fatal**:
+//! a reporting error is logged and swallowed, never failing the benchmark.
 
 use std::path::Path;
 
-use sbgh_core::github::GitHubApi;
+use sbgh_core::github::{
+    CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi,
+};
 
 use crate::bench_summary::{self, RunResult};
 use crate::job_source::{ProgressTarget, RunnableJob};
@@ -17,21 +21,60 @@ impl<'a> ProgressReporter<'a> {
         Self { gh, job }
     }
 
-    pub async fn started(&self) -> anyhow::Result<()> {
-        self.update(&format!(
+    /// Claimed → running. Refresh the comment; the check stays `in_progress`
+    /// (it transitions to `neutral` only at a terminal state).
+    pub async fn started(&self) {
+        self.update_comment(&format!(
             ":rocket: benchmark `{id}` is running on commit `{sha}`.",
             id = self.job.id,
             sha = self.job.commit,
         ))
-        .await
+        .await;
     }
 
-    pub async fn completed(&self, summary: &serde_json::Value) -> anyhow::Result<()> {
-        // The daemon-side summary blob carries pointers to the
-        // archived artifacts. Read + parse run.json (the actual
-        // stacks-bench output) for the user-facing metrics; everything
-        // else in the summary blob is operator/debugging detail that
-        // doesn't belong in the PR comment.
+    pub async fn completed(&self, summary: &serde_json::Value) {
+        let body = self.completed_body(summary);
+        self.update_comment(&body)
+            .await;
+        // Only PR jobs with a comment have one to point at; a baseline's commit
+        // check is self-contained.
+        let pointer = if self.has_comment() { "see comment / details" } else { "see details" };
+        self.complete_check(CheckRunOutput {
+            title: format!("benchmark {} — complete", self.job.id),
+            summary: format!("commit `{}` — {pointer}", self.job.commit),
+            text: Some(body),
+        })
+        .await;
+    }
+
+    /// Whether this job has a PR comment surface (a `PullRequest` target whose
+    /// comment was actually posted).
+    fn has_comment(&self) -> bool {
+        matches!(self.job.progress, ProgressTarget::PullRequest { comment_id: Some(_), .. })
+    }
+
+    /// Terminal failure. `error` is the full anyhow chain (internal paths,
+    /// stderr) — surface only a short, sanitized snippet; the DB row keeps the
+    /// full string. A *failed* check is still `neutral` (non-blocking), never
+    /// a red `failure`.
+    pub async fn failed(&self, error: &str) {
+        let snippet = short_pr_error(error);
+        self.update_comment(&format!(
+            ":x: benchmark `{id}` failed: `{snippet}`\n\n_(full details in the daemon logs)_",
+            id = self.job.id,
+        ))
+        .await;
+        self.complete_check(CheckRunOutput {
+            title: format!("benchmark {} — failed", self.job.id),
+            summary: format!("commit `{}` failed", self.job.commit),
+            text: Some(format!("```\n{snippet}\n```\n\n_(full details in the daemon logs)_")),
+        })
+        .await;
+    }
+
+    /// The shared completed render (read + parse the archived `run.json` for
+    /// the user-facing metrics) used by both the comment and the check.
+    fn completed_body(&self, summary: &serde_json::Value) -> String {
         let archive_dir = summary
             .get("archive_dir")
             .and_then(|v| v.as_str())
@@ -42,61 +85,55 @@ impl<'a> ProgressReporter<'a> {
         let parsed = run_json_path
             .map(Path::new)
             .and_then(read_run_json);
-
-        let body = bench_summary::render_pr_comment(
+        bench_summary::render_pr_comment(
             &self.job.id.to_string(),
             &self.job.commit,
             archive_dir,
             parsed.as_ref(),
-        );
-        self.update(&body).await
+        )
     }
 
-    /// Update the PR comment with a short failure snippet.
-    ///
-    /// `error` is the full anyhow chain — internal paths, command flags,
-    /// stderr dumps. Don't leak that to the PR; it's noisy and exposes
-    /// daemon internals. Surface only the first line, truncated,
-    /// and point at the daemon logs for details. The DB row still
-    /// gets the full string via `JobStore::fail`.
-    pub async fn failed(&self, error: &str) -> anyhow::Result<()> {
-        let snippet = short_pr_error(error);
-        self.update(&format!(
-            ":x: benchmark `{id}` failed: `{snippet}`\n\n_(full details in the daemon logs)_",
-            id = self.job.id,
-        ))
-        .await
+    /// Edit the PR comment if this job has one. Non-fatal.
+    async fn update_comment(&self, body: &str) {
+        let ProgressTarget::PullRequest {
+            comment_id: Some(comment_id), ..
+        } = self.job.progress
+        else {
+            tracing::debug!(job_id = %self.job.id, "progress (no comment surface)");
+            return;
+        };
+        if let Err(e) = self
+            .gh
+            .update_pr_comment(self.job.installation_id, &self.job.repository, comment_id, body)
+            .await
+        {
+            tracing::warn!(job_id = %self.job.id, error = ?e, "update PR comment failed (non-fatal)");
+        }
     }
 
-    async fn update(&self, body: &str) -> anyhow::Result<()> {
-        match self.job.progress {
-            ProgressTarget::PullRequestComment {
-                comment_id: Some(comment_id), ..
-            } => {
-                self.gh
-                    .update_pr_comment(
-                        self.job.installation_id,
-                        &self.job.repository,
-                        comment_id,
-                        body,
-                    )
-                    .await?;
-                Ok(())
-            }
-            ProgressTarget::PullRequestComment { comment_id: None, .. } => {
-                tracing::warn!(job_id = %self.job.id, "no comment id; skipping update");
-                Ok(())
-            }
-            // New-schema BASELINE jobs (branch_push) have no PR, so
-            // progress goes to logs only — no comment, and no intermediate
-            // phase `job_event` rows yet (that timeline is still deferred).
-            // The queued + terminal events are persisted elsewhere.
-            // (PR-comment jobs take the branch above; comment posting for
-            // those landed in the slice 11 cutover.)
-            ProgressTarget::LogOnly => {
-                tracing::debug!(job_id = %self.job.id, body, "progress (log-only)");
-                Ok(())
-            }
+    /// Complete this job's Check Run (`neutral`) if it has one. Non-fatal.
+    async fn complete_check(&self, output: CheckRunOutput) {
+        let check_run_id = match self.job.progress {
+            ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
+            ProgressTarget::CommitCheck { check_run_id } => check_run_id,
+        };
+        let Some(check_run_id) = check_run_id else {
+            return;
+        };
+        if let Err(e) = self
+            .gh
+            .update_check_run(
+                self.job.installation_id,
+                &self.job.repository,
+                check_run_id,
+                CheckRunUpdate {
+                    state: CheckRunState::Completed(CheckRunConclusion::Neutral),
+                    output,
+                },
+            )
+            .await
+        {
+            tracing::warn!(job_id = %self.job.id, error = ?e, "update Check Run failed (non-fatal)");
         }
     }
 }

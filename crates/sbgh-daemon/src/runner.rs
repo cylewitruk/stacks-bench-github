@@ -2,26 +2,32 @@
 //!
 //! On pickup the daemon:
 //!   1. Resolves the commit via the GitHub API (the handler can't — no App
-//!      credentials): a PR-comment job's head SHA, or a `tag_created` job's tag
-//!      → commit. Writes it back to the job row.
-//!   2. For PR jobs, posts the initial "starting" PR comment and persists the
-//!      returned comment id so the phase-progress listener can edit it.
-//!   3. Runs the benchmark.
+//!      credentials): a PR job's head SHA, or a `tag_created` job's tag →
+//!      commit. Writes it back to the job row. (FATAL — no SHA, no run.)
+//!   2. Reporting (NON-FATAL, per `[reporting]`): creates the Check Run on the
+//!      resolved commit and — for PR jobs — posts the "starting" comment
+//!      linking it, persisting both ids so a re-claim reuses them.
+//!   3. Runs the benchmark; updates the check (→ `neutral`) + comment at the
+//!      end.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sbgh_core::config::DaemonConfig;
-use sbgh_core::github::GitHubApi;
+use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use sbgh_core::models::{GitRefKind, ResolvedCommit};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, OutcomeStatus, Phase, PhaseListener, Shell, format_elapsed};
 use crate::progress::ProgressReporter;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Display name of the Check Run the daemon posts (roadmap-v4). Stable so the
+/// reconcile filter (`check_name`) and GitHub's per-name dedup both work.
+const CHECK_NAME: &str = "stacks-bench";
 
 /// Lease after which a job stranded in `claimed` (claimed but never
 /// transitioned to `running` — daemon crashed or preflight errored
@@ -48,6 +54,11 @@ pub struct Runner {
     jobs: Arc<dyn RunnableJobStore>,
     gh: Arc<dyn GitHubApi>,
     shell: Arc<dyn Shell>,
+    /// The App's numeric id, resolved via `GET /app` and cached on **success**
+    /// only — a `get_or_try_init` that leaves the cell empty on error, so a
+    /// transient startup blip is retried on the next job rather than disabling
+    /// the reconcile for the whole process.
+    app_id: OnceCell<i64>,
 }
 
 impl Runner {
@@ -62,11 +73,40 @@ impl Runner {
             jobs,
             gh,
             shell,
+            app_id: OnceCell::new(),
+        }
+    }
+
+    /// Resolve the App's numeric id via `GET /app`, caching it on success.
+    /// Non-fatal: on failure the reconcile is skipped **this time** and the
+    /// cell is left empty, so the next `ensure_check` retries (self-heals after
+    /// a transient blip).
+    async fn resolved_app_id(&self) -> Option<i64> {
+        match self
+            .app_id
+            .get_or_try_init(|| async {
+                let id = self
+                    .gh
+                    .current_app_id()
+                    .await?;
+                tracing::info!(app_id = id, "resolved GitHub App id (check reconcile enabled)");
+                Ok::<i64, sbgh_core::Error>(id)
+            })
+            .await
+        {
+            Ok(id) => Some(*id),
+            Err(e) => {
+                tracing::warn!(error = ?e, "could not resolve App id via GET /app; reconcile skipped (will retry)");
+                None
+            }
         }
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
         tracing::info!("daemon started");
+        // Resolve the App id once up front (logs the outcome); `ensure_check`
+        // reuses the cached value.
+        let _ = self.resolved_app_id().await;
         let lease = chrono::Duration::minutes(CLAIM_LEASE_MINUTES);
         loop {
             // Recover jobs stranded in `claimed` (crash / preflight error
@@ -126,8 +166,8 @@ impl Runner {
             git_ref = %job.git_ref_display,
             commit_preresolved = !job.commit.is_empty(),
             progress = match job.progress {
-                ProgressTarget::PullRequestComment { .. } => "pr_comment",
-                ProgressTarget::LogOnly => "log_only",
+                ProgressTarget::PullRequest { .. } => "pull_request",
+                ProgressTarget::CommitCheck { .. } => "commit_check",
             },
             "claimed job; starting",
         );
@@ -177,11 +217,11 @@ impl Runner {
             self.jobs
                 .fail(&job, msg, None)
                 .await?;
-            let _ = reporter.failed(msg).await;
+            reporter.failed(msg).await;
             return Ok(());
         }
 
-        reporter.started().await?;
+        reporter.started().await;
 
         let driver = LibvirtDriver::new(self.config.clone(), self.shell.clone());
         let phase_listener = CommentPhaseListener::new(self.gh.clone(), job.clone());
@@ -204,7 +244,7 @@ impl Runner {
                     .jobs
                     .fail(&job, &msg, None)
                     .await;
-                let _ = reporter.failed(&msg).await;
+                reporter.failed(&msg).await;
                 return Err(e);
             }
         };
@@ -223,7 +263,7 @@ impl Runner {
                 tracing::info!(job_id = %job.id, "job result persisted (status=completed)");
                 reporter
                     .completed(&outcome.summary)
-                    .await?;
+                    .await;
             }
             OutcomeStatus::Failed(err) => {
                 // VM-side or libvirt-side failure (virsh start refused,
@@ -241,7 +281,7 @@ impl Runner {
                 self.jobs
                     .fail(&job, &err, Some(&outcome.summary))
                     .await?;
-                reporter.failed(&err).await?;
+                reporter.failed(&err).await;
             }
         }
         Ok(())
@@ -265,86 +305,241 @@ impl Runner {
     /// still-`claimed` job, which now terminalizes cleanly rather than
     /// looping (the `fail_job` claimed-or-running guard).
     async fn preflight(&self, job: &mut RunnableJob) -> anyhow::Result<Option<ResolvedCommit>> {
-        let ProgressTarget::PullRequestComment { pr_number, comment_id } = job.progress else {
-            // Non-PR (baseline) job. Resolve a tag's commit if needed;
-            // branch_push jobs already carry their commit. Resolve via
-            // GitHub's canonical qualified form `tags/<name>` so it
-            // unambiguously targets the tag (not a same-named branch).
-            if job.commit.is_empty() && job.git_ref_kind == GitRefKind::Tag {
-                let tag_ref = format!("tags/{}", job.git_ref_display);
-                let resolved = self
-                    .gh
-                    .resolve_commit(job.installation_id, &job.repository, &tag_ref)
-                    .await?;
-                tracing::info!(
-                    job_id = %job.id,
-                    tag = %job.git_ref_display,
-                    commit = %resolved.hash,
-                    "resolved tag to commit at claim time",
-                );
-                job.commit = resolved.hash.clone();
-                return Ok(Some(resolved));
-            }
-            if job.commit.is_empty() {
-                tracing::warn!(
-                    job_id = %job.id,
-                    git_ref = %job.git_ref_display,
-                    "new-schema job has no resolved commit; the empty-commit guard will fail it",
-                );
-            }
-            return Ok(None);
-        };
+        // Commit resolution is FATAL (can't benchmark without a SHA, and the
+        // check needs a concrete head_sha). Reporting is NON-FATAL.
+        let resolved = self
+            .resolve_commit(job)
+            .await?;
+        if !job.commit.is_empty() {
+            self.ensure_reporting(job)
+                .await;
+        }
+        Ok(resolved)
+    }
 
-        let resolved = if job.commit.is_empty() {
+    /// Resolve the job's commit when empty: a PR job → the PR head SHA; a
+    /// `tag_created` baseline → the tag ref. `branch_push` carries its commit
+    /// from enqueue (non-empty → no-op).
+    async fn resolve_commit(
+        &self,
+        job: &mut RunnableJob,
+    ) -> anyhow::Result<Option<ResolvedCommit>> {
+        if !job.commit.is_empty() {
+            return Ok(None);
+        }
+        if let ProgressTarget::PullRequest { pr_number, .. } = job.progress {
             let sha = self
                 .gh
                 .pr_head_sha(job.installation_id, &job.repository, pr_number as u64)
                 .await?;
-            tracing::info!(
-                job_id = %job.id,
-                pr_number,
-                sha = %sha,
-                "resolved PR head SHA at claim time",
-            );
+            tracing::info!(job_id = %job.id, pr_number, sha = %sha, "resolved PR head SHA at claim time");
             job.commit = sha.clone();
-            Some(ResolvedCommit { hash: sha, committed_at: None })
-        } else {
-            None
-        };
-
-        if comment_id.is_none() {
-            let body = format!(
-                ":construction: starting benchmark `{id}` (commit `{sha}`)…",
-                id = job.id,
-                sha = job.commit,
-            );
-            let posted = self
+            return Ok(Some(ResolvedCommit { hash: sha, committed_at: None }));
+        }
+        if job.git_ref_kind == GitRefKind::Tag {
+            // Qualified `tags/<name>` so it unambiguously targets the tag.
+            let tag_ref = format!("tags/{}", job.git_ref_display);
+            let resolved = self
                 .gh
-                .create_pr_comment(job.installation_id, &job.repository, pr_number as u64, &body)
+                .resolve_commit(job.installation_id, &job.repository, &tag_ref)
                 .await?;
-            self.jobs
-                .set_comment_id(job, posted.id)
-                .await?;
-            tracing::info!(
+            tracing::info!(job_id = %job.id, tag = %job.git_ref_display, commit = %resolved.hash, "resolved tag to commit at claim time");
+            job.commit = resolved.hash.clone();
+            return Ok(Some(resolved));
+        }
+        tracing::warn!(
+            job_id = %job.id,
+            git_ref = %job.git_ref_display,
+            "job has no resolved commit; the empty-commit guard will fail it",
+        );
+        Ok(None)
+    }
+
+    /// Create the Check Run (after the commit is resolved) and/or post the
+    /// initial PR comment, per `[reporting]`. NON-FATAL: a reporting error is
+    /// logged and the run proceeds. Mutates `job.progress` with the created
+    /// ids.
+    async fn ensure_reporting(&self, job: &mut RunnableJob) {
+        match job.progress.clone() {
+            ProgressTarget::PullRequest {
+                pr_number,
+                mut comment_id,
+                mut check_run_id,
+                mut check_run_url,
+            } => {
+                // Check first, so the comment can carry its link.
+                if self
+                    .config
+                    .reporting
+                    .pr_report
+                    .wants_check()
+                    && check_run_id.is_none()
+                    && let Some((id, url)) = self.ensure_check(job).await
+                {
+                    check_run_id = Some(id);
+                    check_run_url = url;
+                }
+                if self
+                    .config
+                    .reporting
+                    .pr_report
+                    .wants_comment()
+                    && comment_id.is_none()
+                    && let Some(id) = self
+                        .post_initial_comment(job, pr_number, check_run_url.as_deref())
+                        .await
+                {
+                    comment_id = Some(id);
+                }
+                job.progress = ProgressTarget::PullRequest {
+                    pr_number,
+                    comment_id,
+                    check_run_id,
+                    check_run_url,
+                };
+            }
+            ProgressTarget::CommitCheck { mut check_run_id } => {
+                if self
+                    .config
+                    .reporting
+                    .baseline_report
+                    .wants_check()
+                    && check_run_id.is_none()
+                    && let Some((id, _)) = self.ensure_check(job).await
+                {
+                    check_run_id = Some(id);
+                }
+                job.progress = ProgressTarget::CommitCheck { check_run_id };
+            }
+        }
+    }
+
+    /// Reconcile-or-create the in-progress Check Run on `job.commit`, persist
+    /// its id+url, and return them. Non-fatal (returns `None` on error). The
+    /// reconcile (when the App id resolved via `GET /app`) reuses a run created
+    /// just before a crash rather than duplicating it.
+    async fn ensure_check(&self, job: &RunnableJob) -> Option<(i64, Option<String>)> {
+        let external_id = job.id.to_string();
+        if let Some(app_id) = self.resolved_app_id().await {
+            match self
+                .gh
+                .find_check_run_by_external_id(
+                    job.installation_id,
+                    &job.repository,
+                    &job.commit,
+                    CHECK_NAME,
+                    app_id,
+                    &external_id,
+                )
+                .await
+            {
+                Ok(Some(existing)) => {
+                    self.persist_check_id(job, existing.id, existing.html_url.as_deref())
+                        .await;
+                    tracing::info!(job_id = %job.id, check_run_id = existing.id, "reconciled existing check run");
+                    return Some((existing.id, existing.html_url));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(job_id = %job.id, error = ?e, "check reconcile lookup failed; creating")
+                }
+            }
+        }
+        let output = CheckRunOutput {
+            title: format!("benchmark {}", job.id),
+            summary: format!("Benchmarking commit `{}`…", job.commit),
+            text: None,
+        };
+        match self
+            .gh
+            .create_check_run(
+                job.installation_id,
+                &job.repository,
+                &job.commit,
+                CHECK_NAME,
+                &external_id,
+                CheckRunUpdate {
+                    state: CheckRunState::InProgress,
+                    output,
+                },
+            )
+            .await
+        {
+            Ok(posted) => {
+                self.persist_check_id(job, posted.id, posted.html_url.as_deref())
+                    .await;
+                tracing::info!(job_id = %job.id, check_run_id = posted.id, "created check run");
+                Some((posted.id, posted.html_url))
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job.id, error = ?e, "create check run failed (non-fatal)");
+                None
+            }
+        }
+    }
+
+    /// Persist the check run identity (`check_run_created` event) the reclaim
+    /// path reads back. Non-fatal, but a failure is logged **loudly**: the
+    /// in-memory job keeps the id (so this run still updates the right check),
+    /// but the next claim won't see it and could create a DUPLICATE check.
+    async fn persist_check_id(&self, job: &RunnableJob, id: i64, url: Option<&str>) {
+        if let Err(e) = self
+            .jobs
+            .set_check_run(job, id, url)
+            .await
+        {
+            tracing::warn!(
                 job_id = %job.id,
-                pr_number,
-                comment_id = posted.id,
-                "posted initial PR comment",
-            );
-            job.progress = ProgressTarget::PullRequestComment {
-                pr_number,
-                comment_id: Some(posted.id),
-            };
-        } else {
-            tracing::debug!(
-                job_id = %job.id,
-                pr_number,
-                comment_id = ?comment_id,
-                "reusing existing PR comment (re-claim)",
+                check_run_id = id,
+                error = ?e,
+                "PERSISTING check identity failed — a re-claim may duplicate the check (non-fatal)",
             );
         }
+    }
 
-        Ok(resolved)
+    /// Post the initial "starting" PR comment (carrying the check link when
+    /// present), persist its id. Non-fatal (returns `None` on error).
+    async fn post_initial_comment(
+        &self,
+        job: &RunnableJob,
+        pr_number: i64,
+        check_link: Option<&str>,
+    ) -> Option<i64> {
+        let link = check_link
+            .map(|u| format!(" — [view check ↗]({u})"))
+            .unwrap_or_default();
+        let body = format!(
+            ":construction: starting benchmark `{id}` (commit `{sha}`)…{link}",
+            id = job.id,
+            sha = job.commit,
+        );
+        match self
+            .gh
+            .create_pr_comment(job.installation_id, &job.repository, pr_number as u64, &body)
+            .await
+        {
+            Ok(posted) => {
+                if let Err(e) = self
+                    .jobs
+                    .set_comment_id(job, posted.id)
+                    .await
+                {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        comment_id = posted.id,
+                        error = ?e,
+                        "PERSISTING comment id failed — a re-claim may double-post the comment \
+                         (non-fatal)",
+                    );
+                }
+                tracing::info!(job_id = %job.id, pr_number, comment_id = posted.id, "posted initial PR comment");
+                Some(posted.id)
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job.id, error = ?e, "post initial PR comment failed (non-fatal)");
+                None
+            }
+        }
     }
 }
 
@@ -383,15 +578,15 @@ impl CommentPhaseListener {
     }
 
     async fn try_update(&self, phase: &Phase, elapsed: Duration, force: bool) {
-        // Only PR-comment jobs with a posted comment get GitHub edits.
-        // New-schema (LogOnly) jobs surface phase changes via logs only
-        // in slice 10; both comment posting and intermediate phase
-        // `job_event` rows are slice-11 concerns.
-        let ProgressTarget::PullRequestComment {
+        // Only PR jobs with a posted comment get per-phase GitHub edits. The
+        // Check Run is a status surface (in_progress → neutral at terminal);
+        // it doesn't get per-phase output churn here. Baseline/commit-check
+        // jobs (and any job without a comment) surface phases in logs only.
+        let ProgressTarget::PullRequest {
             comment_id: Some(comment_id), ..
         } = self.job.progress
         else {
-            tracing::debug!(job_id = %self.job.id, phase = %phase, "phase (log-only)");
+            tracing::debug!(job_id = %self.job.id, phase = %phase, "phase (no comment surface)");
             return;
         };
 
@@ -460,8 +655,8 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use sbgh_core::config::{
-        ApiConfig, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig, StacksBenchConfig,
-        VmConfig,
+        ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
+        PrReport, ReportingConfig, StacksBenchConfig, VmConfig,
     };
     use sbgh_core::github::test_support::FakeGitHub;
     use tempfile::TempDir;
@@ -481,6 +676,9 @@ mod tests {
         /// The commit `start_running` was called with (for asserting
         /// claim-time tag resolution).
         started_commit: StdMutex<Option<ResolvedCommit>>,
+        /// Force `set_check_run` / `set_comment_id` to error — for testing that
+        /// a persistence failure is non-fatal (the job still terminalizes).
+        fail_persist: std::sync::atomic::AtomicBool,
     }
 
     impl FakeSource {
@@ -489,7 +687,12 @@ mod tests {
                 job: StdMutex::new(Some(job)),
                 calls: StdMutex::new(Vec::new()),
                 started_commit: StdMutex::new(None),
+                fail_persist: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+        fn fail_persist(&self) {
+            self.fail_persist
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn record(&self, m: &'static str) {
             self.calls
@@ -551,6 +754,27 @@ mod tests {
         }
         async fn set_comment_id(&self, _job: &RunnableJob, _comment_id: i64) -> anyhow::Result<()> {
             self.record("set_comment_id");
+            if self
+                .fail_persist
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("forced set_comment_id failure");
+            }
+            Ok(())
+        }
+        async fn set_check_run(
+            &self,
+            _job: &RunnableJob,
+            _check_run_id: i64,
+            _html_url: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.record("set_check_run");
+            if self
+                .fail_persist
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("forced set_check_run failure");
+            }
             Ok(())
         }
         async fn sweep_stuck_claims(&self, _lease: chrono::Duration) -> anyhow::Result<u64> {
@@ -606,17 +830,24 @@ mod tests {
                 cookie_path: "/tmp/sbgh-test.cookie".into(),
                 ingest_token: None,
             },
+            // Existing runner tests assert comment-only behaviour; check-mode
+            // is exercised by dedicated tests that override this.
+            reporting: ReportingConfig {
+                pr_report: PrReport::Comment,
+                baseline_report: BaselineReport::None,
+            },
         }
     }
 
-    /// The runner drives ANY `RunnableJobStore` (here a new-schema-shaped
-    /// `LogOnly` job, no PR) through `start_running` and, when the driver
-    /// reports failure, `fail` — proving the runner is backend-agnostic
-    /// and the log-only progress path doesn't touch GitHub.
+    /// The runner drives ANY `RunnableJobStore` (here a baseline job with
+    /// reporting disabled — `baseline_report = none`, the default
+    /// `test_config`) through `start_running` and, when the driver reports
+    /// failure, `fail` — proving the runner is backend-agnostic and a
+    /// no-surface job never touches GitHub.
     #[tokio::test]
-    async fn run_once_drives_log_only_job_to_terminal_fail() {
+    async fn run_once_drives_unreported_baseline_job_to_terminal_fail() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let config = test_config(&tmp); // baseline_report = none
 
         let job = RunnableJob {
             id: Uuid::new_v4(),
@@ -626,14 +857,14 @@ mod tests {
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
             bench_args: vec![],
-            progress: ProgressTarget::LogOnly,
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
             claim_token: Some(Uuid::new_v4()),
         };
         let source = Arc::new(FakeSource::new(job));
 
-        // FakeGitHub must never be called for a LogOnly job; a recording
-        // shell that fails the first provisioning command drives the
-        // driver to a Failed outcome.
+        // With reporting off, GitHub must never be touched; a recording shell
+        // that fails the first provisioning command drives the driver to a
+        // Failed outcome.
         let gh = Arc::new(FakeGitHub::new());
         let shell = Arc::new(RecordingShell::new());
         shell.reply(PreparedReply::fail(b"boom: git fetch failed"));
@@ -646,17 +877,11 @@ mod tests {
         assert!(processed, "claimed + executed one job");
 
         // Lifecycle: transitioned to running, then failed (driver setup
-        // error → Failed outcome). No comment work for a LogOnly job.
+        // error → Failed outcome). No reporting work for a no-surface job.
         assert_eq!(source.calls(), vec!["start_running", "fail"]);
         assert!(
-            !gh.calls()
-                .iter()
-                .any(|c| matches!(
-                    c,
-                    sbgh_core::github::test_support::FakeCall::CreateComment { .. }
-                        | sbgh_core::github::test_support::FakeCall::UpdateComment { .. }
-                )),
-            "LogOnly job must not post or edit a GitHub comment"
+            gh.calls().is_empty(),
+            "a job with reporting disabled must make no GitHub calls (no comment or check)"
         );
 
         // Queue now empty.
@@ -685,7 +910,7 @@ mod tests {
             git_ref_kind: GitRefKind::Tag,
             installation_id: 7,
             bench_args: vec![],
-            progress: ProgressTarget::LogOnly,
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
             claim_token: Some(Uuid::new_v4()),
         };
         let source = Arc::new(FakeSource::new(job));
@@ -725,6 +950,291 @@ mod tests {
                     sbgh_core::github::test_support::FakeCall::ResolveCommit { .. }
                 )),
             "runner must call resolve_commit for a tag job"
+        );
+    }
+
+    use sbgh_core::github::test_support::FakeCall;
+
+    fn config_with(tmp: &TempDir, pr: PrReport, baseline: BaselineReport) -> DaemonConfig {
+        let mut c = test_config(tmp);
+        c.reporting = ReportingConfig {
+            pr_report: pr,
+            baseline_report: baseline,
+        };
+        c
+    }
+
+    /// Drive a (pre-resolved) job to a terminal `fail` via a failing shell,
+    /// returning the FakeGitHub + FakeSource call records for assertions.
+    async fn run_to_fail(
+        config: DaemonConfig,
+        job: RunnableJob,
+    ) -> (Vec<FakeCall>, Vec<&'static str>) {
+        // Jobs here carry a pre-resolved commit, so preflight skips the GitHub
+        // commit-resolution call; a failing shell drives a terminal `fail`.
+        let source = Arc::new(FakeSource::new(job));
+        let gh = Arc::new(FakeGitHub::new());
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        runner
+            .run_once()
+            .await
+            .unwrap();
+        (gh.calls(), source.calls())
+    }
+
+    fn pr_job(commit: &str, check_run_id: Option<i64>) -> RunnableJob {
+        RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "acme/widgets".into(),
+            commit: commit.into(),
+            git_ref_display: "feature".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            bench_args: vec![],
+            progress: ProgressTarget::PullRequest {
+                pr_number: 7,
+                comment_id: None,
+                check_run_id,
+                check_run_url: None,
+            },
+            claim_token: Some(Uuid::new_v4()),
+        }
+    }
+
+    /// PR job in `both` mode: creates an in-progress check, posts a comment
+    /// LINKING the check, then completes the check (neutral) on failure.
+    #[tokio::test]
+    async fn pr_job_both_creates_check_and_linked_comment() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Both, BaselineReport::None);
+        let (calls, src) = run_to_fail(config, pr_job("abc123", None)).await;
+
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateCheckRun { .. })),
+            "created the PR-head check"
+        );
+        let comment = calls
+            .iter()
+            .find_map(|c| match c {
+                FakeCall::CreateComment { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .expect("posted an initial comment");
+        assert!(comment.contains("view check"), "comment links the check: {comment}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
+            "completed the check on terminal"
+        );
+        assert!(src.contains(&"set_check_run"), "persisted check identity");
+    }
+
+    /// PR job in `comment` mode: no check at all, just the comment.
+    #[tokio::test]
+    async fn pr_job_comment_mode_skips_check() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+        let (calls, _src) = run_to_fail(config, pr_job("abc123", None)).await;
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateComment { .. })),
+            "posted the comment"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateCheckRun { .. })),
+            "comment mode must not create a check"
+        );
+    }
+
+    /// Baseline job in `check` mode: a commit check, no comment.
+    #[tokio::test]
+    async fn baseline_job_check_mode_creates_commit_check_no_comment() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Both, BaselineReport::Check);
+        let job = RunnableJob {
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            ..pr_job("abc123", None)
+        };
+        let (calls, src) = run_to_fail(config, job).await;
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateCheckRun { .. })),
+            "created the commit check"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
+            "completed the commit check"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateComment { .. })),
+            "a baseline has no comment surface"
+        );
+        assert!(src.contains(&"set_check_run"));
+    }
+
+    /// The reconcile reuses a check created just before a crash (same
+    /// external_id) instead of creating a duplicate.
+    #[tokio::test]
+    async fn check_reconcile_reuses_existing_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+        let job = pr_job("abc123", None);
+        let job_id = job.id;
+        let source = Arc::new(FakeSource::new(job));
+        let gh = Arc::new(FakeGitHub::new());
+        gh.set_head_sha("acme/widgets", 7, "abc123");
+        // A prior run exists for (repo, sha, name, external_id=job id).
+        gh.set_existing_check_run("acme/widgets", "abc123", CHECK_NAME, &job_id.to_string(), 9999);
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom"));
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        runner
+            .run_once()
+            .await
+            .unwrap();
+
+        let calls = gh.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::FindCheckRun { .. })),
+            "reconcile looked up by external_id"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateCheckRun { .. })),
+            "reused the existing run; must NOT create a duplicate"
+        );
+        // The reused id is persisted so the terminal update targets it.
+        assert!(
+            matches!(
+                calls
+                    .iter()
+                    .find(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
+                Some(FakeCall::UpdateCheckRun { check_run_id: 9999, .. })
+            ),
+            "completed the reused check 9999"
+        );
+    }
+
+    /// Non-fatal reporting: if BOTH `create_check_run` and `create_pr_comment`
+    /// error, the benchmark still runs to a terminal state.
+    #[tokio::test]
+    async fn reporting_create_failures_do_not_fail_the_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Both, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+        let gh = Arc::new(FakeGitHub::new());
+        gh.fail_create_check_run();
+        gh.fail_create_comment();
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom"));
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        runner
+            .run_once()
+            .await
+            .unwrap();
+
+        let calls = gh.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateCheckRun { .. })),
+            "attempted the check"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateComment { .. })),
+            "attempted the comment"
+        );
+        // Both surfaces errored, yet the job reached terminal `fail`.
+        assert_eq!(source.calls(), vec!["start_running", "fail"]);
+    }
+
+    /// Non-fatal reporting: if PERSISTING the surface ids fails (the
+    /// `check_run_created` / `comment_posted` events), the job still
+    /// terminalizes and the in-memory ids are retained so the terminal update
+    /// still targets the live check.
+    #[tokio::test]
+    async fn reporting_persistence_failure_does_not_fail_the_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Both, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+        source.fail_persist(); // set_check_run / set_comment_id will error
+        let gh = Arc::new(FakeGitHub::new());
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom"));
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        runner
+            .run_once()
+            .await
+            .unwrap();
+
+        let src = source.calls();
+        assert!(src.contains(&"set_check_run"), "attempted to persist the check id");
+        assert!(src.contains(&"fail"), "job reached terminal fail despite persistence errors");
+        // The check id was retained in-memory (persistence failure swallowed),
+        // so the terminal completion still updated the live check.
+        let calls = gh.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
+            "terminal update used the retained check id"
+        );
+    }
+
+    /// If `GET /app` fails, the reconcile is skipped (no lookup) but the check
+    /// is still created and the job terminalizes. The `OnceCell` is left empty
+    /// (`get_or_try_init` doesn't cache the error), so a later job self-heals.
+    #[tokio::test]
+    async fn app_id_resolution_failure_skips_reconcile_but_not_the_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+        let gh = Arc::new(FakeGitHub::new());
+        gh.fail_current_app_id();
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom"));
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        runner
+            .run_once()
+            .await
+            .unwrap();
+
+        let calls = gh.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::FindCheckRun { .. })),
+            "reconcile is skipped when the App id is unknown"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::CreateCheckRun { .. })),
+            "the check is still created"
+        );
+        assert!(
+            source
+                .calls()
+                .contains(&"fail"),
+            "the job still reached terminal"
         );
     }
 }

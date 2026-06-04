@@ -7,8 +7,9 @@ pub mod webhook;
 
 pub use auth::{AppCredentials, InstallationTokenCache};
 pub use client::{
-    GitHubApi, OctocrabClient, PostedComment, PullRequestAuthor, PullRequestSide,
-    PullRequestSummary, RepoRef, RepoSummary,
+    CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi, OctocrabClient,
+    PostedCheckRun, PostedComment, PullRequestAuthor, PullRequestSide, PullRequestSummary, RepoRef,
+    RepoSummary,
 };
 pub use command::{Command, parse_command};
 pub use webhook::{

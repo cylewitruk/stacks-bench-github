@@ -172,6 +172,7 @@ pub struct DaemonConfig {
     pub lvm: LvmConfig,
     pub stacks_bench: StacksBenchConfig,
     pub api: ApiConfig,
+    pub reporting: ReportingConfig,
 }
 
 /// The daemon's `/api` server (roadmap-v3). Reachable only from the
@@ -209,6 +210,47 @@ pub struct GitHubConfig {
     pub client_id: String,
     pub api_base_url: String,
     pub private_key_path: PathBuf,
+}
+
+/// Which surfaces a job's benchmark result is reported on (roadmap-v4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportingConfig {
+    /// PR (`/benchmark`) jobs. Default `both` (a Check Run + a summary comment
+    /// that links to it).
+    pub pr_report: PrReport,
+    /// Baseline (`branch_push`/`tag_created`) jobs. Default `check` (a
+    /// commit-level Check Run); `none` keeps them headless/DB-only.
+    pub baseline_report: BaselineReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReport {
+    Comment,
+    Check,
+    Both,
+}
+
+impl PrReport {
+    pub fn wants_comment(self) -> bool {
+        matches!(self, PrReport::Comment | PrReport::Both)
+    }
+    pub fn wants_check(self) -> bool {
+        matches!(self, PrReport::Check | PrReport::Both)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineReport {
+    Check,
+    None,
+}
+
+impl BaselineReport {
+    pub fn wants_check(self) -> bool {
+        matches!(self, BaselineReport::Check)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +367,14 @@ struct RawDaemon {
     lvm: RawLvm,
     stacks_bench: RawStacksBench,
     api: RawApi,
+    reporting: RawReporting,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawReporting {
+    pr_report: Option<PrReport>,
+    baseline_report: Option<BaselineReport>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -408,6 +458,14 @@ impl RawDaemon {
         merge_opt(&mut self.github.client_id, other.github.client_id);
         merge_opt(&mut self.github.api_base_url, other.github.api_base_url);
         merge_opt(&mut self.github.private_key_path, other.github.private_key_path);
+
+        merge_opt(&mut self.reporting.pr_report, other.reporting.pr_report);
+        merge_opt(
+            &mut self.reporting.baseline_report,
+            other
+                .reporting
+                .baseline_report,
+        );
 
         merge_opt(&mut self.vm.golden_image, other.vm.golden_image);
         merge_opt(&mut self.vm.build_vcpus, other.vm.build_vcpus);
@@ -682,6 +740,16 @@ impl RawDaemon {
                     .cookie_path
                     .unwrap_or_else(|| PathBuf::from("/etc/sbgh/daemon/.cookie")),
                 ingest_token: self.api.ingest_token,
+            },
+            reporting: ReportingConfig {
+                pr_report: self
+                    .reporting
+                    .pr_report
+                    .unwrap_or(PrReport::Both),
+                baseline_report: self
+                    .reporting
+                    .baseline_report
+                    .unwrap_or(BaselineReport::Check),
             },
         })
     }

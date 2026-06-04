@@ -9,14 +9,16 @@
 //!   - [`RunnableJobStore`] — claim + lifecycle, implemented by [`JobSource`]
 //!     over [`sbgh_core::db::JobStore`] + [`RepoStore`] + [`PullRequestStore`].
 //!
-//! `pr_comment` jobs post/edit a PR comment (the comment id is recorded on
-//! a `comment_posted` `job_event`, read back on re-claim). Baseline jobs
-//! (`branch_push`/`tag_created`) have no PR and stay
-//! [`ProgressTarget::LogOnly`]. `tag_created` jobs are enqueued with no
-//! commit and resolved to their commit at claim time (the runner calls
-//! [`sbgh_core::github::GitHubApi::resolve_commit`] in preflight).
-//! Deferred: the intermediate phase-event timeline (provision/build/bench
-//! `job_event` rows — phase changes are logged only).
+//! `pr_comment` jobs report on a [`ProgressTarget::PullRequest`] (a Check Run
+//! on the PR head and/or a summary comment, per `[reporting]`); baseline jobs
+//! (`branch_push`/`tag_created`) on a [`ProgressTarget::CommitCheck`] (a
+//! commit-level Check Run). The comment id and check run id+url are each
+//! recorded on a `comment_posted` / `check_run_created` `job_event`, read back
+//! on re-claim so a reclaimed job updates them rather than duplicating.
+//! `tag_created` jobs are enqueued with no commit and resolved at claim time
+//! (the runner calls [`sbgh_core::github::GitHubApi::resolve_commit`] in
+//! preflight). Deferred: the intermediate phase-event timeline (provision/
+//! build/bench `job_event` rows — phase changes are logged only).
 
 use std::sync::Arc;
 
@@ -31,19 +33,25 @@ use uuid::Uuid;
 
 use crate::bench_summary::RunResult;
 
-/// Where a job's lifecycle progress should be surfaced.
+/// Where a job's lifecycle progress should be surfaced (roadmap-v4).
 #[derive(Debug, Clone)]
 pub enum ProgressTarget {
-    /// Edit a PR comment (`pr_comment` jobs). `comment_id` is `None` until
-    /// the daemon posts the initial comment.
-    PullRequestComment { pr_number: i64, comment_id: Option<i64> },
-    /// Phase progress goes to LOGS ONLY — baseline jobs
-    /// (`branch_push`/`tag_created`) have no PR. STILL deferred for these:
-    /// intermediate phase `job_event` rows (phase changes are logged
-    /// only). The `queued` + terminal (`completed`/`failed`) events ARE
-    /// persisted (the processor + `complete_job`/`fail_job`). The loud
-    /// variant name keeps the missing comment deliberate (vs. a bug).
-    LogOnly,
+    /// `/benchmark` PR job — a Check Run on the PR head and/or a summary
+    /// comment (per `[reporting].pr_report`). `comment_id`/`check_run_id` are
+    /// `None` until the daemon creates them; `check_run_url` carries the
+    /// created check's link so the comment can point at it (read back on
+    /// re-claim).
+    PullRequest {
+        pr_number: i64,
+        comment_id: Option<i64>,
+        check_run_id: Option<i64>,
+        check_run_url: Option<String>,
+    },
+    /// Baseline job (`branch_push`/`tag_created`) — a commit-level Check Run
+    /// (per `[reporting].baseline_report`), no PR comment. `check_run_id` is
+    /// `None` until created / read back on re-claim, and stays `None` when
+    /// `baseline_report = none` (the "report nothing" case).
+    CommitCheck { check_run_id: Option<i64> },
 }
 
 /// Storage-neutral execution context for one benchmark run. Assembled by
@@ -116,8 +124,19 @@ pub trait RunnableJobStore: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 
     /// Persist the GitHub comment id the daemon just posted. Only
-    /// called for [`ProgressTarget::PullRequestComment`] jobs.
+    /// called for [`ProgressTarget::PullRequest`] jobs.
     async fn set_comment_id(&self, job: &RunnableJob, comment_id: i64) -> anyhow::Result<()>;
+
+    /// Persist the Check Run id + html_url the daemon just created (a
+    /// `check_run_created` `job_event`), read back on re-claim so a reclaimed
+    /// job updates the existing check (and can rebuild the comment link)
+    /// instead of creating a duplicate.
+    async fn set_check_run(
+        &self,
+        job: &RunnableJob,
+        check_run_id: i64,
+        html_url: Option<&str>,
+    ) -> anyhow::Result<()>;
 }
 
 /// [`RunnableJobStore`] over the `job` family. Composes
@@ -126,10 +145,10 @@ pub trait RunnableJobStore: Send + Sync + 'static {
 /// `pr_comment` job's PR number for comment posting), and reads the
 /// queued `job_event` for the run's `bench_args`.
 ///
-/// `pr_comment` jobs post/edit a PR comment (the comment id is recorded as
-/// a `comment_posted` `job_event`, read back on re-claim for idempotency);
-/// baseline jobs (`branch_push`/`tag_created`) have no PR and stay
-/// [`ProgressTarget::LogOnly`].
+/// `pr_comment` jobs report on a [`ProgressTarget::PullRequest`] (comment id +
+/// check id recorded as `comment_posted` / `check_run_created` `job_event`s,
+/// read back on re-claim for idempotency); baseline jobs
+/// (`branch_push`/`tag_created`) report on a [`ProgressTarget::CommitCheck`].
 pub struct JobSource {
     jobs: Arc<dyn JobStore>,
     repos: Arc<dyn RepoStore>,
@@ -183,10 +202,14 @@ impl RunnableJobStore for JobSource {
             .map(|d| bench_args_from_detail(&d.0))
             .unwrap_or_default();
 
-        // PR-linked jobs (`pr_comment`) report progress on the PR
-        // comment; baseline jobs (`branch_push`/`tag_created`) have no PR
-        // → log-only. On (re-)claim, an already-posted comment id is read
-        // back so a reclaimed job edits rather than double-posts.
+        // PR-linked jobs (`pr_comment`) report on a Check Run + comment;
+        // baseline jobs (`branch_push`/`tag_created`) on a commit-level Check
+        // Run. On (re-)claim the already-created comment/check ids are read
+        // back so a reclaimed job updates them rather than duplicating.
+        let check_run = self
+            .jobs
+            .latest_check_run(job.id)
+            .await?;
         let progress = match self
             .jobs
             .pull_request_link(job.id)
@@ -208,12 +231,18 @@ impl RunnableJobStore for JobSource {
                     .jobs
                     .latest_comment_id(job.id)
                     .await?;
-                ProgressTarget::PullRequestComment {
+                ProgressTarget::PullRequest {
                     pr_number: pr.pr_number as i64,
                     comment_id,
+                    check_run_id: check_run
+                        .as_ref()
+                        .map(|(id, _)| *id),
+                    check_run_url: check_run.and_then(|(_, url)| url),
                 }
             }
-            None => ProgressTarget::LogOnly,
+            None => ProgressTarget::CommitCheck {
+                check_run_id: check_run.map(|(id, _)| id),
+            },
         };
 
         Ok(Some(RunnableJob {
@@ -328,6 +357,31 @@ impl RunnableJobStore for JobSource {
                 event_kind: JobEventKind::CommentPosted,
                 event_status: JobEventStatus::Success,
                 github_comment_id: Some(comment_id),
+                github_check_run_id: None,
+                github_check_run_url: None,
+                remark: None,
+                detail: None,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn set_check_run(
+        &self,
+        job: &RunnableJob,
+        check_run_id: i64,
+        html_url: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Check identity lives on a `check_run_created` timeline event;
+        // `latest_check_run` reads it back on (re-)claim for idempotency.
+        self.jobs
+            .insert_event(&NewJobEvent {
+                job_id: job.id,
+                event_kind: JobEventKind::CheckRunCreated,
+                event_status: JobEventStatus::Success,
+                github_comment_id: None,
+                github_check_run_id: Some(check_run_id),
+                github_check_run_url: html_url.map(str::to_string),
                 remark: None,
                 detail: None,
             })

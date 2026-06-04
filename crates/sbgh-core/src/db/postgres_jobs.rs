@@ -160,10 +160,12 @@ impl JobStore for PostgresJobStore {
         let queued_event: JobEvent = sqlx::query_as(
             r#"
             INSERT INTO job_event
-                (job_id, event_kind, event_status, github_comment_id, remark, detail)
-            VALUES ($1, $2, $3, NULL, NULL, $4)
+                (job_id, event_kind, event_status, github_comment_id,
+                 github_check_run_id, github_check_run_url, remark, detail)
+            VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4)
             RETURNING id, job_id, event_kind, event_status, occurred_at,
-                      github_comment_id, remark, detail
+                      github_comment_id, github_check_run_id, github_check_run_url,
+                      remark, detail
             "#,
         )
         .bind(job.id)
@@ -449,7 +451,8 @@ impl JobStore for PostgresJobStore {
         let row = sqlx::query_as::<_, JobEvent>(
             r#"
             SELECT id, job_id, event_kind, event_status, occurred_at,
-                   github_comment_id, remark, detail
+                   github_comment_id, github_check_run_id, github_check_run_url,
+                   remark, detail
               FROM job_event
              WHERE job_id = $1 AND event_kind = 'queued'
           ORDER BY occurred_at, id
@@ -494,20 +497,43 @@ impl JobStore for PostgresJobStore {
         Ok(id)
     }
 
+    async fn latest_check_run(&self, job_id: Uuid) -> Result<Option<(i64, Option<String>)>> {
+        // Most recent check-run-bearing event for the job. The check run id
+        // is stable across status/output updates, so the newest
+        // `check_run_created` event carries the live id + url.
+        let row: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT github_check_run_id, github_check_run_url
+               FROM job_event
+              WHERE job_id = $1
+                AND github_check_run_id IS NOT NULL
+                AND event_kind = 'check_run_created'
+           ORDER BY occurred_at DESC, id DESC
+              LIMIT 1",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, url)| (id.unwrap_or_default(), url)))
+    }
+
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {
         let row = sqlx::query_as::<_, JobEvent>(
             r#"
             INSERT INTO job_event
-                (job_id, event_kind, event_status, github_comment_id, remark, detail)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                (job_id, event_kind, event_status, github_comment_id,
+                 github_check_run_id, github_check_run_url, remark, detail)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id, job_id, event_kind, event_status, occurred_at,
-                      github_comment_id, remark, detail
+                      github_comment_id, github_check_run_id, github_check_run_url,
+                      remark, detail
             "#,
         )
         .bind(new.job_id)
         .bind(new.event_kind)
         .bind(new.event_status)
         .bind(new.github_comment_id)
+        .bind(new.github_check_run_id)
+        .bind(&new.github_check_run_url)
         .bind(&new.remark)
         .bind(&new.detail)
         .fetch_one(&self.pool)

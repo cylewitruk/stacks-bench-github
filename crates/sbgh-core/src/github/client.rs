@@ -7,7 +7,11 @@
 
 use async_trait::async_trait;
 use octocrab::Octocrab;
-use octocrab::models::CommentId;
+use octocrab::models::{CheckRunId, CommentId};
+use octocrab::params::checks::{
+    CheckRunConclusion as OctoConclusion, CheckRunOutput as OctoOutput,
+    CheckRunStatus as OctoStatus,
+};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
 use crate::github::auth::InstallationTokenCache;
@@ -51,6 +55,49 @@ fn encode_ref_path(git_ref: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostedComment {
     pub id: i64,
+}
+
+/// A created/updated Check Run. `html_url` is the link the PR comment points
+/// at; persisting both (roadmap-v4) closes the post-create/pre-comment reclaim
+/// gap. `html_url` is `Option` because GitHub's response field is nullable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedCheckRun {
+    pub id: i64,
+    pub html_url: Option<String>,
+}
+
+/// Lifecycle state for a check create/update. We only ever *complete* with a
+/// non-blocking conclusion — benchmark reporting is informational, never a
+/// hard pass/fail on a PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRunState {
+    InProgress,
+    Completed(CheckRunConclusion),
+}
+
+/// The non-blocking conclusions we use: `neutral` (a result, no verdict) and
+/// `skipped` (considered, not run — e.g. an untrusted PR source).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRunConclusion {
+    Neutral,
+    Skipped,
+}
+
+/// Markdown payload shown in the check's Checks-tab panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRunOutput {
+    pub title: String,
+    pub summary: String,
+    pub text: Option<String>,
+}
+
+/// The mutable payload pushed on a check create/update: its
+/// status/conclusion plus the markdown panel. Bundled so create + update
+/// share one shape (and to keep the trait methods' arity in check).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRunUpdate {
+    pub state: CheckRunState,
+    pub output: CheckRunOutput,
 }
 
 /// Subset of the `/repos/{owner}/{repo}` response the processor needs
@@ -145,6 +192,48 @@ pub trait GitHubApi: Send + Sync + 'static {
         repository: &str,
         git_ref: &str,
     ) -> Result<ResolvedCommit>;
+
+    /// Create a Check Run on `head_sha` in `repository` (`owner/name`).
+    /// `name` is the check's display name; `external_id` is our stable
+    /// reconcile key (the job id). Returns the id + `html_url`.
+    async fn create_check_run(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        head_sha: &str,
+        name: &str,
+        external_id: &str,
+        update: CheckRunUpdate,
+    ) -> Result<PostedCheckRun>;
+
+    /// Update an existing Check Run by id (status/conclusion/output).
+    async fn update_check_run(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        check_run_id: i64,
+        update: CheckRunUpdate,
+    ) -> Result<PostedCheckRun>;
+
+    /// Reconcile primitive (roadmap-v4): find an existing Check Run on
+    /// `head_sha` whose `external_id` matches — used on the retry path to
+    /// reuse a run created just before a crash, rather than creating a
+    /// duplicate. Narrows server-side to **our App (`app_id`) + check `name`**
+    /// per the "List check runs for a Git reference" filters, then matches
+    /// `external_id` exactly. `None` if no prior run exists.
+    async fn find_check_run_by_external_id(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        head_sha: &str,
+        name: &str,
+        app_id: i64,
+        external_id: &str,
+    ) -> Result<Option<PostedCheckRun>>;
+
+    /// The App's own numeric id (`GET /app`, App-JWT auth). Resolved once at
+    /// startup to scope the Check Run reconcile filter to our own runs.
+    async fn current_app_id(&self) -> Result<i64>;
 }
 
 /// Subset of the `/repos/{owner}/{repo}/pulls/{number}` response the
@@ -373,6 +462,132 @@ impl GitHubApi for OctocrabClient {
                     .and_then(|a| a.date)
             });
         Ok(ResolvedCommit { hash: commit.sha, committed_at })
+    }
+
+    async fn create_check_run(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        head_sha: &str,
+        name: &str,
+        external_id: &str,
+        update: CheckRunUpdate,
+    ) -> Result<PostedCheckRun> {
+        let CheckRunUpdate { state, output } = update;
+        let (owner, repo) = split_repo(repository)?;
+        let client = self
+            .installation_client(installation_id)
+            .await?;
+        let checks = client.checks(owner, repo);
+        let mut builder = checks
+            .create_check_run(name, head_sha)
+            .external_id(external_id)
+            .status(octo_status(state))
+            .output(octo_output(output));
+        if let CheckRunState::Completed(c) = state {
+            builder = builder.conclusion(octo_conclusion(c));
+        }
+        let run = builder.send().await?;
+        Ok(PostedCheckRun {
+            id: run.id.0 as i64,
+            html_url: run.html_url,
+        })
+    }
+
+    async fn update_check_run(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        check_run_id: i64,
+        update: CheckRunUpdate,
+    ) -> Result<PostedCheckRun> {
+        let CheckRunUpdate { state, output } = update;
+        let (owner, repo) = split_repo(repository)?;
+        let client = self
+            .installation_client(installation_id)
+            .await?;
+        let checks = client.checks(owner, repo);
+        let mut builder = checks
+            .update_check_run(CheckRunId(check_run_id as u64))
+            .status(octo_status(state))
+            .output(octo_output(output));
+        if let CheckRunState::Completed(c) = state {
+            builder = builder.conclusion(octo_conclusion(c));
+        }
+        let run = builder.send().await?;
+        Ok(PostedCheckRun {
+            id: run.id.0 as i64,
+            html_url: run.html_url,
+        })
+    }
+
+    async fn find_check_run_by_external_id(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        head_sha: &str,
+        name: &str,
+        app_id: i64,
+        external_id: &str,
+    ) -> Result<Option<PostedCheckRun>> {
+        let (owner, repo) = split_repo(repository)?;
+        let client = self
+            .installation_client(installation_id)
+            .await?;
+        // The typed octocrab `CheckRun` model omits `external_id`, so GET the
+        // raw list. Narrow server-side to OUR App + check name (the two filters
+        // the endpoint supports); `external_id` isn't a server filter, so match
+        // it client-side to pick this job's run.
+        #[derive(serde::Deserialize)]
+        struct ListResp {
+            check_runs: Vec<Item>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Item {
+            id: u64,
+            html_url: Option<String>,
+            external_id: Option<String>,
+        }
+        let route = format!("/repos/{owner}/{repo}/commits/{head_sha}/check-runs");
+        let resp: ListResp = client
+            .get(route, Some(&[("check_name", name.to_string()), ("app_id", app_id.to_string())]))
+            .await?;
+        Ok(resp
+            .check_runs
+            .into_iter()
+            .find(|r| r.external_id.as_deref() == Some(external_id))
+            .map(|r| PostedCheckRun {
+                id: r.id as i64,
+                html_url: r.html_url,
+            }))
+    }
+
+    async fn current_app_id(&self) -> Result<i64> {
+        self.tokens.app_id().await
+    }
+}
+
+fn octo_status(state: CheckRunState) -> OctoStatus {
+    match state {
+        CheckRunState::InProgress => OctoStatus::InProgress,
+        CheckRunState::Completed(_) => OctoStatus::Completed,
+    }
+}
+
+fn octo_conclusion(c: CheckRunConclusion) -> OctoConclusion {
+    match c {
+        CheckRunConclusion::Neutral => OctoConclusion::Neutral,
+        CheckRunConclusion::Skipped => OctoConclusion::Skipped,
+    }
+}
+
+fn octo_output(o: CheckRunOutput) -> OctoOutput {
+    OctoOutput {
+        title: o.title,
+        summary: o.summary,
+        text: o.text,
+        annotations: vec![],
+        images: vec![],
     }
 }
 

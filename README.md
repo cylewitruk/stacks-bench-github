@@ -27,6 +27,7 @@ the handler and CLI reach the daemon over `/api`.
 - [docs/host-bringup.md](docs/host-bringup.md) — provision a benchmark host from scratch.
 - [docs/v2-to-v3-upgrade.md](docs/v2-to-v3-upgrade.md) — upgrade an existing v2 deployment to v3.
 - [docs/roadmap-v3.md](docs/roadmap-v3.md) — the API-fronted-daemon refactor (complete).
+- [docs/roadmap-v4.md](docs/roadmap-v4.md) — Check Run reporting on PRs + baseline commits (planned).
 
 ## Common commands
 

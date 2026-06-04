@@ -150,9 +150,56 @@ impl InstallationTokenCache {
         Self {
             creds,
             api_base_url: api_base_url.into(),
-            http: reqwest::Client::new(),
+            // A per-request timeout so a stalled GitHub connection can't hang
+            // startup (`GET /app`) or block token minting indefinitely.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("building reqwest client"),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Fetch the App's numeric id via `GET /app` (App-JWT auth). Called once
+    /// at daemon startup to scope the Check Run reconcile to our own runs
+    /// (roadmap-v4) — avoids an operator-provided `app_id` config value.
+    pub async fn app_id(&self) -> Result<i64> {
+        let jwt = self.creds.mint_jwt()?;
+        let url = format!(
+            "{}/app",
+            self.api_base_url
+                .trim_end_matches('/')
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {jwt}"))
+                .map_err(|e| Error::Config(format!("bad jwt header: {e}")))?,
+        );
+        headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("sbgh-daemon"));
+
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_default();
+            return Err(Error::Config(format!("GET /app failed: {status}: {body}")));
+        }
+        #[derive(Deserialize)]
+        struct App {
+            id: i64,
+        }
+        let app: App = resp.json().await?;
+        Ok(app.id)
     }
 
     pub async fn token_for(&self, installation_id: i64) -> Result<String> {

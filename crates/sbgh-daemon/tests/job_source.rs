@@ -126,7 +126,10 @@ async fn v2_source_claims_assembles_and_completes_with_metric_and_result() {
     assert_eq!(job.commit, "pushsha");
     assert_eq!(job.git_ref_display, "develop");
     assert_eq!(job.bench_args, vec!["--iters=5"], "bench_args resolved from queued event detail");
-    assert!(matches!(job.progress, ProgressTarget::LogOnly), "new-schema progress is log-only");
+    assert!(
+        matches!(job.progress, ProgressTarget::CommitCheck { check_run_id: None }),
+        "a baseline (push) job reports on a commit check"
+    );
     assert!(job.claim_token.is_some());
 
     // Transition to running (commit already resolved → None).
@@ -306,11 +309,11 @@ async fn v2_source_sweeps_stuck_claimed_jobs() {
 
 #[tokio::test]
 async fn v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id() {
-    // Slice 11: a `pr_comment` job carries a PR link, so claim_next must
-    // assemble `PullRequestComment { pr_number, .. }` (resolved via
-    // PullRequestStore) — not LogOnly. set_comment_id records a
-    // `comment_posted` event; a re-claim reads that id back so the job
-    // edits the existing comment instead of double-posting.
+    // A `pr_comment` job carries a PR link, so claim_next must assemble
+    // `PullRequest { pr_number, .. }` (resolved via PullRequestStore) — not a
+    // `CommitCheck`. set_comment_id records a `comment_posted` event; a
+    // re-claim reads that id back so the job edits the existing comment instead
+    // of double-posting.
     let (_db, pool) = setup_pg_db().await;
     let webhook_id = seed(&pool, 100, 10).await;
     let store = Arc::new(PostgresJobStore::new(pool.clone()));
@@ -369,13 +372,17 @@ async fn v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id()
         .unwrap()
         .unwrap();
     match job.progress {
-        ProgressTarget::PullRequestComment { pr_number, comment_id } => {
+        ProgressTarget::PullRequest {
+            pr_number,
+            comment_id,
+            check_run_id,
+            ..
+        } => {
             assert_eq!(pr_number, 7, "pr_number resolved from the PR link");
             assert!(comment_id.is_none(), "no comment posted yet on first claim");
+            assert!(check_run_id.is_none(), "no check created yet on first claim");
         }
-        ProgressTarget::LogOnly => {
-            panic!("pr_comment job must assemble PullRequestComment progress")
-        }
+        other => panic!("pr_comment job must assemble PullRequest progress, got {other:?}"),
     }
 
     // Record the posted comment id → a comment_posted event lands.
@@ -409,9 +416,9 @@ async fn v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id()
         .unwrap()
         .unwrap();
     match reclaimed.progress {
-        ProgressTarget::PullRequestComment { comment_id, .. } => {
+        ProgressTarget::PullRequest { comment_id, .. } => {
             assert_eq!(comment_id, Some(555), "re-claim reads back the posted comment id");
         }
-        ProgressTarget::LogOnly => panic!("expected PullRequestComment on re-claim"),
+        other => panic!("expected PullRequest on re-claim, got {other:?}"),
     }
 }

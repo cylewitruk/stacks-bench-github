@@ -342,6 +342,8 @@ async fn job_event_insert_round_trips() {
             event_kind: JobEventKind::Queued,
             event_status: JobEventStatus::Success,
             github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
             remark: Some("slice 9 will populate this from the processor".into()),
             detail: Some(serde_json::json!({ "trigger": "pr_comment" })),
         })

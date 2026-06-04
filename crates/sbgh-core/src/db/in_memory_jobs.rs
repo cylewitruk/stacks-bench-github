@@ -207,6 +207,8 @@ impl JobStore for InMemoryJobStore {
             event_status: JobEventStatus::Success,
             occurred_at: now,
             github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
             remark: None,
             detail: request
                 .queued_event_detail
@@ -371,6 +373,8 @@ impl JobStore for InMemoryJobStore {
             event_status: JobEventStatus::Success,
             occurred_at: now,
             github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
             remark: None,
             detail: completion
                 .event_detail
@@ -416,6 +420,8 @@ impl JobStore for InMemoryJobStore {
             event_status: JobEventStatus::Fail,
             occurred_at: now,
             github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
             remark: Some(failure.remark.clone()),
             detail: failure
                 .event_detail
@@ -472,6 +478,26 @@ impl JobStore for InMemoryJobStore {
             .and_then(|e| e.github_comment_id))
     }
 
+    async fn latest_check_run(&self, job_id: Uuid) -> Result<Option<(i64, Option<String>)>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.events
+            .iter()
+            .filter(|e| {
+                e.job_id == job_id
+                    && e.github_check_run_id
+                        .is_some()
+                    && matches!(e.event_kind, JobEventKind::CheckRunCreated)
+            })
+            .max_by_key(|e| e.id)
+            .map(|e| {
+                (
+                    e.github_check_run_id
+                        .unwrap_or_default(),
+                    e.github_check_run_url.clone(),
+                )
+            }))
+    }
+
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {
         let row = JobEvent {
             id: self
@@ -482,6 +508,10 @@ impl JobStore for InMemoryJobStore {
             event_status: new.event_status,
             occurred_at: Utc::now(),
             github_comment_id: new.github_comment_id,
+            github_check_run_id: new.github_check_run_id,
+            github_check_run_url: new
+                .github_check_run_url
+                .clone(),
             remark: new.remark.clone(),
             detail: new
                 .detail

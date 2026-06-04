@@ -211,6 +211,13 @@ pub trait JobStore: Send + Sync + 'static {
     /// EDITS the existing comment instead of posting a duplicate.
     async fn latest_comment_id(&self, job_id: Uuid) -> Result<Option<i64>>;
 
+    /// roadmap-v4: the most-recent Check Run recorded on the job's timeline
+    /// (a `check_run_created` event), as `(check_run_id, html_url)`. Read on
+    /// (re-)claim so a reclaimed job UPDATEs the existing check (and can
+    /// rebuild the "started, see check" comment from the stored URL) rather
+    /// than creating a duplicate.
+    async fn latest_check_run(&self, job_id: Uuid) -> Result<Option<(i64, Option<String>)>>;
+
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 
     async fn record_metric(&self, metric: &JobMetric) -> Result<()>;
