@@ -7,11 +7,7 @@
 
 use async_trait::async_trait;
 use octocrab::Octocrab;
-use octocrab::models::{CheckRunId, CommentId};
-use octocrab::params::checks::{
-    CheckRunConclusion as OctoConclusion, CheckRunOutput as OctoOutput,
-    CheckRunStatus as OctoStatus,
-};
+use octocrab::models::CommentId;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
 use crate::github::auth::InstallationTokenCache;
@@ -473,24 +469,31 @@ impl GitHubApi for OctocrabClient {
         external_id: &str,
         update: CheckRunUpdate,
     ) -> Result<PostedCheckRun> {
-        let CheckRunUpdate { state, output } = update;
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
             .await?;
-        let checks = client.checks(owner, repo);
-        let mut builder = checks
-            .create_check_run(name, head_sha)
-            .external_id(external_id)
-            .status(octo_status(state))
-            .output(octo_output(output));
-        if let CheckRunState::Completed(c) = state {
-            builder = builder.conclusion(octo_conclusion(c));
-        }
-        let run = builder.send().await?;
+        let (status, conclusion) = status_strings(update.state);
+        // Raw POST: octocrab 0.51's `CheckRun` response model types
+        // `pull_requests` as the FULL `PullRequest` (needs `node_id`), but the
+        // Checks API returns minimal PR refs — so `.send()` fails to
+        // deserialize the moment a check is associated with a PR (i.e. PR
+        // jobs). Send our own body + minimal response instead.
+        let body = CheckRunWrite {
+            name: Some(name),
+            head_sha: Some(head_sha),
+            external_id: Some(external_id),
+            status,
+            conclusion,
+            output: output_body(update.output),
+        };
+        let route = format!("/repos/{owner}/{repo}/check-runs");
+        let resp: CheckRunWriteResp = client
+            .post(route, Some(&body))
+            .await?;
         Ok(PostedCheckRun {
-            id: run.id.0 as i64,
-            html_url: run.html_url,
+            id: resp.id as i64,
+            html_url: resp.html_url,
         })
     }
 
@@ -501,23 +504,26 @@ impl GitHubApi for OctocrabClient {
         check_run_id: i64,
         update: CheckRunUpdate,
     ) -> Result<PostedCheckRun> {
-        let CheckRunUpdate { state, output } = update;
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
             .await?;
-        let checks = client.checks(owner, repo);
-        let mut builder = checks
-            .update_check_run(CheckRunId(check_run_id as u64))
-            .status(octo_status(state))
-            .output(octo_output(output));
-        if let CheckRunState::Completed(c) = state {
-            builder = builder.conclusion(octo_conclusion(c));
-        }
-        let run = builder.send().await?;
+        let (status, conclusion) = status_strings(update.state);
+        let body = CheckRunWrite {
+            name: None,
+            head_sha: None,
+            external_id: None,
+            status,
+            conclusion,
+            output: output_body(update.output),
+        };
+        let route = format!("/repos/{owner}/{repo}/check-runs/{check_run_id}");
+        let resp: CheckRunWriteResp = client
+            .patch(route, Some(&body))
+            .await?;
         Ok(PostedCheckRun {
-            id: run.id.0 as i64,
-            html_url: run.html_url,
+            id: resp.id as i64,
+            html_url: resp.html_url,
         })
     }
 
@@ -567,28 +573,54 @@ impl GitHubApi for OctocrabClient {
     }
 }
 
-fn octo_status(state: CheckRunState) -> OctoStatus {
+/// Map our lifecycle state to GitHub's `status` + optional `conclusion`
+/// strings. We only ever complete with a non-blocking conclusion.
+fn status_strings(state: CheckRunState) -> (&'static str, Option<&'static str>) {
     match state {
-        CheckRunState::InProgress => OctoStatus::InProgress,
-        CheckRunState::Completed(_) => OctoStatus::Completed,
+        CheckRunState::InProgress => ("in_progress", None),
+        CheckRunState::Completed(CheckRunConclusion::Neutral) => ("completed", Some("neutral")),
+        CheckRunState::Completed(CheckRunConclusion::Skipped) => ("completed", Some("skipped")),
     }
 }
 
-fn octo_conclusion(c: CheckRunConclusion) -> OctoConclusion {
-    match c {
-        CheckRunConclusion::Neutral => OctoConclusion::Neutral,
-        CheckRunConclusion::Skipped => OctoConclusion::Skipped,
-    }
-}
-
-fn octo_output(o: CheckRunOutput) -> OctoOutput {
-    OctoOutput {
+fn output_body(o: CheckRunOutput) -> CheckRunOutputBody {
+    CheckRunOutputBody {
         title: o.title,
         summary: o.summary,
         text: o.text,
-        annotations: vec![],
-        images: vec![],
     }
+}
+
+/// Request body for create/update check-run. `name`/`head_sha`/`external_id`
+/// are sent only on create.
+#[derive(serde::Serialize)]
+struct CheckRunWrite<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<&'a str>,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conclusion: Option<&'static str>,
+    output: CheckRunOutputBody,
+}
+
+#[derive(serde::Serialize)]
+struct CheckRunOutputBody {
+    title: String,
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+}
+
+/// Minimal slice of the check-run response — just the fields we need, so we
+/// never touch the octocrab model's broken `pull_requests` deserialization.
+#[derive(serde::Deserialize)]
+struct CheckRunWriteResp {
+    id: u64,
+    html_url: Option<String>,
 }
 
 fn repo_summary_from_octocrab(repo: &octocrab::models::Repository) -> RepoSummary {
@@ -633,7 +665,33 @@ fn split_repo(full_name: &str) -> Result<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_ref_path;
+    use super::{CheckRunWriteResp, encode_ref_path};
+
+    /// Regression for the octocrab `CheckRun` deser bug: GitHub's check-run
+    /// response embeds MINIMAL pull-request refs (no `node_id`) under
+    /// `pull_requests` — the exact shape that makes octocrab's typed model fail
+    /// to decode *after* the check is already created. Our boundary DTO must
+    /// ignore that field and decode just `id` + `html_url`.
+    #[test]
+    fn check_run_write_resp_ignores_minimal_pull_requests() {
+        let body = r#"{
+            "id": 12345,
+            "head_sha": "abc",
+            "html_url": "https://github.com/o/r/runs/12345",
+            "status": "in_progress",
+            "external_id": "job-1",
+            "output": { "title": null, "summary": null, "text": null },
+            "pull_requests": [
+                { "id": 1, "number": 2,
+                  "url": "https://api.github.com/repos/o/r/pulls/2",
+                  "head": { "ref": "f", "sha": "abc" },
+                  "base": { "ref": "develop2", "sha": "def" } }
+            ]
+        }"#;
+        let parsed: CheckRunWriteResp = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.id, 12345);
+        assert_eq!(parsed.html_url.as_deref(), Some("https://github.com/o/r/runs/12345"));
+    }
 
     #[test]
     fn encode_ref_preserves_slashes() {
