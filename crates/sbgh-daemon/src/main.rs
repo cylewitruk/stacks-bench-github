@@ -1,8 +1,12 @@
 mod api;
+mod bench_recipe;
 mod bench_summary;
+mod events;
 mod job_source;
 mod libvirt;
 mod progress;
+mod recipe;
+mod reporter;
 mod runner;
 mod webhook_processor;
 

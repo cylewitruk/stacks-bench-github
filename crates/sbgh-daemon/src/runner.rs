@@ -11,23 +11,20 @@
 //!      RUN?) + updates the comment at the end.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use async_trait::async_trait;
 use sbgh_core::config::DaemonConfig;
-use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
-use sbgh_core::models::{GitRefKind, ResolvedCommit};
-use tokio::sync::{Mutex, OnceCell};
+use sbgh_core::github::GitHubApi;
+use tokio::sync::{OnceCell, mpsc, oneshot};
 
+use crate::bench_recipe::BenchRecipe;
+use crate::events::{ChannelSink, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
-use crate::libvirt::{LibvirtDriver, OutcomeStatus, Phase, PhaseListener, Shell, format_elapsed};
-use crate::progress::ProgressReporter;
+use crate::libvirt::Shell;
+use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
+use crate::reporter::{Prepared, Reporter};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Display name of the Check Run the daemon posts (roadmap-v4). Stable so the
-/// reconcile filter (`check_name`) and GitHub's per-name dedup both work.
-const CHECK_NAME: &str = "stacks-bench";
 
 /// Lease after which a job stranded in `claimed` (claimed but never
 /// transitioned to `running` — daemon crashed or preflight errored
@@ -37,28 +34,22 @@ const CHECK_NAME: &str = "stacks-bench";
 /// without leaving a crashed claim stuck for long.
 const CLAIM_LEASE_MINUTES: i64 = 5;
 
-/// Minimum interval between per-phase reporting edits driven by the
-/// `ProgressPhaseListener` (comment + check). Phase transitions and heartbeats
-/// both go through this debounce; terminal phases (done/error) bypass it so
-/// the user always sees the final state immediately.
-///
-/// 30s gives us at most ~2 edits/min in the worst case, which is well
-/// below any plausible GitHub secondary rate limit and looks calm in
-/// the PR's "edit history". The first edit after a comment is created
-/// is always allowed through — so the user sees the initial state
-/// transition immediately rather than waiting 30s.
-const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// Bounded capacity of the per-job worker→reporter event channel. Phase
+/// transitions are few and heartbeats are droppable, so a small buffer
+/// absorbs bursts without ever stalling the worker for long.
+const EVENT_BUFFER: usize = 32;
 
 pub struct Runner {
     config: Arc<DaemonConfig>,
     jobs: Arc<dyn RunnableJobStore>,
     gh: Arc<dyn GitHubApi>,
     shell: Arc<dyn Shell>,
-    /// The App's numeric id, resolved via `GET /app` and cached on **success**
+    /// Shared App-id cache, resolved via `GET /app` and cached on **success**
     /// only — a `get_or_try_init` that leaves the cell empty on error, so a
-    /// transient startup blip is retried on the next job rather than disabling
-    /// the reconcile for the whole process.
-    app_id: OnceCell<i64>,
+    /// transient blip is retried on the next job rather than disabling the
+    /// reconcile for the whole process. Cloned into each job's reporter, which
+    /// resolves it lazily (see [`resolved_app_id`]).
+    app_id: Arc<OnceCell<i64>>,
 }
 
 impl Runner {
@@ -73,40 +64,15 @@ impl Runner {
             jobs,
             gh,
             shell,
-            app_id: OnceCell::new(),
-        }
-    }
-
-    /// Resolve the App's numeric id via `GET /app`, caching it on success.
-    /// Non-fatal: on failure the reconcile is skipped **this time** and the
-    /// cell is left empty, so the next `ensure_check` retries (self-heals after
-    /// a transient blip).
-    async fn resolved_app_id(&self) -> Option<i64> {
-        match self
-            .app_id
-            .get_or_try_init(|| async {
-                let id = self
-                    .gh
-                    .current_app_id()
-                    .await?;
-                tracing::info!(app_id = id, "resolved GitHub App id (check reconcile enabled)");
-                Ok::<i64, sbgh_core::Error>(id)
-            })
-            .await
-        {
-            Ok(id) => Some(*id),
-            Err(e) => {
-                tracing::warn!(error = ?e, "could not resolve App id via GET /app; reconcile skipped (will retry)");
-                None
-            }
+            app_id: Arc::new(OnceCell::new()),
         }
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
         tracing::info!("daemon started");
-        // Resolve the App id once up front (logs the outcome); `ensure_check`
-        // reuses the cached value.
-        let _ = self.resolved_app_id().await;
+        // The App id is resolved lazily by the first job whose reporter actually
+        // wants a Check Run (shared, cached, self-healing) — no startup
+        // `GET /app` for a daemon that only ever runs no-report jobs.
         let lease = chrono::Duration::minutes(CLAIM_LEASE_MINUTES);
         loop {
             // Recover jobs stranded in `claimed` (crash / preflight error
@@ -155,10 +121,11 @@ impl Runner {
         }
     }
 
-    /// Owns the job by value so we can attach the resolved commit + the
-    /// posted comment_id to the in-memory copy before handing it to the
-    /// reporter and the driver (both want them populated).
-    async fn execute(&self, mut job: RunnableJob) -> anyhow::Result<()> {
+    /// Claim-to-terminal for one job: spawn the per-job [`Reporter`] (which
+    /// owns `prepare` + all GitHub/DB side-effects), run the worker inline (the
+    /// recipe), and hand the terminal outcome back over the channel. Returns
+    /// the reporter's result so setup-level failures still back off the loop.
+    async fn execute(&self, job: RunnableJob) -> anyhow::Result<()> {
         tracing::info!(
             job_id = %job.id,
             repo = %job.repository,
@@ -172,522 +139,86 @@ impl Runner {
             "claimed job; starting",
         );
 
-        // Pre-flight: resolve the commit + post the initial PR comment.
-        // Returns the commit if newly resolved (so `start_running` can
-        // persist it). Errors here are reported back via `fail` — the
-        // user otherwise sees a silent "/benchmark went nowhere" because
-        // the handler doesn't write a comment any more.
-        let resolved_commit = match self.preflight(&mut job).await {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("pre-flight failed: {e}");
-                tracing::error!(job_id = %job.id, error = ?e, "pre-flight failed");
-                let _ = self
-                    .jobs
-                    .fail(&job, &msg, None)
-                    .await;
-                return Err(e);
-            }
-        };
+        let recipe =
+            BenchRecipe::new(self.config.clone(), self.shell.clone(), job.bench_args.clone());
 
-        // Transition `claimed → running`, persisting the resolved commit.
-        let commit_persisted = resolved_commit.is_some();
-        self.jobs
-            .start_running(&job, resolved_commit)
-            .await?;
-        tracing::info!(
-            job_id = %job.id,
-            commit = %job.commit,
-            commit_persisted,
-            "job running (claimed → running)",
+        let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
+        let (prepared_tx, prepared_rx) = oneshot::channel();
+
+        // The reporter task owns prepare + reporting + the terminal write. It
+        // gets the shared App-id cache (resolved lazily, only if a check is
+        // wanted) for the Check Run reconcile.
+        let reporter = Reporter::new(
+            self.config.clone(),
+            self.jobs.clone(),
+            self.gh.clone(),
+            self.app_id.clone(),
+            job.clone(),
         );
+        let handle = tokio::spawn(reporter.run(events_rx, prepared_tx));
 
-        let reporter = ProgressReporter::new(self.gh.as_ref(), &job);
+        // The worker runs inline: it waits for prepare's resolved commit, runs
+        // the recipe (emitting progress to the channel), and sends the terminal.
+        run_worker(&recipe, &job, prepared_rx, events_tx).await;
 
-        // Defensive: a job with no resolved commit can't be benchmarked
-        // (an empty SHA would produce a confusing `git fetch ''`). In
-        // practice this shouldn't trigger — `pr_comment` + `branch_push`
-        // carry their commit from enqueue, and `tag_created` jobs resolve
-        // it in preflight above. If a commit is somehow still empty, fail
-        // terminally now that we're `running` so it records a terminal
-        // state instead of looping via the stuck-claim sweep.
-        if job.commit.is_empty() {
-            let msg = "no resolved commit; cannot benchmark";
-            tracing::error!(job_id = %job.id, git_ref = %job.git_ref_display, "{msg}");
-            self.jobs
-                .fail(&job, msg, None)
-                .await?;
-            reporter.failed(msg).await;
-            return Ok(());
-        }
-
-        reporter.started().await;
-
-        let driver = LibvirtDriver::new(self.config.clone(), self.shell.clone());
-        let phase_listener = ProgressPhaseListener::new(self.gh.clone(), job.clone());
-        let outcome = match driver
-            .run_benchmark(&job, &phase_listener)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                // Driver-level error (couldn't even start the run). Log
-                // the full anyhow chain locally — reporter.failed posts
-                // only a short snippet to the PR.
-                tracing::error!(
-                    job_id = %job.id,
-                    error = ?e,
-                    "driver returned setup error",
-                );
-                let msg = format!("{e:#}");
-                let _ = self
-                    .jobs
-                    .fail(&job, &msg, None)
-                    .await;
-                reporter.failed(&msg).await;
-                return Err(e);
-            }
-        };
-
-        match outcome.status {
-            OutcomeStatus::Ok => {
-                tracing::info!(
-                    job_id = %job.id,
-                    repo = %job.repository,
-                    commit = %job.commit,
-                    "benchmark completed; persisting result",
-                );
-                self.jobs
-                    .complete(&job, &outcome.summary)
-                    .await?;
-                tracing::info!(job_id = %job.id, "job result persisted (status=completed)");
-                reporter
-                    .completed(&outcome.summary)
-                    .await;
-            }
-            OutcomeStatus::Failed(err) => {
-                // VM-side or libvirt-side failure (virsh start refused,
-                // VM powered off before phase=done, timeout, etc.). The
-                // `err` already carries enough context for the DB row;
-                // surface it locally too so operators don't have to dig
-                // through Postgres to see why a run failed.
-                tracing::error!(
-                    job_id = %job.id,
-                    finish_reason = ?outcome.summary.get("finish_reason"),
-                    last_phase = ?outcome.summary.get("last_phase"),
-                    error = %err,
-                    "benchmark failed",
-                );
-                self.jobs
-                    .fail(&job, &err, Some(&outcome.summary))
-                    .await?;
-                reporter.failed(&err).await;
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve the commit + (for PR-comment jobs) post the initial PR
-    /// comment, mutating `job` in place so the caller's reporter/listener
-    /// see populated values. Returns `Some(ResolvedCommit)` when the
-    /// commit was newly resolved so the caller persists it via
-    /// `start_running`.
-    ///
-    /// Commit resolution covers two cases when `commit` is empty:
-    ///   - a PR-comment job → the PR head SHA (`pr_head_sha`). The authored
-    ///     date is unknown so `committed_at` stays `None` (fabricating one
-    ///     would corrupt baseline-timeline ordering).
-    ///   - a `tag_created` baseline job → resolve the tag ref to its commit +
-    ///     authored date (`resolve_commit`). `branch_push` jobs carry their
-    ///     commit from enqueue and skip this.
-    ///
-    /// A resolution failure propagates (`?`): the runner then `fail`s the
-    /// still-`claimed` job, which now terminalizes cleanly rather than
-    /// looping (the `fail_job` claimed-or-running guard).
-    async fn preflight(&self, job: &mut RunnableJob) -> anyhow::Result<Option<ResolvedCommit>> {
-        // Commit resolution is FATAL (can't benchmark without a SHA, and the
-        // check needs a concrete head_sha). Reporting is NON-FATAL.
-        let resolved = self
-            .resolve_commit(job)
-            .await?;
-        if !job.commit.is_empty() {
-            self.ensure_reporting(job)
-                .await;
-        }
-        Ok(resolved)
-    }
-
-    /// Resolve the job's commit when empty: a PR job → the PR head SHA; a
-    /// `tag_created` baseline → the tag ref. `branch_push` carries its commit
-    /// from enqueue (non-empty → no-op).
-    async fn resolve_commit(
-        &self,
-        job: &mut RunnableJob,
-    ) -> anyhow::Result<Option<ResolvedCommit>> {
-        if !job.commit.is_empty() {
-            return Ok(None);
-        }
-        if let ProgressTarget::PullRequest { pr_number, .. } = job.progress {
-            let sha = self
-                .gh
-                .pr_head_sha(job.installation_id, &job.repository, pr_number as u64)
-                .await?;
-            tracing::info!(job_id = %job.id, pr_number, sha = %sha, "resolved PR head SHA at claim time");
-            job.commit = sha.clone();
-            return Ok(Some(ResolvedCommit { hash: sha, committed_at: None }));
-        }
-        if job.git_ref_kind == GitRefKind::Tag {
-            // Qualified `tags/<name>` so it unambiguously targets the tag.
-            let tag_ref = format!("tags/{}", job.git_ref_display);
-            let resolved = self
-                .gh
-                .resolve_commit(job.installation_id, &job.repository, &tag_ref)
-                .await?;
-            tracing::info!(job_id = %job.id, tag = %job.git_ref_display, commit = %resolved.hash, "resolved tag to commit at claim time");
-            job.commit = resolved.hash.clone();
-            return Ok(Some(resolved));
-        }
-        tracing::warn!(
-            job_id = %job.id,
-            git_ref = %job.git_ref_display,
-            "job has no resolved commit; the empty-commit guard will fail it",
-        );
-        Ok(None)
-    }
-
-    /// Create the Check Run (after the commit is resolved) and/or post the
-    /// initial PR comment, per `[reporting]`. NON-FATAL: a reporting error is
-    /// logged and the run proceeds. Mutates `job.progress` with the created
-    /// ids.
-    async fn ensure_reporting(&self, job: &mut RunnableJob) {
-        match job.progress.clone() {
-            ProgressTarget::PullRequest {
-                pr_number,
-                mut comment_id,
-                mut check_run_id,
-                mut check_run_url,
-            } => {
-                // Check first, so the comment can carry its link.
-                if self
-                    .config
-                    .reporting
-                    .pr_report
-                    .wants_check()
-                    && check_run_id.is_none()
-                    && let Some((id, url)) = self.ensure_check(job).await
-                {
-                    check_run_id = Some(id);
-                    check_run_url = url;
-                }
-                if self
-                    .config
-                    .reporting
-                    .pr_report
-                    .wants_comment()
-                    && comment_id.is_none()
-                    && let Some(id) = self
-                        .post_initial_comment(job, pr_number, check_run_url.as_deref())
-                        .await
-                {
-                    comment_id = Some(id);
-                }
-                job.progress = ProgressTarget::PullRequest {
-                    pr_number,
-                    comment_id,
-                    check_run_id,
-                    check_run_url,
-                };
-            }
-            ProgressTarget::CommitCheck { mut check_run_id } => {
-                if self
-                    .config
-                    .reporting
-                    .baseline_report
-                    .wants_check()
-                    && check_run_id.is_none()
-                    && let Some((id, _)) = self.ensure_check(job).await
-                {
-                    check_run_id = Some(id);
-                }
-                job.progress = ProgressTarget::CommitCheck { check_run_id };
-            }
-        }
-    }
-
-    /// Reconcile-or-create the in-progress Check Run on `job.commit`, persist
-    /// its id+url, and return them. Non-fatal (returns `None` on error). The
-    /// reconcile (when the App id resolved via `GET /app`) reuses a run created
-    /// just before a crash rather than duplicating it.
-    async fn ensure_check(&self, job: &RunnableJob) -> Option<(i64, Option<String>)> {
-        let external_id = job.id.to_string();
-        if let Some(app_id) = self.resolved_app_id().await {
-            match self
-                .gh
-                .find_check_run_by_external_id(
-                    job.installation_id,
-                    &job.repository,
-                    &job.commit,
-                    CHECK_NAME,
-                    app_id,
-                    &external_id,
-                )
-                .await
-            {
-                Ok(Some(existing)) => {
-                    self.persist_check_id(job, existing.id, existing.html_url.as_deref())
-                        .await;
-                    tracing::info!(job_id = %job.id, check_run_id = existing.id, "reconciled existing check run");
-                    return Some((existing.id, existing.html_url));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(job_id = %job.id, error = ?e, "check reconcile lookup failed; creating")
-                }
-            }
-        }
-        let output = CheckRunOutput {
-            title: format!("benchmark {}", job.id),
-            summary: format!("Benchmarking commit `{}`…", job.commit),
-            text: None,
-        };
-        match self
-            .gh
-            .create_check_run(
-                job.installation_id,
-                &job.repository,
-                &job.commit,
-                CHECK_NAME,
-                &external_id,
-                CheckRunUpdate {
-                    state: CheckRunState::InProgress,
-                    output,
-                },
-            )
-            .await
-        {
-            Ok(posted) => {
-                self.persist_check_id(job, posted.id, posted.html_url.as_deref())
-                    .await;
-                tracing::info!(job_id = %job.id, check_run_id = posted.id, "created check run");
-                Some((posted.id, posted.html_url))
-            }
-            Err(e) => {
-                tracing::warn!(job_id = %job.id, error = ?e, "create check run failed (non-fatal)");
-                None
-            }
-        }
-    }
-
-    /// Persist the check run identity (`check_run_created` event) the reclaim
-    /// path reads back. Non-fatal, but a failure is logged **loudly**: the
-    /// in-memory job keeps the id (so this run still updates the right check),
-    /// but the next claim won't see it and could create a DUPLICATE check.
-    async fn persist_check_id(&self, job: &RunnableJob, id: i64, url: Option<&str>) {
-        if let Err(e) = self
-            .jobs
-            .set_check_run(job, id, url)
-            .await
-        {
-            tracing::warn!(
-                job_id = %job.id,
-                check_run_id = id,
-                error = ?e,
-                "PERSISTING check identity failed — a re-claim may duplicate the check (non-fatal)",
-            );
-        }
-    }
-
-    /// Post the initial "starting" PR comment (carrying the check link when
-    /// present), persist its id. Non-fatal (returns `None` on error).
-    async fn post_initial_comment(
-        &self,
-        job: &RunnableJob,
-        pr_number: i64,
-        check_link: Option<&str>,
-    ) -> Option<i64> {
-        let link = check_link
-            .map(|u| format!(" — [view check ↗]({u})"))
-            .unwrap_or_default();
-        let body = format!(
-            ":construction: starting benchmark `{id}` (commit `{sha}`)…{link}",
-            id = job.id,
-            sha = job.commit,
-        );
-        match self
-            .gh
-            .create_pr_comment(job.installation_id, &job.repository, pr_number as u64, &body)
-            .await
-        {
-            Ok(posted) => {
-                if let Err(e) = self
-                    .jobs
-                    .set_comment_id(job, posted.id)
-                    .await
-                {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        comment_id = posted.id,
-                        error = ?e,
-                        "PERSISTING comment id failed — a re-claim may double-post the comment \
-                         (non-fatal)",
-                    );
-                }
-                tracing::info!(job_id = %job.id, pr_number, comment_id = posted.id, "posted initial PR comment");
-                Some(posted.id)
-            }
-            Err(e) => {
-                tracing::warn!(job_id = %job.id, error = ?e, "post initial PR comment failed (non-fatal)");
-                None
-            }
+        // Surface the reporter's result (setup-level failures back off the loop;
+        // a panic in the reporter task becomes an iteration error).
+        match handle.await {
+            Ok(result) => result,
+            Err(join_err) => Err(anyhow::anyhow!("reporter task panicked: {join_err}")),
         }
     }
 }
 
-/// Bridge between the libvirt driver's phase events and the job's reporting
-/// surface(s) — the PR comment and/or the Check Run's `output` (roadmap-v4).
-/// Per-phase updates set the check's `output.title` (the one-liner in the PR's
-/// consolidated checks view — "building", "running", …) and `output.summary`
-/// (the check's detail panel).
-///
-/// Two callers drive edits:
-///   * `on_phase` — fires once per transition. Terminal phases (`done`/`error`)
-///     bypass the debounce; non-terminal phases are debounced.
-///   * `on_heartbeat` — fires periodically while the same phase is current,
-///     refreshing the elapsed-time annotation. Always debounced.
-///
-/// The debounce (`PR_UPDATE_MIN_INTERVAL`) keeps us below GitHub's secondary
-/// rate limits and is shared across both surfaces; the first edit after pickup
-/// is always allowed through. All updates are NON-FATAL. The check's terminal
-/// state is owned by the reporter's `complete_check`, so the listener skips the
-/// check on terminal phases (no flicker / redundant PATCH).
-struct ProgressPhaseListener {
-    gh: Arc<dyn GitHubApi>,
-    job: RunnableJob,
-    state: Mutex<PhaseState>,
-}
+/// The inline worker: await prepare's go/abort signal, run the recipe (emitting
+/// progress onto the channel), and send the terminal outcome. Pure execution —
+/// it never touches GitHub or the DB; the reporter owns all of that.
+async fn run_worker(
+    recipe: &BenchRecipe,
+    job: &RunnableJob,
+    prepared_rx: oneshot::Receiver<Prepared>,
+    events_tx: mpsc::Sender<WorkerEvent>,
+) {
+    // Wait for the reporter to finish `prepare` and hand us the resolved
+    // commit. `Abort` (or a dropped sender) means prepare failed / the job
+    // won't run — the reporter already handled any reporting, so we stop.
+    let commit = match prepared_rx.await {
+        Ok(Prepared::Run { commit }) => commit,
+        Ok(Prepared::Abort) | Err(_) => return,
+    };
 
-#[derive(Default)]
-struct PhaseState {
-    last_update_at: Option<Instant>,
-}
-
-impl ProgressPhaseListener {
-    fn new(gh: Arc<dyn GitHubApi>, job: RunnableJob) -> Self {
-        Self {
-            gh,
-            job,
-            state: Mutex::new(PhaseState::default()),
+    let sink = ChannelSink::new(events_tx.clone());
+    let ctx = TaskContext {
+        job_id: job.id,
+        repository: &job.repository,
+        commit: &commit,
+    };
+    let terminal = match recipe
+        .execute(&ctx, &sink)
+        .await
+    {
+        Ok(outcome) => match outcome.status() {
+            TaskStatus::Completed => Terminal::Completed {
+                summary: outcome.summary().clone(),
+            },
+            TaskStatus::Failed(error) => Terminal::Failed {
+                error,
+                summary: outcome.summary().clone(),
+            },
+        },
+        // A setup-level error (the run couldn't start). Log the full anyhow
+        // chain locally; the reporter posts only a short snippet to the PR.
+        Err(e) => {
+            tracing::error!(job_id = %job.id, error = ?e, "recipe returned setup error");
+            Terminal::SetupError { error: format!("{e:#}") }
         }
-    }
+    };
 
-    fn comment_id(&self) -> Option<i64> {
-        match self.job.progress {
-            ProgressTarget::PullRequest { comment_id, .. } => comment_id,
-            ProgressTarget::CommitCheck { .. } => None,
-        }
-    }
-
-    fn check_run_id(&self) -> Option<i64> {
-        match self.job.progress {
-            ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
-            ProgressTarget::CommitCheck { check_run_id } => check_run_id,
-        }
-    }
-
-    async fn try_update(&self, phase: &Phase, elapsed: Duration, force: bool) {
-        let comment_id = self.comment_id();
-        // The reporter owns the check's terminal state; don't churn it here.
-        let check_run_id = if phase.is_terminal() { None } else { self.check_run_id() };
-        if comment_id.is_none() && check_run_id.is_none() {
-            tracing::debug!(job_id = %self.job.id, phase = %phase, "phase (no reporting surface)");
-            return;
-        }
-
-        // Shared debounce. Brief lock — not held across the network calls.
-        {
-            let mut state = self.state.lock().await;
-            if !force
-                && let Some(last) = state.last_update_at
-                && last.elapsed() < PR_UPDATE_MIN_INTERVAL
-            {
-                tracing::trace!(phase = %phase, since_last = ?last.elapsed(), "phase update debounced");
-                return;
-            }
-            state.last_update_at = Some(Instant::now());
-        }
-
-        // PR comment (when present): the verbose progress line.
-        if let Some(comment_id) = comment_id {
-            let body = format!(
-                ":construction: benchmark `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
-                id = self.job.id,
-                phase = phase,
-                elapsed = format_elapsed(elapsed),
-                sha = self.job.commit,
-            );
-            if let Err(e) = self
-                .gh
-                .update_pr_comment(
-                    self.job.installation_id,
-                    &self.job.repository,
-                    comment_id,
-                    &body,
-                )
-                .await
-            {
-                tracing::warn!(error = ?e, "phase comment update failed (non-fatal)");
-            }
-        }
-
-        // Check Run output (when present): `title` → the consolidated-view
-        // one-liner; `summary` → the detail panel. Stays `in_progress`.
-        if let Some(check_run_id) = check_run_id {
-            let output = CheckRunOutput {
-                title: phase.to_string(),
-                summary: format!(
-                    "**{phase}** for `{elapsed}` — commit `{sha}`",
-                    phase = phase,
-                    elapsed = format_elapsed(elapsed),
-                    sha = self.job.commit,
-                ),
-                text: None,
-            };
-            if let Err(e) = self
-                .gh
-                .update_check_run(
-                    self.job.installation_id,
-                    &self.job.repository,
-                    check_run_id,
-                    CheckRunUpdate {
-                        state: CheckRunState::InProgress,
-                        output,
-                    },
-                )
-                .await
-            {
-                tracing::warn!(error = ?e, "phase check update failed (non-fatal)");
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl PhaseListener for ProgressPhaseListener {
-    async fn on_phase(&self, phase: &Phase) {
-        // Terminal phases bypass debounce so the comment shows the final state
-        // immediately. Just-entered phase → 0 elapsed; the prose still reads
-        // naturally as "running for 00:00:00".
-        let force = phase.is_terminal();
-        self.try_update(phase, Duration::ZERO, force)
-            .await;
-    }
-
-    async fn on_heartbeat(&self, phase: &Phase, elapsed: Duration) {
-        // Heartbeats are always debounced — a "still alive" signal where
-        // missing one is fine.
-        self.try_update(phase, elapsed, false)
-            .await;
-    }
+    // Send the terminal; dropping `events_tx` + the sink's clone afterwards
+    // closes the channel, ending the reporter's drain loop.
+    let _ = events_tx
+        .send(WorkerEvent::Finished(terminal))
+        .await;
 }
 
 #[cfg(test)]
@@ -695,17 +226,20 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
 
+    use async_trait::async_trait;
     use sbgh_core::config::{
         ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
         PrReport, ReportingConfig, StacksBenchConfig, VmConfig,
     };
     use sbgh_core::github::test_support::FakeGitHub;
+    use sbgh_core::models::{GitRefKind, ResolvedCommit};
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
     use crate::job_source::ProgressTarget;
     use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
+    use crate::reporter::CHECK_NAME;
 
     /// A [`RunnableJobStore`] fake that hands out a single pre-staged job
     /// then goes empty, and records which lifecycle methods the runner
@@ -1276,95 +810,6 @@ mod tests {
                 .calls()
                 .contains(&"fail"),
             "the job still reached terminal"
-        );
-    }
-
-    fn job_with(progress: ProgressTarget) -> RunnableJob {
-        RunnableJob {
-            id: Uuid::new_v4(),
-            repository: "acme/widgets".into(),
-            commit: "abc123".into(),
-            git_ref_display: "feature".into(),
-            git_ref_kind: GitRefKind::Branch,
-            installation_id: 7,
-            bench_args: vec![],
-            progress,
-            claim_token: Some(Uuid::new_v4()),
-        }
-    }
-
-    /// A non-terminal phase sets the check's `output.title` to the phase name —
-    /// that's the one-liner shown in the PR's consolidated checks view.
-    #[tokio::test]
-    async fn phase_listener_sets_check_title_to_phase() {
-        let gh = Arc::new(FakeGitHub::new());
-        let listener = ProgressPhaseListener::new(
-            gh.clone(),
-            job_with(ProgressTarget::CommitCheck { check_run_id: Some(777) }),
-        );
-        listener
-            .on_phase(&Phase::Building)
-            .await;
-        let title = gh
-            .calls()
-            .into_iter()
-            .find_map(|c| match c {
-                FakeCall::UpdateCheckRun { check_run_id: 777, output, .. } => Some(output.title),
-                _ => None,
-            })
-            .expect("check updated on phase");
-        assert_eq!(title, "building");
-    }
-
-    /// A PR job updates BOTH surfaces per phase (verbose comment + check
-    /// title).
-    #[tokio::test]
-    async fn phase_listener_updates_both_comment_and_check() {
-        let gh = Arc::new(FakeGitHub::new());
-        let listener = ProgressPhaseListener::new(
-            gh.clone(),
-            job_with(ProgressTarget::PullRequest {
-                pr_number: 7,
-                comment_id: Some(800),
-                check_run_id: Some(900),
-                check_run_url: None,
-            }),
-        );
-        listener
-            .on_phase(&Phase::Running)
-            .await;
-        let calls = gh.calls();
-        assert!(
-            calls
-                .iter()
-                .any(|c| matches!(c, FakeCall::UpdateComment { .. })),
-            "comment updated"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
-            "check updated"
-        );
-    }
-
-    /// Terminal phases are owned by the reporter's `complete_check`; the
-    /// listener must not churn the check there.
-    #[tokio::test]
-    async fn phase_listener_skips_check_on_terminal_phase() {
-        let gh = Arc::new(FakeGitHub::new());
-        let listener = ProgressPhaseListener::new(
-            gh.clone(),
-            job_with(ProgressTarget::CommitCheck { check_run_id: Some(5) }),
-        );
-        listener
-            .on_phase(&Phase::Done)
-            .await;
-        assert!(
-            !gh.calls()
-                .iter()
-                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
-            "no check churn on a terminal phase"
         );
     }
 }

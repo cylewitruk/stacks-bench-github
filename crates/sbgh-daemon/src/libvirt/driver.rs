@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sbgh_core::config::DaemonConfig;
 
-use crate::job_source::RunnableJob;
 use crate::libvirt::boot::BootDisk;
 use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitCommon};
 use crate::libvirt::domain::{self, DomainSpec};
@@ -34,6 +33,7 @@ use crate::libvirt::source::SourceDisk;
 use crate::libvirt::tmpfs::ResultsTmpfs;
 use crate::libvirt::virsh::{self, DomState};
 use crate::libvirt::{forensics, git_mirror};
+use crate::recipe::TaskContext;
 
 /// Size of the per-job host tmpfs that holds the virtio-fs results
 /// share. Must accommodate everything the VM writes there before
@@ -121,6 +121,16 @@ struct JobArtifacts {
     domain_started: bool,
 }
 
+/// The driver's per-run inputs threaded through provisioning: the target
+/// repository and commit (from the platform [`TaskContext`]) plus this run's
+/// benchmark args. Bundled so the provisioning helpers stay within the
+/// argument-count budget.
+struct RunInputs<'a> {
+    repository: &'a str,
+    commit: &'a str,
+    bench_args: &'a [String],
+}
+
 pub struct LibvirtDriver {
     config: Arc<DaemonConfig>,
     shell: Arc<dyn Shell>,
@@ -133,10 +143,11 @@ impl LibvirtDriver {
 
     pub async fn run_benchmark(
         &self,
-        job: &RunnableJob,
+        ctx: &TaskContext<'_>,
+        bench_args: &[String],
         listener: &dyn PhaseListener,
     ) -> anyhow::Result<BenchmarkOutcome> {
-        let job_id = job.id.to_string();
+        let job_id = ctx.job_id.to_string();
         let domain_name = format!("sbgh-{job_id}");
         let job_dir = self
             .config
@@ -147,11 +158,23 @@ impl LibvirtDriver {
 
         let mut arts = JobArtifacts::default();
         let started = Instant::now();
+        let inputs = RunInputs {
+            repository: ctx.repository,
+            commit: ctx.commit,
+            bench_args,
+        };
 
         // Run the inner pipeline. Any error becomes a Failed outcome with
         // whatever forensics we can recover.
         let inner_result: anyhow::Result<FinishReason> = self
-            .provision_define_start_poll(job, &job_id, &job_dir, &domain_name, &mut arts, listener)
+            .provision_define_start_poll(
+                &inputs,
+                &job_id,
+                &job_dir,
+                &domain_name,
+                &mut arts,
+                listener,
+            )
             .await;
 
         // --- forensics (must happen BEFORE teardown) ----------------------
@@ -277,9 +300,9 @@ impl LibvirtDriver {
         // --- build summary ------------------------------------------------
         let duration_secs = started.elapsed().as_secs();
         let summary = serde_json::json!({
-            "job_id": job.id,
-            "head_sha": job.commit,
-            "repository": job.repository,
+            "job_id": ctx.job_id,
+            "head_sha": ctx.commit,
+            "repository": ctx.repository,
             "duration_secs": duration_secs,
             "finish_reason": match &inner_result {
                 Ok(r) => r.label(),
@@ -329,7 +352,7 @@ impl LibvirtDriver {
 
     async fn provision_define_start_poll(
         &self,
-        job: &RunnableJob,
+        inputs: &RunInputs<'_>,
         job_id: &str,
         job_dir: &Path,
         domain_name: &str,
@@ -338,7 +361,7 @@ impl LibvirtDriver {
     ) -> anyhow::Result<FinishReason> {
         // ── one-time provisioning shared by both phases ────────────────
         let cidata = self
-            .provision_artifacts(job, job_id, job_dir, arts)
+            .provision_artifacts(inputs, job_id, job_dir, arts)
             .await?;
 
         // ── phase 1: build VM ─────────────────────────────────────────
@@ -396,15 +419,16 @@ impl LibvirtDriver {
     /// tmpfs) + the two cidata ISOs.
     async fn provision_artifacts(
         &self,
-        job: &RunnableJob,
+        inputs: &RunInputs<'_>,
         job_id: &str,
         job_dir: &Path,
         arts: &mut JobArtifacts,
     ) -> anyhow::Result<CloudInitArtifacts> {
         // Git mirror.
-        let repo_url = format!("https://github.com/{}.git", job.repository);
+        let repo_url = format!("https://github.com/{}.git", inputs.repository);
         git_mirror::ensure(self.shell.as_ref(), &self.config.paths, &repo_url).await?;
-        git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, &job.commit).await?;
+        git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, inputs.commit)
+            .await?;
 
         // Boot disk — single qcow2 overlay reused across both phases.
         // The bench VM boots from the same disk the build VM left
@@ -425,7 +449,7 @@ impl LibvirtDriver {
                 &self.config.paths,
                 job_dir,
                 &source_mount,
-                &job.commit,
+                inputs.commit,
                 &self
                     .config
                     .server
@@ -460,7 +484,7 @@ impl LibvirtDriver {
         // Cloud-init: two ISOs, one per phase, distinct instance-ids
         // so cloud-init re-runs user-data on the second boot.
         let stacks_bench_args = derive_stacks_bench_args(
-            job,
+            inputs.bench_args,
             &self
                 .config
                 .stacks_bench
@@ -472,7 +496,7 @@ impl LibvirtDriver {
             job_dir,
             &CloudInitCommon {
                 job_id,
-                head_sha: &job.commit,
+                head_sha: inputs.commit,
                 chainstate_mount: "/var/lib/stacks-chainstate",
                 source_mount: "/opt/stacks-core",
                 results_share_tag: RESULTS_SHARE_TAG,
@@ -735,8 +759,8 @@ impl LibvirtDriver {
     }
 }
 
-fn derive_stacks_bench_args(job: &RunnableJob, default: &str) -> String {
-    if job.bench_args.is_empty() { default.to_string() } else { job.bench_args.join(" ") }
+fn derive_stacks_bench_args(bench_args: &[String], default: &str) -> String {
+    if bench_args.is_empty() { default.to_string() } else { bench_args.join(" ") }
 }
 
 #[cfg(test)]
@@ -751,8 +775,18 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::job_source::ProgressTarget;
+    use crate::job_source::{ProgressTarget, RunnableJob};
     use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
+
+    /// A platform-neutral [`TaskContext`] borrowed from a fake job — the
+    /// `run_benchmark` inputs the driver actually reads.
+    fn ctx_of(job: &RunnableJob) -> TaskContext<'_> {
+        TaskContext {
+            job_id: job.id,
+            repository: &job.repository,
+            commit: &job.commit,
+        }
+    }
 
     fn test_config(tmp: &TempDir) -> DaemonConfig {
         let p = tmp.path();
@@ -901,7 +935,7 @@ mod tests {
         let shell = Arc::new(happy_path_shell());
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
         let outcome = driver
-            .run_benchmark(&job, &NoopPhaseListener)
+            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener)
             .await
             .expect("driver should return Ok even on VM-side failures");
 
@@ -1038,7 +1072,7 @@ mod tests {
 
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
         let outcome = driver
-            .run_benchmark(&job, &NoopPhaseListener)
+            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener)
             .await
             .unwrap();
 
@@ -1080,7 +1114,7 @@ mod tests {
         let shell = Arc::new(happy_path_shell());
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
         let outcome = driver
-            .run_benchmark(&job, &NoopPhaseListener)
+            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener)
             .await
             .unwrap();
 

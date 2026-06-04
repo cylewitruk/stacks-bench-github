@@ -21,8 +21,22 @@ daemon already computes, so a PR check appears only on repos sbgh manages.
 
 Process is unchanged: Opus implements, Codex reviews, Opus fixes.
 
-> **Status: planned.** Design only — no code yet. Phases/checkboxes below
-> are the proposed plan for Codex to review before implementation starts.
+> **Status: Phases 1–2 shipped** (the MVP), implemented + Codex-reviewed +
+> deploying. Phase 0's cross-fork spike is **deferred** (the same-repo PR +
+> baseline-commit paths are verified and don't depend on it; cross-fork only
+> matters when `stacks-network` upstream onboards). Phase 4 is **partial**
+> (config + `checks:write` consent done; the host-bringup rollout note pending).
+> Phase 3 (placeholder/`skipped` checks) is **re-sequenced onto the v5
+> architecture** — its feature scope still stands, but its original mechanism (the
+> `pr-check-sync` task, Decision #3) is superseded by the v5 Reporter, so it now
+> builds on v5 and lands with [v5](./roadmap-v5.md) Phase 5 (see the Phase 3
+> note). Process unchanged: Opus implements, Codex reviews, Opus fixes.
+>
+> **Successor docs (where the rest moved):** execution architecture — concurrency,
+> the worker/reporter split, signal/shutdown — is [roadmap-v5.md](./roadmap-v5.md);
+> the multi-task `stacks-github` platform is [roadmap-v6.md](./roadmap-v6.md). v4
+> stays the source of truth for the Check-Run **product** surface, the
+> `checks:write` permission, and rollout (Phases 0 & 4 remain open here).
 
 ## Why
 
@@ -108,12 +122,14 @@ be installed.
 
 **Notes:**
 
-- Throwaway spike, not production code; its output is a **decision** that pins
-  Phase 1's posting target and Phase 2's surface-selection logic. Everything
-  downstream is contingent on it.
-- **PR path only.** Baseline checks post on a commit in the install's *own*
-  repo (no fork), so they're not subject to this cross-fork risk and don't wait
-  on the spike.
+- **Deferred until upstream onboarding.** Phases 1–2 shipped against the
+  same-repo path (internal PRs where head == base, plus baseline commit checks)
+  — which has no cross-fork concern and is verified live. The spike (does a
+  base-repo check on a *fork's* head SHA render?) only matters when
+  `stacks-network` upstream onboards contributor forks; we'll run it then and
+  add the comment-fallback for cross-fork PRs if needed.
+- Throwaway spike, not production code; its output is a **decision** that would
+  pin the PR posting target + surface-selection fallback.
 
 ---
 
@@ -143,17 +159,26 @@ Runs, mirroring the existing comment methods.
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
-- [ ] Reviewed — Codex signed off
-- [ ] Complete
+- [x] Initial implementation completed
+- [x] Integration coverage added (or N/A justified)
+- [x] Reviewed — Codex signed off
+- [x] Complete
 
 **Notes:**
 
 - Requires the App's **`checks:write`** permission (see Phase 4) — the calls
   fail (`403 resource not accessible by integration`) until the permission is
-  granted, so this phase ships dormant behind the Phase 4 rollout. (`403` is
-  the degrade-to-comment trigger; `401` would mean bad credentials.)
+  granted; reporting degrades rather than failing the run. (`403` is the
+  degrade trigger; `401` would mean bad credentials.)
+- **`external_id` model gap (deferred to Phase 2's reconcile use):** the
+  reconcile GET deserializes a minimal DTO because octocrab's typed `CheckRun`
+  omits `external_id`.
+- **create/update bypass octocrab's `CheckRun` model entirely** (Codex-flagged
+  bug fix): octocrab 0.51–0.53 type `CheckRun.pull_requests` as the full
+  `PullRequest` (needs `node_id`), but GitHub returns minimal PR refs — so
+  `.send()` *fails to deserialize after the check is created*, orphaning it.
+  We keep octocrab's auth/transport but do a raw POST/PATCH with our own
+  2-field `CheckRunWriteResp { id, html_url }`. Regression test pins it.
 
 ---
 
@@ -250,15 +275,26 @@ pair it with the summary comment.
 
 **Status:**
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
-- [ ] Reviewed — Codex signed off
-- [ ] Complete
+- [x] Initial implementation completed
+- [x] Integration coverage added (or N/A justified)
+- [x] Reviewed — Codex signed off
+- [x] Complete
 
 **Notes:**
 
-- Surface selection per [reporting] config (Decisions #1): PR runs default to
+- Surface selection per `[reporting]` config (Decisions #1): PR runs default to
   `both` (check + linked summary comment), baselines to a commit check.
+- **Conclusion is `success`/`failure` on whether the benchmark RAN** (revised
+  from the original always-`neutral` — see the top note). Non-required, so a
+  `failure` is a red ✗ that doesn't block; perf is data, not a gate.
+- **Per-phase `output` updates** (post-MVP ask): the `ProgressPhaseListener`
+  PATCHes `output.title` (the consolidated one-liner: `building`/`running`/…)
+  and `output.summary` while `in_progress`, sharing the comment's debounce;
+  terminal phases are owned by the reporter's conclusion.
+- **App id for the reconcile is auto-resolved** via `GET /app` at startup
+  (cached, self-healing on a transient blip) — no `app_id` config value.
+- **The whole reporting surface is non-fatal** — check *and* comment
+  create/update/persist failures are logged, never fail the benchmark.
 
 ---
 
@@ -299,11 +335,23 @@ pair it with the summary comment.
 
 **Notes:**
 
-- **Architectural tension.** Today GitHub side-effects live in the **runner**;
-  webhook handlers are pure DB classification. Decisions #3 keeps that invariant
-  — `PullRequestHandler` enqueues a lightweight `pr-check-sync` task rather than
-  calling `GitHubApi` inline. Phase 2 delivers value without any of this; Phase 3
-  is the discoverability layer and can ship later or be dropped.
+- **Re-sequenced onto v5 (read this first).** The *feature* below still stands,
+  but **do not build it via the `pr-check-sync` task described next** — that
+  mechanism is **superseded by [roadmap-v5.md](./roadmap-v5.md)**. v5 relocates
+  all GitHub side-effects out of the runner and into a dedicated **Reporter**,
+  which is the natural home for a placeholder check — so the "keep handlers pure
+  via a bespoke task" workaround is no longer needed. Build this **after v5**, on
+  the Reporter, and land it with **v5 Phase 5** (which already absorbs the
+  per-running-job half of the `queued (N before)` updater; this Phase 3 supplies
+  the **pre-claim** placeholder persistence the two share). The original
+  `(installation, repo, PR, head_sha)` persistence design above is still correct.
+- **Architectural tension (the now-superseded reasoning).** Today GitHub
+  side-effects live in the **runner**; webhook handlers are pure DB
+  classification. Decision #3 kept that invariant by enqueuing a lightweight
+  `pr-check-sync` task instead of calling `GitHubApi` inline. **v5's Reporter
+  removes this tension entirely** — kept here only to explain why the task
+  approach is no longer the plan. Phase 2 delivered value without any of this;
+  Phase 3 is the discoverability layer and can ship later or be dropped.
 
 ---
 
@@ -327,12 +375,17 @@ safely.
 - Until an install has granted it, PR runs fall back to `comment` and baselines
   to `none` (headless/DB-only) — detect the `403` and degrade, or key off config.
 
-**Status:**
+**Status:** partial.
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
-- [ ] Reviewed — Codex signed off
-- [ ] Complete
+- [x] `[reporting]` config (`pr_report` / `baseline_report`) + example
+- [x] `checks:write` granted on the operator's fork install (`cylewitruk`)
+- [ ] `host-bringup.md` rollout note + README quick-setup mention
+- [ ] Multi-installer re-consent rollout (when `stacks-network` upstream onboards)
+
+**Notes:**
+
+- The `app_id`-via-config idea was dropped — the numeric App id is auto-resolved
+  via `GET /app` at startup (see Phase 2).
 
 ---
 
@@ -375,11 +428,14 @@ in review:
    Rename the PR variant to e.g. `PullRequest { pr_number, comment_id:
    Option<_>, check_run_id: Option<_> }`. Comment + check are two surfaces of one
    PR target; a baseline has the single commit-check surface.
-3. **Phase 3 placement → enqueued `pr-check-sync` task, not a handler-inline
-   call.** Preserves the invariant that webhook handlers are pure DB
-   classification and the runner/worker owns GitHub I/O, and inherits retry +
-   idempotency from the existing job/event machinery. (Phase 3 is optional, so
-   this lands only if/when Phase 3 does.)
+3. **Phase 3 placement → v5 Reporter-owned placeholder check. (Previous
+   `pr-check-sync` task decision superseded by [roadmap-v5.md](./roadmap-v5.md).)**
+   The original decision enqueued a lightweight `pr-check-sync` task so webhook
+   handlers stayed pure-DB and the runner owned GitHub I/O. v5 makes that moot:
+   GitHub side-effects move into a dedicated **Reporter**, the natural owner of a
+   pre-claim placeholder check — so Phase 3 builds on the Reporter (post-v5,
+   landing with v5 Phase 5), not a bespoke task. (Phase 3 is optional; it lands
+   only if/when it does — now on the v5 architecture.)
 4. **`DeniedSource` → `skipped` check with a reason**, not silence. The repo IS
    a configured target, so a contributor from an untrusted fork gets an
    actionable breadcrumb; noise stays low because it only appears on managed
