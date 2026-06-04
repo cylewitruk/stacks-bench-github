@@ -22,7 +22,7 @@ impl<'a> ProgressReporter<'a> {
     }
 
     /// Claimed → running. Refresh the comment; the check stays `in_progress`
-    /// (it transitions to `neutral` only at a terminal state).
+    /// (it concludes `success`/`failure` only at a terminal state).
     pub async fn started(&self) {
         self.update_comment(&format!(
             ":rocket: benchmark `{id}` is running on commit `{sha}`.",
@@ -39,11 +39,16 @@ impl<'a> ProgressReporter<'a> {
         // Only PR jobs with a comment have one to point at; a baseline's commit
         // check is self-contained.
         let pointer = if self.has_comment() { "see comment / details" } else { "see details" };
-        self.complete_check(CheckRunOutput {
-            title: format!("benchmark {} — complete", self.job.id),
-            summary: format!("commit `{}` — {pointer}", self.job.commit),
-            text: Some(body),
-        })
+        // The benchmark RAN and produced results → success. (Perf is data, not
+        // a gate — a regression doesn't flip this.)
+        self.complete_check(
+            CheckRunConclusion::Success,
+            CheckRunOutput {
+                title: format!("benchmark {} — complete", self.job.id),
+                summary: format!("commit `{}` — {pointer}", self.job.commit),
+                text: Some(body),
+            },
+        )
         .await;
     }
 
@@ -55,8 +60,8 @@ impl<'a> ProgressReporter<'a> {
 
     /// Terminal failure. `error` is the full anyhow chain (internal paths,
     /// stderr) — surface only a short, sanitized snippet; the DB row keeps the
-    /// full string. A *failed* check is still `neutral` (non-blocking), never
-    /// a red `failure`.
+    /// full string. The check is concluded `failure` (the benchmark failed to
+    /// run) — a red ✗ that's non-blocking because the check isn't required.
     pub async fn failed(&self, error: &str) {
         let snippet = short_pr_error(error);
         self.update_comment(&format!(
@@ -64,11 +69,14 @@ impl<'a> ProgressReporter<'a> {
             id = self.job.id,
         ))
         .await;
-        self.complete_check(CheckRunOutput {
-            title: format!("benchmark {} — failed", self.job.id),
-            summary: format!("commit `{}` failed", self.job.commit),
-            text: Some(format!("```\n{snippet}\n```\n\n_(full details in the daemon logs)_")),
-        })
+        self.complete_check(
+            CheckRunConclusion::Failure,
+            CheckRunOutput {
+                title: format!("benchmark {} — failed", self.job.id),
+                summary: format!("commit `{}` failed", self.job.commit),
+                text: Some(format!("```\n{snippet}\n```\n\n_(full details in the daemon logs)_")),
+            },
+        )
         .await;
     }
 
@@ -111,8 +119,9 @@ impl<'a> ProgressReporter<'a> {
         }
     }
 
-    /// Complete this job's Check Run (`neutral`) if it has one. Non-fatal.
-    async fn complete_check(&self, output: CheckRunOutput) {
+    /// Complete this job's Check Run with `conclusion` if it has one.
+    /// Non-fatal.
+    async fn complete_check(&self, conclusion: CheckRunConclusion, output: CheckRunOutput) {
         let check_run_id = match self.job.progress {
             ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
             ProgressTarget::CommitCheck { check_run_id } => check_run_id,
@@ -127,7 +136,7 @@ impl<'a> ProgressReporter<'a> {
                 &self.job.repository,
                 check_run_id,
                 CheckRunUpdate {
-                    state: CheckRunState::Completed(CheckRunConclusion::Neutral),
+                    state: CheckRunState::Completed(conclusion),
                     output,
                 },
             )
@@ -191,7 +200,66 @@ fn short_pr_error(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::short_pr_error;
+    use sbgh_core::github::test_support::{FakeCall, FakeGitHub};
+    use sbgh_core::github::{CheckRunConclusion, CheckRunState};
+    use sbgh_core::models::GitRefKind;
+    use uuid::Uuid;
+
+    use super::{ProgressReporter, short_pr_error};
+    use crate::job_source::{ProgressTarget, RunnableJob};
+
+    fn check_job(check_run_id: i64) -> RunnableJob {
+        RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(),
+            git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            bench_args: vec![],
+            progress: ProgressTarget::CommitCheck {
+                check_run_id: Some(check_run_id),
+            },
+            claim_token: Some(Uuid::new_v4()),
+        }
+    }
+
+    fn concluded_state(gh: &FakeGitHub) -> Option<CheckRunState> {
+        gh.calls()
+            .into_iter()
+            .find_map(|c| match c {
+                FakeCall::UpdateCheckRun { state, .. } => Some(state),
+                _ => None,
+            })
+    }
+
+    /// A completed benchmark concludes the check `success` — it RAN.
+    #[tokio::test]
+    async fn completed_concludes_check_success() {
+        let gh = FakeGitHub::new();
+        let job = check_job(11);
+        ProgressReporter::new(&gh, &job)
+            .completed(&serde_json::json!({}))
+            .await;
+        assert_eq!(
+            concluded_state(&gh),
+            Some(CheckRunState::Completed(CheckRunConclusion::Success))
+        );
+    }
+
+    /// A failed benchmark concludes the check `failure` — it didn't run.
+    #[tokio::test]
+    async fn failed_concludes_check_failure() {
+        let gh = FakeGitHub::new();
+        let job = check_job(11);
+        ProgressReporter::new(&gh, &job)
+            .failed("boom: VM died")
+            .await;
+        assert_eq!(
+            concluded_state(&gh),
+            Some(CheckRunState::Completed(CheckRunConclusion::Failure))
+        );
+    }
 
     #[test]
     fn short_message_unchanged() {

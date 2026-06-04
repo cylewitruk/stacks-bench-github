@@ -1,13 +1,23 @@
 # Roadmap 4 — Check Run reporting
 
 Successor to [roadmap-v3.md](./roadmap-v3.md). Goal: surface benchmark results
-as **GitHub Check Runs** (non-required, `conclusion: neutral`) on the relevant
-commit — on the **PR head** for PR-triggered runs (paired with a summary
-comment that links to the check), and on the **pushed/tagged commit** for
-baseline runs. Checks are the canonical status surface; the PR comment is the
-visible human summary (the Coveralls/Codecov model). PR-path creation is gated
-by the policy decision the daemon already computes, so a PR check appears only
-on repos sbgh manages.
+as **GitHub Check Runs** (non-required) on the relevant commit — on the **PR
+head** for PR-triggered runs (paired with a summary comment that links to the
+check), and on the **pushed/tagged commit** for baseline runs. Checks are the
+canonical status surface; the PR comment is the visible human summary (the
+Coveralls/Codecov model). PR-path creation is gated by the policy decision the
+daemon already computes, so a PR check appears only on repos sbgh manages.
+
+> **Conclusion semantics (revised post-deploy):** the check concludes
+> `success` when the benchmark **ran** (produced results) and `failure` when it
+> **failed to run** (setup error, VM died, panic, timeout). Perf is data, not a
+> gate — a slow/regressed-but-completed run is still `success`. Because the
+> check is non-required, a `failure` is a visible red ✗ without blocking the
+> merge. (`neutral`/`skipped` remain for the Phase-3 placeholder paths.) The
+> check also gets **per-phase `output` PATCHes** while `in_progress` —
+> `output.title` ("building"/"running"/…) drives the consolidated one-liner —
+> sharing the comment's debounce so the API cadence is ~1 extra PATCH per
+> debounce window (see Phase 2).
 
 Process is unchanged: Opus implements, Codex reviews, Opus fixes.
 
@@ -25,9 +35,10 @@ this:
 
 - Renders in the PR's **Checks** tab — where reviewers already look — with a
   rich markdown `output` (the vs-baseline delta table fits perfectly).
-- `conclusion: neutral` **reports without blocking** — it is not a failure,
-  so a non-required check never gates a merge. (`skipped` is the explicit
-  "considered, not run" state.)
+- It concludes `success`/`failure` on whether the benchmark **ran** (not on
+  the numbers), and being **non-required** it reports without gating a merge —
+  a `failure` is a visible red ✗, not a block. (`skipped`/`neutral` remain for
+  the Phase-3 placeholder paths.)
 - Check creation is gated by the **same path that creates the job** —
   `/benchmark` authz/policy for PR jobs, configured `branch_push`/`tag_created`
   triggers for baseline jobs — so a check appears only where a benchmark
@@ -54,8 +65,8 @@ trigger:
 
 | Trigger | Check Run | Comment |
 | ---- | ---- | ---- |
-| `/benchmark` (PR) | on the PR head SHA: `in_progress` → `neutral` | yes — an immediate "started, see check ↗" reply, updated in place to the results + delta (one comment, keeps the check link) |
-| `branch_push` baseline (e.g. `develop`) | on the **pushed commit**: `in_progress` → `neutral`, results in `output` | none (no PR) |
+| `/benchmark` (PR) | on the PR head SHA: `in_progress` (per-phase `output.title`) → `success`/`failure` | yes — an immediate "started, see check ↗" reply, updated in place to the results + delta (one comment, keeps the check link) |
+| `branch_push` baseline (e.g. `develop`) | on the **pushed commit**: `in_progress` (per-phase) → `success`/`failure`, results in `output` | none (no PR) |
 | `tag_created` baseline | on the **tagged commit** | none |
 
 - **Baselines attach to the commit, not the Actions tab.** GitHub's Actions
@@ -123,7 +134,7 @@ Runs, mirroring the existing comment methods.
     against the PR head SHA (`job.commit`) if cross-fork rendering is
     confirmed, else the surface-selection fallback.
 - New wire types: `CheckRunStatus` (`queued`/`in_progress`/`completed`),
-  `CheckRunConclusion` (`neutral`/`skipped`/…), `CheckRunOutput`
+  `CheckRunConclusion` (`success`/`failure`/`neutral`/`skipped`), `CheckRunOutput`
   (`title`/`summary`/`text`), `PostedCheckRun { id, html_url }` (mirrors
   `PostedComment`; `html_url` from the create response is what the PR comment
   links to — without it the "started, see check" reply needs a second lookup).
@@ -169,14 +180,21 @@ pair it with the summary comment.
     **after** that resolution, not at claim. It's still created **before** the
     comment (`create_check_run` `in_progress`, `"Benchmarking <sha>…"`) so the
     comment can carry its `html_url`.
-  - phase/heartbeat → `update_check_run` (reuse the debounced heartbeat).
-  - success → `completed` / `neutral` with the metrics (+ vs-baseline delta once
-    available). PR runs mirror the summary into the comment; baselines carry it
-    in the check `output` (their only surface).
-  - failure → `completed` / `neutral` (NOT `failure` — non-blocking by design)
-    with `finish_reason` + console tail in `output.text`. A failed **baseline**
-    is therefore a grey neutral check on the `develop` commit, never a red
-    `failure`.
+  - phase/heartbeat → `update_check_run` while `in_progress`: the
+    `ProgressPhaseListener` PATCHes `output.title` to the phase name
+    (`building`/`running`/`collecting`/…) — which drives the one-liner in the
+    PR's consolidated checks view — and `output.summary` with elapsed. Shares
+    the comment's debounce (`PR_UPDATE_MIN_INTERVAL`), so this adds at most
+    ~1 extra PATCH per debounce window vs. terminal-only updates. Terminal
+    phases are skipped here — the reporter owns the conclusion (below).
+  - success (benchmark RAN) → `completed` / `success` with the metrics (+
+    vs-baseline delta once available). PR runs mirror the summary into the
+    comment; baselines carry it in the check `output` (their only surface).
+  - failure (benchmark failed to RUN — setup error, VM died, panic, timeout) →
+    `completed` / `failure` with `finish_reason` + console tail in
+    `output.text`. A slow-but-completed run is still `success` — perf is data,
+    not a gate. The check is **non-required**, so a `failure` is a red ✗ that
+    doesn't block the merge.
 - **Persistent check identity (crash/reclaim).** Mirror the comment mechanism:
   the comment id is persisted on a `CommentPosted` `job_event` (via the
   `github_comment_id` column) and read back on re-claim
@@ -204,7 +222,7 @@ pair it with the summary comment.
     check and **reconcile before creating** — list the SHA's check runs for our
     App and reuse a match on `external_id` rather than creating a second. (Scope
     the lookup to the retry path to keep the happy path one call. If skipped, the
-    residual failure mode is a harmless duplicate *neutral* check — cosmetic,
+    residual failure mode is a harmless duplicate check — cosmetic,
     non-fatal — so the `external_id` reconcile is the clean close, not a
     correctness blocker.) **Impl note:** confirm the list call (e.g. `GET
     /repos/{o}/{r}/commits/{sha}/check-runs`, filtered to our App + check name)
@@ -260,8 +278,9 @@ pair it with the summary comment.
   | `DeniedTarget` | **No check** — repo isn't an sbgh target; no noise. |
   | `DeniedSource` | `skipped` check with a reason ("source fork not trusted — operator must `policy source allow` it"). |
 
-- `/benchmark` then **updates that same check** (in_progress → neutral +
-  results) rather than creating a fresh one.
+- `/benchmark` then **adopts that same check** (the `neutral` placeholder →
+  `in_progress` → `success`/`failure` + results) rather than creating a fresh
+  one.
 - **Placeholder needs its own persistence (NOT the Phase 2 `job_event`
   column).** The placeholder check is created *before a job exists*, so there's
   no `job_event` row to store its id on. Phase 3 needs identity keyed by
@@ -371,7 +390,7 @@ in review:
 - **Phase 0 (cross-fork spike) gates the PR path only** — its outcome pins the
   PR posting target before that reporter code is written. The baseline
   commit-check half of Phase 2 (same-repo commit) doesn't wait on it.
-- **Phases 1 → 2 are the MVP** and deliver the headline value (neutral checks on
+- **Phases 1 → 2 are the MVP** and deliver the headline value (checks on
   benchmarked PRs **and** on `develop` baseline commits); they can land before
   the `checks:write` rollout by shipping behind `pr_report = comment` /
   `baseline_report = none`.

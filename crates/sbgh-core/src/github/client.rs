@@ -71,10 +71,17 @@ pub enum CheckRunState {
     Completed(CheckRunConclusion),
 }
 
-/// The non-blocking conclusions we use: `neutral` (a result, no verdict) and
-/// `skipped` (considered, not run — e.g. an untrusted PR source).
+/// A check's terminal conclusion. We report on whether the benchmark **ran**,
+/// not on whether the numbers are "good": `success` when it completed and
+/// produced results, `failure` when it failed to run (setup error, VM died,
+/// panic, timeout). A slow/regressed-but-completed run is still `success` —
+/// perf is data, not a gate. The check is non-required, so a `failure` is a
+/// visible signal without blocking the merge. `skipped`/`neutral` are for the
+/// Phase-3 placeholder paths (considered-not-run / not-yet-run).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckRunConclusion {
+    Success,
+    Failure,
     Neutral,
     Skipped,
 }
@@ -576,10 +583,13 @@ impl GitHubApi for OctocrabClient {
 /// Map our lifecycle state to GitHub's `status` + optional `conclusion`
 /// strings. We only ever complete with a non-blocking conclusion.
 fn status_strings(state: CheckRunState) -> (&'static str, Option<&'static str>) {
+    use CheckRunConclusion::*;
     match state {
         CheckRunState::InProgress => ("in_progress", None),
-        CheckRunState::Completed(CheckRunConclusion::Neutral) => ("completed", Some("neutral")),
-        CheckRunState::Completed(CheckRunConclusion::Skipped) => ("completed", Some("skipped")),
+        CheckRunState::Completed(Success) => ("completed", Some("success")),
+        CheckRunState::Completed(Failure) => ("completed", Some("failure")),
+        CheckRunState::Completed(Neutral) => ("completed", Some("neutral")),
+        CheckRunState::Completed(Skipped) => ("completed", Some("skipped")),
     }
 }
 

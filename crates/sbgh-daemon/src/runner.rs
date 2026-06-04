@@ -7,8 +7,8 @@
 //!   2. Reporting (NON-FATAL, per `[reporting]`): creates the Check Run on the
 //!      resolved commit and — for PR jobs — posts the "starting" comment
 //!      linking it, persisting both ids so a re-claim reuses them.
-//!   3. Runs the benchmark; updates the check (→ `neutral`) + comment at the
-//!      end.
+//!   3. Runs the benchmark; concludes the check `success`/`failure` (did it
+//!      RUN?) + updates the comment at the end.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,9 +37,9 @@ const CHECK_NAME: &str = "stacks-bench";
 /// without leaving a crashed claim stuck for long.
 const CLAIM_LEASE_MINUTES: i64 = 5;
 
-/// Minimum interval between PR-comment edits driven by the
-/// `CommentPhaseListener`. Phase transitions and heartbeats both go
-/// through this debounce; terminal phases (done/error) bypass it so
+/// Minimum interval between per-phase reporting edits driven by the
+/// `ProgressPhaseListener` (comment + check). Phase transitions and heartbeats
+/// both go through this debounce; terminal phases (done/error) bypass it so
 /// the user always sees the final state immediately.
 ///
 /// 30s gives us at most ~2 edits/min in the worst case, which is well
@@ -224,7 +224,7 @@ impl Runner {
         reporter.started().await;
 
         let driver = LibvirtDriver::new(self.config.clone(), self.shell.clone());
-        let phase_listener = CommentPhaseListener::new(self.gh.clone(), job.clone());
+        let phase_listener = ProgressPhaseListener::new(self.gh.clone(), job.clone());
         let outcome = match driver
             .run_benchmark(&job, &phase_listener)
             .await
@@ -543,107 +543,148 @@ impl Runner {
     }
 }
 
-/// Bridge between the libvirt driver's phase events and the PR comment.
+/// Bridge between the libvirt driver's phase events and the job's reporting
+/// surface(s) — the PR comment and/or the Check Run's `output` (roadmap-v4).
+/// Per-phase updates set the check's `output.title` (the one-liner in the PR's
+/// consolidated checks view — "building", "running", …) and `output.summary`
+/// (the check's detail panel).
 ///
-/// Two callers drive PR comment edits:
-///   * `on_phase` — fires once per transition the driver replays from the in-VM
-///     phase journal. Terminal phases (`done`/`error`) bypass the debounce;
-///     non-terminal phases are debounced.
+/// Two callers drive edits:
+///   * `on_phase` — fires once per transition. Terminal phases (`done`/`error`)
+///     bypass the debounce; non-terminal phases are debounced.
 ///   * `on_heartbeat` — fires periodically while the same phase is current,
 ///     refreshing the elapsed-time annotation. Always debounced.
 ///
-/// The debounce window (`PR_UPDATE_MIN_INTERVAL`) keeps us well below
-/// GitHub's secondary rate limits and avoids spamming the PR's edit
-/// history. The very first edit after job pickup is always allowed
-/// through (last_pr_update_at starts as None), so the user sees
-/// something happen immediately when they `/benchmark`.
-struct CommentPhaseListener {
+/// The debounce (`PR_UPDATE_MIN_INTERVAL`) keeps us below GitHub's secondary
+/// rate limits and is shared across both surfaces; the first edit after pickup
+/// is always allowed through. All updates are NON-FATAL. The check's terminal
+/// state is owned by the reporter's `complete_check`, so the listener skips the
+/// check on terminal phases (no flicker / redundant PATCH).
+struct ProgressPhaseListener {
     gh: Arc<dyn GitHubApi>,
     job: RunnableJob,
-    state: Mutex<CommentState>,
+    state: Mutex<PhaseState>,
 }
 
 #[derive(Default)]
-struct CommentState {
-    last_pr_update_at: Option<Instant>,
+struct PhaseState {
+    last_update_at: Option<Instant>,
 }
 
-impl CommentPhaseListener {
+impl ProgressPhaseListener {
     fn new(gh: Arc<dyn GitHubApi>, job: RunnableJob) -> Self {
         Self {
             gh,
             job,
-            state: Mutex::new(CommentState::default()),
+            state: Mutex::new(PhaseState::default()),
+        }
+    }
+
+    fn comment_id(&self) -> Option<i64> {
+        match self.job.progress {
+            ProgressTarget::PullRequest { comment_id, .. } => comment_id,
+            ProgressTarget::CommitCheck { .. } => None,
+        }
+    }
+
+    fn check_run_id(&self) -> Option<i64> {
+        match self.job.progress {
+            ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
+            ProgressTarget::CommitCheck { check_run_id } => check_run_id,
         }
     }
 
     async fn try_update(&self, phase: &Phase, elapsed: Duration, force: bool) {
-        // Only PR jobs with a posted comment get per-phase GitHub edits. The
-        // Check Run is a status surface (in_progress → neutral at terminal);
-        // it doesn't get per-phase output churn here. Baseline/commit-check
-        // jobs (and any job without a comment) surface phases in logs only.
-        let ProgressTarget::PullRequest {
-            comment_id: Some(comment_id), ..
-        } = self.job.progress
-        else {
-            tracing::debug!(job_id = %self.job.id, phase = %phase, "phase (no comment surface)");
+        let comment_id = self.comment_id();
+        // The reporter owns the check's terminal state; don't churn it here.
+        let check_run_id = if phase.is_terminal() { None } else { self.check_run_id() };
+        if comment_id.is_none() && check_run_id.is_none() {
+            tracing::debug!(job_id = %self.job.id, phase = %phase, "phase (no reporting surface)");
             return;
-        };
+        }
 
-        // Decide whether to actually send the edit. Brief lock — we
-        // don't hold across the network call.
+        // Shared debounce. Brief lock — not held across the network calls.
         {
             let mut state = self.state.lock().await;
             if !force
-                && let Some(last) = state.last_pr_update_at
+                && let Some(last) = state.last_update_at
                 && last.elapsed() < PR_UPDATE_MIN_INTERVAL
             {
-                tracing::trace!(
-                    phase = %phase,
-                    since_last = ?last.elapsed(),
-                    "PR update debounced",
-                );
+                tracing::trace!(phase = %phase, since_last = ?last.elapsed(), "phase update debounced");
                 return;
             }
-            state.last_pr_update_at = Some(Instant::now());
+            state.last_update_at = Some(Instant::now());
         }
 
-        let body = format!(
-            ":construction: benchmark `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
-            id = self.job.id,
-            phase = phase,
-            elapsed = format_elapsed(elapsed),
-            sha = self.job.commit,
-        );
-        if let Err(e) = self
-            .gh
-            .update_pr_comment(self.job.installation_id, &self.job.repository, comment_id, &body)
-            .await
-        {
-            // Debug repr surfaces GitHub's response body (status + message),
-            // e.g. "Resource not accessible by integration" when the App is
-            // missing the Issues: Write permission.
-            tracing::warn!(error = ?e, "phase comment update failed");
+        // PR comment (when present): the verbose progress line.
+        if let Some(comment_id) = comment_id {
+            let body = format!(
+                ":construction: benchmark `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
+                id = self.job.id,
+                phase = phase,
+                elapsed = format_elapsed(elapsed),
+                sha = self.job.commit,
+            );
+            if let Err(e) = self
+                .gh
+                .update_pr_comment(
+                    self.job.installation_id,
+                    &self.job.repository,
+                    comment_id,
+                    &body,
+                )
+                .await
+            {
+                tracing::warn!(error = ?e, "phase comment update failed (non-fatal)");
+            }
+        }
+
+        // Check Run output (when present): `title` → the consolidated-view
+        // one-liner; `summary` → the detail panel. Stays `in_progress`.
+        if let Some(check_run_id) = check_run_id {
+            let output = CheckRunOutput {
+                title: phase.to_string(),
+                summary: format!(
+                    "**{phase}** for `{elapsed}` — commit `{sha}`",
+                    phase = phase,
+                    elapsed = format_elapsed(elapsed),
+                    sha = self.job.commit,
+                ),
+                text: None,
+            };
+            if let Err(e) = self
+                .gh
+                .update_check_run(
+                    self.job.installation_id,
+                    &self.job.repository,
+                    check_run_id,
+                    CheckRunUpdate {
+                        state: CheckRunState::InProgress,
+                        output,
+                    },
+                )
+                .await
+            {
+                tracing::warn!(error = ?e, "phase check update failed (non-fatal)");
+            }
         }
     }
 }
 
 #[async_trait]
-impl PhaseListener for CommentPhaseListener {
+impl PhaseListener for ProgressPhaseListener {
     async fn on_phase(&self, phase: &Phase) {
-        // Terminal phases bypass debounce so the user sees the final
-        // state immediately even if we just edited the comment for a
-        // heartbeat. The "elapsed in current phase" annotation isn't
-        // meaningful here (we've just entered the phase), so pass 0;
-        // the prose still reads naturally as "running for 00:00:00".
+        // Terminal phases bypass debounce so the comment shows the final state
+        // immediately. Just-entered phase → 0 elapsed; the prose still reads
+        // naturally as "running for 00:00:00".
         let force = phase.is_terminal();
         self.try_update(phase, Duration::ZERO, force)
             .await;
     }
 
     async fn on_heartbeat(&self, phase: &Phase, elapsed: Duration) {
-        // Heartbeats are always debounced — they're inherently a
-        // "still alive" signal and missing one is fine.
+        // Heartbeats are always debounced — a "still alive" signal where
+        // missing one is fine.
         self.try_update(phase, elapsed, false)
             .await;
     }
@@ -1004,7 +1045,7 @@ mod tests {
     }
 
     /// PR job in `both` mode: creates an in-progress check, posts a comment
-    /// LINKING the check, then completes the check (neutral) on failure.
+    /// LINKING the check, then completes the check (`failure`) on failure.
     #[tokio::test]
     async fn pr_job_both_creates_check_and_linked_comment() {
         let tmp = TempDir::new().unwrap();
@@ -1235,6 +1276,95 @@ mod tests {
                 .calls()
                 .contains(&"fail"),
             "the job still reached terminal"
+        );
+    }
+
+    fn job_with(progress: ProgressTarget) -> RunnableJob {
+        RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(),
+            git_ref_display: "feature".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            bench_args: vec![],
+            progress,
+            claim_token: Some(Uuid::new_v4()),
+        }
+    }
+
+    /// A non-terminal phase sets the check's `output.title` to the phase name —
+    /// that's the one-liner shown in the PR's consolidated checks view.
+    #[tokio::test]
+    async fn phase_listener_sets_check_title_to_phase() {
+        let gh = Arc::new(FakeGitHub::new());
+        let listener = ProgressPhaseListener::new(
+            gh.clone(),
+            job_with(ProgressTarget::CommitCheck { check_run_id: Some(777) }),
+        );
+        listener
+            .on_phase(&Phase::Building)
+            .await;
+        let title = gh
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                FakeCall::UpdateCheckRun { check_run_id: 777, output, .. } => Some(output.title),
+                _ => None,
+            })
+            .expect("check updated on phase");
+        assert_eq!(title, "building");
+    }
+
+    /// A PR job updates BOTH surfaces per phase (verbose comment + check
+    /// title).
+    #[tokio::test]
+    async fn phase_listener_updates_both_comment_and_check() {
+        let gh = Arc::new(FakeGitHub::new());
+        let listener = ProgressPhaseListener::new(
+            gh.clone(),
+            job_with(ProgressTarget::PullRequest {
+                pr_number: 7,
+                comment_id: Some(800),
+                check_run_id: Some(900),
+                check_run_url: None,
+            }),
+        );
+        listener
+            .on_phase(&Phase::Running)
+            .await;
+        let calls = gh.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateComment { .. })),
+            "comment updated"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
+            "check updated"
+        );
+    }
+
+    /// Terminal phases are owned by the reporter's `complete_check`; the
+    /// listener must not churn the check there.
+    #[tokio::test]
+    async fn phase_listener_skips_check_on_terminal_phase() {
+        let gh = Arc::new(FakeGitHub::new());
+        let listener = ProgressPhaseListener::new(
+            gh.clone(),
+            job_with(ProgressTarget::CommitCheck { check_run_id: Some(5) }),
+        );
+        listener
+            .on_phase(&Phase::Done)
+            .await;
+        assert!(
+            !gh.calls()
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
+            "no check churn on a terminal phase"
         );
     }
 }
