@@ -382,6 +382,13 @@ sudo chmod 0600 /etc/sbgh/daemon/secrets.env
 sudo chown sbgh:sbgh /etc/sbgh/daemon/secrets.env
 ```
 
+> **Optional — concurrency.** `[runner].max_concurrent_jobs` (default `1`,
+> sequential) caps how many benchmarks run at once. Each job is a full
+> build+bench VM (vCPUs, memory, an LVM snapshot, a results tmpfs), so raise it
+> only when the host can carry that many simultaneously — size against
+> `[vm].build_vcpus`/`build_memory` × N and your VG free space. Leave it at `1`
+> until you've measured headroom.
+
 ## 6. Run handler + smee + Postgres in Docker
 
 The handler, smee, and Postgres run in containers via

@@ -173,6 +173,18 @@ pub struct DaemonConfig {
     pub stacks_bench: StacksBenchConfig,
     pub api: ApiConfig,
     pub reporting: ReportingConfig,
+    pub runner: RunnerConfig,
+}
+
+/// Daemon run-loop tuning (roadmap-v5). Deliberately **not** under `[vm]`: the
+/// limit is on daemon execution *slots*, not VM capacity — task kinds become
+/// non-VM in v6, so the run-loop knob lives on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerConfig {
+    /// Maximum jobs executed concurrently. Default `1` (sequential — the
+    /// historical behavior). Raise it only when the host can run that many
+    /// jobs at once (each is a full VM today). Values below 1 are clamped to 1.
+    pub max_concurrent_jobs: usize,
 }
 
 /// The daemon's `/api` server (roadmap-v3). Reachable only from the
@@ -368,6 +380,7 @@ struct RawDaemon {
     stacks_bench: RawStacksBench,
     api: RawApi,
     reporting: RawReporting,
+    runner: RawRunner,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -375,6 +388,12 @@ struct RawDaemon {
 struct RawReporting {
     pr_report: Option<PrReport>,
     baseline_report: Option<BaselineReport>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawRunner {
+    max_concurrent_jobs: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -465,6 +484,15 @@ impl RawDaemon {
             other
                 .reporting
                 .baseline_report,
+        );
+
+        merge_opt(
+            &mut self
+                .runner
+                .max_concurrent_jobs,
+            other
+                .runner
+                .max_concurrent_jobs,
         );
 
         merge_opt(&mut self.vm.golden_image, other.vm.golden_image);
@@ -600,6 +628,13 @@ impl RawDaemon {
         env_csv_into(&mut self.api.listen, "SBGH_API_LISTEN");
         env_path_into(&mut self.api.cookie_path, "SBGH_API_COOKIE_PATH");
         env_into(&mut self.api.ingest_token, "SBGH_API_INGEST_TOKEN");
+
+        env_parse_into(
+            &mut self
+                .runner
+                .max_concurrent_jobs,
+            "SBGH_RUNNER_MAX_CONCURRENT_JOBS",
+        );
     }
 
     fn into_config(self) -> Result<DaemonConfig> {
@@ -750,6 +785,14 @@ impl RawDaemon {
                     .reporting
                     .baseline_report
                     .unwrap_or(BaselineReport::Check),
+            },
+            runner: RunnerConfig {
+                // Default 1 = sequential (historical behavior). Clamp 0 → 1.
+                max_concurrent_jobs: self
+                    .runner
+                    .max_concurrent_jobs
+                    .unwrap_or(1)
+                    .max(1),
             },
         })
     }

@@ -15,11 +15,11 @@ serial `execute()` into three cooperating roles — a **coordinator**, per-job
 
 Process unchanged: Opus implements, Codex reviews, Opus fixes.
 
-> **Status: Phase 1 shipped** (the worker/reporter split, concurrency = 1) —
-> implemented + Codex-reviewed in two slices. Phases 2–5 are planned. Phases are
-> ordered so each is independently shippable with tests green; **Phase 1
-> delivered the separation-of-concerns win** at concurrency = 1, and concurrency
-> is only switched on in Phase 3.
+> **Status: Phases 1–3 shipped** (all Codex-signed-off). Phase 1 (worker/reporter
+> split), Phase 2 (mirror-lock concurrency audit), and Phase 3 (the coordinator +
+> slot pool, behind a default-1 limit) are done. Phases 4–5 planned. Phases are
+> ordered so each is independently shippable with tests green; concurrency is
+> only *usable* once an operator raises `[runner].max_concurrent_jobs`.
 
 ## Why
 
@@ -406,27 +406,47 @@ switched on.
 
 **What:**
 
-- Replace the single-job `run()` loop with a **coordinator**: a `Semaphore`
-  (size `[vm].max_concurrent_jobs`, default 1) + a `JoinSet` of worker/reporter
-  pairs. Claim while permits are free; spawn a pair per claim; free the permit on
-  join.
-- Add `[vm].max_concurrent_jobs` config (default 1) + example + docs.
-- Graceful shutdown via `CancellationToken`; panic isolation via `JoinSet` join
-  errors → synthetic `Finished(Failed)` (consideration 6).
-- Keep the stuck-claim sweep on its existing cadence.
+- Replace the single-job `run()` loop with a **coordinator**: an `Arc<Semaphore>`
+  (size `[runner].max_concurrent_jobs`, default 1) + a `JoinSet` of per-job
+  tasks. Claim while permits are free; spawn a task per claim with the permit
+  **moved into the task** (frees the slot on completion — no coordinator
+  bookkeeping); free + top up on `join_next`.
+- Add `[runner].max_concurrent_jobs` config (default 1) + example + host-bringup
+  note. **Under `[runner]`, not `[vm]`** (Codex): the limit is on daemon
+  execution *slots*, not VM capacity — task kinds go non-VM in v6.
+- **Panic isolation falls out of Phase 1 for free:** a job-task panic drops its
+  `events_tx` → the reporter's channel-close path terminal-fails the job; the
+  coordinator logs the `JoinError` with job context (a task-id→job-id map). No
+  synthetic `Finished(Failed)` needed — the reporter owns the terminal write.
+- Keep the stuck-claim sweep each loop iteration (the lease keeps it off
+  actively-`running` jobs).
 
 **Design notes:**
 
 - Default 1 means **deploying this phase changes nothing** until the operator
-  raises the limit — a safe rollout.
+  raises the limit — a safe rollout. (Verified: the whole prior suite passes
+  through the new `JobDeps::run` path unchanged.)
 - Claim stays serial inside the coordinator loop; only execution parallelizes.
+- **Graceful/abort shutdown is Phase 4**, not here — this phase has no
+  `CancellationToken`; the coordinator loops forever and relies on the existing
+  sweep + the reporter's terminal handling for recovery.
 
-**Status:**
+**Status:** implementation complete (pending Codex review).
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (N concurrent jobs reach terminal independently; a panicking worker fails only its job; sweep still recovers)
-- [ ] Reviewed — Codex signed off
-- [ ] Complete
+- [x] Initial implementation completed
+- [x] Integration coverage added — `coordinator_enforces_limit_and_tops_up`
+      drives the extracted `Coordinator` fill/reap seam with a blocking source,
+      asserting the slot limit is enforced (spawns exactly the limit, no
+      over-claim while full, tops up on completion);
+      `concurrent_jobs_reach_terminal_independently` covers per-job isolation.
+      The panicking-task path is logging-only here (the reporter's abnormal-close
+      terminal-fail is covered by `abnormal_channel_close_terminal_fails_the_job`)
+- [x] Reviewed — Codex signed off
+- [x] Complete
+
+> **Noted (Codex):** `in_flight()` (`JoinSet::len`) is an *upper bound* — a task
+> can free its semaphore permit (allowing a top-up) before the next `join_next`
+> reaps it. The **semaphore** is the real concurrency cap, not the task count.
 
 ---
 

@@ -769,7 +769,7 @@ mod tests {
 
     use sbgh_core::config::{
         ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
-        PrReport, ReportingConfig, StacksBenchConfig, VmConfig,
+        PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
     };
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -844,6 +844,7 @@ mod tests {
                 pr_report: PrReport::Both,
                 baseline_report: BaselineReport::Check,
             },
+            runner: RunnerConfig { max_concurrent_jobs: 1 },
         }
     }
 

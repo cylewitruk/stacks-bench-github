@@ -662,7 +662,7 @@ mod tests {
 
     use sbgh_core::config::{
         ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
-        PrReport, ReportingConfig, StacksBenchConfig, VmConfig,
+        PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
     };
     use sbgh_core::github::test_support::{FakeCall, FakeGitHub};
     use sbgh_core::models::GitRefKind;
@@ -808,6 +808,7 @@ mod tests {
                 pr_report: PrReport::Comment,
                 baseline_report: BaselineReport::None,
             },
+            runner: RunnerConfig { max_concurrent_jobs: 1 },
         }
     }
 

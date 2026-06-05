@@ -1,21 +1,23 @@
-//! Main daemon loop.
+//! Main daemon loop — a **coordinator** over a pool of concurrent job tasks
+//! (roadmap-v5 Phase 3).
 //!
-//! On pickup the daemon:
-//!   1. Resolves the commit via the GitHub API (the handler can't — no App
-//!      credentials): a PR job's head SHA, or a `tag_created` job's tag →
-//!      commit. Writes it back to the job row. (FATAL — no SHA, no run.)
-//!   2. Reporting (NON-FATAL, per `[reporting]`): creates the Check Run on the
-//!      resolved commit and — for PR jobs — posts the "starting" comment
-//!      linking it, persisting both ids so a re-claim reuses them.
-//!   3. Runs the benchmark; concludes the check `success`/`failure` (did it
-//!      RUN?) + updates the comment at the end.
+//! The coordinator claims while execution slots are free (a `Semaphore` sized
+//! by `[runner].max_concurrent_jobs`, default 1) and spawns one task per job
+//! into a `JoinSet`; the slot frees when the task finishes. Claims stay serial
+//! inside the loop — only *execution* parallelizes. Each job task
+//! ([`JobDeps::run`]) spawns the per-job [`Reporter`] (commit resolution +
+//! Check Run / comment per `[reporting]` + the terminal DB write) and runs the
+//! worker (the benchmark recipe) inline against it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::github::GitHubApi;
-use tokio::sync::{OnceCell, mpsc, oneshot};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::task::{Id, JoinError, JoinSet};
+use uuid::Uuid;
 
 use crate::bench_recipe::BenchRecipe;
 use crate::events::{ChannelSink, Terminal, WorkerEvent};
@@ -24,6 +26,7 @@ use crate::libvirt::Shell;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 use crate::reporter::{Prepared, Reporter};
 
+/// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Lease after which a job stranded in `claimed` (claimed but never
@@ -39,7 +42,10 @@ const CLAIM_LEASE_MINUTES: i64 = 5;
 /// absorbs bursts without ever stalling the worker for long.
 const EVENT_BUFFER: usize = 32;
 
-pub struct Runner {
+/// The runner's shared handles, cloned into each job task so it can run on its
+/// own (spawned) without borrowing the coordinator.
+#[derive(Clone)]
+struct JobDeps {
     config: Arc<DaemonConfig>,
     jobs: Arc<dyn RunnableJobStore>,
     gh: Arc<dyn GitHubApi>,
@@ -47,9 +53,15 @@ pub struct Runner {
     /// Shared App-id cache, resolved via `GET /app` and cached on **success**
     /// only — a `get_or_try_init` that leaves the cell empty on error, so a
     /// transient blip is retried on the next job rather than disabling the
-    /// reconcile for the whole process. Cloned into each job's reporter, which
-    /// resolves it lazily (see [`resolved_app_id`]).
+    /// reconcile for the whole process. Each reporter resolves it lazily (see
+    /// [`crate::reporter::resolved_app_id`]).
     app_id: Arc<OnceCell<i64>>,
+}
+
+pub struct Runner {
+    deps: JobDeps,
+    /// Max jobs executed concurrently (`[runner].max_concurrent_jobs`, ≥ 1).
+    max_concurrent: usize,
 }
 
 impl Runner {
@@ -59,73 +71,204 @@ impl Runner {
         gh: Arc<dyn GitHubApi>,
         shell: Arc<dyn Shell>,
     ) -> Self {
+        let max_concurrent = config
+            .runner
+            .max_concurrent_jobs
+            .max(1);
         Self {
-            config: Arc::new(config),
-            jobs,
-            gh,
-            shell,
-            app_id: Arc::new(OnceCell::new()),
+            deps: JobDeps {
+                config: Arc::new(config),
+                jobs,
+                gh,
+                shell,
+                app_id: Arc::new(OnceCell::new()),
+            },
+            max_concurrent,
         }
     }
 
+    /// The coordinator loop: sweep stranded claims, fill every free slot from
+    /// the queue, then wait for a task to free a slot or the poll tick. Runs
+    /// forever. The per-iteration machinery lives on [`Coordinator`] so it's
+    /// unit-testable without the loop.
     pub async fn run(self) -> anyhow::Result<()> {
-        tracing::info!("daemon started");
-        // The App id is resolved lazily by the first job whose reporter actually
-        // wants a Check Run (shared, cached, self-healing) — no startup
-        // `GET /app` for a daemon that only ever runs no-report jobs.
+        tracing::info!(max_concurrent = self.max_concurrent, "daemon started");
         let lease = chrono::Duration::minutes(CLAIM_LEASE_MINUTES);
+        let mut coord = Coordinator::new(self.deps, self.max_concurrent);
         loop {
-            // Recover jobs stranded in `claimed` (crash / preflight error
-            // between claim and start_running) before claiming the next.
-            // A single job runs to completion before the loop turns over,
-            // so this fires between jobs and at startup — exactly when a
-            // stranded claim from a prior (crashed) run needs reclaiming.
-            match self
-                .jobs
-                .sweep_stuck_claims(lease)
-                .await
-            {
-                Ok(n) if n > 0 => {
-                    tracing::warn!(recovered = n, "recovered stuck `claimed` jobs")
-                }
-                Ok(_) => {}
-                Err(e) => tracing::error!(error = ?e, "stuck-claim sweep failed"),
-            }
-
-            match self.run_once().await {
-                Ok(true) => {}
-                Ok(false) => tokio::time::sleep(POLL_INTERVAL).await,
-                Err(e) => {
-                    // Setup-time failure (claim failed, couldn't resolve
-                    // SHA, mkdir failed, etc.). VM-side failures come
-                    // back via `BenchmarkOutcome::Failed` and are NOT
-                    // errors here. Log and keep looping.
-                    tracing::error!(error = ?e, "job iteration failed");
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-            }
+            coord.sweep(lease).await;
+            coord.fill_slots().await;
+            coord
+                .wait_for_progress()
+                .await;
         }
     }
 
-    /// Claim + execute one job. Returns `Ok(true)` if a job was
-    /// processed, `Ok(false)` if the queue was empty. Split out from
-    /// `run` so the claim→execute→terminal lifecycle is testable against
-    /// any [`RunnableJobStore`] without the infinite poll loop.
+    /// Claim + run one job to completion on a standalone slot. The run-loop
+    /// test seam — drives the claim→terminal lifecycle without the coordinator.
+    /// Returns `Ok(true)` if a job was processed, `Ok(false)` if idle.
+    #[cfg(test)]
     pub async fn run_once(&self) -> anyhow::Result<bool> {
-        match self.jobs.claim_next().await? {
+        match self
+            .deps
+            .jobs
+            .claim_next()
+            .await?
+        {
             Some(job) => {
-                self.execute(job).await?;
+                let permit = Arc::new(Semaphore::new(1))
+                    .try_acquire_owned()
+                    .expect("a fresh semaphore always has a permit");
+                self.deps
+                    .clone()
+                    .run(job, permit)
+                    .await?;
                 Ok(true)
             }
             None => Ok(false),
         }
     }
+}
 
-    /// Claim-to-terminal for one job: spawn the per-job [`Reporter`] (which
-    /// owns `prepare` + all GitHub/DB side-effects), run the worker inline (the
-    /// recipe), and hand the terminal outcome back over the channel. Returns
-    /// the reporter's result so setup-level failures still back off the loop.
-    async fn execute(&self, job: RunnableJob) -> anyhow::Result<()> {
+/// The concurrent run loop's state: the slot `Semaphore`, the in-flight task
+/// set, and the task→job map. Split out from [`Runner::run`] so the fill/reap
+/// machinery (the load-bearing Phase-3 code) is unit-testable without the
+/// infinite loop.
+struct Coordinator {
+    deps: JobDeps,
+    slots: Arc<Semaphore>,
+    tasks: JoinSet<anyhow::Result<()>>,
+    /// task id → job id, so a panicking task can be logged with context.
+    task_jobs: HashMap<Id, Uuid>,
+}
+
+impl Coordinator {
+    fn new(deps: JobDeps, max_concurrent: usize) -> Self {
+        Self {
+            deps,
+            slots: Arc::new(Semaphore::new(max_concurrent)),
+            tasks: JoinSet::new(),
+            task_jobs: HashMap::new(),
+        }
+    }
+
+    /// Spawned-but-not-yet-reaped tasks. An **upper bound** on live jobs: a
+    /// task can finish (freeing its semaphore permit, so a slot may top up)
+    /// before the next `join_next` reaps it. The real concurrency cap is
+    /// the semaphore, not this count.
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// Reclaim jobs stranded mid-claim (crash / preflight error between claim
+    /// and start_running). The lease keeps it off actively-`running` jobs.
+    async fn sweep(&self, lease: chrono::Duration) {
+        match self
+            .deps
+            .jobs
+            .sweep_stuck_claims(lease)
+            .await
+        {
+            Ok(n) if n > 0 => tracing::warn!(recovered = n, "recovered stuck `claimed` jobs"),
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = ?e, "stuck-claim sweep failed"),
+        }
+    }
+
+    /// Claim into every free slot, spawning a job task per claim (the permit is
+    /// moved into the task and frees the slot on completion). Returns how many
+    /// were spawned this call.
+    async fn fill_slots(&mut self) -> usize {
+        let mut spawned = 0;
+        while let Ok(permit) = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+        {
+            match self
+                .deps
+                .jobs
+                .claim_next()
+                .await
+            {
+                Ok(Some(job)) => {
+                    let job_id = job.id;
+                    let id = self
+                        .tasks
+                        .spawn(
+                            self.deps
+                                .clone()
+                                .run(job, permit),
+                        )
+                        .id();
+                    self.task_jobs
+                        .insert(id, job_id);
+                    spawned += 1;
+                }
+                Ok(None) => {
+                    // Queue empty — release the slot and stop claiming.
+                    drop(permit);
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, "claim failed");
+                    drop(permit);
+                    break;
+                }
+            }
+        }
+        spawned
+    }
+
+    /// Wait for a task to finish (freeing a slot) or the poll tick (to re-sweep
+    /// + top up slots if the queue grew). When idle, just poll.
+    async fn wait_for_progress(&mut self) {
+        if self.tasks.is_empty() {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        } else {
+            tokio::select! {
+                Some(joined) = self.tasks.join_next_with_id() => self.reap(joined),
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    /// Record the outcome of a finished job task and drop its id→job mapping.
+    fn reap(&mut self, joined: Result<(Id, anyhow::Result<()>), JoinError>) {
+        match joined {
+            Ok((id, result)) => {
+                self.task_jobs.remove(&id);
+                if let Err(e) = result {
+                    // Setup-level failure — the reporter already terminal-failed
+                    // the job; logged here for visibility.
+                    tracing::error!(error = ?e, "job iteration failed");
+                }
+            }
+            Err(join_err) => {
+                // The job task itself panicked. Its reporter (a separate task)
+                // observes the channel close and terminal-fails the job; a panic
+                // *before* the reporter was gated leaves the job `claimed` (the
+                // stuck-claim sweep recovers it) or `running` (Phase-4 recovery).
+                let job_id = self
+                    .task_jobs
+                    .remove(&join_err.id());
+                tracing::error!(
+                    job_id = ?job_id,
+                    error = ?join_err,
+                    "job task panicked — recovery via reporter / stuck-claim sweep",
+                );
+            }
+        }
+    }
+}
+
+impl JobDeps {
+    /// Run one claimed job to a terminal state: spawn the per-job [`Reporter`]
+    /// (which owns prepare + all GitHub/DB side-effects), run the worker inline
+    /// (the recipe), and surface the reporter's result. The `permit` is held
+    /// for the job's lifetime, freeing its concurrency slot on completion.
+    async fn run(self, job: RunnableJob, _permit: OwnedSemaphorePermit) -> anyhow::Result<()> {
         tracing::info!(
             job_id = %job.id,
             repo = %job.repository,
@@ -229,7 +372,7 @@ mod tests {
     use async_trait::async_trait;
     use sbgh_core::config::{
         ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
-        PrReport, ReportingConfig, StacksBenchConfig, VmConfig,
+        PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
     };
     use sbgh_core::github::test_support::FakeGitHub;
     use sbgh_core::models::{GitRefKind, ResolvedCommit};
@@ -411,6 +554,7 @@ mod tests {
                 pr_report: PrReport::Comment,
                 baseline_report: BaselineReport::None,
             },
+            runner: RunnerConfig { max_concurrent_jobs: 1 },
         }
     }
 
@@ -811,5 +955,222 @@ mod tests {
                 .contains(&"fail"),
             "the job still reached terminal"
         );
+    }
+
+    /// Several jobs, run as independent tasks **concurrently** (sharing the
+    /// immutable config + App-id cache exactly as the coordinator would), each
+    /// reach a terminal state without interfering — the foundation for
+    /// `max_concurrent_jobs > 1`.
+    #[tokio::test]
+    async fn concurrent_jobs_reach_terminal_independently() {
+        const N: usize = 5;
+        let tmp = TempDir::new().unwrap();
+        // Baseline jobs with reporting off → no GitHub, just the lifecycle.
+        let config = Arc::new(config_with(&tmp, PrReport::Comment, BaselineReport::None));
+        let app_id = Arc::new(OnceCell::new()); // shared across jobs, as in prod
+
+        let mut handles = Vec::with_capacity(N);
+        let mut sources = Vec::with_capacity(N);
+        for _ in 0..N {
+            let job = RunnableJob {
+                progress: ProgressTarget::CommitCheck { check_run_id: None },
+                ..pr_job("abc123", None)
+            };
+            let source = Arc::new(FakeSource::new(job.clone()));
+            // Each job gets its own shell that fails provisioning → a clean
+            // `Terminal::Failed` (a *ran-and-failed*, so `run` returns `Ok`).
+            let shell = Arc::new(RecordingShell::new());
+            shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
+            let deps = JobDeps {
+                config: config.clone(),
+                jobs: source.clone(),
+                gh: Arc::new(FakeGitHub::new()),
+                shell,
+                app_id: app_id.clone(),
+            };
+            let permit = Arc::new(Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap();
+            handles.push(tokio::spawn(deps.run(job, permit)));
+            sources.push(source);
+        }
+
+        for h in handles {
+            // No task panicked, and each reporter drove its job to terminal.
+            h.await
+                .expect("job task did not panic")
+                .expect("job reached terminal without a setup error");
+        }
+        for source in sources {
+            assert_eq!(
+                source.calls(),
+                vec!["start_running", "fail"],
+                "each concurrent job ran to a terminal `fail`",
+            );
+        }
+    }
+
+    /// A store whose `start_running` **blocks** until the test releases it,
+    /// then errors — so a job task stays alive (holding its slot) without
+    /// needing the worker/driver, and completes the moment it's released.
+    /// Tracks the peak number blocked at once.
+    struct BlockingSource {
+        queue: StdMutex<std::collections::VecDeque<RunnableJob>>,
+        gate: tokio::sync::Semaphore,
+        blocked: std::sync::atomic::AtomicUsize,
+        peak_blocked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BlockingSource {
+        fn new(jobs: Vec<RunnableJob>) -> Self {
+            Self {
+                queue: StdMutex::new(jobs.into()),
+                gate: tokio::sync::Semaphore::new(0),
+                blocked: std::sync::atomic::AtomicUsize::new(0),
+                peak_blocked: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn release(&self, n: usize) {
+            self.gate.add_permits(n);
+        }
+        fn peak_blocked(&self) -> usize {
+            self.peak_blocked
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// Wait until at least `n` jobs are blocked in `start_running`.
+        async fn await_blocked(&self, n: usize) {
+            for _ in 0..2000 {
+                if self
+                    .blocked
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    >= n
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            panic!("timed out waiting for {n} jobs blocked in start_running");
+        }
+    }
+
+    #[async_trait]
+    impl RunnableJobStore for BlockingSource {
+        async fn claim_next(&self) -> anyhow::Result<Option<RunnableJob>> {
+            Ok(self
+                .queue
+                .lock()
+                .unwrap()
+                .pop_front())
+        }
+        async fn start_running(
+            &self,
+            _job: &RunnableJob,
+            _resolved: Option<ResolvedCommit>,
+        ) -> anyhow::Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self
+                .blocked
+                .fetch_add(1, SeqCst)
+                + 1;
+            self.peak_blocked
+                .fetch_max(now, SeqCst);
+            // Block until released, then error so the task completes here (no
+            // worker needed) and frees its slot.
+            self.gate
+                .acquire()
+                .await
+                .unwrap()
+                .forget();
+            self.blocked
+                .fetch_sub(1, SeqCst);
+            anyhow::bail!("released by test")
+        }
+        async fn sweep_stuck_claims(&self, _lease: chrono::Duration) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn complete(&self, _: &RunnableJob, _: &serde_json::Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn fail(
+            &self,
+            _: &RunnableJob,
+            _: &str,
+            _: Option<&serde_json::Value>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_comment_id(&self, _: &RunnableJob, _: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_check_run(
+            &self,
+            _: &RunnableJob,
+            _: i64,
+            _: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The coordinator enforces `max_concurrent_jobs`: it spawns exactly the
+    /// limit, never over-claims while full, and tops the slot back up when a
+    /// job finishes — observed directly on the [`Coordinator`] fill/reap
+    /// seam.
+    #[tokio::test]
+    async fn coordinator_enforces_limit_and_tops_up() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(config_with(&tmp, PrReport::Comment, BaselineReport::None));
+        // 4 baseline jobs (commit pre-resolved; reporting off → no GitHub).
+        let jobs: Vec<RunnableJob> = (0..4)
+            .map(|_| RunnableJob {
+                progress: ProgressTarget::CommitCheck { check_run_id: None },
+                ..pr_job("abc123", None)
+            })
+            .collect();
+        let source = Arc::new(BlockingSource::new(jobs));
+        let deps = JobDeps {
+            config,
+            jobs: source.clone(),
+            gh: Arc::new(FakeGitHub::new()),
+            shell: Arc::new(RecordingShell::new()),
+            app_id: Arc::new(OnceCell::new()),
+        };
+        let mut coord = Coordinator::new(deps, 2); // max_concurrent = 2
+
+        // First fill claims exactly the limit (2), not all 4.
+        assert_eq!(coord.fill_slots().await, 2, "first fill spawns exactly the limit");
+        assert_eq!(coord.in_flight(), 2);
+        source.await_blocked(2).await;
+        assert_eq!(source.peak_blocked(), 2);
+
+        // No over-claim while full: a second fill spawns nothing.
+        assert_eq!(coord.fill_slots().await, 0, "no over-claim while slots are full");
+        assert_eq!(coord.in_flight(), 2);
+
+        // Release one job → it completes → reap frees a slot.
+        source.release(1);
+        while coord.in_flight() == 2 {
+            coord
+                .wait_for_progress()
+                .await;
+        }
+        assert_eq!(coord.in_flight(), 1);
+
+        // Re-fill tops the slot back up with the 3rd job — exactly one.
+        assert_eq!(coord.fill_slots().await, 1, "tops up exactly one freed slot");
+        assert_eq!(coord.in_flight(), 2);
+
+        // Drain the rest; the limit must have held throughout.
+        source.release(10);
+        loop {
+            coord.fill_slots().await;
+            if coord.in_flight() == 0 {
+                break;
+            }
+            coord
+                .wait_for_progress()
+                .await;
+        }
+        assert_eq!(source.peak_blocked(), 2, "never exceeded the configured limit");
     }
 }

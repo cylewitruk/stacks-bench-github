@@ -146,3 +146,11 @@ pr_report = "both"
 # Baseline (push/tag) jobs: "check" (a commit-level Check Run on the baseline
 # commit) or "none" (headless/DB-only). Default "check".
 baseline_report = "check"
+
+[runner]
+# Maximum benchmark jobs run concurrently. Default 1 (sequential — the
+# historical behavior). This limits daemon execution *slots*, not VM capacity:
+# raise it only when the host can actually run that many jobs at once (each is a
+# full build+bench VM today — vCPUs, memory, an LVM snapshot, and a tmpfs per
+# job). Values below 1 are clamped to 1.
+max_concurrent_jobs = 1
