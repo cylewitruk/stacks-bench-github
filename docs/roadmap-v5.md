@@ -15,8 +15,9 @@ serial `execute()` into three cooperating roles — a **coordinator**, per-job
 
 Process unchanged: Opus implements, Codex reviews, Opus fixes.
 
-> **Status: Phases 1–4 Codex-signed-off** (Phases 1–3 + 4A/4B-1 shipped; 4B-2
-> signed off, deploy + Phase-4 operator smoke-test pending). Phase 1
+> **Status: Phases 1–4 shipped + signed off** (Phase 4 also **smoke-tested
+> live** on the host: SIGTERM mid-run → gray "cancelled" check; `kill -9` +
+> restart → orphan VM cleaned + row `cancelled` + check concluded). Phase 1
 > (worker/reporter split), Phase 2 (mirror-lock concurrency audit), Phase 3 (the
 > coordinator + slot pool, behind a default-1 limit), and Phase 4 (signal
 > handling / graceful shutdown / orphan recovery) are done. Phase 5
@@ -537,10 +538,11 @@ mid-flight.
   assumes **fail** (the user's stated intent: "abort/cleanup/fail"), with a clear
   remark so an operator can re-trigger.
 
-**Status:** complete — **4A + 4B-1 + 4B-2 all Codex-signed-off** (cancel-safety
-primitive; signals + graceful shutdown; orphan/stuck-`running` recovery). 4A and
-4B-1 shipped; 4B-2 awaiting deploy plus the Phase-4 operator smoke-test
-(abort/drain and kill-9 orphan recovery — the parts unit tests can't cover).
+**Status:** complete + **live-validated** — 4A + 4B-1 + 4B-2 + 4C all
+Codex-signed-off and smoke-tested on the host: `systemctl stop` mid-run produced
+a gray "cancelled" check; `kill -9` + restart cleaned the orphaned VM (destroy/
+undefine/umount/`losetup -j`/`lvremove`/dir-removal, all reconstructed from the
+job id), cancelled the row, and concluded the stuck check.
 
 - **4A — cancel-safety primitive (done; revised after Codex review):**
   cancellation is **threaded into the driver** and honored at the **poll loop
@@ -646,14 +648,15 @@ primitive; signals + graceful shutdown; orphan/stuck-`running` recovery). 4A and
   - [x] 4B-2 review round 3 — Codex Low (return-contract is *source-loop-clear*, not "fully complete"); doc + `source_loop_clear` rename
   - [x] 4B-2 coverage added (10 tests across driver, store, coordinator)
   - [x] 4B-2 reviewed — Codex signed off (3 rounds; no findings on the last pass)
-  - [x] Complete (code; pending deploy + the Phase-4 operator smoke-test)
+  - [x] Complete + live-validated (kill-9 orphan recovery on the host)
 
 ### Phase 4C — Cancelled terminal status (abort/orphan ≠ failure)
 
-**Status:** complete — 4C-1 + 4C-2 both Codex-signed-off; 4C-1 also
-**live-validated** (a `systemctl stop` mid-run produced the gray "Cancelled"
-check + "cancelled… re-run with `/benchmark`" comment on a real PR). Pending
-deploy + the kill-9 orphan smoke-test (which now concludes the orphan check too).
+**Status:** complete + **live-validated** — 4C-1 + 4C-2 both Codex-signed-off.
+A `systemctl stop` mid-run produced the gray "Cancelled" check + "re-run with
+`/benchmark`" comment; a `kill -9` + restart cleaned the orphan, cancelled the
+row, and concluded its stuck check as gray "Cancelled" with the "daemon
+restarted while this run was in progress" reason — both on real PRs.
 
 **Why:** before this, an operator-initiated abort *and* a crash-orphan both
 landed as `failed` — a red ✗ check that reads as "the benchmark broke" and
@@ -716,7 +719,7 @@ using it. No migration needed.
 - [x] 4C-2 implemented (orphan check-conclusion via `load_runnable` + reused `ProgressReporter::cancelled`)
 - [x] 4C-2 coverage added (3 new tests; 531 daemon+core green)
 - [x] 4C-2 reviewed — Codex signed off (added the existing-check-surfacing test)
-- [x] Complete (code; pending deploy + the kill-9 orphan smoke-test)
+- [x] Complete + live-validated (kill-9 orphan → row cancelled + check concluded gray)
 
 ---
 
@@ -754,12 +757,53 @@ cost, with one caveat about pre-claim jobs.
   residual work, shared with v4 Phase 3 — the two roadmaps converge here. The
   reporter is also the natural home for v4 Phase 3's placeholder/`skipped` checks.
 
-**Status:**
+**Status:** sub-sliced by value-at-`max=1`. **5.1 (queued "#N ahead")
+Codex-signed-off** (pending deploy + smoke-test). 5.2 (in-flight position) and 5.4 (resource-budget
+admission) are **deferred** — they only pay off at `max_concurrent > 1`, which
+isn't deployed; revisit when the knob is raised. 5.3 (PR-sync discoverability
+placeholder, the v4-Phase-3 convergence) is a separate, migration-bearing
+follow-up.
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
-- [ ] Reviewed — Codex signed off
-- [ ] Complete
+- **5.1 — queued "#N ahead" position (done):** a coordinator-side updater
+  (`update_queue_positions`, run each loop iteration after `fill_slots`) reports
+  each still-queued job its place. Key facts that made it migration-free:
+  `pr_comment`/`branch_push` jobs already carry their head SHA at enqueue, and
+  the existing `check_run_created` job-event already persists a check id for the
+  reporter to adopt. Mechanics:
+  - `JobStore::queued_jobs_ordered` (FIFO `created_at, id`, matching
+    `claim_next_queued`) + `RunnableJobStore::list_queued` (read-only assembly via
+    the shared `assemble_runnable`, `claim_token = None`).
+  - For queued job at index `i`, `ahead = in_flight + i` (runs that finish/claim
+    before it). `ensure_position_check` creates **or** updates a check in the
+    existing `in_progress` state with a "queued — N ahead" body — *not* a new
+    GitHub `queued` state, so the signed-off reporter is untouched and there's no
+    queued→in_progress transition gap; on claim the reporter adopts the same
+    check (id persisted) and phase updates replace the text.
+  - Restart-safe + dedup: mirrors the reporter's reconcile-or-create-and-persist
+    (`find_check_run_by_external_id` → reuse, else create + `set_check_run`). A
+    **failed persist returns `false`** (Codex review) so the position isn't
+    debounced — the next tick re-reconciles + retries recording the
+    `check_run_created` event the claim-time reporter reads back to adopt.
+  - An in-memory `last_positions` map suppresses redundant GitHub edits (only on
+    a position change) and is pruned to the live queue.
+  - **Eligibility:** only jobs whose `[reporting]` wants a check *and* that
+    already carry a head SHA (so a `tag_created` job, unresolved until claim, and
+    a comment-only/no-report job, get no pre-claim position check).
+  - Tests: `coordinator_reports_queue_positions_and_debounces`,
+    `coordinator_updates_existing_position_check_without_duplicating`,
+    `coordinator_skips_position_for_no_check_and_unresolved_jobs`,
+    `v2_source_list_queued_returns_queued_in_claim_order_readonly`.
+  - **Known caveat (for review):** an unbounded queue means one position check per
+    queued job per change; fine for realistic queues, but a `top-N` cap (with a
+    logged "+M more") is a natural follow-up if queues ever get deep.
+
+- [x] 5.1 implemented (queued "#N ahead" position; no migration)
+- [x] 5.1 review round 1 — Codex Medium (failed persist must un-debounce / retry) addressed
+- [x] 5.1 review round 2 — Codex Low (reconcile path: failed `update_check_run` returns `false`, mirroring the existing-check path)
+- [x] 5.1 coverage added (5 new tests; 536 daemon+core green)
+- [x] 5.1 reviewed — Codex signed off (2 review rounds; Medium + Low addressed)
+- [x] 5.1 complete (code; pending deploy + queue-behind-running smoke-test)
+- [ ] 5.2 / 5.3 / 5.4 — deferred (see status)
 
 ---
 

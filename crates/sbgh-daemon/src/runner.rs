@@ -9,13 +9,13 @@
 //! Check Run / comment per `[reporting]` + the terminal DB write) and runs the
 //! worker (the benchmark recipe) inline against it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use sbgh_core::config::DaemonConfig;
-use sbgh_core::github::GitHubApi;
+use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,7 @@ use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, Shell};
 use crate::progress::ProgressReporter;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
-use crate::reporter::{Prepared, Reporter};
+use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
@@ -133,6 +133,17 @@ impl Runner {
             {
                 coord.fill_slots().await;
             }
+            // Report each still-queued job its position (after fill_slots, so the
+            // queue is what genuinely remains). Skipped during drain — we're
+            // winding down, not advertising waits.
+            if !shutdown
+                .draining
+                .is_cancelled()
+            {
+                coord
+                    .update_queue_positions()
+                    .await;
+            }
             // Shutdown requested and nothing left in flight → we're done.
             if shutdown
                 .draining
@@ -190,6 +201,11 @@ struct Coordinator {
     /// abort cancels every in-flight run at once, while one job's own
     /// cancellation never propagates back up to siblings.
     abort: CancellationToken,
+    /// Phase 5: last queue position pushed per queued job id, so the position
+    /// updater only edits GitHub when a job's position actually changes (and
+    /// prunes entries once a job leaves the queue). In-memory only — a restart
+    /// just re-pushes once.
+    last_positions: HashMap<Uuid, usize>,
 }
 
 impl Coordinator {
@@ -200,6 +216,7 @@ impl Coordinator {
             tasks: JoinSet::new(),
             task_jobs: HashMap::new(),
             abort,
+            last_positions: HashMap::new(),
         }
     }
 
@@ -313,6 +330,186 @@ impl Coordinator {
         ProgressReporter::new(self.deps.gh.as_ref(), &job)
             .cancelled(ORPHAN_CHECK_REASON)
             .await;
+    }
+
+    /// Phase 5: report each waiting job its queue position on a Check Run.
+    /// Called each loop iteration after `fill_slots`, so `in_flight()` reflects
+    /// the just-claimed jobs and the queue is what genuinely remains. For a
+    /// queued job at index `i`, `ahead = in_flight + i` (the runs that finish
+    /// or get claimed before it). The check is created/refreshed in the
+    /// existing `in_progress` state with a "queued — N ahead" body; on
+    /// claim the reporter adopts the same check (its id is persisted) and
+    /// phase updates replace the text. Best-effort: a GitHub or DB hiccup
+    /// is logged, never fatal.
+    ///
+    /// The `last_positions` map suppresses redundant GitHub edits (only push
+    /// when a job's position changed) and is pruned to the current queue.
+    async fn update_queue_positions(&mut self) {
+        let queued = match self
+            .deps
+            .jobs
+            .list_queued()
+            .await
+        {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!(error = ?e, "queue-position: list_queued failed");
+                return;
+            }
+        };
+        let in_flight = self.in_flight();
+        let mut seen = HashSet::new();
+        for (i, job) in queued.iter().enumerate() {
+            // Only jobs whose `[reporting]` wants a check and that already carry
+            // a head SHA (PR / branch-push; a tag job resolves only at claim) get
+            // a pre-claim position check.
+            if job.commit.is_empty() || !wants_position_check(&self.deps.config.reporting, job) {
+                continue;
+            }
+            let ahead = in_flight + i;
+            seen.insert(job.id);
+            if self
+                .last_positions
+                .get(&job.id)
+                == Some(&ahead)
+            {
+                continue; // unchanged → no GitHub edit
+            }
+            if self
+                .ensure_position_check(job, ahead)
+                .await
+            {
+                self.last_positions
+                    .insert(job.id, ahead);
+            }
+        }
+        self.last_positions
+            .retain(|id, _| seen.contains(id));
+    }
+
+    /// Create-or-update the queued job's position Check Run (`in_progress`
+    /// state, "queued — N ahead" body). Mirrors the reporter's
+    /// reconcile-or-create-and- persist (restart-safe via
+    /// `find_check_run_by_external_id` + the persisted `check_run_created`
+    /// event) so a claim later *adopts* this check rather than duplicating
+    /// it. Returns whether the surface is now up to date.
+    async fn ensure_position_check(&self, job: &RunnableJob, ahead: usize) -> bool {
+        let gh = self.deps.gh.as_ref();
+        let existing = match job.progress {
+            ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
+            ProgressTarget::CommitCheck { check_run_id } => check_run_id,
+        };
+
+        // Already have a check (a prior tick / re-claim) → just refresh the text.
+        if let Some(id) = existing {
+            return match gh
+                .update_check_run(
+                    job.installation_id,
+                    &job.repository,
+                    id,
+                    CheckRunUpdate {
+                        state: CheckRunState::InProgress,
+                        output: queue_position_output(job.id, ahead),
+                    },
+                )
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(job_id = %job.id, error = ?e, "queue-position: update check failed (non-fatal)");
+                    false
+                }
+            };
+        }
+
+        // No check yet: reconcile (dedup a check stranded by a crash before its
+        // id was persisted), else create — persisting the id either way so the
+        // claim-time reporter adopts it.
+        let external_id = job.id.to_string();
+        if let Some(app_id) = resolved_app_id(&self.deps.app_id, gh).await
+            && let Ok(Some(found)) = gh
+                .find_check_run_by_external_id(
+                    job.installation_id,
+                    &job.repository,
+                    &job.commit,
+                    CHECK_NAME,
+                    app_id,
+                    &external_id,
+                )
+                .await
+        {
+            // Persist the id FIRST. If it doesn't land, report failure so the
+            // position isn't recorded in `last_positions` — the next tick
+            // re-reconciles and retries, rather than debouncing away the only
+            // chance to record the `check_run_created` event the claim-time
+            // reporter reads back to adopt this check.
+            if let Err(e) = self
+                .deps
+                .jobs
+                .set_check_run(job, found.id, found.html_url.as_deref())
+                .await
+            {
+                tracing::warn!(job_id = %job.id, check_run_id = found.id, error = ?e, "queue-position: persisting reconciled check id failed; will retry next tick");
+                return false;
+            }
+            // Refresh the text; mirror the existing-check path — a failed update
+            // returns `false` so the stale position isn't debounced and the next
+            // tick (now via the existing-check path, the id having persisted)
+            // retries.
+            return match gh
+                .update_check_run(
+                    job.installation_id,
+                    &job.repository,
+                    found.id,
+                    CheckRunUpdate {
+                        state: CheckRunState::InProgress,
+                        output: queue_position_output(job.id, ahead),
+                    },
+                )
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(job_id = %job.id, check_run_id = found.id, error = ?e, "queue-position: refreshing reconciled check text failed (non-fatal); will retry");
+                    false
+                }
+            };
+        }
+
+        match gh
+            .create_check_run(
+                job.installation_id,
+                &job.repository,
+                &job.commit,
+                CHECK_NAME,
+                &external_id,
+                CheckRunUpdate {
+                    state: CheckRunState::InProgress,
+                    output: queue_position_output(job.id, ahead),
+                },
+            )
+            .await
+        {
+            Ok(posted) => {
+                // Same as the reconcile path: a failed persist returns `false` so
+                // the next tick re-finds this check (via reconcile) and retries
+                // recording its id, instead of being debounced.
+                if let Err(e) = self
+                    .deps
+                    .jobs
+                    .set_check_run(job, posted.id, posted.html_url.as_deref())
+                    .await
+                {
+                    tracing::warn!(job_id = %job.id, check_run_id = posted.id, error = ?e, "queue-position: persisting created check id failed; will retry next tick (reconcile adopts the existing check)");
+                    return false;
+                }
+                true
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job.id, error = ?e, "queue-position: create check failed (non-fatal)");
+                false
+            }
+        }
     }
 
     /// Reclaim jobs stranded mid-claim (crash / preflight error between claim
@@ -542,6 +739,37 @@ async fn run_worker(
         .await;
 }
 
+/// Whether a queued job's `[reporting]` config wants a Check Run surface, so a
+/// pre-claim position check makes sense (Phase 5). PR jobs key off `pr_report`,
+/// baselines off `baseline_report`; comment-only / no-report jobs get none.
+fn wants_position_check(reporting: &sbgh_core::config::ReportingConfig, job: &RunnableJob) -> bool {
+    match job.progress {
+        ProgressTarget::PullRequest { .. } => reporting
+            .pr_report
+            .wants_check(),
+        ProgressTarget::CommitCheck { .. } => reporting
+            .baseline_report
+            .wants_check(),
+    }
+}
+
+/// The "queued — N ahead" Check Run output. `ahead` is the number of runs that
+/// will be claimed / finish before this one starts.
+fn queue_position_output(job_id: Uuid, ahead: usize) -> CheckRunOutput {
+    let summary = match ahead {
+        0 => "queued — next to run".to_string(),
+        1 => "queued — 1 run ahead".to_string(),
+        n => format!("queued — {n} runs ahead"),
+    };
+    CheckRunOutput {
+        title: format!("benchmark {job_id} — queued"),
+        summary,
+        text: Some(
+            "Waiting for an execution slot; this updates as the queue advances.".to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -581,6 +809,8 @@ mod tests {
         fail_list: std::sync::atomic::AtomicBool,
         /// The read-only view `load_runnable` returns (4C-2 orphan-check path).
         orphan_runnable: StdMutex<Option<RunnableJob>>,
+        /// The queued views `list_queued` returns (Phase 5 position path).
+        queued: StdMutex<Vec<RunnableJob>>,
     }
 
     impl FakeSource {
@@ -593,7 +823,12 @@ mod tests {
                 orphans: StdMutex::new(Vec::new()),
                 fail_list: std::sync::atomic::AtomicBool::new(false),
                 orphan_runnable: StdMutex::new(None),
+                queued: StdMutex::new(Vec::new()),
             }
+        }
+        /// Seed the queued views `list_queued` returns (Phase 5 position path).
+        fn set_queued(&self, jobs: Vec<RunnableJob>) {
+            *self.queued.lock().unwrap() = jobs;
         }
         /// Seed an orphaned `running` job id for the startup-recovery path.
         fn add_orphan(&self, id: Uuid) {
@@ -652,6 +887,13 @@ mod tests {
         async fn load_runnable(&self, _job_id: Uuid) -> anyhow::Result<Option<RunnableJob>> {
             Ok(self
                 .orphan_runnable
+                .lock()
+                .unwrap()
+                .clone())
+        }
+        async fn list_queued(&self) -> anyhow::Result<Vec<RunnableJob>> {
+            Ok(self
+                .queued
                 .lock()
                 .unwrap()
                 .clone())
@@ -1301,6 +1543,9 @@ mod tests {
         async fn load_runnable(&self, _job_id: Uuid) -> anyhow::Result<Option<RunnableJob>> {
             Ok(None)
         }
+        async fn list_queued(&self) -> anyhow::Result<Vec<RunnableJob>> {
+            Ok(vec![])
+        }
         async fn start_running(
             &self,
             _job: &RunnableJob,
@@ -1679,6 +1924,168 @@ mod tests {
             sbgh_core::github::CheckRunState::Completed(
                 sbgh_core::github::CheckRunConclusion::Cancelled
             ),
+        );
+    }
+
+    /// Build a `Coordinator` over a `FakeSource` for the queue-position tests.
+    fn position_coord(
+        config: DaemonConfig,
+        source: Arc<FakeSource>,
+        gh: Arc<FakeGitHub>,
+    ) -> Coordinator {
+        let deps = JobDeps {
+            config: Arc::new(config),
+            jobs: source,
+            gh,
+            shell: Arc::new(RecordingShell::new()),
+            app_id: Arc::new(OnceCell::new()),
+        };
+        Coordinator::new(deps, 1, CancellationToken::new())
+    }
+
+    fn create_summary_for(gh: &FakeGitHub, job_id: Uuid) -> Option<String> {
+        gh.calls()
+            .into_iter()
+            .find_map(|c| match c {
+                FakeCall::CreateCheckRun { external_id, output, .. }
+                    if external_id == job_id.to_string() =>
+                {
+                    Some(output.summary)
+                }
+                _ => None,
+            })
+    }
+
+    fn create_count(gh: &FakeGitHub) -> usize {
+        gh.calls()
+            .iter()
+            .filter(|c| matches!(c, FakeCall::CreateCheckRun { .. }))
+            .count()
+    }
+
+    /// Phase 5: the coordinator reports each queued job its position on a
+    /// freshly created (and persisted, so the claim-time reporter adopts
+    /// it) check, with text matching claim order. A second pass with
+    /// unchanged positions makes NO new GitHub edits (the `last_positions`
+    /// debounce).
+    #[tokio::test]
+    async fn coordinator_reports_queue_positions_and_debounces() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+        let j0 = pr_job("sha0", None);
+        let j1 = pr_job("sha1", None);
+        let source = Arc::new(FakeSource::new(pr_job("unused", None)));
+        source.set_queued(vec![j0.clone(), j1.clone()]);
+        let gh = Arc::new(FakeGitHub::new());
+        let mut coord = position_coord(config, source.clone(), gh.clone());
+
+        coord
+            .update_queue_positions()
+            .await;
+
+        // in_flight = 0 → ahead = index. Position text matches claim order.
+        assert_eq!(create_summary_for(&gh, j0.id).as_deref(), Some("queued — next to run"));
+        assert_eq!(create_summary_for(&gh, j1.id).as_deref(), Some("queued — 1 run ahead"));
+        assert_eq!(create_count(&gh), 2);
+        // Each created check's id was persisted so a later claim adopts it.
+        assert_eq!(
+            source
+                .calls()
+                .iter()
+                .filter(|c| **c == "set_check_run")
+                .count(),
+            2,
+        );
+
+        // Second pass, unchanged queue → debounced (no new creates).
+        coord
+            .update_queue_positions()
+            .await;
+        assert_eq!(create_count(&gh), 2, "unchanged positions make no new GitHub edits");
+    }
+
+    /// A queued job that already has a check (persisted by a prior tick / read
+    /// back on re-claim) is **updated**, never duplicated.
+    #[tokio::test]
+    async fn coordinator_updates_existing_position_check_without_duplicating() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("unused", None)));
+        source.set_queued(vec![pr_job("sha", Some(900))]);
+        let gh = Arc::new(FakeGitHub::new());
+        let mut coord = position_coord(config, source.clone(), gh.clone());
+
+        coord
+            .update_queue_positions()
+            .await;
+
+        assert!(
+            gh.calls()
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateCheckRun { check_run_id: 900, .. })),
+            "the existing check was updated",
+        );
+        assert_eq!(create_count(&gh), 0, "must update, not create a duplicate");
+    }
+
+    /// Eligibility: a baseline job whose `baseline_report` wants no check, and
+    /// a job with an unresolved commit (a tag job pre-claim), both get NO
+    /// pre-claim position check.
+    #[tokio::test]
+    async fn coordinator_skips_position_for_no_check_and_unresolved_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+        let baseline = RunnableJob {
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            ..pr_job("sha", None)
+        };
+        let unresolved = RunnableJob {
+            commit: String::new(),
+            ..pr_job("sha", None)
+        };
+        let source = Arc::new(FakeSource::new(pr_job("unused", None)));
+        source.set_queued(vec![baseline, unresolved]);
+        let gh = Arc::new(FakeGitHub::new());
+        let mut coord = position_coord(config, source.clone(), gh.clone());
+
+        coord
+            .update_queue_positions()
+            .await;
+
+        assert!(
+            gh.calls().is_empty(),
+            "no-check + unresolved-commit jobs get no position check, got {:?}",
+            gh.calls(),
+        );
+    }
+
+    /// Codex 5.1 Medium: if persisting the check id fails after GitHub create,
+    /// the position must NOT be recorded as up-to-date — otherwise the debounce
+    /// would suppress the only retry that records the `check_run_created` event
+    /// the claim-time reporter adopts. So a second tick still retries.
+    #[tokio::test]
+    async fn coordinator_retries_position_check_when_persist_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("unused", None)));
+        source.set_queued(vec![pr_job("sha", None)]);
+        source.fail_persist(); // set_check_run errors
+        let gh = Arc::new(FakeGitHub::new());
+        let mut coord = position_coord(config, source.clone(), gh.clone());
+
+        coord
+            .update_queue_positions()
+            .await;
+        coord
+            .update_queue_positions()
+            .await;
+
+        // A failed persist isn't recorded in `last_positions`, so the position
+        // wasn't debounced — the second tick attempted the check again.
+        assert_eq!(
+            create_count(&gh),
+            2,
+            "a persist failure must leave the position un-debounced so it retries",
         );
     }
 }

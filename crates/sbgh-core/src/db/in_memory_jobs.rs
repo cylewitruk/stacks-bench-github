@@ -486,6 +486,23 @@ impl JobStore for InMemoryJobStore {
             .collect())
     }
 
+    async fn queued_jobs_ordered(&self) -> Result<Vec<Job>> {
+        let s = self.state.lock().unwrap();
+        let mut queued: Vec<Job> = s
+            .jobs
+            .values()
+            .filter(|j| j.status == JobStatus::Queued)
+            .cloned()
+            .collect();
+        // Match `claim_next_queued`'s `ORDER BY created_at, id`.
+        queued.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.id.cmp(&b.id))
+        });
+        Ok(queued)
+    }
+
     async fn cancel_orphan(&self, job_id: Uuid, remark: &str) -> Result<bool> {
         // Mirror the Postgres path: unconditional running→cancelled (no claim
         // guard) + a `cancelled` event, idempotent on a re-run.

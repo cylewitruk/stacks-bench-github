@@ -357,6 +357,66 @@ async fn v2_source_load_runnable_surfaces_existing_check_for_conclusion() {
     assert!(loaded.claim_token.is_none(), "still read-only");
 }
 
+/// Phase 5: `list_queued` returns every `queued` job in **claim order**
+/// (`created_at, id`), as read-only views (no claim taken, rows stay queued) —
+/// the input to the coordinator's queue-position reporting.
+#[tokio::test]
+async fn v2_source_list_queued_returns_queued_in_claim_order_readonly() {
+    let (_db, pool) = setup_pg_db().await;
+    let webhook_id = seed(&pool, 100, 10).await;
+    let store = Arc::new(PostgresJobStore::new(pool.clone()));
+    enqueue_branch_push(&store, webhook_id).await;
+    // A second queued job via a distinct webhook.
+    let wh2: i64 = sqlx::query_scalar(
+        "INSERT INTO github_webhook (delivery_id, event_type, payload_size_bytes) VALUES \
+         ('v2-source-2', 'push', 0) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    enqueue_branch_push(&store, wh2).await;
+
+    let source = JobSource::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+    );
+
+    // Force a deterministic claim order: make one row strictly older.
+    let ids: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM job WHERE status = 'queued' ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ids.len(), 2);
+    sqlx::query("UPDATE job SET created_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
+        .bind(ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let queued = source
+        .list_queued()
+        .await
+        .unwrap();
+    assert_eq!(queued.len(), 2, "both queued jobs listed");
+    assert_eq!(queued[0].id, ids[0], "older job first (matches claim order)");
+    assert_eq!(queued[1].id, ids[1]);
+    assert!(
+        queued
+            .iter()
+            .all(|j| j.claim_token.is_none()),
+        "read-only — no claim taken"
+    );
+
+    // Read-only: both rows are still queued.
+    let still_queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job WHERE status = 'queued'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(still_queued, 2, "list_queued must not transition any row");
+}
+
 #[tokio::test]
 async fn v2_source_fail_records_event_and_forensics_result() {
     let (_db, pool) = setup_pg_db().await;

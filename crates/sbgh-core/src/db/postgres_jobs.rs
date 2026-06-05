@@ -488,6 +488,24 @@ impl JobStore for PostgresJobStore {
         Ok(ids)
     }
 
+    async fn queued_jobs_ordered(&self) -> Result<Vec<Job>> {
+        // Same ordering as `claim_next_queued` so the reported position matches
+        // the order jobs are actually claimed.
+        let rows = sqlx::query_as::<_, Job>(
+            r#"
+            SELECT id, github_installation_id, github_repo_id, status, job_kind,
+                   trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
+                   git_committed_at, claim_token, claimed_at, created_at, updated_at
+              FROM job
+             WHERE status = 'queued'
+          ORDER BY created_at, id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn cancel_orphan(&self, job_id: Uuid, remark: &str) -> Result<bool> {
         // No claim-token guard (see trait docs): startup-only, the original
         // claimer is dead, so an unconditional running→cancelled is safe and a

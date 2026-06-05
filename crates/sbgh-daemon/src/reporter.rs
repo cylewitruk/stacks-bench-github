@@ -737,6 +737,9 @@ mod tests {
         async fn load_runnable(&self, _job_id: uuid::Uuid) -> anyhow::Result<Option<RunnableJob>> {
             Ok(None)
         }
+        async fn list_queued(&self) -> anyhow::Result<Vec<RunnableJob>> {
+            Ok(vec![])
+        }
         async fn start_running(
             &self,
             _job: &RunnableJob,

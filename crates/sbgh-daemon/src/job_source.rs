@@ -100,6 +100,11 @@ pub trait RunnableJobStore: Send + Sync + 'static {
     /// is gone.
     async fn load_runnable(&self, job_id: Uuid) -> anyhow::Result<Option<RunnableJob>>;
 
+    /// All `queued` jobs in claim order, as read-only [`RunnableJob`] views
+    /// (`claim_token = None`). Phase 5: the coordinator reports each waiting
+    /// job its queue position on a check. Empty when nothing is queued.
+    async fn list_queued(&self) -> anyhow::Result<Vec<RunnableJob>>;
+
     /// Mark the job as actually running, persisting a commit resolved
     /// during preflight (if any): `claimed → running` carrying the
     /// resolved commit under the claim-token guard. A `ResolvedCommit`
@@ -222,6 +227,22 @@ impl RunnableJobStore for JobSource {
             self.assemble_runnable(job, None)
                 .await?,
         ))
+    }
+
+    async fn list_queued(&self) -> anyhow::Result<Vec<RunnableJob>> {
+        let mut out = Vec::new();
+        for job in self
+            .jobs
+            .queued_jobs_ordered()
+            .await?
+        {
+            // Read-only assembly, claim order preserved (`claim_token = None`).
+            out.push(
+                self.assemble_runnable(job, None)
+                    .await?,
+            );
+        }
+        Ok(out)
     }
 
     async fn start_running(

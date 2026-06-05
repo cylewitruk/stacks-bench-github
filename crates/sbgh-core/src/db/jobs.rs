@@ -207,6 +207,11 @@ pub trait JobStore: Send + Sync + 'static {
     /// cleans each one's leaked VM and terminal-cancels the row at startup.
     async fn running_job_ids(&self) -> Result<Vec<Uuid>>;
 
+    /// roadmap-v5 Phase 5: all `queued` jobs in **claim order** (the same
+    /// `ORDER BY created_at, id` `claim_next_queued` picks from), so the
+    /// coordinator can report each waiting job its queue position. Read-only.
+    async fn queued_jobs_ordered(&self) -> Result<Vec<Job>>;
+
     /// Orphan recovery (4B-2 + 4C): terminal-**cancel** a job stranded in
     /// `running` by a dead daemon, with NO claim-token guard. The daemon that
     /// claimed it is gone, and this runs at startup before the coordinator
