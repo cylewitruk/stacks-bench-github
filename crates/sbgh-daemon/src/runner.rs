@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::github::GitHubApi;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -23,7 +24,7 @@ use uuid::Uuid;
 use crate::bench_recipe::BenchRecipe;
 use crate::events::{ChannelSink, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
-use crate::libvirt::Shell;
+use crate::libvirt::{LibvirtDriver, Shell};
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 use crate::reporter::{Prepared, Reporter};
 use crate::shutdown::Shutdown;
@@ -43,6 +44,13 @@ const CLAIM_LEASE_MINUTES: i64 = 5;
 /// transitions are few and heartbeats are droppable, so a small buffer
 /// absorbs bursts without ever stalling the worker for long.
 const EVENT_BUFFER: usize = 32;
+
+/// Terminal remark stamped on a job recovered from `running` at startup — a
+/// crash/kill orphaned it (no result, possibly a leaked VM we just cleaned).
+/// We **cancel** rather than re-run (Phase 4C): a crash-orphan is
+/// re-triggerable, not a benchmark failure, and a crash mid-run may recur. PR
+/// jobs are re-triggered with `/benchmark`; baselines by the next push.
+const ORPHAN_REMARK: &str = "recovered: orphaned in `running` by a daemon restart/crash";
 
 /// The runner's shared handles, cloned into each job task so it can run on its
 /// own (spawned) without borrowing the coordinator.
@@ -101,6 +109,15 @@ impl Runner {
         // The job tasks get child tokens of `abort`, so an abort cancels them
         // all at once.
         let mut coord = Coordinator::new(self.deps, self.max_concurrent, shutdown.abort.clone());
+        // One-time startup recovery (Phase 4B-2 + 4C): any job still `running`
+        // is an orphan from a crashed/killed prior daemon — clean its leaked VM
+        // and terminal-cancel the row before we start claiming fresh work. A
+        // failure to even *enumerate* running rows is startup-critical (we can't
+        // rule out live orphan VMs), so it propagates → the process exits and
+        // systemd `Restart=on-failure` retries rather than claiming blind.
+        coord
+            .recover_orphans()
+            .await?;
         loop {
             coord.sweep(lease).await;
             // Once a drain/abort is requested, stop pulling new work; queued
@@ -187,6 +204,76 @@ impl Coordinator {
     /// the semaphore, not this count.
     fn in_flight(&self) -> usize {
         self.tasks.len()
+    }
+
+    /// Recover jobs orphaned in `running` by a crashed/killed prior daemon
+    /// (Phase 4B-2). Runs ONCE at startup, before any fresh claim, so every
+    /// `running` row is necessarily an orphan (this daemon has started none of
+    /// its own yet). For each: clean the leaked VM via the handle-less
+    /// [`LibvirtDriver::cleanup_by_job_id`], THEN terminal-**cancel** the row
+    /// (Phase 4C — a crash-orphan is re-triggerable, not a failure) — that
+    /// order is crash-safe (a crash mid-recovery re-lists the
+    /// still-`running` job next boot, so cleanup re-runs idempotently and
+    /// no VM is leaked behind a terminal row).
+    ///
+    /// v5 is bench-only, so recovery dispatches straight to the libvirt driver;
+    /// v6's task-kind split would pick the cleanup by the orphan's stored kind.
+    ///
+    /// Errors only on a failure to **enumerate** running rows (startup-critical
+    /// — see [`Runner::run`]). Per-orphan failures are non-fatal: an orphan
+    /// whose VM couldn't be fully cleaned is left `running` (not cancelled) so
+    /// the next boot retries — cancelling it would strand whatever cleanup
+    /// preserved (e.g. an undetachable source loop) with no handle back to it.
+    async fn recover_orphans(&self) -> anyhow::Result<()> {
+        let ids = self
+            .deps
+            .jobs
+            .running_job_ids()
+            .await
+            .context(
+                "orphan recovery: enumerating `running` jobs failed; refusing to claim with \
+                 possibly-live orphan VMs",
+            )?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(
+            count = ids.len(),
+            "recovering jobs orphaned in `running` by a prior daemon"
+        );
+        let driver = LibvirtDriver::new(self.deps.config.clone(), self.deps.shell.clone());
+        for id in ids {
+            // Clean BEFORE cancelling the row. If cleanup couldn't fully clear
+            // the VM (a source loop may still be attached, its backing file
+            // preserved), leave the row `running` so the next boot retries —
+            // cancelling it now would lose the only handle back to the leak.
+            if !driver
+                .cleanup_by_job_id(&id.to_string())
+                .await
+            {
+                tracing::error!(
+                    job_id = %id,
+                    "orphan cleanup incomplete; leaving job `running` to retry recovery next boot",
+                );
+                continue;
+            }
+            match self
+                .deps
+                .jobs
+                .cancel_orphan(id, ORPHAN_REMARK)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(job_id = %id, "recovered orphaned `running` job (cancelled)")
+                }
+                // Raced off `running` between list and cancel — nothing to do.
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(error = ?e, job_id = %id, "orphan recovery: cancel_orphan failed")
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reclaim jobs stranded mid-claim (crash / preflight error between claim
@@ -449,6 +536,10 @@ mod tests {
         /// Force `set_check_run` / `set_comment_id` to error — for testing that
         /// a persistence failure is non-fatal (the job still terminalizes).
         fail_persist: std::sync::atomic::AtomicBool,
+        /// Job ids `running_job_ids` reports as orphans (Phase 4B-2 recovery).
+        orphans: StdMutex<Vec<Uuid>>,
+        /// Force `running_job_ids` to error — the startup-critical path.
+        fail_list: std::sync::atomic::AtomicBool,
     }
 
     impl FakeSource {
@@ -458,7 +549,21 @@ mod tests {
                 calls: StdMutex::new(Vec::new()),
                 started_commit: StdMutex::new(None),
                 fail_persist: std::sync::atomic::AtomicBool::new(false),
+                orphans: StdMutex::new(Vec::new()),
+                fail_list: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+        /// Seed an orphaned `running` job id for the startup-recovery path.
+        fn add_orphan(&self, id: Uuid) {
+            self.orphans
+                .lock()
+                .unwrap()
+                .push(id);
+        }
+        /// Make `running_job_ids` error, exercising the startup-critical path.
+        fn fail_list(&self) {
+            self.fail_list
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn fail_persist(&self) {
             self.fail_persist
@@ -522,6 +627,10 @@ mod tests {
             self.record("fail");
             Ok(())
         }
+        async fn cancel(&self, _job: &RunnableJob, _remark: &str) -> anyhow::Result<()> {
+            self.record("cancel");
+            Ok(())
+        }
         async fn set_comment_id(&self, _job: &RunnableJob, _comment_id: i64) -> anyhow::Result<()> {
             self.record("set_comment_id");
             if self
@@ -549,6 +658,23 @@ mod tests {
         }
         async fn sweep_stuck_claims(&self, _lease: chrono::Duration) -> anyhow::Result<u64> {
             Ok(0)
+        }
+        async fn running_job_ids(&self) -> anyhow::Result<Vec<Uuid>> {
+            if self
+                .fail_list
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("forced running_job_ids failure");
+            }
+            Ok(self
+                .orphans
+                .lock()
+                .unwrap()
+                .clone())
+        }
+        async fn cancel_orphan(&self, _job_id: Uuid, _remark: &str) -> anyhow::Result<bool> {
+            self.record("cancel_orphan");
+            Ok(true)
         }
     }
 
@@ -1151,6 +1277,9 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn cancel(&self, _: &RunnableJob, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn set_comment_id(&self, _: &RunnableJob, _: i64) -> anyhow::Result<()> {
             Ok(())
         }
@@ -1161,6 +1290,12 @@ mod tests {
             _: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+        async fn running_job_ids(&self) -> anyhow::Result<Vec<Uuid>> {
+            Ok(vec![])
+        }
+        async fn cancel_orphan(&self, _: Uuid, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
         }
     }
 
@@ -1291,5 +1426,133 @@ mod tests {
             "drained: the queued job was never claimed/started, got {:?}",
             source.calls(),
         );
+    }
+
+    /// Startup recovery (Phase 4B-2 + 4C): a job left `running` by a crashed
+    /// daemon is cleaned (the coordinator runs `cleanup_by_job_id` — observed
+    /// as a `virsh destroy` on the shell) and terminal-cancelled
+    /// (`cancel_orphan`) before the loop starts claiming. Driven with a
+    /// pre-set drain so the loop exits straight after recovery.
+    #[tokio::test]
+    async fn startup_recovers_orphaned_running_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+        source.add_orphan(Uuid::new_v4());
+
+        // `cleanup_by_job_id` for an orphan with no loop attached issues seven
+        // shell calls: destroy, undefine, umount(tmpfs), umount(source.mnt),
+        // losetup -j (empty), lvremove, git prune.
+        let shell = Arc::new(RecordingShell::new());
+        shell
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount tmpfs
+            .expect_ok(1) // umount source.mnt
+            .reply(PreparedReply::with_stdout("")) // losetup -j → nothing attached
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git prune
+
+        let runner =
+            Runner::new(config, source.clone(), Arc::new(FakeGitHub::new()), shell.clone());
+        let shutdown = Shutdown::new();
+        shutdown.draining.cancel(); // skip the claim loop — we exercise only startup recovery
+
+        runner
+            .run(shutdown)
+            .await
+            .unwrap();
+
+        // Recovery cleaned the leaked VM …
+        assert!(
+            shell.calls().iter().any(|c| {
+                c.program.ends_with("virsh")
+                    && c.args
+                        .iter()
+                        .any(|a| a == "destroy")
+            }),
+            "recovery ran cleanup_by_job_id (virsh destroy) for the orphan",
+        );
+        // … and terminal-cancelled the orphaned row.
+        assert!(
+            source
+                .calls()
+                .contains(&"cancel_orphan"),
+            "recovery terminal-cancelled the orphan via cancel_orphan, got {:?}",
+            source.calls(),
+        );
+    }
+
+    /// Codex 4B-2 Medium: if `cleanup_by_job_id` can't fully clear the VM (the
+    /// source loop won't detach), the orphan must be LEFT `running` (no
+    /// `cancel_orphan`) so the next boot retries — and a per-orphan failure
+    /// stays non-fatal (the loop still runs to a clean exit).
+    #[tokio::test]
+    async fn startup_leaves_orphan_running_when_cleanup_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+        source.add_orphan(Uuid::new_v4());
+
+        // `losetup -j` lists a device whose `-d` FAILS → cleanup reports incomplete.
+        let shell = Arc::new(RecordingShell::new());
+        shell
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount tmpfs
+            .expect_ok(1) // umount source.mnt
+            .reply(PreparedReply::with_stdout("/dev/loop9: [2049]:1 (j/source.raw)\n")) // losetup -j
+            .reply(PreparedReply::fail("device or resource busy")) // losetup -d fails
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git prune
+
+        let runner =
+            Runner::new(config, source.clone(), Arc::new(FakeGitHub::new()), shell.clone());
+        let shutdown = Shutdown::new();
+        shutdown.draining.cancel();
+
+        runner
+            .run(shutdown)
+            .await
+            .unwrap(); // per-orphan failure is non-fatal
+
+        assert!(
+            !source
+                .calls()
+                .contains(&"cancel_orphan"),
+            "an incompletely-cleaned orphan must be left `running`, not cancelled; got {:?}",
+            source.calls(),
+        );
+    }
+
+    /// Codex 4B-2 Medium: failure to even *enumerate* running rows is
+    /// startup-critical (we can't rule out live orphan VMs), so it propagates —
+    /// the runner returns `Err` (process exits → systemd retries) and never
+    /// claims fresh work.
+    #[tokio::test]
+    async fn startup_recovery_aborts_when_listing_running_jobs_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+        source.fail_list(); // running_job_ids errors
+
+        let runner = Runner::new(
+            config,
+            source.clone(),
+            Arc::new(FakeGitHub::new()),
+            Arc::new(RecordingShell::new()),
+        );
+        let shutdown = Shutdown::new();
+        shutdown.draining.cancel(); // even mid-drain, recovery runs first and must abort
+
+        let err = runner
+            .run(shutdown)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("enumerating `running` jobs failed"),
+            "list failure is startup-critical and propagates, got: {err:#}",
+        );
+        assert!(source.calls().is_empty(), "aborted before any claim, got {:?}", source.calls(),);
     }
 }

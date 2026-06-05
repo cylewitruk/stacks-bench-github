@@ -192,6 +192,32 @@ pub trait JobStore: Send + Sync + 'static {
     /// `Ok(false)` on a stale-claim guard miss.
     async fn fail_job(&self, failure: &JobFailure) -> Result<bool>;
 
+    /// roadmap-v5 Phase 4C: atomic **cancellation** — a deliberately-stopped
+    /// run (operator shutdown/abort), distinct from a failure. Guarded by
+    /// `(job_id, claim_token, status IN ('claimed','running'))` like `fail_job`
+    /// (an abort can land before *or* after the run started); transitions to
+    /// `cancelled` and appends a `cancelled` `job_event` with `remark`. No
+    /// forensics `job_result` (a cancelled run produced none). Returns
+    /// `Ok(false)` on a stale-claim guard miss.
+    async fn cancel_job(&self, job_id: Uuid, claim_token: Uuid, remark: &str) -> Result<bool>;
+
+    /// Orphan recovery (roadmap-v5 Phase 4B-2): every job id currently in
+    /// `running`. After a crash/restart these are necessarily orphans — a
+    /// freshly-started daemon has no running jobs of its own — so the runner
+    /// cleans each one's leaked VM and terminal-cancels the row at startup.
+    async fn running_job_ids(&self) -> Result<Vec<Uuid>>;
+
+    /// Orphan recovery (4B-2 + 4C): terminal-**cancel** a job stranded in
+    /// `running` by a dead daemon, with NO claim-token guard. The daemon that
+    /// claimed it is gone, and this runs at startup before the coordinator
+    /// claims anything, so there's no live writer to race — an unconditional
+    /// `running → cancelled` (plus a `cancelled` event carrying `remark`) is
+    /// safe. A crash-orphan is re-triggerable, not a benchmark failure, so it's
+    /// `cancelled` not `failed`. Returns `Ok(false)` if the row wasn't
+    /// `running` (already recovered / gone), making a re-run after a
+    /// mid-recovery crash idempotent.
+    async fn cancel_orphan(&self, job_id: Uuid, remark: &str) -> Result<bool>;
+
     /// Slice 10: read the `queued` timeline event for a job (carries the
     /// trigger provenance + `bench_args` the daemon forwards to
     /// the run). `None` if the job has no queued event (shouldn't happen

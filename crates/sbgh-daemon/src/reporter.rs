@@ -294,22 +294,23 @@ impl Reporter {
             }
             Terminal::Aborted => {
                 // Operator shutdown/abort (Phase 4): the run already tore its
-                // host artifacts down. Record a terminal failure — a clean ✗,
-                // re-triggerable.
+                // host artifacts down. Record a terminal **cancellation** (4C) —
+                // a deliberately-stopped run, not a failure: status `cancelled`
+                // + a neutral-gray check, re-triggerable.
                 let msg = "aborted by shutdown";
                 tracing::warn!(job_id = %self.job.id, "{msg}");
                 if let Err(e) = self
                     .jobs
-                    .fail(&self.job, msg, None)
+                    .cancel(&self.job, msg)
                     .await
                 {
-                    // The terminal-fail write didn't land — the job may still be
+                    // The terminal write didn't land — the job may still be
                     // `running`. Surface it loudly + back off rather than
                     // reporting the job as cleanly handled.
-                    tracing::error!(job_id = %self.job.id, error = ?e, "persisting aborted terminal failed");
+                    tracing::error!(job_id = %self.job.id, error = ?e, "persisting cancelled terminal failed");
                     return Some(e);
                 }
-                reporter.failed(msg).await;
+                reporter.cancelled(msg).await;
                 None
             }
         }
@@ -761,6 +762,10 @@ mod tests {
             self.rec("fail");
             Ok(())
         }
+        async fn cancel(&self, _job: &RunnableJob, _remark: &str) -> anyhow::Result<()> {
+            self.rec("cancel");
+            Ok(())
+        }
         async fn set_comment_id(&self, _job: &RunnableJob, _id: i64) -> anyhow::Result<()> {
             Ok(())
         }
@@ -771,6 +776,12 @@ mod tests {
             _url: Option<&str>,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+        async fn running_job_ids(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
+            Ok(vec![])
+        }
+        async fn cancel_orphan(&self, _job_id: uuid::Uuid, _remark: &str) -> anyhow::Result<bool> {
+            Ok(false)
         }
     }
 
@@ -867,6 +878,61 @@ mod tests {
         assert!(
             calls.contains(&"fail"),
             "the orphaned `running` job must be terminal-failed, got {calls:?}"
+        );
+    }
+
+    /// Phase 4C: a `Terminal::Aborted` (operator shutdown) is recorded as a
+    /// **cancellation**, not a failure — the store sees `cancel` (not `fail`)
+    /// and the Check Run is concluded `cancelled` (neutral-gray), not
+    /// `failure`.
+    #[tokio::test]
+    async fn aborted_terminal_cancels_the_job_and_check() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let gh = Arc::new(FakeGitHub::new());
+        let reporter = Reporter::new(
+            Arc::new(no_report_config(&tmp)),
+            store.clone(),
+            gh.clone(),
+            Arc::new(OnceCell::new()),
+            // Pre-resolved commit; a check id already on the job (as if read
+            // back on re-claim) so the cancelled conclusion has a target.
+            job_with(ProgressTarget::CommitCheck { check_run_id: Some(900) }),
+        );
+
+        // Deliver a single `Finished(Aborted)`, then close the channel.
+        let (events_tx, events_rx) = mpsc::channel(4);
+        events_tx
+            .send(WorkerEvent::Finished(Terminal::Aborted))
+            .await
+            .unwrap();
+        drop(events_tx);
+        let (prepared_tx, _prepared_rx) = oneshot::channel();
+
+        let result = reporter
+            .run(events_rx, prepared_tx)
+            .await;
+        assert!(result.is_ok(), "a clean abort terminalizes without backoff");
+
+        // Store recorded `cancel`, never `fail`.
+        let calls = store.calls();
+        assert!(calls.contains(&"cancel"), "abort records a cancellation, got {calls:?}");
+        assert!(!calls.contains(&"fail"), "abort must NOT record a failure, got {calls:?}");
+
+        // The check was concluded `cancelled` (neutral-gray), not `failure`.
+        let concluded = gh
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                FakeCall::UpdateCheckRun { check_run_id: 900, state, .. } => Some(state),
+                _ => None,
+            })
+            .expect("the check was concluded");
+        assert_eq!(
+            concluded,
+            sbgh_core::github::CheckRunState::Completed(
+                sbgh_core::github::CheckRunConclusion::Cancelled
+            ),
         );
     }
 

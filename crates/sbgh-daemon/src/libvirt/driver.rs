@@ -789,6 +789,214 @@ impl LibvirtDriver {
             tracing::warn!(error = %e, "job dir cleanup failed");
         }
     }
+
+    /// Best-effort, idempotent teardown of every per-job artifact addressed
+    /// purely by `job_id` — no live [`JobArtifacts`] handle required. This is
+    /// the orphan-recovery primitive (roadmap-v5 Phase 4B-2): a hard-killed
+    /// daemon or dead reporter can leave a VM plus its disks/mounts behind with
+    /// no driver to run the normal [`teardown`](Self::teardown). Every step is
+    /// logged-and-continued, so a missing artifact (already gone, or never
+    /// created) never blocks the rest.
+    ///
+    /// Order mirrors `teardown`, with the two reconstruct-from-id wrinkles the
+    /// handle path gets for free: the source `source.mnt` is unmounted and its
+    /// dynamically-named loop device is found via `losetup -j <source.raw>` and
+    /// detached **before** the job dir (with the backing file) is removed.
+    ///
+    /// The return value tracks **only the source loop device** — *not* whether
+    /// every artifact was removed. `true` means the loop is verified gone, so
+    /// deleting the job dir (with `source.raw`) and failing the row are safe;
+    /// `false` means it couldn't be verified-gone, so the job dir — hence
+    /// `source.raw`, the only handle to re-find the loop — is **preserved** and
+    /// the caller MUST leave the row `running` for the next boot to retry
+    /// (else failing it would strand a leaked loop with no way back to it).
+    ///
+    /// The loop is singled out because it's the one artifact whose recovery
+    /// *needs* the backing file: every other step (domain destroy/undefine,
+    /// tmpfs/`source.mnt` unmount, `lvremove`, git ref prune) is id-addressable
+    /// without it, so those stay best-effort — a transient failure is logged
+    /// and does **not** hold the row `running` (we don't want to wedge the
+    /// job lifecycle on a flaky `lvremove`/`virsh`; the next op or an
+    /// operator reclaims the stray resource).
+    pub async fn cleanup_by_job_id(&self, job_id: &str) -> bool {
+        let domain_name = format!("sbgh-{job_id}");
+        let job_dir = self
+            .config
+            .paths
+            .jobs_dir
+            .join(job_id);
+        tracing::info!(job_id, domain = domain_name, "orphan cleanup: starting");
+
+        // 1. Domain: destroy a still-running VM, then drop its inactive definition.
+        //    Both are unconditional — a destroy/undefine of an already-off/absent
+        //    domain is a harmless non-zero we just log.
+        if let Err(e) = virsh::destroy(self.shell.as_ref(), &self.config.paths, &domain_name).await
+        {
+            tracing::warn!(error = %e, domain = domain_name, "orphan cleanup: virsh destroy failed");
+        }
+        if let Err(e) = virsh::undefine(self.shell.as_ref(), &self.config.paths, &domain_name).await
+        {
+            tracing::warn!(error = %e, domain = domain_name, "orphan cleanup: virsh undefine failed");
+        }
+
+        // 2. Results tmpfs (lives under results_tmpfs_root/<job-id>, OUTSIDE the job
+        //    dir, so `remove_dir_all(job_dir)` below won't reach it).
+        let tmpfs_dir = self
+            .config
+            .paths
+            .results_tmpfs_root
+            .join(job_id);
+        self.umount_best_effort(&tmpfs_dir, "results tmpfs")
+            .await;
+        let _ = std::fs::remove_dir(&tmpfs_dir);
+
+        // 3. Source disk: unmount `source.mnt` (a crash can leave it mounted) and
+        //    detach the loop device. The `losetup -fP` device name is dynamic
+        //    (`/dev/loopN`), so it's only recoverable by querying the job-id-named
+        //    backing file — the piece the 4A cleanup lacked. `source_loop_clear` gates
+        //    the job-dir removal below: never delete `source.raw` while a loop that
+        //    needs it to be re-found may still be attached.
+        self.umount_best_effort(&job_dir.join("source.mnt"), "source.mnt")
+            .await;
+        let source_loop_clear = self
+            .detach_source_loop(&job_dir.join("source.raw"))
+            .await;
+
+        // 4. Chainstate LVM snapshot: lvremove --force <vg>/sbgh-<job-id>-chainstate.
+        let target = format!("{}/sbgh-{job_id}-chainstate", self.config.lvm.vg_name);
+        match self
+            .shell
+            .run(spec_priv(Path::new("/usr/sbin/lvremove"), &["--force", &target]))
+            .await
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => tracing::warn!(
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                target,
+                "orphan cleanup: lvremove non-zero (snapshot likely absent)",
+            ),
+            Err(e) => tracing::warn!(error = %e, target, "orphan cleanup: lvremove failed"),
+        }
+
+        // 5. Git per-job ref (idempotent), then — only if the source loop is verified
+        //    gone — the whole job dir (boot/source raw, cidata, domain XML, console.log
+        //    all live under it). If a loop may still be attached, PRESERVE the dir:
+        //    `source.raw` is the only handle the next recovery has to re-find and
+        //    detach the leaked device.
+        git_mirror::prune(self.shell.as_ref(), &self.config.paths, job_id).await;
+        if !source_loop_clear {
+            tracing::error!(
+                job_id,
+                job_dir = %job_dir.display(),
+                "orphan cleanup INCOMPLETE: source loop may still be attached; preserving job dir \
+                 (source.raw) for retry on next boot",
+            );
+            return false;
+        }
+        match std::fs::remove_dir_all(&job_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "orphan cleanup: job dir removal failed"),
+        }
+        true
+    }
+
+    /// `umount <path>` best-effort. A non-zero exit ("not mounted") is the
+    /// common, expected case during orphan recovery, so it's only logged at
+    /// debug; an actual *error* invoking umount is a warning.
+    async fn umount_best_effort(&self, path: &Path, what: &'static str) {
+        let path_s = path.display().to_string();
+        match self
+            .shell
+            .run(spec_priv(Path::new("/usr/bin/umount"), &[&path_s]))
+            .await
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(_) => tracing::debug!(path = %path_s, what, "orphan cleanup: not mounted (ok)"),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path_s, what, "orphan cleanup: umount errored")
+            }
+        }
+    }
+
+    /// Find and detach any loop device backed by `raw` via `losetup -j`. The
+    /// `provision`-time device name (`/dev/loopN`) is dynamic, so it can only
+    /// be recovered by querying the backing file — exactly the leak the 4A
+    /// cleanup couldn't address from the job id alone.
+    ///
+    /// Returns `true` when no loop remains attached to `raw` (safe to delete
+    /// the backing file): `losetup -j` exited 0 and either listed nothing, or
+    /// every device it listed detached cleanly. Returns `false` if the query
+    /// couldn't be run, exited non-zero, or any `losetup -d` failed — a loop
+    /// may still be attached, and any working `losetup` lists an attached
+    /// loop, so the only path to deleting `raw` with a live loop is a
+    /// query/detach failure, which this catches.
+    async fn detach_source_loop(&self, raw: &Path) -> bool {
+        let raw_s = raw.display().to_string();
+        let out = match self
+            .shell
+            .run(spec_priv(Path::new("/usr/sbin/losetup"), &["-j", &raw_s]))
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                // Couldn't even spawn the query — can't assert the loop is gone.
+                tracing::warn!(error = %e, raw = %raw_s, "orphan cleanup: losetup -j failed; can't verify loop is detached");
+                return false;
+            }
+        };
+        // A non-zero `losetup -j` is a genuine query failure (a *missing* file
+        // exits 0 with empty output on util-linux). Empty stdout then tells us
+        // nothing — refuse to green-light deleting `source.raw`; preserve + retry.
+        if !out.status.success() {
+            tracing::warn!(
+                raw = %raw_s,
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "orphan cleanup: losetup -j exited non-zero; can't verify loop is detached",
+            );
+            return false;
+        }
+        // `losetup -j <file>` prints one line per association:
+        //   /dev/loop7: [2049]:12345 (/path/source.raw)
+        // Empty output (exit 0) means nothing is attached — the common case.
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let mut all_clear = true;
+        for line in listing.lines() {
+            let Some(dev) = line
+                .split(':')
+                .next()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+            else {
+                continue;
+            };
+            match self
+                .shell
+                .run(spec_priv(Path::new("/usr/sbin/losetup"), &["-d", dev]))
+                .await
+            {
+                Ok(o) if o.status.success() => {
+                    tracing::info!(
+                        loop_dev = dev,
+                        "orphan cleanup: detached leaked source loop device"
+                    )
+                }
+                Ok(o) => {
+                    tracing::warn!(
+                        stderr = %String::from_utf8_lossy(&o.stderr),
+                        loop_dev = dev,
+                        "orphan cleanup: losetup -d non-zero; loop may still be attached",
+                    );
+                    all_clear = false;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, loop_dev = dev, "orphan cleanup: losetup -d failed; loop may still be attached");
+                    all_clear = false;
+                }
+            }
+        }
+        all_clear
+    }
 }
 
 fn derive_stacks_bench_args(bench_args: &[String], default: &str) -> String {
@@ -1233,5 +1441,239 @@ mod tests {
         );
         // And the normal teardown ran (destroyed the running domain by name).
         assert!(issued("virsh", "destroy"), "teardown destroyed the domain on cancel");
+    }
+
+    /// Handle-less orphan cleanup (Phase 4B-2): from a job id alone,
+    /// `cleanup_by_job_id` must destroy/undefine the domain, unmount the
+    /// results tmpfs AND the source mount, find+detach the dynamically-named
+    /// loop device via `losetup -j`, lvremove the chainstate snapshot, prune
+    /// the git ref, and remove the job dir — in that order, best-effort.
+    #[tokio::test]
+    async fn cleanup_by_job_id_reconstructs_full_teardown_from_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(test_config(&tmp));
+        let job_id = "orphan-123";
+
+        // A leftover job dir (with the source.raw backing file) + tmpfs dir,
+        // as a crashed daemon would leave them.
+        let job_dir = cfg
+            .paths
+            .jobs_dir
+            .join(job_id);
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::write(job_dir.join("source.raw"), b"raw").unwrap();
+        std::fs::create_dir_all(
+            cfg.paths
+                .results_tmpfs_root
+                .join(job_id),
+        )
+        .unwrap();
+
+        // Canned replies in the exact order cleanup issues them. `losetup -j`
+        // reports one association so a `losetup -d` must follow.
+        let shell = Arc::new(RecordingShell::new());
+        shell
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount results tmpfs
+            .expect_ok(1) // umount source.mnt
+            .reply(PreparedReply::with_stdout(
+                "/dev/loop42: [2049]:7 (/var/lib/sbgh/jobs/orphan-123/source.raw)\n",
+            )) // losetup -j
+            .expect_ok(1) // losetup -d /dev/loop42
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git update-ref -d (prune)
+
+        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
+        driver
+            .cleanup_by_job_id(job_id)
+            .await;
+
+        let calls = shell.calls();
+        let prog = |i: usize| {
+            std::path::Path::new(&calls[i].program)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let programs: Vec<String> = (0..calls.len())
+            .map(prog)
+            .collect();
+        assert_eq!(
+            programs,
+            [
+                "virsh",    // destroy
+                "virsh",    // undefine
+                "umount",   // results tmpfs
+                "umount",   // source.mnt
+                "losetup",  // -j (find loop)
+                "losetup",  // -d (detach)
+                "lvremove", // chainstate snapshot
+                "git",      // ref prune
+            ],
+            "cleanup command order",
+        );
+        // The detach targeted the exact device `losetup -j` reported.
+        assert!(
+            calls[5]
+                .args
+                .contains(&"-d".to_string())
+                && calls[5]
+                    .args
+                    .contains(&"/dev/loop42".to_string()),
+            "losetup -d must detach the device losetup -j surfaced",
+        );
+        // lvremove targets the job-id-named snapshot.
+        assert!(
+            calls[6]
+                .args
+                .iter()
+                .any(|a| a == "sbgh-vg/sbgh-orphan-123-chainstate"),
+            "lvremove must target the per-job snapshot",
+        );
+        // The job dir (and its source.raw) is gone.
+        assert!(!job_dir.exists(), "job dir removed");
+    }
+
+    /// `losetup -j` with no association (the source disk was already torn down,
+    /// or never provisioned) must NOT issue a `losetup -d`, and cleanup still
+    /// completes the rest. Proves the no-leak path is also the no-spurious-op
+    /// path.
+    #[tokio::test]
+    async fn cleanup_by_job_id_skips_loop_detach_when_none_attached() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(test_config(&tmp));
+        let job_id = "orphan-empty";
+
+        let shell = Arc::new(RecordingShell::new());
+        shell
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount results tmpfs
+            .expect_ok(1) // umount source.mnt
+            .reply(PreparedReply::with_stdout("")) // losetup -j → nothing attached
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git update-ref -d (prune)
+
+        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
+        driver
+            .cleanup_by_job_id(job_id)
+            .await;
+
+        let calls = shell.calls();
+        let detaches = calls
+            .iter()
+            .filter(|c| {
+                c.program.ends_with("losetup")
+                    && c.args
+                        .contains(&"-d".to_string())
+            })
+            .count();
+        assert_eq!(detaches, 0, "no loop attached → no losetup -d");
+        // lvremove + prune still ran after the (empty) loop query.
+        assert!(
+            calls.iter().any(|c| c
+                .program
+                .ends_with("lvremove")),
+            "cleanup continues past the empty loop query",
+        );
+    }
+
+    /// Codex 4B-2 Medium: when the source loop device can't be detached,
+    /// cleanup must PRESERVE the job dir (so `source.raw` — the only handle to
+    /// re-find the loop — survives) and report incomplete (`false`), so the
+    /// caller leaves the row `running` for retry instead of failing it and
+    /// stranding the leak.
+    #[tokio::test]
+    async fn cleanup_by_job_id_preserves_backing_file_when_loop_detach_fails() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(test_config(&tmp));
+        let job_id = "orphan-stuck-loop";
+
+        let job_dir = cfg
+            .paths
+            .jobs_dir
+            .join(job_id);
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::write(job_dir.join("source.raw"), b"raw").unwrap();
+
+        let shell = Arc::new(RecordingShell::new());
+        shell
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount tmpfs
+            .expect_ok(1) // umount source.mnt
+            .reply(PreparedReply::with_stdout(
+                "/dev/loop42: [2049]:7 (/var/lib/sbgh/jobs/orphan-stuck-loop/source.raw)\n",
+            )) // losetup -j
+            .reply(PreparedReply::fail("losetup: cannot detach: device or resource busy")) // -d fails
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git prune
+
+        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
+        let clean = driver
+            .cleanup_by_job_id(job_id)
+            .await;
+
+        assert!(!clean, "a failed loop detach must report incomplete cleanup");
+        assert!(
+            job_dir
+                .join("source.raw")
+                .exists(),
+            "source.raw must survive so the next recovery can re-find the loop",
+        );
+        assert!(job_dir.exists(), "job dir preserved on incomplete cleanup");
+    }
+
+    /// Codex 4B-2 re-review Medium: a **non-zero** `losetup -j` (a genuine
+    /// query failure, not a missing-file no-op) must NOT be read as "all
+    /// clear" just because stdout is empty — we can't enumerate, so we
+    /// can't safely delete `source.raw`. Cleanup must preserve the backing
+    /// file, issue no blind `losetup -d`, and report incomplete.
+    #[tokio::test]
+    async fn cleanup_by_job_id_preserves_backing_file_when_losetup_query_fails() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(test_config(&tmp));
+        let job_id = "orphan-query-fail";
+
+        let job_dir = cfg
+            .paths
+            .jobs_dir
+            .join(job_id);
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::write(job_dir.join("source.raw"), b"raw").unwrap();
+
+        let shell = Arc::new(RecordingShell::new());
+        shell
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount tmpfs
+            .expect_ok(1) // umount source.mnt
+            .reply(PreparedReply::fail("losetup: cannot read /dev: permission denied")) // -j non-zero, empty stdout
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git prune
+
+        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
+        let clean = driver
+            .cleanup_by_job_id(job_id)
+            .await;
+
+        assert!(!clean, "a non-zero losetup -j must report incomplete cleanup");
+        let calls = shell.calls();
+        assert!(
+            !calls.iter().any(|c| {
+                c.program.ends_with("losetup")
+                    && c.args
+                        .contains(&"-d".to_string())
+            }),
+            "must not blindly detach when the query itself failed",
+        );
+        assert!(
+            job_dir
+                .join("source.raw")
+                .exists(),
+            "source.raw preserved when the loop query fails",
+        );
     }
 }

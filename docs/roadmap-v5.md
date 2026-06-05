@@ -15,11 +15,14 @@ serial `execute()` into three cooperating roles — a **coordinator**, per-job
 
 Process unchanged: Opus implements, Codex reviews, Opus fixes.
 
-> **Status: Phases 1–3 shipped** (all Codex-signed-off). Phase 1 (worker/reporter
-> split), Phase 2 (mirror-lock concurrency audit), and Phase 3 (the coordinator +
-> slot pool, behind a default-1 limit) are done. Phases 4–5 planned. Phases are
-> ordered so each is independently shippable with tests green; concurrency is
-> only *usable* once an operator raises `[runner].max_concurrent_jobs`.
+> **Status: Phases 1–4 Codex-signed-off** (Phases 1–3 + 4A/4B-1 shipped; 4B-2
+> signed off, deploy + Phase-4 operator smoke-test pending). Phase 1
+> (worker/reporter split), Phase 2 (mirror-lock concurrency audit), Phase 3 (the
+> coordinator + slot pool, behind a default-1 limit), and Phase 4 (signal
+> handling / graceful shutdown / orphan recovery) are done. Phase 5
+> (resource-aware admission + queue-position) planned. Phases are ordered so each
+> is independently shippable with tests green; concurrency is only *usable* once
+> an operator raises `[runner].max_concurrent_jobs`.
 
 ## Why
 
@@ -534,8 +537,10 @@ mid-flight.
   assumes **fail** (the user's stated intent: "abort/cleanup/fail"), with a clear
   remark so an operator can re-trigger.
 
-**Status:** sub-sliced (like Phase 1). **4A shipped** (the cancel-safety
-primitive); **4B pending** (signals + coordinator + wiring).
+**Status:** complete — **4A + 4B-1 + 4B-2 all Codex-signed-off** (cancel-safety
+primitive; signals + graceful shutdown; orphan/stuck-`running` recovery). 4A and
+4B-1 shipped; 4B-2 awaiting deploy plus the Phase-4 operator smoke-test
+(abort/drain and kill-9 orphan recovery — the parts unit tests can't cover).
 
 - **4A — cancel-safety primitive (done; revised after Codex review):**
   cancellation is **threaded into the driver** and honored at the **poll loop
@@ -570,11 +575,64 @@ primitive); **4B pending** (signals + coordinator + wiring).
   trigger. systemd unit gains `KillMode=mixed` + `TimeoutStopSec=120s` (so the
   daemon drives teardown instead of systemd SIGKILLing its `virsh` children).
   Test: `drain_stops_claiming_and_fires_exit_when_idle`.
-- **4B-2 — orphan/stuck-`running` recovery (next):** the `cleanup_by_job_id`
-  primitive (complete this time: `source.mnt` + loop device via `losetup -j` on
-  the job-id-named backing file) for a dead reporter / hard-killed daemon, where
-  there's no live driver to run the normal teardown — wired into the
-  startup/stuck-claim sweep.
+- **4B-2 — orphan/stuck-`running` recovery (done):**
+  [`LibvirtDriver::cleanup_by_job_id`](../crates/sbgh-daemon/src/libvirt/driver.rs)
+  is now the **complete**, handle-less, idempotent teardown — destroy/undefine
+  the `sbgh-<id>` domain, unmount the results tmpfs **and** `source.mnt`, find +
+  detach the dynamically-named loop device via `losetup -j <source.raw>` (the
+  piece 4A couldn't reconstruct from the id), `lvremove` the
+  `sbgh-<id>-chainstate` snapshot, prune the git ref, `rm -rf` the job dir; every
+  step logged-and-continued. Two new `JobStore` methods back the recovery:
+  `running_job_ids` (after a crash, every `running` row is necessarily an orphan)
+  and `fail_orphan` (unconditional `running → failed` + a `failed` event, **no
+  claim-token guard** — the claimer is dead and recovery runs before any fresh
+  claim; idempotent on the guard). *(Superseded by **4C-1**: `fail_orphan` →
+  `cancel_orphan`, `failed` → `cancelled` — a crash-orphan is re-triggerable, not
+  a failure.)* The coordinator runs `recover_orphans`
+  **once at startup, before the loop**: for each orphan, `cleanup_by_job_id`
+  **then** `fail_orphan` — that order is crash-safe (a crash mid-recovery
+  re-lists the still-`running` row next boot, so cleanup re-runs idempotently and
+  no VM leaks behind a `failed` row). Orphans are **failed**, not re-queued
+  (consistent with abort; a crash mid-run may recur) — PR jobs are re-triggered
+  with `/benchmark`, baselines by the next push. v5 is bench-only so recovery
+  dispatches straight to the libvirt driver; v6's task-kind split would pick the
+  cleanup by the orphan's stored kind.
+  - **Codex review hardening (two Mediums):** (1) `cleanup_by_job_id` returns a
+    **source-loop-clear** signal — narrowly "the source loop is verified gone,
+    so deleting `source.raw` + failing the row are safe," *not* "every artifact
+    cleaned." The loop is singled out because it's the only artifact whose
+    recovery needs the backing file; the rest (domain, tmpfs, LVM, git ref) stay
+    best-effort and a transient failure there does NOT hold the row `running`
+    (id-addressable without `source.raw`; don't wedge the lifecycle on a flaky
+    `lvremove`). If the loop can't be verified-detached (`losetup -j`/`-d`
+    failed), it **preserves the job dir** (so `source.raw` — the only handle to
+    re-find the loop — survives) and returns `false`; `recover_orphans` then
+    leaves the row **`running`** (skips `fail_orphan`) so the next boot retries,
+    rather than failing it and stranding the leak. (2)
+    `recover_orphans` now returns `Result` and **propagates** a
+    `running_job_ids` enumeration failure — startup-critical, since we can't
+    rule out live orphan VMs; the process exits and systemd
+    `Restart=on-failure` retries rather than claiming blind. **Re-review
+    Medium:** a non-zero `losetup -j` exit (a genuine query failure, vs a
+    missing file which exits 0/empty on util-linux) is now also treated as
+    incomplete — empty stdout after a failed query can't be read as "all clear",
+    so `source.raw` is preserved and the row left `running`.
+  - **Out of 4B-2 scope (follow-up):** concluding an orphaned PR job's
+    stuck-spinning Check Run — needs the reporting context (check id + repo +
+    installation) reconstructed at startup; a re-triggered `/benchmark` posts a
+    fresh check meanwhile. The dead-reporter-while-alive case is recovered at the
+    **next** restart, not in-process (a reporter panic is a rare bug).
+  - Tests: `cleanup_by_job_id_reconstructs_full_teardown_from_id` (exact command
+    order + `losetup -j`→`-d` of the surfaced device + snapshot/job-dir removal),
+    `cleanup_by_job_id_skips_loop_detach_when_none_attached` (no spurious
+    `losetup -d`), `startup_recovers_orphaned_running_job` (recovery runs
+    `cleanup_by_job_id` + `cancel_orphan` before claiming),
+    `running_job_ids_lists_only_running_jobs`,
+    `cancel_orphan_terminalizes_running_without_a_claim_token_and_is_idempotent`,
+    `cancel_orphan_ignores_a_claimed_not_running_job` (4C-renamed). Review hardening adds
+    `cleanup_by_job_id_preserves_backing_file_when_loop_detach_fails`,
+    `startup_leaves_orphan_running_when_cleanup_incomplete`, and
+    `startup_recovery_aborts_when_listing_running_jobs_fails`.
 
   - [x] 4A implementation completed
   - [x] 4A coverage (cancel breaks at the poll loop, `losetup -d` ran before
@@ -582,8 +640,67 @@ primitive); **4B pending** (signals + coordinator + wiring).
   - [x] 4A reviewed — Codex signed off
   - [x] 4B-1 implemented (SIGTERM aborts; SIGINT drains; 2×SIGINT escalates; graceful exit)
   - [x] 4B-1 reviewed — Codex signed off
-  - [ ] 4B-2 (orphan / stuck-`running` recovery) + review
-  - [ ] Complete
+  - [x] 4B-2 implemented (complete `cleanup_by_job_id` + `running_job_ids`/`fail_orphan` + startup `recover_orphans`)
+  - [x] 4B-2 review round 1 — Codex 2 Mediums (loop-leak preservation; list-failure startup-critical) addressed
+  - [x] 4B-2 review round 2 — Codex Medium (non-zero `losetup -j` → incomplete, preserve) addressed
+  - [x] 4B-2 review round 3 — Codex Low (return-contract is *source-loop-clear*, not "fully complete"); doc + `source_loop_clear` rename
+  - [x] 4B-2 coverage added (10 tests across driver, store, coordinator)
+  - [x] 4B-2 reviewed — Codex signed off (3 rounds; no findings on the last pass)
+  - [x] Complete (code; pending deploy + the Phase-4 operator smoke-test)
+
+### Phase 4C — Cancelled terminal status (abort/orphan ≠ failure)
+
+**Status:** 4C-1 implemented (code review pending); 4C-2 (orphan check-conclusion) pending.
+
+**Why:** before this, an operator-initiated abort *and* a crash-orphan both
+landed as `failed` — a red ✗ check that reads as "the benchmark broke" and
+counts against failure metrics, when the run was simply *stopped*. The
+`cancelled` status existed in both PG enums (`job_status`, `job_event_kind`) and
+the Rust models since the first migration but was **never written** — 4C starts
+using it. No migration needed.
+
+- **4C-1 — Cancelled end-to-end (done):**
+  - `CheckRunConclusion::Cancelled` → GitHub's native `cancelled` conclusion
+    (`status_strings` maps it to `("completed", "cancelled")`), which renders
+    **neutral-gray**, not a red ✗.
+  - Store: `cancel_job(job_id, claim_token, remark)` — claim-guarded
+    `claimed|running → cancelled` + a `cancelled` event, mirroring `fail_job`
+    minus the forensics result (a cancelled run produced none). `fail_orphan`
+    (added in 4B-2, only called by `recover_orphans`) is **replaced** by
+    `cancel_orphan` (unguarded `running → cancelled`) — a crash-orphan is
+    re-triggerable, not a failure (the operator's chosen classification).
+  - Reporter: `Terminal::Aborted` now routes to `jobs.cancel(...)` +
+    `ProgressReporter::cancelled(...)` (gray check + a "cancelled, re-run…"
+    comment) instead of `fail(...)`/`failed(...)`. The check's re-trigger hint
+    branches by surface (Codex review): PR jobs say "re-run with `/benchmark`",
+    baseline (`branch_push`/`tag_created`) checks say "re-run by pushing the
+    branch/tag again" — the comment's `/benchmark` copy is PR-only by
+    construction (`update_comment` no-ops for baselines).
+  - Runner: `recover_orphans` → `cancel_orphan` (orphan rows become `cancelled`).
+  - **Metrics:** cancelled runs are excluded from baselines / change-impact
+    deltas *by construction* — `cancel_job`/`cancel_orphan` write no `job_metric`
+    (only `complete_job` does), and baselines select only metric-bearing rows.
+  - **`event_status` note:** the cancelled timeline event uses
+    `JobEventStatus::Fail` (the `job_event_status` PG enum has no neutral value,
+    and it's an audit-only field) — the load-bearing fields are
+    `job.status=cancelled` + `event_kind=cancelled`. A dedicated `cancelled`
+    event_status would need a migration for negligible gain; deferred.
+  - Tests (5 new): `cancel_job_transitions_running_to_cancelled_with_event`,
+    `cancel_job_rejects_a_stale_claim_token`,
+    `cancel_job_terminalizes_a_claimed_job_not_yet_running`,
+    `cancelled_concludes_check_cancelled` (progress),
+    `aborted_terminal_cancels_the_job_and_check` (reporter); plus the 4B-2
+    orphan tests retargeted to `cancel_orphan` + `Cancelled`.
+- **4C-2 — conclude the orphaned check (pending):** at startup recovery,
+  reconstruct an orphan's reporting context (repo + installation + check id) and
+  conclude its stuck-`in_progress` Check Run as `cancelled` — closing the
+  spinner the 4B-2 follow-up flagged. Needs a read-only context lookup; deferred
+  to keep 4C-1 reviewable.
+
+- [x] 4C-1 implemented (Cancelled status + gray check; abort + orphan → cancelled)
+- [x] 4C-1 coverage added (5 new tests; 527 daemon+core green)
+- [ ] 4C-1 reviewed — Codex review pending
+- [ ] 4C-2 (orphan check-conclusion) + review
 
 ---
 

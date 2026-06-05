@@ -123,6 +123,12 @@ pub trait RunnableJobStore: Send + Sync + 'static {
         summary: Option<&serde_json::Value>,
     ) -> anyhow::Result<()>;
 
+    /// Terminal **cancellation** (roadmap-v5 Phase 4C): a deliberately-stopped
+    /// run (operator shutdown/abort), recorded as `cancelled` not `failed` so
+    /// it doesn't read as a broken benchmark. Like [`fail`](Self::fail) but
+    /// with no forensics summary (a cancelled run produced none).
+    async fn cancel(&self, job: &RunnableJob, remark: &str) -> anyhow::Result<()>;
+
     /// Persist the GitHub comment id the daemon just posted. Only
     /// called for [`ProgressTarget::PullRequest`] jobs.
     async fn set_comment_id(&self, job: &RunnableJob, comment_id: i64) -> anyhow::Result<()>;
@@ -137,6 +143,20 @@ pub trait RunnableJobStore: Send + Sync + 'static {
         check_run_id: i64,
         html_url: Option<&str>,
     ) -> anyhow::Result<()>;
+
+    /// Orphan recovery (roadmap-v5 Phase 4B-2): job ids stranded in `running`.
+    /// At daemon startup these are necessarily orphans from a crashed/killed
+    /// prior daemon, so the runner cleans each one's leaked VM (via
+    /// `cleanup_by_job_id`) and then [`cancel_orphan`](Self::cancel_orphan)s
+    /// it.
+    async fn running_job_ids(&self) -> anyhow::Result<Vec<Uuid>>;
+
+    /// Orphan recovery (4B-2 + 4C): terminal-**cancel** a job stranded in
+    /// `running`, with no claim-token guard (the claimer is dead; runs at
+    /// startup before any new claim). A crash-orphan is re-triggerable, not a
+    /// failure, so it's `cancelled`. Returns `false` if the row wasn't
+    /// `running` — idempotent.
+    async fn cancel_orphan(&self, job_id: Uuid, remark: &str) -> anyhow::Result<bool>;
 }
 
 /// [`RunnableJobStore`] over the `job` family. Composes
@@ -346,6 +366,23 @@ impl RunnableJobStore for JobSource {
         Ok(())
     }
 
+    async fn cancel(&self, job: &RunnableJob, remark: &str) -> anyhow::Result<()> {
+        let claim_token = self.expect_token(job)?;
+        let ok = self
+            .jobs
+            .cancel_job(job.id, claim_token, remark)
+            .await?;
+        if !ok {
+            // Same stale-claim semantics as `fail`: the sweep reclaimed our
+            // lease, so leave the row for re-claim rather than clobbering it.
+            tracing::warn!(
+                job_id = %job.id,
+                "cancel_job was a no-op (lost our claim to the sweep); leaving for re-claim"
+            );
+        }
+        Ok(())
+    }
+
     async fn set_comment_id(&self, job: &RunnableJob, comment_id: i64) -> anyhow::Result<()> {
         // Slice 11: the new schema has no `comment_id` column — the
         // comment identity lives on a `comment_posted` timeline event.
@@ -387,6 +424,20 @@ impl RunnableJobStore for JobSource {
             })
             .await?;
         Ok(())
+    }
+
+    async fn running_job_ids(&self) -> anyhow::Result<Vec<Uuid>> {
+        Ok(self
+            .jobs
+            .running_job_ids()
+            .await?)
+    }
+
+    async fn cancel_orphan(&self, job_id: Uuid, remark: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .jobs
+            .cancel_orphan(job_id, remark)
+            .await?)
     }
 }
 

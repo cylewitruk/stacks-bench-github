@@ -80,6 +80,43 @@ impl<'a> ProgressReporter<'a> {
         .await;
     }
 
+    /// Terminal **cancellation** (roadmap-v5 Phase 4C): the run was
+    /// deliberately stopped (operator shutdown/abort, or crash-orphan
+    /// recovery), not a benchmark failure. Concludes the check `cancelled` —
+    /// GitHub renders it neutral-gray, not a red ✗ — and notes it on the
+    /// comment. `reason` is a short, already-safe phrase (no error chain).
+    pub async fn cancelled(&self, reason: &str) {
+        // The comment surface only exists for PR jobs (`update_comment` is a
+        // no-op otherwise), so its `/benchmark` copy never reaches a baseline.
+        self.update_comment(&format!(
+            ":no_entry_sign: benchmark `{id}` cancelled: {reason}. Re-run with `/benchmark`.",
+            id = self.job.id,
+        ))
+        .await;
+        // The check exists for BOTH PR and baseline jobs, so its re-trigger hint
+        // must match how each is actually re-run.
+        let hint = self.retrigger_hint();
+        self.complete_check(
+            CheckRunConclusion::Cancelled,
+            CheckRunOutput {
+                title: format!("benchmark {} — cancelled", self.job.id),
+                summary: format!("commit `{}` — {reason}", self.job.commit),
+                text: Some(format!("Cancelled: {reason}. {hint}")),
+            },
+        )
+        .await;
+    }
+
+    /// How this job is re-triggered, for the cancelled-check text. A PR job
+    /// re-runs via the `/benchmark` command; a baseline (`branch_push` /
+    /// `tag_created`) check re-runs when its ref is pushed again.
+    fn retrigger_hint(&self) -> &'static str {
+        match self.job.progress {
+            ProgressTarget::PullRequest { .. } => "Re-run with `/benchmark`.",
+            ProgressTarget::CommitCheck { .. } => "Re-run by pushing the branch/tag again.",
+        }
+    }
+
     /// The shared completed render (read + parse the archived `run.json` for
     /// the user-facing metrics) used by both the comment and the check.
     fn completed_body(&self, summary: &serde_json::Value) -> String {
@@ -259,6 +296,63 @@ mod tests {
             concluded_state(&gh),
             Some(CheckRunState::Completed(CheckRunConclusion::Failure))
         );
+    }
+
+    /// A cancelled run (Phase 4C: operator abort / crash-orphan) concludes the
+    /// check `cancelled` (neutral-gray), NOT `failure` — it was deliberately
+    /// stopped, not broken.
+    #[tokio::test]
+    async fn cancelled_concludes_check_cancelled() {
+        let gh = FakeGitHub::new();
+        let job = check_job(11);
+        ProgressReporter::new(&gh, &job)
+            .cancelled("aborted by shutdown")
+            .await;
+        assert_eq!(
+            concluded_state(&gh),
+            Some(CheckRunState::Completed(CheckRunConclusion::Cancelled))
+        );
+    }
+
+    /// The check's re-trigger hint matches how the job actually re-runs: a
+    /// baseline (`CommitCheck`) must NOT say `/benchmark` (that's PR-only) — it
+    /// re-runs by pushing the ref; a PR job does say `/benchmark`.
+    #[tokio::test]
+    async fn cancelled_check_text_matches_retrigger_path() {
+        let check_text = |gh: &FakeGitHub| -> String {
+            gh.calls()
+                .into_iter()
+                .find_map(|c| match c {
+                    FakeCall::UpdateCheckRun { output, .. } => output.text,
+                    _ => None,
+                })
+                .expect("check concluded with text")
+        };
+
+        // Baseline commit check → push-the-ref, never `/benchmark`.
+        let gh = FakeGitHub::new();
+        ProgressReporter::new(&gh, &check_job(11))
+            .cancelled("aborted by shutdown")
+            .await;
+        let baseline = check_text(&gh);
+        assert!(!baseline.contains("/benchmark"), "baseline must not say /benchmark: {baseline}");
+        assert!(baseline.contains("push"), "baseline hint mentions pushing: {baseline}");
+
+        // PR job → `/benchmark`.
+        let gh_pr = FakeGitHub::new();
+        let pr = RunnableJob {
+            progress: ProgressTarget::PullRequest {
+                pr_number: 7,
+                comment_id: None,
+                check_run_id: Some(22),
+                check_run_url: None,
+            },
+            ..check_job(22)
+        };
+        ProgressReporter::new(&gh_pr, &pr)
+            .cancelled("aborted by shutdown")
+            .await;
+        assert!(check_text(&gh_pr).contains("/benchmark"), "PR job re-runs via /benchmark");
     }
 
     #[test]

@@ -447,6 +447,76 @@ impl JobStore for PostgresJobStore {
         Ok(true)
     }
 
+    async fn cancel_job(&self, job_id: Uuid, claim_token: Uuid, remark: &str) -> Result<bool> {
+        // Mirror `fail_job` (claimed OR running, claim-token guarded) but
+        // transition to `cancelled` and skip the forensics result — a cancelled
+        // run produced none. `event_status = Fail` marks the non-success
+        // terminal; the `cancelled` event_kind + `cancelled` job status carry
+        // the precise (not-a-failure) semantics, and `job_event_status` has no
+        // neutral value (audit-only field).
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE job SET status = 'cancelled'
+             WHERE id = $1 AND claim_token = $2 AND status IN ('claimed', 'running')",
+        )
+        .bind(job_id)
+        .bind(claim_token)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO job_event (job_id, event_kind, event_status, remark)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(job_id)
+        .bind(JobEventKind::Cancelled)
+        .bind(JobEventStatus::Fail)
+        .bind(remark)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn running_job_ids(&self) -> Result<Vec<Uuid>> {
+        let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM job WHERE status = 'running'")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(ids)
+    }
+
+    async fn cancel_orphan(&self, job_id: Uuid, remark: &str) -> Result<bool> {
+        // No claim-token guard (see trait docs): startup-only, the original
+        // claimer is dead, so an unconditional running→cancelled is safe and a
+        // re-run after a mid-recovery crash is idempotent (a row already off
+        // `running` won't match). One transaction for the transition + event.
+        let mut tx = self.pool.begin().await?;
+        let updated =
+            sqlx::query("UPDATE job SET status = 'cancelled' WHERE id = $1 AND status = 'running'")
+                .bind(job_id)
+                .execute(&mut *tx)
+                .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO job_event (job_id, event_kind, event_status, remark)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(job_id)
+        .bind(JobEventKind::Cancelled)
+        .bind(JobEventStatus::Fail)
+        .bind(remark)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn queued_event(&self, job_id: Uuid) -> Result<Option<JobEvent>> {
         let row = sqlx::query_as::<_, JobEvent>(
             r#"

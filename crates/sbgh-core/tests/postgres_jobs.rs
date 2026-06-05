@@ -995,3 +995,199 @@ async fn fail_job_terminalizes_a_claimed_job_not_yet_running() {
         .unwrap();
     assert_eq!(row.status, JobStatus::Failed);
 }
+
+// ─── roadmap-v5 Phase 4B-2: orphan / stuck-`running` recovery ───────────
+
+#[tokio::test]
+async fn running_job_ids_lists_only_running_jobs() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+
+    // One `running`, one left `queued`, one `claimed` (not yet running).
+    let (running_id, _t) = claim_and_run(&store, 100, 10).await;
+    store
+        .insert_job(&make_new_job(100, 10))
+        .await
+        .unwrap(); // stays queued
+    store
+        .insert_job(&make_new_job(100, 10))
+        .await
+        .unwrap();
+    store
+        .claim_next_queued(Uuid::new_v4())
+        .await
+        .unwrap()
+        .unwrap(); // claimed-not-running
+
+    let ids = store
+        .running_job_ids()
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![running_id], "only the `running` row is an orphan candidate");
+}
+
+#[tokio::test]
+async fn cancel_orphan_terminalizes_running_without_a_claim_token_and_is_idempotent() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+    // The orphan still carries its (now-dead) claimer's token; cancel_orphan
+    // must transition it WITHOUT being given that token.
+    let (job_id, _dead_token) = claim_and_run(&store, 100, 10).await;
+
+    let recovered = store
+        .cancel_orphan(job_id, "recovered: orphaned by restart")
+        .await
+        .unwrap();
+    assert!(recovered, "a `running` orphan transitions to cancelled with no claim token");
+
+    let row = store
+        .lookup_job(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // A crash-orphan is cancelled (re-triggerable), NOT failed (Phase 4C).
+    assert_eq!(row.status, JobStatus::Cancelled);
+    let (kind, remark): (String, Option<String>) = sqlx::query_as(
+        "SELECT event_kind::text, remark FROM job_event WHERE job_id = $1 AND event_kind = \
+         'cancelled'",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "cancelled");
+    assert_eq!(remark.as_deref(), Some("recovered: orphaned by restart"));
+
+    // Idempotent: a second pass (a crash mid-recovery re-listed the row) is a
+    // no-op — the guard requires `status = 'running'`.
+    let again = store
+        .cancel_orphan(job_id, "recovered: orphaned by restart")
+        .await
+        .unwrap();
+    assert!(!again, "a row already off `running` must not be re-cancelled");
+}
+
+#[tokio::test]
+async fn cancel_orphan_ignores_a_claimed_not_running_job() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+    store
+        .insert_job(&make_new_job(100, 10))
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_next_queued(Uuid::new_v4())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Orphan recovery only touches `running`; a `claimed` row is the
+    // stuck-claim sweep's job, not cancel_orphan's.
+    let r = store
+        .cancel_orphan(claimed.id, "should not apply")
+        .await
+        .unwrap();
+    assert!(!r, "cancel_orphan must leave a `claimed` job alone");
+    let row = store
+        .lookup_job(claimed.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, JobStatus::Claimed);
+}
+
+// ─── roadmap-v5 Phase 4C: cancellation (operator abort) ─────────────────
+
+#[tokio::test]
+async fn cancel_job_transitions_running_to_cancelled_with_event() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let (job_id, token) = claim_and_run(&store, 100, 10).await;
+
+    let ok = store
+        .cancel_job(job_id, token, "aborted by shutdown")
+        .await
+        .unwrap();
+    assert!(ok, "a running job under our token cancels");
+
+    let row = store
+        .lookup_job(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Cancelled, NOT failed — a deliberately-stopped run (Phase 4C).
+    assert_eq!(row.status, JobStatus::Cancelled);
+    let (kind, remark): (String, Option<String>) = sqlx::query_as(
+        "SELECT event_kind::text, remark FROM job_event WHERE job_id = $1 AND event_kind = \
+         'cancelled'",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "cancelled");
+    assert_eq!(remark.as_deref(), Some("aborted by shutdown"));
+    // No forensics result row for a cancelled run.
+    let result_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_result WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(result_count, 0);
+}
+
+#[tokio::test]
+async fn cancel_job_rejects_a_stale_claim_token() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let (job_id, _token) = claim_and_run(&store, 100, 10).await;
+
+    // A writer whose lease was reclaimed by the sweep must not cancel the row.
+    let ok = store
+        .cancel_job(job_id, Uuid::new_v4(), "aborted")
+        .await
+        .unwrap();
+    assert!(!ok, "stale claim_token must not cancel");
+    let row = store
+        .lookup_job(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, JobStatus::Running);
+}
+
+#[tokio::test]
+async fn cancel_job_terminalizes_a_claimed_job_not_yet_running() {
+    // Like fail_job, cancel accepts `claimed` (an abort can land before the
+    // run started) — terminalize cleanly rather than looping via the sweep.
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+    store
+        .insert_job(&make_new_job(100, 10))
+        .await
+        .unwrap();
+    let token = Uuid::new_v4();
+    let claimed = store
+        .claim_next_queued(token)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ok = store
+        .cancel_job(claimed.id, token, "aborted before run")
+        .await
+        .unwrap();
+    assert!(ok, "cancel_job must terminalize a claimed job");
+    let row = store
+        .lookup_job(claimed.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled);
+}

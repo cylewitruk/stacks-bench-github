@@ -442,6 +442,83 @@ impl JobStore for InMemoryJobStore {
         Ok(true)
     }
 
+    async fn cancel_job(&self, job_id: Uuid, claim_token: Uuid, remark: &str) -> Result<bool> {
+        // Mirror `fail_job` (claimed OR running, claim-token guarded) but
+        // transition to `cancelled` + a `cancelled` event, no forensics result.
+        let mut s = self.state.lock().unwrap();
+        match s.jobs.get(&job_id) {
+            Some(j)
+                if matches!(j.status, JobStatus::Claimed | JobStatus::Running)
+                    && j.claim_token == Some(claim_token) => {}
+            _ => return Ok(false),
+        }
+        let now = Utc::now();
+        let event = JobEvent {
+            id: self
+                .next_event_id
+                .fetch_add(1, Ordering::SeqCst),
+            job_id,
+            event_kind: JobEventKind::Cancelled,
+            event_status: JobEventStatus::Fail,
+            occurred_at: now,
+            github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
+            remark: Some(remark.to_string()),
+            detail: None,
+        };
+        let job = s
+            .jobs
+            .get_mut(&job_id)
+            .unwrap();
+        job.status = JobStatus::Cancelled;
+        job.updated_at = now;
+        s.events.push(event);
+        Ok(true)
+    }
+
+    async fn running_job_ids(&self) -> Result<Vec<Uuid>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.jobs
+            .values()
+            .filter(|j| j.status == JobStatus::Running)
+            .map(|j| j.id)
+            .collect())
+    }
+
+    async fn cancel_orphan(&self, job_id: Uuid, remark: &str) -> Result<bool> {
+        // Mirror the Postgres path: unconditional running→cancelled (no claim
+        // guard) + a `cancelled` event, idempotent on a re-run.
+        let mut s = self.state.lock().unwrap();
+        match s.jobs.get(&job_id) {
+            Some(j) if j.status == JobStatus::Running => {}
+            _ => return Ok(false),
+        }
+        let now = Utc::now();
+        let event = JobEvent {
+            id: self
+                .next_event_id
+                .fetch_add(1, Ordering::SeqCst),
+            job_id,
+            event_kind: JobEventKind::Cancelled,
+            event_status: JobEventStatus::Fail,
+            occurred_at: now,
+            github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
+            remark: Some(remark.to_string()),
+            detail: None,
+        };
+        let job = s
+            .jobs
+            .get_mut(&job_id)
+            .unwrap();
+        job.status = JobStatus::Cancelled;
+        job.updated_at = now;
+        s.events.push(event);
+        Ok(true)
+    }
+
     async fn queued_event(&self, job_id: Uuid) -> Result<Option<JobEvent>> {
         let s = self.state.lock().unwrap();
         Ok(s.events

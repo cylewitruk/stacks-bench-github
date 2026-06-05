@@ -77,13 +77,17 @@ pub enum CheckRunState {
 /// panic, timeout). A slow/regressed-but-completed run is still `success` —
 /// perf is data, not a gate. The check is non-required, so a `failure` is a
 /// visible signal without blocking the merge. `skipped`/`neutral` are for the
-/// Phase-3 placeholder paths (considered-not-run / not-yet-run).
+/// Phase-3 placeholder paths (considered-not-run / not-yet-run). `cancelled` is
+/// a *deliberately-stopped* run (operator shutdown/abort or crash-orphan
+/// recovery) — GitHub renders it neutral-gray, distinct from a red `failure`,
+/// so a stopped run doesn't read as a broken benchmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckRunConclusion {
     Success,
     Failure,
     Neutral,
     Skipped,
+    Cancelled,
 }
 
 /// Markdown payload shown in the check's Checks-tab panel.
@@ -590,6 +594,7 @@ fn status_strings(state: CheckRunState) -> (&'static str, Option<&'static str>) 
         CheckRunState::Completed(Failure) => ("completed", Some("failure")),
         CheckRunState::Completed(Neutral) => ("completed", Some("neutral")),
         CheckRunState::Completed(Skipped) => ("completed", Some("skipped")),
+        CheckRunState::Completed(Cancelled) => ("completed", Some("cancelled")),
     }
 }
 
