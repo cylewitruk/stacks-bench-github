@@ -25,6 +25,7 @@ use crate::bench_recipe::BenchRecipe;
 use crate::events::{ChannelSink, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, Shell};
+use crate::progress::ProgressReporter;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 use crate::reporter::{Prepared, Reporter};
 use crate::shutdown::Shutdown;
@@ -51,6 +52,10 @@ const EVENT_BUFFER: usize = 32;
 /// re-triggerable, not a benchmark failure, and a crash mid-run may recur. PR
 /// jobs are re-triggered with `/benchmark`; baselines by the next push.
 const ORPHAN_REMARK: &str = "recovered: orphaned in `running` by a daemon restart/crash";
+
+/// Short, user-facing reason shown on a recovered orphan's **cancelled** Check
+/// Run (4C-2) — the longer [`ORPHAN_REMARK`] is the DB-side remark.
+const ORPHAN_CHECK_REASON: &str = "the daemon restarted while this run was in progress";
 
 /// The runner's shared handles, cloned into each job task so it can run on its
 /// own (spawned) without borrowing the coordinator.
@@ -264,7 +269,11 @@ impl Coordinator {
                 .await
             {
                 Ok(true) => {
-                    tracing::info!(job_id = %id, "recovered orphaned `running` job (cancelled)")
+                    tracing::info!(job_id = %id, "recovered orphaned `running` job (cancelled)");
+                    // 4C-2: conclude the orphan's stuck `in_progress` check (and
+                    // stale comment) as cancelled, via the normal reporting path.
+                    self.conclude_orphan_report(id)
+                        .await;
                 }
                 // Raced off `running` between list and cancel — nothing to do.
                 Ok(false) => {}
@@ -274,6 +283,36 @@ impl Coordinator {
             }
         }
         Ok(())
+    }
+
+    /// Conclude a recovered orphan's stuck Check Run (and update its stale
+    /// comment) as **cancelled** (4C-2), reusing the normal reporting path so
+    /// the gray-check + correct re-trigger hint match a live abort.
+    /// Best-effort: the row is already terminal, so a GitHub blip just
+    /// leaves the check spinning (no worse than pre-4C-2) and isn't
+    /// retried.
+    async fn conclude_orphan_report(&self, job_id: Uuid) {
+        let job = match self
+            .deps
+            .jobs
+            .load_runnable(job_id)
+            .await
+        {
+            Ok(Some(job)) => job,
+            // Row vanished, or nothing to load — nothing to conclude.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    job_id = %job_id,
+                    "orphan recovery: couldn't load reporting context; check may stay in-progress",
+                );
+                return;
+            }
+        };
+        ProgressReporter::new(self.deps.gh.as_ref(), &job)
+            .cancelled(ORPHAN_CHECK_REASON)
+            .await;
     }
 
     /// Reclaim jobs stranded mid-claim (crash / preflight error between claim
@@ -540,6 +579,8 @@ mod tests {
         orphans: StdMutex<Vec<Uuid>>,
         /// Force `running_job_ids` to error — the startup-critical path.
         fail_list: std::sync::atomic::AtomicBool,
+        /// The read-only view `load_runnable` returns (4C-2 orphan-check path).
+        orphan_runnable: StdMutex<Option<RunnableJob>>,
     }
 
     impl FakeSource {
@@ -551,6 +592,7 @@ mod tests {
                 fail_persist: std::sync::atomic::AtomicBool::new(false),
                 orphans: StdMutex::new(Vec::new()),
                 fail_list: std::sync::atomic::AtomicBool::new(false),
+                orphan_runnable: StdMutex::new(None),
             }
         }
         /// Seed an orphaned `running` job id for the startup-recovery path.
@@ -559,6 +601,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(id);
+        }
+        /// Seed the [`RunnableJob`] view `load_runnable` returns (the orphan's
+        /// reconstructed reporting context, for the 4C-2 check-conclusion
+        /// path).
+        fn set_orphan_runnable(&self, job: RunnableJob) {
+            *self
+                .orphan_runnable
+                .lock()
+                .unwrap() = Some(job);
         }
         /// Make `running_job_ids` error, exercising the startup-critical path.
         fn fail_list(&self) {
@@ -597,6 +648,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .take())
+        }
+        async fn load_runnable(&self, _job_id: Uuid) -> anyhow::Result<Option<RunnableJob>> {
+            Ok(self
+                .orphan_runnable
+                .lock()
+                .unwrap()
+                .clone())
         }
         async fn start_running(
             &self,
@@ -1240,6 +1298,9 @@ mod tests {
                 .unwrap()
                 .pop_front())
         }
+        async fn load_runnable(&self, _job_id: Uuid) -> anyhow::Result<Option<RunnableJob>> {
+            Ok(None)
+        }
         async fn start_running(
             &self,
             _job: &RunnableJob,
@@ -1554,5 +1615,70 @@ mod tests {
             "list failure is startup-critical and propagates, got: {err:#}",
         );
         assert!(source.calls().is_empty(), "aborted before any claim, got {:?}", source.calls(),);
+    }
+
+    /// Phase 4C-2: a recovered orphan's stuck `in_progress` Check Run is
+    /// concluded `cancelled` (gray) via the normal reporting path —
+    /// `load_runnable` reconstructs the orphan's reporting context and
+    /// `ProgressReporter::cancelled` concludes its check.
+    #[tokio::test]
+    async fn startup_concludes_orphan_check_as_cancelled() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+        let orphan_id = Uuid::new_v4();
+        let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+        source.add_orphan(orphan_id);
+        // The reconstructed orphan view carries a commit check (id 555) to conclude.
+        source.set_orphan_runnable(RunnableJob {
+            id: orphan_id,
+            progress: ProgressTarget::CommitCheck { check_run_id: Some(555) },
+            ..pr_job("abc123", None)
+        });
+
+        let gh = Arc::new(FakeGitHub::new());
+        // `cleanup_by_job_id` (no loop attached) issues seven shell calls.
+        let shell = Arc::new(RecordingShell::new());
+        shell
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount tmpfs
+            .expect_ok(1) // umount source.mnt
+            .reply(PreparedReply::with_stdout("")) // losetup -j → none
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git prune
+
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        let shutdown = Shutdown::new();
+        shutdown.draining.cancel();
+
+        runner
+            .run(shutdown)
+            .await
+            .unwrap();
+
+        // The orphan row was cancelled …
+        assert!(
+            source
+                .calls()
+                .contains(&"cancel_orphan"),
+            "orphan row cancelled, got {:?}",
+            source.calls(),
+        );
+        // … and its stuck check concluded `cancelled` (neutral-gray), not left
+        // spinning.
+        let concluded = gh
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                FakeCall::UpdateCheckRun { check_run_id: 555, state, .. } => Some(state),
+                _ => None,
+            })
+            .expect("the orphan's check was concluded");
+        assert_eq!(
+            concluded,
+            sbgh_core::github::CheckRunState::Completed(
+                sbgh_core::github::CheckRunConclusion::Cancelled
+            ),
+        );
     }
 }

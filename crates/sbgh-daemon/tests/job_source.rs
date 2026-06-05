@@ -209,6 +209,154 @@ async fn v2_source_claims_assembles_and_completes_with_metric_and_result() {
     assert_eq!(event_count, 1);
 }
 
+/// 4C-2: `load_runnable` assembles the same execution view as `claim_next`
+/// but **read-only** — no claim taken (`claim_token = None`) and the row's
+/// status is untouched. Used by orphan recovery to conclude a stuck check.
+#[tokio::test]
+async fn v2_source_load_runnable_assembles_view_without_claiming() {
+    let (_db, pool) = setup_pg_db().await;
+    let webhook_id = seed(&pool, 100, 10).await;
+    let store = Arc::new(PostgresJobStore::new(pool.clone()));
+    enqueue_branch_push(&store, webhook_id).await;
+    let source = JobSource::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+    );
+
+    // Claim + run so there's a `running` row to load (the orphan case).
+    let claimed = source
+        .claim_next()
+        .await
+        .unwrap()
+        .expect("one queued job");
+    source
+        .start_running(&claimed, None)
+        .await
+        .unwrap();
+
+    let loaded = source
+        .load_runnable(claimed.id)
+        .await
+        .unwrap()
+        .expect("the running row loads");
+    // Same assembled view…
+    assert_eq!(loaded.id, claimed.id);
+    assert_eq!(loaded.repository, "octo/core");
+    assert_eq!(loaded.commit, "pushsha");
+    assert!(matches!(loaded.progress, ProgressTarget::CommitCheck { check_run_id: None }));
+    // …but read-only: no claim, and the status stayed `running`.
+    assert!(loaded.claim_token.is_none(), "load_runnable takes no claim");
+    let status: String = sqlx::query_scalar("SELECT status::text FROM job WHERE id = $1")
+        .bind(claimed.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "running", "load_runnable must not transition the row");
+
+    // A missing id loads nothing.
+    assert!(
+        source
+            .load_runnable(uuid::Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// 4C-2 (Codex test-gap): the product value of `load_runnable` is surfacing an
+/// **existing** Check Run id + url so orphan recovery can conclude the stuck
+/// check. A PR job with a recorded `check_run_created` event, left `running`
+/// (the orphan state), loads with `check_run_id`/`check_run_url` populated.
+#[tokio::test]
+async fn v2_source_load_runnable_surfaces_existing_check_for_conclusion() {
+    let (_db, pool) = setup_pg_db().await;
+    let webhook_id = seed(&pool, 100, 10).await;
+    let store = Arc::new(PostgresJobStore::new(pool.clone()));
+
+    // Author + PR row (the PR link's FK target).
+    sqlx::query("INSERT INTO github_user (id, login, user_type) VALUES (42, 'alice', 'user')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pr_id: i64 = sqlx::query_scalar(
+        "INSERT INTO github_pull_request (target_github_repo_id, source_github_repo_id, \
+         pr_number, title, author_github_user_id) VALUES (10, 10, 7, 't', 42) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let created = store
+        .create_job_with_links(&JobCreationRequest {
+            new_job: NewJob {
+                github_installation_id: 100,
+                github_repo_id: 10,
+                job_kind: JobKind::AdHoc,
+                trigger_kind: TriggerKind::PrComment,
+                git_ref_kind: GitRefKind::Branch,
+                git_ref_display: "feat".into(),
+                git_commit_hash: Some("headsha".into()),
+                git_committed_at: None,
+            },
+            github_webhook_id: webhook_id,
+            triggering_user_id: Some(42),
+            pull_request_link: Some(NewPullRequestLink {
+                github_pull_request_id: pr_id,
+                triggering_comment_id: Some(9001),
+            }),
+            queued_event_detail: None,
+        })
+        .await
+        .unwrap();
+    let JobCreationOutcome::Created(created) = created else {
+        panic!("expected Created");
+    };
+
+    let source = JobSource::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+    );
+
+    // Claim, record a created check (id + url), and mark running — the orphan
+    // state.
+    let job = source
+        .claim_next()
+        .await
+        .unwrap()
+        .unwrap();
+    source
+        .set_check_run(&job, 4242, Some("https://github.test/checks/4242"))
+        .await
+        .unwrap();
+    source
+        .start_running(&job, None)
+        .await
+        .unwrap();
+
+    // load_runnable surfaces the existing check id + url for conclusion.
+    let loaded = source
+        .load_runnable(created.job.id)
+        .await
+        .unwrap()
+        .expect("the running row loads");
+    match loaded.progress {
+        ProgressTarget::PullRequest {
+            check_run_id, check_run_url, ..
+        } => {
+            assert_eq!(check_run_id, Some(4242), "existing check id surfaced for conclusion");
+            assert_eq!(
+                check_run_url.as_deref(),
+                Some("https://github.test/checks/4242"),
+                "existing check url surfaced",
+            );
+        }
+        other => panic!("expected PullRequest progress, got {other:?}"),
+    }
+    assert!(loaded.claim_token.is_none(), "still read-only");
+}
+
 #[tokio::test]
 async fn v2_source_fail_records_event_and_forensics_result() {
     let (_db, pool) = setup_pg_db().await;

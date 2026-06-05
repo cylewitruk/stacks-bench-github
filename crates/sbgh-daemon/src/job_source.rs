@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sbgh_core::db::{JobCompletion, JobFailure, JobStore, PullRequestStore, RepoStore};
 use sbgh_core::models::{
-    GitRefKind, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent, QueuedEventDetail,
-    ResolvedCommit,
+    GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent,
+    QueuedEventDetail, ResolvedCommit,
 };
 use uuid::Uuid;
 
@@ -92,6 +92,13 @@ pub trait RunnableJobStore: Send + Sync + 'static {
     /// `claimed → running` step happens in [`Self::start_running`] once
     /// execution actually begins).
     async fn claim_next(&self) -> anyhow::Result<Option<RunnableJob>>;
+
+    /// Assemble the read-only [`RunnableJob`] view for an existing job by id,
+    /// **without** claiming it (no status change; `claim_token = None`). Used
+    /// by orphan recovery (4C-2) to conclude a stuck orphan's Check Run +
+    /// stale comment through the normal reporting path. `None` if the row
+    /// is gone.
+    async fn load_runnable(&self, job_id: Uuid) -> anyhow::Result<Option<RunnableJob>>;
 
     /// Mark the job as actually running, persisting a commit resolved
     /// during preflight (if any): `claimed → running` carrying the
@@ -196,88 +203,25 @@ impl RunnableJobStore for JobSource {
         else {
             return Ok(None);
         };
+        Ok(Some(
+            self.assemble_runnable(job, Some(claim_token))
+                .await?,
+        ))
+    }
 
-        // Resolve owner/name. The job's composite FK guarantees the repo
-        // row exists, so a cache miss here is a real inconsistency.
-        let repo = self
-            .repos
-            .lookup_repo(job.github_repo_id)
+    async fn load_runnable(&self, job_id: Uuid) -> anyhow::Result<Option<RunnableJob>> {
+        let Some(job) = self
+            .jobs
+            .lookup_job(job_id)
             .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "job {} references unknown github_repo {}",
-                    job.id,
-                    job.github_repo_id
-                )
-            })?;
-
-        // bench_args live in the queued event's provenance detail.
-        let queued = self
-            .jobs
-            .queued_event(job.id)
-            .await?;
-        let bench_args = queued
-            .as_ref()
-            .and_then(|e| e.detail.as_ref())
-            .map(|d| bench_args_from_detail(&d.0))
-            .unwrap_or_default();
-
-        // PR-linked jobs (`pr_comment`) report on a Check Run + comment;
-        // baseline jobs (`branch_push`/`tag_created`) on a commit-level Check
-        // Run. On (re-)claim the already-created comment/check ids are read
-        // back so a reclaimed job updates them rather than duplicating.
-        let check_run = self
-            .jobs
-            .latest_check_run(job.id)
-            .await?;
-        let progress = match self
-            .jobs
-            .pull_request_link(job.id)
-            .await?
-        {
-            Some(link) => {
-                let pr = self
-                    .pull_requests
-                    .lookup_by_id(link.github_pull_request_id)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "job {} links unknown github_pull_request {}",
-                            job.id,
-                            link.github_pull_request_id
-                        )
-                    })?;
-                let comment_id = self
-                    .jobs
-                    .latest_comment_id(job.id)
-                    .await?;
-                ProgressTarget::PullRequest {
-                    pr_number: pr.pr_number as i64,
-                    comment_id,
-                    check_run_id: check_run
-                        .as_ref()
-                        .map(|(id, _)| *id),
-                    check_run_url: check_run.and_then(|(_, url)| url),
-                }
-            }
-            None => ProgressTarget::CommitCheck {
-                check_run_id: check_run.map(|(id, _)| id),
-            },
+        else {
+            return Ok(None);
         };
-
-        Ok(Some(RunnableJob {
-            id: job.id,
-            repository: format!("{}/{}", repo.owner, repo.name),
-            commit: job
-                .git_commit_hash
-                .unwrap_or_default(),
-            git_ref_display: job.git_ref_display,
-            git_ref_kind: job.git_ref_kind,
-            installation_id: job.github_installation_id,
-            bench_args,
-            progress,
-            claim_token: Some(claim_token),
-        }))
+        // Read-only view: no claim taken, so `claim_token = None`.
+        Ok(Some(
+            self.assemble_runnable(job, None)
+                .await?,
+        ))
     }
 
     async fn start_running(
@@ -445,6 +389,101 @@ impl JobSource {
     fn expect_token(&self, job: &RunnableJob) -> anyhow::Result<Uuid> {
         job.claim_token
             .ok_or_else(|| anyhow::anyhow!("new-schema job {} has no claim token", job.id))
+    }
+
+    /// Assemble the storage-neutral [`RunnableJob`] view from a `job` row:
+    /// resolve `owner/name`, read `bench_args` from the queued event, and the
+    /// reporting surface (a PR's Check Run + comment ids, or a baseline commit
+    /// check). Shared by [`claim_next`](RunnableJobStore::claim_next) (with the
+    /// fresh claim token) and
+    /// [`load_runnable`](RunnableJobStore::load_runnable) (read-only,
+    /// `claim_token = None`).
+    async fn assemble_runnable(
+        &self,
+        job: Job,
+        claim_token: Option<Uuid>,
+    ) -> anyhow::Result<RunnableJob> {
+        // Resolve owner/name. The job's composite FK guarantees the repo
+        // row exists, so a cache miss here is a real inconsistency.
+        let repo = self
+            .repos
+            .lookup_repo(job.github_repo_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "job {} references unknown github_repo {}",
+                    job.id,
+                    job.github_repo_id
+                )
+            })?;
+
+        // bench_args live in the queued event's provenance detail.
+        let queued = self
+            .jobs
+            .queued_event(job.id)
+            .await?;
+        let bench_args = queued
+            .as_ref()
+            .and_then(|e| e.detail.as_ref())
+            .map(|d| bench_args_from_detail(&d.0))
+            .unwrap_or_default();
+
+        // PR-linked jobs (`pr_comment`) report on a Check Run + comment;
+        // baseline jobs (`branch_push`/`tag_created`) on a commit-level Check
+        // Run. The already-created comment/check ids are read back so a
+        // reclaimed (or recovered) job updates them rather than duplicating.
+        let check_run = self
+            .jobs
+            .latest_check_run(job.id)
+            .await?;
+        let progress = match self
+            .jobs
+            .pull_request_link(job.id)
+            .await?
+        {
+            Some(link) => {
+                let pr = self
+                    .pull_requests
+                    .lookup_by_id(link.github_pull_request_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "job {} links unknown github_pull_request {}",
+                            job.id,
+                            link.github_pull_request_id
+                        )
+                    })?;
+                let comment_id = self
+                    .jobs
+                    .latest_comment_id(job.id)
+                    .await?;
+                ProgressTarget::PullRequest {
+                    pr_number: pr.pr_number as i64,
+                    comment_id,
+                    check_run_id: check_run
+                        .as_ref()
+                        .map(|(id, _)| *id),
+                    check_run_url: check_run.and_then(|(_, url)| url),
+                }
+            }
+            None => ProgressTarget::CommitCheck {
+                check_run_id: check_run.map(|(id, _)| id),
+            },
+        };
+
+        Ok(RunnableJob {
+            id: job.id,
+            repository: format!("{}/{}", repo.owner, repo.name),
+            commit: job
+                .git_commit_hash
+                .unwrap_or_default(),
+            git_ref_display: job.git_ref_display,
+            git_ref_kind: job.git_ref_kind,
+            installation_id: job.github_installation_id,
+            bench_args,
+            progress,
+            claim_token,
+        })
     }
 }
 

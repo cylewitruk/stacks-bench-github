@@ -650,7 +650,10 @@ primitive; signals + graceful shutdown; orphan/stuck-`running` recovery). 4A and
 
 ### Phase 4C — Cancelled terminal status (abort/orphan ≠ failure)
 
-**Status:** 4C-1 implemented (code review pending); 4C-2 (orphan check-conclusion) pending.
+**Status:** complete — 4C-1 + 4C-2 both Codex-signed-off; 4C-1 also
+**live-validated** (a `systemctl stop` mid-run produced the gray "Cancelled"
+check + "cancelled… re-run with `/benchmark`" comment on a real PR). Pending
+deploy + the kill-9 orphan smoke-test (which now concludes the orphan check too).
 
 **Why:** before this, an operator-initiated abort *and* a crash-orphan both
 landed as `failed` — a red ✗ check that reads as "the benchmark broke" and
@@ -691,16 +694,29 @@ using it. No migration needed.
     `cancelled_concludes_check_cancelled` (progress),
     `aborted_terminal_cancels_the_job_and_check` (reporter); plus the 4B-2
     orphan tests retargeted to `cancel_orphan` + `Cancelled`.
-- **4C-2 — conclude the orphaned check (pending):** at startup recovery,
-  reconstruct an orphan's reporting context (repo + installation + check id) and
-  conclude its stuck-`in_progress` Check Run as `cancelled` — closing the
-  spinner the 4B-2 follow-up flagged. Needs a read-only context lookup; deferred
-  to keep 4C-1 reviewable.
+- **4C-2 — conclude the orphaned check (done):** at startup recovery, after
+  `cancel_orphan` succeeds, the coordinator concludes the orphan's
+  stuck-`in_progress` Check Run (and updates its stale comment) as `cancelled` —
+  closing the spinner the 4B-2 follow-up flagged. Rather than duplicate the
+  conclusion logic, a new read-only `RunnableJobStore::load_runnable(job_id)`
+  reconstructs the orphan's `RunnableJob` view (sharing `claim_next`'s assembly
+  via an extracted `assemble_runnable`, but taking **no claim** —
+  `claim_token = None`, status untouched), and the existing
+  `ProgressReporter::cancelled` does the rest (gray check + correct re-trigger
+  hint, exactly matching a live abort). Best-effort: the row is already
+  terminal, so a GitHub blip just leaves the check spinning (no worse than
+  pre-4C-2) and isn't retried. Tests: `startup_concludes_orphan_check_as_cancelled`
+  (runner) + `v2_source_load_runnable_assembles_view_without_claiming` (read-only,
+  no status change) + `v2_source_load_runnable_surfaces_existing_check_for_conclusion`
+  (the existing check id + url are surfaced — the data the conclusion needs).
 
 - [x] 4C-1 implemented (Cancelled status + gray check; abort + orphan → cancelled)
-- [x] 4C-1 coverage added (5 new tests; 527 daemon+core green)
-- [ ] 4C-1 reviewed — Codex review pending
-- [ ] 4C-2 (orphan check-conclusion) + review
+- [x] 4C-1 coverage added (6 new tests, incl. the baseline re-trigger-hint fix)
+- [x] 4C-1 reviewed — Codex signed off (Low: baseline check hint) + live-validated via `systemctl stop`
+- [x] 4C-2 implemented (orphan check-conclusion via `load_runnable` + reused `ProgressReporter::cancelled`)
+- [x] 4C-2 coverage added (3 new tests; 531 daemon+core green)
+- [x] 4C-2 reviewed — Codex signed off (added the existing-check-surfacing test)
+- [x] Complete (code; pending deploy + the kill-9 orphan smoke-test)
 
 ---
 

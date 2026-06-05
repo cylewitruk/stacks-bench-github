@@ -734,6 +734,9 @@ mod tests {
         async fn claim_next(&self) -> anyhow::Result<Option<RunnableJob>> {
             Ok(None)
         }
+        async fn load_runnable(&self, _job_id: uuid::Uuid) -> anyhow::Result<Option<RunnableJob>> {
+            Ok(None)
+        }
         async fn start_running(
             &self,
             _job: &RunnableJob,
