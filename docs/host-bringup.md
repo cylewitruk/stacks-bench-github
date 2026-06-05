@@ -545,6 +545,15 @@ in the repo. To override `RUST_LOG` or other env per host, use
 `sudo systemctl edit sbgh-daemon` (creates a drop-in at
 `/etc/systemd/system/sbgh-daemon.service.d/override.conf`).
 
+> **Shutdown behavior.** `systemctl stop` (SIGTERM) **aborts** in-flight runs —
+> the daemon cancels them, tears their VMs down, marks the jobs failed ("aborted
+> by shutdown"), and exits. In a foreground/`tmux` run, **one** `Ctrl-C` (SIGINT)
+> **drains** instead — it stops claiming new jobs and lets in-flight runs finish,
+> then exits; a **second** `Ctrl-C` escalates to abort. The unit sets
+> `KillMode=mixed` + `TimeoutStopSec=120s` so systemd lets the daemon run that
+> teardown rather than SIGKILLing its `virsh`/`lvremove` children — raise the
+> timeout if you run many concurrent jobs.
+
 **For first-time debugging** before installing the unit (sees errors
 immediately, easier to ctrl-C), foreground-run in a `tmux` session:
 

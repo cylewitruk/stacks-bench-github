@@ -35,6 +35,23 @@ RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=10s
 
+# ─── Shutdown (roadmap-v5 Phase 4) ──────────────────────────────────────
+# `systemctl stop` → SIGTERM, which the daemon handles as an ABORT: it cancels
+# in-flight runs and tears their VMs down (via its own virsh/lvremove calls),
+# then exits cleanly.
+#
+# KillMode=mixed sends SIGTERM to the **main process only** (not the whole
+# cgroup). That's essential: the daemon's teardown spawns `sudo virsh
+# destroy/undefine`, `lvremove`, `umount` children — `KillMode=control-group`
+# (the default) would SIGTERM those out from under an in-progress cleanup. With
+# `mixed`, only the daemon gets the signal; it drives the teardown itself, and
+# systemd SIGKILLs anything still in the cgroup only at the final timeout.
+KillMode=mixed
+# Give the abort path room to tear down every in-flight VM before systemd
+# escalates to SIGKILL — a few virsh/LVM ops per concurrent job. Bump this if
+# you raise [runner].max_concurrent_jobs substantially.
+TimeoutStopSec=120s
+
 # Logs go to journald — view with:
 #   journalctl -u sbgh-daemon -f
 #   journalctl -u sbgh-daemon -p info --since '1h ago'

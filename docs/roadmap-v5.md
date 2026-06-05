@@ -179,9 +179,12 @@ Everything per-run is `job_id`-namespaced *except*:
 
 ### 6. Failure isolation + two-mode shutdown
 
-Workers run in a `JoinSet` under a `CancellationToken`. A panicking worker fails
-**that** job only (the coordinator catches the join error and routes a synthetic
-`Finished(Failed)` to its reporter).
+Job tasks run in a `JoinSet`, each with a child of the daemon abort
+`CancellationToken`. A panicking task fails **that** job only: dropping it closes
+its `events` channel, so the (separate) reporter task hits its channel-close
+`abandon` path and terminal-fails the job; the coordinator just logs the
+`JoinError` with job context. (No synthetic `Finished(Failed)` — the reporter
+owns the terminal write.)
 
 Shutdown has **two modes**, driven by signals (full design in Phase 4):
 
@@ -556,20 +559,30 @@ primitive); **4B pending** (signals + coordinator + wiring).
   - Tests: `cancellation_breaks_at_poll_loop_and_tears_down` (driver: pre-cancel
     → poll breaks → teardown destroys the domain) and
     `a_cancelled_run_is_reported_aborted` (worker: cancelled token → `Aborted`).
-- **4B — signals + orchestration (next):** the `SIGTERM`/`SIGINT` task + a
-  `watch` drain/abort/escalate state, the coordinator's stop-claiming, the
-  cancel-on-abort and shutdown-token exit condition, the top-level `try_join!`
-  wiring, the systemd `KillMode=mixed` / `TimeoutStopSec` docs, **and
-  orphan/stuck-`running` recovery** — the `cleanup_by_job_id` primitive
-  (complete this time: `source.mnt` + loop device via `losetup -j` on the
-  job-id-named backing file) for a dead reporter / hard-killed daemon, where
-  there's no live driver to run the normal teardown.
+- **4B-1 — signals + graceful shutdown (done):** [shutdown.rs](../crates/sbgh-daemon/src/shutdown.rs)
+  defines three `CancellationToken`s — **`abort`** (parent of the per-job child
+  tokens; fired on Abort), **`draining`** (stop-claiming; set on Drain or Abort),
+  **`exit`** (the coordinator fires it when drained + idle). `watch_signals` maps
+  `SIGINT`×1 → Drain, `SIGINT`×2 / `SIGTERM` → Abort. `Runner::run(shutdown)`
+  stops claiming when draining and returns once idle, firing `exit`; the API
+  (`with_graceful_shutdown`) + processor (`select!`) observe `exit` so
+  `try_join!` completes and the process exits — the coordinator is the **sole**
+  trigger. systemd unit gains `KillMode=mixed` + `TimeoutStopSec=120s` (so the
+  daemon drives teardown instead of systemd SIGKILLing its `virsh` children).
+  Test: `drain_stops_claiming_and_fires_exit_when_idle`.
+- **4B-2 — orphan/stuck-`running` recovery (next):** the `cleanup_by_job_id`
+  primitive (complete this time: `source.mnt` + loop device via `losetup -j` on
+  the job-id-named backing file) for a dead reporter / hard-killed daemon, where
+  there's no live driver to run the normal teardown — wired into the
+  startup/stuck-claim sweep.
 
   - [x] 4A implementation completed
   - [x] 4A coverage (cancel breaks at the poll loop, `losetup -d` ran before
         cancel, normal teardown destroys the domain; worker maps token → aborted)
   - [x] 4A reviewed — Codex signed off
-  - [ ] 4B (SIGTERM aborts+cleans+fails; SIGINT drains; 2×SIGINT escalates) + review
+  - [x] 4B-1 implemented (SIGTERM aborts; SIGINT drains; 2×SIGINT escalates; graceful exit)
+  - [x] 4B-1 reviewed — Codex signed off
+  - [ ] 4B-2 (orphan / stuck-`running` recovery) + review
   - [ ] Complete
 
 ---

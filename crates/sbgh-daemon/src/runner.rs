@@ -26,6 +26,7 @@ use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::Shell;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 use crate::reporter::{Prepared, Reporter};
+use crate::shutdown::Shutdown;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -89,20 +90,42 @@ impl Runner {
     }
 
     /// The coordinator loop: sweep stranded claims, fill every free slot from
-    /// the queue, then wait for a task to free a slot or the poll tick. Runs
-    /// forever. The per-iteration machinery lives on [`Coordinator`] so it's
-    /// unit-testable without the loop.
-    pub async fn run(self) -> anyhow::Result<()> {
+    /// the queue (until a drain/abort is requested), then wait for a task to
+    /// free a slot or the poll tick. Returns when drained/aborted **and** idle,
+    /// firing `shutdown.exit` so the rest of the process can stop. The
+    /// per-iteration machinery lives on [`Coordinator`] so it's unit-testable
+    /// without the loop.
+    pub async fn run(self, shutdown: Shutdown) -> anyhow::Result<()> {
         tracing::info!(max_concurrent = self.max_concurrent, "daemon started");
         let lease = chrono::Duration::minutes(CLAIM_LEASE_MINUTES);
-        let mut coord = Coordinator::new(self.deps, self.max_concurrent);
+        // The job tasks get child tokens of `abort`, so an abort cancels them
+        // all at once.
+        let mut coord = Coordinator::new(self.deps, self.max_concurrent, shutdown.abort.clone());
         loop {
             coord.sweep(lease).await;
-            coord.fill_slots().await;
+            // Once a drain/abort is requested, stop pulling new work; queued
+            // jobs wait for the next boot.
+            if !shutdown
+                .draining
+                .is_cancelled()
+            {
+                coord.fill_slots().await;
+            }
+            // Shutdown requested and nothing left in flight → we're done.
+            if shutdown
+                .draining
+                .is_cancelled()
+                && coord.in_flight() == 0
+            {
+                break;
+            }
             coord
-                .wait_for_progress()
+                .wait_for_progress(&shutdown.draining)
                 .await;
         }
+        tracing::info!("coordinator drained; signalling process exit");
+        shutdown.exit.cancel();
+        Ok(())
     }
 
     /// Claim + run one job to completion on a standalone slot. The run-loop
@@ -141,21 +164,20 @@ struct Coordinator {
     tasks: JoinSet<anyhow::Result<()>>,
     /// task id → job id, so a panicking task can be logged with context.
     task_jobs: HashMap<Id, Uuid>,
-    /// The daemon-wide shutdown token. Each job gets a **child** token, so an
+    /// The daemon-wide **abort** token. Each job gets a **child** token, so an
     /// abort cancels every in-flight run at once, while one job's own
-    /// cancellation never propagates back up to siblings (Phase 4 wires the
-    /// trigger; in this slice it's never fired).
-    shutdown: CancellationToken,
+    /// cancellation never propagates back up to siblings.
+    abort: CancellationToken,
 }
 
 impl Coordinator {
-    fn new(deps: JobDeps, max_concurrent: usize) -> Self {
+    fn new(deps: JobDeps, max_concurrent: usize, abort: CancellationToken) -> Self {
         Self {
             deps,
             slots: Arc::new(Semaphore::new(max_concurrent)),
             tasks: JoinSet::new(),
             task_jobs: HashMap::new(),
-            shutdown: CancellationToken::new(),
+            abort,
         }
     }
 
@@ -163,7 +185,6 @@ impl Coordinator {
     /// task can finish (freeing its semaphore permit, so a slot may top up)
     /// before the next `join_next` reaps it. The real concurrency cap is
     /// the semaphore, not this count.
-    #[cfg(test)]
     fn in_flight(&self) -> usize {
         self.tasks.len()
     }
@@ -201,7 +222,7 @@ impl Coordinator {
             {
                 Ok(Some(job)) => {
                     let job_id = job.id;
-                    let token = self.shutdown.child_token();
+                    let token = self.abort.child_token();
                     let id = self
                         .tasks
                         .spawn(
@@ -229,15 +250,22 @@ impl Coordinator {
         spawned
     }
 
-    /// Wait for a task to finish (freeing a slot) or the poll tick (to re-sweep
-    /// + top up slots if the queue grew). When idle, just poll.
-    async fn wait_for_progress(&mut self) {
+    /// Wait for a task to finish (freeing a slot), the poll tick (to re-sweep +
+    /// top up slots if the queue grew), or a drain request (to re-evaluate the
+    /// exit condition promptly). The `draining` wake arm is disabled once it's
+    /// already set, so a drain-with-jobs-in-flight reaps via `join_next` rather
+    /// than busy-looping.
+    async fn wait_for_progress(&mut self, draining: &CancellationToken) {
         if self.tasks.is_empty() {
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                _ = draining.cancelled(), if !draining.is_cancelled() => {}
+            }
         } else {
             tokio::select! {
                 Some(joined) = self.tasks.join_next_with_id() => self.reap(joined),
                 _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                _ = draining.cancelled(), if !draining.is_cancelled() => {}
             }
         }
     }
@@ -1159,7 +1187,8 @@ mod tests {
             shell: Arc::new(RecordingShell::new()),
             app_id: Arc::new(OnceCell::new()),
         };
-        let mut coord = Coordinator::new(deps, 2); // max_concurrent = 2
+        let mut coord = Coordinator::new(deps, 2, CancellationToken::new()); // max_concurrent = 2
+        let never_draining = CancellationToken::new();
 
         // First fill claims exactly the limit (2), not all 4.
         assert_eq!(coord.fill_slots().await, 2, "first fill spawns exactly the limit");
@@ -1175,7 +1204,7 @@ mod tests {
         source.release(1);
         while coord.in_flight() == 2 {
             coord
-                .wait_for_progress()
+                .wait_for_progress(&never_draining)
                 .await;
         }
         assert_eq!(coord.in_flight(), 1);
@@ -1192,7 +1221,7 @@ mod tests {
                 break;
             }
             coord
-                .wait_for_progress()
+                .wait_for_progress(&never_draining)
                 .await;
         }
         assert_eq!(source.peak_blocked(), 2, "never exceeded the configured limit");
@@ -1230,5 +1259,37 @@ mod tests {
             Some(WorkerEvent::Finished(Terminal::Aborted)) => {}
             other => panic!("expected Finished(Aborted), got {other:?}"),
         }
+    }
+
+    /// With a drain requested, the coordinator **stops claiming** (queued jobs
+    /// wait for the next boot) and, being idle, returns — firing `exit` so the
+    /// rest of the process can stop.
+    #[tokio::test]
+    async fn drain_stops_claiming_and_fires_exit_when_idle() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+        // The source has a job ready, but a drain means it must never be claimed.
+        let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+        let runner = Runner::new(
+            config,
+            source.clone(),
+            Arc::new(FakeGitHub::new()),
+            Arc::new(RecordingShell::new()),
+        );
+
+        let shutdown = Shutdown::new();
+        shutdown.draining.cancel(); // drain requested before the loop runs
+
+        runner
+            .run(shutdown.clone())
+            .await
+            .unwrap();
+
+        assert!(shutdown.exit.is_cancelled(), "coordinator fired process-exit on drain-complete",);
+        assert!(
+            source.calls().is_empty(),
+            "drained: the queued job was never claimed/started, got {:?}",
+            source.calls(),
+        );
     }
 }

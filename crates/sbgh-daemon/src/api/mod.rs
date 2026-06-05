@@ -131,7 +131,11 @@ pub fn bootstrap_cookie(path: &Path) -> anyhow::Result<String> {
 /// Binds eagerly so a bad address / in-use port fails at startup. Returns
 /// when any listener errors (which crashes the daemon → systemd
 /// restart, same as the runner/processor arms).
-pub async fn serve(listen: &[String], router: Router) -> anyhow::Result<()> {
+pub async fn serve(
+    listen: &[String],
+    router: Router,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
     if listen.is_empty() {
         anyhow::bail!("[api].listen is empty — nothing to bind");
     }
@@ -144,7 +148,13 @@ pub async fn serve(listen: &[String], router: Router) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding api listener on {socket}"))?;
         tracing::info!(%socket, "api listening");
-        serves.push(axum::serve(listener, router.clone()).into_future());
+        // Stop accepting + finish in-flight requests once the daemon exits.
+        let token = shutdown.clone();
+        serves.push(
+            axum::serve(listener, router.clone())
+                .with_graceful_shutdown(async move { token.cancelled().await })
+                .into_future(),
+        );
     }
     futures::future::try_join_all(serves).await?;
     Ok(())

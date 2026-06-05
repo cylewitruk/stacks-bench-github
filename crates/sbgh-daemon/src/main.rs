@@ -8,6 +8,7 @@ mod progress;
 mod recipe;
 mod reporter;
 mod runner;
+mod shutdown;
 mod webhook_processor;
 
 use std::path::{Path, PathBuf};
@@ -175,15 +176,24 @@ async fn main() -> anyhow::Result<()> {
 
     let runner = Runner::new(config, runnable_jobs, gh, shell);
 
+    // Lifecycle shutdown (roadmap-v5 Phase 4B): a `SIGINT` drains (stop
+    // claiming, finish in-flight), a second `SIGINT` or `SIGTERM` aborts. The
+    // coordinator owns drain completion and fires `exit`, which stops the other
+    // arms so the `try_join!` returns and the process exits cleanly.
+    let shutdown = shutdown::Shutdown::new();
+
     tokio::try_join!(
-        runner.run(),
+        runner.run(shutdown.clone()),
         async {
-            processor
-                .run()
-                .await
-                .map_err(anyhow::Error::from)
+            // Stop processing webhooks once shutdown is underway; any in-flight
+            // claim is reclaimed by the processor's own sweep on the next boot.
+            tokio::select! {
+                r = processor.run() => r.map_err(anyhow::Error::from),
+                _ = shutdown.exit.cancelled() => Ok(()),
+            }
         },
-        api::serve(&api_listen, api_router),
+        api::serve(&api_listen, api_router, shutdown.exit.clone()),
+        shutdown::watch_signals(shutdown.clone()),
     )?;
     Ok(())
 }
