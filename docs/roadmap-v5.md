@@ -363,12 +363,40 @@ switched on.
   audit finds everything already safe, it collapses to the git-mirror lock + a
   regression test.
 
-**Status:**
+**Status:** complete (Codex signed off).
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (or N/A justified)
-- [ ] Reviewed — Codex signed off
-- [ ] Complete
+- [x] Initial implementation completed
+- [x] Integration coverage added — `concurrent_mirror_fetches_are_serialized`
+- [x] Reviewed — Codex signed off
+- [x] Complete
+
+> **Noted assumption (Codex):** `MIRROR_LOCK` is **process-local** — it protects
+> the mirror only within one daemon, which matches today's one-daemon-per-host
+> model. Two daemons sharing a `paths.git_mirror` would need an OS file lock
+> (`flock`); out of scope.
+
+**Audit findings:** as predicted, the audit collapsed to **one** hazard.
+
+- **git mirror** — the only shared mutable state on the per-job path. Fixed with
+  a process-global `MIRROR_LOCK` (`tokio::Mutex`, one mirror per daemon)
+  serializing every mirror mutation (`ensure` clone, `fetch_sha`, `prune`). This
+  closes the fresh-host double-`clone --mirror` TOCTOU and `FETCH_HEAD`/
+  packed-refs/object-store races. Per-job refs `refs/sbgh/<job_id>` already
+  avoided ref-name collisions. Cost is negligible (the guarded ops are
+  seconds-long vs a ~30-min run).
+- **Safe by construction (no change needed):** VM domain (`sbgh-{job_id}` name +
+  per-job UUID + libvirt **auto-generated MAC** — no `<mac>` is emitted), LVM
+  chainstate snapshot (`sbgh-{job_id}-chainstate` off a **read-only** origin;
+  `lvcreate` is VG-locked by LVM), results tmpfs + job dir (keyed by `job_id`),
+  and sccache (shared by design — atomic content-addressed writes, no teardown
+  wipe).
+
+**Design notes:**
+
+- The driver-seam concurrency test is realized as the git-mirror serialization
+  test (a probe `Shell` proving peak in-flight = 1); a separate driver-level
+  interleave test would only re-prove per-job path isolation already covered by
+  the audit. Real multi-VM execution lands behind Phase 3's default-1 limit.
 
 ---
 
