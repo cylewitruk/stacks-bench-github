@@ -17,6 +17,7 @@ use sbgh_core::config::DaemonConfig;
 use sbgh_core::github::GitHubApi;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{Id, JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::bench_recipe::BenchRecipe;
@@ -121,7 +122,7 @@ impl Runner {
                     .expect("a fresh semaphore always has a permit");
                 self.deps
                     .clone()
-                    .run(job, permit)
+                    .run(job, permit, CancellationToken::new())
                     .await?;
                 Ok(true)
             }
@@ -140,6 +141,11 @@ struct Coordinator {
     tasks: JoinSet<anyhow::Result<()>>,
     /// task id → job id, so a panicking task can be logged with context.
     task_jobs: HashMap<Id, Uuid>,
+    /// The daemon-wide shutdown token. Each job gets a **child** token, so an
+    /// abort cancels every in-flight run at once, while one job's own
+    /// cancellation never propagates back up to siblings (Phase 4 wires the
+    /// trigger; in this slice it's never fired).
+    shutdown: CancellationToken,
 }
 
 impl Coordinator {
@@ -149,6 +155,7 @@ impl Coordinator {
             slots: Arc::new(Semaphore::new(max_concurrent)),
             tasks: JoinSet::new(),
             task_jobs: HashMap::new(),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -194,12 +201,13 @@ impl Coordinator {
             {
                 Ok(Some(job)) => {
                     let job_id = job.id;
+                    let token = self.shutdown.child_token();
                     let id = self
                         .tasks
                         .spawn(
                             self.deps
                                 .clone()
-                                .run(job, permit),
+                                .run(job, permit, token),
                         )
                         .id();
                     self.task_jobs
@@ -268,7 +276,12 @@ impl JobDeps {
     /// (which owns prepare + all GitHub/DB side-effects), run the worker inline
     /// (the recipe), and surface the reporter's result. The `permit` is held
     /// for the job's lifetime, freeing its concurrency slot on completion.
-    async fn run(self, job: RunnableJob, _permit: OwnedSemaphorePermit) -> anyhow::Result<()> {
+    async fn run(
+        self,
+        job: RunnableJob,
+        _permit: OwnedSemaphorePermit,
+        token: CancellationToken,
+    ) -> anyhow::Result<()> {
         tracing::info!(
             job_id = %job.id,
             repo = %job.repository,
@@ -302,7 +315,8 @@ impl JobDeps {
 
         // The worker runs inline: it waits for prepare's resolved commit, runs
         // the recipe (emitting progress to the channel), and sends the terminal.
-        run_worker(&recipe, &job, prepared_rx, events_tx).await;
+        // On `token` cancellation it cleans up + reports aborted.
+        run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
 
         // Surface the reporter's result (setup-level failures back off the loop;
         // a panic in the reporter task becomes an iteration error).
@@ -321,6 +335,7 @@ async fn run_worker(
     job: &RunnableJob,
     prepared_rx: oneshot::Receiver<Prepared>,
     events_tx: mpsc::Sender<WorkerEvent>,
+    token: CancellationToken,
 ) {
     // Wait for the reporter to finish `prepare` and hand us the resolved
     // commit. `Abort` (or a dropped sender) means prepare failed / the job
@@ -336,24 +351,33 @@ async fn run_worker(
         repository: &job.repository,
         commit: &commit,
     };
-    let terminal = match recipe
-        .execute(&ctx, &sink)
-        .await
-    {
-        Ok(outcome) => match outcome.status() {
-            TaskStatus::Completed => Terminal::Completed {
-                summary: outcome.summary().clone(),
+    // The recipe honors `token` at its own cancellation-safe points (never
+    // mid-provision) and runs its normal teardown on cancel — so we await it to
+    // completion rather than dropping the future, which could leak the source
+    // loop device. A cancelled token after it returns means "aborted".
+    let outcome = recipe
+        .execute(&ctx, &sink, &token)
+        .await;
+    let terminal = if token.is_cancelled() {
+        tracing::warn!(job_id = %job.id, "run cancelled; reporting aborted");
+        Terminal::Aborted
+    } else {
+        match outcome {
+            Ok(outcome) => match outcome.status() {
+                TaskStatus::Completed => Terminal::Completed {
+                    summary: outcome.summary().clone(),
+                },
+                TaskStatus::Failed(error) => Terminal::Failed {
+                    error,
+                    summary: outcome.summary().clone(),
+                },
             },
-            TaskStatus::Failed(error) => Terminal::Failed {
-                error,
-                summary: outcome.summary().clone(),
-            },
-        },
-        // A setup-level error (the run couldn't start). Log the full anyhow
-        // chain locally; the reporter posts only a short snippet to the PR.
-        Err(e) => {
-            tracing::error!(job_id = %job.id, error = ?e, "recipe returned setup error");
-            Terminal::SetupError { error: format!("{e:#}") }
+            // A setup-level error (the run couldn't start). Log the full anyhow
+            // chain locally; the reporter posts only a short snippet to the PR.
+            Err(e) => {
+                tracing::error!(job_id = %job.id, error = ?e, "recipe returned setup error");
+                Terminal::SetupError { error: format!("{e:#}") }
+            }
         }
     };
 
@@ -991,7 +1015,7 @@ mod tests {
             let permit = Arc::new(Semaphore::new(1))
                 .try_acquire_owned()
                 .unwrap();
-            handles.push(tokio::spawn(deps.run(job, permit)));
+            handles.push(tokio::spawn(deps.run(job, permit, CancellationToken::new())));
             sources.push(source);
         }
 
@@ -1172,5 +1196,39 @@ mod tests {
                 .await;
         }
         assert_eq!(source.peak_blocked(), 2, "never exceeded the configured limit");
+    }
+
+    /// When the job's token is cancelled, the worker reports
+    /// `Terminal::Aborted` regardless of what the (now cancel-safe) recipe
+    /// returns — the abort signal is the token, not the outcome. (The driver's
+    /// own teardown-on-cancel is covered in `libvirt::driver`.)
+    #[tokio::test]
+    async fn a_cancelled_run_is_reported_aborted() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(config_with(&tmp, PrReport::Comment, BaselineReport::None));
+        // Provisioning fails fast → `execute` returns promptly; the pre-cancelled
+        // token then makes the worker report aborted.
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
+        let recipe = BenchRecipe::new(config, shell, vec![]);
+        let job = RunnableJob {
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            ..pr_job("abc123", None)
+        };
+
+        let (events_tx, mut events_rx) = mpsc::channel(EVENT_BUFFER);
+        let (prepared_tx, prepared_rx) = oneshot::channel();
+        prepared_tx
+            .send(Prepared::Run { commit: "abc123".into() })
+            .unwrap();
+        let token = CancellationToken::new();
+        token.cancel(); // cancelled before the run → outcome is overridden to aborted
+
+        run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+
+        match events_rx.recv().await {
+            Some(WorkerEvent::Finished(Terminal::Aborted)) => {}
+            other => panic!("expected Finished(Aborted), got {other:?}"),
+        }
     }
 }

@@ -15,6 +15,7 @@ sbgh-core.workspace = true
 sbgh-api.workspace = true
 
 tokio.workspace = true
+tokio-util.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sbgh_core::config::DaemonConfig;
+use tokio_util::sync::CancellationToken;
 
 use crate::libvirt::boot::BootDisk;
 use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitCommon};
@@ -96,6 +97,10 @@ enum FinishReason {
     PhaseError,
     ShutOff,
     Timeout,
+    /// The run was cancelled (operator shutdown/abort). Only honored at the
+    /// poll loop — provisioning runs atomically (its loop-device window can't
+    /// be safely interrupted), so cancel is observed once the VM is running.
+    Cancelled,
 }
 
 impl FinishReason {
@@ -105,6 +110,7 @@ impl FinishReason {
             FinishReason::PhaseError => "phase_error",
             FinishReason::ShutOff => "shut_off",
             FinishReason::Timeout => "timeout",
+            FinishReason::Cancelled => "cancelled",
         }
     }
 }
@@ -146,6 +152,7 @@ impl LibvirtDriver {
         ctx: &TaskContext<'_>,
         bench_args: &[String],
         listener: &dyn PhaseListener,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<BenchmarkOutcome> {
         let job_id = ctx.job_id.to_string();
         let domain_name = format!("sbgh-{job_id}");
@@ -174,6 +181,7 @@ impl LibvirtDriver {
                 &domain_name,
                 &mut arts,
                 listener,
+                cancel,
             )
             .await;
 
@@ -344,12 +352,18 @@ impl LibvirtDriver {
                     .vm
                     .job_timeout_secs
             )),
+            // The worker overrides this to `Aborted` via the token; `Failed` is
+            // the safe fallback if that check is ever missed.
+            Ok(FinishReason::Cancelled) => {
+                OutcomeStatus::Failed("run cancelled by shutdown".into())
+            }
             Err(e) => OutcomeStatus::Failed(e.to_string()),
         };
 
         Ok(BenchmarkOutcome { status, summary })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn provision_define_start_poll(
         &self,
         inputs: &RunInputs<'_>,
@@ -358,6 +372,7 @@ impl LibvirtDriver {
         domain_name: &str,
         arts: &mut JobArtifacts,
         listener: &dyn PhaseListener,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<FinishReason> {
         // ── one-time provisioning shared by both phases ────────────────
         let cidata = self
@@ -382,6 +397,7 @@ impl LibvirtDriver {
                 domain_name,
                 arts,
                 listener,
+                cancel,
             )
             .await?;
         match build_reason {
@@ -409,6 +425,7 @@ impl LibvirtDriver {
                 domain_name,
                 arts,
                 listener,
+                cancel,
             )
             .await?;
         Ok(bench_reason)
@@ -536,6 +553,7 @@ impl LibvirtDriver {
         domain_name: &str,
         arts: &mut JobArtifacts,
         listener: &dyn PhaseListener,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<FinishReason> {
         tracing::info!(domain = domain_name, phase_lifecycle = phase_label, "starting phase");
 
@@ -590,7 +608,7 @@ impl LibvirtDriver {
 
         let phase_log = tmpfs_ref.phase_log();
         let reason = self
-            .poll_to_completion(domain_name, &phase_log, listener, mode)
+            .poll_to_completion(domain_name, &phase_log, listener, mode, cancel)
             .await;
         Ok(reason)
     }
@@ -601,6 +619,7 @@ impl LibvirtDriver {
         phase_log: &Path,
         listener: &dyn PhaseListener,
         mode: PollMode,
+        cancel: &CancellationToken,
     ) -> FinishReason {
         let started = Instant::now();
         let timeout = Duration::from_secs(
@@ -646,6 +665,13 @@ impl LibvirtDriver {
         let mut success_phase_seen = false;
 
         loop {
+            // Shutdown/abort observed at a safe point — the VM is running, so
+            // the caller's normal teardown (with handles) will tear it down.
+            if cancel.is_cancelled() {
+                tracing::warn!(domain = domain_name, "run cancelled; stopping poll");
+                return FinishReason::Cancelled;
+            }
+
             // Replay any new journal entries. Multiple transitions in
             // one poll window get emitted in order so the listener sees
             // every state change, not just the most recent.
@@ -710,7 +736,13 @@ impl LibvirtDriver {
             if started.elapsed() > timeout {
                 return FinishReason::Timeout;
             }
-            tokio::time::sleep(poll_interval).await;
+            // Sleep until the next poll, but wake immediately on cancellation
+            // so abort is prompt while the VM runs (the top-of-loop check then
+            // returns `Cancelled`).
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {}
+                _ = cancel.cancelled() => {}
+            }
         }
     }
 
@@ -936,7 +968,12 @@ mod tests {
         let shell = Arc::new(happy_path_shell());
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
         let outcome = driver
-            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener)
+            .run_benchmark(
+                &ctx_of(&job),
+                &job.bench_args,
+                &NoopPhaseListener,
+                &CancellationToken::new(),
+            )
             .await
             .expect("driver should return Ok even on VM-side failures");
 
@@ -1073,7 +1110,12 @@ mod tests {
 
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
         let outcome = driver
-            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener)
+            .run_benchmark(
+                &ctx_of(&job),
+                &job.bench_args,
+                &NoopPhaseListener,
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -1115,7 +1157,12 @@ mod tests {
         let shell = Arc::new(happy_path_shell());
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
         let outcome = driver
-            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener)
+            .run_benchmark(
+                &ctx_of(&job),
+                &job.bench_args,
+                &NoopPhaseListener,
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
 
@@ -1131,5 +1178,60 @@ mod tests {
                 .unwrap(),
             "kernel panic at 0x..."
         );
+    }
+
+    /// Cancellation is honored at the poll loop (not mid-provision): a
+    /// pre-cancelled token lets provisioning finish atomically, then the poll
+    /// loop returns `cancelled` and the **normal teardown** (with handles —
+    /// including the source loop device) runs.
+    #[tokio::test]
+    async fn cancellation_breaks_at_poll_loop_and_tears_down() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(test_config(&tmp));
+        let job = fake_job();
+        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+        std::fs::create_dir_all(
+            cfg.paths
+                .results_tmpfs_root
+                .join(job.id.to_string()),
+        )
+        .unwrap();
+
+        let shell = Arc::new(happy_path_shell());
+        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // pre-cancelled → the poll loop's top check fires first
+
+        let outcome = driver
+            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener, &cancel)
+            .await
+            .expect("driver returns Ok");
+
+        assert_eq!(
+            outcome
+                .summary
+                .get("finish_reason")
+                .and_then(|v| v.as_str()),
+            Some("cancelled"),
+            "the run ended via the poll-loop cancellation",
+        );
+        let calls = shell.calls();
+        let issued = |prog: &str, arg: &str| {
+            calls.iter().any(|c| {
+                c.program.ends_with(prog)
+                    && c.args
+                        .iter()
+                        .any(|a| a == arg)
+            })
+        };
+        // The exact High-finding regression: provisioning ran **atomically** —
+        // the source loop device was detached (`losetup -d`) before cancel was
+        // ever observed, so it can't leak.
+        assert!(
+            issued("losetup", "-d"),
+            "provision completed (source loop device detached) before cancellation",
+        );
+        // And the normal teardown ran (destroyed the running domain by name).
+        assert!(issued("virsh", "destroy"), "teardown destroyed the domain on cancel");
     }
 }

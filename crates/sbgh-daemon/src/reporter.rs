@@ -68,6 +68,7 @@ const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// What `prepare` tells the inline worker: the resolved commit to run, or that
 /// it must not run (prepare failed / no commit / lost claim).
+#[derive(Debug)]
 pub enum Prepared {
     Run { commit: String },
     Abort,
@@ -290,6 +291,26 @@ impl Reporter {
                     .await;
                 reporter.failed(&error).await;
                 Some(anyhow::anyhow!("{error}"))
+            }
+            Terminal::Aborted => {
+                // Operator shutdown/abort (Phase 4): the run already tore its
+                // host artifacts down. Record a terminal failure — a clean ✗,
+                // re-triggerable.
+                let msg = "aborted by shutdown";
+                tracing::warn!(job_id = %self.job.id, "{msg}");
+                if let Err(e) = self
+                    .jobs
+                    .fail(&self.job, msg, None)
+                    .await
+                {
+                    // The terminal-fail write didn't land — the job may still be
+                    // `running`. Surface it loudly + back off rather than
+                    // reporting the job as cleanly handled.
+                    tracing::error!(job_id = %self.job.id, error = ?e, "persisting aborted terminal failed");
+                    return Some(e);
+                }
+                reporter.failed(msg).await;
+                None
             }
         }
     }

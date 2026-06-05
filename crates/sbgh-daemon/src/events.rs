@@ -95,6 +95,10 @@ pub enum Terminal {
     /// treats this as an iteration error (backoff), matching the prior
     /// `recipe.execute` `Err` path.
     SetupError { error: String },
+    /// The run was **cancelled** (operator shutdown/abort, roadmap-v5 Phase 4)
+    /// and its host artifacts cleaned up. The reporter records a terminal
+    /// failure ("aborted by shutdown") — a clean ✗, re-triggerable.
+    Aborted,
 }
 
 /// A progress event sent from the worker to its reporter over the per-job

@@ -14,6 +14,7 @@
 //! its rendering, so behavior is unchanged.
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::events::EventSink;
@@ -57,9 +58,15 @@ pub trait Recipe: Send + Sync {
     /// to `sink`. Returns the terminal outcome, or `Err` only for a
     /// catastrophic setup failure (the task could not start) — task-side
     /// failures come back as an `Ok(outcome)` whose `status()` is `Failed`.
+    ///
+    /// **Cancellation:** the recipe must honor `cancel` at *cancellation-safe*
+    /// points only (never mid-provision, where an interrupted teardown could
+    /// leak host state). On cancel it runs its normal teardown and returns —
+    /// the worker treats `cancel.is_cancelled()` as the abort signal.
     async fn execute(
         &self,
         ctx: &TaskContext<'_>,
         sink: &dyn EventSink,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<Self::Outcome>;
 }

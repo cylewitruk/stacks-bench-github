@@ -192,16 +192,24 @@ Shutdown has **two modes**, driven by signals (full design in Phase 4):
   (`finish_reason = aborted`), then exit.
 
 The hard part is **async cancel-safety**: dropping a worker future at an
-`await` does **not** destroy its VM — tokio cancellation just stops polling. So
-abort must be *cooperative* — the worker `select!`s on the cancel token and, on
-cancellation, explicitly runs cleanup before returning. To make that robust and
-reusable, introduce an idempotent **`cleanup_by_job_id(job_id)`** on the driver
-that reconstructs every resource name from the job id (destroy `sbgh-{job_id}`,
-drop the LVM snapshot, unmount the tmpfs, `rm -rf` the job dir) — usable both for
-live abort **and** for startup recovery of VMs orphaned by a hard kill, which
-strengthens the existing **stuck-claim sweep**
+`await` does **not** destroy its VM — and worse, dropping it *mid-provision*
+orphans the source **loop device** (`/dev/loopN`, dynamically named, attached
+then detached *inside* `SourceDisk::provision`). So abort is **not** a
+worker-side `select!`-drop. Instead (as built in 4A): **the cancel token is
+threaded into the driver** and honored at a **cancellation-safe point — the poll
+loop, never mid-provision**. Provision runs atomically; once the VM is running,
+a cancel makes the poll loop stop and the driver's **normal teardown** (with its
+artifact handles, including the loop detach) runs. The worker just awaits and
+maps `token.is_cancelled()` → aborted.
+
+A separate, idempotent **`cleanup_by_job_id(job_id)`** (4B) covers the
+*handle-less* case — orphans from a dead reporter or hard-killed daemon, where
+no live driver exists. It reconstructs resources from the job id (destroy
+`sbgh-{job_id}`, drop the LVM snapshot, unmount the tmpfs + `source.mnt`, detach
+the loop device via `losetup -j` on the job-id-named backing file, prune the git
+ref, `rm -rf` the job dir), strengthening the **stuck-claim sweep**
 ([runner.rs:117](../crates/sbgh-daemon/src/runner.rs#L117)) into a true
-crash-recovery path (reclaim the row *and* clean the orphaned domain).
+crash-recovery path (reclaim the row *and* clean the orphan).
 
 ### 7. The DB claim path is already concurrency-safe
 
@@ -308,11 +316,11 @@ everything after.
   `heartbeat`, and the channel-backed sink now genuinely returns `SinkClosed`
   when the reporter is gone. **Surfacing** it is done in the channel slice (the
   worker logs it loudly). **Acting** on it — aborting an in-flight run — is
-  deliberately *not* done here: a clean abort must interrupt the driver mid-run
-  and tear the VM down (`cleanup_by_job_id`), which is exactly the **Phase 4**
-  cancellation path; a dirty `select!`-drop now would leak the VM (worse than
-  letting the run finish + tear down). So the worker carries a loud `TODO`
-  pointing at Phase 4. The *symmetric* gap — a reporter that dies mid-run
+  deliberately *not* done here: a clean abort needs the **Phase 4** driver
+  poll-loop cancellation path (so the driver's normal teardown runs with
+  handles); a dirty `select!`-drop now would leak the VM (and, mid-provision,
+  the source loop device). So the worker carries a loud `TODO` pointing at Phase
+  4. The *symmetric* gap — a reporter that dies mid-run
   leaving the job stuck in `running` — is partly closed in the channel slice
   (the reporter terminal-fails on an abnormal channel close, so a *dead worker*
   can't strand the job); a *dead reporter* still needs Phase 4's stuck-`running`
@@ -333,10 +341,11 @@ everything after.
   hand-off, the spawned per-job `Reporter` owning `prepare` + all GitHub/DB
   side-effects (forward-looking constraint 1 fully realized — `prepare` moved
   into the reporter, not deferred).
-- **Carried to Phase 4:** the `SinkClosed` → in-flight **abort action** (needs
-  the driver cancellation path + `cleanup_by_job_id`; a dirty drop would leak
-  the VM) and the **dead-reporter / stuck-`running` recovery**. A dead *worker*
-  is already handled in-slice (the reporter terminal-fails on abnormal close).
+- **Carried to Phase 4:** the `SinkClosed` → in-flight **abort action** (the
+  driver poll-loop cancellation path; a dirty drop would leak the VM) and the
+  **dead-reporter / stuck-`running` recovery** (the handle-less
+  `cleanup_by_job_id`). A dead *worker* is already handled in-slice (the reporter
+  terminal-fails on abnormal close).
 
 ---
 
@@ -472,10 +481,13 @@ mid-flight.
   `SIGINT` while `Draining`, or any `SIGTERM` → `Aborting` (cancel fires).
 - **Coordinator:** stop claiming once not `Running`; on `Aborting` propagate
   cancellation to all workers; exit once the `JoinSet` is empty.
-- **Worker cancel-safety:** wrap the driver run in `select!` against the cancel
-  token; on cancel call `driver.cleanup_by_job_id` (consideration 6) and emit
-  `Finished(Aborted)`. Optionally thread the token into the driver's poll loops
-  so abort is *prompt* rather than waiting for the current phase await to yield.
+- **Worker cancel-safety (done in 4A):** the cancel token is **threaded into
+  the driver** (`run_benchmark`→`run_phase`→`poll_to_completion`) and honored at
+  the **poll loop only** — never mid-provision (dropping the run there would
+  orphan the source loop device). The worker **awaits** the recipe (no
+  `select!`-drop) and maps `token.is_cancelled()` → `Finished(Aborted)`; the
+  driver's normal teardown runs with handles. **`cleanup_by_job_id` is not used
+  here** — it's the handle-less orphan-recovery path below.
 - **Reporter:** `Finished(Aborted)` → `fail(job, "aborted by shutdown")` (DB) +
   conclude the check `failure` with an "aborted" note. The run shows a clean ✗,
   not a spinner.
@@ -508,20 +520,57 @@ mid-flight.
 
 **Design notes:**
 
-- The worker-level cancel-safety primitive (`cleanup_by_job_id` + cooperative
-  cancel) is independently valuable and could be pulled forward to Phase 1/2 to
-  give clean single-job shutdown before concurrency lands; the SIGINT 1×/2×
-  escalation needs the coordinator (Phase 3), so the full phase sits here.
+- Two distinct mechanisms, don't conflate them: **live in-process abort** is
+  driver-token / poll-loop cancellation (4A, done) — there's a running driver
+  that does its own teardown; **`cleanup_by_job_id`** is the *handle-less*
+  orphan/stuck-`running` recovery (4B) for a dead reporter or hard-killed daemon
+  where no driver exists. The cancel-safety primitive (4A) was buildable before
+  the signal wiring; the SIGINT 1×/2× escalation needs the coordinator (Phase 3),
+  so the orchestration sits here.
 - **Fail vs re-queue on abort** is a real choice — see open questions. This phase
   assumes **fail** (the user's stated intent: "abort/cleanup/fail"), with a clear
   remark so an operator can re-trigger.
 
-**Status:**
+**Status:** sub-sliced (like Phase 1). **4A shipped** (the cancel-safety
+primitive); **4B pending** (signals + coordinator + wiring).
 
-- [ ] Initial implementation completed
-- [ ] Integration coverage added (SIGTERM aborts+cleans+fails; SIGINT drains; 2×SIGINT escalates; cancel actually tears down the VM)
-- [ ] Reviewed — Codex signed off
-- [ ] Complete
+- **4A — cancel-safety primitive (done; revised after Codex review):**
+  cancellation is **threaded into the driver** and honored at the **poll loop
+  only** (`run_benchmark`→`run_phase`→`poll_to_completion` take a
+  `CancellationToken`; a `FinishReason::Cancelled`). The worker **awaits**
+  `recipe.execute(ctx, sink, &token)` (it does *not* drop the future) and maps
+  `token.is_cancelled()` → `Terminal::Aborted`; the reporter records `Aborted`
+  as `fail("aborted by shutdown")`, **propagating a fail-write error** so a job
+  that may still be `running` isn't reported as cleanly handled. The coordinator
+  hands each job a **child** token off one daemon `shutdown` token (not fired in
+  4A).
+  - **Why poll-loop-only (the Codex High fix):** dropping the `execute` future
+    mid-`SourceDisk::provision` would orphan its **loop device** (attached then
+    detached *within* provision; `/dev/loopN` is dynamically named and not
+    reconstructable by id). So provision runs **atomically**; cancel is observed
+    once the VM is running, and the driver's **normal teardown** (with handles)
+    tears it down. No partial-provision cleanup needed → **`cleanup_by_job_id`
+    and `Recipe::cleanup` are deferred to 4B** (cross-boot/dead-reporter orphan
+    recovery, where it'll also handle `source.mnt` + the loop device via
+    `losetup -j` on the job-id-named backing file).
+  - Tests: `cancellation_breaks_at_poll_loop_and_tears_down` (driver: pre-cancel
+    → poll breaks → teardown destroys the domain) and
+    `a_cancelled_run_is_reported_aborted` (worker: cancelled token → `Aborted`).
+- **4B — signals + orchestration (next):** the `SIGTERM`/`SIGINT` task + a
+  `watch` drain/abort/escalate state, the coordinator's stop-claiming, the
+  cancel-on-abort and shutdown-token exit condition, the top-level `try_join!`
+  wiring, the systemd `KillMode=mixed` / `TimeoutStopSec` docs, **and
+  orphan/stuck-`running` recovery** — the `cleanup_by_job_id` primitive
+  (complete this time: `source.mnt` + loop device via `losetup -j` on the
+  job-id-named backing file) for a dead reporter / hard-killed daemon, where
+  there's no live driver to run the normal teardown.
+
+  - [x] 4A implementation completed
+  - [x] 4A coverage (cancel breaks at the poll loop, `losetup -d` ran before
+        cancel, normal teardown destroys the domain; worker maps token → aborted)
+  - [x] 4A reviewed — Codex signed off
+  - [ ] 4B (SIGTERM aborts+cleans+fails; SIGINT drains; 2×SIGINT escalates) + review
+  - [ ] Complete
 
 ---
 

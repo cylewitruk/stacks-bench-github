@@ -22,6 +22,7 @@ sbgh-api = { path = "crates/sbgh-api" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 async-trait = "0.1"
 futures = "0.3"
 

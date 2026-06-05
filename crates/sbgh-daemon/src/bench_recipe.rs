@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sbgh_core::config::DaemonConfig;
+use tokio_util::sync::CancellationToken;
 
 use crate::events::{EventSink, PhaseLabel};
 use crate::libvirt::{LibvirtDriver, OutcomeStatus, Phase, PhaseListener, Shell};
@@ -54,11 +55,12 @@ impl Recipe for BenchRecipe {
         &self,
         ctx: &TaskContext<'_>,
         sink: &dyn EventSink,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<Self::Outcome> {
         let driver = LibvirtDriver::new(self.config.clone(), self.shell.clone());
         let adapter = SinkAdapter { sink };
         let outcome = driver
-            .run_benchmark(ctx, &self.bench_args, &adapter)
+            .run_benchmark(ctx, &self.bench_args, &adapter, cancel)
             .await?;
         let status = match outcome.status {
             OutcomeStatus::Ok => TaskStatus::Completed,
