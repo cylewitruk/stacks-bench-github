@@ -488,6 +488,31 @@ impl JobStore for PostgresJobStore {
         Ok(ids)
     }
 
+    async fn find_active_job(
+        &self,
+        github_repo_id: i64,
+        commit: &str,
+        trigger_kind: crate::models::TriggerKind,
+    ) -> Result<Option<Uuid>> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id
+              FROM job
+             WHERE github_repo_id = $1
+               AND git_commit_hash = $2
+               AND trigger_kind = $3
+               AND status IN ('queued', 'claimed', 'running')
+             LIMIT 1
+            "#,
+        )
+        .bind(github_repo_id)
+        .bind(commit)
+        .bind(trigger_kind)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
     async fn queued_jobs_ordered(&self) -> Result<Vec<Job>> {
         // Same ordering as `claim_next_queued` so the reported position matches
         // the order jobs are actually claimed.

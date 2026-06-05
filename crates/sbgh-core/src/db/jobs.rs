@@ -212,6 +212,25 @@ pub trait JobStore: Send + Sync + 'static {
     /// coordinator can report each waiting job its queue position. Read-only.
     async fn queued_jobs_ordered(&self) -> Result<Vec<Job>>;
 
+    /// roadmap-v5 Phase 5 (dedup): the id of an **active** (`queued` /
+    /// `claimed` / `running`) job for this exact `(github_repo_id,
+    /// git_commit_hash, trigger_kind)`, if any. Used to skip enqueuing a
+    /// duplicate `/benchmark` for a commit already being benchmarked — two jobs
+    /// on one head SHA would otherwise fight over the single GitHub check
+    /// GitHub surfaces per `(name, head_sha)`.
+    ///
+    /// This is a **best-effort** read used for a check-then-insert; it is not a
+    /// hard uniqueness guarantee against concurrent processors or a crash
+    /// between the check and the inbox completing the webhook (see the caller
+    /// in `webhook_processor`). A partial unique index on the active set is
+    /// the structural hardening if that's ever needed.
+    async fn find_active_job(
+        &self,
+        github_repo_id: i64,
+        commit: &str,
+        trigger_kind: crate::models::TriggerKind,
+    ) -> Result<Option<Uuid>>;
+
     /// Orphan recovery (4B-2 + 4C): terminal-**cancel** a job stranded in
     /// `running` by a dead daemon, with NO claim-token guard. The daemon that
     /// claimed it is gone, and this runs at startup before the coordinator

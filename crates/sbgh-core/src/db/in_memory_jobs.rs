@@ -486,6 +486,27 @@ impl JobStore for InMemoryJobStore {
             .collect())
     }
 
+    async fn find_active_job(
+        &self,
+        github_repo_id: i64,
+        commit: &str,
+        trigger_kind: crate::models::TriggerKind,
+    ) -> Result<Option<Uuid>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.jobs
+            .values()
+            .find(|j| {
+                j.github_repo_id == github_repo_id
+                    && j.git_commit_hash.as_deref() == Some(commit)
+                    && j.trigger_kind == trigger_kind
+                    && matches!(
+                        j.status,
+                        JobStatus::Queued | JobStatus::Claimed | JobStatus::Running
+                    )
+            })
+            .map(|j| j.id))
+    }
+
     async fn queued_jobs_ordered(&self) -> Result<Vec<Job>> {
         let s = self.state.lock().unwrap();
         let mut queued: Vec<Job> = s

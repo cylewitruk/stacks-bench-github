@@ -1191,3 +1191,90 @@ async fn cancel_job_terminalizes_a_claimed_job_not_yet_running() {
         .unwrap();
     assert_eq!(row.status, JobStatus::Cancelled);
 }
+
+// ─── roadmap-v5 Phase 5: /benchmark dedup (find_active_job) ──────────────
+
+#[tokio::test]
+async fn find_active_job_matches_repo_commit_kind_and_excludes_terminal() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+
+    let job = store
+        .insert_job(&NewJob {
+            github_installation_id: 100,
+            github_repo_id: 10,
+            job_kind: JobKind::AdHoc,
+            trigger_kind: TriggerKind::PrComment,
+            git_ref_kind: GitRefKind::Branch,
+            git_ref_display: "feat".into(),
+            git_commit_hash: Some("abc".into()),
+            git_committed_at: None,
+        })
+        .await
+        .unwrap();
+
+    // Exact (repo, commit, kind) match.
+    assert_eq!(
+        store
+            .find_active_job(10, "abc", TriggerKind::PrComment)
+            .await
+            .unwrap(),
+        Some(job.id),
+    );
+    // A different commit / repo / trigger kind does not match.
+    assert!(
+        store
+            .find_active_job(10, "xyz", TriggerKind::PrComment)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert!(
+        store
+            .find_active_job(99, "abc", TriggerKind::PrComment)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert!(
+        store
+            .find_active_job(10, "abc", TriggerKind::BranchPush)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+
+    // `claimed` still counts as active (the job is in flight, not terminal).
+    let token = Uuid::new_v4();
+    store
+        .claim_next_queued(token)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .find_active_job(10, "abc", TriggerKind::PrComment)
+            .await
+            .unwrap(),
+        Some(job.id),
+        "a claimed job is still active",
+    );
+
+    // A terminal job is excluded → a re-`/benchmark` after it finishes runs.
+    store
+        .mark_running(job.id, token, None)
+        .await
+        .unwrap();
+    store
+        .cancel_job(job.id, token, "stopped")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .find_active_job(10, "abc", TriggerKind::PrComment)
+            .await
+            .unwrap()
+            .is_none(),
+        "a terminal (cancelled/completed/failed) job no longer blocks a re-run",
+    );
+}

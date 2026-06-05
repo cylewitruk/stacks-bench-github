@@ -796,13 +796,50 @@ follow-up.
   - **Known caveat (for review):** an unbounded queue means one position check per
     queued job per change; fine for realistic queues, but a `top-N` cap (with a
     logged "+M more") is a natural follow-up if queues ever get deep.
+  - **Same-SHA dedup (5.1 follow-up, from the live smoke-test):** the smoke-test
+    surfaced that GitHub shows only the **latest-updated** check run per
+    `(app, name, head_sha)`, so two jobs on the *same commit* (e.g. a double
+    `/benchmark` on one PR) fight over the single `stacks-bench` check — the
+    running job's phases and the queued job's position alternate. This is a
+    *pre-existing* consequence of per-job checks on a shared SHA (two running
+    jobs would collide too); 5.1 just made it visible during the wait. **Fix
+    (operator's choice — dedup at enqueue):** `JobStore::find_active_job(repo,
+    commit, trigger_kind)` + the `/benchmark` accept path skips enqueuing when an
+    active (`queued`/`claimed`/`running`) `pr_comment` job already covers that
+    exact `(repo, head_sha)` — silently (consistent with how the processor
+    handles denials; the existing job's check is the implicit feedback), mapped
+    to the `EnqueuedJob` outcome like the per-webhook `AlreadyEnqueued`. A
+    re-`/benchmark` after the job finishes still runs (terminal jobs don't
+    block). Cross-kind collisions (a `branch_push` baseline + a PR `/benchmark`
+    on the same SHA) are a noted, rarer limitation — they report to different
+    surfaces, so they're not deduped. Tests:
+    `find_active_job_matches_repo_commit_kind_and_excludes_terminal` (store) +
+    `benchmark_for_a_commit_already_being_benchmarked_is_deduped` (processor).
+  - **Guarantee — best-effort, not hard (Codex review):** the dedup is a
+    check-then-insert *outside* the atomic job-creation boundary, so it isn't a
+    structural guarantee. Two windows remain: (1) two **concurrent processors**
+    (the queue is `FOR UPDATE SKIP LOCKED`) could both pass the check then both
+    insert — unreachable on the current **single daemon**, real only if the
+    processor is scaled out; (2) a **crash** between the dedup decision and the
+    inbox marking the webhook done could, on retry-after-the-original-finished,
+    enqueue a fresh job. Crucially, the worst case of *both* is a redundant
+    **re-run** (the original's check has already concluded), **not** the
+    concurrent check collision the dedup prevents — so the live UX problem
+    doesn't recur. **Structural hardening (if/when a hard guarantee or
+    multi-processor is wanted):** a partial unique index
+    `UNIQUE (github_repo_id, git_commit_hash) WHERE trigger_kind = 'pr_comment'
+    AND status IN ('queued','claimed','running')`, with `create_job_with_links`
+    catching the unique violation → `AlreadyEnqueued`. Deferred as premature for
+    a single-processor deployment.
 
 - [x] 5.1 implemented (queued "#N ahead" position; no migration)
 - [x] 5.1 review round 1 — Codex Medium (failed persist must un-debounce / retry) addressed
 - [x] 5.1 review round 2 — Codex Low (reconcile path: failed `update_check_run` returns `false`, mirroring the existing-check path)
 - [x] 5.1 coverage added (5 new tests; 536 daemon+core green)
 - [x] 5.1 reviewed — Codex signed off (2 review rounds; Medium + Low addressed)
-- [x] 5.1 complete (code; pending deploy + queue-behind-running smoke-test)
+- [x] 5.1 smoke-tested live — queue-behind-running showed "queued — 1 run ahead"; surfaced the same-SHA check collision
+- [x] 5.1 follow-up: same-SHA `/benchmark` dedup at enqueue (find_active_job) + tests
+- [x] dedup reviewed — Codex signed off as a documented **best-effort** UX guard (not a DB-enforced invariant); structural partial-unique-index hardening specced + deferred (single-processor; crash-retry worst case is a redundant re-run, not a collision)
 - [ ] 5.2 / 5.3 / 5.4 — deferred (see status)
 
 ---

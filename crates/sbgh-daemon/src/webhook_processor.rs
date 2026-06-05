@@ -472,7 +472,44 @@ impl EventHandler for IssueCommentHandler {
                             }),
                             queued_event_detail: queued_detail(detail),
                         };
-                        enqueue_job(self.job_store.as_ref(), request).await
+                        // Phase 5 dedup (BEST-EFFORT): if an active `/benchmark`
+                        // job already covers this exact commit, skip enqueuing a
+                        // duplicate — two jobs on one head SHA would fight over
+                        // the single check GitHub surfaces per `(name, head_sha)`.
+                        //
+                        // This is a check-then-insert *outside* the atomic job
+                        // boundary, so it is NOT a hard guarantee: two concurrent
+                        // processors (the queue is `FOR UPDATE SKIP LOCKED`), or a
+                        // crash between this decision and the inbox marking the
+                        // webhook done, can still slip a duplicate. Both windows
+                        // are narrow here (single daemon) and their worst case is
+                        // a redundant *re-run* after the original concluded — NOT
+                        // the concurrent check collision this prevents. A partial
+                        // unique index on active `(github_repo_id, git_commit_hash)
+                        // WHERE trigger_kind='pr_comment'` is the structural
+                        // hardening if a hard guarantee / multi-processor is ever
+                        // needed (see roadmap-v5 Phase 5).
+                        match self
+                            .job_store
+                            .find_active_job(pr.base.repo.id, &pr.head.sha, TriggerKind::PrComment)
+                            .await
+                        {
+                            Ok(Some(existing)) => {
+                                tracing::info!(
+                                    installation_id = install_id,
+                                    pr_number,
+                                    existing_job = %existing,
+                                    head_sha = %pr.head.sha,
+                                    "duplicate /benchmark for a commit already being benchmarked; not enqueuing"
+                                );
+                                // Same Processed bucket as the per-webhook
+                                // `AlreadyEnqueued` idempotency — the request is
+                                // satisfied by the existing job.
+                                ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
+                            }
+                            Ok(None) => enqueue_job(self.job_store.as_ref(), request).await,
+                            Err(e) => ClassifyOutcome::Retryable(format!("find_active_job: {e}")),
+                        }
                     }
                     PolicyEvaluation::DeniedTarget => {
                         ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)
@@ -2824,6 +2861,51 @@ mod tests {
             "reprocess must still terminalize as EnqueuedJob (idempotent)"
         );
         assert_eq!(job_store.all_jobs().len(), 1, "reprocess must NOT create a duplicate job");
+    }
+
+    #[tokio::test]
+    async fn benchmark_for_a_commit_already_being_benchmarked_is_deduped() {
+        // Phase 5 dedup: a SECOND, DISTINCT `/benchmark` (different webhook id,
+        // so it clears the per-webhook idempotency) for a commit that already
+        // has an active job must NOT enqueue a duplicate — two jobs on one head
+        // SHA would fight over GitHub's single check per `(name, head_sha)`.
+        let (h, _gh, policy_store, _install_store, _user_store, job_store) =
+            make_benchmark_handler().await;
+        policy_store.seed_target(1, 10, true);
+        policy_store.seed_source(1, 20, true);
+
+        // First /benchmark → one job for (repo 10, head "headsha").
+        let first = make_claimed(
+            "issue_comment",
+            Some("created"),
+            Some(issue_comment_payload("created", "/benchmark run", true)),
+        );
+        assert!(matches!(
+            h.handle(&first).await,
+            ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
+        ));
+        assert_eq!(job_store.all_jobs().len(), 1);
+
+        // A distinct second webhook for the SAME PR/commit while the first is
+        // still active (queued) → deduped, no second job.
+        let mut second = make_claimed(
+            "issue_comment",
+            Some("created"),
+            Some(issue_comment_payload("created", "/benchmark run", true)),
+        );
+        second.id = 2;
+        second.delivery_id = "d2".into();
+
+        let outcome = h.handle(&second).await;
+        assert!(
+            matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)),
+            "a deduped request still terminalizes as EnqueuedJob (the benchmark is covered)"
+        );
+        assert_eq!(
+            job_store.all_jobs().len(),
+            1,
+            "no duplicate job for a commit already being benchmarked",
+        );
     }
 
     #[tokio::test]
