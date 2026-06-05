@@ -59,6 +59,14 @@ pub struct DomainSpec<'a> {
     pub sccache_share_tag: &'a str,
     pub console_log_path: &'a Path,
     pub network: &'a str,
+    /// Optional CPU pinning (roadmap-v5 Phase 5): the libvirt cpuset this VM's
+    /// vCPUs are pinned to (e.g. `"0-1"`), from `[runner].cpu_sets[slot]`.
+    /// `None` → vCPUs float (no `<vcpu cpuset=…>` / `<cputune>`).
+    pub vcpu_cpuset: Option<&'a str>,
+    /// Optional host cpuset for the qemu emulator/I-O threads (`[runner].
+    /// host_cpus`), pinned off the bench cores. Only emitted when `vcpu_cpuset`
+    /// is set.
+    pub emulator_cpuset: Option<&'a str>,
 }
 
 pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
@@ -76,7 +84,27 @@ pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
             w.create_element("memory")
                 .with_attribute(("unit", "KiB"))
                 .write_text_content(BytesText::new(&memory_kib.to_string()))?;
-            text(w, "vcpu", &spec.vcpus.to_string())?;
+
+            // `<vcpu>` — pinned (`placement='static' cpuset='…'`) when a slot
+            // cpuset is configured, else floating. `<cputune><emulatorpin>`
+            // keeps the qemu emulator/I-O threads off the bench cores.
+            let vcpus = spec.vcpus.to_string();
+            match spec.vcpu_cpuset {
+                Some(cpuset) => {
+                    w.create_element("vcpu")
+                        .with_attribute(("placement", "static"))
+                        .with_attribute(("cpuset", cpuset))
+                        .write_text_content(BytesText::new(&vcpus))?;
+                }
+                None => text(w, "vcpu", &vcpus)?,
+            }
+            if let (Some(_), Some(emulator)) = (spec.vcpu_cpuset, spec.emulator_cpuset) {
+                w.create_element("cputune")
+                    .write_inner_content(|w| {
+                        empty(w, "emulatorpin", &[("cpuset", emulator)])?;
+                        Ok(())
+                    })?;
+            }
 
             w.create_element("os")
                 .write_inner_content(|w| {
@@ -276,6 +304,8 @@ mod tests {
             sccache_share_tag: "sccache",
             console_log_path: Path::new("/var/lib/sbgh/jobs/job1/console.log"),
             network: "default",
+            vcpu_cpuset: None,
+            emulator_cpuset: None,
         }
     }
 
@@ -309,6 +339,50 @@ mod tests {
         assert!(xml.contains("network=\"default\""));
         assert!(xml.contains("/var/lib/sbgh/jobs/job1/console.log"));
         assert!(xml.contains("org.qemu.guest_agent.0"));
+    }
+
+    /// No pinning by default: plain `<vcpu>`, no `<cputune>` (Phase 5).
+    #[test]
+    fn no_cpu_pinning_by_default() {
+        let xml = render(&sample()).unwrap();
+        assert!(xml.contains("<vcpu>4</vcpu>"), "unpinned vcpu has no cpuset");
+        assert!(!xml.contains("cputune"), "no cputune block when unpinned");
+        assert!(!xml.contains("cpuset"), "no cpuset attribute when unpinned");
+    }
+
+    /// With a slot cpuset + host cpus, vCPUs pin (`placement='static'
+    /// cpuset='…'`) and the emulator threads pin off the bench cores. Modelled
+    /// on the recommended shape: 2 vCPUs on a 2-core slot (1 vCPU per core).
+    #[test]
+    fn renders_cpu_pinning_when_configured() {
+        let spec = DomainSpec {
+            vcpus: 2,
+            vcpu_cpuset: Some("0-1"),
+            emulator_cpuset: Some("4-5"),
+            ..sample()
+        };
+        let xml = render(&spec).unwrap();
+        assert!(
+            xml.contains("<vcpu placement=\"static\" cpuset=\"0-1\">2</vcpu>"),
+            "vcpus pinned to the slot cpuset, got: {xml}",
+        );
+        assert!(
+            xml.contains("<emulatorpin cpuset=\"4-5\"/>"),
+            "emulator threads pinned to the host cores, got: {xml}",
+        );
+    }
+
+    /// `emulator_cpuset` without `vcpu_cpuset` is a no-op (emulatorpin only
+    /// makes sense alongside vCPU pinning).
+    #[test]
+    fn emulator_cpuset_alone_does_nothing() {
+        let spec = DomainSpec {
+            emulator_cpuset: Some("4-5"),
+            ..sample()
+        };
+        let xml = render(&spec).unwrap();
+        assert!(!xml.contains("cputune"), "no emulatorpin without vcpu pinning");
+        assert!(xml.contains("<vcpu>4</vcpu>"));
     }
 
     #[test]

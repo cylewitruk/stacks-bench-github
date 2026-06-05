@@ -758,7 +758,8 @@ cost, with one caveat about pre-claim jobs.
   reporter is also the natural home for v4 Phase 3's placeholder/`skipped` checks.
 
 **Status:** sub-sliced by value-at-`max=1`. **5.1 (queued "#N ahead")
-Codex-signed-off** (pending deploy + smoke-test). 5.2 (in-flight position) and 5.4 (resource-budget
+Codex-signed-off**; **CPU pinning (5.5) implemented** (review pending) so
+concurrent benchmarks can run on dedicated cores. 5.2 (in-flight position) and 5.4 (resource-budget
 admission) are **deferred** — they only pay off at `max_concurrent > 1`, which
 isn't deployed; revisit when the knob is raised. 5.3 (PR-sync discoverability
 placeholder, the v4-Phase-3 convergence) is a separate, migration-bearing
@@ -840,6 +841,10 @@ follow-up.
 - [x] 5.1 smoke-tested live — queue-behind-running showed "queued — 1 run ahead"; surfaced the same-SHA check collision
 - [x] 5.1 follow-up: same-SHA `/benchmark` dedup at enqueue (find_active_job) + tests
 - [x] dedup reviewed — Codex signed off as a documented **best-effort** UX guard (not a DB-enforced invariant); structural partial-unique-index hardening specced + deferred (single-processor; crash-retry worst case is a redundant re-run, not a collision)
+- [x] 5.5 — CPU pinning implemented (per-slot `[runner].cpu_sets` + `host_cpus` → `<vcpu cpuset>` + `<emulatorpin>`; coordinator slot-index pool; host-bringup docs for `nosmt`/`isolcpus`/IRQ + `scripts/irq-affinity.sh` helper)
+- [x] 5.5 review round 1 — Codex Low (example/docs: match per-phase vCPUs to slot size; build-oversubscribe-is-contained-but-pointless, bench-must-not) addressed
+- [x] 5.5 reviewed — Codex signed off (round 2: copy-paste TOML polish on the example comment)
+- [x] 5.5 complete (code; pending deploy + the pinned serial-vs-concurrent A/B)
 - [ ] 5.2 / 5.3 / 5.4 — deferred (see status)
 
 ---

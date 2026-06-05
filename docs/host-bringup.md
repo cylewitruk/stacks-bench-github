@@ -753,3 +753,106 @@ sudo rm -rf /var/lib/sbgh/jobs/<job-id> /run/sbgh/jobs/<job-id>
 ```
 
 (A "sweep on startup" step on the daemon that reaps these is on the v2 list.)
+
+## 9. Concurrent benchmarking & CPU pinning (optional)
+
+By default the daemon runs one job at a time (`[runner].max_concurrent_jobs =
+1`). Raising it lets benchmarks run in parallel — but on a single-socket host
+the concurrent VMs contend for cores, the shared L3, and memory bandwidth, which
+can inflate the measured `Execution+Commit` time past the serial noise floor.
+**Measure before you trust concurrent numbers**, and pin the VMs to dedicated
+cores so at least the scheduler isn't adding jitter.
+
+This setup assumes a dedicated bench host where measurement accuracy matters.
+
+### 9.1 Daemon config
+
+In `config.toml` (`[runner]`):
+
+```toml
+[runner]
+max_concurrent_jobs = 2
+cpu_sets  = ["0-1", "2-3"]   # slot 0 → cores 0,1 ; slot 1 → cores 2,3
+host_cpus = "4-5"            # pin the qemu emulator/I-O threads off the bench cores
+```
+
+The daemon emits `<vcpu placement='static' cpuset='…'>` + `<cputune>
+<emulatorpin cpuset='…'/>` into each job's domain XML. `cpu_sets` must have at
+least `max_concurrent_jobs` entries; omit it (or leave empty) to disable pinning.
+
+Match the per-phase vCPU counts to the slot size — set **both**
+`[vm].build_vcpus` and `[vm].bench_vcpus` to the cores per slot (`2` for a 2-core
+slot). A VM's vCPUs are *confined* to its cpuset, so a larger count just
+oversubscribes that slot's own cores: for `build_vcpus` that's harmless (it stays
+contained to the slot, and the build isn't measured) but pointless — it can't use
+more than the slot's cores. For `bench_vcpus` it matters — keep it ≤ slot cores
+so the *measured* phase runs one vCPU per core, not oversubscribed. (The default
+`build_vcpus = 4` targets the unpinned single-job case; drop it to the slot size
+when pinning.)
+
+### 9.2 Host-side isolation (matters as much as the pinning)
+
+Pinning the VM is only half of it — keep the host kernel off the bench cores too,
+or kernel threads + interrupts re-introduce the jitter. These are kernel
+cmdline + IRQ-affinity changes (GRUB, editable over SSH — no BIOS needed).
+
+**Disable SMT/hyperthreading** (siblings share execution units → variance):
+
+```bash
+# Runtime (non-persistent — reverts on reboot):
+echo off | sudo tee /sys/devices/system/cpu/smt/control
+lscpu -e=CPU,CORE,SOCKET,ONLINE     # confirm one online CPU per physical core
+```
+
+**Persist SMT-off + isolate the bench cores** via the kernel cmdline. Edit
+`/etc/default/grub`, append to `GRUB_CMDLINE_LINUX_DEFAULT`:
+
+```text
+nosmt isolcpus=0,1,2,3 nohz_full=0,1,2,3 rcu_nocbs=0,1,2,3
+```
+
+then `sudo update-grub && sudo reboot`. (`isolcpus` numbers are the *bench*
+logical CPUs; with SMT off on a 6-core box those are 0–3, leaving 4–5 for the
+host.) After this, re-establish your serial baselines — the CPU config changed.
+
+**(Optional, last-mile) Steer device interrupts off the bench cores.** When a
+device (NVMe, NIC) finishes work it raises an *interrupt* that preempts whatever
+is running on the core that handles it — if that's a bench core, it's a tiny
+stall in a measurement. Steering those interrupts onto the host cores (4,5)
+avoids it.
+
+This is genuinely a refinement, not a must-do: `nosmt` + `isolcpus`/`nohz_full`/
+`rcu_nocbs` already keep the kernel + timer ticks off the bench cores, and the
+daemon's `<emulatorpin>` puts the VM's qemu I/O threads on the host cores — so
+the VM's own NVMe completions already tend to fire there. **Skip it for your
+first A/B run; revisit only if the results show jitter that tracks with I/O.**
+
+Use the helper to print (or `--apply`) the right commands for *your* IRQs:
+
+```bash
+# Print the recommended commands (review, then run):
+scripts/irq-affinity.sh --host-cpus 4-5
+# …or apply directly (storage + network only, as root):
+sudo scripts/irq-affinity.sh --host-cpus 4-5 --match 'nvme|en|eth|virtio' --apply
+```
+
+Under the hood it disables `irqbalance` (which would otherwise re-spread IRQs)
+and writes each device IRQ's allowed CPUs to `/proc/irq/<n>/smp_affinity_list`
+(a plain cpu-list like `4-5` — simpler than the `smp_affinity` hex bitmask).
+Caveats it handles for you: NVMe *per-queue* IRQs are kernel-managed and won't
+repin (reported as skipped), and `/proc` affinities reset on reboot (re-run, or
+wire into a startup unit).
+
+### 9.3 The honest ceiling
+
+Pinning + isolation remove scheduler jitter and core-sharing, but on a single
+socket the concurrent jobs still share the **L3 cache and one memory
+controller** — which no pinning can partition. Block replay (MARF + Clarity) is
+cache/bandwidth-sensitive, so concurrent runs may still perturb each other.
+
+**Validate it:** establish a serial `Execution+Commit` baseline per commit
+(`max_concurrent_jobs = 1`, several runs → mean + CV), then run two *different*
+commits concurrently and compare each to its own serial baseline. If the shift
+stays within your noise floor, concurrency is safe for change detection; if not,
+this host benchmarks accurately only serially, and `max > 1` is for throughput
+when accuracy isn't the point.

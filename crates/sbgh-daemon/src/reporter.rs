@@ -846,7 +846,11 @@ mod tests {
                 pr_report: PrReport::Comment,
                 baseline_report: BaselineReport::None,
             },
-            runner: RunnerConfig { max_concurrent_jobs: 1 },
+            runner: RunnerConfig {
+                max_concurrent_jobs: 1,
+                cpu_sets: vec![],
+                host_cpus: None,
+            },
         }
     }
 

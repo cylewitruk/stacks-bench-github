@@ -154,3 +154,32 @@ baseline_report = "check"
 # full build+bench VM today — vCPUs, memory, an LVM snapshot, and a tmpfs per
 # job). Values below 1 are clamped to 1.
 max_concurrent_jobs = 1
+
+# CPU pinning (optional). One libvirt cpuset per concurrency slot, so each
+# concurrent benchmark runs on dedicated physical cores — removing scheduler
+# jitter and core-sharing between jobs (essential for trustworthy concurrent
+# numbers). Length must be >= max_concurrent_jobs. Omit (or leave empty) to
+# disable pinning (vCPUs float across all cores — the default).
+#
+# Example for a 6-core box (SMT off) running 2 concurrent jobs at 2 vCPUs each,
+# leaving cores 4-5 for the host/OS:
+#   max_concurrent_jobs = 2
+#   cpu_sets   = ["0-1", "2-3"]   # slot 0 → cores 0,1 ; slot 1 → cores 2,3
+#   host_cpus  = "4-5"            # pin qemu emulator/I-O threads off the bench cores
+# …and match the per-phase vCPU counts to the slot size (a VM's vCPUs are
+# CONFINED to its cpuset, so anything above the slot's core count just
+# oversubscribes that slot's own cores). For a 2-core slot:
+#   [vm]
+#   build_vcpus = 2   # the default 4 would oversubscribe a 2-core slot —
+#                     # harmless (contained + the build isn't measured) but
+#                     # pointless; it can't use more than the slot's cores.
+#   bench_vcpus = 2   # keep <= slot cores: the bench phase IS measured, so
+#                     # 1 vCPU per core (no oversubscription on the metric).
+#
+# NOTE: pinning isolates *cores*; it cannot partition the shared L3 / memory
+# bandwidth on a single socket. Measure serial-vs-concurrent before trusting
+# concurrent results. Pair with kernel `isolcpus=0,1,2,3 nohz_full=… rcu_nocbs=…`
+# + IRQ affinity on the host (see docs/host-bringup.md) to keep the kernel off
+# the bench cores.
+# cpu_sets  = ["0-1", "2-3"]
+# host_cpus = "4-5"

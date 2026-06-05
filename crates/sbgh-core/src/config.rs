@@ -179,12 +179,27 @@ pub struct DaemonConfig {
 /// Daemon run-loop tuning (roadmap-v5). Deliberately **not** under `[vm]`: the
 /// limit is on daemon execution *slots*, not VM capacity — task kinds become
 /// non-VM in v6, so the run-loop knob lives on its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerConfig {
     /// Maximum jobs executed concurrently. Default `1` (sequential — the
     /// historical behavior). Raise it only when the host can run that many
     /// jobs at once (each is a full VM today). Values below 1 are clamped to 1.
     pub max_concurrent_jobs: usize,
+    /// Optional CPU pinning (roadmap-v5 Phase 5), one **libvirt cpuset** per
+    /// concurrency slot — e.g. `["0-1", "2-3"]` pins slot 0's VM to cores 0,1
+    /// and slot 1's to 2,3. Length must be ≥ `max_concurrent_jobs`. Empty (the
+    /// default) → no pinning, vCPUs float across all host cores. Pinning each
+    /// concurrent benchmark to dedicated cores removes scheduler jitter +
+    /// core-sharing between jobs; it can't partition shared L3 / memory
+    /// bandwidth (single-socket), so measure before trusting concurrent runs.
+    #[serde(default)]
+    pub cpu_sets: Vec<String>,
+    /// Host cpuset for the qemu **emulator/I-O threads** (e.g. `"4-5"`), pinned
+    /// *off* the benchmark cores so emulator activity doesn't jitter a measured
+    /// run. Only applied when `cpu_sets` is set. `None` → emulator threads not
+    /// pinned.
+    #[serde(default)]
+    pub host_cpus: Option<String>,
 }
 
 /// The daemon's `/api` server (roadmap-v3). Reachable only from the
@@ -394,6 +409,8 @@ struct RawReporting {
 #[serde(default, deny_unknown_fields)]
 struct RawRunner {
     max_concurrent_jobs: Option<usize>,
+    cpu_sets: Option<Vec<String>>,
+    host_cpus: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -494,6 +511,8 @@ impl RawDaemon {
                 .runner
                 .max_concurrent_jobs,
         );
+        merge_opt(&mut self.runner.cpu_sets, other.runner.cpu_sets);
+        merge_opt(&mut self.runner.host_cpus, other.runner.host_cpus);
 
         merge_opt(&mut self.vm.golden_image, other.vm.golden_image);
         merge_opt(&mut self.vm.build_vcpus, other.vm.build_vcpus);
@@ -635,6 +654,17 @@ impl RawDaemon {
                 .max_concurrent_jobs,
             "SBGH_RUNNER_MAX_CONCURRENT_JOBS",
         );
+        // cpu_sets is a list of cpusets (each may contain commas, e.g. "0,2"),
+        // so it's `;`-separated rather than CSV.
+        if let Ok(v) = std::env::var("SBGH_RUNNER_CPU_SETS") {
+            self.runner.cpu_sets = Some(
+                v.split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
+        }
+        env_into(&mut self.runner.host_cpus, "SBGH_RUNNER_HOST_CPUS");
     }
 
     fn into_config(self) -> Result<DaemonConfig> {
@@ -786,13 +816,33 @@ impl RawDaemon {
                     .baseline_report
                     .unwrap_or(BaselineReport::Check),
             },
-            runner: RunnerConfig {
+            runner: {
                 // Default 1 = sequential (historical behavior). Clamp 0 → 1.
-                max_concurrent_jobs: self
+                let max_concurrent_jobs = self
                     .runner
                     .max_concurrent_jobs
                     .unwrap_or(1)
-                    .max(1),
+                    .max(1);
+                let cpu_sets = self
+                    .runner
+                    .cpu_sets
+                    .unwrap_or_default();
+                // Pinning is all-or-nothing per slot: if set, every concurrency
+                // slot needs a cpuset, else some jobs would run unpinned and
+                // contend with pinned ones.
+                if !cpu_sets.is_empty() && cpu_sets.len() < max_concurrent_jobs {
+                    return Err(Error::Config(format!(
+                        "[runner].cpu_sets has {} entries but max_concurrent_jobs is {}; provide \
+                         one cpuset per slot (or none to disable pinning)",
+                        cpu_sets.len(),
+                        max_concurrent_jobs,
+                    )));
+                }
+                RunnerConfig {
+                    max_concurrent_jobs,
+                    cpu_sets,
+                    host_cpus: self.runner.host_cpus,
+                }
             },
         })
     }
@@ -1011,6 +1061,43 @@ mod tests {
         let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         assert_eq!(cfg.vm.build_vcpus, 12);
         assert_eq!(cfg.vm.build_memory, crate::memory::MemorySize::from_gib(24));
+    }
+
+    #[test]
+    fn daemon_runner_cpu_pinning_parses() {
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write(
+            "[runner]\nmax_concurrent_jobs = 2\ncpu_sets = [\"0-1\", \"2-3\"]\nhost_cpus = \
+             \"4-5\"\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert_eq!(cfg.runner.max_concurrent_jobs, 2);
+        assert_eq!(cfg.runner.cpu_sets, vec!["0-1".to_string(), "2-3".to_string()]);
+        assert_eq!(
+            cfg.runner
+                .host_cpus
+                .as_deref(),
+            Some("4-5")
+        );
+    }
+
+    #[test]
+    fn daemon_runner_defaults_to_no_pinning() {
+        let _g = EnvGuard::set(&daemon_env());
+        let cfg = DaemonConfig::load_layered(None).unwrap();
+        assert_eq!(cfg.runner.max_concurrent_jobs, 1);
+        assert!(cfg.runner.cpu_sets.is_empty(), "no pinning by default");
+        assert!(cfg.runner.host_cpus.is_none());
+    }
+
+    #[test]
+    fn daemon_runner_cpu_sets_shorter_than_max_errors() {
+        // Pinning is all-or-nothing per slot: fewer cpusets than slots would
+        // leave some jobs unpinned and contending with pinned ones.
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write("[runner]\nmax_concurrent_jobs = 3\ncpu_sets = [\"0-1\", \"2-3\"]\n");
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got: {err:?}");
     }
 
     #[test]

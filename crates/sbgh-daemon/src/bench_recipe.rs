@@ -23,11 +23,24 @@ pub struct BenchRecipe {
     config: Arc<DaemonConfig>,
     shell: Arc<dyn Shell>,
     bench_args: Vec<String>,
+    /// The libvirt cpuset this job's VM vCPUs are pinned to (its concurrency
+    /// slot's `[runner].cpu_sets` entry), or `None` to float (Phase 5).
+    vcpu_cpuset: Option<String>,
 }
 
 impl BenchRecipe {
-    pub fn new(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>, bench_args: Vec<String>) -> Self {
-        Self { config, shell, bench_args }
+    pub fn new(
+        config: Arc<DaemonConfig>,
+        shell: Arc<dyn Shell>,
+        bench_args: Vec<String>,
+        vcpu_cpuset: Option<String>,
+    ) -> Self {
+        Self {
+            config,
+            shell,
+            bench_args,
+            vcpu_cpuset,
+        }
     }
 }
 
@@ -60,7 +73,7 @@ impl Recipe for BenchRecipe {
         let driver = LibvirtDriver::new(self.config.clone(), self.shell.clone());
         let adapter = SinkAdapter { sink };
         let outcome = driver
-            .run_benchmark(ctx, &self.bench_args, &adapter, cancel)
+            .run_benchmark(ctx, &self.bench_args, &adapter, cancel, self.vcpu_cpuset.as_deref())
             .await?;
         let status = match outcome.status {
             OutcomeStatus::Ok => TaskStatus::Completed,

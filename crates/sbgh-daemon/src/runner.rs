@@ -1,22 +1,23 @@
 //! Main daemon loop — a **coordinator** over a pool of concurrent job tasks
 //! (roadmap-v5 Phase 3).
 //!
-//! The coordinator claims while execution slots are free (a `Semaphore` sized
-//! by `[runner].max_concurrent_jobs`, default 1) and spawns one task per job
-//! into a `JoinSet`; the slot frees when the task finishes. Claims stay serial
+//! The coordinator claims while execution slots are free (a pool of slot
+//! indices sized by `[runner].max_concurrent_jobs`, default 1) and spawns one
+//! task per job into a `JoinSet`; the slot frees when the task is reaped. Each
+//! slot maps to a stable cpuset for Phase-5 CPU pinning. Claims stay serial
 //! inside the loop — only *execution* parallelizes. Each job task
 //! ([`JobDeps::run`]) spawns the per-job [`Reporter`] (commit resolution +
 //! Check Run / comment per `[reporting]` + the terminal DB write) and runs the
 //! worker (the benchmark recipe) inline against it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
-use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OnceCell, mpsc, oneshot};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -173,12 +174,10 @@ impl Runner {
             .await?
         {
             Some(job) => {
-                let permit = Arc::new(Semaphore::new(1))
-                    .try_acquire_owned()
-                    .expect("a fresh semaphore always has a permit");
+                // Standalone run — no concurrency slot, so no pinning.
                 self.deps
                     .clone()
-                    .run(job, permit, CancellationToken::new())
+                    .run(job, None, CancellationToken::new())
                     .await?;
                 Ok(true)
             }
@@ -187,16 +186,23 @@ impl Runner {
     }
 }
 
-/// The concurrent run loop's state: the slot `Semaphore`, the in-flight task
-/// set, and the task→job map. Split out from [`Runner::run`] so the fill/reap
+/// The concurrent run loop's state: the slot pool, the in-flight task set, and
+/// the task→job/slot maps. Split out from [`Runner::run`] so the fill/reap
 /// machinery (the load-bearing Phase-3 code) is unit-testable without the
 /// infinite loop.
 struct Coordinator {
     deps: JobDeps,
-    slots: Arc<Semaphore>,
+    /// Free **slot indices** (`0..max_concurrent`). The pool size *is* the
+    /// concurrency bound (an empty pool = full), and each in-flight job holds a
+    /// stable slot index for its lifetime — which Phase-5 CPU pinning maps to a
+    /// fixed cpuset (`[runner].cpu_sets[slot]`), so slot 0 always pins to the
+    /// same cores. A slot returns to the pool on reap.
+    slots_free: VecDeque<usize>,
     tasks: JoinSet<anyhow::Result<()>>,
     /// task id → job id, so a panicking task can be logged with context.
     task_jobs: HashMap<Id, Uuid>,
+    /// task id → slot index, so the slot is returned to `slots_free` on reap.
+    task_slots: HashMap<Id, usize>,
     /// The daemon-wide **abort** token. Each job gets a **child** token, so an
     /// abort cancels every in-flight run at once, while one job's own
     /// cancellation never propagates back up to siblings.
@@ -212,18 +218,18 @@ impl Coordinator {
     fn new(deps: JobDeps, max_concurrent: usize, abort: CancellationToken) -> Self {
         Self {
             deps,
-            slots: Arc::new(Semaphore::new(max_concurrent)),
+            slots_free: (0..max_concurrent).collect(),
             tasks: JoinSet::new(),
             task_jobs: HashMap::new(),
+            task_slots: HashMap::new(),
             abort,
             last_positions: HashMap::new(),
         }
     }
 
-    /// Spawned-but-not-yet-reaped tasks. An **upper bound** on live jobs: a
-    /// task can finish (freeing its semaphore permit, so a slot may top up)
-    /// before the next `join_next` reaps it. The real concurrency cap is
-    /// the semaphore, not this count.
+    /// Spawned-but-not-yet-reaped tasks (= occupied slots). An **upper bound**
+    /// on live jobs: a task can finish before the next `join_next` reaps it +
+    /// returns its slot. The real concurrency cap is the slot pool.
     fn in_flight(&self) -> usize {
         self.tasks.len()
     }
@@ -527,16 +533,13 @@ impl Coordinator {
         }
     }
 
-    /// Claim into every free slot, spawning a job task per claim (the permit is
-    /// moved into the task and frees the slot on completion). Returns how many
-    /// were spawned this call.
+    /// Claim into every free slot, spawning a job task per claim. Each job
+    /// holds its slot index until reap (which returns it), so the slot —
+    /// and its Phase-5 cpuset — is stable for the run. Returns how many
+    /// were spawned.
     async fn fill_slots(&mut self) -> usize {
         let mut spawned = 0;
-        while let Ok(permit) = self
-            .slots
-            .clone()
-            .try_acquire_owned()
-        {
+        while let Some(slot) = self.slots_free.pop_front() {
             match self
                 .deps
                 .jobs
@@ -546,31 +549,47 @@ impl Coordinator {
                 Ok(Some(job)) => {
                     let job_id = job.id;
                     let token = self.abort.child_token();
+                    let cpuset = self.cpuset_for_slot(slot);
                     let id = self
                         .tasks
                         .spawn(
                             self.deps
                                 .clone()
-                                .run(job, permit, token),
+                                .run(job, cpuset, token),
                         )
                         .id();
                     self.task_jobs
                         .insert(id, job_id);
+                    self.task_slots
+                        .insert(id, slot);
                     spawned += 1;
                 }
                 Ok(None) => {
-                    // Queue empty — release the slot and stop claiming.
-                    drop(permit);
+                    // Queue empty — return the slot and stop claiming.
+                    self.slots_free
+                        .push_front(slot);
                     break;
                 }
                 Err(e) => {
                     tracing::error!(error = ?e, "claim failed");
-                    drop(permit);
+                    self.slots_free
+                        .push_front(slot);
                     break;
                 }
             }
         }
         spawned
+    }
+
+    /// The libvirt cpuset configured for a concurrency slot (Phase 5 CPU
+    /// pinning), or `None` when `[runner].cpu_sets` is unset (vCPUs float).
+    fn cpuset_for_slot(&self, slot: usize) -> Option<String> {
+        self.deps
+            .config
+            .runner
+            .cpu_sets
+            .get(slot)
+            .cloned()
     }
 
     /// Wait for a task to finish (freeing a slot), the poll tick (to re-sweep +
@@ -593,11 +612,13 @@ impl Coordinator {
         }
     }
 
-    /// Record the outcome of a finished job task and drop its id→job mapping.
+    /// Record the outcome of a finished job task, drop its id→job mapping, and
+    /// **return its slot** to the free pool so the next claim can reuse it.
     fn reap(&mut self, joined: Result<(Id, anyhow::Result<()>), JoinError>) {
         match joined {
             Ok((id, result)) => {
                 self.task_jobs.remove(&id);
+                self.free_slot(&id);
                 if let Err(e) = result {
                     // Setup-level failure — the reporter already terminal-failed
                     // the job; logged here for visibility.
@@ -609,9 +630,9 @@ impl Coordinator {
                 // observes the channel close and terminal-fails the job; a panic
                 // *before* the reporter was gated leaves the job `claimed` (the
                 // stuck-claim sweep recovers it) or `running` (Phase-4 recovery).
-                let job_id = self
-                    .task_jobs
-                    .remove(&join_err.id());
+                let id = join_err.id();
+                let job_id = self.task_jobs.remove(&id);
+                self.free_slot(&id);
                 tracing::error!(
                     job_id = ?job_id,
                     error = ?join_err,
@@ -620,17 +641,25 @@ impl Coordinator {
             }
         }
     }
+
+    /// Return a finished task's slot index to the free pool.
+    fn free_slot(&mut self, id: &Id) {
+        if let Some(slot) = self.task_slots.remove(id) {
+            self.slots_free
+                .push_back(slot);
+        }
+    }
 }
 
 impl JobDeps {
     /// Run one claimed job to a terminal state: spawn the per-job [`Reporter`]
     /// (which owns prepare + all GitHub/DB side-effects), run the worker inline
-    /// (the recipe), and surface the reporter's result. The `permit` is held
-    /// for the job's lifetime, freeing its concurrency slot on completion.
+    /// (the recipe), and surface the reporter's result. `vcpu_cpuset` is the
+    /// job's concurrency-slot CPU pinning (Phase 5), `None` to float.
     async fn run(
         self,
         job: RunnableJob,
-        _permit: OwnedSemaphorePermit,
+        vcpu_cpuset: Option<String>,
         token: CancellationToken,
     ) -> anyhow::Result<()> {
         tracing::info!(
@@ -639,6 +668,7 @@ impl JobDeps {
             git_ref_kind = ?job.git_ref_kind,
             git_ref = %job.git_ref_display,
             commit_preresolved = !job.commit.is_empty(),
+            cpuset = ?vcpu_cpuset,
             progress = match job.progress {
                 ProgressTarget::PullRequest { .. } => "pull_request",
                 ProgressTarget::CommitCheck { .. } => "commit_check",
@@ -646,8 +676,12 @@ impl JobDeps {
             "claimed job; starting",
         );
 
-        let recipe =
-            BenchRecipe::new(self.config.clone(), self.shell.clone(), job.bench_args.clone());
+        let recipe = BenchRecipe::new(
+            self.config.clone(),
+            self.shell.clone(),
+            job.bench_args.clone(),
+            vcpu_cpuset,
+        );
 
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
         let (prepared_tx, prepared_rx) = oneshot::channel();
@@ -1032,7 +1066,11 @@ mod tests {
                 pr_report: PrReport::Comment,
                 baseline_report: BaselineReport::None,
             },
-            runner: RunnerConfig { max_concurrent_jobs: 1 },
+            runner: RunnerConfig {
+                max_concurrent_jobs: 1,
+                cpu_sets: vec![],
+                host_cpus: None,
+            },
         }
     }
 
@@ -1466,10 +1504,7 @@ mod tests {
                 shell,
                 app_id: app_id.clone(),
             };
-            let permit = Arc::new(Semaphore::new(1))
-                .try_acquire_owned()
-                .unwrap();
-            handles.push(tokio::spawn(deps.run(job, permit, CancellationToken::new())));
+            handles.push(tokio::spawn(deps.run(job, None, CancellationToken::new())));
             sources.push(source);
         }
 
@@ -1680,7 +1715,7 @@ mod tests {
         // token then makes the worker report aborted.
         let shell = Arc::new(RecordingShell::new());
         shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
-        let recipe = BenchRecipe::new(config, shell, vec![]);
+        let recipe = BenchRecipe::new(config, shell, vec![], None);
         let job = RunnableJob {
             progress: ProgressTarget::CommitCheck { check_run_id: None },
             ..pr_job("abc123", None)
@@ -2087,5 +2122,45 @@ mod tests {
             2,
             "a persist failure must leave the position un-debounced so it retries",
         );
+    }
+
+    /// Phase 5 CPU pinning: each concurrency slot maps to its configured
+    /// `[runner].cpu_sets` cpuset (stable: slot 0 → cpu_sets[0]); an
+    /// out-of-range slot or empty config → no pinning.
+    #[tokio::test]
+    async fn coordinator_maps_slot_to_configured_cpuset() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+        config.runner.cpu_sets = vec!["0-1".into(), "2-3".into()];
+        config.runner.host_cpus = Some("4-5".into());
+        let coord = position_coord(
+            config,
+            Arc::new(FakeSource::new(pr_job("abc", None))),
+            Arc::new(FakeGitHub::new()),
+        );
+
+        assert_eq!(
+            coord
+                .cpuset_for_slot(0)
+                .as_deref(),
+            Some("0-1"),
+            "slot 0 → first cpuset"
+        );
+        assert_eq!(
+            coord
+                .cpuset_for_slot(1)
+                .as_deref(),
+            Some("2-3"),
+            "slot 1 → second cpuset"
+        );
+        assert_eq!(coord.cpuset_for_slot(2), None, "out-of-range slot is unpinned");
+
+        // No cpu_sets → every slot floats.
+        let bare_coord = position_coord(
+            config_with(&tmp, PrReport::Comment, BaselineReport::None),
+            Arc::new(FakeSource::new(pr_job("abc", None))),
+            Arc::new(FakeGitHub::new()),
+        );
+        assert_eq!(bare_coord.cpuset_for_slot(0), None, "no cpu_sets → unpinned");
     }
 }

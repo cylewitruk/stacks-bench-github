@@ -153,6 +153,9 @@ impl LibvirtDriver {
         bench_args: &[String],
         listener: &dyn PhaseListener,
         cancel: &CancellationToken,
+        // Phase 5 CPU pinning: the libvirt cpuset this job's slot owns, or
+        // `None` to float. Threaded down to the domain XML.
+        vcpu_cpuset: Option<&str>,
     ) -> anyhow::Result<BenchmarkOutcome> {
         let job_id = ctx.job_id.to_string();
         let domain_name = format!("sbgh-{job_id}");
@@ -182,6 +185,7 @@ impl LibvirtDriver {
                 &mut arts,
                 listener,
                 cancel,
+                vcpu_cpuset,
             )
             .await;
 
@@ -373,6 +377,7 @@ impl LibvirtDriver {
         arts: &mut JobArtifacts,
         listener: &dyn PhaseListener,
         cancel: &CancellationToken,
+        vcpu_cpuset: Option<&str>,
     ) -> anyhow::Result<FinishReason> {
         // ── one-time provisioning shared by both phases ────────────────
         let cidata = self
@@ -398,6 +403,7 @@ impl LibvirtDriver {
                 arts,
                 listener,
                 cancel,
+                vcpu_cpuset,
             )
             .await?;
         match build_reason {
@@ -426,6 +432,7 @@ impl LibvirtDriver {
                 arts,
                 listener,
                 cancel,
+                vcpu_cpuset,
             )
             .await?;
         Ok(bench_reason)
@@ -554,6 +561,7 @@ impl LibvirtDriver {
         arts: &mut JobArtifacts,
         listener: &dyn PhaseListener,
         cancel: &CancellationToken,
+        vcpu_cpuset: Option<&str>,
     ) -> anyhow::Result<FinishReason> {
         tracing::info!(domain = domain_name, phase_lifecycle = phase_label, "starting phase");
 
@@ -598,6 +606,15 @@ impl LibvirtDriver {
             sccache_share_tag: SCCACHE_SHARE_TAG,
             console_log_path: &console_log,
             network: &self.config.vm.network,
+            vcpu_cpuset,
+            // Emulator threads pin to the host cores only when this job's vCPUs
+            // are pinned (`[runner].host_cpus`); meaningless otherwise.
+            emulator_cpuset: vcpu_cpuset.and(
+                self.config
+                    .runner
+                    .host_cpus
+                    .as_deref(),
+            ),
         })?;
         std::fs::write(&domain_xml_path, &xml)?;
 
@@ -1084,7 +1101,11 @@ mod tests {
                 pr_report: PrReport::Both,
                 baseline_report: BaselineReport::Check,
             },
-            runner: RunnerConfig { max_concurrent_jobs: 1 },
+            runner: RunnerConfig {
+                max_concurrent_jobs: 1,
+                cpu_sets: vec![],
+                host_cpus: None,
+            },
         }
     }
 
@@ -1181,6 +1202,7 @@ mod tests {
                 &job.bench_args,
                 &NoopPhaseListener,
                 &CancellationToken::new(),
+                None,
             )
             .await
             .expect("driver should return Ok even on VM-side failures");
@@ -1323,6 +1345,7 @@ mod tests {
                 &job.bench_args,
                 &NoopPhaseListener,
                 &CancellationToken::new(),
+                None,
             )
             .await
             .unwrap();
@@ -1370,6 +1393,7 @@ mod tests {
                 &job.bench_args,
                 &NoopPhaseListener,
                 &CancellationToken::new(),
+                None,
             )
             .await
             .unwrap();
@@ -1411,7 +1435,7 @@ mod tests {
         cancel.cancel(); // pre-cancelled → the poll loop's top check fires first
 
         let outcome = driver
-            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener, &cancel)
+            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener, &cancel, None)
             .await
             .expect("driver returns Ok");
 
