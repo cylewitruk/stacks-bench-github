@@ -804,44 +804,57 @@ echo off | sudo tee /sys/devices/system/cpu/smt/control
 lscpu -e=CPU,CORE,SOCKET,ONLINE     # confirm one online CPU per physical core
 ```
 
-**Persist SMT-off + isolate the bench cores** via the kernel cmdline. Edit
-`/etc/default/grub`, append to `GRUB_CMDLINE_LINUX_DEFAULT`:
+**Persist SMT-off + isolate the bench cores (incl. managed IRQs)** via the
+kernel cmdline. Edit `/etc/default/grub` — append to `GRUB_CMDLINE_LINUX`
+(applies to every entry; use `GRUB_CMDLINE_LINUX_DEFAULT` if you'd rather leave
+a *recovery* boot un-isolated for debugging):
 
 ```text
-nosmt isolcpus=0,1,2,3 nohz_full=0,1,2,3 rcu_nocbs=0,1,2,3
+nosmt=force isolcpus=domain,managed_irq,0-3 nohz_full=0-3 rcu_nocbs=0-3
 ```
 
-then `sudo update-grub && sudo reboot`. (`isolcpus` numbers are the *bench*
-logical CPUs; with SMT off on a 6-core box those are 0–3, leaving 4–5 for the
-host.) After this, re-establish your serial baselines — the CPU config changed.
+then `sudo update-grub && sudo reboot`. The cpu numbers are the *bench* logical
+CPUs; with SMT off on a 6-core box those are 0–3, leaving 4–5 for the host. After
+this, re-establish your serial baselines — the CPU config changed. What each flag
+buys you:
 
-**(Optional, last-mile) Steer device interrupts off the bench cores.** When a
-device (NVMe, NIC) finishes work it raises an *interrupt* that preempts whatever
-is running on the core that handles it — if that's a bench core, it's a tiny
-stall in a measurement. Steering those interrupts onto the host cores (4,5)
-avoids it.
+- **`nosmt=force`** — disable SMT *and* forbid re-enabling it at runtime (stricter
+  than plain `nosmt`; `/sys/.../smt/control` reads `forceoff`).
+- **`isolcpus=domain,managed_irq,0-3`** — `domain` keeps the scheduler off cores
+  0–3 (no tasks unless explicitly pinned); **`managed_irq`** keeps *kernel-managed*
+  interrupts off them too. This is the important one: NVMe (and multiqueue NIC)
+  completion IRQs are managed — one queue per CPU, kernel-assigned, **not**
+  movable via `/proc/irq/*/smp_affinity`. `managed_irq` is the only lever that
+  steers them away from the isolated cores, and it must be set at boot. (This is
+  why `irq-affinity.sh --apply` reported the NVMe IRQs as skipped — they're
+  managed.)
+- **`nohz_full=0-3`** — full tickless on the bench cores (drop the periodic timer
+  interrupt). Needs a `CONFIG_NO_HZ_FULL` kernel (Ubuntu's stock kernel has it)
+  and ≥1 housekeeping CPU, which 4,5 are.
+- **`rcu_nocbs=0-3`** — offload RCU callbacks off the bench cores.
 
-This is genuinely a refinement, not a must-do: `nosmt` + `isolcpus`/`nohz_full`/
-`rcu_nocbs` already keep the kernel + timer ticks off the bench cores, and the
-daemon's `<emulatorpin>` puts the VM's qemu I/O threads on the host cores — so
-the VM's own NVMe completions already tend to fire there. **Skip it for your
-first A/B run; revisit only if the results show jitter that tracks with I/O.**
+Between `managed_irq` (NVMe/NIC) and `nohz_full` (timers), the high-rate
+interrupt sources are now handled at boot — so explicit IRQ steering is rarely
+needed.
 
-Use the helper to print (or `--apply`) the right commands for *your* IRQs:
+**(Optional) Steer any *non-managed* device IRQs off the bench cores.** A few
+legacy single-vector device IRQs (not NVMe/NIC multiqueue) aren't covered by
+`managed_irq` and can still target a bench core — but they're low-rate, so this
+is belt-and-suspenders. The daemon's `<emulatorpin>` also puts the VM's qemu I/O
+threads on the host cores. **Skip it for your first A/B; revisit only if results
+show jitter that tracks with I/O.** If you do want it:
 
 ```bash
 # Print the recommended commands (review, then run):
 scripts/irq-affinity.sh --host-cpus 4-5
-# …or apply directly (storage + network only, as root):
-sudo scripts/irq-affinity.sh --host-cpus 4-5 --match 'nvme|en|eth|virtio' --apply
+# …or apply directly (root):
+sudo scripts/irq-affinity.sh --host-cpus 4-5 --apply
 ```
 
-Under the hood it disables `irqbalance` (which would otherwise re-spread IRQs)
-and writes each device IRQ's allowed CPUs to `/proc/irq/<n>/smp_affinity_list`
-(a plain cpu-list like `4-5` — simpler than the `smp_affinity` hex bitmask).
-Caveats it handles for you: NVMe *per-queue* IRQs are kernel-managed and won't
-repin (reported as skipped), and `/proc` affinities reset on reboot (re-run, or
-wire into a startup unit).
+It disables `irqbalance` (which would re-spread IRQs) and writes each
+*non-managed* device IRQ's allowed CPUs to `/proc/irq/<n>/smp_affinity_list`.
+Managed IRQs (handled by `managed_irq` above) are reported as skipped; `/proc`
+affinities reset on reboot, so the GRUB line is the durable mechanism.
 
 ### 9.3 The honest ceiling
 

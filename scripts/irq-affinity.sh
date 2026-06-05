@@ -3,15 +3,17 @@
 # disk/NIC IRQ can't preempt a measured run and add jitter. By DEFAULT this only
 # PRINTS the commands (review them, then run yourself); pass --apply to execute.
 #
-# This is an OPTIONAL, last-mile refinement. `nosmt` + `isolcpus`/`nohz_full`/
-# `rcu_nocbs` + the daemon's `<emulatorpin>` already keep the big interrupt
-# sources off the bench cores (and the VM's own NVMe completions tend to follow
-# the pinned qemu I/O threads onto the host cores). Reach for this only if your
-# serial-vs-concurrent A/B shows jitter that tracks with I/O. See
-# docs/host-bringup.md §9.2.
+# This is an OPTIONAL, last-mile refinement, and only for NON-managed device
+# IRQs. The high-rate managed IRQs (NVMe / multiqueue NIC) are kept off the
+# bench cores by the kernel cmdline `isolcpus=...,managed_irq,...` at boot — they
+# are NOT movable via /proc (see below). Between that, `nohz_full` (timers), and
+# the daemon's `<emulatorpin>` (VM I/O threads on the host cores), the sources
+# that matter are already handled. Reach for this only if your serial-vs-
+# concurrent A/B shows jitter that tracks with I/O. See docs/host-bringup.md §9.2.
 #
-# NVMe per-queue IRQs (e.g. `nvme0q1`) are usually kernel-MANAGED — repinning
-# them harmlessly no-ops (a plain write fails); --apply reports those as skipped.
+# NVMe per-queue IRQs (e.g. `nvme0q1`) are kernel-MANAGED — a /proc write
+# no-ops, so --apply reports them as skipped; use `managed_irq` in isolcpus
+# (kernel cmdline) for those, not this script.
 #
 # Run `irq-affinity.sh --help` for options.
 

@@ -178,8 +178,9 @@ max_concurrent_jobs = 1
 #
 # NOTE: pinning isolates *cores*; it cannot partition the shared L3 / memory
 # bandwidth on a single socket. Measure serial-vs-concurrent before trusting
-# concurrent results. Pair with kernel `isolcpus=0,1,2,3 nohz_full=… rcu_nocbs=…`
-# + IRQ affinity on the host (see docs/host-bringup.md) to keep the kernel off
-# the bench cores.
+# concurrent results. Pair with a kernel cmdline that keeps the host + managed
+# (NVMe/NIC) IRQs off the bench cores:
+#   nosmt=force isolcpus=domain,managed_irq,0-3 nohz_full=0-3 rcu_nocbs=0-3
+# See docs/host-bringup.md §9 for the full host setup.
 # cpu_sets  = ["0-1", "2-3"]
 # host_cpus = "4-5"
