@@ -25,6 +25,8 @@ use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi
 use sbgh_core::models::{GitRefKind, ResolvedCommit};
 use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
 
+use crate::bench_summary::RunResult;
+use crate::comparison::{BaselineComparison, compare};
 use crate::events::{EventSink, PhaseLabel, SinkResult, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
@@ -233,6 +235,119 @@ impl Reporter {
     /// Write the terminal state (DB + GitHub). Returns `Some(err)` when the run
     /// loop should back off: a persistence failure, or a recipe `SetupError`
     /// (the run couldn't start) — preserving the prior `execute` semantics.
+    /// roadmap-v7: best-effort vs-baseline comparison for a completed PR run.
+    /// Resolves the PR's base ref + head identity (`get_pull_request`), the
+    /// merge-base (`compare_commits`), the matching baseline (`find_baseline`),
+    /// and this run's metric, then [`compare`]s them. `None` (→ absolute-only
+    /// render) for non-PR jobs, no comparable baseline, or any lookup/parse
+    /// error — reporting is non-fatal.
+    async fn baseline_comparison(&self, summary: &serde_json::Value) -> Option<BaselineComparison> {
+        let ProgressTarget::PullRequest { pr_number, .. } = &self.job.progress else {
+            return None;
+        };
+        let pr_number = *pr_number as u64;
+        let workload_key = self
+            .job
+            .workload_key
+            .as_deref()?;
+
+        // PR base ref + head identity (the issue_comment payload didn't carry them).
+        let pr = match self
+            .gh
+            .get_pull_request(self.job.installation_id, &self.job.repository, pr_number)
+            .await
+        {
+            Ok(pr) => pr,
+            Err(e) => {
+                tracing::debug!(job_id = %self.job.id, error = ?e, "vs-baseline: get_pull_request failed (absolute-only)");
+                return None;
+            }
+        };
+
+        // The benchmarked commit was captured at claim time. If the PR branch
+        // advanced during the run, the *current* head (and its merge-base /
+        // baseline / diff link) no longer matches the metrics we have — comparing
+        // them would mislead. Degrade to absolute-only rather than compare across
+        // commits (Codex Phase-3 finding).
+        if pr.head.sha != self.job.commit {
+            tracing::debug!(
+                job_id = %self.job.id,
+                benchmarked = %self.job.commit,
+                current_head = %pr.head.sha,
+                "vs-baseline: PR head moved during the run; absolute-only",
+            );
+            return None;
+        }
+
+        // Merge-base (fork point), cross-fork-safe head form.
+        let merge_base = match self
+            .gh
+            .compare_commits(
+                self.job.installation_id,
+                &self.job.repository,
+                &pr.base.branch,
+                &pr.head.repo.owner,
+                &pr.head.branch,
+            )
+            .await
+        {
+            Ok(Some(mb)) => mb,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(job_id = %self.job.id, error = ?e, "vs-baseline: compare_commits failed (absolute-only)");
+                return None;
+            }
+        };
+
+        // The matching baseline (exact → nearest-before), repo resolved.
+        let baseline = match self
+            .jobs
+            .find_baseline(&merge_base.hash, &pr.base.branch, merge_base.committed_at, workload_key)
+            .await
+        {
+            Ok(Some(b)) => b,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(job_id = %self.job.id, error = ?e, "vs-baseline: find_baseline failed (absolute-only)");
+                return None;
+            }
+        };
+
+        // This run's metric (the same extraction we persist), from run.json.
+        let pr_metric = self.pr_metric(summary)?;
+        let comparison = compare(
+            &pr_metric,
+            &baseline.metric,
+            self.config
+                .reporting
+                .noise_cv_pct,
+        )?;
+
+        Some(BaselineComparison {
+            comparison,
+            baseline_repo: baseline.repository,
+            baseline_commit: baseline.commit,
+            baseline_ref: baseline.git_ref_display,
+            baseline_committed_at: baseline.committed_at,
+            selection: baseline.selection,
+            base_repo: self.job.repository.clone(),
+            head_owner: pr.head.repo.owner,
+            head_ref: pr.head.branch,
+        })
+    }
+
+    /// This run's metric, parsed from the archived `run.json` referenced in the
+    /// forensics `summary` — the same `metric_from_run` the persistence path
+    /// uses, so the comment's delta is on the numbers we store.
+    fn pr_metric(&self, summary: &serde_json::Value) -> Option<sbgh_core::models::JobMetric> {
+        let path = summary
+            .get("run_json_archived_path")?
+            .as_str()?;
+        let bytes = std::fs::read(path).ok()?;
+        let run = RunResult::from_bytes(&bytes)?;
+        crate::job_source::metric_from_run(self.job.id, &run)
+    }
+
     async fn finish(
         &self,
         reporter: &ProgressReporter<'_>,
@@ -255,8 +370,11 @@ impl Reporter {
                     return Some(e);
                 }
                 tracing::info!(job_id = %self.job.id, "job result persisted (status=completed)");
+                let comparison = self
+                    .baseline_comparison(&summary)
+                    .await;
                 reporter
-                    .completed(&summary)
+                    .completed(&summary, comparison.as_ref())
                     .await;
                 None
             }
@@ -692,6 +810,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::job_source::BaselineRef;
 
     fn job_with(progress: ProgressTarget) -> RunnableJob {
         RunnableJob {
@@ -701,6 +820,7 @@ mod tests {
             git_ref_display: "feature".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            workload_key: None,
             bench_args: vec![],
             progress,
             claim_token: Some(Uuid::new_v4()),
@@ -709,9 +829,11 @@ mod tests {
 
     /// A minimal [`RunnableJobStore`] that records which lifecycle methods the
     /// reporter called — enough to prove the channel-close terminal-fail path.
+    /// `baseline` is the staged `find_baseline` response (roadmap-v7).
     #[derive(Default)]
     struct RecordingStore {
         calls: StdMutex<Vec<&'static str>>,
+        baseline: Option<BaselineRef>,
     }
 
     impl RecordingStore {
@@ -758,6 +880,15 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.rec("complete");
             Ok(())
+        }
+        async fn find_baseline(
+            &self,
+            _merge_base_sha: &str,
+            _base_ref: &str,
+            _at: Option<chrono::DateTime<chrono::Utc>>,
+            _workload_key: &str,
+        ) -> anyhow::Result<Option<BaselineRef>> {
+            Ok(self.baseline.clone())
         }
         async fn fail(
             &self,
@@ -845,6 +976,7 @@ mod tests {
             reporting: ReportingConfig {
                 pr_report: PrReport::Comment,
                 baseline_report: BaselineReport::None,
+                noise_cv_pct: None,
             },
             runner: RunnerConfig {
                 max_concurrent_jobs: 1,
@@ -943,6 +1075,182 @@ mod tests {
             sbgh_core::github::CheckRunState::Completed(
                 sbgh_core::github::CheckRunConclusion::Cancelled
             ),
+        );
+    }
+
+    // ─── roadmap-v7: vs-baseline comparison wiring ───
+
+    fn baseline_metric(exec: i64, commit: i64) -> sbgh_core::models::JobMetric {
+        sbgh_core::models::JobMetric {
+            job_id: Uuid::nil(),
+            envelope_duration_us: 0,
+            replay_duration_us: 0,
+            total_duration_us: 0,
+            setup_duration_us: 0,
+            execution_duration_us: exec,
+            commit_duration_us: commit,
+            clarity_runtime: 0,
+            transactions: 0,
+            read_length: 0,
+            write_length: 0,
+            measured_blocks: 5000,
+            warmup_blocks: 1000,
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        }
+    }
+
+    fn side(
+        owner: &str,
+        name: &str,
+        branch: &str,
+        sha: &str,
+    ) -> sbgh_core::github::PullRequestSide {
+        sbgh_core::github::PullRequestSide {
+            repo: sbgh_core::github::RepoRef {
+                id: 1,
+                owner: owner.into(),
+                name: name.into(),
+            },
+            sha: sha.into(),
+            branch: branch.into(),
+        }
+    }
+
+    /// A completed PR run with a comparable baseline produces a vs-baseline
+    /// delta: get_pull_request → compare_commits → find_baseline → compare.
+    #[tokio::test]
+    async fn baseline_comparison_renders_delta_for_pr_run() {
+        let tmp = TempDir::new().unwrap();
+        // This run's combined Exec+Commit = 718_000 + 300_000 = 1_018_000µs.
+        let run_json = tmp.path().join("run.json");
+        std::fs::write(
+            &run_json,
+            r#"{"success":true,"duration_secs":1100.0,"data":{"measured_blocks":5000,
+               "warmup_blocks":1000,"duration_secs":1000.0,"summary":{"total_duration_us":1100000000,
+               "setup_duration_us":50000000,"execution_duration_us":718000,"commit_duration_us":300000,
+               "transactions":12345,"clarity_runtime":99,"write_length":100,"read_length":200}}}"#,
+        )
+        .unwrap();
+
+        // Baseline combined = 1_000_000µs → this run is +1.8%.
+        let store = Arc::new(RecordingStore {
+            calls: Default::default(),
+            baseline: Some(BaselineRef {
+                metric: baseline_metric(700_000, 300_000),
+                repository: "stacks-network/stacks-core".into(),
+                commit: "basecommit0".into(),
+                git_ref_display: "develop".into(),
+                committed_at: chrono::DateTime::from_timestamp(1_716_000_000, 0),
+                selection: sbgh_core::db::BaselineSelection::NearestBefore,
+            }),
+        });
+
+        let gh = Arc::new(FakeGitHub::new());
+        // The PR head SHA matches the benchmarked commit (`job_with` → "abc123").
+        gh.set_pull_request(
+            "cylewitruk/stacks-core",
+            7,
+            side("cylewitruk", "stacks-core", "develop", "basesha"),
+            side("cylewitruk", "stacks-core", "feat/foo", "abc123"),
+        );
+        gh.set_merge_base(
+            "cylewitruk/stacks-core",
+            "develop",
+            "cylewitruk",
+            "feat/foo",
+            "mergebase0",
+            chrono::DateTime::from_timestamp(1_715_000_000, 0),
+        );
+
+        let mut config = no_report_config(&tmp);
+        config.reporting.noise_cv_pct = Some(0.37);
+
+        let mut job = job_with(ProgressTarget::PullRequest {
+            pr_number: 7,
+            comment_id: Some(11),
+            check_run_id: Some(22),
+            check_run_url: None,
+        });
+        job.repository = "cylewitruk/stacks-core".into();
+        job.workload_key = Some("wk1".into());
+
+        let reporter = Reporter::new(Arc::new(config), store, gh, Arc::new(OnceCell::new()), job);
+
+        let summary = serde_json::json!({ "run_json_archived_path": run_json.to_str().unwrap() });
+        let c = reporter
+            .baseline_comparison(&summary)
+            .await
+            .expect("a comparable baseline → Some");
+
+        assert!((c.comparison.delta_pct - 1.8).abs() < 0.01, "delta {}", c.comparison.delta_pct);
+        assert_eq!(c.comparison.verdict, crate::comparison::Verdict::Strong);
+        assert!(c.comparison.sigma.unwrap() > 3.0);
+        assert_eq!(c.baseline_repo, "stacks-network/stacks-core");
+        assert_eq!(c.baseline_commit, "basecommit0");
+        assert_eq!(c.baseline_ref, "develop");
+        assert_eq!(c.base_repo, "cylewitruk/stacks-core");
+        assert_eq!(c.head_owner, "cylewitruk");
+        assert_eq!(c.head_ref, "feat/foo");
+        assert_eq!(c.selection, sbgh_core::db::BaselineSelection::NearestBefore);
+    }
+
+    /// A baseline (non-PR) job has no fork-point → no comparison.
+    #[tokio::test]
+    async fn baseline_comparison_none_for_non_pr_job() {
+        let tmp = TempDir::new().unwrap();
+        let reporter = Reporter::new(
+            Arc::new(no_report_config(&tmp)),
+            Arc::new(RecordingStore::default()),
+            Arc::new(FakeGitHub::new()),
+            Arc::new(OnceCell::new()),
+            job_with(ProgressTarget::CommitCheck { check_run_id: Some(1) }),
+        );
+        assert!(
+            reporter
+                .baseline_comparison(&serde_json::json!({}))
+                .await
+                .is_none(),
+        );
+    }
+
+    /// Codex Phase-3: if the PR branch advanced during the run (current head
+    /// SHA ≠ the benchmarked commit), degrade to absolute-only — never
+    /// compare the moved head's merge-base against the old commit's
+    /// metrics.
+    #[tokio::test]
+    async fn baseline_comparison_none_when_pr_head_moved() {
+        let tmp = TempDir::new().unwrap();
+        let gh = Arc::new(FakeGitHub::new());
+        // Current head SHA differs from the benchmarked commit ("abc123").
+        gh.set_pull_request(
+            "cylewitruk/stacks-core",
+            7,
+            side("cylewitruk", "stacks-core", "develop", "basesha"),
+            side("cylewitruk", "stacks-core", "feat/foo", "movedsha"),
+        );
+        let mut config = no_report_config(&tmp);
+        config.reporting.noise_cv_pct = Some(0.37);
+        let mut job = job_with(ProgressTarget::PullRequest {
+            pr_number: 7,
+            comment_id: Some(11),
+            check_run_id: Some(22),
+            check_run_url: None,
+        });
+        job.repository = "cylewitruk/stacks-core".into();
+        job.workload_key = Some("wk1".into());
+        let reporter = Reporter::new(
+            Arc::new(config),
+            Arc::new(RecordingStore::default()),
+            gh,
+            Arc::new(OnceCell::new()),
+            job,
+        );
+        assert!(
+            reporter
+                .baseline_comparison(&serde_json::json!({}))
+                .await
+                .is_none(),
+            "a moved PR head must not compare across commits",
         );
     }
 

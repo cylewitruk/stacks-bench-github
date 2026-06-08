@@ -391,6 +391,10 @@ pub struct Job {
     pub git_ref_display: String,
     pub git_commit_hash: Option<String>,
     pub git_committed_at: Option<DateTime<Utc>>,
+    /// roadmap-v7: stable hash of the effective bench workload args (see
+    /// [`crate::bench_args::workload_key`]). Set at enqueue; NULL on rows
+    /// predating the column (they can't serve as a comparison baseline).
+    pub workload_key: Option<String>,
     pub claim_token: Option<Uuid>,
     pub claimed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -414,6 +418,10 @@ pub struct NewJob {
     /// values to `mark_running` via `ResolvedCommit`.
     pub git_commit_hash: Option<String>,
     pub git_committed_at: Option<DateTime<Utc>>,
+    /// roadmap-v7: workload key for baseline comparison (see
+    /// [`crate::bench_args`]). Computed at enqueue from the effective args
+    /// (`resolve_bench_args`); `None` only in non-enqueue test fixtures.
+    pub workload_key: Option<String>,
 }
 
 /// Slice 8 (post-review fix): typed handoff for the

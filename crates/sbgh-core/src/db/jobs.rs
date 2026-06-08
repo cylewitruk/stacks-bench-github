@@ -31,7 +31,7 @@
 //! `lookup_job` — slice 9 + slice 10 need this for read paths.
 
 use async_trait::async_trait;
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use crate::Result;
@@ -106,6 +106,39 @@ pub enum JobCreationOutcome {
     /// A job already existed for this webhook (idempotent retry). No
     /// rows were written; the prior attempt's job stands.
     AlreadyEnqueued,
+}
+
+/// roadmap-v7: how the baseline anchor was chosen for a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineSelection {
+    /// A completed baseline existed at the exact merge-base (fork-point) SHA.
+    Exact,
+    /// No exact baseline; the newest completed baseline on the target branch
+    /// at/just-before the fork-point (by `git_committed_at`). Best-effort.
+    NearestBefore,
+}
+
+/// roadmap-v7: provenance of the baseline a PR run was compared against — what
+/// the report names + links to. Carries `github_repo_id` (NOT owner/name): the
+/// renderer resolves the repo for the GitHub link, keeping this query free of a
+/// `github_repo` join (and the in-memory impl free of repo knowledge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineAnchor {
+    pub job_id: Uuid,
+    pub github_repo_id: i64,
+    pub commit: String,
+    pub git_ref_display: String,
+    pub committed_at: Option<DateTime<Utc>>,
+    pub selection: BaselineSelection,
+}
+
+/// roadmap-v7: the baseline match for a comparison — the measured metric plus
+/// its [`BaselineAnchor`] provenance. (No `PartialEq` — `JobMetric` carries
+/// none; assert on `anchor` + the metric fields you care about.)
+#[derive(Debug, Clone)]
+pub struct BaselineMatch {
+    pub metric: JobMetric,
+    pub anchor: BaselineAnchor,
 }
 
 #[async_trait]
@@ -214,10 +247,15 @@ pub trait JobStore: Send + Sync + 'static {
 
     /// roadmap-v5 Phase 5 (dedup): the id of an **active** (`queued` /
     /// `claimed` / `running`) job for this exact `(github_repo_id,
-    /// git_commit_hash, trigger_kind)`, if any. Used to skip enqueuing a
-    /// duplicate `/benchmark` for a commit already being benchmarked — two jobs
-    /// on one head SHA would otherwise fight over the single GitHub check
-    /// GitHub surfaces per `(name, head_sha)`.
+    /// git_commit_hash, trigger_kind, workload_key)`, if any. Used to skip
+    /// enqueuing a duplicate `/benchmark` for a commit already being
+    /// benchmarked — two jobs on one head SHA would otherwise fight over
+    /// the single GitHub check GitHub surfaces per `(name, head_sha)`.
+    ///
+    /// roadmap-v7: the match is **workload-aware**. A different `workload_key`
+    /// (e.g. `/benchmark run --count 1` while a default `/benchmark` is active)
+    /// is a genuinely different benchmark and must NOT be deduped — so it is
+    /// not matched here, and the caller enqueues it.
     ///
     /// This is a **best-effort** read used for a check-then-insert; it is not a
     /// hard uniqueness guarantee against concurrent processors or a crash
@@ -229,7 +267,34 @@ pub trait JobStore: Send + Sync + 'static {
         github_repo_id: i64,
         commit: &str,
         trigger_kind: crate::models::TriggerKind,
+        workload_key: &str,
     ) -> Result<Option<Uuid>>;
+
+    /// roadmap-v7: find the baseline a PR run should be compared against.
+    /// **Repo-agnostic** — a measurement is a property of the commit, not the
+    /// repo that ran it — so a fork PR finds an upstream baseline at the same
+    /// SHA. Two-step:
+    ///
+    /// 1. **Exact** — a completed baseline at `merge_base_sha` for the same
+    ///    `workload_key` (newest measurement wins).
+    /// 2. **Nearest-before** (only if no exact hit AND
+    ///    `merge_base_committed_at` is `Some`) — the newest completed baseline
+    ///    on `base_ref` for the same `workload_key` with `git_committed_at <=`
+    ///    the fork-point. Best-effort, labelled as such.
+    ///
+    /// Only `job_kind='baseline'`, `status='completed'`,
+    /// matching-`workload_key` rows are eligible; a NULL `workload_key`
+    /// never matches. `None` when neither step finds one. Ties (a commit
+    /// benchmarked more than once, or two commits sharing a timestamp) resolve
+    /// **deterministically** to the freshest measurement, then the highest job
+    /// id — so a report never silently flips which baseline it cites.
+    async fn find_baseline_for(
+        &self,
+        merge_base_sha: &str,
+        base_ref: &str,
+        merge_base_committed_at: Option<DateTime<Utc>>,
+        workload_key: &str,
+    ) -> Result<Option<BaselineMatch>>;
 
     /// Orphan recovery (4B-2 + 4C): terminal-**cancel** a job stranded in
     /// `running` by a dead daemon, with NO claim-token guard. The daemon that

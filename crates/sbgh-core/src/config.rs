@@ -240,7 +240,8 @@ pub struct GitHubConfig {
 }
 
 /// Which surfaces a job's benchmark result is reported on (roadmap-v4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: `noise_cv_pct: Option<f64>` (roadmap-v7) is only `PartialEq`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ReportingConfig {
     /// PR (`/benchmark`) jobs. Default `both` (a Check Run + a summary comment
     /// that links to it).
@@ -248,6 +249,12 @@ pub struct ReportingConfig {
     /// Baseline (`branch_push`/`tag_created`) jobs. Default `check` (a
     /// commit-level Check Run); `none` keeps them headless/DB-only.
     pub baseline_report: BaselineReport,
+    /// roadmap-v7: the measured per-run coefficient of variation of the
+    /// combined Execution+Commit metric, as a **percent** (e.g. `0.37`). Drives
+    /// the vs-baseline confidence (sigma). `None` → the delta is shown but the
+    /// confidence reads "provisional" until the host noise floor is
+    /// re-measured.
+    pub noise_cv_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +410,7 @@ struct RawDaemon {
 struct RawReporting {
     pr_report: Option<PrReport>,
     baseline_report: Option<BaselineReport>,
+    noise_cv_pct: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -502,6 +510,7 @@ impl RawDaemon {
                 .reporting
                 .baseline_report,
         );
+        merge_opt(&mut self.reporting.noise_cv_pct, other.reporting.noise_cv_pct);
 
         merge_opt(
             &mut self
@@ -815,6 +824,7 @@ impl RawDaemon {
                     .reporting
                     .baseline_report
                     .unwrap_or(BaselineReport::Check),
+                noise_cv_pct: self.reporting.noise_cv_pct,
             },
             runner: {
                 // Default 1 = sequential (historical behavior). Clamp 0 → 1.

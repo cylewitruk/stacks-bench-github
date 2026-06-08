@@ -12,7 +12,10 @@ use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use crate::Result;
-use crate::db::jobs::{CreatedJob, JobCompletion, JobCreationOutcome, JobFailure, JobStore};
+use crate::db::jobs::{
+    BaselineAnchor, BaselineMatch, BaselineSelection, CreatedJob, JobCompletion,
+    JobCreationOutcome, JobFailure, JobStore,
+};
 use crate::models::{
     GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
     JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, NewJob, NewJobEvent,
@@ -104,6 +107,25 @@ impl InMemoryJobStore {
     }
 }
 
+/// Build a [`BaselineMatch`] from an in-memory job + its metric (mirrors the
+/// Postgres `BaselineRow::into_match`).
+fn make_match(job: &Job, metric: &JobMetric, selection: BaselineSelection) -> BaselineMatch {
+    BaselineMatch {
+        anchor: BaselineAnchor {
+            job_id: job.id,
+            github_repo_id: job.github_repo_id,
+            commit: job
+                .git_commit_hash
+                .clone()
+                .unwrap_or_default(),
+            git_ref_display: job.git_ref_display.clone(),
+            committed_at: job.git_committed_at,
+            selection,
+        },
+        metric: metric.clone(),
+    }
+}
+
 #[async_trait]
 impl JobStore for InMemoryJobStore {
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
@@ -120,6 +142,7 @@ impl JobStore for InMemoryJobStore {
             git_ref_display: new.git_ref_display.clone(),
             git_commit_hash: new.git_commit_hash.clone(),
             git_committed_at: new.git_committed_at,
+            workload_key: new.workload_key.clone(),
             claim_token: None,
             claimed_at: None,
             created_at: now,
@@ -172,6 +195,10 @@ impl JobStore for InMemoryJobStore {
             git_committed_at: request
                 .new_job
                 .git_committed_at,
+            workload_key: request
+                .new_job
+                .workload_key
+                .clone(),
             claim_token: None,
             claimed_at: None,
             created_at: now,
@@ -491,6 +518,7 @@ impl JobStore for InMemoryJobStore {
         github_repo_id: i64,
         commit: &str,
         trigger_kind: crate::models::TriggerKind,
+        workload_key: &str,
     ) -> Result<Option<Uuid>> {
         let s = self.state.lock().unwrap();
         Ok(s.jobs
@@ -499,12 +527,60 @@ impl JobStore for InMemoryJobStore {
                 j.github_repo_id == github_repo_id
                     && j.git_commit_hash.as_deref() == Some(commit)
                     && j.trigger_kind == trigger_kind
+                    && j.workload_key.as_deref() == Some(workload_key)
                     && matches!(
                         j.status,
                         JobStatus::Queued | JobStatus::Claimed | JobStatus::Running
                     )
             })
             .map(|j| j.id))
+    }
+
+    async fn find_baseline_for(
+        &self,
+        merge_base_sha: &str,
+        base_ref: &str,
+        merge_base_committed_at: Option<chrono::DateTime<chrono::Utc>>,
+        workload_key: &str,
+    ) -> Result<Option<BaselineMatch>> {
+        let s = self.state.lock().unwrap();
+        // Eligible = completed baseline, same workload, with a recorded metric.
+        let eligible = |j: &&Job| {
+            j.job_kind == crate::models::JobKind::Baseline
+                && j.status == JobStatus::Completed
+                && j.workload_key.as_deref() == Some(workload_key)
+                && s.metrics.contains_key(&j.id)
+        };
+
+        // 1. Exact hit at the merge-base SHA (repo-agnostic). Deterministic tie:
+        //    freshest measurement, then job id (mirrors the SQL ORDER BY).
+        if let Some(j) = s
+            .jobs
+            .values()
+            .filter(eligible)
+            .filter(|j| j.git_commit_hash.as_deref() == Some(merge_base_sha))
+            .max_by_key(|j| (s.metrics[&j.id].created_at, j.id))
+        {
+            return Ok(Some(make_match(j, &s.metrics[&j.id], BaselineSelection::Exact)));
+        }
+
+        // 2. Nearest-before on the target branch (needs a fork-point timestamp).
+        let Some(ts) = merge_base_committed_at else {
+            return Ok(None);
+        };
+        let nearest = s
+            .jobs
+            .values()
+            .filter(eligible)
+            .filter(|j| {
+                j.git_ref_display == base_ref
+                    && j.git_committed_at
+                        .is_some_and(|c| c <= ts)
+            })
+            // Newest commit ≤ fork-point; ties break to freshest measurement,
+            // then job id (mirrors the SQL ORDER BY).
+            .max_by_key(|j| (j.git_committed_at, s.metrics[&j.id].created_at, j.id));
+        Ok(nearest.map(|j| make_match(j, &s.metrics[&j.id], BaselineSelection::NearestBefore)))
     }
 
     async fn queued_jobs_ordered(&self) -> Result<Vec<Job>> {

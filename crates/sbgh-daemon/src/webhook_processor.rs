@@ -26,6 +26,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use chrono::Utc;
 use sbgh_core::Result;
+use sbgh_core::bench_args::{normalize_stored, resolve_bench_args};
 use sbgh_core::db::{
     ClaimedWebhook, InstallationStore, JobCreationOutcome, JobStore, NewInstallation,
     NewPullRequest, NewRepoIdentity, NewRepoLineage, NewUser, PolicyStore, PullRequestStore,
@@ -255,6 +256,10 @@ pub struct IssueCommentHandler {
     /// Slice 9: the accept path creates a `pr_comment` `job` row instead
     /// of emitting the Phase-1 `WouldEnqueueJob` shadow signal.
     job_store: Arc<dyn JobStore>,
+    /// roadmap-v7: the configured `default_args`, used to compute the job's
+    /// `workload_key` at enqueue (a bare `/benchmark` resolves to these).
+    /// Defaults to empty; set via [`Self::with_default_args`].
+    default_args: String,
 }
 
 impl IssueCommentHandler {
@@ -278,7 +283,15 @@ impl IssueCommentHandler {
             pull_request_store,
             gh,
             job_store,
+            default_args: String::new(),
         }
+    }
+
+    /// roadmap-v7: supply the configured `default_args` so enqueued jobs get a
+    /// `workload_key`. Builder-style so existing call sites need no change.
+    pub fn with_default_args(mut self, default_args: impl Into<String>) -> Self {
+        self.default_args = default_args.into();
+        self
     }
 }
 
@@ -453,6 +466,9 @@ impl EventHandler for IssueCommentHandler {
                             subcommand: cmd.subcommand.clone(),
                             bench_args: cmd.args.clone(),
                         };
+                        let workload_key =
+                            resolve_bench_args(&normalize_stored(&detail), &self.default_args)
+                                .workload_key;
                         let request = JobCreationRequest {
                             new_job: NewJob {
                                 github_installation_id: install_id,
@@ -463,6 +479,7 @@ impl EventHandler for IssueCommentHandler {
                                 git_ref_display: pr.head.branch.clone(),
                                 git_commit_hash: Some(pr.head.sha.clone()),
                                 git_committed_at: None,
+                                workload_key: Some(workload_key.clone()),
                             },
                             github_webhook_id: webhook.id,
                             triggering_user_id: Some(event.sender.id),
@@ -473,9 +490,16 @@ impl EventHandler for IssueCommentHandler {
                             queued_event_detail: queued_detail(detail),
                         };
                         // Phase 5 dedup (BEST-EFFORT): if an active `/benchmark`
-                        // job already covers this exact commit, skip enqueuing a
-                        // duplicate — two jobs on one head SHA would fight over
-                        // the single check GitHub surfaces per `(name, head_sha)`.
+                        // job already covers this exact commit AND the same
+                        // workload, skip enqueuing a duplicate — two jobs on one
+                        // head SHA would fight over the single check GitHub
+                        // surfaces per `(name, head_sha)`.
+                        //
+                        // roadmap-v7: the match is **workload-aware** — a
+                        // *different* workload (e.g. `/benchmark run --count 1`
+                        // while a default `/benchmark` is active) is a genuinely
+                        // different benchmark, so it is NOT deduped and enqueues
+                        // normally (it gets its own per-job check).
                         //
                         // This is a check-then-insert *outside* the atomic job
                         // boundary, so it is NOT a hard guarantee: two concurrent
@@ -485,13 +509,18 @@ impl EventHandler for IssueCommentHandler {
                         // are narrow here (single daemon) and their worst case is
                         // a redundant *re-run* after the original concluded — NOT
                         // the concurrent check collision this prevents. A partial
-                        // unique index on active `(github_repo_id, git_commit_hash)
-                        // WHERE trigger_kind='pr_comment'` is the structural
-                        // hardening if a hard guarantee / multi-processor is ever
-                        // needed (see roadmap-v5 Phase 5).
+                        // unique index on active `(github_repo_id, git_commit_hash,
+                        // workload_key) WHERE trigger_kind='pr_comment'` is the
+                        // structural hardening if a hard guarantee / multi-processor
+                        // is ever needed (see roadmap-v5 Phase 5).
                         match self
                             .job_store
-                            .find_active_job(pr.base.repo.id, &pr.head.sha, TriggerKind::PrComment)
+                            .find_active_job(
+                                pr.base.repo.id,
+                                &pr.head.sha,
+                                TriggerKind::PrComment,
+                                &workload_key,
+                            )
                             .await
                         {
                             Ok(Some(existing)) => {
@@ -1664,6 +1693,10 @@ pub struct PushHandler {
     /// Slice 9: a matched `branch_push` trigger creates a `baseline`
     /// job instead of emitting the Phase-1 `WouldEnqueueJob` signal.
     job_store: Arc<dyn JobStore>,
+    /// roadmap-v7: configured `default_args` for the baseline's `workload_key`
+    /// (a trigger with NULL `bench_args` resolves to these). Set via
+    /// [`Self::with_default_args`]; defaults to empty.
+    default_args: String,
 }
 
 impl PushHandler {
@@ -1676,7 +1709,15 @@ impl PushHandler {
             policy_store,
             install_store,
             job_store,
+            default_args: String::new(),
         }
+    }
+
+    /// roadmap-v7: supply the configured `default_args` so baseline jobs get a
+    /// `workload_key`. Builder-style so existing call sites need no change.
+    pub fn with_default_args(mut self, default_args: impl Into<String>) -> Self {
+        self.default_args = default_args.into();
+        self
     }
 }
 
@@ -1781,6 +1822,8 @@ impl EventHandler for PushHandler {
             trigger_id: trigger.id,
             bench_args: trigger.bench_args.clone(),
         };
+        let workload_key =
+            resolve_bench_args(&normalize_stored(&detail), &self.default_args).workload_key;
         let request = JobCreationRequest {
             new_job: NewJob {
                 github_installation_id: event.installation.id,
@@ -1791,6 +1834,7 @@ impl EventHandler for PushHandler {
                 git_ref_display: branch.to_string(),
                 git_commit_hash: Some(head_commit.id.clone()),
                 git_committed_at: Some(head_commit.timestamp),
+                workload_key: Some(workload_key),
             },
             github_webhook_id: webhook.id,
             // No responsible user for an automated branch-push trigger.
@@ -1813,6 +1857,10 @@ pub struct CreateHandler {
     /// unresolved commit (the `create` event carries no SHA); the
     /// daemon resolves the tag → commit at claim time.
     job_store: Arc<dyn JobStore>,
+    /// roadmap-v7: configured `default_args` for the baseline's `workload_key`
+    /// (a trigger with NULL `bench_args` resolves to these). Set via
+    /// [`Self::with_default_args`]; defaults to empty.
+    default_args: String,
 }
 
 impl CreateHandler {
@@ -1825,7 +1873,15 @@ impl CreateHandler {
             policy_store,
             install_store,
             job_store,
+            default_args: String::new(),
         }
+    }
+
+    /// roadmap-v7: supply the configured `default_args` so baseline jobs get a
+    /// `workload_key`. Builder-style so existing call sites need no change.
+    pub fn with_default_args(mut self, default_args: impl Into<String>) -> Self {
+        self.default_args = default_args.into();
+        self
     }
 }
 
@@ -1925,6 +1981,8 @@ impl EventHandler for CreateHandler {
             trigger_id: trigger.id,
             bench_args: trigger.bench_args.clone(),
         };
+        let workload_key =
+            resolve_bench_args(&normalize_stored(&detail), &self.default_args).workload_key;
         let request = JobCreationRequest {
             new_job: NewJob {
                 github_installation_id: event.installation.id,
@@ -1939,6 +1997,7 @@ impl EventHandler for CreateHandler {
                 // persisted via `mark_running`).
                 git_commit_hash: None,
                 git_committed_at: None,
+                workload_key: Some(workload_key),
             },
             github_webhook_id: webhook.id,
             triggering_user_id: None,
@@ -5090,6 +5149,47 @@ mod tests {
                 .pr_links()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn push_baseline_persists_workload_key_from_default_args() {
+        // roadmap-v7 Slice 2: a baseline's `workload_key` is computed at
+        // enqueue from `default_args` (the seeded trigger has NULL
+        // `bench_args`), so it MATCHES a bare `/benchmark` PR — which also
+        // resolves to `default_args`. The cross-trigger equality itself is
+        // unit-tested in `sbgh_core::bench_args`; here we assert the handler
+        // wires `default_args` through and persists the key.
+        const DEFAULT: &str = "--start-at 7800000 --count 5000 --bench-spans-only";
+        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
+        policy_store.seed_target(100, 10, true);
+        policy_store.seed_trigger(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+            true,
+        );
+        let install_store = make_active_install_store().await;
+        let job_store = Arc::new(sbgh_core::db::InMemoryJobStore::new());
+        let h = PushHandler::new(policy_store, install_store, job_store.clone())
+            .with_default_args(DEFAULT);
+        let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
+        assert!(matches!(
+            h.handle(&w).await,
+            ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
+        ));
+
+        let jobs = job_store.all_jobs();
+        let key = jobs[0].workload_key.clone();
+        // NULL trigger args → default_args → same key a bare `/benchmark`
+        // (empty override) would resolve to.
+        let expected = sbgh_core::bench_args::resolve_bench_args(&[], DEFAULT).workload_key;
+        assert_eq!(key.as_deref(), Some(expected.as_str()));
+        // A different workload must NOT collide.
+        let other =
+            sbgh_core::bench_args::resolve_bench_args(&["--count".into(), "1".into()], DEFAULT)
+                .workload_key;
+        assert_ne!(key.as_deref(), Some(other.as_str()));
     }
 
     #[tokio::test]

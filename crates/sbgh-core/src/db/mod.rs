@@ -53,7 +53,10 @@ pub use in_memory_user::InMemoryUserStore;
 pub use in_memory_webhook::{InMemoryWebhookInbox, InMemoryWebhookRow, SeedWebhook};
 pub use ingest::{IngestOutcome, IngestStore, NewWebhook, SUPPORTED_WEBHOOK_EVENT_TYPES};
 pub use installation::{DeleteInstallationOutcome, InstallationStore, NewInstallation};
-pub use jobs::{CreatedJob, JobCompletion, JobCreationOutcome, JobFailure, JobStore};
+pub use jobs::{
+    BaselineAnchor, BaselineMatch, BaselineSelection, CreatedJob, JobCompletion,
+    JobCreationOutcome, JobFailure, JobStore,
+};
 pub use migrate::migrate;
 pub use policy::PolicyStore;
 pub use pool::{Pool, connect};

@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod bench_args;
 pub mod config;
 pub mod db;
 pub mod error;

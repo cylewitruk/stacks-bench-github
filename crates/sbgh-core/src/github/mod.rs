@@ -9,7 +9,7 @@ pub use auth::{AppCredentials, InstallationTokenCache};
 pub use client::{
     CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi, OctocrabClient,
     PostedCheckRun, PostedComment, PullRequestAuthor, PullRequestSide, PullRequestSummary, RepoRef,
-    RepoSummary,
+    RepoSummary, encode_ref_path,
 };
 pub use command::{Command, parse_command};
 pub use webhook::{

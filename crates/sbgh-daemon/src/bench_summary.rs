@@ -12,7 +12,11 @@
 //! the optional-everywhere relaxation. Extra fields from the JSON are
 //! ignored silently by serde's default behaviour.
 
+use sbgh_core::db::BaselineSelection;
+use sbgh_core::github::encode_ref_path;
 use serde::Deserialize;
+
+use crate::comparison::{BaselineComparison, Verdict};
 
 /// Top-level envelope written by `stacks-bench bench run --json`. The
 /// envelope's `duration_secs` is the full wall-clock time (setup +
@@ -95,6 +99,7 @@ pub fn render_pr_comment(
     head_sha: &str,
     archive_dir: &str,
     result: Option<&RunResult>,
+    comparison: Option<&BaselineComparison>,
 ) -> String {
     let mut out = String::new();
     out.push_str(":white_check_mark: benchmark `");
@@ -102,6 +107,14 @@ pub fn render_pr_comment(
     out.push_str("` complete (commit `");
     out.push_str(head_sha);
     out.push_str("`)\n\n");
+
+    // roadmap-v7: the vs-baseline headline goes first (most visible). Absent for
+    // baseline jobs and PR runs with no comparable baseline — then the absolute
+    // table below stands alone, exactly as before.
+    if let Some(c) = comparison {
+        out.push_str(&render_comparison(c));
+        out.push('\n');
+    }
 
     if let Some(r) = result {
         let table = metric_table(r);
@@ -130,6 +143,69 @@ pub fn render_pr_comment(
     out.push_str("```\n\n");
     out.push_str("</details>");
     out
+}
+
+/// roadmap-v7: the vs-baseline headline + provenance line. Names the delta on
+/// the combined Execution+Commit budget, the confidence, the linked baseline
+/// commit, how it was chosen, and a cross-fork-safe diff link.
+fn render_comparison(c: &BaselineComparison) -> String {
+    let cmp = &c.comparison;
+    let pr_secs = cmp.pr_combined_us as f64 / 1_000_000.0;
+
+    let (arrow, dir) = if cmp.delta_pct > 0.05 {
+        (":small_red_triangle:", "slower")
+    } else if cmp.delta_pct < -0.05 {
+        (":small_red_triangle_down:", "faster")
+    } else {
+        ("≈", "no change")
+    };
+    let confidence = match cmp.sigma {
+        Some(z) => format!("≈{z:.1}σ — {}", verdict_phrase(cmp.verdict)),
+        None => "confidence provisional — set `[reporting].noise_cv_pct`".to_string(),
+    };
+
+    let short = c
+        .baseline_commit
+        .get(..8)
+        .unwrap_or(&c.baseline_commit);
+    let commit_url = format!("https://github.com/{}/commit/{}", c.baseline_repo, c.baseline_commit);
+    // Encode the head ref's URL-unsafe chars (preserving `/`) the same way the
+    // API client does — a branch with `#`/`%`/`?`/spaces would otherwise break
+    // the diff link (Codex Phase-3 finding).
+    let compare_url = format!(
+        "https://github.com/{}/compare/{}...{}:{}",
+        c.base_repo,
+        c.baseline_commit,
+        c.head_owner,
+        encode_ref_path(&c.head_ref)
+    );
+    let selection = match c.selection {
+        BaselineSelection::Exact => "exact fork-point".to_string(),
+        BaselineSelection::NearestBefore => "nearest baseline before fork-point".to_string(),
+    };
+    let committed = c
+        .baseline_committed_at
+        .map(|d| format!(" · committed {}", d.format("%Y-%m-%d")))
+        .unwrap_or_default();
+
+    format!(
+        "**Execution+Commit** {pr_secs:.1}s · {arrow} {:.1}% {dir} ({confidence})\nCompared \
+         against [`{}@{short}`]({commit_url}) on `{}`{committed} · {selection} · \
+         [diff]({compare_url})\n",
+        cmp.delta_pct.abs(),
+        c.baseline_repo,
+        c.baseline_ref,
+    )
+}
+
+fn verdict_phrase(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Strong => "likely real",
+        Verdict::Moderate => "moderate",
+        Verdict::Weak => "weak signal",
+        Verdict::Inconclusive => "within noise",
+        Verdict::Provisional => "provisional",
+    }
 }
 
 /// Build the "Metric | Value" GitHub-flavoured Markdown table. Skips
@@ -357,7 +433,8 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let md = render_pr_comment("job-1", "abc123", "/var/lib/sbgh/results/job-1", Some(&r));
+        let md =
+            render_pr_comment("job-1", "abc123", "/var/lib/sbgh/results/job-1", Some(&r), None);
 
         assert!(md.contains("benchmark `job-1`"));
         assert!(md.contains("(commit `abc123`)"));
@@ -376,7 +453,7 @@ mod tests {
 
     #[test]
     fn render_falls_back_when_no_run_json() {
-        let md = render_pr_comment("job-x", "deadbeef", "/some/path", None);
+        let md = render_pr_comment("job-x", "deadbeef", "/some/path", None, None);
         assert!(md.contains("benchmark `job-x`"));
         assert!(md.contains("(commit `deadbeef`)"));
         assert!(md.contains("run.json missing"));
@@ -389,7 +466,7 @@ mod tests {
         // RunResult with everything None — table should be empty,
         // fallback message kicks in.
         let r = RunResult::default();
-        let md = render_pr_comment("j", "h", "/p", Some(&r));
+        let md = render_pr_comment("j", "h", "/p", Some(&r), None);
         // No "| Metric | Value |" but also no "missing" message
         // (we DID parse, the result is just empty).
         assert!(!md.contains("| Metric"));
@@ -406,9 +483,82 @@ mod tests {
             }),
             ..Default::default()
         };
-        let md = render_pr_comment("j", "h", "/p", Some(&r));
+        let md = render_pr_comment("j", "h", "/p", Some(&r), None);
         assert!(md.contains("Interrupted"));
         assert!(md.contains("partial measurements"));
+    }
+
+    // ─── roadmap-v7: vs-baseline headline render ───
+
+    use crate::comparison::Comparison;
+
+    fn sample_comparison() -> BaselineComparison {
+        BaselineComparison {
+            comparison: Comparison {
+                base_combined_us: 1_000_000,
+                pr_combined_us: 1_018_000,
+                delta_pct: 1.8,
+                sigma: Some(3.44),
+                verdict: Verdict::Strong,
+            },
+            baseline_repo: "stacks-network/stacks-core".into(),
+            baseline_commit: "abc1234def567".into(),
+            baseline_ref: "develop".into(),
+            baseline_committed_at: chrono::DateTime::from_timestamp(1_716_000_000, 0),
+            selection: BaselineSelection::NearestBefore,
+            base_repo: "cylewitruk/stacks-core".into(),
+            head_owner: "cylewitruk".into(),
+            head_ref: "feat/foo".into(),
+        }
+    }
+
+    #[test]
+    fn render_includes_vs_baseline_headline() {
+        let c = sample_comparison();
+        let md = render_pr_comment("j", "h", "/p", None, Some(&c));
+        // Headline: combined metric, signed delta, sigma + verdict.
+        assert!(md.contains("**Execution+Commit** 1.0s"), "{md}");
+        assert!(md.contains("1.8% slower"), "{md}");
+        assert!(md.contains("≈3.4σ — likely real"), "{md}");
+        // Provenance: linked baseline commit (repo@short8), ref, selection, date.
+        assert!(md.contains("[`stacks-network/stacks-core@abc1234d`]"), "{md}");
+        assert!(md.contains("https://github.com/stacks-network/stacks-core/commit/abc1234def567"));
+        assert!(md.contains("on `develop`"), "{md}");
+        assert!(md.contains("committed 2024-05-18"), "{md}");
+        assert!(md.contains("nearest baseline before fork-point"), "{md}");
+        // Cross-fork-safe diff link on the PR's base repo.
+        assert!(
+            md.contains(
+                "https://github.com/cylewitruk/stacks-core/compare/abc1234def567...cylewitruk:feat/foo"
+            ),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn render_no_comparison_has_no_headline() {
+        let md = render_pr_comment("j", "h", "/p", None, None);
+        assert!(!md.contains("Execution+Commit"), "no baseline → no vs-baseline headline");
+    }
+
+    #[test]
+    fn render_provisional_when_no_sigma() {
+        let mut c = sample_comparison();
+        c.comparison.sigma = None;
+        c.comparison.verdict = Verdict::Provisional;
+        let md = render_pr_comment("j", "h", "/p", None, Some(&c));
+        assert!(md.contains("confidence provisional"), "{md}");
+        assert!(!md.contains('σ'), "no sigma figure when provisional: {md}");
+    }
+
+    #[test]
+    fn render_encodes_head_ref_in_diff_link() {
+        // A head branch with URL-significant chars must be encoded (Codex
+        // Phase-3): `/` preserved, space → %20, `#` → %23.
+        let mut c = sample_comparison();
+        c.head_ref = "feat/a b#c".into();
+        let md = render_pr_comment("j", "h", "/p", None, Some(&c));
+        assert!(md.contains("...cylewitruk:feat/a%20b%23c"), "{md}");
     }
 
     // ─── helpers ───

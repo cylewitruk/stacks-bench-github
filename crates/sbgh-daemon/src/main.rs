@@ -1,6 +1,7 @@
 mod api;
 mod bench_recipe;
 mod bench_summary;
+mod comparison;
 mod events;
 mod job_source;
 mod libvirt;
@@ -91,15 +92,23 @@ async fn main() -> anyhow::Result<()> {
     // Write-through inbox for the `/api` webhook-submit endpoint.
     let api_ingest = Arc::new(PostgresIngestStore::new(pool.clone()));
     let classifier = BasicClassifier::builder()
-        .with_handler(Arc::new(IssueCommentHandler::new(
-            repo_store.clone(),
-            policy_store.clone(),
-            installation_store.clone(),
-            user_store.clone(),
-            pull_request_store.clone(),
-            gh.clone(),
-            jobs_store.clone(),
-        )))
+        .with_handler(Arc::new(
+            IssueCommentHandler::new(
+                repo_store.clone(),
+                policy_store.clone(),
+                installation_store.clone(),
+                user_store.clone(),
+                pull_request_store.clone(),
+                gh.clone(),
+                jobs_store.clone(),
+            )
+            .with_default_args(
+                config
+                    .stacks_bench
+                    .default_args
+                    .clone(),
+            ),
+        ))
         .with_handler(Arc::new(InstallationHandler::new(
             installation_store.clone(),
             repo_store.clone(),
@@ -119,16 +128,24 @@ async fn main() -> anyhow::Result<()> {
             user_store,
             pull_request_store.clone(),
         )))
-        .with_handler(Arc::new(PushHandler::new(
-            policy_store.clone(),
-            installation_store.clone(),
-            jobs_store.clone(),
-        )))
-        .with_handler(Arc::new(CreateHandler::new(
-            policy_store,
-            installation_store,
-            jobs_store.clone(),
-        )))
+        .with_handler(Arc::new(
+            PushHandler::new(policy_store.clone(), installation_store.clone(), jobs_store.clone())
+                .with_default_args(
+                    config
+                        .stacks_bench
+                        .default_args
+                        .clone(),
+                ),
+        ))
+        .with_handler(Arc::new(
+            CreateHandler::new(policy_store, installation_store, jobs_store.clone())
+                .with_default_args(
+                    config
+                        .stacks_bench
+                        .default_args
+                        .clone(),
+                ),
+        ))
         .build();
     let processor =
         WebhookProcessor::new(webhook_inbox, Arc::new(classifier), ProcessorConfig::default());

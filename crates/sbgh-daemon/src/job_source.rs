@@ -23,11 +23,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
-use sbgh_core::db::{JobCompletion, JobFailure, JobStore, PullRequestStore, RepoStore};
+use chrono::{DateTime, Utc};
+use sbgh_core::bench_args::normalize_stored_value;
+use sbgh_core::db::{
+    BaselineSelection, JobCompletion, JobFailure, JobStore, PullRequestStore, RepoStore,
+};
 use sbgh_core::models::{
     GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent,
-    QueuedEventDetail, ResolvedCommit,
+    ResolvedCommit,
 };
 use uuid::Uuid;
 
@@ -74,6 +77,9 @@ pub struct RunnableJob {
     /// `GitHubApi::resolve_commit`.
     pub git_ref_kind: GitRefKind,
     pub installation_id: i64,
+    /// roadmap-v7: the job's workload key, for the vs-baseline lookup (only a
+    /// baseline of the *same* workload is comparable). `None` on pre-v7 rows.
+    pub workload_key: Option<String>,
     /// Resolved `stacks-bench` CLI args. Empty → the driver falls back to
     /// the configured `default_args`.
     pub bench_args: Vec<String>,
@@ -82,6 +88,20 @@ pub struct RunnableJob {
     /// `(id, claim_token)` so a write that lost its lease to the
     /// stuck-claim sweep is a no-op.
     pub claim_token: Option<Uuid>,
+}
+
+/// roadmap-v7: a resolved comparison baseline — the measured metric + the
+/// provenance the report links to. The repo is `owner/name` (resolved from the
+/// anchor's `github_repo_id` by the store), since the baseline may live in a
+/// *different* repo than the PR (a fork PR vs. an upstream baseline).
+#[derive(Debug, Clone)]
+pub struct BaselineRef {
+    pub metric: JobMetric,
+    pub repository: String,
+    pub commit: String,
+    pub git_ref_display: String,
+    pub committed_at: Option<DateTime<Utc>>,
+    pub selection: BaselineSelection,
 }
 
 /// Claim + lifecycle over the job queue. Implemented by [`JobSource`]; the
@@ -125,6 +145,20 @@ pub trait RunnableJobStore: Send + Sync + 'static {
     /// Terminal success. `summary` is the daemon forensics blob
     /// (archive paths, console tail, finish reason).
     async fn complete(&self, job: &RunnableJob, summary: &serde_json::Value) -> anyhow::Result<()>;
+
+    /// roadmap-v7: resolve the baseline a PR run should be compared against
+    /// (the merge-base, else nearest-before on the target branch) into a
+    /// render-ready [`BaselineRef`] — the baseline metric + its repo
+    /// `owner/name` (resolved from the anchor's `github_repo_id`) +
+    /// commit/ref/selection. `None` if no comparable baseline exists.
+    /// Best-effort; the caller degrades to absolute-only.
+    async fn find_baseline(
+        &self,
+        merge_base_sha: &str,
+        base_ref: &str,
+        merge_base_committed_at: Option<DateTime<Utc>>,
+        workload_key: &str,
+    ) -> anyhow::Result<Option<BaselineRef>>;
 
     /// Terminal failure. `summary` is the same forensics blob shape when
     /// available (setup-time failures may have none).
@@ -287,6 +321,39 @@ impl RunnableJobStore for JobSource {
         Ok(())
     }
 
+    async fn find_baseline(
+        &self,
+        merge_base_sha: &str,
+        base_ref: &str,
+        merge_base_committed_at: Option<DateTime<Utc>>,
+        workload_key: &str,
+    ) -> anyhow::Result<Option<BaselineRef>> {
+        let Some(m) = self
+            .jobs
+            .find_baseline_for(merge_base_sha, base_ref, merge_base_committed_at, workload_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Resolve the baseline's repo `owner/name` for the report link — it may
+        // be a different repo than the PR (fork PR vs. upstream baseline).
+        let repo = self
+            .repos
+            .lookup_repo(m.anchor.github_repo_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("baseline references unknown repo {}", m.anchor.github_repo_id)
+            })?;
+        Ok(Some(BaselineRef {
+            metric: m.metric,
+            repository: format!("{}/{}", repo.owner, repo.name),
+            commit: m.anchor.commit,
+            git_ref_display: m.anchor.git_ref_display,
+            committed_at: m.anchor.committed_at,
+            selection: m.anchor.selection,
+        }))
+    }
+
     async fn fail(
         &self,
         job: &RunnableJob,
@@ -446,7 +513,7 @@ impl JobSource {
         let bench_args = queued
             .as_ref()
             .and_then(|e| e.detail.as_ref())
-            .map(|d| bench_args_from_detail(&d.0))
+            .map(|d| normalize_stored_value(&d.0))
             .unwrap_or_default();
 
         // PR-linked jobs (`pr_comment`) report on a Check Run + comment;
@@ -501,29 +568,11 @@ impl JobSource {
             git_ref_display: job.git_ref_display,
             git_ref_kind: job.git_ref_kind,
             installation_id: job.github_installation_id,
+            workload_key: job.workload_key,
             bench_args,
             progress,
             claim_token,
         })
-    }
-}
-
-/// Extract `bench_args` from a queued event's [`QueuedEventDetail`].
-/// `pr_comment` carries a token vec directly; `branch_push`/`tag_created`
-/// carry a single optional string that we split on whitespace. Unknown /
-/// unparseable detail yields no args (driver falls back to defaults).
-fn bench_args_from_detail(detail: &serde_json::Value) -> Vec<String> {
-    match serde_json::from_value::<QueuedEventDetail>(detail.clone()) {
-        Ok(QueuedEventDetail::PrComment { bench_args, .. }) => bench_args,
-        Ok(QueuedEventDetail::BranchPush { bench_args, .. })
-        | Ok(QueuedEventDetail::TagCreated { bench_args, .. }) => bench_args
-            .map(|s| {
-                s.split_whitespace()
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
     }
 }
 
@@ -568,7 +617,9 @@ fn archive_dir(summary: &serde_json::Value) -> Option<String> {
 /// Map a parsed `run.json` to the typed `job_metric` row. Returns `None`
 /// unless EVERY promoted metric is present — the columns are `NOT NULL`,
 /// so a partial run.json gets a `job_result` (raw) but no `job_metric`.
-fn metric_from_run(job_id: Uuid, run: &RunResult) -> Option<JobMetric> {
+/// Also reused (roadmap-v7) to build the PR run's metric for the vs-baseline
+/// comparison, so the comment's delta is on the same numbers we persist.
+pub fn metric_from_run(job_id: Uuid, run: &RunResult) -> Option<JobMetric> {
     let data = run.data.as_ref()?;
     let summary = data.summary.as_ref()?;
     Some(JobMetric {

@@ -952,6 +952,15 @@ mod tests {
             self.record("complete");
             Ok(())
         }
+        async fn find_baseline(
+            &self,
+            _merge_base_sha: &str,
+            _base_ref: &str,
+            _at: Option<chrono::DateTime<chrono::Utc>>,
+            _workload_key: &str,
+        ) -> anyhow::Result<Option<crate::job_source::BaselineRef>> {
+            Ok(None)
+        }
         async fn fail(
             &self,
             _job: &RunnableJob,
@@ -1065,6 +1074,7 @@ mod tests {
             reporting: ReportingConfig {
                 pr_report: PrReport::Comment,
                 baseline_report: BaselineReport::None,
+                noise_cv_pct: None,
             },
             runner: RunnerConfig {
                 max_concurrent_jobs: 1,
@@ -1091,6 +1101,7 @@ mod tests {
             git_ref_display: "develop".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::CommitCheck { check_run_id: None },
             claim_token: Some(Uuid::new_v4()),
@@ -1144,6 +1155,7 @@ mod tests {
             git_ref_display: "release/1.2".into(),
             git_ref_kind: GitRefKind::Tag,
             installation_id: 7,
+            workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::CommitCheck { check_run_id: None },
             claim_token: Some(Uuid::new_v4()),
@@ -1195,6 +1207,7 @@ mod tests {
         c.reporting = ReportingConfig {
             pr_report: pr,
             baseline_report: baseline,
+            noise_cv_pct: None,
         };
         c
     }
@@ -1227,6 +1240,7 @@ mod tests {
             git_ref_display: "feature".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::PullRequest {
                 pr_number: 7,
@@ -1609,6 +1623,15 @@ mod tests {
         }
         async fn complete(&self, _: &RunnableJob, _: &serde_json::Value) -> anyhow::Result<()> {
             Ok(())
+        }
+        async fn find_baseline(
+            &self,
+            _merge_base_sha: &str,
+            _base_ref: &str,
+            _at: Option<chrono::DateTime<chrono::Utc>>,
+            _workload_key: &str,
+        ) -> anyhow::Result<Option<crate::job_source::BaselineRef>> {
+            Ok(None)
         }
         async fn fail(
             &self,

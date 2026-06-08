@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::db::Pool;
-use crate::db::jobs::{CreatedJob, JobCompletion, JobCreationOutcome, JobFailure, JobStore};
+use crate::db::jobs::{
+    BaselineAnchor, BaselineMatch, BaselineSelection, CreatedJob, JobCompletion,
+    JobCreationOutcome, JobFailure, JobStore,
+};
 use crate::models::{
     GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
     JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, NewJob, NewJobEvent,
@@ -27,6 +30,35 @@ impl PostgresJobStore {
     }
 }
 
+/// Flattened row for `find_baseline_for`: the anchor columns + the baseline's
+/// metric (via `#[sqlx(flatten)]`). The anchor's `job_id` reuses the metric PK,
+/// so it isn't selected twice.
+#[derive(sqlx::FromRow)]
+struct BaselineRow {
+    github_repo_id: i64,
+    commit: String,
+    git_ref_display: String,
+    committed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sqlx(flatten)]
+    metric: crate::models::JobMetric,
+}
+
+impl BaselineRow {
+    fn into_match(self, selection: BaselineSelection) -> BaselineMatch {
+        BaselineMatch {
+            anchor: BaselineAnchor {
+                job_id: self.metric.job_id,
+                github_repo_id: self.github_repo_id,
+                commit: self.commit,
+                git_ref_display: self.git_ref_display,
+                committed_at: self.committed_at,
+                selection,
+            },
+            metric: self.metric,
+        }
+    }
+}
+
 #[async_trait]
 impl JobStore for PostgresJobStore {
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
@@ -36,11 +68,13 @@ impl JobStore for PostgresJobStore {
             r#"
             INSERT INTO job
                 (github_installation_id, github_repo_id, job_kind, trigger_kind,
-                 git_ref_kind, git_ref_display, git_commit_hash, git_committed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
+                 workload_key)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, github_installation_id, github_repo_id, status, job_kind,
                       trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                      git_committed_at, claim_token, claimed_at, created_at, updated_at
+                      git_committed_at, workload_key, claim_token, claimed_at,
+                      created_at, updated_at
             "#,
         )
         .bind(new.github_installation_id)
@@ -51,6 +85,7 @@ impl JobStore for PostgresJobStore {
         .bind(&new.git_ref_display)
         .bind(&new.git_commit_hash)
         .bind(new.git_committed_at)
+        .bind(&new.workload_key)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -75,11 +110,13 @@ impl JobStore for PostgresJobStore {
             r#"
             INSERT INTO job
                 (github_installation_id, github_repo_id, job_kind, trigger_kind,
-                 git_ref_kind, git_ref_display, git_commit_hash, git_committed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
+                 workload_key)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, github_installation_id, github_repo_id, status, job_kind,
                       trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                      git_committed_at, claim_token, claimed_at, created_at, updated_at
+                      git_committed_at, workload_key, claim_token, claimed_at,
+                      created_at, updated_at
             "#,
         )
         .bind(
@@ -106,6 +143,7 @@ impl JobStore for PostgresJobStore {
                 .new_job
                 .git_committed_at,
         )
+        .bind(&request.new_job.workload_key)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -191,7 +229,7 @@ impl JobStore for PostgresJobStore {
             r#"
             SELECT id, github_installation_id, github_repo_id, status, job_kind,
                    trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                   git_committed_at, claim_token, claimed_at, created_at, updated_at
+                   git_committed_at, workload_key, claim_token, claimed_at, created_at, updated_at
               FROM job
              WHERE id = $1
             "#,
@@ -223,7 +261,7 @@ impl JobStore for PostgresJobStore {
              )
          RETURNING id, github_installation_id, github_repo_id, status, job_kind,
                    trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                   git_committed_at, claim_token, claimed_at, created_at, updated_at
+                   git_committed_at, workload_key, claim_token, claimed_at, created_at, updated_at
             "#,
         )
         .bind(claim_token)
@@ -493,6 +531,7 @@ impl JobStore for PostgresJobStore {
         github_repo_id: i64,
         commit: &str,
         trigger_kind: crate::models::TriggerKind,
+        workload_key: &str,
     ) -> Result<Option<Uuid>> {
         let id: Option<Uuid> = sqlx::query_scalar(
             r#"
@@ -501,6 +540,7 @@ impl JobStore for PostgresJobStore {
              WHERE github_repo_id = $1
                AND git_commit_hash = $2
                AND trigger_kind = $3
+               AND workload_key = $4
                AND status IN ('queued', 'claimed', 'running')
              LIMIT 1
             "#,
@@ -508,9 +548,88 @@ impl JobStore for PostgresJobStore {
         .bind(github_repo_id)
         .bind(commit)
         .bind(trigger_kind)
+        .bind(workload_key)
         .fetch_optional(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    async fn find_baseline_for(
+        &self,
+        merge_base_sha: &str,
+        base_ref: &str,
+        merge_base_committed_at: Option<chrono::DateTime<chrono::Utc>>,
+        workload_key: &str,
+    ) -> Result<Option<BaselineMatch>> {
+        // 1. Exact hit at the merge-base SHA, repo-agnostic (uses
+        //    `job_baseline_exact_idx (git_commit_hash, workload_key)`). Newest
+        //    measurement wins if the same (SHA, workload) ran more than once.
+        let exact: Option<BaselineRow> = sqlx::query_as(
+            r#"
+            SELECT j.github_repo_id,
+                   j.git_commit_hash AS commit,
+                   j.git_ref_display,
+                   j.git_committed_at AS committed_at,
+                   m.job_id, m.envelope_duration_us, m.replay_duration_us,
+                   m.total_duration_us, m.setup_duration_us, m.execution_duration_us,
+                   m.commit_duration_us, m.clarity_runtime, m.transactions,
+                   m.read_length, m.write_length, m.measured_blocks,
+                   m.warmup_blocks, m.created_at
+              FROM job j
+              JOIN job_metric m ON m.job_id = j.id
+             WHERE j.git_commit_hash = $1
+               AND j.workload_key = $2
+               AND j.job_kind = 'baseline'
+               AND j.status = 'completed'
+          -- Deterministic: freshest measurement, then job id, so the same SHA
+          -- benchmarked more than once always resolves to one stable row.
+          ORDER BY m.created_at DESC, j.id DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(merge_base_sha)
+        .bind(workload_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = exact {
+            return Ok(Some(row.into_match(BaselineSelection::Exact)));
+        }
+
+        // 2. Nearest-before on the target branch — needs a fork-point timestamp to
+        //    order against (uses `job_baseline_ref_timeline_idx`).
+        let Some(ts) = merge_base_committed_at else {
+            return Ok(None);
+        };
+        let nearest: Option<BaselineRow> = sqlx::query_as(
+            r#"
+            SELECT j.github_repo_id,
+                   j.git_commit_hash AS commit,
+                   j.git_ref_display,
+                   j.git_committed_at AS committed_at,
+                   m.job_id, m.envelope_duration_us, m.replay_duration_us,
+                   m.total_duration_us, m.setup_duration_us, m.execution_duration_us,
+                   m.commit_duration_us, m.clarity_runtime, m.transactions,
+                   m.read_length, m.write_length, m.measured_blocks,
+                   m.warmup_blocks, m.created_at
+              FROM job j
+              JOIN job_metric m ON m.job_id = j.id
+             WHERE j.git_ref_display = $1
+               AND j.workload_key = $2
+               AND j.git_committed_at <= $3
+               AND j.job_kind = 'baseline'
+               AND j.status = 'completed'
+          -- Newest commit at/before the fork-point; ties (shared timestamp /
+          -- same commit re-run) break to freshest measurement, then job id.
+          ORDER BY j.git_committed_at DESC, m.created_at DESC, j.id DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(base_ref)
+        .bind(workload_key)
+        .bind(ts)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(nearest.map(|row| row.into_match(BaselineSelection::NearestBefore)))
     }
 
     async fn queued_jobs_ordered(&self) -> Result<Vec<Job>> {
@@ -520,7 +639,7 @@ impl JobStore for PostgresJobStore {
             r#"
             SELECT id, github_installation_id, github_repo_id, status, job_kind,
                    trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                   git_committed_at, claim_token, claimed_at, created_at, updated_at
+                   git_committed_at, workload_key, claim_token, claimed_at, created_at, updated_at
               FROM job
              WHERE status = 'queued'
           ORDER BY created_at, id

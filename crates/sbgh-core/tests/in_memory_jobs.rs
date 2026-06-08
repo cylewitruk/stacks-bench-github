@@ -9,10 +9,12 @@
 
 use std::sync::Arc;
 
-use sbgh_core::db::{InMemoryJobStore, JobCompletion, JobCreationOutcome, JobFailure, JobStore};
+use sbgh_core::db::{
+    BaselineSelection, InMemoryJobStore, JobCompletion, JobCreationOutcome, JobFailure, JobStore,
+};
 use sbgh_core::models::{
-    GitRefKind, JobCreationRequest, JobKind, JobResult, JobStatus, NewJob, NewPullRequestLink,
-    TriggerKind,
+    GitRefKind, JobCreationRequest, JobKind, JobMetric, JobResult, JobStatus, NewJob,
+    NewPullRequestLink, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -27,6 +29,7 @@ fn make_request(webhook_id: i64) -> JobCreationRequest {
             git_ref_display: "main".into(),
             git_commit_hash: None,
             git_committed_at: None,
+            workload_key: None,
         },
         github_webhook_id: webhook_id,
         triggering_user_id: Some(42),
@@ -244,5 +247,125 @@ async fn complete_job_and_fail_job_mirror_postgres_guard() {
             .unwrap()
             .status,
         JobStatus::Failed
+    );
+}
+
+// ─── roadmap-v7: find_baseline_for parity with Postgres ──────────────────
+
+fn ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(secs, 0).unwrap()
+}
+
+/// Drive a baseline job to `completed` with a metric (insert → claim → run →
+/// complete). Each call fully completes, so the next call's insert is the only
+/// `queued` row and `claim_next_queued` picks it deterministically.
+async fn seed_completed_baseline(
+    store: &InMemoryJobStore,
+    sha: &str,
+    ref_display: &str,
+    committed_at: chrono::DateTime<chrono::Utc>,
+    workload_key: &str,
+    exec_us: i64,
+) {
+    store
+        .insert_job(&NewJob {
+            github_installation_id: 100,
+            github_repo_id: 10,
+            job_kind: JobKind::Baseline,
+            trigger_kind: TriggerKind::BranchPush,
+            git_ref_kind: GitRefKind::Branch,
+            git_ref_display: ref_display.into(),
+            git_commit_hash: Some(sha.into()),
+            git_committed_at: Some(committed_at),
+            workload_key: Some(workload_key.into()),
+        })
+        .await
+        .unwrap();
+    let token = Uuid::new_v4();
+    let claimed = store
+        .claim_next_queued(token)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .mark_running(claimed.id, token, None)
+        .await
+        .unwrap();
+    store
+        .complete_job(&JobCompletion {
+            job_id: claimed.id,
+            claim_token: token,
+            result: JobResult {
+                job_id: claimed.id,
+                run_json: None,
+                archive_dir: "/tmp".into(),
+                created_at: chrono::Utc::now(),
+            },
+            metric: Some(JobMetric {
+                job_id: claimed.id,
+                envelope_duration_us: 0,
+                replay_duration_us: 0,
+                total_duration_us: 0,
+                setup_duration_us: 0,
+                execution_duration_us: exec_us,
+                commit_duration_us: 0,
+                clarity_runtime: 0,
+                transactions: 0,
+                read_length: 0,
+                write_length: 0,
+                measured_blocks: 5000,
+                warmup_blocks: 1000,
+                created_at: chrono::Utc::now(),
+            }),
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn find_baseline_for_mirrors_postgres() {
+    let store = InMemoryJobStore::new();
+    seed_completed_baseline(&store, "old1", "develop", ts(1_000), "wk1", 100).await;
+    seed_completed_baseline(&store, "abc", "develop", ts(2_000), "wk1", 222).await;
+
+    // Exact hit at the merge-base SHA.
+    let exact = store
+        .find_baseline_for("abc", "develop", Some(ts(2_500)), "wk1")
+        .await
+        .unwrap()
+        .expect("exact hit");
+    assert_eq!(exact.anchor.commit, "abc");
+    assert_eq!(exact.anchor.selection, BaselineSelection::Exact);
+    assert_eq!(
+        exact
+            .metric
+            .execution_duration_us,
+        222
+    );
+
+    // Nearest-before when the fork-point SHA wasn't benchmarked → newest ≤ 2500.
+    let near = store
+        .find_baseline_for("forkpoint", "develop", Some(ts(2_500)), "wk1")
+        .await
+        .unwrap()
+        .expect("nearest-before");
+    assert_eq!(near.anchor.commit, "abc");
+    assert_eq!(near.anchor.selection, BaselineSelection::NearestBefore);
+
+    // Workload mismatch and a missing fork-point timestamp both → None.
+    assert!(
+        store
+            .find_baseline_for("abc", "develop", Some(ts(2_500)), "wk2")
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert!(
+        store
+            .find_baseline_for("nope", "develop", None, "wk1")
+            .await
+            .unwrap()
+            .is_none(),
     );
 }

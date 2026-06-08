@@ -23,6 +23,9 @@ use sbgh_core::models::{
 #[path = "../src/bench_summary.rs"]
 #[allow(dead_code)]
 mod bench_summary;
+#[path = "../src/comparison.rs"]
+#[allow(dead_code)]
+mod comparison;
 #[path = "../src/job_source.rs"]
 #[allow(dead_code)]
 mod job_source;
@@ -92,6 +95,7 @@ async fn enqueue_branch_push(store: &PostgresJobStore, webhook_id: i64) {
                 git_ref_display: "develop".into(),
                 git_commit_hash: Some("pushsha".into()),
                 git_committed_at: None,
+                workload_key: None,
             },
             github_webhook_id: webhook_id,
             triggering_user_id: None,
@@ -298,6 +302,7 @@ async fn v2_source_load_runnable_surfaces_existing_check_for_conclusion() {
                 git_ref_display: "feat".into(),
                 git_commit_hash: Some("headsha".into()),
                 git_committed_at: None,
+                workload_key: None,
             },
             github_webhook_id: webhook_id,
             triggering_user_id: Some(42),
@@ -551,6 +556,7 @@ async fn v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id()
                 git_ref_display: "feat".into(),
                 git_commit_hash: Some("headsha".into()),
                 git_committed_at: None,
+                workload_key: None,
             },
             github_webhook_id: webhook_id,
             triggering_user_id: Some(42),

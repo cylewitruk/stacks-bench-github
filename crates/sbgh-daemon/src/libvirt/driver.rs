@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use sbgh_core::bench_args::effective_arg_string;
 use sbgh_core::config::DaemonConfig;
 use tokio_util::sync::CancellationToken;
 
@@ -507,7 +508,7 @@ impl LibvirtDriver {
 
         // Cloud-init: two ISOs, one per phase, distinct instance-ids
         // so cloud-init re-runs user-data on the second boot.
-        let stacks_bench_args = derive_stacks_bench_args(
+        let stacks_bench_args = effective_arg_string(
             inputs.bench_args,
             &self
                 .config
@@ -1016,10 +1017,6 @@ impl LibvirtDriver {
     }
 }
 
-fn derive_stacks_bench_args(bench_args: &[String], default: &str) -> String {
-    if bench_args.is_empty() { default.to_string() } else { bench_args.join(" ") }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1100,6 +1097,7 @@ mod tests {
             reporting: ReportingConfig {
                 pr_report: PrReport::Both,
                 baseline_report: BaselineReport::Check,
+                noise_cv_pct: None,
             },
             runner: RunnerConfig {
                 max_concurrent_jobs: 1,
@@ -1117,6 +1115,7 @@ mod tests {
             git_ref_display: "PR #42".into(),
             git_ref_kind: sbgh_core::models::GitRefKind::Branch,
             installation_id: 7,
+            workload_key: None,
             bench_args: vec!["--iters=2".into()],
             progress: ProgressTarget::PullRequest {
                 pr_number: 42,

@@ -39,13 +39,28 @@ const REF_SEGMENT: &AsciiSet = &CONTROLS
 
 /// Percent-encode a (possibly slashy) git ref for use in a URL path,
 /// encoding URL-unsafe characters within each segment while preserving
-/// `/` as a path separator.
-fn encode_ref_path(git_ref: &str) -> String {
+/// `/` as a path separator. Public so report renderers building
+/// github.com URLs encode refs the same way the API client does.
+pub fn encode_ref_path(git_ref: &str) -> String {
     git_ref
         .split('/')
         .map(|seg| utf8_percent_encode(seg, REF_SEGMENT).to_string())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Build the `compare` basehead path segment
+/// `{base_ref}...{head_owner}:{head_ref}` (roadmap-v7 merge-base lookup).
+/// Each ref is percent-encoded per-segment (slashy refs like `feat/foo` keep
+/// their `/`); the `...` and `:` separators stay literal. The `{owner}:{ref}`
+/// head form is cross-fork-safe (and correct for same-repo PRs).
+fn compare_basehead(base_ref: &str, head_owner: &str, head_ref: &str) -> String {
+    format!(
+        "{}...{}:{}",
+        encode_ref_path(base_ref),
+        encode_ref_path(head_owner),
+        encode_ref_path(head_ref),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +214,23 @@ pub trait GitHubApi: Send + Sync + 'static {
         repository: &str,
         git_ref: &str,
     ) -> Result<ResolvedCommit>;
+
+    /// roadmap-v7: the **merge-base** (fork point) of the base branch and the
+    /// PR head, via `GET
+    /// /repos/{base}/compare/{base_ref}...{head_owner}:{head_ref}`.
+    /// The `{head_owner}:{head_ref}` head form is cross-fork-safe (and correct
+    /// for same-repo PRs, where `head_owner == base_owner`). Returns the
+    /// merge-base commit + its date, or `None` when there's no common ancestor
+    /// or the refs/repo don't resolve (a `404`) — the caller then degrades
+    /// to absolute-only, since v7 reporting is non-fatal.
+    async fn compare_commits(
+        &self,
+        installation_id: i64,
+        base_repository: &str,
+        base_ref: &str,
+        head_owner: &str,
+        head_ref: &str,
+    ) -> Result<Option<ResolvedCommit>>;
 
     /// Create a Check Run on `head_sha` in `repository` (`owner/name`).
     /// `name` is the check's display name; `external_id` is our stable
@@ -471,6 +503,73 @@ impl GitHubApi for OctocrabClient {
         Ok(ResolvedCommit { hash: commit.sha, committed_at })
     }
 
+    async fn compare_commits(
+        &self,
+        installation_id: i64,
+        base_repository: &str,
+        base_ref: &str,
+        head_owner: &str,
+        head_ref: &str,
+    ) -> Result<Option<ResolvedCommit>> {
+        let (owner, repo) = split_repo(base_repository)?;
+        let client = self
+            .installation_client(installation_id)
+            .await?;
+        // GET /repos/{owner}/{repo}/compare/{base_ref}...{head_owner}:{head_ref}
+        // The `{owner}:{ref}` head form is cross-fork-safe (and correct for
+        // same-repo PRs). Percent-encode each ref segment (preserving `/`) and
+        // keep the `...` and `:` separators literal.
+        let basehead = compare_basehead(base_ref, head_owner, head_ref);
+        let route = format!("/repos/{owner}/{repo}/compare/{basehead}");
+
+        #[derive(serde::Deserialize)]
+        struct CompareResp {
+            merge_base_commit: Option<CommitNode>,
+        }
+        #[derive(serde::Deserialize)]
+        struct CommitNode {
+            sha: String,
+            commit: CommitDetail,
+        }
+        #[derive(serde::Deserialize)]
+        struct CommitDetail {
+            committer: Option<GitActor>,
+            author: Option<GitActor>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GitActor {
+            date: Option<chrono::DateTime<chrono::Utc>>,
+        }
+
+        // A 404 (repo/ref not found, or no common ancestor) is a clean "no
+        // baseline anchor", not an error — return None so the caller shows
+        // absolute-only metrics.
+        let resp: CompareResp = match client
+            .get(route, None::<&()>)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // Prefer the committer date (when the commit landed); fall back to the
+        // author date. Either may be absent — `committed_at` is Optional.
+        Ok(resp
+            .merge_base_commit
+            .map(|c| {
+                let committed_at = c
+                    .commit
+                    .committer
+                    .and_then(|a| a.date)
+                    .or_else(|| {
+                        c.commit
+                            .author
+                            .and_then(|a| a.date)
+                    });
+                ResolvedCommit { hash: c.sha, committed_at }
+            }))
+    }
+
     async fn create_check_run(
         &self,
         installation_id: i64,
@@ -584,6 +683,16 @@ impl GitHubApi for OctocrabClient {
     }
 }
 
+/// True for a GitHub `404` — the compare/lookup target (repo, ref, or common
+/// ancestor) doesn't exist, which roadmap-v7 treats as "no baseline anchor"
+/// rather than a hard error.
+fn is_not_found(e: &octocrab::Error) -> bool {
+    matches!(
+        e,
+        octocrab::Error::GitHub { source, .. } if source.status_code.as_u16() == 404
+    )
+}
+
 /// Map our lifecycle state to GitHub's `status` + optional `conclusion`
 /// strings. We only ever complete with a non-blocking conclusion.
 fn status_strings(state: CheckRunState) -> (&'static str, Option<&'static str>) {
@@ -680,7 +789,19 @@ fn split_repo(full_name: &str) -> Result<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckRunWriteResp, encode_ref_path};
+    use super::{CheckRunWriteResp, compare_basehead, encode_ref_path};
+
+    /// roadmap-v7: the compare basehead keeps `...`/`:` literal, preserves
+    /// slashy refs, and percent-encodes unsafe chars — the cross-fork form the
+    /// fake can't exercise.
+    #[test]
+    fn compare_basehead_builds_cross_fork_and_slashy_refs() {
+        assert_eq!(
+            compare_basehead("develop", "cylewitruk", "feat/foo"),
+            "develop...cylewitruk:feat/foo"
+        );
+        assert_eq!(compare_basehead("release/1.0", "o", "feat/a b"), "release/1.0...o:feat/a%20b");
+    }
 
     /// Regression for the octocrab `CheckRun` deser bug: GitHub's check-run
     /// response embeds MINIMAL pull-request refs (no `node_id`) under

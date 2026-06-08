@@ -9,6 +9,7 @@ use sbgh_core::github::{
 };
 
 use crate::bench_summary::{self, RunResult};
+use crate::comparison::BaselineComparison;
 use crate::job_source::{ProgressTarget, RunnableJob};
 
 pub struct ProgressReporter<'a> {
@@ -32,8 +33,12 @@ impl<'a> ProgressReporter<'a> {
         .await;
     }
 
-    pub async fn completed(&self, summary: &serde_json::Value) {
-        let body = self.completed_body(summary);
+    pub async fn completed(
+        &self,
+        summary: &serde_json::Value,
+        comparison: Option<&BaselineComparison>,
+    ) {
+        let body = self.completed_body(summary, comparison);
         self.update_comment(&body)
             .await;
         // Only PR jobs with a comment have one to point at; a baseline's commit
@@ -119,7 +124,11 @@ impl<'a> ProgressReporter<'a> {
 
     /// The shared completed render (read + parse the archived `run.json` for
     /// the user-facing metrics) used by both the comment and the check.
-    fn completed_body(&self, summary: &serde_json::Value) -> String {
+    fn completed_body(
+        &self,
+        summary: &serde_json::Value,
+        comparison: Option<&BaselineComparison>,
+    ) -> String {
         let archive_dir = summary
             .get("archive_dir")
             .and_then(|v| v.as_str())
@@ -135,6 +144,7 @@ impl<'a> ProgressReporter<'a> {
             &self.job.commit,
             archive_dir,
             parsed.as_ref(),
+            comparison,
         )
     }
 
@@ -253,6 +263,7 @@ mod tests {
             git_ref_display: "develop".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::CommitCheck {
                 check_run_id: Some(check_run_id),
@@ -276,7 +287,7 @@ mod tests {
         let gh = FakeGitHub::new();
         let job = check_job(11);
         ProgressReporter::new(&gh, &job)
-            .completed(&serde_json::json!({}))
+            .completed(&serde_json::json!({}), None)
             .await;
         assert_eq!(
             concluded_state(&gh),

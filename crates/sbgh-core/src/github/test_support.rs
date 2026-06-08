@@ -52,6 +52,13 @@ pub enum FakeCall {
         repository: String,
         git_ref: String,
     },
+    CompareCommits {
+        installation_id: i64,
+        base_repository: String,
+        base_ref: String,
+        head_owner: String,
+        head_ref: String,
+    },
     CreateCheckRun {
         installation_id: i64,
         repository: String,
@@ -99,6 +106,10 @@ struct FakeState {
     /// Pre-programmed responses for `resolve_commit`. Keyed by
     /// `("owner/name", git_ref)`.
     commits: HashMap<(String, String), ResolvedCommit>,
+    /// Pre-programmed `compare_commits` merge-bases, keyed by
+    /// `(base_repository, base_ref, head_owner, head_ref)`. A miss returns
+    /// `Ok(None)` — modeling GitHub's "no common ancestor" / 404 degrade.
+    merge_bases: HashMap<(String, String, String, String), ResolvedCommit>,
     next_check_run_id: i64,
     /// Pre-programmed `find_check_run_by_external_id` hits, keyed by
     /// `(repository, head_sha, name, external_id)` — scoped tightly so a
@@ -297,6 +308,28 @@ impl FakeGitHub {
             );
     }
 
+    /// Pre-program the merge-base `compare_commits` returns for
+    /// `(base_repository, base_ref, head_owner, head_ref)`. Leave a combo
+    /// unstaged to model "no common ancestor" (the fake returns `Ok(None)`).
+    pub fn set_merge_base(
+        &self,
+        base_repository: &str,
+        base_ref: &str,
+        head_owner: &str,
+        head_ref: &str,
+        sha: &str,
+        committed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .merge_bases
+            .insert(
+                (base_repository.into(), base_ref.into(), head_owner.into(), head_ref.into()),
+                ResolvedCommit { hash: sha.into(), committed_at },
+            );
+    }
+
     pub fn calls(&self) -> Vec<FakeCall> {
         self.inner
             .lock()
@@ -439,6 +472,30 @@ impl GitHubApi for FakeGitHub {
                      set_commit to stage it)"
                 ))
             })
+    }
+
+    async fn compare_commits(
+        &self,
+        installation_id: i64,
+        base_repository: &str,
+        base_ref: &str,
+        head_owner: &str,
+        head_ref: &str,
+    ) -> Result<Option<ResolvedCommit>> {
+        let mut s = self.inner.lock().unwrap();
+        s.calls
+            .push(FakeCall::CompareCommits {
+                installation_id,
+                base_repository: base_repository.into(),
+                base_ref: base_ref.into(),
+                head_owner: head_owner.into(),
+                head_ref: head_ref.into(),
+            });
+        // A miss models "no common ancestor" / 404 → Ok(None) (not an error),
+        // mirroring the real client's degrade.
+        Ok(s.merge_bases
+            .get(&(base_repository.into(), base_ref.into(), head_owner.into(), head_ref.into()))
+            .cloned())
     }
 
     async fn create_check_run(
