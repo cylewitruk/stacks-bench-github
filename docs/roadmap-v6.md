@@ -159,9 +159,17 @@ result table.
 
 **What:**
 
-- `BlockValidationRecipe: Recipe` — its phases (e.g. fetch/replay/validate), its
-  in-VM command, its done-detection, its resource shape.
+- `BlockValidationRecipe: Recipe` — its phases (build → dataset → probe/plan →
+  K-shard fan-out → reduce), its per-shard command, its done-detection, its
+  resource shape (workspaces / shards / concurrency as separate counts).
 - Its result schema (own table) + check/comment render.
+- **Terminal semantics are explicit (block-val sketch finding 7).**
+  Invalid-blocks-found is a **completed task with a negative result → red GitHub
+  check**, *not* an errored/retryable job. Only VM-died / transport-failed /
+  timeout is a driver/execution failure. The Recipe maps the driver's raw
+  per-shard outcomes to this verdict; the driver never decides pass/fail. This
+  keeps block-val failures off the reporting non-fatal/retry machinery meant for
+  infra faults.
 - Register `block_validation` + `/validate-blocks` (and/or a trigger policy).
 - The only platform/substrate change permitted is *additive*; if Phase 3 needs to
   modify `sgh-engine` or `sgh-substrate`, that's a **boundary leak** to fix in the
@@ -169,6 +177,13 @@ result table.
 
 **Design notes:**
 
+- Task shape pre-sketched in
+  [block-validation-taskspec.md](./block-validation-taskspec.md) (distilled from
+  `stacks-core:contrib/tools/block-validation.sh`) — used to validate the
+  roadmap-v8 Phase 1 `Driver` seam against a second, non-bench task before
+  extraction. Key divergence from bench: a **K-shard parallel** work phase with a
+  **dataset-derived partition** (not a single run), and **full-chainstate + N
+  CoW clones** provisioning (Open question #2 below).
 - This phase is the acceptance test for v5+v6: a new long-running task kind should
   cost ~one crate. Any engine edit it forces is a design defect, logged.
 - Resource shape (multi-hour, different vcpu/memory) feeds v5 Phase 5's

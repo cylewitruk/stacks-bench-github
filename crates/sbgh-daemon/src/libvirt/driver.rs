@@ -25,6 +25,8 @@ use sbgh_core::bench_args::effective_arg_string;
 use sbgh_core::config::DaemonConfig;
 use tokio_util::sync::CancellationToken;
 
+use crate::driver::{Driver, DriverOutcome, DriverStatus, Placement, TaskSpec};
+use crate::events::{EventSink, PhaseLabel};
 use crate::libvirt::boot::BootDisk;
 use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitCommon};
 use crate::libvirt::domain::{self, DomainSpec};
@@ -1014,6 +1016,103 @@ impl LibvirtDriver {
             }
         }
         all_clear
+    }
+}
+
+/// Bridges the libvirt driver's `Phase` callbacks to recipe-neutral
+/// [`EventSink`] calls. The `Phase` → [`PhaseLabel`] mapping lives here so the
+/// driver speaks the neutral event surface — roadmap-v8 Phase 1 moved this
+/// adapter *inside* the libvirt driver (it was on the bench recipe), so the
+/// `Driver` trait takes a backend-neutral `&dyn EventSink`.
+struct SinkAdapter<'a> {
+    sink: &'a dyn EventSink,
+}
+
+impl SinkAdapter<'_> {
+    fn label(phase: &Phase) -> PhaseLabel {
+        PhaseLabel::new(phase.label(), phase.is_terminal())
+    }
+}
+
+#[async_trait]
+impl PhaseListener for SinkAdapter<'_> {
+    async fn on_phase(&self, phase: &Phase) {
+        // A just-entered phase → 0 elapsed (matches the prior reporting path,
+        // whose prose still reads naturally as "running for 00:00:00").
+        //
+        // A phase is a RELIABLE event (roadmap-v5 channel discipline): it must
+        // not be lost. A `SinkClosed` here means the reporter is gone (it
+        // panicked) — surfaced loudly below.
+        //
+        // TODO(Phase 4 — cancel-safety): *acting* on this (aborting the in-flight
+        // run rather than logging-and-continuing) needs the driver cancellation
+        // path + `cleanup_by_job_id` Phase 4 builds — a dirty drop here would
+        // leak the VM. The `PhaseListener` boundary will grow an abort signal
+        // there (`on_phase` returns `()` and the driver has no cancellation path
+        // yet). Do not copy this swallow forward without that abort handling.
+        if self
+            .sink
+            .phase(Self::label(phase), Duration::ZERO)
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                phase = %phase,
+                "reliable phase event dropped: reporting sink closed (reporter gone) — \
+                 VM-safe abort deferred to Phase 4 cancel-safety (see TODO)",
+            );
+        }
+    }
+
+    async fn on_heartbeat(&self, phase: &Phase, elapsed: Duration) {
+        self.sink
+            .heartbeat(Self::label(phase), elapsed)
+            .await;
+    }
+}
+
+#[async_trait]
+impl Driver for LibvirtDriver {
+    /// Bench's `TaskSpec.args` are this run's benchmark CLI args; `Placement`
+    /// carries the Phase-5 cpuset. Wraps the inherent
+    /// [`run_benchmark`](LibvirtDriver::run_benchmark) (bench specifics still
+    /// live there — the cloud-init split is deferred to roadmap-v6) and adapts
+    /// its `BenchmarkOutcome` into the neutral [`DriverOutcome`].
+    async fn run_task(
+        &self,
+        ctx: &TaskContext<'_>,
+        spec: &TaskSpec,
+        sink: &dyn EventSink,
+        cancel: &CancellationToken,
+        placement: &Placement,
+    ) -> anyhow::Result<DriverOutcome> {
+        let adapter = SinkAdapter { sink };
+        let outcome = self
+            .run_benchmark(
+                ctx,
+                &spec.args,
+                &adapter,
+                cancel,
+                placement
+                    .vcpu_cpuset
+                    .as_deref(),
+            )
+            .await?;
+        let status = match outcome.status {
+            OutcomeStatus::Ok => DriverStatus::Completed,
+            OutcomeStatus::Failed(e) => DriverStatus::Failed(e),
+        };
+        Ok(DriverOutcome {
+            status,
+            summary: outcome.summary,
+        })
+    }
+
+    async fn cleanup_by_job_id(&self, job_id: &str) -> bool {
+        // Fully-qualified inherent call: inherent methods win over trait methods
+        // in path resolution, so this is unambiguously the inherent impl — not a
+        // recursive trait call.
+        LibvirtDriver::cleanup_by_job_id(self, job_id).await
     }
 }
 

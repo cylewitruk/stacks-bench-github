@@ -2,6 +2,7 @@ mod api;
 mod bench_recipe;
 mod bench_summary;
 mod comparison;
+mod driver;
 mod events;
 mod job_source;
 mod libvirt;

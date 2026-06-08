@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::bench_recipe::BenchRecipe;
+use crate::driver::Driver;
 use crate::events::{ChannelSink, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, Shell};
@@ -65,7 +66,10 @@ struct JobDeps {
     config: Arc<DaemonConfig>,
     jobs: Arc<dyn RunnableJobStore>,
     gh: Arc<dyn GitHubApi>,
-    shell: Arc<dyn Shell>,
+    /// The execution backend (roadmap-v8 Phase 1). Shared by the per-job recipe
+    /// and startup orphan recovery; built once from `[backend]` config (libvirt
+    /// today) in [`Runner::new`].
+    driver: Arc<dyn Driver>,
     /// Shared App-id cache, resolved via `GET /app` and cached on **success**
     /// only — a `get_or_try_init` that leaves the cell empty on error, so a
     /// transient blip is retried on the next job rather than disabling the
@@ -91,12 +95,16 @@ impl Runner {
             .runner
             .max_concurrent_jobs
             .max(1);
+        let config = Arc::new(config);
+        // v8 Phase 1: the backend is the libvirt driver (the only kind today),
+        // built from the shell here and shared as an `Arc<dyn Driver>`.
+        let driver: Arc<dyn Driver> = Arc::new(LibvirtDriver::new(config.clone(), shell));
         Self {
             deps: JobDeps {
-                config: Arc::new(config),
+                config,
                 jobs,
                 gh,
-                shell,
+                driver,
                 app_id: Arc::new(OnceCell::new()),
             },
             max_concurrent,
@@ -244,8 +252,9 @@ impl Coordinator {
     /// still-`running` job next boot, so cleanup re-runs idempotently and
     /// no VM is leaked behind a terminal row).
     ///
-    /// v5 is bench-only, so recovery dispatches straight to the libvirt driver;
-    /// v6's task-kind split would pick the cleanup by the orphan's stored kind.
+    /// Recovery dispatches over the shared `Arc<dyn Driver>` (libvirt today —
+    /// v8 Phase 1); v6's task-kind split would pick the cleanup by the orphan's
+    /// stored kind.
     ///
     /// Errors only on a failure to **enumerate** running rows (startup-critical
     /// — see [`Runner::run`]). Per-orphan failures are non-fatal: an orphan
@@ -269,13 +278,14 @@ impl Coordinator {
             count = ids.len(),
             "recovering jobs orphaned in `running` by a prior daemon"
         );
-        let driver = LibvirtDriver::new(self.deps.config.clone(), self.deps.shell.clone());
         for id in ids {
             // Clean BEFORE cancelling the row. If cleanup couldn't fully clear
             // the VM (a source loop may still be attached, its backing file
             // preserved), leave the row `running` so the next boot retries —
             // cancelling it now would lose the only handle back to the leak.
-            if !driver
+            if !self
+                .deps
+                .driver
                 .cleanup_by_job_id(&id.to_string())
                 .await
             {
@@ -676,12 +686,7 @@ impl JobDeps {
             "claimed job; starting",
         );
 
-        let recipe = BenchRecipe::new(
-            self.config.clone(),
-            self.shell.clone(),
-            job.bench_args.clone(),
-            vcpu_cpuset,
-        );
+        let recipe = BenchRecipe::new(self.driver.clone(), job.bench_args.clone(), vcpu_cpuset);
 
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
         let (prepared_tx, prepared_rx) = oneshot::channel();
@@ -1511,11 +1516,12 @@ mod tests {
             // `Terminal::Failed` (a *ran-and-failed*, so `run` returns `Ok`).
             let shell = Arc::new(RecordingShell::new());
             shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
+            let driver: Arc<dyn Driver> = Arc::new(LibvirtDriver::new(config.clone(), shell));
             let deps = JobDeps {
                 config: config.clone(),
                 jobs: source.clone(),
                 gh: Arc::new(FakeGitHub::new()),
-                shell,
+                driver,
                 app_id: app_id.clone(),
             };
             handles.push(tokio::spawn(deps.run(job, None, CancellationToken::new())));
@@ -1679,11 +1685,13 @@ mod tests {
             })
             .collect();
         let source = Arc::new(BlockingSource::new(jobs));
+        let driver: Arc<dyn Driver> =
+            Arc::new(LibvirtDriver::new(config.clone(), Arc::new(RecordingShell::new())));
         let deps = JobDeps {
             config,
             jobs: source.clone(),
             gh: Arc::new(FakeGitHub::new()),
-            shell: Arc::new(RecordingShell::new()),
+            driver,
             app_id: Arc::new(OnceCell::new()),
         };
         let mut coord = Coordinator::new(deps, 2, CancellationToken::new()); // max_concurrent = 2
@@ -1738,7 +1746,8 @@ mod tests {
         // token then makes the worker report aborted.
         let shell = Arc::new(RecordingShell::new());
         shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
-        let recipe = BenchRecipe::new(config, shell, vec![], None);
+        let driver: Arc<dyn Driver> = Arc::new(LibvirtDriver::new(config, shell));
+        let recipe = BenchRecipe::new(driver, vec![], None);
         let job = RunnableJob {
             progress: ProgressTarget::CommitCheck { check_run_id: None },
             ..pr_job("abc123", None)
@@ -1991,11 +2000,14 @@ mod tests {
         source: Arc<FakeSource>,
         gh: Arc<FakeGitHub>,
     ) -> Coordinator {
+        let config = Arc::new(config);
+        let driver: Arc<dyn Driver> =
+            Arc::new(LibvirtDriver::new(config.clone(), Arc::new(RecordingShell::new())));
         let deps = JobDeps {
-            config: Arc::new(config),
+            config,
             jobs: source,
             gh,
-            shell: Arc::new(RecordingShell::new()),
+            driver,
             app_id: Arc::new(OnceCell::new()),
         };
         Coordinator::new(deps, 1, CancellationToken::new())
