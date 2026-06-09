@@ -1,6 +1,6 @@
 # v1 → v2 upgrade runbook
 
-> **Historical — superseded by [roadmap-v3.md](./roadmap-v3.md).** Two waves
+> **Historical — superseded by [`0012` (api-fronted daemon)](../planning/archive/completed/0012-api-fronted-daemon.md).** Two waves
 > have obsoleted parts of this runbook:
 >
 > - **Phase 1** removed the legacy `jobs` code path entirely: the

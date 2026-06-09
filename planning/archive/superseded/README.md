@@ -10,8 +10,6 @@ accident.
 Aggregate historical registers use `rollup-*` filenames instead of item IDs, with
 a short crosswalk to the numbered items that replaced them.
 
-> **Planned rollup.** When the `docs/roadmap-vN.md` docs are fully converted into
-> `design/` + `decisions/`, the original roadmap set is archived here as
-> `rollup-roadmap-register-2026-06.md` with a vN → `NNNN` crosswalk. Until then
-> the roadmaps stay live in `docs/` and are indexed by
-> [../../backlog.md](../../backlog.md).
+> **Rollup (done).** The pre-planning-system roadmap set is archived here as
+> [rollup-roadmap-register-2026-06.md](rollup-roadmap-register-2026-06.md) with a
+> vN → `NNNN` crosswalk; every `docs/roadmap-vN.md` is now a tombstone.

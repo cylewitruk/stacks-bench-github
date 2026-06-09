@@ -1,7 +1,7 @@
 # Daemon API (design)
 
 Status: **implemented** — roadmap-v3 Phases 2–6. Tracked by
-[roadmap-v3.md](./roadmap-v3.md).
+[`0012` (api-fronted daemon)](../planning/archive/completed/0012-api-fronted-daemon.md).
 
 The daemon becomes the single component that owns the database, the
 GitHub App key, and the only config file. `sbgh-handler` and `sbgh-cli`
@@ -299,7 +299,7 @@ phase 6. (Alternative: add temporary `sbgh_orch` write grants in phase 3
 ### `sbgh-cli` (loses owner creds) — final state, after phase 6
 
 - **Drops:** `DATABASE_URL` (owner DSN), the `migrate` subcommand, all
-  direct `sbgh-core::db` use. (Per [roadmap-v3.md](./roadmap-v3.md),
+  direct `sbgh-core::db` use. (Per [`0012` (api-fronted daemon)](../planning/archive/completed/0012-api-fronted-daemon.md),
   `migrate` is the last of these to go — it survives until phase 6
   replaces it with startup migrations.)
 - **Adds:** `--api-url` (default `http://127.0.0.1:8787`) and auto-reads

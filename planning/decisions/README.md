@@ -46,5 +46,7 @@ into an ADR as we work the related item (skeleton phase — not yet extracted):
   port the viewer** (roadmap-v11).
 - **Slack = trigger source + reporting surface, not a new task kind; Socket
   Mode transport** (roadmap-v10).
-- **Artifact signed URLs are S3-only; local store is behavior-preserving**
-  (roadmap-v12).
+
+*Extracted so far (from `0001-artifact-store`):* `0001-artifact-urls-s3-only`,
+`0002-artifact-refs-are-store-keys`,
+`0003-artifact-export-failure-not-benchmark-failure`.

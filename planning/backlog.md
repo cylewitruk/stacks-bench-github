@@ -6,31 +6,11 @@ the single-home rule in the [README](README.md#item-ids). The complete registry
 of every item (all statuses, incl. shipped/in-flight) is [index.md](index.md);
 keep entries here compact and push worked-through detail to `design/`.
 
-> **Transitional index (2026-06).** Each item below points at its existing
-> `docs/roadmap-vN.md` for full detail; content conversion into `design/` +
-> `decisions/` happens incrementally as we work an item. The `(was roadmap-vN)`
-> note is the crosswalk. **Sequence is not yet pinned beyond "0001 first"** —
-> priorities below are a starting proposal, not a committed order.
+*`0001-artifact-store` was promoted to iteration
+[v1-artifact-store](iterations/v1-artifact-store.md) (2026-06) — see
+[index.md](index.md).*
 
 ## Candidate (near-term)
-
-### 0001 — Artifact store (object-storage-backed run artifacts)
-
-- **id:** `0001-artifact-store`
-- **status:** `candidate`
-- **priority:** `high`
-- **unblocks:** `0002-slack-adhoc-profiling`, `0003-results-portal`
-- **design:** [docs/roadmap-v12.md](../docs/roadmap-v12.md) *(was roadmap-v12)*
-
-**Problem:** Run artifacts (SQLite, `run.json`, flamegraph, binary, phase-log)
-live on the orchestrator's local disk; neither Slack nor a portal can reach them
-there.
-
-**Scope:** A pluggable `ArtifactStore` (local default → S3-compatible / Hetzner
-object storage), ship-on-completion, signed-URL fetch.
-
-**Acceptance:** Behavior-preserving with `kind = "local"`; S3 opt-in; consumers
-resolve via the store. **Foundational — build first.**
 
 ### 0002 — Slack ad-hoc profiling benchmarks
 
@@ -39,15 +19,14 @@ resolve via the store. **Foundational — build first.**
 - **priority:** `medium`
 - **depends_on:** `0001-artifact-store` (Phase 4 — flamegraph delivery)
 - **review:** `Codex signed off` (design)
-- **source:** Codex-reviewed cluster (v12 → v10 → v11)
-- **design:** [docs/roadmap-v10.md](../docs/roadmap-v10.md) *(was roadmap-v10)*
+- **design:** [design/0002-slack-adhoc-profiling.md](design/0002-slack-adhoc-profiling.md)
 
-**Problem:** No-commit, ad-hoc "profile this tx/block from yesterday" requests
-have no entry point; the team lives in Slack.
+**Problem:** No-commit, ad-hoc "profile this tx/block from yesterday" requests have
+no entry point; the team lives in Slack.
 
-**Scope:** Socket Mode connector + `slack_adhoc` trigger (default rev, workload
-via `--txid`/`--block`/`--repetitions`), a generalized `ReportSurface`, and a
-flamegraph artifact.
+**Scope:** Socket Mode connector + `slack_adhoc` trigger (default rev, workload via
+`--txid`/`--block`/`--repetitions`), a generalized `ReportSurface`, and a flamegraph
+artifact.
 
 **Acceptance:** `/bench …` in Slack returns a flamegraph for the workload.
 
@@ -60,17 +39,15 @@ flamegraph artifact.
 - **priority:** `medium`
 - **depends_on:** `0001-artifact-store`
 - **review:** `Codex signed off` (design)
-- **design:** [docs/roadmap-v11.md](../docs/roadmap-v11.md) *(was roadmap-v11)*
+- **design:** [design/0003-results-portal.md](design/0003-results-portal.md)
 
-**Problem:** No way to browse runs, watch the queue, or deep-inspect a run's
-profile.
+**Problem:** No way to browse runs, watch the queue, or deep-inspect a run's profile.
 
-**Scope:** A permissioned portal (GitHub OAuth → existing roles, visibility-
-scoped) that's an **API client of the orchestrator** (never a second DB client),
-reusing the upstream `stacks-bench` explorer version-matched + proxied.
+**Scope:** A permissioned portal (GitHub OAuth → existing roles, visibility-scoped)
+that's an **API client of the orchestrator** (never a second DB client), reusing the
+upstream `stacks-bench` explorer version-matched + proxied.
 
-**Acceptance:** A logged-in user browses runs they may see and opens a profiler
-trace.
+**Acceptance:** A logged-in user browses runs they may see and opens a profiler trace.
 
 ### 0004 — Distributed worker fleet (`remote-daemon`)
 
@@ -79,35 +56,119 @@ trace.
 - **priority:** `medium`
 - **depends_on:** `0010-driver-seam` (shipped)
 - **review:** `Codex signed off` (design)
-- **design:** [docs/roadmap-v9.md](../docs/roadmap-v9.md) *(was roadmap-v9)*
+- **design:** [design/0004-worker-fleet.md](design/0004-worker-fleet.md)
 
-**Problem:** A single host caps concurrency and can't serve heterogeneous
-hardware (pinned bench boxes vs. big-local-NVMe block-val boxes).
+**Problem:** A single host caps concurrency and can't serve heterogeneous hardware
+(pinned bench boxes vs. big-local-NVMe block-val boxes).
 
-**Scope:** Split `sbgh-daemon` into orchestrator + `sbgh-worker` (shared
-`sbgh-exec`); thin pull-based worker API; capability matching; per-
-`measurement_profile` baseline trust.
+**Scope:** Split `sbgh-daemon` into orchestrator + `sbgh-worker` (shared `sbgh-exec`);
+thin pull-based worker API; capability matching; per-`measurement_profile` baseline
+trust.
 
-**Acceptance:** A remote worker runs a bench end-to-end; orchestrator stays the
-sole DB client.
+**Acceptance:** A remote worker runs a bench end-to-end; orchestrator stays the sole
+DB client.
 
-### 0005 — Block validation (second task kind)
+### 0005 — Task-kind platform (registry + job typing)
 
-- **id:** `0005-block-validation`
+- **id:** `0005-task-kind-platform`
 - **status:** `backlog`
 - **priority:** `medium`
-- **design:** [docs/roadmap-v6.md](../docs/roadmap-v6.md) +
-  [docs/block-validation-taskspec.md](../docs/block-validation-taskspec.md)
-  *(was roadmap-v6)*
+- **unblocks:** `0019-block-validation-recipe`
+- **design:** [design/0005-task-kind-platform.md](design/0005-task-kind-platform.md)
+  *(from roadmap-v6 platform work)*
 
-**Problem:** Only one task kind (bench) exists; block validation is the planned
-second.
+**Problem:** The engine is implicitly bench-only; a second task kind needs a task-kind
+registry + job typing so adding a kind is ~a new crate, not an engine change.
 
-**Scope:** A `BlockValidationRecipe` with a probe-driven, K-shard fan-out over
-CoW chainstate workspaces; terminal semantics (invalid-blocks = red check, not
-infra failure).
+**Scope:** Crate split along the `Recipe`/`Driver` boundary (crate **naming TBD**
+— the `sbgh-*`→`sgh-*` rename is an open question, not committed), a task-kind
+registry + `task_kind` job typing, per-kind result tables/render; the three-layer
+model (platform / Stacks substrate / task).
 
-**Acceptance:** A new task kind costs ~one crate, no engine edits.
+**Acceptance:** A new task kind registers + types its jobs without engine edits.
+
+### 0019 — Block-validation recipe (second task kind)
+
+- **id:** `0019-block-validation-recipe`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** `0005-task-kind-platform`
+- **review:** `Codex signed off` (design sketch)
+- **design:** [design/0019-block-validation-recipe.md](design/0019-block-validation-recipe.md)
+  *(from roadmap-v6 Phase 3 + block-validation-taskspec)*
+
+**Problem:** Block validation is the planned second task kind — the proof that the
+platform costs ~one crate per kind.
+
+**Scope:** A `BlockValidationRecipe` with a probe-driven, K-shard fan-out over CoW
+chainstate workspaces; terminal semantics (invalid-blocks = red check, not infra
+failure).
+
+**Acceptance:** Block validation lands on top of `0005` with no engine edits.
+
+### 0014 — Pre-claim placeholder / skipped checks + queue visibility
+
+- **id:** `0014-preclaim-placeholder-checks`
+- **status:** `backlog`
+- **priority:** `medium`
+- **source:** `archive/completed/0007` (v4 Phase 3) + `0008` (v5 Phase 5.3)
+
+**Problem:** A still-DB-queued job has no reporter, so there's no pre-`/benchmark`
+check or pre-claim position visibility; a denied source leaves no `skipped`
+breadcrumb.
+
+**Scope:** Policy-gated placeholder/`skipped` checks on PR sync + a pre-claim
+queued-position updater keyed by `(installation, repo, PR, head_sha)`
+(migration-bearing).
+
+**Acceptance:** A PR shows a placeholder/queued check before its job is claimed.
+
+### 0015 — Resource-aware admission / budgets
+
+- **id:** `0015-resource-aware-admission`
+- **status:** `backlog`
+- **priority:** `low`
+- **source:** `archive/completed/0008` (v5 Phase 5.2/5.4)
+
+**Problem:** Admission is a flat `max_concurrent_jobs` count, ignoring heterogeneous
+per-job resource shapes.
+
+**Scope:** Admit by Σ(per-job vCPU/memory) ≤ host capacity + in-flight position
+reporting.
+
+**Acceptance:** Concurrent admission respects host capacity, not just a count.
+
+**Deferred / non-goals:** Only pays off at `max_concurrent > 1`.
+
+### 0017 — Generic phase-event enum
+
+- **id:** `0017-generic-phase-events`
+- **status:** `backlog`
+- **priority:** `low`
+- **unblocks:** `0019-block-validation-recipe`
+- **source:** `archive/completed/0008` (v5 forward-looking constraint)
+
+**Problem:** `job_event` carries bench-specific `PhaseBuild*`/`PhaseBench*`; a second
+task kind needs task-agnostic phase events.
+
+**Scope:** Collapse to `PhaseStarted{label}`/`PhaseFinished{label}` via an additive
+`ALTER TYPE … ADD VALUE` migration.
+
+**Acceptance:** Phase events carry a task-agnostic label; bench + block-val both fit.
+
+### 0013 — Drop legacy `jobs` table
+
+- **id:** `0013-drop-legacy-jobs-table`
+- **status:** `backlog`
+- **priority:** `low`
+- **source:** `archive/completed/0011` (v2 slice 12) + `0012` (v3 Phase 1)
+
+**Problem:** The legacy `jobs` table is abandoned (no code path, no grants) but still
+physically present, awaiting a soak window.
+
+**Scope:** A one-line `DROP TABLE jobs` migration.
+
+**Acceptance:** The legacy table is gone; nothing references it.
 
 ## Parked
 
@@ -117,8 +178,9 @@ infra failure).
 - **status:** `parked`
 - **priority:** `low`
 - **depends_on:** `0004-worker-fleet` (returns as its worker provisioner)
-- **design:** [docs/roadmap-v8.md](../docs/roadmap-v8.md) Phases 0, 3–6
-  *(was roadmap-v8 cloud phases)*
+- **design:** historical only — roadmap-v8 cloud phases, see the
+  [rollup crosswalk](archive/superseded/rollup-roadmap-register-2026-06.md)
+  *(parked; no live design until justified)*
 
 **Problem:** Owned hardware caps elastic capacity.
 
@@ -126,3 +188,36 @@ infra failure).
 
 **Deferred / non-goals:** Parked — returns later as a **worker provisioner** for
 `0004`, gated on cost/variance/hydration data; not pursued standalone.
+
+### 0016 — DB-enforced same-SHA PR dedup
+
+- **id:** `0016-db-enforced-same-sha-dedup`
+- **status:** `parked`
+- **priority:** `low`
+- **source:** `archive/completed/0008` (v5 Phase 5.1 follow-up)
+
+**Problem:** Same-SHA PR `/benchmark` dedup is best-effort (check-then-insert outside
+the atomic boundary).
+
+**Scope:** A partial unique index on `(repo, commit) WHERE trigger_kind='pr_comment'
+AND status IN active`, with the violation mapped to `AlreadyEnqueued`.
+
+**Deferred / non-goals:** Parked — premature for a single processor; revisit at
+multi-processor.
+
+### 0018 — Auto-rerun confidence gate
+
+- **id:** `0018-auto-rerun-confidence-gate`
+- **status:** `parked`
+- **priority:** `low`
+- **source:** `archive/completed/0009` (v7 Phase 4)
+
+**Problem:** A single run can't separate a real regression from noise on suspicious
+(~1–2σ) or shock (>20%) deltas.
+
+**Scope:** Rerun on suspicious/shock bands (bypassing same-SHA dedup), aggregate
+`(repo, commit)` metrics to a CI (`SEM = σ/√N`), cap at `max_reruns`, surface
+"confirmed over N runs".
+
+**Deferred / non-goals:** Parked — design-only, gated on the operational re-baseline
+that sets the noise floor.

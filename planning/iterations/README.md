@@ -63,7 +63,7 @@ What changes in this deliverable.
 
 **Tests:**
 
-- [test_name](../../crates/…/tests/some_test.rs) or a manual/smoke check.
+- `crates/…/tests/some_test.rs` (the test name), or a manual/smoke check.
 
 **Notes:** Optional.
 

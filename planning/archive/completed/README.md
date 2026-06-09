@@ -6,8 +6,7 @@ Each should record: the item metadata, a concise problem/scope summary, what
 shipped, validation evidence (tests run, review sign-off), notable deviations
 from the plan, and any follow-up items produced.
 
-> **Pending conversion.** Four initiatives have shipped but still live as
-> `docs/roadmap-vN.md` (see the "Shipped — pending archive" section of
-> [../../backlog.md](../../backlog.md)): the check-run surface (v4), the
-> execution architecture (v5), change-impact reporting (v7), and the v8 Phase 1
-> `Driver` seam. They move here, condensed, in a later pass.
+Contains `0007`–`0012` (the migrated shipped initiatives: check-run surface, execution
+architecture, change-impact reporting, `Driver` seam, job-pipeline cutover,
+API-fronted daemon). Each links its original `docs/roadmap-vN.md` (now a tombstone)
+as `source`.

@@ -8,11 +8,11 @@ read as a backlog rather than a roadmap.
 
 Workflow: Opus drafts, Codex reviews, Opus fixes. Keep planning docs concise.
 
-> **Transitional state (2026-06).** This is the **skeleton + scheme** only.
-> [backlog.md](backlog.md) currently **indexes** the existing
-> `docs/roadmap-vN.md` docs in place; their content is converted into
-> `design/` + `decisions/` **incrementally, as we work each item**. Until an
-> item is converted, its detail still lives in its linked `docs/roadmap-vN.md`.
+> **Migration complete (2026-06).** The old `docs/roadmap-vN.md` set has been
+> migrated into this system — shipped work → `archive/completed/`; active work →
+> `backlog.md` + `design/`; durable rules → `decisions/`. **Every
+> `docs/roadmap-vN.md` is now a tombstone** (slated for deletion); the crosswalk is
+> [archive/superseded/rollup-roadmap-register-2026-06.md](archive/superseded/rollup-roadmap-register-2026-06.md).
 
 ## Where To Look
 
@@ -90,11 +90,12 @@ entry lives in exactly the file its status maps to:
 When a status change crosses a location boundary, the item is **moved** (the
 single-home rule above) and [index.md](index.md) is updated.
 
-**Transitional exception (migration only):** the pre-planning-system `shipped`
-items (`0007`–`0010`) are still indexed at their original `docs/roadmap-vN.md` in
-[index.md](index.md) until converted to `archive/completed/`. That's the one
-place location lags this table during the migration; new `shipped` items go
-straight to `archive/completed/`.
+**Transitional note (migration):** the `docs/roadmap-vN.md` set has been migrated
+into this system (crosswalk in
+[archive/superseded/rollup-roadmap-register-2026-06.md](archive/superseded/rollup-roadmap-register-2026-06.md));
+the old files are tombstones (slated for deletion). Shipped pre-planning-system
+work lives in `archive/completed/` (`0007`–`0012`); active backlog design lives in
+`design/`. New `shipped` items go straight to `archive/completed/`.
 
 ## Item Template
 
