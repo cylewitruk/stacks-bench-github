@@ -18,7 +18,7 @@ need editing when an item's status or location changes.
 
 | ID | Name | Status | Location |
 | ---- | ---- | ------ | -------- |
-| `0001-artifact-store` | Artifact store | `planned` | [iterations/v1-artifact-store.md](iterations/v1-artifact-store.md) |
+| `0001-artifact-store` | Artifact store | `in_progress` | [iterations/v4-artifact-store.md](iterations/v4-artifact-store.md) |
 | `0002-slack-adhoc-profiling` | Slack ad-hoc profiling | `candidate` | [backlog.md](backlog.md) |
 | `0003-results-portal` | Results portal | `backlog` | [backlog.md](backlog.md) |
 | `0004-worker-fleet` | Worker fleet (`remote-daemon`) | `backlog` | [backlog.md](backlog.md) |
@@ -42,7 +42,7 @@ need editing when an item's status or location changes.
 
 | ID | Name | Status | Location |
 | ---- | ---- | ------ | -------- |
-| `v1-artifact-store` | Artifact store | `planned` | [iterations/v1-artifact-store.md](iterations/v1-artifact-store.md) |
+| `v4-artifact-store` | Artifact store | `in_progress` | [iterations/v4-artifact-store.md](iterations/v4-artifact-store.md) |
 
 ## Decisions
 

@@ -2,7 +2,7 @@
 
 - **id:** `0001-artifact-store`
 - **status:** `planned` — iteration
-  [v1-artifact-store](../iterations/v1-artifact-store.md)
+  [v4-artifact-store](../iterations/v4-artifact-store.md)
 - **decisions:** [0001 — URLs are S3-only](../decisions/0001-artifact-urls-s3-only.md) ·
   [0002 — refs are store keys](../decisions/0002-artifact-refs-are-store-keys.md) ·
   [0003 — export-fail ≠ bench-fail](../decisions/0003-artifact-export-failure-not-benchmark-failure.md)

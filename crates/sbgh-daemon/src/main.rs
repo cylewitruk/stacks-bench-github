@@ -1,4 +1,5 @@
 mod api;
+mod artifact_store;
 mod bench_recipe;
 mod bench_summary;
 mod comparison;
@@ -153,8 +154,15 @@ async fn main() -> anyhow::Result<()> {
 
     // The runner claims from the `job` family and posts PR comments for
     // `pr_comment` jobs.
-    let runnable_jobs: Arc<dyn RunnableJobStore> =
-        Arc::new(JobSource::new(jobs_store, repo_store, pull_request_store));
+    let runnable_jobs: Arc<dyn RunnableJobStore> = Arc::new(JobSource::new(
+        jobs_store,
+        repo_store,
+        pull_request_store,
+        config
+            .paths
+            .results_archive_dir
+            .clone(),
+    ));
 
     // API server (roadmap-v3 Phase 2). Operator `admin` token is a cookie
     // regenerated each boot; the handler's `ingest` token comes from

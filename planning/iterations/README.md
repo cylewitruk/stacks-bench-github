@@ -7,6 +7,11 @@ validation story and one clear archive destination.
 Use `vN-short-name.md` naming. Iterations are deliverables, not item IDs; they
 reference the numbered items they implement.
 
+> **`vN` continues the project's deployment-version lineage, it does *not* reset
+> to 1.** The last deployed version was **v3** (see `docs/v2-to-v3-upgrade.md`), so
+> deliverables start at **v4** (`v4-artifact-store`). Each iteration is the next
+> version milestone; the canonical item identity is still its `NNNN` id.
+
 When an iteration ships, archive each completed item under its own `NNNN-slug.md`
 in `archive/completed/`. Keep the iteration file only if it's still useful as a
 validation recipe; otherwise move it to `archive/superseded/`.

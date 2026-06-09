@@ -25,6 +25,7 @@ use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi
 use sbgh_core::models::{GitRefKind, ResolvedCommit};
 use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
 
+use crate::artifact_store::{ArtifactStore, LocalFsStore};
 use crate::bench_summary::RunResult;
 use crate::comparison::{BaselineComparison, compare};
 use crate::events::{EventSink, PhaseLabel, SinkResult, Terminal, WorkerEvent};
@@ -340,9 +341,16 @@ impl Reporter {
     /// forensics `summary` — the same `metric_from_run` the persistence path
     /// uses, so the comment's delta is on the numbers we store.
     fn pr_metric(&self, summary: &serde_json::Value) -> Option<sbgh_core::models::JobMetric> {
-        let path = summary
+        let key = summary
             .get("run_json_archived_path")?
             .as_str()?;
+        let store = LocalFsStore::new(
+            self.config
+                .paths
+                .results_archive_dir
+                .clone(),
+        );
+        let path = store.get(key).ok()?;
         let bytes = std::fs::read(path).ok()?;
         let run = RunResult::from_bytes(&bytes)?;
         crate::job_source::metric_from_run(self.job.id, &run)
@@ -373,8 +381,14 @@ impl Reporter {
                 let comparison = self
                     .baseline_comparison(&summary)
                     .await;
+                let store = LocalFsStore::new(
+                    self.config
+                        .paths
+                        .results_archive_dir
+                        .clone(),
+                );
                 reporter
-                    .completed(&summary, comparison.as_ref())
+                    .completed(&store, &summary, comparison.as_ref())
                     .await;
                 None
             }
@@ -1122,7 +1136,14 @@ mod tests {
     async fn baseline_comparison_renders_delta_for_pr_run() {
         let tmp = TempDir::new().unwrap();
         // This run's combined Exec+Commit = 718_000 + 300_000 = 1_018_000µs.
-        let run_json = tmp.path().join("run.json");
+        // Place run.json under the config's archive root at the summary key
+        // (Decision 0002 — pr_metric resolves it via ArtifactStore::get).
+        let run_json_key = "job/run.json";
+        let run_json = tmp
+            .path()
+            .join("archive")
+            .join(run_json_key);
+        std::fs::create_dir_all(run_json.parent().unwrap()).unwrap();
         std::fs::write(
             &run_json,
             r#"{"success":true,"duration_secs":1100.0,"data":{"measured_blocks":5000,
@@ -1176,7 +1197,7 @@ mod tests {
 
         let reporter = Reporter::new(Arc::new(config), store, gh, Arc::new(OnceCell::new()), job);
 
-        let summary = serde_json::json!({ "run_json_archived_path": run_json.to_str().unwrap() });
+        let summary = serde_json::json!({ "run_json_archived_path": run_json_key });
         let c = reporter
             .baseline_comparison(&summary)
             .await

@@ -14,8 +14,9 @@ change is behavior-preserving in local mode.
 
 **Concretely (which fields change):** the per-artifact pointer fields in `summary`
 (`run_json_archived_path`, `sqlite_archived_path`, `binary_archived_path`,
-`phase_log_archived_path`, …) carry **store keys** — in local mode their value
-equals today's path, so rendering is unchanged. **`job_result.archive_dir` stays a
+`phase_log_archived_path`, …) carry **store keys** (`<job_id>/<relative>`) — in
+local mode a key **resolves to** today's path via `ArtifactStore::get`, so
+consumer behavior is unchanged. **`job_result.archive_dir` stays a
 local diagnostic path** (the local archive root): unchanged in local mode, used
 as an operator/forensics breadcrumb, **never a fetch reference**. A unified
 `artifacts: { name → key }` map is a possible later cleanup, out of scope for

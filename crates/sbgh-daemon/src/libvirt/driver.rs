@@ -25,6 +25,7 @@ use sbgh_core::bench_args::effective_arg_string;
 use sbgh_core::config::DaemonConfig;
 use tokio_util::sync::CancellationToken;
 
+use crate::artifact_store::{ArtifactStore, LocalFsStore, artifact_key};
 use crate::driver::{Driver, DriverOutcome, DriverStatus, Placement, TaskSpec};
 use crate::events::{EventSink, PhaseLabel};
 use crate::libvirt::boot::BootDisk;
@@ -199,76 +200,50 @@ impl LibvirtDriver {
             .and_then(|t| phase::read_last(&t.phase_log()))
             .map(|p| p.label().to_string());
 
-        let (sqlite_archived_path, sqlite_size_bytes) = arts
-            .tmpfs
-            .as_ref()
-            .map(|t| {
-                forensics::archive_sqlite(
-                    &t.sqlite_file(),
-                    &self
-                        .config
-                        .paths
-                        .results_archive_dir,
-                    &job_id,
-                )
-            })
-            .unwrap_or((None, None));
+        // Archive the per-job artifacts through the store (LocalFsStore today →
+        // S3 in Phase 2). The summary records each artifact's store **key**
+        // (`<job_id>/<relative>`, Decision 0002), not a bare path; `put` returns
+        // the byte size, or `None` when the VM produced no such file.
+        let store = LocalFsStore::new(
+            self.config
+                .paths
+                .results_archive_dir
+                .clone(),
+        );
 
-        // Archive the append-only phase journal alongside the SQLite —
-        // cheap (a few hundred bytes) and makes per-job "how long was
-        // each phase" trivial to answer after the job dir is gone.
-        let (phase_log_archived_path, phase_log_size_bytes) = arts
+        let sqlite_key = artifact_key(&job_id, forensics::SQLITE_RELATIVE);
+        let sqlite_size_bytes = arts
             .tmpfs
             .as_ref()
-            .map(|t| {
-                forensics::archive_phase_log(
-                    &t.phase_log(),
-                    &self
-                        .config
-                        .paths
-                        .results_archive_dir,
-                    &job_id,
-                )
-            })
-            .unwrap_or((None, None));
+            .and_then(|t| store.put(&sqlite_key, &t.sqlite_file()));
+        let sqlite_archived_path = sqlite_size_bytes.map(|_| sqlite_key);
 
-        // Snapshot the stacks-bench binary that produced this run. The
-        // template `cp`s it into $RESULTS just before phase=done; archive
-        // it next to the SQLite so post-hoc `bench list` / `bench summary`
-        // queries always have the exact-version reader. Missing when the
-        // VM didn't reach the collecting phase (e.g. build failed).
-        let (binary_archived_path, binary_size_bytes) = arts
+        // The append-only phase journal — cheap, makes per-job "how long was
+        // each phase" trivial after the job dir is gone.
+        let phase_log_key = artifact_key(&job_id, forensics::PHASE_LOG_RELATIVE);
+        let phase_log_size_bytes = arts
             .tmpfs
             .as_ref()
-            .map(|t| {
-                forensics::archive_binary(
-                    &t.stacks_bench_binary(),
-                    &self
-                        .config
-                        .paths
-                        .results_archive_dir,
-                    &job_id,
-                )
-            })
-            .unwrap_or((None, None));
+            .and_then(|t| store.put(&phase_log_key, &t.phase_log()));
+        let phase_log_archived_path = phase_log_size_bytes.map(|_| phase_log_key);
 
-        // Raw JSON stdout from `stacks-bench bench run --json`. Useful
-        // both for the PR-comment summary builder and as the canonical
-        // human-readable summary of what each run produced.
-        let (run_json_archived_path, run_json_size_bytes) = arts
+        // The stacks-bench binary that produced this run — the exact-version
+        // reader for the DB. Missing when the VM didn't reach collecting.
+        let binary_key = artifact_key(&job_id, forensics::BINARY_RELATIVE);
+        let binary_size_bytes = arts
             .tmpfs
             .as_ref()
-            .map(|t| {
-                forensics::archive_run_json(
-                    &t.run_json(),
-                    &self
-                        .config
-                        .paths
-                        .results_archive_dir,
-                    &job_id,
-                )
-            })
-            .unwrap_or((None, None));
+            .and_then(|t| store.put(&binary_key, &t.stacks_bench_binary()));
+        let binary_archived_path = binary_size_bytes.map(|_| binary_key);
+
+        // Raw JSON stdout from `stacks-bench bench run --json` — the source of
+        // the curated PR-comment metrics (read back via `ArtifactStore::get`).
+        let run_json_key = artifact_key(&job_id, forensics::RUN_JSON_RELATIVE);
+        let run_json_size_bytes = arts
+            .tmpfs
+            .as_ref()
+            .and_then(|t| store.put(&run_json_key, &t.run_json()));
+        let run_json_archived_path = run_json_size_bytes.map(|_| run_json_key);
 
         // Chown the serial console log to sbgh before we try to read it.
         // libvirt-qemu creates this file as itself (typically
@@ -326,10 +301,7 @@ impl LibvirtDriver {
             "last_phase": last_phase,
             "console_tail": console_tail,
             "console_size_bytes": console_size_bytes,
-            "archive_dir": forensics::job_archive_root(
-                &self.config.paths.results_archive_dir,
-                &job_id,
-            ),
+            "archive_dir": store.job_dir(&job_id),
             "sqlite_archived_path": sqlite_archived_path,
             "sqlite_size_bytes": sqlite_size_bytes,
             "binary_archived_path": binary_archived_path,

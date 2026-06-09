@@ -27,7 +27,7 @@
 | `roadmap-v9` | worker fleet | `design/0004-worker-fleet.md` (`0004`) |
 | `roadmap-v10` | Slack ad-hoc profiling | `design/0002-slack-adhoc-profiling.md` (`0002`) |
 | `roadmap-v11` | results portal | `design/0003-results-portal.md` (`0003`) |
-| `roadmap-v12` | artifact store | `0001` / iteration `v1-artifact-store` (converted) |
+| `roadmap-v12` | artifact store | `0001` / iteration `v4-artifact-store` (converted) |
 | `block-validation-taskspec` | block-val seam sketch | `design/0019` |
 
 ## Notes

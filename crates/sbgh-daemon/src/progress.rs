@@ -8,6 +8,7 @@ use sbgh_core::github::{
     CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi,
 };
 
+use crate::artifact_store::ArtifactStore;
 use crate::bench_summary::{self, RunResult};
 use crate::comparison::BaselineComparison;
 use crate::job_source::{ProgressTarget, RunnableJob};
@@ -35,10 +36,11 @@ impl<'a> ProgressReporter<'a> {
 
     pub async fn completed(
         &self,
+        store: &dyn ArtifactStore,
         summary: &serde_json::Value,
         comparison: Option<&BaselineComparison>,
     ) {
-        let body = self.completed_body(summary, comparison);
+        let body = self.completed_body(store, summary, comparison);
         self.update_comment(&body)
             .await;
         // Only PR jobs with a comment have one to point at; a baseline's commit
@@ -126,6 +128,7 @@ impl<'a> ProgressReporter<'a> {
     /// the user-facing metrics) used by both the comment and the check.
     fn completed_body(
         &self,
+        store: &dyn ArtifactStore,
         summary: &serde_json::Value,
         comparison: Option<&BaselineComparison>,
     ) -> String {
@@ -133,12 +136,12 @@ impl<'a> ProgressReporter<'a> {
             .get("archive_dir")
             .and_then(|v| v.as_str())
             .unwrap_or("/var/lib/sbgh/results");
-        let run_json_path = summary
+        // Resolve the run.json store **key** (Decision 0002) → local path → parse.
+        let parsed = summary
             .get("run_json_archived_path")
-            .and_then(|v| v.as_str());
-        let parsed = run_json_path
-            .map(Path::new)
-            .and_then(read_run_json);
+            .and_then(|v| v.as_str())
+            .and_then(|key| store.get(key).ok())
+            .and_then(|p| read_run_json(&p));
         bench_summary::render_pr_comment(
             &self.job.id.to_string(),
             &self.job.commit,
@@ -286,8 +289,9 @@ mod tests {
     async fn completed_concludes_check_success() {
         let gh = FakeGitHub::new();
         let job = check_job(11);
+        let store = crate::artifact_store::LocalFsStore::new(std::env::temp_dir());
         ProgressReporter::new(&gh, &job)
-            .completed(&serde_json::json!({}), None)
+            .completed(&store, &serde_json::json!({}), None)
             .await;
         assert_eq!(
             concluded_state(&gh),

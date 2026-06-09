@@ -5,7 +5,6 @@
 //! confidence proof that the new execution backend works before it
 //! becomes the production source.
 
-use std::io::Write;
 use std::sync::Arc;
 
 use sbgh_core::db::{
@@ -19,7 +18,12 @@ use sbgh_core::models::{
 
 // Daemon is a bin-only crate; pull in the modules under test via
 // path include (same pattern as processor_e2e). `job_source` references
-// `crate::bench_summary`, so both must be declared at the test root.
+// `crate::bench_summary` + `crate::artifact_store`, so all must be declared at
+// the test root.
+// `artifact_store.rs` carries its own `#![allow(dead_code)]`, so no outer
+// attribute here (a second one trips `clippy::duplicated_attributes`).
+#[path = "../src/artifact_store.rs"]
+mod artifact_store;
 #[path = "../src/bench_summary.rs"]
 #[allow(dead_code)]
 mod bench_summary;
@@ -114,10 +118,14 @@ async fn v2_source_claims_assembles_and_completes_with_metric_and_result() {
     let store = Arc::new(PostgresJobStore::new(pool.clone()));
     enqueue_branch_push(&store, webhook_id).await;
 
+    let archive_root = tempfile::tempdir().unwrap();
     let source = JobSource::new(
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        archive_root
+            .path()
+            .to_path_buf(),
     );
 
     // Claim assembles the execution view from across the schema.
@@ -150,19 +158,30 @@ async fn v2_source_claims_assembles_and_completes_with_metric_and_result() {
 
     // Write a run.json the summary points at, so complete() promotes a
     // full job_metric AND stores the raw run_json.
-    let mut run_json = tempfile::NamedTempFile::new().unwrap();
-    write!(
-        run_json,
-        r#"{{"success":true,"duration_secs":2200.0,"data":{{"measured_blocks":4000,
-        "warmup_blocks":1000,"duration_secs":1900.0,"summary":{{"total_duration_us":100000000,
+    // Place the run.json under the store root at the key the summary references
+    // (Decision 0002 — `complete` resolves it via `ArtifactStore::get`).
+    let run_json_key = "job/run.json";
+    let run_json_path = archive_root
+        .path()
+        .join(run_json_key);
+    std::fs::create_dir_all(
+        run_json_path
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &run_json_path,
+        r#"{"success":true,"duration_secs":2200.0,"data":{"measured_blocks":4000,
+        "warmup_blocks":1000,"duration_secs":1900.0,"summary":{"total_duration_us":100000000,
         "setup_duration_us":9000000,"execution_duration_us":72000000,"commit_duration_us":18000000,
         "transactions":12345,"clarity_runtime":9876543,"write_length":89000000,
-        "read_length":245000000}}}}}}"#
+        "read_length":245000000}}}"#,
     )
     .unwrap();
     let summary = serde_json::json!({
         "archive_dir": "/var/lib/sbgh/results/job",
-        "run_json_archived_path": run_json.path().to_str().unwrap(),
+        "run_json_archived_path": run_json_key,
         "finish_reason": "phase_done",
     });
 
@@ -226,6 +245,7 @@ async fn v2_source_load_runnable_assembles_view_without_claiming() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        std::path::PathBuf::from("/var/lib/sbgh/results"),
     );
 
     // Claim + run so there's a `running` row to load (the orphan case).
@@ -322,6 +342,7 @@ async fn v2_source_load_runnable_surfaces_existing_check_for_conclusion() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        std::path::PathBuf::from("/var/lib/sbgh/results"),
     );
 
     // Claim, record a created check (id + url), and mark running — the orphan
@@ -385,6 +406,7 @@ async fn v2_source_list_queued_returns_queued_in_claim_order_readonly() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        std::path::PathBuf::from("/var/lib/sbgh/results"),
     );
 
     // Force a deterministic claim order: make one row strictly older.
@@ -432,6 +454,7 @@ async fn v2_source_fail_records_event_and_forensics_result() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        std::path::PathBuf::from("/var/lib/sbgh/results"),
     );
 
     let job = source
@@ -491,6 +514,7 @@ async fn v2_source_sweeps_stuck_claimed_jobs() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        std::path::PathBuf::from("/var/lib/sbgh/results"),
     );
 
     // Claim → claimed, then simulate a crash by NOT calling start_running
@@ -577,6 +601,7 @@ async fn v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id()
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        std::path::PathBuf::from("/var/lib/sbgh/results"),
     );
 
     // Claim assembles PR progress (pr_number=7, no comment yet).
