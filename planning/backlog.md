@@ -10,25 +10,9 @@ keep entries here compact and push worked-through detail to `design/`.
 [v4-artifact-store](iterations/v4-artifact-store.md) (2026-06) — see
 [index.md](index.md).*
 
-## Candidate (near-term)
-
-### 0002 — Slack ad-hoc profiling benchmarks
-
-- **id:** `0002-slack-adhoc-profiling`
-- **status:** `candidate`
-- **priority:** `medium`
-- **depends_on:** `0001-artifact-store` (Phase 4 — flamegraph delivery)
-- **review:** `Codex signed off` (design)
-- **design:** [design/0002-slack-adhoc-profiling.md](design/0002-slack-adhoc-profiling.md)
-
-**Problem:** No-commit, ad-hoc "profile this tx/block from yesterday" requests have
-no entry point; the team lives in Slack.
-
-**Scope:** Socket Mode connector + `slack_adhoc` trigger (default rev, workload via
-`--txid`/`--block`/`--repetitions`), a generalized `ReportSurface`, and a flamegraph
-artifact.
-
-**Acceptance:** `/bench …` in Slack returns a flamegraph for the workload.
+*`0002-slack-adhoc-profiling` was promoted to iteration
+[v5-slack-adhoc-profiling](iterations/v5-slack-adhoc-profiling.md) (2026-06) —
+see [index.md](index.md).*
 
 ## Backlog (unscheduled)
 
@@ -169,6 +153,32 @@ physically present, awaiting a soak window.
 **Scope:** A one-line `DROP TABLE jobs` migration.
 
 **Acceptance:** The legacy table is gone; nothing references it.
+
+### 0020 — LLM intent resolution for Slack benches
+
+- **id:** `0020-llm-intent-resolution`
+- **status:** `backlog`
+- **priority:** `low`
+- **depends_on:** `0002-slack-adhoc-profiling` (the mention surface + the
+  `resolve_workload` seam it defines)
+- **source:** v5 scoping (2026-06)
+
+**Problem:** v5 resolves a Slack bench request with a deterministic flag parser;
+the team would prefer **natural language** ("profile yesterday's slow block
+~5×") over memorized flags.
+
+**Scope:** An LLM-backed `resolve_workload` impl behind v5's seam — raw mention
+text → structured `WorkloadSpec` (txid/block/repetitions/rev), then the **same**
+deterministic validator (the LLM never emits raw `bench_args`, so it can't
+inject flags). Authz stays *before* resolution; an uncertain resolver asks a
+clarifying question in-thread.
+
+**Acceptance:** A natural-language `@sbgh` request resolves to the correct
+`WorkloadSpec` (or asks a clarifying question), under the same authz + validation
+guards as the flag parser.
+
+**Deferred / non-goals:** No new task/execution work; rides v5's surface + bench
+path. Model/provider choice + prompt design are part of its own design.
 
 ## Parked
 

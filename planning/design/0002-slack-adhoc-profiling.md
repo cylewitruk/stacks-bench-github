@@ -1,7 +1,8 @@
 # Design 0002: Slack ad-hoc profiling benchmarks
 
 - **id:** `0002-slack-adhoc-profiling`
-- **status:** `candidate`
+- **status:** `planned` — iteration
+  [v5-slack-adhoc-profiling](../iterations/v5-slack-adhoc-profiling.md)
 - **depends_on:** `0001-artifact-store` (Phase 4 — flamegraph delivery)
 - **review:** Codex signed off (design)
 - **source:** roadmap-v10
@@ -12,11 +13,12 @@ slow."* No PR, no commit under test — the code is a constant (a configured def
 rev), the **workload** is the variable (`--txid` / `--block`), and the deliverable
 is a **flamegraph**, not a vs-baseline delta.
 
-**Goal:** someone types `/bench --block 184231 --repetitions 5` (or `--txid
+**Goal:** someone posts `@sbgh bench --block 184231 --repetitions 5` (or `--txid
 0xabc…`) in Slack and gets back a flamegraph — reusing the existing bench
 execution path. Slack is a **new trigger source** + **new reporting surface**; the
 job is the **existing bench `Recipe`** with ad-hoc workload args (no new task
-kind). It rides the shipped `Driver` seam (`0010`), is independent of the worker
+kind). *(v1 entry surface = **`@sbgh` mention**, pinned during v5 scoping; see
+[iterations/v5-slack-adhoc-profiling.md](../iterations/v5-slack-adhoc-profiling.md).)* It rides the shipped `Driver` seam (`0010`), is independent of the worker
 fleet (`0004`) and task-kind platform (`0005`), and its flamegraph delivery
 depends on the artifact store (`0001`).
 
@@ -80,9 +82,9 @@ dials *out* (firewall/NAT-friendly — same philosophy as the v9 worker model).
   against the config allowlist (Phase 1) before acting — the connection being
   authenticated says nothing about *who* sent a given command. Tie the per-command
   check here so it isn't treated as an afterthought.
-- **Ack discipline:** each socket envelope must be **acked within 3 s**; the
-  actual work (enqueue + reporting) happens async, exactly like the
-  ack-then-update pattern the slash-command HTTP flow would use.
+- **Ack discipline:** each socket envelope (an `app_mention`) must be **acked
+  within 3 s**; the actual work (authz → resolve → enqueue → reporting) happens
+  async — ack the envelope first, then act and post/update after.
 
 ## Phase 0: Slack app + Socket Mode connectivity spike
 
@@ -90,13 +92,16 @@ dials *out* (firewall/NAT-friendly — same philosophy as the v9 worker model).
 
 **Scope:**
 
-- Register the Slack app; scopes: `commands`, `chat:write`, `files:write` (for
-  the flamegraph), optionally `app_mentions:read`. Mint the app-level token
-  (`connections:write`) + bot token.
-- Prove end-to-end by hand: open a Socket Mode connection, receive a `/bench`
-  slash-command envelope, **ack within 3 s**, and `chat.postMessage` a reply.
-- Decide the v1 entry surface: **slash command** (recommended) vs. a modal vs.
-  `@sbgh` mention.
+- Register the Slack app; scopes: `app_mentions:read` (the v1 entry surface),
+  `chat:write`, `reactions:write` (status reactions), `files:write` (the
+  flamegraph). Mint the app-level token (`connections:write`) + bot token.
+  *(No `commands` scope in v1 — that's only for a future slash-command surface,
+  Phase 5.)*
+- Prove end-to-end by hand: open a Socket Mode connection, receive an
+  `app_mention` envelope, **ack within 3 s**, and post a **threaded** reply +
+  a status reaction.
+- Entry surface is **decided: `@sbgh` mention** (Decision 6) — not a slash
+  command. The spike confirms the mention event + threaded reply + reaction.
 - **`stacks-bench` artifact spike (Codex) — the other half of the de-risk.** Run
   the intended ad-hoc command (`--txid`/`--block` + `--repetitions`) locally / in
   the VM and confirm: which **profiler flags** produce a flamegraph, **what
@@ -106,13 +111,14 @@ dials *out* (firewall/NAT-friendly — same philosophy as the v9 worker model).
 
 **Status:**
 
-- [ ] Spike complete — connection + slash command + reply proven
+- [ ] Spike complete — connection + `app_mention` + threaded reply proven
 - [ ] `stacks-bench` ad-hoc command produces the expected flamegraph artifact
 - [ ] Reviewed — Codex signed off
 
 ## Phase 1: Slack connector + ad-hoc job enqueue
 
-**Goal:** `/bench …` in Slack enqueues a job and acks with a "queued" message.
+**Goal:** `@sbgh bench …` enqueues a job and acks with a ⏳ status **reaction**
+on the request (no bot parent message).
 
 > **Not deployable alone (Codex).** Phase 1 is an internal slice — Slack enqueue
 > stays **disabled/behind config** until Phase 2 adds terminal reporting, so a
@@ -123,16 +129,19 @@ dials *out* (firewall/NAT-friendly — same philosophy as the v9 worker model).
 
 - A `slack` connector (orchestrator-side — a new concurrent task in `main`'s
   `try_join!`, alongside the runner + webhook processor + api): the Socket Mode
-  client loop, with reconnect/backoff.
-- Parse the `/bench` command text → workload: `--txid` / `--block` (repeatable,
-  mutually exclusive), `--repetitions`, `--warmup`, optional `--rev`.
+  client loop consuming `app_mention` events, with reconnect/backoff.
+- **Authz first**, then `resolve_workload(text)` → `WorkloadSpec` (Decision 8;
+  v1 deterministic parser of `--txid`/`--block` mutually exclusive,
+  `--repetitions`/`--warmup`/`--rev`) → the shared validator. On any failure,
+  `chat.postEphemeral` the reason and stop (no job, no thread output).
 - **Authz:** a Slack allowlist in config (workspace + user ids) → permission to
   enqueue against the default repo. (Distinct from the GitHub multi-tenant
   model — Slack identities are their own allowlist.)
-- Enqueue a `RunnableJob`: repo/rev from `[slack]` config, `bench_args` = the
-  parsed workload, `ProgressTarget::Slack { channel, message_ts }`, baseline off.
-- Ack: post a "⏳ queued" `chat.postMessage` and capture its `ts` for later
-  `chat.update`s.
+- Enqueue a `RunnableJob`: repo/rev from `[slack]` config, `bench_args` from the
+  `WorkloadSpec`, `ProgressTarget::Slack { channel, message_ts }` where
+  `message_ts` is the **request's** ts (thread anchor), baseline off.
+- Ack: add a ⏳ **reaction** to the request (no bot parent message); the
+  request's `ts` is the thread anchor for the terminal result + later updates.
 
 **Status:**
 
@@ -157,10 +166,13 @@ dials *out* (firewall/NAT-friendly — same philosophy as the v9 worker model).
 - **Minimal terminal Slack reporting — so the MVP actually finishes a job
   (Codex).** A Slack job needs *someone* to post its result, so this phase adds a
   small **Slack branch at terminal** in the reporter: for `ProgressTarget::Slack`
-  it `chat.update`s the queued ack into a result message (absolute timing text).
-  This is a thin inline post, **not** the generalized surface trait — that, plus
-  *live* phase progress, is Phase 3. So Phases 1+2 deliver a working text bench
-  (queued → result); no job is ever enqueued without a reporting path.
+  it posts the result (absolute timing text) as a **threaded reply under the
+  request `ts`** and swaps the request's status **reaction** to terminal (✅/❌)
+  via `reactions.add`/`remove` — the threaded-reporting model (status on the
+  request; detail in-thread; no bot parent). This is a thin inline post, **not**
+  the generalized surface trait — that, plus *live* phase progress, is Phase 3.
+  So Phases 1+2 deliver a working text bench (reaction ack → threaded result); no
+  job is ever enqueued without a reporting path.
 
 **Status:**
 
@@ -203,7 +215,7 @@ add **live** phase progress.
 - Capture `stacks-bench`'s profiler/flamegraph output in the VM; add it to the
   **artifact manifest** so the driver pulls it into the run bundle next to
   `run.json` (the v8 artifact path, unchanged in shape).
-- **Depends on the artifact store ([`0001`](0001-artifact-store.md)).** The
+- **Depends on the artifact store ([`0001`](../index.md)).** The
   bundle ships to object storage; Slack delivery is then either a **signed-URL
   link** (v12 issues it — simplest) or a file **upload** via Slack's current
   external-upload flow (`files.getUploadURLExternal` →
@@ -211,6 +223,14 @@ add **live** phase progress.
   upload vs. signed link — see below.)**
 - Render the result: absolute per-tx/per-block timing + the flamegraph; **no**
   vs-baseline delta.
+- **`stacks-bench.db` link (S3 only, added during v5 scoping).** When
+  `kind = "s3"`, append a presigned link to the run's SQLite db
+  (`artifact_key(job, SQLITE_RELATIVE)`) at the bottom of the threaded result —
+  gated on `store.exists` so it only shows once the object is in the bucket;
+  local mode shows no link (`signed_url → Unsupported`). If the upload isn't
+  confirmed at report time (future async/retried uploads), it's a follow-up
+  threaded reply once `exists` is true — never blocks the result. This +
+  the flamegraph retire the store's `signed_url`/`exists` `allow(dead_code)`.
 
 **Status:**
 
@@ -225,8 +245,9 @@ add **live** phase progress.
 
 **Scope:**
 
-- A **modal** (`views.open` off the slash command's `trigger_id`) with a form
-  for tx/block/repetitions/rev, instead of memorized flags.
+- A **modal** (`views.open` off a result **button's** `trigger_id` — an
+  `app_mention` event carries none) with a form for tx/block/repetitions/rev,
+  instead of memorized flags.
 - **Buttons** on a result: "Re-run", "Profile again with more repetitions".
 - `@sbgh` **mention** invocation + threaded results.
 
@@ -255,13 +276,27 @@ add **live** phase progress.
    the orchestrator).
 5. **Reporting is generalized behind a `ReportSurface` trait.** GitHub + Slack
    are two impls selected by `ProgressTarget`; existing GitHub behavior preserved.
+6. **Entry surface = `@sbgh` mention, not a slash command — pinned during v5
+   scoping.** A slash command leaves no channel message to thread on; a mention
+   (`app_mention` event) is a real message whose `ts` anchors the thread, and a
+   free-text message is the natural home for the future LLM resolver (`0020`). A
+   `/bench` slash command may be added later as a secondary surface.
+7. **Threaded reporting (anti-spam) — pinned during v5 scoping.** **No bot
+   parent**: all output threads under the **user's request** (`thread_ts` = the
+   mention `ts`, which `ProgressTarget::Slack`'s `message_ts` captures). Lifecycle
+   status is a **reaction** on the request; rejections are `chat.postEphemeral`
+   (invoker-only, no channel/thread clutter). First-class from Phase 1.
+8. **Intent resolution is a seam — added during v5 scoping.** `resolve_workload(text)
+   → WorkloadSpec` behind a seam: v1 deterministic parser, future LLM resolver
+   (`0020`). **Authz before resolution; validation after** — the resolver emits a
+   *structured* spec the same validator checks, never raw `bench_args`.
 
 ## Sequencing & relationship to the other roadmaps
 
 - **Rides v8 Phase 1 (done); independent of v6 and v9.** It runs on the current
   single-host bench path now, and inherits the v9 fleet later for free (a Slack
   job is just a bench job a worker runs).
-- **Phase 4 depends on the artifact store ([`0001`](0001-artifact-store.md))** —
+- **Phase 4 depends on the artifact store ([`0001`](../index.md))** —
   build that first; the flamegraph ships to object storage and Slack links it.
 - **MVP = Phases 1 + 2** — a working text bench end-to-end (queued ack →
   **terminal result**, via Phase 2's minimal Slack reporting). **Phase 3** adds
@@ -274,7 +309,7 @@ add **live** phase progress.
 
 1. **Flamegraph delivery:** Slack file upload (renders inline, but needs
    `files:write` + the upload dance) vs. a **signed-URL link** to the artifact in
-   object storage ([`0001`](0001-artifact-store.md), simpler). Lean: link first,
+   object storage ([`0001`](../index.md), simpler). Lean: link first,
    upload as a Phase-4 polish.
 2. **Authz + cost control.** A profiling run is expensive (full VM + replay).
    What's the allowlist granularity (workspace / channel / user), and do we need

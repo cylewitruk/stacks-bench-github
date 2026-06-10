@@ -19,7 +19,7 @@ need editing when an item's status or location changes.
 | ID | Name | Status | Location |
 | ---- | ---- | ------ | -------- |
 | `0001-artifact-store` | Artifact store | `in_progress` | [iterations/v4-artifact-store.md](iterations/v4-artifact-store.md) |
-| `0002-slack-adhoc-profiling` | Slack ad-hoc profiling | `candidate` | [backlog.md](backlog.md) |
+| `0002-slack-adhoc-profiling` | Slack ad-hoc profiling | `planned` | [iterations/v5-slack-adhoc-profiling.md](iterations/v5-slack-adhoc-profiling.md) |
 | `0003-results-portal` | Results portal | `backlog` | [backlog.md](backlog.md) |
 | `0004-worker-fleet` | Worker fleet (`remote-daemon`) | `backlog` | [backlog.md](backlog.md) |
 | `0005-task-kind-platform` | Task-kind platform | `backlog` | [backlog.md](backlog.md) |
@@ -37,12 +37,14 @@ need editing when an item's status or location changes.
 | `0017-generic-phase-events` | Generic phase-event enum | `backlog` | [backlog.md](backlog.md) |
 | `0018-auto-rerun-confidence-gate` | Auto-rerun confidence gate | `parked` | [backlog.md](backlog.md) |
 | `0019-block-validation-recipe` | Block-validation recipe | `backlog` | [backlog.md](backlog.md) |
+| `0020-llm-intent-resolution` | LLM intent resolution (Slack) | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 
 | ID | Name | Status | Location |
 | ---- | ---- | ------ | -------- |
 | `v4-artifact-store` | Artifact store | `in_progress` | [iterations/v4-artifact-store.md](iterations/v4-artifact-store.md) |
+| `v5-slack-adhoc-profiling` | Slack ad-hoc profiling | `planned` | [iterations/v5-slack-adhoc-profiling.md](iterations/v5-slack-adhoc-profiling.md) |
 
 ## Decisions
 
