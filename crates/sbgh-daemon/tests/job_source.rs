@@ -123,9 +123,11 @@ async fn v2_source_claims_assembles_and_completes_with_metric_and_result() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
-        archive_root
-            .path()
-            .to_path_buf(),
+        Arc::new(artifact_store::LocalFsStore::new(
+            archive_root
+                .path()
+                .to_path_buf(),
+        )),
     );
 
     // Claim assembles the execution view from across the schema.
@@ -245,7 +247,9 @@ async fn v2_source_load_runnable_assembles_view_without_claiming() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
-        std::path::PathBuf::from("/var/lib/sbgh/results"),
+        Arc::new(artifact_store::LocalFsStore::new(std::path::PathBuf::from(
+            "/var/lib/sbgh/results",
+        ))),
     );
 
     // Claim + run so there's a `running` row to load (the orphan case).
@@ -342,7 +346,9 @@ async fn v2_source_load_runnable_surfaces_existing_check_for_conclusion() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
-        std::path::PathBuf::from("/var/lib/sbgh/results"),
+        Arc::new(artifact_store::LocalFsStore::new(std::path::PathBuf::from(
+            "/var/lib/sbgh/results",
+        ))),
     );
 
     // Claim, record a created check (id + url), and mark running — the orphan
@@ -406,7 +412,9 @@ async fn v2_source_list_queued_returns_queued_in_claim_order_readonly() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
-        std::path::PathBuf::from("/var/lib/sbgh/results"),
+        Arc::new(artifact_store::LocalFsStore::new(std::path::PathBuf::from(
+            "/var/lib/sbgh/results",
+        ))),
     );
 
     // Force a deterministic claim order: make one row strictly older.
@@ -454,7 +462,9 @@ async fn v2_source_fail_records_event_and_forensics_result() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
-        std::path::PathBuf::from("/var/lib/sbgh/results"),
+        Arc::new(artifact_store::LocalFsStore::new(std::path::PathBuf::from(
+            "/var/lib/sbgh/results",
+        ))),
     );
 
     let job = source
@@ -514,7 +524,9 @@ async fn v2_source_sweeps_stuck_claimed_jobs() {
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
-        std::path::PathBuf::from("/var/lib/sbgh/results"),
+        Arc::new(artifact_store::LocalFsStore::new(std::path::PathBuf::from(
+            "/var/lib/sbgh/results",
+        ))),
     );
 
     // Claim → claimed, then simulate a crash by NOT calling start_running
@@ -601,7 +613,9 @@ async fn v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id()
         store.clone(),
         Arc::new(PostgresRepoStore::new(pool.clone())),
         Arc::new(PostgresPullRequestStore::new(pool.clone())),
-        std::path::PathBuf::from("/var/lib/sbgh/results"),
+        Arc::new(artifact_store::LocalFsStore::new(std::path::PathBuf::from(
+            "/var/lib/sbgh/results",
+        ))),
     );
 
     // Claim assembles PR progress (pr_number=7, no comment yet).

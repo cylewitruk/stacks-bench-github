@@ -40,7 +40,9 @@ impl<'a> ProgressReporter<'a> {
         summary: &serde_json::Value,
         comparison: Option<&BaselineComparison>,
     ) {
-        let body = self.completed_body(store, summary, comparison);
+        let body = self
+            .completed_body(store, summary, comparison)
+            .await;
         self.update_comment(&body)
             .await;
         // Only PR jobs with a comment have one to point at; a baseline's commit
@@ -126,7 +128,7 @@ impl<'a> ProgressReporter<'a> {
 
     /// The shared completed render (read + parse the archived `run.json` for
     /// the user-facing metrics) used by both the comment and the check.
-    fn completed_body(
+    async fn completed_body(
         &self,
         store: &dyn ArtifactStore,
         summary: &serde_json::Value,
@@ -137,11 +139,16 @@ impl<'a> ProgressReporter<'a> {
             .and_then(|v| v.as_str())
             .unwrap_or("/var/lib/sbgh/results");
         // Resolve the run.json store **key** (Decision 0002) → local path → parse.
-        let parsed = summary
+        let run_json_path = match summary
             .get("run_json_archived_path")
             .and_then(|v| v.as_str())
-            .and_then(|key| store.get(key).ok())
-            .and_then(|p| read_run_json(&p));
+        {
+            Some(key) => store.get(key).await.ok(),
+            None => None,
+        };
+        let parsed = run_json_path
+            .as_deref()
+            .and_then(read_run_json);
         bench_summary::render_pr_comment(
             &self.job.id.to_string(),
             &self.job.commit,

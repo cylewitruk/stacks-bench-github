@@ -20,7 +20,6 @@
 //! preflight). Deferred: the intermediate phase-event timeline (provision/
 //! build/bench `job_event` rows — phase changes are logged only).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -35,7 +34,7 @@ use sbgh_core::models::{
 };
 use uuid::Uuid;
 
-use crate::artifact_store::{ArtifactStore, LocalFsStore};
+use crate::artifact_store::ArtifactStore;
 use crate::bench_summary::RunResult;
 
 /// Where a job's lifecycle progress should be surfaced (roadmap-v4).
@@ -221,9 +220,9 @@ pub struct JobSource {
     jobs: Arc<dyn JobStore>,
     repos: Arc<dyn RepoStore>,
     pull_requests: Arc<dyn PullRequestStore>,
-    /// Root for resolving archived-artifact store keys (Decision 0002) when
-    /// persisting a completed job's `run.json`-derived metric.
-    results_archive_dir: PathBuf,
+    /// The configured artifact store, for resolving a completed job's
+    /// `run.json` store key (Decision 0002) when persisting its metric.
+    store: Arc<dyn ArtifactStore>,
 }
 
 impl JobSource {
@@ -231,13 +230,13 @@ impl JobSource {
         jobs: Arc<dyn JobStore>,
         repos: Arc<dyn RepoStore>,
         pull_requests: Arc<dyn PullRequestStore>,
-        results_archive_dir: PathBuf,
+        store: Arc<dyn ArtifactStore>,
     ) -> Self {
         Self {
             jobs,
             repos,
             pull_requests,
-            results_archive_dir,
+            store,
         }
     }
 }
@@ -315,11 +314,7 @@ impl RunnableJobStore for JobSource {
 
     async fn complete(&self, job: &RunnableJob, summary: &serde_json::Value) -> anyhow::Result<()> {
         let claim_token = self.expect_token(job)?;
-        let store = LocalFsStore::new(
-            self.results_archive_dir
-                .clone(),
-        );
-        let (result, metric) = extract_outcome(job.id, summary, &store);
+        let (result, metric) = extract_outcome(job.id, summary, self.store.as_ref()).await;
         let ok = self
             .jobs
             .complete_job(&JobCompletion {
@@ -595,7 +590,7 @@ impl JobSource {
 /// companions: always a [`JobResult`] (carrying the archived `run.json`
 /// content when readable + the archive dir), and a [`JobMetric`] when
 /// `run.json` parsed with the full promoted-metric set.
-fn extract_outcome(
+async fn extract_outcome(
     job_id: Uuid,
     summary: &serde_json::Value,
     store: &dyn ArtifactStore,
@@ -604,11 +599,14 @@ fn extract_outcome(
     // Resolve the run.json store **key** (Decision 0002) to a local path, then
     // read it once: stored raw as `run_json` and (if fully populated) promoted
     // to a `job_metric`.
-    let bytes = summary
+    let run_json_path = match summary
         .get("run_json_archived_path")
         .and_then(|v| v.as_str())
-        .and_then(|key| store.get(key).ok())
-        .and_then(|p| std::fs::read(p).ok());
+    {
+        Some(key) => store.get(key).await.ok(),
+        None => None,
+    };
+    let bytes = run_json_path.and_then(|p| std::fs::read(p).ok());
     let run_json = bytes
         .as_deref()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())

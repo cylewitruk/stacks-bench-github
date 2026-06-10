@@ -25,7 +25,7 @@ use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi
 use sbgh_core::models::{GitRefKind, ResolvedCommit};
 use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
 
-use crate::artifact_store::{ArtifactStore, LocalFsStore};
+use crate::artifact_store::build_store_or_local;
 use crate::bench_summary::RunResult;
 use crate::comparison::{BaselineComparison, compare};
 use crate::events::{EventSink, PhaseLabel, SinkResult, Terminal, WorkerEvent};
@@ -315,7 +315,9 @@ impl Reporter {
         };
 
         // This run's metric (the same extraction we persist), from run.json.
-        let pr_metric = self.pr_metric(summary)?;
+        let pr_metric = self
+            .pr_metric(summary)
+            .await?;
         let comparison = compare(
             &pr_metric,
             &baseline.metric,
@@ -340,17 +342,12 @@ impl Reporter {
     /// This run's metric, parsed from the archived `run.json` referenced in the
     /// forensics `summary` — the same `metric_from_run` the persistence path
     /// uses, so the comment's delta is on the numbers we store.
-    fn pr_metric(&self, summary: &serde_json::Value) -> Option<sbgh_core::models::JobMetric> {
+    async fn pr_metric(&self, summary: &serde_json::Value) -> Option<sbgh_core::models::JobMetric> {
         let key = summary
             .get("run_json_archived_path")?
             .as_str()?;
-        let store = LocalFsStore::new(
-            self.config
-                .paths
-                .results_archive_dir
-                .clone(),
-        );
-        let path = store.get(key).ok()?;
+        let store = build_store_or_local(self.config.as_ref());
+        let path = store.get(key).await.ok()?;
         let bytes = std::fs::read(path).ok()?;
         let run = RunResult::from_bytes(&bytes)?;
         crate::job_source::metric_from_run(self.job.id, &run)
@@ -381,14 +378,9 @@ impl Reporter {
                 let comparison = self
                     .baseline_comparison(&summary)
                     .await;
-                let store = LocalFsStore::new(
-                    self.config
-                        .paths
-                        .results_archive_dir
-                        .clone(),
-                );
+                let store = build_store_or_local(self.config.as_ref());
                 reporter
-                    .completed(&store, &summary, comparison.as_ref())
+                    .completed(store.as_ref(), &summary, comparison.as_ref())
                     .await;
                 None
             }
@@ -997,6 +989,7 @@ mod tests {
                 cpu_sets: vec![],
                 host_cpus: None,
             },
+            artifacts: Default::default(),
         }
     }
 

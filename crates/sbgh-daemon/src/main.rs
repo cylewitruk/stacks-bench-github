@@ -152,17 +152,16 @@ async fn main() -> anyhow::Result<()> {
     let processor =
         WebhookProcessor::new(webhook_inbox, Arc::new(classifier), ProcessorConfig::default());
 
+    // The configured artifact store (local FS, or S3 with a local mirror).
+    // Built once at startup so a bad `[artifacts]` endpoint fails fast here
+    // rather than per-job; the runner/reporter derive theirs from config.
+    let artifact_store =
+        artifact_store::build_store(&config).context("building the artifact store")?;
+
     // The runner claims from the `job` family and posts PR comments for
     // `pr_comment` jobs.
-    let runnable_jobs: Arc<dyn RunnableJobStore> = Arc::new(JobSource::new(
-        jobs_store,
-        repo_store,
-        pull_request_store,
-        config
-            .paths
-            .results_archive_dir
-            .clone(),
-    ));
+    let runnable_jobs: Arc<dyn RunnableJobStore> =
+        Arc::new(JobSource::new(jobs_store, repo_store, pull_request_store, artifact_store));
 
     // API server (roadmap-v3 Phase 2). Operator `admin` token is a cookie
     // regenerated each boot; the handler's `ingest` token comes from

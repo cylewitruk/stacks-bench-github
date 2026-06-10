@@ -26,6 +26,7 @@ the handler and CLI reach the daemon over `/api`.
 - [docs/daemon-api.md](docs/daemon-api.md) — the `/api` surface, auth, and topology.
 - [docs/host-bringup.md](docs/host-bringup.md) — provision a benchmark host from scratch.
 - [docs/v2-to-v3-upgrade.md](docs/v2-to-v3-upgrade.md) — upgrade an existing v2 deployment to v3.
+- [docs/v3-to-v4-upgrade.md](docs/v3-to-v4-upgrade.md) — upgrade v3 → v4 (the artifact store; opt-in S3).
 - [planning/index.md](planning/index.md) — **roadmap / backlog registry** (every
   item: shipped, planned, parked); guide + detail in [planning/](planning/README.md).
   The old `docs/roadmap-vN.md` docs were migrated here (shipped work →

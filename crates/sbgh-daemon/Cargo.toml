@@ -40,6 +40,10 @@ uuid.workspace = true
 chrono.workspace = true
 quick-xml.workspace = true
 clap.workspace = true
+# Artifact store (item 0001): S3-compatible object storage, driven by reqwest.
+reqwest.workspace = true
+rusty-s3.workspace = true
+url.workspace = true
 # Slice 5 trigger_policy: regex matching for tag_pattern matchers.
 regex.workspace = true
 

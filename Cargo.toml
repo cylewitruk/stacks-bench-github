@@ -22,7 +22,8 @@ sbgh-api = { path = "crates/sbgh-api" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+# `io` for ReaderStream (streaming artifact uploads, item 0001).
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -30,7 +31,10 @@ futures = "0.3"
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "limit"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# S3-compatible object storage for run artifacts (item 0001). Sans-IO (pure
+# SigV4 signing + request building); driven by reqwest.
+rusty-s3 = "0.9"
 
 # GitHub
 octocrab = "0.51"

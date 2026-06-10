@@ -1,31 +1,57 @@
 //! Pluggable run-artifact storage (item `0001-artifact-store`, iteration v4).
 //!
 //! Run artifacts (the SQLite db, `run.json`, the `stacks-bench` binary, the
-//! phase log) live on the orchestrator's local disk today; Slack (`0002`) and
-//! the portal (`0003`) need them off-box. [`ArtifactStore`] is the seam: a
-//! local-FS impl (today's behavior) and, in the next slice, an S3-compatible
-//! one.
+//! phase log) live on the orchestrator's local disk; Slack (`0002`) and the
+//! portal (`0003`) need them off-box. [`ArtifactStore`] is the seam: a local-FS
+//! impl ([`LocalFsStore`], today's behavior) and an S3-compatible one
+//! ([`S3Store`]). [`build_store`] selects between them from `[artifacts]`
+//! config.
 //!
 //! Contracts (see `planning/decisions/`):
 //! - **0001** — `signed_url` is an S3-only affordance; [`LocalFsStore`] returns
 //!   [`ArtifactUrlError::Unsupported`], and a consumer that needs a fetchable
 //!   URL falls back to an authenticated download endpoint.
 //! - **0002** — a run's artifact references are **store keys**
-//!   (`<job_id>/<relative>`), resolved via [`ArtifactStore::get`]; for
-//!   `LocalFsStore` a key resolves to today's exact
-//!   `results_archive_dir/<job_id>/…` path, so the change is
-//!   behavior-preserving.
+//!   (`<job_id>/<relative>`), resolved via [`ArtifactStore::get`]; for both
+//!   stores a key resolves to today's exact `results_archive_dir/<job_id>/…`
+//!   local path, so the change is behavior-preserving in local mode.
+//! - **0003** — an `S3Store` upload failure after a completed run is **not** a
+//!   benchmark failure: [`S3Store::put`] returns the *local* size and retains
+//!   the local copy, logging the upload error.
 //!
-//! Wiring status (v4 Phase 1b): `put`, `get`, `artifact_key`, and `job_dir` are
-//! live — the libvirt driver archives through `put`, and the
-//! reporter/job-source/progress readers resolve keys via `get`. `exists`,
-//! `signed_url`, and [`ArtifactUrlError`] are the **Phase-2** surface (the S3
-//! store and the portal/Slack consumers), so the module keeps
-//! `allow(dead_code)` until then.
+//! Wiring status (v4 Phase 2): `put` / `get` / `job_dir` are live — the libvirt
+//! driver archives through `put`, the reporter/job-source/progress readers
+//! resolve keys via `get`, and [`build_store`] picks the impl from config.
+//! `exists` + `signed_url` + [`ArtifactUrlError`] are **implemented** for both
+//! stores but have no in-tree caller yet — their consumers are the Slack
+//! (`0002`) and portal (`0003`) fetch paths — so the module keeps
+//! `allow(dead_code)` until those land.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+
+use anyhow::Context;
+use futures::StreamExt;
+use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
+use sbgh_core::config::{ArtifactStoreKind, DaemonConfig, S3Config};
+use tokio::io::AsyncWriteExt;
+
+/// TTL for the short-lived presigned URLs the store mints for its **own**
+/// internal S3 GET/PUT/HEAD requests. Independent of the public
+/// [`ArtifactStore::signed_url`] TTL (which the caller chooses).
+const INTERNAL_SIGN_TTL: Duration = Duration::from_secs(300);
+
+/// Cap on establishing the TCP/TLS connection to S3 — fails fast when the
+/// endpoint is unreachable so a stalled connect can't hang job completion.
+const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-read **idle** timeout (not a total cap): a transfer that keeps making
+/// progress is never cut off, but one that stalls for this long fails — so a
+/// hung S3 GET/PUT can't wedge teardown/reporting after a benchmark finishes,
+/// while a large-but-progressing multi-GB upload still completes.
+const S3_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Why a [`signed_url`](ArtifactStore::signed_url) couldn't be produced — kept
 /// typed so "this store can't sign" is distinguishable from "signing failed".
@@ -56,16 +82,37 @@ pub fn artifact_key(job_id: &str, relative: &str) -> String {
     format!("{job_id}/{relative}")
 }
 
-/// Pluggable storage for a run's archived artifacts.
+/// Sibling temp path for a streamed download (`<dest>.<token>.part`), renamed
+/// to `dest` on completion so a partial transfer never lands at the key path.
+/// The `token` is unique per download so two concurrent cache misses for the
+/// same key don't write/rename the same temp file.
+fn part_path(dest: &Path, token: &str) -> PathBuf {
+    let mut s = dest
+        .as_os_str()
+        .to_os_string();
+    s.push(format!(".{token}.part"));
+    PathBuf::from(s)
+}
+
+/// Pluggable storage for a run's archived artifacts. `put`/`get`/`exists` are
+/// async (object storage is network IO); `signed_url`/`job_dir` are pure (no
+/// IO) and stay sync.
+#[async_trait::async_trait]
 pub trait ArtifactStore: Send + Sync {
     /// Store `src` under `key`. Best-effort (matching the prior forensics
     /// semantics): returns the stored byte size, or `None` if `src` is missing
-    /// or the store write failed.
-    fn put(&self, key: &str, src: &Path) -> Option<u64>;
+    /// or the store write failed. For [`S3Store`] the size is the *local*
+    /// mirror's (Decision 0003 — a failed S3 upload still returns `Some`).
+    async fn put(&self, key: &str, src: &Path) -> Option<u64>;
 
     /// Resolve `key` to a **local readable path** — for a remote store this
     /// materializes the object locally first. `Err(NotFound)` if absent.
-    fn get(&self, key: &str) -> std::io::Result<PathBuf>;
+    async fn get(&self, key: &str) -> std::io::Result<PathBuf>;
+
+    /// The per-job local archive directory (`<root>/<job_id>`) — the diagnostic
+    /// `archive_dir` (Decision 0002: a breadcrumb, not a fetch reference).
+    /// Local for both stores (`S3Store` keeps a local mirror).
+    fn job_dir(&self, job_id: &str) -> PathBuf;
 
     /// A short-TTL fetchable URL for `key`.
     /// `Err(`[`ArtifactUrlError::Unsupported`]`)` when the store can't sign
@@ -74,7 +121,51 @@ pub trait ArtifactStore: Send + Sync {
     fn signed_url(&self, key: &str, ttl: Duration) -> Result<String, ArtifactUrlError>;
 
     /// Whether `key` exists in the store.
-    fn exists(&self, key: &str) -> bool;
+    async fn exists(&self, key: &str) -> bool;
+}
+
+/// Pick the configured store: [`LocalFsStore`] (default) or [`S3Store`], from
+/// `[artifacts]`. The single S3-wiring construction site (Codex, 1b review) —
+/// adding a backend touches only here. Fails fast on a bad S3 endpoint, so call
+/// it at startup; hot paths that only hold the config use
+/// [`build_store_or_local`].
+pub fn build_store(config: &DaemonConfig) -> anyhow::Result<Arc<dyn ArtifactStore>> {
+    let root = config
+        .paths
+        .results_archive_dir
+        .clone();
+    match config.artifacts.kind {
+        ArtifactStoreKind::Local => Ok(Arc::new(LocalFsStore::new(root))),
+        ArtifactStoreKind::S3 => {
+            let s3 = config
+                .artifacts
+                .s3
+                .as_ref()
+                .context("[artifacts] kind = s3 but S3 settings are missing (config bug)")?;
+            let http = reqwest::Client::builder()
+                .connect_timeout(S3_CONNECT_TIMEOUT)
+                .read_timeout(S3_READ_TIMEOUT)
+                .build()
+                .context("building the HTTP client for the S3 artifact store")?;
+            Ok(Arc::new(S3Store::new(root, s3, http)?))
+        }
+    }
+}
+
+/// Like [`build_store`] but never fails: on an init error it logs and degrades
+/// to a local-only store so the run still archives its breadcrumb (Decision
+/// 0003). For the producer/reporter hot paths, which only hold the config — the
+/// strict [`build_store`] runs once at startup as the fail-fast validator.
+pub fn build_store_or_local(config: &DaemonConfig) -> Arc<dyn ArtifactStore> {
+    build_store(config).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "artifact store init failed; falling back to local-only archiving");
+        Arc::new(LocalFsStore::new(
+            config
+                .paths
+                .results_archive_dir
+                .clone(),
+        ))
+    })
 }
 
 /// Local-filesystem store rooted at `results_archive_dir` — the
@@ -89,17 +180,11 @@ impl LocalFsStore {
         Self { root }
     }
 
-    /// The per-job archive directory (`<root>/<job_id>`) — the local diagnostic
-    /// `archive_dir` (Decision 0002: a breadcrumb, not a fetch reference).
-    pub fn job_dir(&self, job_id: &str) -> PathBuf {
-        self.root.join(job_id)
-    }
-
     /// Resolve `key` to a path **under the root**, rejecting anything that
-    /// could escape it: absolute, `..`/`.`/prefix components, or empty.
-    /// Keys flow from persisted run-summary data once consumers wire in
-    /// (1b), so this is a security boundary, not just hygiene. `None` when
-    /// the key is unsafe.
+    /// could escape it: absolute, `..`/`.`/prefix components, or empty. Keys
+    /// flow from persisted run-summary data, so this is a security boundary,
+    /// not just hygiene. `None` when the key is unsafe. Shared by [`S3Store`]
+    /// (same module) to bound its download/sign paths too.
     fn checked_path(&self, key: &str) -> Option<PathBuf> {
         use std::path::Component;
         if key.is_empty()
@@ -113,8 +198,9 @@ impl LocalFsStore {
     }
 }
 
+#[async_trait::async_trait]
 impl ArtifactStore for LocalFsStore {
-    fn put(&self, key: &str, src: &Path) -> Option<u64> {
+    async fn put(&self, key: &str, src: &Path) -> Option<u64> {
         if !src.exists() {
             return None;
         }
@@ -137,7 +223,7 @@ impl ArtifactStore for LocalFsStore {
         }
     }
 
-    fn get(&self, key: &str) -> std::io::Result<PathBuf> {
+    async fn get(&self, key: &str) -> std::io::Result<PathBuf> {
         let path = self
             .checked_path(key)
             .ok_or_else(|| {
@@ -156,15 +242,215 @@ impl ArtifactStore for LocalFsStore {
         }
     }
 
+    fn job_dir(&self, job_id: &str) -> PathBuf {
+        self.root.join(job_id)
+    }
+
     /// Local FS can't mint an externally-usable URL (Decision 0001).
     fn signed_url(&self, _key: &str, _ttl: Duration) -> Result<String, ArtifactUrlError> {
         Err(ArtifactUrlError::Unsupported)
     }
 
-    fn exists(&self, key: &str) -> bool {
+    async fn exists(&self, key: &str) -> bool {
         self.checked_path(key)
             .map(|p| p.exists())
             .unwrap_or(false)
+    }
+}
+
+/// S3-compatible store (Hetzner / any S3 endpoint), **local-first**: a
+/// [`LocalFsStore`] mirror holds the `archive_dir` breadcrumb and the retained
+/// copy (Decision 0003), with S3 as the durable, fetchable backing. Requests
+/// are driven by presigned URLs (`rusty-s3` signs, `reqwest` executes), so the
+/// store carries no long-lived auth state beyond the credentials.
+pub struct S3Store {
+    /// The local mirror — `archive_dir`, the put breadcrumb, and the `get`
+    /// fast-path / retained copy when an upload fails.
+    local: LocalFsStore,
+    bucket: Bucket,
+    credentials: Credentials,
+    http: reqwest::Client,
+}
+
+impl S3Store {
+    pub fn new(local_root: PathBuf, cfg: &S3Config, http: reqwest::Client) -> anyhow::Result<Self> {
+        let endpoint = url::Url::parse(&cfg.endpoint)
+            .with_context(|| format!("[artifacts] invalid S3 endpoint: {}", cfg.endpoint))?;
+        // Path-style addressing is the portable choice for custom endpoints
+        // (Hetzner / MinIO), avoiding bucket-as-subdomain DNS requirements.
+        let bucket = Bucket::new(endpoint, UrlStyle::Path, cfg.bucket.clone(), cfg.region.clone())
+            .context("[artifacts] building the S3 bucket")?;
+        let credentials =
+            Credentials::new(cfg.access_key_id.clone(), cfg.secret_access_key.clone());
+        Ok(Self {
+            local: LocalFsStore::new(local_root),
+            bucket,
+            credentials,
+            http,
+        })
+    }
+
+    /// Upload the local copy of `key` to S3. Errors are surfaced to the caller,
+    /// which (per Decision 0003) logs but does not fail the job. The body is
+    /// **streamed** from disk (a run's SQLite db can be multi-GB), never read
+    /// fully into memory.
+    async fn upload(&self, key: &str, src: &Path) -> anyhow::Result<()> {
+        let file = tokio::fs::File::open(src)
+            .await
+            .with_context(|| format!("opening {} for S3 upload", src.display()))?;
+        let len = file
+            .metadata()
+            .await
+            .with_context(|| format!("stat {} for S3 upload", src.display()))?
+            .len();
+        let url = self
+            .bucket
+            .put_object(Some(&self.credentials), key)
+            .sign(INTERNAL_SIGN_TTL);
+        // Stream the file as the request body. `Content-Length` is set
+        // explicitly so S3 frames a single PutObject (it rejects chunked
+        // transfer-encoding for a plain PUT); the presigned URL signs only
+        // `host`, so an unsigned length header is fine.
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        let resp = self
+            .http
+            .put(url)
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(body)
+            .send()
+            .await
+            .context("S3 PUT request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("S3 PUT {key} returned HTTP {}", resp.status());
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ArtifactStore for S3Store {
+    async fn put(&self, key: &str, src: &Path) -> Option<u64> {
+        // Local mirror first — the breadcrumb + retained copy, and the
+        // authoritative success signal. A rejected/unsafe key or missing source
+        // stops here (and never reaches S3).
+        let size = self
+            .local
+            .put(key, src)
+            .await?;
+        // Best-effort S3 upload; a failure is logged, not fatal (Decision
+        // 0003) — the local copy is retained and the upload is retryable.
+        if let Err(e) = self.upload(key, src).await {
+            tracing::warn!(error = %e, key, "artifact store: S3 upload failed; local copy retained");
+        }
+        Some(size)
+    }
+
+    async fn get(&self, key: &str) -> std::io::Result<PathBuf> {
+        // Fast path: present in the local mirror (always true right after a
+        // run; may be reaped for an old run, hence the S3 fallback).
+        if let Ok(path) = self.local.get(key).await {
+            return Ok(path);
+        }
+        // Bound the download to the mirror root — never write outside it.
+        let dest = self
+            .local
+            .checked_path(key)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsafe artifact key: {key}"),
+                )
+            })?;
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), key)
+            .sign(INTERNAL_SIGN_TTL);
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| std::io::Error::other(format!("S3 GET {key}: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("artifact key not found in S3: {key} (HTTP {})", resp.status()),
+            ));
+        }
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        // **Stream** the body to disk (objects can be multi-GB) via a sibling
+        // per-download `.part` file, renamed on completion — an interrupted
+        // download never leaves a truncated artifact at the real key path, and
+        // concurrent misses for the same key don't collide on the temp file.
+        let part = part_path(&dest, &uuid::Uuid::new_v4().to_string());
+        let mut file = tokio::fs::File::create(&part).await?;
+        let mut stream = resp.bytes_stream();
+        let outcome = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    std::io::Error::other(format!("reading S3 GET body for {key}: {e}"))
+                })?;
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await
+        }
+        .await;
+        if let Err(e) = outcome {
+            // Best-effort cleanup of the partial file; surface the read/write error.
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(e);
+        }
+        tokio::fs::rename(&part, &dest).await?;
+        Ok(dest)
+    }
+
+    fn job_dir(&self, job_id: &str) -> PathBuf {
+        self.local.job_dir(job_id)
+    }
+
+    fn signed_url(&self, key: &str, ttl: Duration) -> Result<String, ArtifactUrlError> {
+        // Reuse the local store's traversal guard so a crafted key can't be
+        // signed into a path outside the run's namespace.
+        if self
+            .local
+            .checked_path(key)
+            .is_none()
+        {
+            return Err(ArtifactUrlError::Backend(format!("unsafe artifact key: {key}")));
+        }
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), key)
+            .sign(ttl);
+        Ok(url.to_string())
+    }
+
+    async fn exists(&self, key: &str) -> bool {
+        if self.local.exists(key).await {
+            return true;
+        }
+        if self
+            .local
+            .checked_path(key)
+            .is_none()
+        {
+            return false;
+        }
+        let url = self
+            .bucket
+            .head_object(Some(&self.credentials), key)
+            .sign(INTERNAL_SIGN_TTL);
+        match self
+            .http
+            .head(url)
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -189,8 +475,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn put_then_get_round_trips_and_lands_at_root_slash_key() {
+    #[tokio::test]
+    async fn put_then_get_round_trips_and_lands_at_root_slash_key() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let src = tmp.path().join("run.json");
@@ -200,36 +486,44 @@ mod tests {
             .unwrap();
 
         let key = artifact_key("job1", "run.json");
-        let size = s.put(&key, &src);
+        let size = s.put(&key, &src).await;
         assert_eq!(size, Some(b"{\"ok\":true}".len() as u64));
 
         // The key resolves to today's exact `<root>/<job_id>/<relative>` path.
-        let got = s.get(&key).unwrap();
+        let got = s.get(&key).await.unwrap();
         assert_eq!(
             got,
             tmp.path()
                 .join("archive/job1/run.json")
         );
         assert_eq!(std::fs::read(&got).unwrap(), b"{\"ok\":true}");
-        assert!(s.exists(&key));
+        assert!(s.exists(&key).await);
     }
 
-    #[test]
-    fn put_missing_src_returns_none() {
+    #[tokio::test]
+    async fn put_missing_src_returns_none() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
-        assert_eq!(s.put(&artifact_key("job1", "run.json"), &tmp.path().join("nope")), None);
+        assert_eq!(
+            s.put(&artifact_key("job1", "run.json"), &tmp.path().join("nope"))
+                .await,
+            None
+        );
     }
 
-    #[test]
-    fn get_absent_key_is_not_found() {
+    #[tokio::test]
+    async fn get_absent_key_is_not_found() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let err = s
             .get(&artifact_key("job1", "run.json"))
+            .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert!(!s.exists(&artifact_key("job1", "run.json")));
+        assert!(
+            !s.exists(&artifact_key("job1", "run.json"))
+                .await
+        );
     }
 
     #[test]
@@ -241,16 +535,16 @@ mod tests {
         assert!(matches!(err, ArtifactUrlError::Unsupported));
     }
 
-    #[test]
-    fn unsafe_keys_cannot_escape_the_root() {
+    #[tokio::test]
+    async fn unsafe_keys_cannot_escape_the_root() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let src = tmp.path().join("payload");
         std::fs::write(&src, b"x").unwrap();
         for bad in ["", "..", "../escape", "job1/../../escape", "/abs/escape", "./x"] {
-            assert_eq!(s.put(bad, &src), None, "put must reject {bad:?}");
-            assert!(s.get(bad).is_err(), "get must reject {bad:?}");
-            assert!(!s.exists(bad), "exists must be false for {bad:?}");
+            assert_eq!(s.put(bad, &src).await, None, "put must reject {bad:?}");
+            assert!(s.get(bad).await.is_err(), "get must reject {bad:?}");
+            assert!(!s.exists(bad).await, "exists must be false for {bad:?}");
         }
         // Nothing was written outside the root.
         assert!(
@@ -270,6 +564,84 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         assert_eq!(
             store(&tmp).job_dir("abc-123"),
+            tmp.path()
+                .join("archive/abc-123")
+        );
+    }
+
+    // ─── S3Store (no live endpoint needed) ───
+
+    fn s3_store(tmp: &TempDir, endpoint: &str) -> S3Store {
+        let cfg = S3Config {
+            endpoint: endpoint.to_string(),
+            bucket: "sbgh-artifacts".into(),
+            region: "fsn1".into(),
+            access_key_id: "AKIAEXAMPLE".into(),
+            secret_access_key: "s3cr3t".into(),
+        };
+        // Short timeout so the "unreachable endpoint" tests fail fast.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        S3Store::new(tmp.path().join("archive"), &cfg, http).unwrap()
+    }
+
+    #[test]
+    fn s3_signed_url_is_a_presigned_get() {
+        // Pure signing — no network. The URL targets the bucket+key and carries
+        // a SigV4 signature.
+        let tmp = TempDir::new().unwrap();
+        let s = s3_store(&tmp, "https://fsn1.example.com");
+        let url = s
+            .signed_url("job1/run.json", Duration::from_secs(900))
+            .unwrap();
+        assert!(url.contains("sbgh-artifacts"), "url targets the bucket: {url}");
+        assert!(url.contains("job1/run.json"), "url targets the key: {url}");
+        assert!(url.contains("X-Amz-Signature"), "url is presigned: {url}");
+    }
+
+    #[test]
+    fn s3_signed_url_rejects_unsafe_keys() {
+        let tmp = TempDir::new().unwrap();
+        let s = s3_store(&tmp, "https://fsn1.example.com");
+        let err = s
+            .signed_url("../escape", Duration::from_secs(60))
+            .unwrap_err();
+        assert!(matches!(err, ArtifactUrlError::Backend(_)));
+    }
+
+    /// Decision 0003: an S3 upload failure must NOT fail the put — the local
+    /// mirror is written + retained, and `get` still serves it. Pointed at an
+    /// unreachable endpoint so the upload errors without a mock server.
+    #[tokio::test]
+    async fn s3_put_succeeds_locally_when_upload_fails() {
+        let tmp = TempDir::new().unwrap();
+        let s = s3_store(&tmp, "http://127.0.0.1:9"); // discard port → refused
+        let src = tmp.path().join("run.json");
+        std::fs::write(&src, b"{\"ok\":true}").unwrap();
+
+        let key = artifact_key("job1", "run.json");
+        // Upload fails, but the local mirror write succeeds → Some(size).
+        let size = s.put(&key, &src).await;
+        assert_eq!(size, Some(b"{\"ok\":true}".len() as u64));
+
+        // The retained local copy is still fetchable via the mirror fast-path.
+        let got = s.get(&key).await.unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), b"{\"ok\":true}");
+        assert_eq!(
+            got,
+            tmp.path()
+                .join("archive/job1/run.json")
+        );
+    }
+
+    #[test]
+    fn s3_job_dir_is_the_local_mirror() {
+        let tmp = TempDir::new().unwrap();
+        let s = s3_store(&tmp, "https://fsn1.example.com");
+        assert_eq!(
+            s.job_dir("abc-123"),
             tmp.path()
                 .join("archive/abc-123")
         );

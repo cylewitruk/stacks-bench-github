@@ -174,6 +174,7 @@ pub struct DaemonConfig {
     pub api: ApiConfig,
     pub reporting: ReportingConfig,
     pub runner: RunnerConfig,
+    pub artifacts: ArtifactsConfig,
 }
 
 /// Daemon run-loop tuning (roadmap-v5). Deliberately **not** under `[vm]`: the
@@ -370,6 +371,65 @@ pub struct StacksBenchConfig {
     pub default_args: String,
 }
 
+/// Where run artifacts are stored and fetched (item `0001-artifact-store`,
+/// iteration v4). `local` (default) keeps today's on-disk behavior; `s3` ships
+/// artifacts to S3-compatible object storage (e.g. Hetzner) for off-box fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactsConfig {
+    pub kind: ArtifactStoreKind,
+    /// S3 settings — `Some` iff `kind == S3` (enforced at load).
+    pub s3: Option<S3Config>,
+}
+
+impl Default for ArtifactsConfig {
+    /// Local FS, today's behavior — the default when `[artifacts]` is absent.
+    fn default() -> Self {
+        Self {
+            kind: ArtifactStoreKind::Local,
+            s3: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStoreKind {
+    #[default]
+    Local,
+    S3,
+}
+
+impl std::str::FromStr for ArtifactStoreKind {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "local" => Ok(Self::Local),
+            "s3" => Ok(Self::S3),
+            other => {
+                Err(format!("unknown artifact store kind: {other} (expected `local` or `s3`)"))
+            }
+        }
+    }
+}
+
+/// S3-compatible endpoint settings. `endpoint`/`bucket`/`region` come from the
+/// `[artifacts]` TOML; the credentials are **env-only**
+/// (`SBGH_ARTIFACTS_S3_*`), mirroring `api.ingest_token`, so the secret never
+/// lands in the config file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct S3Config {
+    /// Base endpoint URL, e.g. `https://fsn1.your-objectstorage.com`.
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
 impl DaemonConfig {
     pub fn load() -> Result<Self> {
         let path = resolve_config_path(DAEMON_DEFAULT_CONFIG_PATH, DAEMON_HOME_RELATIVE);
@@ -403,6 +463,24 @@ struct RawDaemon {
     api: RawApi,
     reporting: RawReporting,
     runner: RawRunner,
+    artifacts: RawArtifacts,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawArtifacts {
+    kind: Option<ArtifactStoreKind>,
+    endpoint: Option<String>,
+    bucket: Option<String>,
+    region: Option<String>,
+    /// **Env-only** (`SBGH_ARTIFACTS_S3_ACCESS_KEY_ID`) — `#[serde(skip)]` +
+    /// `deny_unknown_fields` makes a TOML key a hard error (secret stays out of
+    /// the config file), mirroring `api.ingest_token`.
+    #[serde(skip)]
+    access_key_id: Option<String>,
+    /// **Env-only** (`SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY`).
+    #[serde(skip)]
+    secret_access_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -594,6 +672,12 @@ impl RawDaemon {
         merge_opt(&mut self.api.cookie_path, other.api.cookie_path);
         // `api.ingest_token` is env-only (#[serde(skip)]); nothing to merge
         // from a file.
+
+        merge_opt(&mut self.artifacts.kind, other.artifacts.kind);
+        merge_opt(&mut self.artifacts.endpoint, other.artifacts.endpoint);
+        merge_opt(&mut self.artifacts.bucket, other.artifacts.bucket);
+        merge_opt(&mut self.artifacts.region, other.artifacts.region);
+        // `artifacts.{access_key_id,secret_access_key}` are env-only.
     }
 
     fn apply_env(&mut self) {
@@ -674,6 +758,18 @@ impl RawDaemon {
             );
         }
         env_into(&mut self.runner.host_cpus, "SBGH_RUNNER_HOST_CPUS");
+
+        env_parse_into(&mut self.artifacts.kind, "SBGH_ARTIFACTS_KIND");
+        env_into(&mut self.artifacts.endpoint, "SBGH_ARTIFACTS_S3_ENDPOINT");
+        env_into(&mut self.artifacts.bucket, "SBGH_ARTIFACTS_S3_BUCKET");
+        env_into(&mut self.artifacts.region, "SBGH_ARTIFACTS_S3_REGION");
+        env_into(&mut self.artifacts.access_key_id, "SBGH_ARTIFACTS_S3_ACCESS_KEY_ID");
+        env_into(
+            &mut self
+                .artifacts
+                .secret_access_key,
+            "SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY",
+        );
     }
 
     fn into_config(self) -> Result<DaemonConfig> {
@@ -853,6 +949,35 @@ impl RawDaemon {
                     cpu_sets,
                     host_cpus: self.runner.host_cpus,
                 }
+            },
+            artifacts: {
+                let kind = self
+                    .artifacts
+                    .kind
+                    .unwrap_or_default();
+                // `s3` settings are required iff `kind = s3`; for `local` any
+                // stray S3 keys are simply ignored (no store to apply them to).
+                let s3 = match kind {
+                    ArtifactStoreKind::Local => None,
+                    ArtifactStoreKind::S3 => Some(S3Config {
+                        endpoint: required(
+                            self.artifacts.endpoint,
+                            "[artifacts].endpoint (kind = s3)",
+                        )?,
+                        bucket: required(self.artifacts.bucket, "[artifacts].bucket (kind = s3)")?,
+                        region: required(self.artifacts.region, "[artifacts].region (kind = s3)")?,
+                        access_key_id: required(
+                            self.artifacts.access_key_id,
+                            "SBGH_ARTIFACTS_S3_ACCESS_KEY_ID (kind = s3)",
+                        )?,
+                        secret_access_key: required(
+                            self.artifacts
+                                .secret_access_key,
+                            "SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY (kind = s3)",
+                        )?,
+                    }),
+                };
+                ArtifactsConfig { kind, s3 }
             },
         })
     }
@@ -1153,6 +1278,85 @@ mod tests {
         // an unknown field (hard error), not silently honored.
         let _g = EnvGuard::set(&daemon_env());
         let f = write("[api]\ningest_token = \"should-not-be-in-config\"\n");
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    // ─── ArtifactsConfig ───
+
+    #[test]
+    fn daemon_artifacts_defaults_to_local() {
+        let _g = EnvGuard::set(&daemon_env());
+        let cfg = DaemonConfig::load_layered(None).unwrap();
+        assert_eq!(cfg.artifacts.kind, ArtifactStoreKind::Local);
+        assert!(cfg.artifacts.s3.is_none(), "no S3 settings under local");
+    }
+
+    #[test]
+    fn daemon_artifacts_s3_from_toml_and_env() {
+        // endpoint/bucket/region from TOML; credentials env-only (out of the
+        // config file).
+        let mut env = daemon_env();
+        env.push(("SBGH_ARTIFACTS_S3_ACCESS_KEY_ID", "AKIAEXAMPLE"));
+        env.push(("SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY", "s3cr3t"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[artifacts]\nkind = \"s3\"\nendpoint = \"https://fsn1.example.com\"\nbucket = \
+             \"sbgh-artifacts\"\nregion = \"fsn1\"\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert_eq!(cfg.artifacts.kind, ArtifactStoreKind::S3);
+        let s3 = cfg
+            .artifacts
+            .s3
+            .expect("s3 settings present");
+        assert_eq!(s3.endpoint, "https://fsn1.example.com");
+        assert_eq!(s3.bucket, "sbgh-artifacts");
+        assert_eq!(s3.region, "fsn1");
+        assert_eq!(s3.access_key_id, "AKIAEXAMPLE");
+        assert_eq!(s3.secret_access_key, "s3cr3t");
+    }
+
+    #[test]
+    fn daemon_artifacts_kind_via_env_only() {
+        // A fully env-driven deployment (no TOML) can still opt into S3.
+        let mut env = daemon_env();
+        env.push(("SBGH_ARTIFACTS_KIND", "s3"));
+        env.push(("SBGH_ARTIFACTS_S3_ENDPOINT", "https://s3.example.com"));
+        env.push(("SBGH_ARTIFACTS_S3_BUCKET", "b"));
+        env.push(("SBGH_ARTIFACTS_S3_REGION", "r"));
+        env.push(("SBGH_ARTIFACTS_S3_ACCESS_KEY_ID", "k"));
+        env.push(("SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY", "s"));
+        let _g = EnvGuard::set(&env);
+        let cfg = DaemonConfig::load_layered(None).unwrap();
+        assert_eq!(cfg.artifacts.kind, ArtifactStoreKind::S3);
+        assert_eq!(
+            cfg.artifacts
+                .s3
+                .unwrap()
+                .bucket,
+            "b"
+        );
+    }
+
+    #[test]
+    fn daemon_artifacts_s3_missing_required_field_errors() {
+        // kind = s3 but no bucket → hard error (per-kind validation).
+        let mut env = daemon_env();
+        env.push(("SBGH_ARTIFACTS_S3_ACCESS_KEY_ID", "k"));
+        env.push(("SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY", "s"));
+        let _g = EnvGuard::set(&env);
+        let f = write("[artifacts]\nkind = \"s3\"\nendpoint = \"https://s3.example.com\"\n");
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn daemon_artifacts_s3_credentials_in_toml_are_rejected() {
+        // The S3 secret is env-only; a TOML `access_key_id` key is an unknown
+        // field (hard error), keeping the secret out of the config file.
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write("[artifacts]\nkind = \"s3\"\naccess_key_id = \"leaked\"\n");
         let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }

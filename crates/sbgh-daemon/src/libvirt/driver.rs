@@ -25,7 +25,7 @@ use sbgh_core::bench_args::effective_arg_string;
 use sbgh_core::config::DaemonConfig;
 use tokio_util::sync::CancellationToken;
 
-use crate::artifact_store::{ArtifactStore, LocalFsStore, artifact_key};
+use crate::artifact_store::{artifact_key, build_store_or_local};
 use crate::driver::{Driver, DriverOutcome, DriverStatus, Placement, TaskSpec};
 use crate::events::{EventSink, PhaseLabel};
 use crate::libvirt::boot::BootDisk;
@@ -200,49 +200,63 @@ impl LibvirtDriver {
             .and_then(|t| phase::read_last(&t.phase_log()))
             .map(|p| p.label().to_string());
 
-        // Archive the per-job artifacts through the store (LocalFsStore today →
-        // S3 in Phase 2). The summary records each artifact's store **key**
-        // (`<job_id>/<relative>`, Decision 0002), not a bare path; `put` returns
-        // the byte size, or `None` when the VM produced no such file.
-        let store = LocalFsStore::new(
-            self.config
-                .paths
-                .results_archive_dir
-                .clone(),
-        );
+        // Archive the per-job artifacts through the configured store (local FS,
+        // or S3 with a local mirror — Phase 2). The summary records each
+        // artifact's store **key** (`<job_id>/<relative>`, Decision 0002), not a
+        // bare path; `put` returns the byte size, or `None` when the VM produced
+        // no such file (or, for S3, the local mirror write failed — a failed S3
+        // upload is logged but still returns the local size, Decision 0003).
+        let store = build_store_or_local(self.config.as_ref());
+        let tmpfs = arts.tmpfs.as_ref();
 
         let sqlite_key = artifact_key(&job_id, forensics::SQLITE_RELATIVE);
-        let sqlite_size_bytes = arts
-            .tmpfs
-            .as_ref()
-            .and_then(|t| store.put(&sqlite_key, &t.sqlite_file()));
+        let sqlite_size_bytes = match tmpfs {
+            Some(t) => {
+                store
+                    .put(&sqlite_key, &t.sqlite_file())
+                    .await
+            }
+            None => None,
+        };
         let sqlite_archived_path = sqlite_size_bytes.map(|_| sqlite_key);
 
         // The append-only phase journal — cheap, makes per-job "how long was
         // each phase" trivial after the job dir is gone.
         let phase_log_key = artifact_key(&job_id, forensics::PHASE_LOG_RELATIVE);
-        let phase_log_size_bytes = arts
-            .tmpfs
-            .as_ref()
-            .and_then(|t| store.put(&phase_log_key, &t.phase_log()));
+        let phase_log_size_bytes = match tmpfs {
+            Some(t) => {
+                store
+                    .put(&phase_log_key, &t.phase_log())
+                    .await
+            }
+            None => None,
+        };
         let phase_log_archived_path = phase_log_size_bytes.map(|_| phase_log_key);
 
         // The stacks-bench binary that produced this run — the exact-version
         // reader for the DB. Missing when the VM didn't reach collecting.
         let binary_key = artifact_key(&job_id, forensics::BINARY_RELATIVE);
-        let binary_size_bytes = arts
-            .tmpfs
-            .as_ref()
-            .and_then(|t| store.put(&binary_key, &t.stacks_bench_binary()));
+        let binary_size_bytes = match tmpfs {
+            Some(t) => {
+                store
+                    .put(&binary_key, &t.stacks_bench_binary())
+                    .await
+            }
+            None => None,
+        };
         let binary_archived_path = binary_size_bytes.map(|_| binary_key);
 
         // Raw JSON stdout from `stacks-bench bench run --json` — the source of
         // the curated PR-comment metrics (read back via `ArtifactStore::get`).
         let run_json_key = artifact_key(&job_id, forensics::RUN_JSON_RELATIVE);
-        let run_json_size_bytes = arts
-            .tmpfs
-            .as_ref()
-            .and_then(|t| store.put(&run_json_key, &t.run_json()));
+        let run_json_size_bytes = match tmpfs {
+            Some(t) => {
+                store
+                    .put(&run_json_key, &t.run_json())
+                    .await
+            }
+            None => None,
+        };
         let run_json_archived_path = run_json_size_bytes.map(|_| run_json_key);
 
         // Chown the serial console log to sbgh before we try to read it.
@@ -1175,6 +1189,7 @@ mod tests {
                 cpu_sets: vec![],
                 host_cpus: None,
             },
+            artifacts: Default::default(),
         }
     }
 

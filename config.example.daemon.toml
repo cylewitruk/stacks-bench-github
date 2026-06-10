@@ -193,3 +193,27 @@ max_concurrent_jobs = 1
 # See docs/host-bringup.md §9 for the full host setup.
 # cpu_sets  = ["0-1", "2-3"]
 # host_cpus = "4-5"
+
+# Run-artifact storage (item 0001). Default `local` keeps artifacts on the
+# orchestrator's disk under [paths].results_archive_dir — today's behavior.
+[artifacts]
+kind = "local"
+
+# Opt into S3-compatible object storage (e.g. Hetzner) so Slack / the portal can
+# fetch artifacts off-box. The local archive is still written as a diagnostic
+# breadcrumb + retained copy; S3 is the durable, presigned-fetchable backing,
+# and an upload failure never fails the benchmark.
+#
+#   kind     = "s3"
+#   endpoint = "https://fsn1.your-objectstorage.com"
+#   bucket   = "sbgh-artifacts"
+#   region   = "fsn1"
+#
+# Credentials are ENV-ONLY (never in this file — a TOML key here is a hard
+# error, like [api].ingest_token):
+#   SBGH_ARTIFACTS_S3_ACCESS_KEY_ID
+#   SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY
+#
+# All of the above can also be set via env for a fully env-driven deploy:
+#   SBGH_ARTIFACTS_KIND=s3
+#   SBGH_ARTIFACTS_S3_ENDPOINT / _BUCKET / _REGION

@@ -1086,6 +1086,7 @@ mod tests {
                 cpu_sets: vec![],
                 host_cpus: None,
             },
+            artifacts: Default::default(),
         }
     }
 
