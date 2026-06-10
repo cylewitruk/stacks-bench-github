@@ -80,10 +80,12 @@ of the mandatory upgrade.
 
 ## Part B — opt into S3 (optional)
 
-> **Gate:** do **not** flip a production host to `kind = "s3"` until you've run
-> the live round-trip in [§B4](#b4-verify-the-live-round-trip) at least once
-> against your real bucket. The S3 paths (signing, streaming, fault-tolerance)
-> are unit-tested, but an actual upload→bucket→fetch is not exercised in CI.
+> **Smoke-test first.** The S3 code path — signing, streaming, fault-tolerance,
+> and a full upload→bucket→presigned-GET round-trip — is covered in CI against a
+> real S3 server (MinIO, `s3_round_trip.rs`), so the implementation is proven.
+> Still run [§B4](#b4-verify-the-live-round-trip) once against **your** bucket on
+> first enable, to catch endpoint / credential / network specifics that CI can't
+> (region, DNS, firewall, key scoping).
 
 S3 mode keeps the local archive as a diagnostic breadcrumb **and** retained
 copy, then best-effort uploads each artifact to the bucket. An upload failure is

@@ -26,12 +26,25 @@ fail-fast = false
 # healthcheck passes so the server accepts connections before any test runs.
 command = "docker compose -f docker/docker-compose.test.yml up --wait -d postgres"
 
+[scripts.setup.minio]
+# S3-compatible object storage for the artifact-store live round-trip test
+# (sbgh-daemon only). Idempotent `up`; the MinIO image ships its own
+# healthcheck, so `--wait` blocks until it's ready before any test runs.
+command = "docker compose -f docker/docker-compose.test.yml up --wait -d minio"
+
 # Shared Postgres for the packages whose suites touch the DB. Package-scoped
 # so new DB tests are covered without editing a list; a unit test in these
 # crates just triggers a (cheap, idempotent) `up` it doesn't use.
 [[profile.default.scripts]]
 filter = "package(=sbgh-core) | package(=sbgh-cli) | package(=sbgh-daemon)"
 setup = "postgres"
+
+# MinIO for the S3 round-trip test. Scoped to that one integration-test binary,
+# so unrelated targeted daemon-test runs don't pull/start MinIO — only a run
+# that includes `s3_round_trip` does.
+[[profile.default.scripts]]
+filter = "binary(=s3_round_trip)"
+setup = "minio"
 
 # A couple of retries for the DB-backed packages — transient shared-server
 # hiccups. Harmless on the deterministic unit tests in the same crates: they

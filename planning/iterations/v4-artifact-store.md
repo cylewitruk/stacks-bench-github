@@ -10,11 +10,10 @@ so deliverables start at v4. The canonical item identity is `0001-artifact-store
 > **Status:** in_progress
 >
 > Promoted from backlog 2026-06; design converted from the former
-> `docs/roadmap-v12.md`. **Phase 1 complete (Codex-signed-off). Phase 2
-> implemented (S3Store + config + wiring); Codex review round 1 fixes applied
-> (streaming I/O, client timeouts, example config) — re-review pending. One
-> deferral: the live-endpoint S3 round-trip test (no object-storage service in
-> CI).**
+> `docs/roadmap-v12.md`. **Phases 1 & 2 complete and Codex-signed-off. The
+> deferred live S3 round-trip now runs in CI (`s3_round_trip.rs` against a
+> pinned MinIO), closing the last gap — code-complete.** Remaining before
+> `shipped`: deploy v4 (see [v3-to-v4-upgrade.md](../../docs/v3-to-v4-upgrade.md)).
 
 ## Items
 
@@ -157,27 +156,31 @@ default + commented S3 example + env vars) in `config.example.daemon.toml`.
   `JobSource` holds the shared `Arc`, `main` builds once / fails fast).
 - [x] Unit tests (config parse per-kind; `S3Store` signing + fault-injection +
   traversal guard; `LocalFsStore` round-trip)
-- [ ] **Live-endpoint round-trip** — a real upload→bucket→presigned-GET against a
-  MinIO/S3 container is **not** in the harness yet (no object-storage service in
-  CI). The signing/path logic is unit-covered without network; the live
-  round-trip is deferred to manual validation / a follow-up integration job.
+- [x] **Live-endpoint round-trip** — `crates/sbgh-daemon/tests/s3_round_trip.rs`
+  runs against a compose-managed **MinIO** (pinned `RELEASE.2025-09-07T16-13-09Z`,
+  started by the `minio` nextest setup script). Proves end to end: upload reaches
+  the bucket, `get`/`exists` resolve from S3 against an *empty* mirror, and a
+  presigned GET fetches with **no client credentials** (MinIO accepts our SigV4
+  signature). Closes the prior deferral.
 - [x] Reviewed (Codex) — **signed off, code-complete.** Three rounds: streaming
   I/O (no whole-object buffering), connect/idle-read timeouts, `[artifacts]`
-  example config, and a per-download unique `.part` temp path. Standing caveat
-  (Codex's + ours): **don't enable `kind = "s3"` on the real host until a live
-  MinIO/Hetzner round-trip has been run** — see
-  [docs/v3-to-v4-upgrade.md](../../docs/v3-to-v4-upgrade.md) Part B.
-- [x] Validated — the checks below that don't need a live endpoint were run (672
-  tests green, lint clean)
+  example config, and a per-download unique `.part` temp path. Codex's standing
+  caveat (a live round-trip before trusting `kind = "s3"`) is now **satisfied in
+  CI** by `s3_round_trip.rs` against real MinIO; a Hetzner-specific smoke test on
+  first enable (real endpoint/creds/network) remains recommended, not a gate —
+  see [docs/v3-to-v4-upgrade.md](../../docs/v3-to-v4-upgrade.md) Part B.
+- [x] Validated — all checks run: full workspace suite green (684 tests, incl.
+  the live S3 round-trip), lint clean.
 
 **Acceptance & Validation:**
 
-- [ ] With `kind = "s3"`, a completed run's bundle is present in the bucket —
-  needs a live/mock S3 endpoint (see *Live-endpoint round-trip* above; deferred).
-- [x] `S3Store::signed_url` mints a **presigned GET** (SigV4, targets bucket+key);
-  `LocalFsStore` returns `Unsupported` — store unit tests
-  (`s3_signed_url_is_a_presigned_get`, `signed_url_is_unsupported_for_local`).
-  *(URL fetch-ability against a live bucket is part of the deferred round-trip.)*
+- [x] With `kind = "s3"`, an uploaded run artifact is present in the bucket —
+  validated by `s3_round_trip.rs` against live MinIO (upload → fetched back from
+  S3 via a fresh empty-mirror store).
+- [x] `S3Store::signed_url` mints a **working presigned GET** (SigV4, targets
+  bucket+key); `LocalFsStore` returns `Unsupported` — unit tests
+  (`s3_signed_url_is_a_presigned_get`, `signed_url_is_unsupported_for_local`) +
+  the live `s3_round_trip.rs` fetch confirms a real verifier honors the URL.
 - [x] **An `S3Store::put` failure after a completed benchmark does NOT fail the
   job** — local artifacts retained + still fetchable (Decision 0003) — validated
   via `s3_put_succeeds_locally_when_upload_fails` (unreachable endpoint → `put`
@@ -191,7 +194,9 @@ default + commented S3 example + env vars) in `config.example.daemon.toml`.
 - `S3Store` unit tests (signing, fault-injection, job_dir, traversal guard) —
   no live endpoint needed; `signed_url` presign + local-`Unsupported`.
 - `[artifacts]` config parse/validation tests in `crates/sbgh-core`.
-- *(Deferred: live MinIO/S3 round-trip integration test.)*
+- **`crates/sbgh-daemon/tests/s3_round_trip.rs`** — live round-trip against the
+  compose-managed MinIO (`minio` nextest setup script): upload → S3 fetch from a
+  fresh mirror → presigned GET → absent-key handling.
 
 ## Final Validation
 
