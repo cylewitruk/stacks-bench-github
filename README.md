@@ -28,7 +28,7 @@ the handler and CLI reach the daemon over `/api`.
 - [docs/v2-to-v3-upgrade.md](docs/v2-to-v3-upgrade.md) — upgrade an existing v2 deployment to v3.
 - [docs/v3-to-v4-upgrade.md](docs/v3-to-v4-upgrade.md) — upgrade v3 → v4 (the artifact store; opt-in S3).
 - [docs/v4-to-v5-upgrade.md](docs/v4-to-v5-upgrade.md) — upgrade v4 → v5 (Slack ad-hoc profiling; opt-in).
-- [docs/slack-setup.md](docs/slack-setup.md) — register + configure the `@sbgh` Slack bot.
+- [docs/slack-setup.md](docs/slack-setup.md) — register + configure the `@BenchBot` Slack bot.
 - [planning/index.md](planning/index.md) — **roadmap / backlog registry** (every
   item: shipped, planned, parked); guide + detail in [planning/](planning/README.md).
   The old `docs/roadmap-vN.md` docs were migrated here (shipped work →

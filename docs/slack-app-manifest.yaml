@@ -6,7 +6,7 @@
 #
 # Every scope below is dictated by a call the daemon actually makes — do not add
 # more (least privilege):
-#   app_mentions:read  — receive `app_mention` events (the `@sbgh …` surface)
+#   app_mentions:read  — receive `app_mention` events (the `@BenchBot …` surface)
 #   chat:write         — chat.postMessage (threaded result) + chat.postEphemeral
 #                        (invoker-only rejections)
 #   reactions:write    — reactions.add / reactions.remove (⏳ → ✅/❌ status swap)
@@ -17,12 +17,12 @@
 # separately (see docs/slack-setup.md).
 
 display_information:
-  name: sbgh
+  name: Stacks BenchBot
   description: stacks-core benchmark bot — ad-hoc profiling from Slack.
 
 features:
   bot_user:
-    display_name: sbgh
+    display_name: BenchBot
     always_online: true
 
 oauth_config:
@@ -39,8 +39,6 @@ settings:
   interactivity:
     is_enabled: false
   org_deploy_enabled: false
-  # Self-hosted Socket Mode app (daemon owns the WS connection) — no Slack-hosted
-  # endpoint.
   is_hosted: false
   socket_mode_enabled: true
   token_rotation_enabled: false

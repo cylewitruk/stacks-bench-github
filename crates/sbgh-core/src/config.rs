@@ -433,7 +433,7 @@ pub struct S3Config {
 
 /// Slack ad-hoc profiling connector (item `0002`, iteration v5). Disabled by
 /// default; when `enabled`, the orchestrator opens a Socket Mode connection and
-/// serves `@sbgh` mention benches. The code under test is a **constant**
+/// serves `@BenchBot` mention benches. The code under test is a **constant**
 /// (`default_repository`/`default_rev`); the workload is the variable (the
 /// mention's args). Tokens are **env-only**; identities are allowlisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

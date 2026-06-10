@@ -134,3 +134,56 @@ async fn s3_store_round_trips_against_minio() {
         .expect_err("get() of an absent key errors");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
+
+/// The Slack download-link gate (v5 acceptance): `signed_url_if_fetchable`
+/// links an object ONLY when it's actually in the **bucket** — not merely in
+/// the local mirror. A failed upload leaves the mirror populated (Decision
+/// 0003), so the gate must HEAD S3, never trust `exists` (which is
+/// local-or-remote).
+#[tokio::test]
+async fn signed_url_if_fetchable_requires_bucket_presence() {
+    ensure_bucket().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = s3_config();
+    let job = format!("it-{}", Uuid::new_v4());
+    let mirror = tmp.path().join("mirror");
+    let store = S3Store::new(mirror.clone(), &cfg, http()).unwrap();
+    let ttl = Duration::from_secs(300);
+
+    // Uploaded → in the bucket → a link is offered.
+    let present = artifact_key(&job, "uploaded.db");
+    let src = tmp.path().join("uploaded.db");
+    std::fs::write(&src, b"db-bytes").unwrap();
+    store
+        .put(&present, &src)
+        .await;
+    assert!(
+        store
+            .signed_url_if_fetchable(&present, ttl)
+            .await
+            .is_some(),
+        "an uploaded object is linkable",
+    );
+
+    // Local mirror present, S3 object ABSENT (the failed-upload case): write the
+    // mirror copy directly, never uploading. `exists` is true via the mirror,
+    // but the gate must still decline — no dead Slack link.
+    let local_only = artifact_key(&job, "local-only.db");
+    let mirror_path = mirror.join(&local_only);
+    std::fs::create_dir_all(mirror_path.parent().unwrap()).unwrap();
+    std::fs::write(&mirror_path, b"db-bytes").unwrap();
+    assert!(
+        store
+            .exists(&local_only)
+            .await,
+        "exists() is true via the local mirror"
+    );
+    assert!(
+        store
+            .signed_url_if_fetchable(&local_only, ttl)
+            .await
+            .is_none(),
+        "a local-only object must NOT be linked (bucket HEAD declines)",
+    );
+}

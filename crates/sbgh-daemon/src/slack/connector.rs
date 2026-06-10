@@ -1,6 +1,6 @@
 //! The Slack mention → benchmark orchestration (item `0002`, v5 Phase 1).
 //!
-//! Flow for one `@sbgh bench …` mention, in this order:
+//! Flow for one `@BenchBot bench …` mention, in this order:
 //!   1. **authz** (team + user allowlist) — *before* anything else;
 //!   2. **resolve** the workload (the deterministic parser seam);
 //!   3. **enqueue** an ad-hoc job (default repo/rev, no webhook) carrying the
@@ -100,11 +100,9 @@ impl SlackConnector {
             trigger_kind: TriggerKind::SlackAdhoc,
             // `Branch` is the neutral default for a default-rev like `develop`;
             // `git_commit_hash` is `None`, so the rev resolves to a commit at
-            // claim time. **PHASE GATE:** reporter `prepare` only resolves a
-            // commit for PR jobs (PR head) and tags today — a
-            // `ProgressTarget::Slack` job has neither, so it would fail
-            // `prepare`. Socket Mode MUST NOT be enabled until the next slice
-            // adds rev→commit resolution for Slack jobs.
+            // claim time — the reporter's `prepare` resolves a Slack job's bare
+            // rev (branch/tag/SHA) via `resolve_commit`, so it passes the
+            // empty-commit guard like a PR-head or tag job.
             git_ref_kind: GitRefKind::Branch,
             git_ref_display: rev,
             git_commit_hash: None,
@@ -218,6 +216,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((channel.into(), thread_ts.into(), text.into()));
+            Ok(())
+        }
+        async fn post_blocks_in_thread(
+            &self,
+            _channel: &str,
+            _thread_ts: &str,
+            _blocks: &serde_json::Value,
+            _fallback: &str,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn add_reaction(

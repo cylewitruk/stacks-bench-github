@@ -1,6 +1,6 @@
 # Slack ad-hoc profiling setup
 
-How to stand up the `@sbgh` benchmark bot (item 0002, iteration v5). The app
+How to stand up the `@BenchBot` benchmark bot (item 0002, iteration v5). The app
 definition lives in [`slack-app-manifest.yaml`](slack-app-manifest.yaml); the
 daemon-side config is the `[slack]` block in `config.example.daemon.toml`.
 
@@ -48,15 +48,15 @@ PR opened from it) — startup fails fast otherwise.
 
 ## 5. Invite + smoke test
 
-> The bot is addressed by its **display name** (`sbgh` in the manifest, but
-> workspace-renamable) — examples below use `@sbgh`; substitute whatever you
+> The bot is addressed by its **display name** (`BenchBot` in the manifest, but
+> workspace-renamable) — examples below use `@BenchBot`; substitute whatever you
 > named it. Nothing in the daemon hardcodes the name: Slack delivers mentions by
 > the bot's user id, and the daemon strips the leading `<@id>` token regardless.
 
-1. Invite the bot to the channel: `/invite @sbgh` (it can only see mentions and
+1. Invite the bot to the channel: `/invite @BenchBot` (it can only see mentions and
    reply in channels it is a member of).
 2. Restart the daemon — the log shows `slack: socket mode connected`.
-3. From an allowlisted user: `@sbgh bench --block <n>`.
+3. From an allowlisted user: `@BenchBot bench --block <n>`.
 4. Expect: ⏳ on your message → a threaded result with the metrics → ⏳ swapped
    for ✅ (or ❌ on failure). A denied/garbled request gets an ephemeral
    (invoker-only) reply and no reaction.

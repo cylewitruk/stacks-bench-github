@@ -3,6 +3,7 @@
 //! a reporting error is logged and swallowed, never failing the benchmark.
 
 use std::path::Path;
+use std::time::Duration;
 
 use sbgh_core::github::{
     CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi,
@@ -13,6 +14,12 @@ use crate::bench_summary::{self, RunResult};
 use crate::comparison::BaselineComparison;
 use crate::job_source::{ProgressTarget, RunnableJob};
 use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
+
+/// Lifetime of the presigned `stacks-bench.db` download link in a Slack card.
+/// Kept in sync with [`bench_summary::DB_LINK_TTL_HUMAN`] (the "expires in …"
+/// copy). 3 days is comfortably under S3's 7-day SigV4 cap and long enough to
+/// fetch the DB for local investigation.
+const DB_LINK_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 pub struct ProgressReporter<'a> {
     gh: &'a dyn GitHubApi,
@@ -52,18 +59,36 @@ impl<'a> ProgressReporter<'a> {
         summary: &serde_json::Value,
         comparison: Option<&BaselineComparison>,
     ) {
-        // Slack ad-hoc job → a threaded result + ⏳→✅ reaction swap, no GitHub
-        // surface (and no vs-baseline — ad-hoc runs aren't PRs).
+        // Slack ad-hoc job → a threaded Block Kit result card + ⏳→✅ reaction
+        // swap, no GitHub surface (and no vs-baseline — ad-hoc runs aren't PRs).
         if let ProgressTarget::Slack { channel, message_ts } = &self.job.progress {
             let result = self
                 .parsed_run(store, summary)
                 .await;
-            let body = bench_summary::render_slack_result(
-                &self.job.id.to_string(),
+            // A presigned download link for the archived DB — `Some` only in S3
+            // mode with the object in the bucket; absent → the card omits it.
+            let db_url = self
+                .signed_db_url(store, summary)
+                .await;
+            let commit_url =
+                format!("https://github.com/{}/commit/{}", self.job.repository, self.job.commit);
+            let blocks = bench_summary::render_slack_blocks(
+                &self.job.git_ref_display,
                 &self.job.commit,
+                &self.job.id.to_string(),
                 result.as_ref(),
+                db_url.as_deref(),
+                Some(&commit_url),
             );
-            self.post_thread(channel, message_ts, &body)
+            let fallback = format!(
+                ":white_check_mark: Benchmark complete — commit `{}` (job `{}`)",
+                self.job
+                    .commit
+                    .get(..8)
+                    .unwrap_or(&self.job.commit),
+                self.job.id,
+            );
+            self.post_thread_blocks(channel, message_ts, &blocks, &fallback)
                 .await;
             self.swap_reaction(channel, message_ts, COMPLETED_REACTION)
                 .await;
@@ -243,6 +268,46 @@ impl<'a> ProgressReporter<'a> {
         {
             tracing::warn!(job_id = %self.job.id, error = ?e, "slack: post_in_thread failed (non-fatal)");
         }
+    }
+
+    /// Post a Block Kit card (the completed-result surface) as a threaded
+    /// reply. Non-fatal; a no-op when no client is wired.
+    async fn post_thread_blocks(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        blocks: &serde_json::Value,
+        fallback: &str,
+    ) {
+        let Some(slack) = self.slack else {
+            tracing::debug!(job_id = %self.job.id, "slack terminal (no client wired)");
+            return;
+        };
+        if let Err(e) = slack
+            .post_blocks_in_thread(channel, thread_ts, blocks, fallback)
+            .await
+        {
+            tracing::warn!(job_id = %self.job.id, error = ?e, "slack: post_blocks_in_thread failed (non-fatal)");
+        }
+    }
+
+    /// A presigned download URL for the run's archived `stacks-bench.db`, or
+    /// `None`. `Some` only in S3 mode with the object **actually in the
+    /// bucket** (`signed_url_if_fetchable` HEADs it first — the v5
+    /// acceptance gate): a `local` store has no shareable URL, a run that
+    /// produced no DB has no `sqlite_archived_path`, and a failed upload
+    /// (local mirror only) yields no link rather than a dead one.
+    async fn signed_db_url(
+        &self,
+        store: &dyn ArtifactStore,
+        summary: &serde_json::Value,
+    ) -> Option<String> {
+        let key = summary
+            .get("sqlite_archived_path")
+            .and_then(|v| v.as_str())?;
+        store
+            .signed_url_if_fetchable(key, DB_LINK_TTL)
+            .await
     }
 
     /// Retire the queued ⏳ and add the terminal `to` reaction (✅/❌) on the
@@ -529,11 +594,12 @@ mod tests {
     use crate::artifact_store::LocalFsStore;
     use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
 
-    /// Records every terminal Slack call so tests can assert the thread reply +
-    /// the ⏳→✅/❌ reaction swap.
+    /// Records every terminal Slack call so tests can assert the thread reply /
+    /// card + the ⏳→✅/❌ reaction swap.
     #[derive(Default)]
     struct FakeSlackClient {
         threads: StdMutex<Vec<(String, String, String)>>, // (channel, thread_ts, text)
+        blocks: StdMutex<Vec<(String, String, String)>>,  // (channel, thread_ts, blocks-json)
         added: StdMutex<Vec<(String, String, String)>>,   // (channel, ts, reaction)
         removed: StdMutex<Vec<(String, String, String)>>, // (channel, ts, reaction)
     }
@@ -548,6 +614,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((c.into(), ts.into(), t.into()));
+            Ok(())
+        }
+        async fn post_blocks_in_thread(
+            &self,
+            c: &str,
+            ts: &str,
+            blocks: &serde_json::Value,
+            _fallback: &str,
+        ) -> anyhow::Result<()> {
+            self.blocks
+                .lock()
+                .unwrap()
+                .push((c.into(), ts.into(), blocks.to_string()));
             Ok(())
         }
         async fn add_reaction(&self, c: &str, ts: &str, r: &str) -> anyhow::Result<()> {
@@ -576,9 +655,9 @@ mod tests {
         }
     }
 
-    /// A completed Slack ad-hoc job posts the rendered metrics as a threaded
-    /// reply (`thread_ts` = the request ts) and swaps ⏳→✅ — never touching
-    /// GitHub.
+    /// A completed Slack ad-hoc job posts a Block Kit card (in the request
+    /// thread) carrying the metrics, and swaps ⏳→✅ — never touching GitHub.
+    /// A `local` store mints no download link, so the card omits it.
     #[tokio::test]
     async fn slack_completed_posts_thread_and_swaps_to_check() {
         let tmp = TempDir::new().unwrap();
@@ -596,27 +675,52 @@ mod tests {
 
         ProgressReporter::new(&gh, &job)
             .with_slack(Some(&slack))
-            .completed(&store, &serde_json::json!({ "run_json_archived_path": "run.json" }), None)
+            .completed(
+                &store,
+                // sqlite key present, but a local store can't presign → no link.
+                &serde_json::json!({
+                    "run_json_archived_path": "run.json",
+                    "sqlite_archived_path": "job/appdata/stacks-bench.db",
+                }),
+                None,
+            )
             .await;
 
-        // One threaded reply on the request's ts, carrying the metrics.
-        let threads = slack.threads.lock().unwrap();
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].0, "C1");
-        assert_eq!(threads[0].1, "1700000000.000100", "reply is in the request thread");
+        // One Block Kit card on the request's ts, carrying the metrics; the
+        // plain-text post_in_thread is unused for the completed surface.
         assert!(
-            threads[0]
+            slack
+                .threads
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "completed posts blocks, not text"
+        );
+        let blocks = slack.blocks.lock().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, "C1");
+        assert_eq!(blocks[0].1, "1700000000.000100", "card is in the request thread");
+        // A plan card titled for the job's ref @ commit (slack_job → develop@abc123).
+        assert!(
+            blocks[0]
                 .2
-                .contains("*Benchmark complete*"),
+                .contains("Benchmark develop @ abc123"),
             "{}",
-            threads[0].2
+            blocks[0].2
         );
         assert!(
-            threads[0]
+            blocks[0]
                 .2
                 .contains("Blocks measured"),
             "metrics rendered: {}",
-            threads[0].2
+            blocks[0].2
+        );
+        assert!(
+            !blocks[0]
+                .2
+                .contains("Download stacks-bench.db"),
+            "local store → no download link: {}",
+            blocks[0].2
         );
 
         // ⏳ removed, ✅ added — on the same message.

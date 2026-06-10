@@ -173,7 +173,7 @@ deterministic validator (the LLM never emits raw `bench_args`, so it can't
 inject flags). Authz stays *before* resolution; an uncertain resolver asks a
 clarifying question in-thread.
 
-**Acceptance:** A natural-language `@sbgh` request resolves to the correct
+**Acceptance:** A natural-language `@BenchBot` request resolves to the correct
 `WorkloadSpec` (or asks a clarifying question), under the same authz + validation
 guards as the flag parser.
 

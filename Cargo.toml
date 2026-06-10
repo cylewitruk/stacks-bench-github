@@ -45,6 +45,9 @@ jsonwebtoken = "10"
 # all rustls/ring-aligned with our stack; the `axum` feature (Events-API HTTP
 # push) is deliberately NOT enabled — Socket Mode is an outbound WebSocket.
 slack-morphism = { version = "2", default-features = false, features = ["hyper"] }
+# Typed Block Kit builders (item 0002): the terminal result card (`task_card`).
+# Serde-only at runtime — no async/HTTP stack of its own.
+slack-messaging = "0.7"
 
 # Crypto / hashing for webhook signature verification
 hmac = "0.12"

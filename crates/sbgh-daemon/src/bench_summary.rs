@@ -208,27 +208,159 @@ fn verdict_phrase(v: Verdict) -> &'static str {
     }
 }
 
-/// Render the per-job Slack thread reply for a successful ad-hoc run (item
-/// `0002`). Slack mrkdwn has no tables or `<details>`, so the metrics become a
-/// bullet list under a one-line headline. Short commit + job id identify the
-/// run; an empty metric set degrades to a bare "completed" line.
-pub fn render_slack_result(job_id: &str, commit: &str, result: Option<&RunResult>) -> String {
+/// Human-readable form of the db link TTL, kept in sync with
+/// `progress::DB_LINK_TTL` so the card's "expires in …" copy matches the signed
+/// URL's lifetime.
+pub const DB_LINK_TTL_HUMAN: &str = "3 days";
+
+/// Render the per-job Slack Block Kit card for a completed ad-hoc run (item
+/// `0002`) as a [`plan`](https://docs.slack.dev/reference/block-kit/blocks/plan-block)
+/// block — the timeline container — whose `task_card` rows are the benchmark's
+/// stages (Build → Benchmark → Archive), all `complete`. The metrics fill the
+/// Benchmark row's rich-text `output`; the Build row links the GitHub commit;
+/// the Archive row links the archived `stacks-bench.db` in S3 mode (`db_url` is
+/// `Some`). Returns the `blocks` array (caller supplies the plain `text`
+/// fallback). Falls back to a minimal section block if the typed builder ever
+/// rejects the (statically valid) shape, so terminal reporting stays non-fatal.
+///
+/// This is a **terminal snapshot** (every row `complete`); a live
+/// `pending → in_progress → complete` timeline would post the plan early and
+/// `chat.update` it as phases advance (a future streaming slice).
+pub fn render_slack_blocks(
+    rev: &str,
+    commit: &str,
+    job_id: &str,
+    result: Option<&RunResult>,
+    db_url: Option<&str>,
+    commit_url: Option<&str>,
+) -> serde_json::Value {
+    match build_plan(rev, commit, job_id, result, db_url, commit_url) {
+        Ok(blocks) => blocks,
+        Err(e) => {
+            tracing::warn!(error = %e, "slack: plan block build failed; using a plain section card");
+            fallback_card(rev, commit, result, db_url)
+        }
+    }
+}
+
+/// The metric lines for a card's rich-text `output` (one `text` element; Slack
+/// renders the embedded newlines). An empty set degrades to a note.
+fn card_output_text(result: Option<&RunResult>) -> String {
+    match result.map(metric_rows) {
+        Some(rows) if !rows.is_empty() => rows
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => "No parsed metrics — see the daemon archive for raw output.".to_string(),
+    }
+}
+
+/// A one-line rich-text body (one section, one text element) — the shape
+/// `task_card.details`/`output` validate as "exactly one element".
+fn rich_text_line(
+    text: String,
+) -> Result<slack_messaging::blocks::RichText, Box<dyn std::error::Error>> {
+    use slack_messaging::blocks::RichText;
+    use slack_messaging::blocks::rich_text::RichTextSection;
+    use slack_messaging::blocks::rich_text::types::RichTextElementText;
+    Ok(RichText::builder()
+        .element(
+            RichTextSection::builder()
+                .element(
+                    RichTextElementText::builder()
+                        .text(text)
+                        .build()?,
+                )
+                .build()?,
+        )
+        .build()?)
+}
+
+fn build_plan(
+    rev: &str,
+    commit: &str,
+    job_id: &str,
+    result: Option<&RunResult>,
+    db_url: Option<&str>,
+    commit_url: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use slack_messaging::blocks::elements::UrlSource;
+    use slack_messaging::blocks::{Plan, TaskCard, TaskStatus};
+
     let short = commit
         .get(..8)
         .unwrap_or(commit);
-    let mut out =
-        format!(":white_check_mark: *Benchmark complete* — commit `{short}` (job `{job_id}`)\n");
-    match result.map(metric_rows) {
-        Some(rows) if !rows.is_empty() => {
-            for (k, v) in rows {
-                out.push_str(&format!("• *{k}:* {v}\n"));
-            }
-        }
-        // Parsed but empty, or no run.json at all — say so rather than render a
-        // bare headline that looks truncated.
-        _ => out.push_str("_(no parsed metrics — see the daemon archive for raw output)_\n"),
+
+    // Build → compiled stacks-core at the commit (+ a link to it).
+    let mut build = TaskCard::builder()
+        .task_id(format!("{job_id}-build"))
+        .title("Built stacks-core")
+        .status(TaskStatus::Complete)
+        .details(rich_text_line(format!("commit {short}"))?);
+    if let Some(url) = commit_url {
+        build = build.source(
+            UrlSource::builder()
+                .url(url)
+                .text("View commit")
+                .build()?,
+        );
     }
-    out
+
+    // Benchmark → the metrics in `output`.
+    let bench = TaskCard::builder()
+        .task_id(format!("{job_id}-bench"))
+        .title("Ran benchmark")
+        .status(TaskStatus::Complete)
+        .output(rich_text_line(card_output_text(result))?)
+        .build()?;
+
+    // Archive → the DB download (S3 only).
+    let mut archive = TaskCard::builder()
+        .task_id(format!("{job_id}-archive"))
+        .title("Archived artifacts")
+        .status(TaskStatus::Complete);
+    if let Some(url) = db_url {
+        archive = archive.source(
+            UrlSource::builder()
+                .url(url)
+                .text(format!("Download stacks-bench.db (expires in {DB_LINK_TTL_HUMAN})"))
+                .build()?,
+        );
+    }
+
+    let plan = Plan::builder()
+        .title(format!("Benchmark {rev} @ {short}"))
+        .task(build.build()?)
+        .task(bench)
+        .task(archive.build()?)
+        .build()?;
+
+    Ok(serde_json::json!([serde_json::to_value(plan)?]))
+}
+
+/// Minimal valid fallback if the typed `task_card` builder errors (shouldn't —
+/// the shape is static) — a single mrkdwn section so something still posts.
+fn fallback_card(
+    rev: &str,
+    commit: &str,
+    result: Option<&RunResult>,
+    db_url: Option<&str>,
+) -> serde_json::Value {
+    let short = commit
+        .get(..8)
+        .unwrap_or(commit);
+    let mut text = format!(":white_check_mark: *Benchmark complete* — `{rev}` @ `{short}`\n");
+    for (k, v) in result
+        .map(metric_rows)
+        .unwrap_or_default()
+    {
+        text.push_str(&format!("• *{k}:* {v}\n"));
+    }
+    if let Some(url) = db_url {
+        text.push_str(&format!(":inbox_tray: <{url}|Download stacks-bench.db>\n"));
+    }
+    serde_json::json!([{ "type": "section", "text": { "type": "mrkdwn", "text": text } }])
 }
 
 /// Build the "Metric | Value" GitHub-flavoured Markdown table from
@@ -519,10 +651,16 @@ mod tests {
         assert!(md.contains("partial measurements"));
     }
 
-    // ─── item 0002: Slack thread render ───
+    // ─── item 0002: Slack plan-block card ───
+
+    /// The whole `blocks` array as one string — convenient for substring
+    /// assertions without walking the JSON.
+    fn blocks_text(v: &serde_json::Value) -> String {
+        v.to_string()
+    }
 
     #[test]
-    fn render_slack_result_lists_metrics() {
+    fn render_slack_blocks_builds_plan_with_phase_tasks_and_links() {
         let r = RunResult {
             success: Some(true),
             duration_secs: Some(2203.8),
@@ -538,26 +676,72 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let s = render_slack_result("job-1", "abcdef1234567890", Some(&r));
-        assert!(s.contains(":white_check_mark: *Benchmark complete*"), "{s}");
-        // Short commit (8) + job id.
-        assert!(s.contains("commit `abcdef12`"), "{s}");
-        assert!(s.contains("(job `job-1`)"), "{s}");
-        // Bullet list (Slack mrkdwn), not a GitHub table.
-        assert!(s.contains("• *Blocks measured:* 5,000 (1,000 warmup)"), "{s}");
-        assert!(s.contains("• *Execution:*"), "{s}");
-        assert!(!s.contains("| Metric |"), "Slack render must not emit a GH table: {s}");
+        let v = render_slack_blocks(
+            "feat/foo",
+            "abcdef1234567890",
+            "job-1",
+            Some(&r),
+            Some("https://s3/db?sig=x"),
+            Some("https://github.com/o/r/commit/abcdef1234567890"),
+        );
+        let blocks = v
+            .as_array()
+            .expect("blocks is an array");
+
+        // One plan block, titled, with the three phase task rows (all complete).
+        assert_eq!(blocks.len(), 1, "{v}");
+        assert_eq!(blocks[0]["type"], "plan");
+        let tasks = blocks[0]["tasks"]
+            .as_array()
+            .expect("plan has tasks");
+        assert_eq!(tasks.len(), 3, "{v}");
+        assert_eq!(tasks[0]["title"], "Built stacks-core");
+        assert_eq!(tasks[1]["title"], "Ran benchmark");
+        assert_eq!(tasks[2]["title"], "Archived artifacts");
+        for t in tasks {
+            assert_eq!(t["status"], "complete", "{v}");
+        }
+
+        let s = blocks_text(&v);
+        assert!(s.contains("Benchmark feat/foo @ abcdef12"), "plan title: {s}");
+        // Metrics live in the Benchmark row's rich-text output.
+        assert!(s.contains("Blocks measured: 5,000 (1,000 warmup)"), "metrics: {s}");
+        // Build row links the commit; Archive row links the DB (S3) with TTL.
+        assert!(s.contains("View commit"), "{s}");
+        assert!(s.contains("https://s3/db?sig=x"), "{s}");
+        assert!(s.contains("Download stacks-bench.db"), "{s}");
+        assert!(s.contains(DB_LINK_TTL_HUMAN), "{s}");
+        // Never a GitHub table.
+        assert!(!s.contains("| Metric |"), "no GH table in a Slack card: {s}");
     }
 
     #[test]
-    fn render_slack_result_handles_empty_metrics() {
-        // Parsed but all-`None`, and the no-run.json case both fall back.
+    fn render_slack_blocks_omits_db_link_without_url() {
+        let r = RunResult {
+            data: Some(RunData {
+                measured_blocks: Some(100),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let v = render_slack_blocks("dev", "deadbeefcafe", "j", Some(&r), None, None);
+        let s = blocks_text(&v);
+        assert!(!s.contains("Download stacks-bench.db"), "no DB link in local mode: {s}");
+        // Still a valid plan with the three rows.
+        assert_eq!(v.as_array().unwrap()[0]["type"], "plan", "{s}");
+        assert!(s.contains("Ran benchmark"), "{s}");
+    }
+
+    #[test]
+    fn render_slack_blocks_handles_empty_metrics() {
+        // Parsed but all-`None`, and the no-run.json case both render the note in
+        // the Benchmark row's output (still a valid plan).
         let empty = RunResult::default();
         for result in [Some(&empty), None] {
-            let s = render_slack_result("j", "deadbeefcafe", result);
-            assert!(s.contains("*Benchmark complete*"), "{s}");
-            assert!(s.contains("no parsed metrics"), "{s}");
-            assert!(!s.contains("• *"), "no bullets when there are no metrics: {s}");
+            let v = render_slack_blocks("dev", "deadbeefcafe", "j", result, None, None);
+            let s = blocks_text(&v);
+            assert_eq!(v.as_array().unwrap()[0]["type"], "plan", "{s}");
+            assert!(s.contains("No parsed metrics"), "{s}");
         }
     }
 

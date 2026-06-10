@@ -19,13 +19,12 @@
 //!   benchmark failure: [`S3Store::put`] returns the *local* size and retains
 //!   the local copy, logging the upload error.
 //!
-//! Wiring status (v4 Phase 2): `put` / `get` / `job_dir` are live — the libvirt
-//! driver archives through `put`, the reporter/job-source/progress readers
-//! resolve keys via `get`, and [`build_store`] picks the impl from config.
-//! `exists` + `signed_url` + [`ArtifactUrlError`] are **implemented** for both
-//! stores but have no in-tree caller yet — their consumers are the Slack
-//! (`0002`) and portal (`0003`) fetch paths — so the module keeps
-//! `allow(dead_code)` until those land.
+//! Wiring status: `put` / `get` / `job_dir` are live (the libvirt driver
+//! archives through `put`; the reporter/job-source/progress readers resolve
+//! keys via `get`; [`build_store`] picks the impl from config).
+//! `signed_url_if_fetchable` is consumed by the Slack (`0002`) result card's DB
+//! download link; `exists` / `signed_url` / [`ArtifactUrlError`] remain for the
+//! portal (`0003`) fetch path, so the module keeps `allow(dead_code)`.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -120,7 +119,19 @@ pub trait ArtifactStore: Send + Sync {
     /// failure so callers can branch the fallback correctly.
     fn signed_url(&self, key: &str, ttl: Duration) -> Result<String, ArtifactUrlError>;
 
-    /// Whether `key` exists in the store.
+    /// A signed URL for `key` **only if the object is actually fetchable** —
+    /// the gated form a public link (e.g. Slack) must use. Distinct from
+    /// `signed_url`, which signs unconditionally: a failed S3 upload still
+    /// leaves the local mirror (Decision 0003), so `exists` (local-or-remote)
+    /// can't tell "in the bucket" from "local only". This verifies *bucket*
+    /// presence first. Default `None` — a store with no shareable URL
+    /// (`LocalFsStore`) never offers a link.
+    async fn signed_url_if_fetchable(&self, key: &str, ttl: Duration) -> Option<String> {
+        let _ = (key, ttl);
+        None
+    }
+
+    /// Whether `key` exists in the store (local mirror **or** the bucket).
     async fn exists(&self, key: &str) -> bool;
 }
 
@@ -325,6 +336,33 @@ impl S3Store {
         }
         Ok(())
     }
+
+    /// Bucket-side `HEAD` for `key` — the authoritative "is the object really
+    /// in S3" check, with **no** local-mirror fast path. `exists` is true
+    /// whenever the mirror has it (so a failed upload still shows local);
+    /// this is what gates a public download link.
+    async fn head_in_bucket(&self, key: &str) -> bool {
+        if self
+            .local
+            .checked_path(key)
+            .is_none()
+        {
+            return false; // unsafe key — never construct a URL for it
+        }
+        let url = self
+            .bucket
+            .head_object(Some(&self.credentials), key)
+            .sign(INTERNAL_SIGN_TTL);
+        match self
+            .http
+            .head(url)
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -427,30 +465,15 @@ impl ArtifactStore for S3Store {
         Ok(url.to_string())
     }
 
+    async fn signed_url_if_fetchable(&self, key: &str, ttl: Duration) -> Option<String> {
+        // The gate (v5 acceptance): only link an object actually in the bucket.
+        // `head_in_bucket` (not `exists`) so a failed upload — local mirror
+        // present, S3 object absent — yields no link rather than a dead one.
+        if self.head_in_bucket(key).await { self.signed_url(key, ttl).ok() } else { None }
+    }
+
     async fn exists(&self, key: &str) -> bool {
-        if self.local.exists(key).await {
-            return true;
-        }
-        if self
-            .local
-            .checked_path(key)
-            .is_none()
-        {
-            return false;
-        }
-        let url = self
-            .bucket
-            .head_object(Some(&self.credentials), key)
-            .sign(INTERNAL_SIGN_TTL);
-        match self
-            .http
-            .head(url)
-            .send()
-            .await
-        {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
-        }
+        self.local.exists(key).await || self.head_in_bucket(key).await
     }
 }
 

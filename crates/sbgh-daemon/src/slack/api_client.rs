@@ -111,6 +111,25 @@ impl SlackClient for WebApiClient {
         .await
     }
 
+    async fn post_blocks_in_thread(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        blocks: &serde_json::Value,
+        fallback: &str,
+    ) -> anyhow::Result<()> {
+        self.call(
+            "chat.postMessage",
+            serde_json::json!({
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "blocks": blocks,
+                "text": fallback,
+            }),
+        )
+        .await
+    }
+
     async fn add_reaction(&self, channel: &str, ts: &str, reaction: &str) -> anyhow::Result<()> {
         self.call(
             "reactions.add",

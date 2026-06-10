@@ -13,11 +13,11 @@ slow."* No PR, no commit under test — the code is a constant (a configured def
 rev), the **workload** is the variable (`--txid` / `--block`), and the deliverable
 is a **flamegraph**, not a vs-baseline delta.
 
-**Goal:** someone posts `@sbgh bench --block 184231 --repetitions 5` (or `--txid
+**Goal:** someone posts `@BenchBot bench --block 184231 --repetitions 5` (or `--txid
 0xabc…`) in Slack and gets back a flamegraph — reusing the existing bench
 execution path. Slack is a **new trigger source** + **new reporting surface**; the
 job is the **existing bench `Recipe`** with ad-hoc workload args (no new task
-kind). *(v1 entry surface = **`@sbgh` mention**, pinned during v5 scoping; see
+kind). *(v1 entry surface = **`@BenchBot` mention**, pinned during v5 scoping; see
 [iterations/v5-slack-adhoc-profiling.md](../iterations/v5-slack-adhoc-profiling.md).)* It rides the shipped `Driver` seam (`0010`), is independent of the worker
 fleet (`0004`) and task-kind platform (`0005`), and its flamegraph delivery
 depends on the artifact store (`0001`).
@@ -102,7 +102,7 @@ dials *out* (firewall/NAT-friendly — same philosophy as the v9 worker model).
 - Prove end-to-end by hand: open a Socket Mode connection, receive an
   `app_mention` envelope, **ack within 3 s**, and post a **threaded** reply +
   a status reaction.
-- Entry surface is **decided: `@sbgh` mention** (Decision 6) — not a slash
+- Entry surface is **decided: `@BenchBot` mention** (Decision 6) — not a slash
   command. The spike confirms the mention event + threaded reply + reaction.
 - **`stacks-bench` artifact spike (Codex) — the other half of the de-risk.** Run
   the intended ad-hoc command (`--txid`/`--block` + `--repetitions`) locally / in
@@ -119,7 +119,7 @@ dials *out* (firewall/NAT-friendly — same philosophy as the v9 worker model).
 
 ## Phase 1: Slack connector + ad-hoc job enqueue
 
-**Goal:** `@sbgh bench …` enqueues a job and acks with a ⏳ status **reaction**
+**Goal:** `@BenchBot bench …` enqueues a job and acks with a ⏳ status **reaction**
 on the request (no bot parent message).
 
 > **Not deployable alone (Codex).** Phase 1 is an internal slice — Slack enqueue
@@ -251,7 +251,7 @@ add **live** phase progress.
   `app_mention` event carries none) with a form for tx/block/repetitions/rev,
   instead of memorized flags.
 - **Buttons** on a result: "Re-run", "Profile again with more repetitions".
-- `@sbgh` **mention** invocation + threaded results.
+- `@BenchBot` **mention** invocation + threaded results.
 
 **Status:**
 
@@ -278,7 +278,7 @@ add **live** phase progress.
    the orchestrator).
 5. **Reporting is generalized behind a `ReportSurface` trait.** GitHub + Slack
    are two impls selected by `ProgressTarget`; existing GitHub behavior preserved.
-6. **Entry surface = `@sbgh` mention, not a slash command — pinned during v5
+6. **Entry surface = `@BenchBot` mention, not a slash command — pinned during v5
    scoping.** A slash command leaves no channel message to thread on; a mention
    (`app_mention` event) is a real message whose `ts` anchors the thread, and a
    free-text message is the natural home for the future LLM resolver (`0020`). A

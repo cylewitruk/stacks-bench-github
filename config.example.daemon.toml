@@ -220,7 +220,7 @@ kind = "local"
 
 # Slack ad-hoc profiling connector (item 0002, iteration v5). Disabled by
 # default — when off, the connector never starts and the rest of this section is
-# inert. Enable it to serve `@sbgh bench …` mention benches over Socket Mode.
+# inert. Enable it to serve `@BenchBot bench …` mention benches over Socket Mode.
 [slack]
 enabled = false
 

@@ -2,7 +2,7 @@
 
 Cutting a **running** v4 deployment over to v5 (**Slack ad-hoc profiling**, item
 `0002-slack-adhoc-profiling`). v5 adds Slack as a new **trigger source** +
-**reporting surface**: an `@sbgh bench --block/--txid …` mention enqueues an
+**reporting surface**: an `@BenchBot bench --block/--txid …` mention enqueues an
 ad-hoc benchmark whose code-under-test is a constant (`[slack].default_rev`) and
 whose workload is the variable, with results posted back in the request's
 thread.
@@ -22,7 +22,7 @@ is only for upgrading a host already running v4 (see
 
 | Layer | v4 (deployed) | v5 (this upgrade) |
 | ---- | ---- | ---- |
-| Trigger sources | GitHub: PR `/benchmark`, `branch_push`, `tag_created` | **+ `slack_adhoc`** (an `@sbgh` mention), opt-in |
+| Trigger sources | GitHub: PR `/benchmark`, `branch_push`, `tag_created` | **+ `slack_adhoc`** (an `@BenchBot` mention), opt-in |
 | Reporting surfaces | PR comment + commit Check Run | **+ a Slack thread** (result + ⏳→✅/❌ reaction) for Slack jobs |
 | Config | `[artifacts]` (v4) | **+ a new optional `[slack]` section; default `enabled = false`** |
 | Secrets | `SBGH_API_INGEST_TOKEN`, `SBGH_ARTIFACTS_S3_*` | `+ SBGH_SLACK_APP_TOKEN` / `SBGH_SLACK_BOT_TOKEN` **only if** you enable Slack (env-only, like the others) |
@@ -111,11 +111,11 @@ A TOML `app_token` / `bot_token` key is a **hard startup error** (env-only, like
 
 ### B4. Smoke-test
 
-Invite the bot to a channel (`/invite @sbgh` — it only sees mentions and replies
+Invite the bot to a channel (`/invite @BenchBot` — it only sees mentions and replies
 where it's a member), then from an allowlisted user:
 
 ```text
-@sbgh bench --block <n>
+@BenchBot bench --block <n>
 ```
 
 Expect: ⏳ on your message → a threaded reply with the metrics → ⏳ swapped for

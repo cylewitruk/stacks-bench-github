@@ -190,6 +190,15 @@ mod tests {
         async fn post_in_thread(&self, _c: &str, _ts: &str, _t: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn post_blocks_in_thread(
+            &self,
+            _c: &str,
+            _ts: &str,
+            _b: &serde_json::Value,
+            _f: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn add_reaction(&self, _c: &str, _ts: &str, reaction: &str) -> anyhow::Result<()> {
             self.reactions
                 .lock()

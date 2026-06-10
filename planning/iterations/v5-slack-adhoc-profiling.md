@@ -34,7 +34,7 @@ behind a surface seam, reusable for any later surface.
 
 ## Scope
 
-A Socket-Mode Slack connector with an **`@sbgh` mention** entry surface, a
+A Socket-Mode Slack connector with an **`@BenchBot` mention** entry surface, a
 `slack_adhoc` trigger (default repo/rev from config, ad-hoc workload), a
 generalized `ReportSurface`, and a flamegraph artifact delivered into Slack. The
 **code under test is a constant** (configured default rev) and the **workload is
@@ -42,7 +42,7 @@ the variable** — so an ad-hoc job is an ordinary `RunnableJob` with
 `ProgressTarget::Slack`, baseline comparison off. Details + transport rationale
 (Socket Mode, ack discipline, authz) live in the design doc.
 
-**Entry surface = `@sbgh` mention** (an `app_mention` event), *not* a slash
+**Entry surface = `@BenchBot` mention** (an `app_mention` event), *not* a slash
 command — chosen so all reporting can thread under the user's own request
 message (a slash command leaves no channel message to thread on) and because a
 free-text message is the natural home for the future LLM intent resolver. A
@@ -73,7 +73,7 @@ request text ─▶ resolve_workload() ─▶ validated WorkloadSpec ─▶ benc
 ## Cross-cutting: threaded reporting (anti-spam)
 
 **All bot output threads under the user's own request message** — there is **no
-bot-posted parent**. The user's `@sbgh bench …` mention *is* the single
+bot-posted parent**. The user's `@BenchBot bench …` mention *is* the single
 channel-level message; everything else (progress, result, flamegraph, db link)
 is a **threaded reply** under it (`thread_ts` = the request's `ts`). The channel
 shows just the request + a tidy thread, even when several profiles run at once.
@@ -138,7 +138,7 @@ This is a first-class requirement from Phase 1 onward.
 >
 > **All slices are green.** The only remaining step is operational: the user
 > provides `SBGH_SLACK_APP_TOKEN`/`SBGH_SLACK_BOT_TOKEN`, flips
-> `[slack].enabled = true`, and runs a live smoke test (`@sbgh bench …`).
+> `[slack].enabled = true`, and runs a live smoke test (`@BenchBot bench …`).
 
 ### Phase 0: Slack app + Socket Mode + artifact spike (de-risk)
 
@@ -169,7 +169,7 @@ wiring.
 
 **Acceptance & Validation:**
 
-- [ ] A hand-driven `@sbgh bench …` round-trips (ack < 3 s, threaded reply +
+- [ ] A hand-driven `@BenchBot bench …` round-trips (ack < 3 s, threaded reply +
   status reaction post) — manual spike.
 - [ ] The profiler flag set + emitted flamegraph file path are documented (feeds
   Phase 4's manifest entry) — recorded in the design doc / this iteration.
@@ -179,7 +179,7 @@ biggest unknowns (Socket Mode behavior, flamegraph artifact shape).
 
 ### Phase 1: Slack connector + ad-hoc enqueue (behind config)
 
-**Goal:** `@sbgh bench …` enqueues a job and acks on the **request** (status
+**Goal:** `@BenchBot bench …` enqueues a job and acks on the **request** (status
 reaction); no bot parent message.
 
 > **Not deployable alone.** Phase 1 stays disabled/behind config until Phase 2
@@ -217,7 +217,7 @@ reaction); no bot parent message.
 
 **Acceptance & Validation:**
 
-- [ ] A valid `@sbgh bench …` enqueues exactly one `RunnableJob` with the resolved
+- [ ] A valid `@BenchBot bench …` enqueues exactly one `RunnableJob` with the resolved
   `bench_args` and `ProgressTarget::Slack` anchored on the **request ts**, and
   posts **no** channel message (only a reaction) — fake-Slack-client test.
 - [ ] An off-allowlist `team_id`/user gets a **`chat.postEphemeral`** rejection,
@@ -375,7 +375,7 @@ for the deliverable.
 
 Surfaced from the design's open questions + this iteration's refinements:
 
-1. **Entry surface = `@sbgh` mention** (thread on the user's request; no bot
+1. **Entry surface = `@BenchBot` mention** (thread on the user's request; no bot
    parent). **Pinned** — see Scope. (Slash command is a possible later
    secondary surface, Phase 5.)
 2. **Threaded reporting** — all output threads under the request; status via a
@@ -397,7 +397,7 @@ Surfaced from the design's open questions + this iteration's refinements:
 
 ## Final Validation
 
-- **MVP (Phases 1+2):** `@sbgh bench --block N --repetitions K` → a status
+- **MVP (Phases 1+2):** `@BenchBot bench --block N --repetitions K` → a status
   reaction on the request + a threaded absolute-timing result, end-to-end on the
   bench path; GitHub reporting untouched.
 - **Payoff (Phase 4):** the same flow returns a **flamegraph** in-thread.

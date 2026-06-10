@@ -3,8 +3,8 @@
 //! Slack is a new **trigger source** + **reporting surface** for the *ad-hoc,
 //! no-commit* case ("profile this tx/block from yesterday"). The code under
 //! test is a constant (`[slack].default_repository`/`default_rev`); the
-//! workload is the variable (`--txid`/`--block`/…), resolved from an `@sbgh`
-//! mention.
+//! workload is the variable (`--txid`/`--block`/…), resolved from an
+//! `@BenchBot` mention.
 //!
 //! This module is built in slices (v5 phases): [`workload`] is the pure
 //! resolve-then-validate seam, [`connector`] the mention→job orchestration,

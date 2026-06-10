@@ -15,7 +15,7 @@
 //!   `--warmup <n>`                   (warmup iterations)
 //!   `--rev <ref>`                    (override the code-under-test rev)
 //!
-//! The caller passes text with the leading `@sbgh` mention already stripped
+//! The caller passes text with the leading `@BenchBot` mention already stripped
 //! (Slack-formatting concerns stay in the connector; this layer is surface- and
 //! Slack-agnostic so the LLM resolver can reuse it).
 
@@ -133,7 +133,7 @@ pub fn resolve_workload(text: &str) -> Result<WorkloadSpec, ResolveError> {
         .split_whitespace()
         .peekable();
 
-    // Skip an optional leading `bench` verb (`@sbgh bench …` → `bench …` here).
+    // Skip an optional leading `bench` verb (`@BenchBot bench …` → `bench …` here).
     if tokens
         .peek()
         .is_some_and(|t| t.eq_ignore_ascii_case("bench"))

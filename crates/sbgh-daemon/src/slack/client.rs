@@ -26,13 +26,24 @@ pub trait SlackClient: Send + Sync {
     async fn post_ephemeral(&self, channel: &str, user: &str, text: &str) -> anyhow::Result<()>;
 
     /// Post `text` as a threaded reply under the message at `thread_ts` in
-    /// `channel` — the terminal result surface, kept in the request's thread so
-    /// it never spams the channel.
+    /// `channel` — the terminal surface for the terse failed / cancelled notes,
+    /// kept in the request's thread so it never spams the channel.
     async fn post_in_thread(
         &self,
         channel: &str,
         thread_ts: &str,
         text: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Post a Block Kit message (`blocks`) as a threaded reply under
+    /// `thread_ts` — the rich completed-result card. `fallback` is the plain
+    /// notification/accessibility text Slack shows where blocks can't render.
+    async fn post_blocks_in_thread(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        blocks: &serde_json::Value,
+        fallback: &str,
     ) -> anyhow::Result<()>;
 
     /// Add an emoji `reaction` to the message at `ts` in `channel` — the
