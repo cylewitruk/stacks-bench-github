@@ -14,7 +14,7 @@ use sbgh_core::db::{
 };
 use sbgh_core::models::{
     GitRefKind, JobCreationRequest, JobKind, JobMetric, JobResult, JobStatus, NewJob,
-    NewPullRequestLink, TriggerKind,
+    NewPullRequestLink, QueuedEventDetail, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -39,6 +39,56 @@ fn make_request(webhook_id: i64) -> JobCreationRequest {
         }),
         queued_event_detail: Some(serde_json::json!({"trigger": "pr_comment"})),
     }
+}
+
+/// v5 (item 0002): in-memory parity for `create_adhoc_job` (the store the Slack
+/// connector tests use) — a webhook-less queued job whose queued event carries
+/// the `SlackAdhoc` provenance, with no webhook link.
+#[tokio::test]
+async fn create_adhoc_job_is_webhook_less_and_preserves_detail() {
+    let store = InMemoryJobStore::new();
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into()],
+    })
+    .unwrap();
+    let new_job = NewJob {
+        github_installation_id: 100,
+        github_repo_id: 10,
+        job_kind: JobKind::AdHoc,
+        trigger_kind: TriggerKind::SlackAdhoc,
+        git_ref_kind: GitRefKind::Branch,
+        git_ref_display: "develop".into(),
+        git_commit_hash: None,
+        git_committed_at: None,
+        workload_key: None,
+    };
+
+    let job = store
+        .create_adhoc_job(&new_job, &detail)
+        .await
+        .unwrap();
+    assert_eq!(job.status, JobStatus::Queued);
+    assert_eq!(job.trigger_kind, TriggerKind::SlackAdhoc);
+    assert!(job.claim_token.is_none() && job.claimed_at.is_none());
+
+    // No webhook link — same boundary as the Postgres path.
+    assert!(!store.has_webhook_link_for_job(job.id), "an ad-hoc job must have no webhook link");
+
+    // The queued event preserves the SlackAdhoc detail verbatim.
+    let queued = store
+        .queued_event(job.id)
+        .await
+        .unwrap()
+        .expect("ad-hoc job has a queued event");
+    assert_eq!(
+        queued
+            .detail
+            .expect("queued event carries detail")
+            .0,
+        detail
+    );
 }
 
 #[tokio::test]

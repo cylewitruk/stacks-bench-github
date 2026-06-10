@@ -208,10 +208,49 @@ fn verdict_phrase(v: Verdict) -> &'static str {
     }
 }
 
-/// Build the "Metric | Value" GitHub-flavoured Markdown table. Skips
-/// any row whose source field is `None`. Returns an empty string if no
-/// metrics were present (caller renders the fallback message).
+/// Render the per-job Slack thread reply for a successful ad-hoc run (item
+/// `0002`). Slack mrkdwn has no tables or `<details>`, so the metrics become a
+/// bullet list under a one-line headline. Short commit + job id identify the
+/// run; an empty metric set degrades to a bare "completed" line.
+pub fn render_slack_result(job_id: &str, commit: &str, result: Option<&RunResult>) -> String {
+    let short = commit
+        .get(..8)
+        .unwrap_or(commit);
+    let mut out =
+        format!(":white_check_mark: *Benchmark complete* — commit `{short}` (job `{job_id}`)\n");
+    match result.map(metric_rows) {
+        Some(rows) if !rows.is_empty() => {
+            for (k, v) in rows {
+                out.push_str(&format!("• *{k}:* {v}\n"));
+            }
+        }
+        // Parsed but empty, or no run.json at all — say so rather than render a
+        // bare headline that looks truncated.
+        _ => out.push_str("_(no parsed metrics — see the daemon archive for raw output)_\n"),
+    }
+    out
+}
+
+/// Build the "Metric | Value" GitHub-flavoured Markdown table from
+/// [`metric_rows`]. Returns an empty string if no metrics were present (caller
+/// renders the fallback message).
 fn metric_table(r: &RunResult) -> String {
+    let rows = metric_rows(r);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("| Metric | Value |\n| ---- | ---- |\n");
+    for (k, v) in rows {
+        out.push_str(&format!("| {k} | {v} |\n"));
+    }
+    out
+}
+
+/// Extract the user-facing `(label, value)` metric rows shared by every
+/// renderer (GitHub table + Slack list). Skips any row whose source field is
+/// `None`; an all-`None` result yields an empty `Vec` (caller renders a
+/// fallback).
+fn metric_rows(r: &RunResult) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = Vec::new();
 
     let data = r.data.as_ref();
@@ -269,15 +308,7 @@ fn metric_table(r: &RunResult) -> String {
         rows.push(("Interrupted".to_string(), "**yes** (partial measurements)".to_string()));
     }
 
-    if rows.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::from("| Metric | Value |\n| ---- | ---- |\n");
-    for (k, v) in rows {
-        out.push_str(&format!("| {k} | {v} |\n"));
-    }
-    out
+    rows
 }
 
 fn avg_us_per(total_us: u64, divisor: Option<u64>) -> String {
@@ -486,6 +517,48 @@ mod tests {
         let md = render_pr_comment("j", "h", "/p", Some(&r), None);
         assert!(md.contains("Interrupted"));
         assert!(md.contains("partial measurements"));
+    }
+
+    // ─── item 0002: Slack thread render ───
+
+    #[test]
+    fn render_slack_result_lists_metrics() {
+        let r = RunResult {
+            success: Some(true),
+            duration_secs: Some(2203.8),
+            data: Some(RunData {
+                measured_blocks: Some(5000),
+                warmup_blocks: Some(1000),
+                summary: Some(RunSummary {
+                    transactions: Some(12345),
+                    execution_duration_us: Some(72_940_000),
+                    commit_duration_us: Some(18_280_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let s = render_slack_result("job-1", "abcdef1234567890", Some(&r));
+        assert!(s.contains(":white_check_mark: *Benchmark complete*"), "{s}");
+        // Short commit (8) + job id.
+        assert!(s.contains("commit `abcdef12`"), "{s}");
+        assert!(s.contains("(job `job-1`)"), "{s}");
+        // Bullet list (Slack mrkdwn), not a GitHub table.
+        assert!(s.contains("• *Blocks measured:* 5,000 (1,000 warmup)"), "{s}");
+        assert!(s.contains("• *Execution:*"), "{s}");
+        assert!(!s.contains("| Metric |"), "Slack render must not emit a GH table: {s}");
+    }
+
+    #[test]
+    fn render_slack_result_handles_empty_metrics() {
+        // Parsed but all-`None`, and the no-run.json case both fall back.
+        let empty = RunResult::default();
+        for result in [Some(&empty), None] {
+            let s = render_slack_result("j", "deadbeefcafe", result);
+            assert!(s.contains("*Benchmark complete*"), "{s}");
+            assert!(s.contains("no parsed metrics"), "{s}");
+            assert!(!s.contains("• *"), "no bullets when there are no metrics: {s}");
+        }
     }
 
     // ─── roadmap-v7: vs-baseline headline render ───

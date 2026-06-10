@@ -32,6 +32,7 @@ use crate::events::{EventSink, PhaseLabel, SinkResult, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
 use crate::progress::ProgressReporter;
+use crate::slack::client::SlackClient;
 
 /// Resolve the App's numeric id via `GET /app`, cached on **success** in `cell`
 /// (a `get_or_try_init` that leaves the cell empty on error, so a transient
@@ -86,6 +87,10 @@ pub struct Reporter {
     /// `ensure_check` only when a Check Run is actually wanted, so a no-report
     /// job makes no `GET /app` call.
     app_id: Arc<OnceCell<i64>>,
+    /// The Slack surface for `ProgressTarget::Slack` jobs (item 0002), shared
+    /// from the runner. `None` for a GitHub-only deployment, or until the
+    /// wiring slice injects a real client.
+    slack: Option<Arc<dyn SlackClient>>,
     job: RunnableJob,
 }
 
@@ -95,9 +100,17 @@ impl Reporter {
         jobs: Arc<dyn RunnableJobStore>,
         gh: Arc<dyn GitHubApi>,
         app_id: Arc<OnceCell<i64>>,
+        slack: Option<Arc<dyn SlackClient>>,
         job: RunnableJob,
     ) -> Self {
-        Self { config, jobs, gh, app_id, job }
+        Self {
+            config,
+            jobs,
+            gh,
+            app_id,
+            slack,
+            job,
+        }
     }
 
     /// The reporter task body. Consumes `self`; see module docs for the
@@ -146,7 +159,8 @@ impl Reporter {
             "job running (claimed → running)",
         );
 
-        let reporter = ProgressReporter::new(self.gh.as_ref(), &self.job);
+        let reporter =
+            ProgressReporter::new(self.gh.as_ref(), &self.job).with_slack(self.slack.as_deref());
 
         // Defensive empty-commit guard: now `running`, fail terminally so it
         // records a terminal state instead of looping via the sweep.
@@ -440,9 +454,10 @@ impl Reporter {
         }
     }
 
-    /// Resolve the job's commit when empty: a PR job → the PR head SHA; a
-    /// `tag_created` baseline → the tag ref. `branch_push` carries its commit
-    /// from enqueue (non-empty → no-op). Mutates `self.job.commit`.
+    /// Resolve the job's commit when empty: a PR job → the PR head SHA; a Slack
+    /// ad-hoc job → its rev (`[slack].default_rev` / `--rev`); a `tag_created`
+    /// baseline → the tag ref. `branch_push` carries its commit from enqueue
+    /// (non-empty → no-op). Mutates `self.job.commit`.
     async fn resolve_commit(&mut self) -> anyhow::Result<Option<ResolvedCommit>> {
         if !self.job.commit.is_empty() {
             return Ok(None);
@@ -455,6 +470,23 @@ impl Reporter {
             tracing::info!(job_id = %self.job.id, pr_number, sha = %sha, "resolved PR head SHA at claim time");
             self.job.commit = sha.clone();
             return Ok(Some(ResolvedCommit { hash: sha, committed_at: None }));
+        }
+        if let ProgressTarget::Slack { .. } = self.job.progress {
+            // A Slack ad-hoc job's rev is a branch/tag/SHA — resolve the **bare**
+            // ref, which GitHub's `commits/{ref}` accepts for any of those forms
+            // (a tag job qualifies `tags/<name>` because it KNOWS it's a tag; a
+            // Slack rev's kind is unknown, so the bare ref is correct).
+            let resolved = self
+                .gh
+                .resolve_commit(
+                    self.job.installation_id,
+                    &self.job.repository,
+                    &self.job.git_ref_display,
+                )
+                .await?;
+            tracing::info!(job_id = %self.job.id, rev = %self.job.git_ref_display, commit = %resolved.hash, "resolved Slack rev to commit at claim time");
+            self.job.commit = resolved.hash.clone();
+            return Ok(Some(resolved));
         }
         if self.job.git_ref_kind == GitRefKind::Tag {
             // Qualified `tags/<name>` so it unambiguously targets the tag.
@@ -530,6 +562,10 @@ impl Reporter {
                 }
                 self.job.progress = ProgressTarget::CommitCheck { check_run_id };
             }
+            // Slack jobs have no GitHub surface to ensure — the request
+            // reaction is added by the connector at enqueue, and the threaded
+            // result is posted at terminal (connector slice). Nothing here.
+            ProgressTarget::Slack { .. } => {}
         }
     }
 
@@ -694,7 +730,7 @@ impl ProgressSink {
     fn comment_id(&self) -> Option<i64> {
         match self.job.progress {
             ProgressTarget::PullRequest { comment_id, .. } => comment_id,
-            ProgressTarget::CommitCheck { .. } => None,
+            ProgressTarget::CommitCheck { .. } | ProgressTarget::Slack { .. } => None,
         }
     }
 
@@ -702,6 +738,8 @@ impl ProgressSink {
         match self.job.progress {
             ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
             ProgressTarget::CommitCheck { check_run_id } => check_run_id,
+            // No GitHub check for a Slack job.
+            ProgressTarget::Slack { .. } => None,
         }
     }
 
@@ -990,6 +1028,7 @@ mod tests {
                 host_cpus: None,
             },
             artifacts: Default::default(),
+            slack: Default::default(),
         }
     }
 
@@ -1005,6 +1044,7 @@ mod tests {
             store.clone(),
             Arc::new(FakeGitHub::new()),
             Arc::new(OnceCell::new()),
+            None,
             // Pre-resolved commit → prepare's resolve is a no-op; `CommitCheck`
             // + `baseline_report = none` → prepare creates no surfaces.
             job_with(ProgressTarget::CommitCheck { check_run_id: None }),
@@ -1044,6 +1084,7 @@ mod tests {
             store.clone(),
             gh.clone(),
             Arc::new(OnceCell::new()),
+            None,
             // Pre-resolved commit; a check id already on the job (as if read
             // back on re-claim) so the cancelled conclusion has a target.
             job_with(ProgressTarget::CommitCheck { check_run_id: Some(900) }),
@@ -1188,7 +1229,8 @@ mod tests {
         job.repository = "cylewitruk/stacks-core".into();
         job.workload_key = Some("wk1".into());
 
-        let reporter = Reporter::new(Arc::new(config), store, gh, Arc::new(OnceCell::new()), job);
+        let reporter =
+            Reporter::new(Arc::new(config), store, gh, Arc::new(OnceCell::new()), None, job);
 
         let summary = serde_json::json!({ "run_json_archived_path": run_json_key });
         let c = reporter
@@ -1217,6 +1259,7 @@ mod tests {
             Arc::new(RecordingStore::default()),
             Arc::new(FakeGitHub::new()),
             Arc::new(OnceCell::new()),
+            None,
             job_with(ProgressTarget::CommitCheck { check_run_id: Some(1) }),
         );
         assert!(
@@ -1257,6 +1300,7 @@ mod tests {
             Arc::new(RecordingStore::default()),
             gh,
             Arc::new(OnceCell::new()),
+            None,
             job,
         );
         assert!(

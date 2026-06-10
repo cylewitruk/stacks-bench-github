@@ -35,7 +35,9 @@ pub struct ResolvedBenchArgs {
 /// optional string split on whitespace; a `None` string yields no tokens.
 pub fn normalize_stored(detail: &QueuedEventDetail) -> Vec<String> {
     match detail {
-        QueuedEventDetail::PrComment { bench_args, .. } => bench_args.clone(),
+        // `pr_comment` and `slack_adhoc` carry a token vec directly.
+        QueuedEventDetail::PrComment { bench_args, .. }
+        | QueuedEventDetail::SlackAdhoc { bench_args, .. } => bench_args.clone(),
         QueuedEventDetail::BranchPush { bench_args, .. }
         | QueuedEventDetail::TagCreated { bench_args, .. } => bench_args
             .as_deref()
@@ -133,10 +135,30 @@ mod tests {
         }
     }
 
+    fn slack(args: &[&str]) -> QueuedEventDetail {
+        QueuedEventDetail::SlackAdhoc {
+            channel: "C123".into(),
+            message_ts: "1700000000.000100".into(),
+            bench_args: args
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
     #[test]
     fn normalize_pr_comment_passes_tokens_through() {
         assert_eq!(normalize_stored(&pr(&["--count", "5000"])), vec!["--count", "5000"]);
         assert!(normalize_stored(&pr(&[])).is_empty());
+    }
+
+    #[test]
+    fn normalize_slack_adhoc_passes_tokens_through() {
+        assert_eq!(
+            normalize_stored(&slack(&["--block", "184231", "--repetitions", "5"])),
+            vec!["--block", "184231", "--repetitions", "5"]
+        );
+        assert!(normalize_stored(&slack(&[])).is_empty());
     }
 
     #[test]

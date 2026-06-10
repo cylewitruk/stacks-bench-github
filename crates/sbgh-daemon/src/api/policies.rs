@@ -138,7 +138,11 @@ pub async fn add_trigger(
     State(s): State<ApiState>,
     ApiJson(req): ApiJson<AddTriggerRequest>,
 ) -> Result<Json<TriggerView>, ApiErr> {
+    // Only webhook trigger kinds are valid policies; reject the rest up front so
+    // the error matches the message (and never reaches the DB).
+    // `add_trigger_policy` enforces the same boundary for non-API callers.
     let kind: TriggerKind = parse_enum(&req.kind)
+        .filter(|k| matches!(k, TriggerKind::BranchPush | TriggerKind::TagCreated))
         .ok_or_else(|| ApiErr::bad_request("`kind` must be `branch_push` or `tag_created`"))?;
     let row = admin::add_trigger_policy(
         &s.pool,

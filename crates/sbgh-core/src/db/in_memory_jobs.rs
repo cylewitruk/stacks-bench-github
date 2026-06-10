@@ -280,6 +280,56 @@ impl JobStore for InMemoryJobStore {
         })))
     }
 
+    async fn create_adhoc_job(
+        &self,
+        new_job: &NewJob,
+        queued_event_detail: &serde_json::Value,
+    ) -> Result<Job> {
+        let now = Utc::now();
+        let job_id = Uuid::new_v4();
+        let job = Job {
+            id: job_id,
+            github_installation_id: new_job.github_installation_id,
+            github_repo_id: new_job.github_repo_id,
+            status: JobStatus::Queued,
+            job_kind: new_job.job_kind,
+            trigger_kind: new_job.trigger_kind,
+            git_ref_kind: new_job.git_ref_kind,
+            git_ref_display: new_job
+                .git_ref_display
+                .clone(),
+            git_commit_hash: new_job
+                .git_commit_hash
+                .clone(),
+            git_committed_at: new_job.git_committed_at,
+            workload_key: new_job.workload_key.clone(),
+            claim_token: None,
+            claimed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let queued_event = JobEvent {
+            id: self
+                .next_event_id
+                .fetch_add(1, Ordering::SeqCst),
+            job_id,
+            event_kind: JobEventKind::Queued,
+            event_status: JobEventStatus::Success,
+            occurred_at: now,
+            github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
+            remark: None,
+            detail: Some(sqlx::types::Json(queued_event_detail.clone())),
+        };
+        let mut s = self.state.lock().unwrap();
+        s.jobs
+            .insert(job_id, job.clone());
+        s.insertion_order.push(job_id);
+        s.events.push(queued_event);
+        Ok(job)
+    }
+
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         Ok(self
             .state

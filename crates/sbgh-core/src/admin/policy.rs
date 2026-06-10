@@ -33,6 +33,11 @@ pub enum PolicyError {
     MissingTargetForTrigger { install_id: i64, repo_id: i64 },
     #[error("Invalid match_spec JSON: {0}")]
     InvalidMatchSpec(String),
+    #[error(
+        "Unsupported trigger kind `{0:?}`: trigger policies are webhook triggers — only \
+         `branch_push` and `tag_created` are valid"
+    )]
+    UnsupportedTriggerKind(TriggerKind),
     #[error("Database: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -243,6 +248,16 @@ pub async fn add_trigger_policy(
     bench_args: Option<&str>,
     note: Option<&str>,
 ) -> Result<TriggerPolicy, PolicyError> {
+    // Trigger policies are **webhook** triggers (a `match_spec` against a push /
+    // tag event). Only `branch_push`/`tag_created` qualify — `pr_comment` is the
+    // implicit `/benchmark` path, and `slack_adhoc`/`scheduled`/`manual` aren't
+    // webhook-driven — so reject them here (the core admin boundary) rather than
+    // letting a raw request create a meaningless `trigger_policy` row the
+    // processor never lists.
+    if !matches!(kind, TriggerKind::BranchPush | TriggerKind::TagCreated) {
+        return Err(PolicyError::UnsupportedTriggerKind(kind));
+    }
+
     // Validate shape now so a malformed spec is rejected at the CLI
     // boundary rather than blowing up later in the processor.
     let parsed: TriggerMatchSpec = serde_json::from_str(match_spec_json)

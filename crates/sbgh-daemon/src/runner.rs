@@ -31,6 +31,7 @@ use crate::progress::ProgressReporter;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
+use crate::slack::client::SlackClient;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -76,6 +77,11 @@ struct JobDeps {
     /// reconcile for the whole process. Each reporter resolves it lazily (see
     /// [`crate::reporter::resolved_app_id`]).
     app_id: Arc<OnceCell<i64>>,
+    /// The Slack surface for `ProgressTarget::Slack` jobs (item 0002), shared
+    /// into every reporter. `None` unless `[slack].enabled` wired a client at
+    /// startup (the Socket Mode adapter slice injects it via
+    /// [`Runner::with_slack`]).
+    slack: Option<Arc<dyn SlackClient>>,
 }
 
 pub struct Runner {
@@ -106,9 +112,19 @@ impl Runner {
                 gh,
                 driver,
                 app_id: Arc::new(OnceCell::new()),
+                slack: None,
             },
             max_concurrent,
         }
+    }
+
+    /// Inject the Slack client used to report `ProgressTarget::Slack` jobs
+    /// (item 0002). Wired by `main` only when `[slack].enabled`; absent,
+    /// those jobs still run and report nothing to Slack (the threaded
+    /// surface is a no-op).
+    pub fn with_slack(mut self, slack: Arc<dyn SlackClient>) -> Self {
+        self.deps.slack = Some(slack);
+        self
     }
 
     /// The coordinator loop: sweep stranded claims, fill every free slot from
@@ -344,6 +360,7 @@ impl Coordinator {
             }
         };
         ProgressReporter::new(self.deps.gh.as_ref(), &job)
+            .with_slack(self.deps.slack.as_deref())
             .cancelled(ORPHAN_CHECK_REASON)
             .await;
     }
@@ -414,6 +431,9 @@ impl Coordinator {
         let existing = match job.progress {
             ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
             ProgressTarget::CommitCheck { check_run_id } => check_run_id,
+            // Slack jobs carry no GitHub check (this runs only for jobs whose
+            // `[reporting]` wants a position check — see `wants_position_check`).
+            ProgressTarget::Slack { .. } => None,
         };
 
         // Already have a check (a prior tick / re-claim) → just refresh the text.
@@ -682,6 +702,7 @@ impl JobDeps {
             progress = match job.progress {
                 ProgressTarget::PullRequest { .. } => "pull_request",
                 ProgressTarget::CommitCheck { .. } => "commit_check",
+                ProgressTarget::Slack { .. } => "slack",
             },
             "claimed job; starting",
         );
@@ -699,6 +720,7 @@ impl JobDeps {
             self.jobs.clone(),
             self.gh.clone(),
             self.app_id.clone(),
+            self.slack.clone(),
             job.clone(),
         );
         let handle = tokio::spawn(reporter.run(events_rx, prepared_tx));
@@ -789,6 +811,9 @@ fn wants_position_check(reporting: &sbgh_core::config::ReportingConfig, job: &Ru
         ProgressTarget::CommitCheck { .. } => reporting
             .baseline_report
             .wants_check(),
+        // Slack jobs report into their thread, not a GitHub queue-position
+        // check.
+        ProgressTarget::Slack { .. } => false,
     }
 }
 
@@ -1087,6 +1112,7 @@ mod tests {
                 host_cpus: None,
             },
             artifacts: Default::default(),
+            slack: Default::default(),
         }
     }
 
@@ -1203,6 +1229,62 @@ mod tests {
                     sbgh_core::github::test_support::FakeCall::ResolveCommit { .. }
                 )),
             "runner must call resolve_commit for a tag job"
+        );
+    }
+
+    /// v5 gate: a `ProgressTarget::Slack` job enqueues with an **empty** commit
+    /// and a rev (`develop`), so it MUST resolve to a commit at claim time (the
+    /// **bare** ref, not `tags/…`) and hand it to `start_running` — proving an
+    /// accepted Slack job passes `prepare` rather than failing the empty-commit
+    /// guard.
+    #[tokio::test]
+    async fn run_once_resolves_slack_rev_commit_in_preflight() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "octo/core".into(),
+            commit: String::new(), // unresolved — a Slack ad-hoc job
+            git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            workload_key: None,
+            bench_args: vec![],
+            progress: ProgressTarget::Slack {
+                channel: "C1".into(),
+                message_ts: "1700000000.000100".into(),
+            },
+            claim_token: Some(Uuid::new_v4()),
+        };
+        let source = Arc::new(FakeSource::new(job));
+
+        let gh = Arc::new(FakeGitHub::new());
+        // Resolved by the BARE rev (Slack doesn't qualify `tags/…`).
+        gh.set_commit("octo/core", "develop", "slacksha", None);
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom")); // fail fast; we only assert preflight
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        assert!(
+            runner
+                .run_once()
+                .await
+                .unwrap()
+        );
+
+        let resolved = source
+            .started_commit()
+            .expect("start_running received the resolved Slack commit");
+        assert_eq!(resolved.hash, "slacksha");
+        assert!(
+            gh.calls()
+                .iter()
+                .any(|c| matches!(
+                    c,
+                    sbgh_core::github::test_support::FakeCall::ResolveCommit { git_ref, .. }
+                        if git_ref == "develop"
+                )),
+            "runner must resolve the bare Slack rev"
         );
     }
 
@@ -1524,6 +1606,7 @@ mod tests {
                 gh: Arc::new(FakeGitHub::new()),
                 driver,
                 app_id: app_id.clone(),
+                slack: None,
             };
             handles.push(tokio::spawn(deps.run(job, None, CancellationToken::new())));
             sources.push(source);
@@ -1694,6 +1777,7 @@ mod tests {
             gh: Arc::new(FakeGitHub::new()),
             driver,
             app_id: Arc::new(OnceCell::new()),
+            slack: None,
         };
         let mut coord = Coordinator::new(deps, 2, CancellationToken::new()); // max_concurrent = 2
         let never_draining = CancellationToken::new();
@@ -2010,6 +2094,7 @@ mod tests {
             gh,
             driver,
             app_id: Arc::new(OnceCell::new()),
+            slack: None,
         };
         Coordinator::new(deps, 1, CancellationToken::new())
     }

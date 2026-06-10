@@ -175,6 +175,7 @@ pub struct DaemonConfig {
     pub reporting: ReportingConfig,
     pub runner: RunnerConfig,
     pub artifacts: ArtifactsConfig,
+    pub slack: SlackConfig,
 }
 
 /// Daemon run-loop tuning (roadmap-v5). Deliberately **not** under `[vm]`: the
@@ -430,6 +431,53 @@ pub struct S3Config {
     pub secret_access_key: String,
 }
 
+/// Slack ad-hoc profiling connector (item `0002`, iteration v5). Disabled by
+/// default; when `enabled`, the orchestrator opens a Socket Mode connection and
+/// serves `@sbgh` mention benches. The code under test is a **constant**
+/// (`default_repository`/`default_rev`); the workload is the variable (the
+/// mention's args). Tokens are **env-only**; identities are allowlisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackConfig {
+    /// Gate the connector — `false` (default) means it never starts, so the
+    /// rest of this section is inert. Required fields are only enforced when
+    /// `true` (the established per-mode validation pattern).
+    pub enabled: bool,
+    /// App-level token (`xapp-…`, `connections:write`) authenticating the
+    /// Socket Mode connection. **Env-only** (`SBGH_SLACK_APP_TOKEN`).
+    /// `Some` iff enabled.
+    pub app_token: Option<String>,
+    /// Bot token (`xoxb-…`) authorizing Web API calls (post / react / upload).
+    /// **Env-only** (`SBGH_SLACK_BOT_TOKEN`). `Some` iff enabled.
+    pub bot_token: Option<String>,
+    /// The constant code under test: `owner/name` repo a Slack bench runs
+    /// against. Resolved to a commit via the existing claim-time path.
+    pub default_repository: String,
+    /// Default rev (branch/tag/sha) of `default_repository`, overridable per
+    /// request via `--rev`.
+    pub default_rev: String,
+    /// Allowlisted Slack workspace ids (`team_id`) — a mention from any other
+    /// workspace is rejected. The authenticated socket says nothing about *who*
+    /// sent a command, so every mention is checked against this.
+    pub allowed_team_ids: Vec<String>,
+    /// Allowlisted Slack user ids permitted to trigger benches.
+    pub allowed_user_ids: Vec<String>,
+}
+
+impl Default for SlackConfig {
+    /// Disabled — the default when `[slack]` is absent.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_token: None,
+            bot_token: None,
+            default_repository: String::new(),
+            default_rev: String::new(),
+            allowed_team_ids: Vec::new(),
+            allowed_user_ids: Vec::new(),
+        }
+    }
+}
+
 impl DaemonConfig {
     pub fn load() -> Result<Self> {
         let path = resolve_config_path(DAEMON_DEFAULT_CONFIG_PATH, DAEMON_HOME_RELATIVE);
@@ -464,6 +512,7 @@ struct RawDaemon {
     reporting: RawReporting,
     runner: RawRunner,
     artifacts: RawArtifacts,
+    slack: RawSlack,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -481,6 +530,23 @@ struct RawArtifacts {
     /// **Env-only** (`SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY`).
     #[serde(skip)]
     secret_access_key: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawSlack {
+    enabled: Option<bool>,
+    default_repository: Option<String>,
+    default_rev: Option<String>,
+    allowed_team_ids: Option<Vec<String>>,
+    allowed_user_ids: Option<Vec<String>>,
+    /// **Env-only** (`SBGH_SLACK_APP_TOKEN`) — `#[serde(skip)]` so a TOML key
+    /// is a hard error; the `xapp-` secret stays out of the config file.
+    #[serde(skip)]
+    app_token: Option<String>,
+    /// **Env-only** (`SBGH_SLACK_BOT_TOKEN`).
+    #[serde(skip)]
+    bot_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -678,6 +744,13 @@ impl RawDaemon {
         merge_opt(&mut self.artifacts.bucket, other.artifacts.bucket);
         merge_opt(&mut self.artifacts.region, other.artifacts.region);
         // `artifacts.{access_key_id,secret_access_key}` are env-only.
+
+        merge_opt(&mut self.slack.enabled, other.slack.enabled);
+        merge_opt(&mut self.slack.default_repository, other.slack.default_repository);
+        merge_opt(&mut self.slack.default_rev, other.slack.default_rev);
+        merge_opt(&mut self.slack.allowed_team_ids, other.slack.allowed_team_ids);
+        merge_opt(&mut self.slack.allowed_user_ids, other.slack.allowed_user_ids);
+        // `slack.{app_token,bot_token}` are env-only.
     }
 
     fn apply_env(&mut self) {
@@ -770,6 +843,14 @@ impl RawDaemon {
                 .secret_access_key,
             "SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY",
         );
+
+        env_parse_into(&mut self.slack.enabled, "SBGH_SLACK_ENABLED");
+        env_into(&mut self.slack.default_repository, "SBGH_SLACK_DEFAULT_REPOSITORY");
+        env_into(&mut self.slack.default_rev, "SBGH_SLACK_DEFAULT_REV");
+        env_csv_into(&mut self.slack.allowed_team_ids, "SBGH_SLACK_ALLOWED_TEAM_IDS");
+        env_csv_into(&mut self.slack.allowed_user_ids, "SBGH_SLACK_ALLOWED_USER_IDS");
+        env_into(&mut self.slack.app_token, "SBGH_SLACK_APP_TOKEN");
+        env_into(&mut self.slack.bot_token, "SBGH_SLACK_BOT_TOKEN");
     }
 
     fn into_config(self) -> Result<DaemonConfig> {
@@ -979,11 +1060,73 @@ impl RawDaemon {
                 };
                 ArtifactsConfig { kind, s3 }
             },
+            slack: {
+                let enabled = self
+                    .slack
+                    .enabled
+                    .unwrap_or(false);
+                // Required fields are enforced only when the connector is on,
+                // so a disabled (default) section needs nothing — same per-mode
+                // shape as `[artifacts]`. An enabled connector with an empty
+                // allowlist would accept nobody, so require at least one id.
+                if enabled {
+                    let team_ids = normalize_ids(
+                        self.slack
+                            .allowed_team_ids
+                            .unwrap_or_default(),
+                    );
+                    let user_ids = normalize_ids(
+                        self.slack
+                            .allowed_user_ids
+                            .unwrap_or_default(),
+                    );
+                    if team_ids.is_empty() || user_ids.is_empty() {
+                        return Err(Error::Config(
+                            "[slack].enabled = true requires non-empty allowed_team_ids and \
+                             allowed_user_ids (an empty allowlist authorizes nobody)"
+                                .into(),
+                        ));
+                    }
+                    SlackConfig {
+                        enabled,
+                        app_token: Some(required(
+                            self.slack.app_token,
+                            "SBGH_SLACK_APP_TOKEN (slack enabled)",
+                        )?),
+                        bot_token: Some(required(
+                            self.slack.bot_token,
+                            "SBGH_SLACK_BOT_TOKEN (slack enabled)",
+                        )?),
+                        default_repository: required(
+                            self.slack.default_repository,
+                            "[slack].default_repository (slack enabled)",
+                        )?,
+                        default_rev: required(
+                            self.slack.default_rev,
+                            "[slack].default_rev (slack enabled)",
+                        )?,
+                        allowed_team_ids: team_ids,
+                        allowed_user_ids: user_ids,
+                    }
+                } else {
+                    SlackConfig::default()
+                }
+            },
         })
     }
 }
 
 // ─────────────────────────── Shared helpers ───────────────────────────
+
+/// Trim each id and drop blank entries, so a TOML `["", "  "]` (which `env_csv`
+/// already filters for env input) collapses to empty rather than passing as a
+/// "non-empty" allowlist that authorizes nobody.
+fn normalize_ids(ids: Vec<String>) -> Vec<String> {
+    ids.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
 
 fn merge_opt<T>(dst: &mut Option<T>, src: Option<T>) {
     if let Some(v) = src {
@@ -1357,6 +1500,117 @@ mod tests {
         // field (hard error), keeping the secret out of the config file.
         let _g = EnvGuard::set(&daemon_env());
         let f = write("[artifacts]\nkind = \"s3\"\naccess_key_id = \"leaked\"\n");
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    // ─── SlackConfig ───
+
+    #[test]
+    fn daemon_slack_defaults_to_disabled() {
+        let _g = EnvGuard::set(&daemon_env());
+        let cfg = DaemonConfig::load_layered(None).unwrap();
+        assert!(!cfg.slack.enabled);
+        assert!(cfg.slack.app_token.is_none());
+        assert!(cfg.slack.bot_token.is_none());
+    }
+
+    #[test]
+    fn daemon_slack_enabled_from_toml_and_env() {
+        // repo/rev/allowlists from TOML; tokens env-only.
+        let mut env = daemon_env();
+        env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
+        env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[slack]\nenabled = true\ndefault_repository = \
+             \"stacks-network/stacks-core\"\ndefault_rev = \"develop\"\nallowed_team_ids = \
+             [\"T1\"]\nallowed_user_ids = [\"U1\", \"U2\"]\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert!(cfg.slack.enabled);
+        assert_eq!(cfg.slack.default_repository, "stacks-network/stacks-core");
+        assert_eq!(cfg.slack.default_rev, "develop");
+        assert_eq!(cfg.slack.allowed_team_ids, vec!["T1"]);
+        assert_eq!(cfg.slack.allowed_user_ids, vec!["U1", "U2"]);
+        assert_eq!(cfg.slack.app_token.as_deref(), Some("xapp-abc"));
+        assert_eq!(cfg.slack.bot_token.as_deref(), Some("xoxb-def"));
+    }
+
+    #[test]
+    fn daemon_slack_enabled_missing_token_errors() {
+        // enabled but no app token (env unset) → hard error.
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write(
+            "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
+             \"develop\"\nallowed_team_ids = [\"T1\"]\nallowed_user_ids = [\"U1\"]\n",
+        );
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn daemon_slack_enabled_empty_allowlist_errors() {
+        // An enabled connector with no allowlisted ids would authorize nobody.
+        let mut env = daemon_env();
+        env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
+        env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
+             \"develop\"\nallowed_team_ids = [\"T1\"]\n",
+        );
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn daemon_slack_disabled_ignores_missing_fields() {
+        // Disabled (or absent) → no required-field enforcement.
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write("[slack]\nenabled = false\n");
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert!(!cfg.slack.enabled);
+    }
+
+    #[test]
+    fn daemon_slack_blank_allowlist_entry_is_rejected() {
+        // A TOML `[""]` / `["  "]` must not pass as a non-empty allowlist (it
+        // authorizes nobody); blanks are trimmed away → empty → error.
+        let mut env = daemon_env();
+        env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
+        env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
+             \"develop\"\nallowed_team_ids = [\"T1\"]\nallowed_user_ids = [\"\", \"   \"]\n",
+        );
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn daemon_slack_allowlist_ids_are_trimmed() {
+        // Surrounding whitespace is stripped and stored normalized.
+        let mut env = daemon_env();
+        env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
+        env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
+             \"develop\"\nallowed_team_ids = [\"  T1  \"]\nallowed_user_ids = [\"U1\", \"  U2 \
+             \"]\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert_eq!(cfg.slack.allowed_team_ids, vec!["T1"]);
+        assert_eq!(cfg.slack.allowed_user_ids, vec!["U1", "U2"]);
+    }
+
+    #[test]
+    fn daemon_slack_token_in_toml_is_rejected() {
+        // The app/bot tokens are env-only; a TOML key is an unknown field.
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write("[slack]\nenabled = true\napp_token = \"xapp-leaked\"\n");
         let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }

@@ -224,6 +224,60 @@ impl JobStore for PostgresJobStore {
         })))
     }
 
+    async fn create_adhoc_job(
+        &self,
+        new_job: &NewJob,
+        queued_event_detail: &serde_json::Value,
+    ) -> Result<Job> {
+        // One transaction: job insert → queued event. No webhook/user/PR links
+        // (an ad-hoc Slack trigger has no GitHub subject) and no idempotency
+        // guard (see the trait docs). A failure on either insert rolls back.
+        let mut tx = self.pool.begin().await?;
+
+        let job: Job = sqlx::query_as(
+            r#"
+            INSERT INTO job
+                (github_installation_id, github_repo_id, job_kind, trigger_kind,
+                 git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
+                 workload_key)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id, github_installation_id, github_repo_id, status, job_kind,
+                      trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
+                      git_committed_at, workload_key, claim_token, claimed_at,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(new_job.github_installation_id)
+        .bind(new_job.github_repo_id)
+        .bind(new_job.job_kind)
+        .bind(new_job.trigger_kind)
+        .bind(new_job.git_ref_kind)
+        .bind(&new_job.git_ref_display)
+        .bind(&new_job.git_commit_hash)
+        .bind(new_job.git_committed_at)
+        .bind(&new_job.workload_key)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_event
+                (job_id, event_kind, event_status, github_comment_id,
+                 github_check_run_id, github_check_run_url, remark, detail)
+            VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4)
+            "#,
+        )
+        .bind(job.id)
+        .bind(JobEventKind::Queued)
+        .bind(JobEventStatus::Success)
+        .bind(queued_event_detail)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(job)
+    }
+
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, Job>(
             r#"

@@ -143,6 +143,9 @@ impl From<PolicyError> for ApiErr {
                  before adding a trigger"
             )),
             InvalidMatchSpec(msg) => ApiErr::bad_request(format!("invalid match_spec: {msg}")),
+            UnsupportedTriggerKind(kind) => ApiErr::bad_request(format!(
+                "unsupported trigger kind `{kind:?}` — use `branch_push` or `tag_created`"
+            )),
             Db(e) => ApiErr::db(e.to_string()),
         }
     }

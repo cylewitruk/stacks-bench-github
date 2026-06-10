@@ -168,6 +168,25 @@ pub trait JobStore: Send + Sync + 'static {
         request: &JobCreationRequest,
     ) -> Result<JobCreationOutcome>;
 
+    /// v5 (item 0002): create an **ad-hoc** job with no GitHub webhook/PR
+    /// subject — the Slack trigger. Inserts the `job` row + its queued
+    /// `job_event` (carrying the `SlackAdhoc` provenance) in one transaction,
+    /// returning the inserted job.
+    ///
+    /// Deliberately **separate** from
+    /// [`create_job_with_links`](Self::create_job_with_links) so the GitHub
+    /// webhook path is untouched: there's no webhook link and **no
+    /// webhook-keyed idempotency**. An ad-hoc trigger has no at-least-once
+    /// inbox behind it — the connector acks the Slack socket envelope
+    /// before enqueuing, so a redelivery can't double-fire — making this a
+    /// plain create. (At-most- once is the right semantic for an ad-hoc
+    /// profile: a lost request is simply re-issued by the user.)
+    async fn create_adhoc_job(
+        &self,
+        new_job: &NewJob,
+        queued_event_detail: &serde_json::Value,
+    ) -> Result<Job>;
+
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>>;
 
     /// `FOR UPDATE SKIP LOCKED` on the queued partial index; transitions

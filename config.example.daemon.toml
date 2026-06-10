@@ -217,3 +217,27 @@ kind = "local"
 # All of the above can also be set via env for a fully env-driven deploy:
 #   SBGH_ARTIFACTS_KIND=s3
 #   SBGH_ARTIFACTS_S3_ENDPOINT / _BUCKET / _REGION
+
+# Slack ad-hoc profiling connector (item 0002, iteration v5). Disabled by
+# default — when off, the connector never starts and the rest of this section is
+# inert. Enable it to serve `@sbgh bench …` mention benches over Socket Mode.
+[slack]
+enabled = false
+
+# When enabled, ALL of the following are required:
+#   enabled            = true
+#   default_repository = "stacks-network/stacks-core"  # the constant code under test
+#   default_rev        = "develop"                      # its default branch/tag/sha
+#   allowed_team_ids   = ["T0123ABCD"]                  # allowlisted workspaces (non-empty)
+#   allowed_user_ids   = ["U0123ABCD", "U0456WXYZ"]     # allowlisted users (non-empty)
+#
+# Tokens are ENV-ONLY (never in this file — a TOML key here is a hard error):
+#   SBGH_SLACK_APP_TOKEN   # xapp-… (connections:write) — the Socket Mode connection
+#   SBGH_SLACK_BOT_TOKEN   # xoxb-… — Web API (chat:write + reactions:write)
+#
+# See docs/slack-setup.md + docs/slack-app-manifest.yaml to create the app.
+#
+# All non-secret fields can also come from env for a fully env-driven deploy:
+#   SBGH_SLACK_ENABLED=true
+#   SBGH_SLACK_DEFAULT_REPOSITORY / _DEFAULT_REV
+#   SBGH_SLACK_ALLOWED_TEAM_IDS / _ALLOWED_USER_IDS   # comma-separated

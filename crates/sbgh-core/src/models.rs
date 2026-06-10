@@ -246,7 +246,8 @@ pub enum TriggerMatchSpec {
 
 /// `trigger_kind` enum mirror. Slice 5 only USES `BranchPush` and
 /// `TagCreated`; `PrComment` is the implicit /benchmark path
-/// (no trigger_policy row needed). `Scheduled` and `Manual` are
+/// (no trigger_policy row needed). `SlackAdhoc` (v5, item 0002) is the
+/// no-commit Slack profiling trigger. `Scheduled` and `Manual` are
 /// reserved for post-slice-9 work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "trigger_kind", rename_all = "snake_case")]
@@ -255,6 +256,7 @@ pub enum TriggerKind {
     PrComment,
     BranchPush,
     TagCreated,
+    SlackAdhoc,
     Scheduled,
     Manual,
 }
@@ -570,6 +572,11 @@ pub enum QueuedEventDetail {
     /// the daemon during the claim phase (the create event
     /// carries no SHA), so no commit fields here.
     TagCreated { tag: String, trigger_id: i64, bench_args: Option<String> },
+    /// Slack ad-hoc profile (`slack_adhoc`, v5/0002). `bench_args` is the
+    /// resolved workload (already a token vec, from `resolve_workload`);
+    /// `channel`/`message_ts` are the reporting provenance — the Slack channel
+    /// and the user's request-message timestamp the result threads under.
+    SlackAdhoc { channel: String, message_ts: String, bench_args: Vec<String> },
 }
 
 /// Slice 8 insert payload for `job_event`. occurred_at defaults to

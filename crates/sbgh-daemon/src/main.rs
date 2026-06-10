@@ -12,6 +12,7 @@ mod recipe;
 mod reporter;
 mod runner;
 mod shutdown;
+mod slack;
 mod webhook_processor;
 
 use std::path::{Path, PathBuf};
@@ -158,6 +159,38 @@ async fn main() -> anyhow::Result<()> {
     let artifact_store =
         artifact_store::build_store(&config).context("building the artifact store")?;
 
+    // Slack ad-hoc profiling (item 0002), only when `[slack].enabled`. Resolve
+    // the default repo → FK ids now (startup-fatal on misconfig, before serving)
+    // and build the one Web API client shared by the reporter (terminal results)
+    // and the socket connector (replies/reactions). `jobs_store` is cloned for
+    // the connector before it moves into the `JobSource` below.
+    let slack_runtime = if config.slack.enabled {
+        let target = slack::target::resolve_target(
+            &pool,
+            &config
+                .slack
+                .default_repository,
+        )
+        .await
+        .context("resolving [slack].default_repository")?;
+        let bot_token = config
+            .slack
+            .bot_token
+            .clone()
+            .context("[slack].enabled but SBGH_SLACK_BOT_TOKEN is unset")?;
+        let web_client: Arc<dyn slack::client::SlackClient> =
+            Arc::new(slack::api_client::WebApiClient::new(bot_token));
+        tracing::info!(
+            repo = %config.slack.default_repository,
+            installation_id = target.installation_id,
+            repo_id = target.repo_id,
+            "slack: ad-hoc profiling enabled",
+        );
+        Some((config.slack.clone(), target, jobs_store.clone(), web_client))
+    } else {
+        None
+    };
+
     // The runner claims from the `job` family and posts PR comments for
     // `pr_comment` jobs.
     let runnable_jobs: Arc<dyn RunnableJobStore> =
@@ -199,7 +232,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let api_router = api::build_router(api_state, api_tokens);
 
-    let runner = Runner::new(config, runnable_jobs, gh, shell);
+    // The reporter posts Slack ad-hoc results through the same Web API client
+    // the socket connector uses (one bot token, one client).
+    let mut runner = Runner::new(config, runnable_jobs, gh, shell);
+    if let Some((_, _, _, web_client)) = &slack_runtime {
+        runner = runner.with_slack(web_client.clone());
+    }
 
     // Lifecycle shutdown (roadmap-v5 Phase 4B): a `SIGINT` drains (stop
     // claiming, finish in-flight), a second `SIGINT` or `SIGTERM` aborts. The
@@ -219,6 +257,26 @@ async fn main() -> anyhow::Result<()> {
         },
         api::serve(&api_listen, api_router, shutdown.exit.clone()),
         shutdown::watch_signals(shutdown.clone()),
+        async {
+            // Slack socket-mode receive loop (item 0002), only when enabled. It
+            // stops accepting mentions at drain start; a startup failure (bad
+            // app token, TLS) is logged but never crashes the daemon — Slack is
+            // an optional surface. This arm then idles until full exit so it
+            // never collapses the `try_join!` early.
+            if let Some((cfg, target, jobs, web_client)) = slack_runtime {
+                if let Err(e) =
+                    slack::socket::run(cfg, target, jobs, web_client, shutdown.draining.clone())
+                        .await
+                {
+                    tracing::error!(error = ?e, "slack: socket mode failed; continuing without Slack");
+                }
+            }
+            shutdown
+                .exit
+                .cancelled()
+                .await;
+            Ok::<(), anyhow::Error>(())
+        },
     )?;
     Ok(())
 }

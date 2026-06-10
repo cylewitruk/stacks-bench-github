@@ -101,6 +101,45 @@ This is a first-class requirement from Phase 1 onward.
 
 ## Phases
 
+> **⚠ Sequencing gate (Codex, 3c review).** Two things must be green before the
+> live Socket Mode receive loop is enabled, so an accepted Slack job both *runs*
+> and *reports back*:
+>
+> 1. **rev→commit resolution for `ProgressTarget::Slack`** — ✅ **done.** The
+>    reporter's `prepare` now resolves a Slack job's rev (bare branch/tag/SHA)
+>    via `resolve_commit`, so it no longer fails the empty-commit guard
+>    (`run_once_resolves_slack_rev_commit_in_preflight`).
+> 2. **terminal threaded reporting** — ✅ **done.** The reporter's terminal path
+>    (`ProgressReporter::{completed,failed,cancelled}`) now posts a Slack job's
+>    result as a threaded reply (`thread_ts` = the request ts) and swaps ⏳ →
+>    ✅/❌ via the `SlackClient`
+>    (`progress::tests::slack_{completed,failed,cancelled}_*`). The client is
+>    injected through `Runner::with_slack`; absent, the surface is a silent
+>    no-op.
+>
+> **Both gate items are now green.** The remaining wiring (3d) is sub-sliced:
+>
+> - **3d-1 — `default_repository` → `(install, repo)` resolution** — ✅ **done**
+>   (token-independent). `slack::target::resolve_target` mirrors `/api/resolve`'s
+>   two-row DB lookup (active install on the account + materialised `github_repo`
+>   for `owner/name`), startup-fatal on misconfiguration
+>   (`tests/slack_target.rs`).
+> - **3d-2 — real Socket Mode adapter** — ✅ **done.** `slack-morphism`
+>   (`hyper` feature) owns the WS transport; `slack::socket::mention_from_callback`
+>   maps an `app_mention` push → `MentionEvent` and `slack::api_client::WebApiClient`
+>   (reqwest) is the real `SlackClient`. Tested without a live socket: a parsed
+>   envelope dispatched through the connector enqueues a job + reacts ⏳
+>   (`socket::tests::parsed_mention_dispatched_through_connector_enqueues_job`).
+> - **3d-3 — `main` wiring** — ✅ **done.** Behind `[slack].enabled`: resolve
+>   the target (startup-fatal), build the one Web API client shared by the
+>   reporter (`Runner::with_slack`) and the socket connector, and add the
+>   receive-loop as a `try_join!` arm that drains on shutdown and never crashes
+>   the daemon on a Slack-side failure (optional surface).
+>
+> **All slices are green.** The only remaining step is operational: the user
+> provides `SBGH_SLACK_APP_TOKEN`/`SBGH_SLACK_BOT_TOKEN`, flips
+> `[slack].enabled = true`, and runs a live smoke test (`@sbgh bench …`).
+
 ### Phase 0: Slack app + Socket Mode + artifact spike (de-risk)
 
 **Goal:** prove the Slack plumbing and the flamegraph artifact *before* any sbgh
@@ -108,11 +147,13 @@ wiring.
 
 **Scope:**
 
-- Register the app: scopes `app_mentions:read` (the entry surface), `chat:write`,
-  `chat:write.public` (post into a channel without joining, if needed),
-  `reactions:write` (status reactions), `files:write` (flamegraph upload);
+- Register the app: scopes `app_mentions:read` (the entry surface), `chat:write`
+  (post results + ephemeral rejections), `reactions:write` (status reactions);
   subscribe to the `app_mention` event over the socket. Mint the app-level
   (`connections:write`) + bot tokens. *(No `commands` scope — slash is not v1.)*
+  As-built manifest: `docs/slack-app-manifest.yaml`. `files:write` is **not**
+  registered — it's only needed if a later polish uploads the DB/flamegraph as a
+  Slack file rather than posting a presigned-URL link (the chosen approach).
 - By hand: open a Socket Mode connection, receive an **`app_mention`** envelope,
   **ack within 3 s**, post a **threaded** reply (`thread_ts` = the mention `ts`)
   and add a status reaction. (Entry surface is **decided: mention** — see Scope.)

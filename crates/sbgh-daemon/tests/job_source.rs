@@ -111,6 +111,76 @@ async fn enqueue_branch_push(store: &PostgresJobStore, webhook_id: i64) {
     assert!(matches!(outcome, JobCreationOutcome::Created(_)));
 }
 
+/// Create a queued `slack_adhoc` ad-hoc job carrying a `SlackAdhoc` queued
+/// event (channel/message_ts reporting provenance + the resolved workload).
+async fn enqueue_slack_adhoc(store: &PostgresJobStore, webhook_id: i64) {
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "5".into()],
+    })
+    .unwrap();
+    let outcome = store
+        .create_job_with_links(&JobCreationRequest {
+            new_job: NewJob {
+                github_installation_id: 100,
+                github_repo_id: 10,
+                job_kind: JobKind::AdHoc,
+                trigger_kind: TriggerKind::SlackAdhoc,
+                git_ref_kind: GitRefKind::Branch,
+                git_ref_display: "develop".into(),
+                git_commit_hash: Some("revsha".into()),
+                git_committed_at: None,
+                workload_key: None,
+            },
+            github_webhook_id: webhook_id,
+            triggering_user_id: None,
+            pull_request_link: None,
+            queued_event_detail: Some(detail),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, JobCreationOutcome::Created(_)));
+}
+
+/// Codex acceptance point (v5): a `slack_adhoc` job MUST assemble as
+/// `ProgressTarget::Slack` (channel/message_ts from its `SlackAdhoc` queued
+/// detail), never fall through to a commit check, and carry the resolved
+/// workload as `bench_args`.
+#[tokio::test]
+async fn slack_adhoc_job_assembles_as_slack_progress() {
+    let (_db, pool) = setup_pg_db().await;
+    let webhook_id = seed(&pool, 100, 10).await;
+    let store = Arc::new(PostgresJobStore::new(pool.clone()));
+    enqueue_slack_adhoc(&store, webhook_id).await;
+
+    let archive_root = tempfile::tempdir().unwrap();
+    let source = JobSource::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        Arc::new(artifact_store::LocalFsStore::new(
+            archive_root
+                .path()
+                .to_path_buf(),
+        )),
+    );
+
+    let job = source
+        .claim_next()
+        .await
+        .unwrap()
+        .expect("one queued slack job");
+    match job.progress {
+        ProgressTarget::Slack { channel, message_ts } => {
+            assert_eq!(channel, "C123");
+            assert_eq!(message_ts, "1700000000.000100");
+        }
+        other => panic!("slack_adhoc must assemble as Slack, got {other:?}"),
+    }
+    assert_eq!(job.bench_args, vec!["--block", "184231", "--repetitions", "5"]);
+}
+
 #[tokio::test]
 async fn v2_source_claims_assembles_and_completes_with_metric_and_result() {
     let (_db, pool) = setup_pg_db().await;

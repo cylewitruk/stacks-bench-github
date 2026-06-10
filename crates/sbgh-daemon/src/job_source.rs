@@ -30,7 +30,7 @@ use sbgh_core::db::{
 };
 use sbgh_core::models::{
     GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent,
-    ResolvedCommit,
+    QueuedEventDetail, ResolvedCommit, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -56,6 +56,13 @@ pub enum ProgressTarget {
     /// `None` until created / read back on re-claim, and stays `None` when
     /// `baseline_report = none` (the "report nothing" case).
     CommitCheck { check_run_id: Option<i64> },
+    /// Slack ad-hoc job (`slack_adhoc`, v5/0002) — reports into the thread on
+    /// the user's request message: `channel` is the Slack channel and
+    /// `message_ts` the request's timestamp (the thread anchor + the
+    /// message the status reaction is added to). No GitHub surface. Assembled
+    /// at claim time from a `slack_adhoc` job's `SlackAdhoc` queued detail;
+    /// both fields are read by the reporter's terminal Slack surface.
+    Slack { channel: String, message_ts: String },
 }
 
 /// Storage-neutral execution context for one benchmark run. Assembled by
@@ -526,47 +533,72 @@ impl JobSource {
             .map(|d| normalize_stored_value(&d.0))
             .unwrap_or_default();
 
-        // PR-linked jobs (`pr_comment`) report on a Check Run + comment;
-        // baseline jobs (`branch_push`/`tag_created`) on a commit-level Check
-        // Run. The already-created comment/check ids are read back so a
-        // reclaimed (or recovered) job updates them rather than duplicating.
-        let check_run = self
-            .jobs
-            .latest_check_run(job.id)
-            .await?;
-        let progress = match self
-            .jobs
-            .pull_request_link(job.id)
-            .await?
-        {
-            Some(link) => {
-                let pr = self
-                    .pull_requests
-                    .lookup_by_id(link.github_pull_request_id)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "job {} links unknown github_pull_request {}",
-                            job.id,
-                            link.github_pull_request_id
-                        )
-                    })?;
-                let comment_id = self
-                    .jobs
-                    .latest_comment_id(job.id)
-                    .await?;
-                ProgressTarget::PullRequest {
-                    pr_number: pr.pr_number as i64,
-                    comment_id,
-                    check_run_id: check_run
-                        .as_ref()
-                        .map(|(id, _)| *id),
-                    check_run_url: check_run.and_then(|(_, url)| url),
+        // A `slack_adhoc` job reports into its Slack thread (no GitHub surface);
+        // PR-linked jobs (`pr_comment`) report on a Check Run + comment; baseline
+        // jobs (`branch_push`/`tag_created`) on a commit-level Check Run. The
+        // already-created comment/check ids are read back so a reclaimed (or
+        // recovered) job updates them rather than duplicating.
+        let progress = if job.trigger_kind == TriggerKind::SlackAdhoc {
+            // `channel`/`message_ts` are reporting provenance in the
+            // `SlackAdhoc` queued detail — a `slack_adhoc` job MUST carry it (and
+            // never falls through to a commit check).
+            let (channel, message_ts) = queued
+                .as_ref()
+                .and_then(|e| e.detail.as_ref())
+                .and_then(|d| serde_json::from_value::<QueuedEventDetail>(d.0.clone()).ok())
+                .and_then(|d| match d {
+                    QueuedEventDetail::SlackAdhoc { channel, message_ts, .. } => {
+                        Some((channel, message_ts))
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "slack_adhoc job {} is missing its SlackAdhoc queued detail \
+                         (channel/message_ts)",
+                        job.id
+                    )
+                })?;
+            ProgressTarget::Slack { channel, message_ts }
+        } else {
+            let check_run = self
+                .jobs
+                .latest_check_run(job.id)
+                .await?;
+            match self
+                .jobs
+                .pull_request_link(job.id)
+                .await?
+            {
+                Some(link) => {
+                    let pr = self
+                        .pull_requests
+                        .lookup_by_id(link.github_pull_request_id)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "job {} links unknown github_pull_request {}",
+                                job.id,
+                                link.github_pull_request_id
+                            )
+                        })?;
+                    let comment_id = self
+                        .jobs
+                        .latest_comment_id(job.id)
+                        .await?;
+                    ProgressTarget::PullRequest {
+                        pr_number: pr.pr_number as i64,
+                        comment_id,
+                        check_run_id: check_run
+                            .as_ref()
+                            .map(|(id, _)| *id),
+                        check_run_url: check_run.and_then(|(_, url)| url),
+                    }
                 }
+                None => ProgressTarget::CommitCheck {
+                    check_run_id: check_run.map(|(id, _)| id),
+                },
             }
-            None => ProgressTarget::CommitCheck {
-                check_run_id: check_run.map(|(id, _)| id),
-            },
         };
 
         Ok(RunnableJob {

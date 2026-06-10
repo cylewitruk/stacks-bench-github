@@ -1190,6 +1190,7 @@ mod tests {
                 host_cpus: None,
             },
             artifacts: Default::default(),
+            slack: Default::default(),
         }
     }
 

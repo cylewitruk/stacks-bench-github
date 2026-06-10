@@ -19,8 +19,8 @@ use sbgh_core::db::{
 };
 use sbgh_core::models::{
     GitRefKind, GithubAccountType, JobCreationRequest, JobEventKind, JobEventStatus, JobKind,
-    JobMetric, JobResult, JobStatus, NewJob, NewJobEvent, NewPullRequestLink, ResolvedCommit,
-    TerminalJobStatus, TriggerKind,
+    JobMetric, JobResult, JobStatus, NewJob, NewJobEvent, NewPullRequestLink, QueuedEventDetail,
+    ResolvedCommit, TerminalJobStatus, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -82,6 +82,95 @@ fn make_new_job(install_id: i64, repo_id: i64) -> NewJob {
         git_committed_at: None,
         workload_key: None,
     }
+}
+
+/// v5 (item 0002): `TriggerKind::SlackAdhoc` — added by the 20260609 migration
+/// — round-trips through the `trigger_kind` Postgres enum, proving the
+/// migration applied and the sqlx mapping matches the DB literal
+/// `'slack_adhoc'`.
+#[tokio::test]
+async fn trigger_kind_slack_adhoc_round_trips() {
+    let (_db, pool) = setup_pg_db().await;
+    // Decode the DB literal → enum.
+    let decoded: TriggerKind = sqlx::query_scalar("SELECT 'slack_adhoc'::trigger_kind")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(decoded, TriggerKind::SlackAdhoc);
+    // Encode the enum → DB → enum.
+    let round: TriggerKind = sqlx::query_scalar("SELECT $1::trigger_kind")
+        .bind(TriggerKind::SlackAdhoc)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(round, TriggerKind::SlackAdhoc);
+}
+
+/// v5 (item 0002): `create_adhoc_job` inserts a webhook-less queued job + its
+/// queued `job_event` (carrying the `SlackAdhoc` provenance) in one
+/// transaction, with **no** `github_webhook_job` link — the non-webhook trigger
+/// entry path, kept separate from the GitHub webhook flow.
+#[tokio::test]
+async fn create_adhoc_job_inserts_queued_job_and_event_without_webhook() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into()],
+    })
+    .unwrap();
+    let new_job = NewJob {
+        github_installation_id: 100,
+        github_repo_id: 10,
+        job_kind: JobKind::AdHoc,
+        trigger_kind: TriggerKind::SlackAdhoc,
+        git_ref_kind: GitRefKind::Branch,
+        git_ref_display: "develop".into(),
+        git_commit_hash: None,
+        git_committed_at: None,
+        workload_key: None,
+    };
+
+    let job = store
+        .create_adhoc_job(&new_job, &detail)
+        .await
+        .unwrap();
+    assert_eq!(job.status, JobStatus::Queued);
+    assert_eq!(job.trigger_kind, TriggerKind::SlackAdhoc);
+    assert!(
+        job.claim_token.is_none() && job.claimed_at.is_none(),
+        "queued-state invariant holds for an ad-hoc job"
+    );
+
+    // No webhook link — the ad-hoc path doesn't bend the GitHub webhook flow.
+    let webhook_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM github_webhook_job WHERE job_id = $1")
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(webhook_count, 0, "an ad-hoc job must have no webhook link");
+
+    // The queued event carries the SlackAdhoc provenance the claim path reads.
+    let queued = store
+        .queued_event(job.id)
+        .await
+        .unwrap()
+        .expect("ad-hoc job has a queued event");
+    let parsed: QueuedEventDetail = serde_json::from_value(
+        queued
+            .detail
+            .expect("queued event carries detail")
+            .0,
+    )
+    .unwrap();
+    assert!(
+        matches!(parsed, QueuedEventDetail::SlackAdhoc { channel, .. } if channel == "C123"),
+        "queued event carries the SlackAdhoc detail"
+    );
 }
 
 #[tokio::test]

@@ -163,6 +163,31 @@ async fn add_trigger_policy_requires_target_fk() {
     );
 }
 
+/// v5: trigger policies are **webhook** triggers — `admin::add_trigger_policy`
+/// (the API/CLI boundary) rejects any non-`branch_push`/`tag_created` kind, so
+/// a raw request can't create a meaningless `trigger_policy` row (e.g. the new
+/// `slack_adhoc`, or `pr_comment`/`scheduled`/`manual`). The kind guard fires
+/// before any DB access, so no seeding is needed.
+#[tokio::test]
+async fn add_trigger_policy_rejects_non_webhook_kinds() {
+    use sbgh_core::admin::PolicyError;
+    let (_db, pool) = setup_pg_db().await;
+    for kind in [
+        TriggerKind::SlackAdhoc,
+        TriggerKind::PrComment,
+        TriggerKind::Scheduled,
+        TriggerKind::Manual,
+    ] {
+        let err = sbgh_core::admin::add_trigger_policy(&pool, 1, 1, kind, "{}", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PolicyError::UnsupportedTriggerKind(_)),
+            "kind {kind:?} must be rejected, got {err:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn add_then_list_enabled_triggers_round_trip() {
     let (_db, pool) = setup_pg_db().await;

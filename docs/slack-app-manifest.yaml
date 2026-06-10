@@ -1,0 +1,46 @@
+# Slack app manifest for the sbgh ad-hoc profiling bot (item 0002, iteration v5).
+#
+# Create the app from this manifest at https://api.slack.com/apps → "Create New
+# App" → "From a manifest". Keeping it in the repo pins the exact scopes/events
+# the daemon depends on; see docs/slack-setup.md for the full setup checklist.
+#
+# Every scope below is dictated by a call the daemon actually makes — do not add
+# more (least privilege):
+#   app_mentions:read  — receive `app_mention` events (the `@sbgh …` surface)
+#   chat:write         — chat.postMessage (threaded result) + chat.postEphemeral
+#                        (invoker-only rejections)
+#   reactions:write    — reactions.add / reactions.remove (⏳ → ✅/❌ status swap)
+#
+# Transport is Socket Mode (an outbound WebSocket), so there is NO request URL /
+# public endpoint. The xapp- App-Level Token that opens the socket carries the
+# `connections:write` scope and is NOT part of this manifest — generate it
+# separately (see docs/slack-setup.md).
+
+display_information:
+  name: sbgh
+  description: stacks-core benchmark bot — ad-hoc profiling from Slack.
+
+features:
+  bot_user:
+    display_name: sbgh
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - reactions:write
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  # Self-hosted Socket Mode app (daemon owns the WS connection) — no Slack-hosted
+  # endpoint.
+  is_hosted: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

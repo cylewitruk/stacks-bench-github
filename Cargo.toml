@@ -40,6 +40,12 @@ rusty-s3 = "0.9"
 octocrab = "0.51"
 jsonwebtoken = "10"
 
+# Slack (item 0002): Socket Mode client for the ad-hoc profiling connector. The
+# `hyper` feature pulls the WS listener (tokio-tungstenite) + Web API client,
+# all rustls/ring-aligned with our stack; the `axum` feature (Events-API HTTP
+# push) is deliberately NOT enabled — Socket Mode is an outbound WebSocket.
+slack-morphism = { version = "2", default-features = false, features = ["hyper"] }
+
 # Crypto / hashing for webhook signature verification
 hmac = "0.12"
 sha2 = "0.10"

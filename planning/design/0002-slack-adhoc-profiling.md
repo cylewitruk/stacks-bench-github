@@ -93,10 +93,12 @@ dials *out* (firewall/NAT-friendly — same philosophy as the v9 worker model).
 **Scope:**
 
 - Register the Slack app; scopes: `app_mentions:read` (the v1 entry surface),
-  `chat:write`, `reactions:write` (status reactions), `files:write` (the
-  flamegraph). Mint the app-level token (`connections:write`) + bot token.
-  *(No `commands` scope in v1 — that's only for a future slash-command surface,
-  Phase 5.)*
+  `chat:write`, `reactions:write` (status reactions). Mint the app-level token
+  (`connections:write`) + bot token. As-built manifest:
+  `docs/slack-app-manifest.yaml`. `files:write` is **not** registered — it's only
+  needed if a later polish uploads the DB/flamegraph as a Slack file instead of
+  posting a presigned-URL link (the chosen approach). *(No `commands` scope in
+  v1 — that's only for a future slash-command surface, Phase 5.)*
 - Prove end-to-end by hand: open a Socket Mode connection, receive an
   `app_mention` envelope, **ack within 3 s**, and post a **threaded** reply +
   a status reaction.

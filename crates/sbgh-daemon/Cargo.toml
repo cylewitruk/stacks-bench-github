@@ -46,6 +46,8 @@ rusty-s3.workspace = true
 url.workspace = true
 # Slice 5 trigger_policy: regex matching for tag_pattern matchers.
 regex.workspace = true
+# Slack ad-hoc profiling connector (item 0002): Socket Mode client.
+slack-morphism.workspace = true
 
 [dev-dependencies]
 sbgh-core = { workspace = true, features = ["testing"] }
