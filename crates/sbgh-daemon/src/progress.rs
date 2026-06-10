@@ -180,7 +180,9 @@ impl<'a> ProgressReporter<'a> {
         match self.job.progress {
             ProgressTarget::PullRequest { .. } => "Re-run with `/benchmark`.",
             ProgressTarget::CommitCheck { .. } => "Re-run by pushing the branch/tag again.",
-            ProgressTarget::Slack { .. } => "Re-run by posting `@sbgh bench …` again.",
+            // Name-agnostic: the bot's display name is workspace-configurable,
+            // and the user is already in a thread on their own request.
+            ProgressTarget::Slack { .. } => "Re-run by mentioning me with a new `bench …` request.",
         }
     }
 
@@ -663,7 +665,7 @@ mod tests {
         assert!(gh.calls().is_empty());
     }
 
-    /// A cancelled Slack job posts a cancellation note (with the `@sbgh`
+    /// A cancelled Slack job posts a cancellation note (with the name-agnostic
     /// re-trigger hint) and swaps ⏳→❌.
     #[tokio::test]
     async fn slack_cancelled_posts_thread_with_hint_and_swaps_to_x() {
@@ -694,7 +696,7 @@ mod tests {
         assert!(
             threads[0]
                 .2
-                .contains("@sbgh bench"),
+                .contains("mentioning me with a new `bench …`"),
             "carries the re-trigger hint: {}",
             threads[0].2
         );

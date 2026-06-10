@@ -2,7 +2,7 @@
 
 Step-by-step for going from a fresh Linux host with libvirt installed to a working `/benchmark` flow on a real PR. Assumes you've already read [architecture.md](./architecture.md).
 
-> This doc brings a **fresh** host up directly on v3 (the current API-fronted-daemon architecture). Upgrading an **existing** deployment instead? Use [v2-to-v3-upgrade.md](./v2-to-v3-upgrade.md) (from a v2 host) — or, if you're still on the legacy `jobs` queue (v1), run [v1-to-v2-upgrade.md](./v1-to-v2-upgrade.md) first, then v2→v3. For the v3 → v4 artifact-store upgrade (opt-in S3), see [v3-to-v4-upgrade.md](./v3-to-v4-upgrade.md).
+> This doc brings a **fresh** host up directly on v3 (the current API-fronted-daemon architecture). Upgrading an **existing** deployment instead? Use [v2-to-v3-upgrade.md](./v2-to-v3-upgrade.md) (from a v2 host) — or, if you're still on the legacy `jobs` queue (v1), run [v1-to-v2-upgrade.md](./v1-to-v2-upgrade.md) first, then v2→v3. For the v3 → v4 artifact-store upgrade (opt-in S3), see [v3-to-v4-upgrade.md](./v3-to-v4-upgrade.md); for v4 → v5 (Slack ad-hoc profiling, opt-in), see [v4-to-v5-upgrade.md](./v4-to-v5-upgrade.md).
 
 ## 0. Prerequisites
 

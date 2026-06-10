@@ -48,6 +48,11 @@ PR opened from it) — startup fails fast otherwise.
 
 ## 5. Invite + smoke test
 
+> The bot is addressed by its **display name** (`sbgh` in the manifest, but
+> workspace-renamable) — examples below use `@sbgh`; substitute whatever you
+> named it. Nothing in the daemon hardcodes the name: Slack delivers mentions by
+> the bot's user id, and the daemon strips the leading `<@id>` token regardless.
+
 1. Invite the bot to the channel: `/invite @sbgh` (it can only see mentions and
    reply in channels it is a member of).
 2. Restart the daemon — the log shows `slack: socket mode connected`.

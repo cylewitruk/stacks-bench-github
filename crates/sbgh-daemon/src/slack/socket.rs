@@ -126,7 +126,7 @@ pub async fn run(
         .listen_for(&app_token)
         .await?;
     listener.start().await;
-    tracing::info!("slack: socket mode connected; listening for @sbgh mentions");
+    tracing::info!("slack: socket mode connected; listening for bot mentions");
 
     // The WSS clients run in background tasks; hold the listener alive until the
     // daemon drains, then tear the socket down.
