@@ -60,9 +60,19 @@ pub enum ProgressTarget {
     /// the user's request message: `channel` is the Slack channel and
     /// `message_ts` the request's timestamp (the thread anchor + the
     /// message the status reaction is added to). No GitHub surface. Assembled
-    /// at claim time from a `slack_adhoc` job's `SlackAdhoc` queued detail;
-    /// both fields are read by the reporter's terminal Slack surface.
-    Slack { channel: String, message_ts: String },
+    /// at claim time from a `slack_adhoc` job's `SlackAdhoc` queued detail.
+    /// `plan_message_ts` is the live-timeline `plan` card's own message `ts`,
+    /// `None` until posted and read back on re-claim (a `plan_message_sent`
+    /// event) so a reclaimed job resumes updating the same card.
+    Slack {
+        channel: String,
+        message_ts: String,
+        /// The live-timeline `plan` card's own message `ts` — populated at
+        /// claim time (read back via `latest_plan_message_ts`) so a
+        /// reclaimed job resumes the existing card; `None` until the
+        /// card is first posted.
+        plan_message_ts: Option<String>,
+    },
 }
 
 /// Storage-neutral execution context for one benchmark run. Assembled by
@@ -197,6 +207,12 @@ pub trait RunnableJobStore: Send + Sync + 'static {
         check_run_id: i64,
         html_url: Option<&str>,
     ) -> anyhow::Result<()>;
+
+    /// Persist the Slack live-timeline `plan` message `ts` the daemon just
+    /// posted (a `plan_message_sent` `job_event`), read back on re-claim so a
+    /// reclaimed [`ProgressTarget::Slack`] job `chat.update`s the existing card
+    /// instead of posting a duplicate. Only called for Slack jobs.
+    async fn set_plan_message_ts(&self, job: &RunnableJob, message_ts: &str) -> anyhow::Result<()>;
 
     /// Orphan recovery (roadmap-v5 Phase 4B-2): job ids stranded in `running`.
     /// At daemon startup these are necessarily orphans from a crashed/killed
@@ -475,6 +491,25 @@ impl RunnableJobStore for JobSource {
         Ok(())
     }
 
+    async fn set_plan_message_ts(&self, job: &RunnableJob, message_ts: &str) -> anyhow::Result<()> {
+        // The Slack `ts` is a string id, so it rides the JSONB `detail` (the
+        // comment/check id columns are BIGINT); `latest_plan_message_ts` reads
+        // it back on (re-)claim for resume-without-duplicate.
+        self.jobs
+            .insert_event(&NewJobEvent {
+                job_id: job.id,
+                event_kind: JobEventKind::PlanMessageSent,
+                event_status: JobEventStatus::Success,
+                github_comment_id: None,
+                github_check_run_id: None,
+                github_check_run_url: None,
+                remark: None,
+                detail: Some(serde_json::json!({ "plan_message_ts": message_ts })),
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn running_job_ids(&self) -> anyhow::Result<Vec<Uuid>> {
         Ok(self
             .jobs
@@ -559,7 +594,17 @@ impl JobSource {
                         job.id
                     )
                 })?;
-            ProgressTarget::Slack { channel, message_ts }
+            // Read back the live-timeline card's `ts` (if already posted) so a
+            // reclaimed job resumes updating it instead of posting a duplicate.
+            let plan_message_ts = self
+                .jobs
+                .latest_plan_message_ts(job.id)
+                .await?;
+            ProgressTarget::Slack {
+                channel,
+                message_ts,
+                plan_message_ts,
+            }
         } else {
             let check_run = self
                 .jobs

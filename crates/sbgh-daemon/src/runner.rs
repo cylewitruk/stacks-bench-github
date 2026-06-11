@@ -32,6 +32,7 @@ use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
 use crate::slack::client::SlackClient;
+use crate::slack::timeline::SlackTimeline;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -359,8 +360,29 @@ impl Coordinator {
                 return;
             }
         };
+        // Reconstruct the Slack live-timeline for an orphaned Slack job (resuming
+        // its persisted card) so recovery marks it cancelled + swaps the stuck ⏳,
+        // mirroring how it concludes a GitHub check.
+        let timeline: Option<Arc<SlackTimeline>> = match (&job.progress, &self.deps.slack) {
+            (
+                ProgressTarget::Slack {
+                    channel,
+                    message_ts,
+                    plan_message_ts,
+                },
+                Some(client),
+            ) => Some(Arc::new(SlackTimeline::new(
+                client.clone(),
+                self.deps.jobs.clone(),
+                job.clone(),
+                channel.clone(),
+                message_ts.clone(),
+                plan_message_ts.clone(),
+            ))),
+            _ => None,
+        };
         ProgressReporter::new(self.deps.gh.as_ref(), &job)
-            .with_slack(self.deps.slack.as_deref())
+            .with_timeline(timeline.as_ref())
             .cancelled(ORPHAN_CHECK_REASON)
             .await;
     }
@@ -1029,6 +1051,14 @@ mod tests {
             }
             Ok(())
         }
+        async fn set_plan_message_ts(
+            &self,
+            _job: &RunnableJob,
+            _message_ts: &str,
+        ) -> anyhow::Result<()> {
+            self.record("set_plan_message_ts");
+            Ok(())
+        }
         async fn sweep_stuck_claims(&self, _lease: chrono::Duration) -> anyhow::Result<u64> {
             Ok(0)
         }
@@ -1254,6 +1284,7 @@ mod tests {
             progress: ProgressTarget::Slack {
                 channel: "C1".into(),
                 message_ts: "1700000000.000100".into(),
+                plan_message_ts: None,
             },
             claim_token: Some(Uuid::new_v4()),
         };
@@ -1743,6 +1774,9 @@ mod tests {
             _: i64,
             _: Option<&str>,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_plan_message_ts(&self, _: &RunnableJob, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
         async fn running_job_ids(&self) -> anyhow::Result<Vec<Uuid>> {

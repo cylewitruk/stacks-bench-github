@@ -509,6 +509,11 @@ pub enum JobEventKind {
     /// `github_check_run_id` + `github_check_run_url`, read back on re-claim
     /// so the runner updates the existing check instead of duplicating it.
     CheckRunCreated,
+    /// The Slack live-timeline `plan` message was posted (item 0002). Carries
+    /// the Slack message `ts` in `detail->>'plan_message_ts'`, read back on
+    /// re-claim so a reclaimed job `chat.update`s the existing card instead of
+    /// posting a duplicate.
+    PlanMessageSent,
     Completed,
     Failed,
     Cancelled,

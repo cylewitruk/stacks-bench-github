@@ -16,9 +16,9 @@ When an iteration ships, archive each completed item under its own `NNNN-slug.md
 in `archive/completed/`. Keep the iteration file only if it's still useful as a
 validation recipe; otherwise move it to `archive/superseded/`.
 
-> **Currently empty** — we're in the skeleton-only phase. `0001-artifact-store`
-> is the agreed next slice; it moves here as the first iteration when we start
-> building it.
+> **Active:** [v6-slack-live-timeline](v6-slack-live-timeline.md)
+> (`0021-slack-live-timeline`). Shipped: v4 (`0001-artifact-store`) and v5
+> (`0002-slack-adhoc-profiling`) → [archive/completed/](../archive/completed/).
 
 ## Iteration Template
 

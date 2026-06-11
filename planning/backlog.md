@@ -6,13 +6,13 @@ the single-home rule in the [README](README.md#item-ids). The complete registry
 of every item (all statuses, incl. shipped/in-flight) is [index.md](index.md);
 keep entries here compact and push worked-through detail to `design/`.
 
-*`0001-artifact-store` was promoted to iteration
-[v4-artifact-store](iterations/v4-artifact-store.md) (2026-06) — see
-[index.md](index.md).*
+*`0001-artifact-store` shipped (iteration v4, 2026-06) →
+[archive/completed/0001-artifact-store.md](archive/completed/0001-artifact-store.md).*
 
-*`0002-slack-adhoc-profiling` was promoted to iteration
-[v5-slack-adhoc-profiling](iterations/v5-slack-adhoc-profiling.md) (2026-06) —
-see [index.md](index.md).*
+*`0002-slack-adhoc-profiling` shipped (iteration v5, 2026-06) →
+[archive/completed/0002-slack-adhoc-profiling.md](archive/completed/0002-slack-adhoc-profiling.md).
+Its live-timeline follow-on is `0021-slack-live-timeline` (iteration
+[v6](iterations/v6-slack-live-timeline.md)).*
 
 ## Backlog (unscheduled)
 

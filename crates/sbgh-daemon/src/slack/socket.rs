@@ -187,10 +187,16 @@ mod tests {
         async fn post_ephemeral(&self, _c: &str, _u: &str, _t: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn post_in_thread(&self, _c: &str, _ts: &str, _t: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
         async fn post_blocks_in_thread(
+            &self,
+            _c: &str,
+            _ts: &str,
+            _b: &serde_json::Value,
+            _f: &str,
+        ) -> anyhow::Result<String> {
+            Ok("ts".into())
+        }
+        async fn update_blocks(
             &self,
             _c: &str,
             _ts: &str,

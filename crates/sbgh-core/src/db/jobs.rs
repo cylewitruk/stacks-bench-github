@@ -352,6 +352,13 @@ pub trait JobStore: Send + Sync + 'static {
     /// than creating a duplicate.
     async fn latest_check_run(&self, job_id: Uuid) -> Result<Option<(i64, Option<String>)>>;
 
+    /// item 0002: the most-recent Slack `plan` message `ts` recorded on the
+    /// job's timeline (a `plan_message_sent` event, from
+    /// `detail->>'plan_message_ts'`). Read on (re-)claim so a reclaimed Slack
+    /// job `chat.update`s the existing live-timeline card instead of posting a
+    /// duplicate.
+    async fn latest_plan_message_ts(&self, job_id: Uuid) -> Result<Option<String>>;
+
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 
     async fn record_metric(&self, metric: &JobMetric) -> Result<()>;

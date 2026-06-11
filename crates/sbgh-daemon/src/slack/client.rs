@@ -25,23 +25,25 @@ pub trait SlackClient: Send + Sync {
     /// never clutters the channel or a thread.
     async fn post_ephemeral(&self, channel: &str, user: &str, text: &str) -> anyhow::Result<()>;
 
-    /// Post `text` as a threaded reply under the message at `thread_ts` in
-    /// `channel` — the terminal surface for the terse failed / cancelled notes,
-    /// kept in the request's thread so it never spams the channel.
-    async fn post_in_thread(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        text: &str,
-    ) -> anyhow::Result<()>;
-
     /// Post a Block Kit message (`blocks`) as a threaded reply under
-    /// `thread_ts` — the rich completed-result card. `fallback` is the plain
+    /// `thread_ts` — the live-timeline `plan` card. `fallback` is the plain
     /// notification/accessibility text Slack shows where blocks can't render.
+    /// Returns the posted message's `ts` so the caller can `chat.update` it as
+    /// the run advances (the live timeline).
     async fn post_blocks_in_thread(
         &self,
         channel: &str,
         thread_ts: &str,
+        blocks: &serde_json::Value,
+        fallback: &str,
+    ) -> anyhow::Result<String>;
+
+    /// `chat.update` the message at `ts` in `channel` with new `blocks` — the
+    /// live-timeline edit (Build → Benchmark → Archive status transitions).
+    async fn update_blocks(
+        &self,
+        channel: &str,
+        ts: &str,
         blocks: &serde_json::Value,
         fallback: &str,
     ) -> anyhow::Result<()>;

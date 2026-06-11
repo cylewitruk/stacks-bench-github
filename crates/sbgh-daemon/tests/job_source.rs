@@ -171,14 +171,41 @@ async fn slack_adhoc_job_assembles_as_slack_progress() {
         .await
         .unwrap()
         .expect("one queued slack job");
-    match job.progress {
-        ProgressTarget::Slack { channel, message_ts } => {
+    match &job.progress {
+        ProgressTarget::Slack {
+            channel,
+            message_ts,
+            plan_message_ts,
+        } => {
             assert_eq!(channel, "C123");
             assert_eq!(message_ts, "1700000000.000100");
+            assert_eq!(*plan_message_ts, None, "no plan card posted yet → None");
         }
         other => panic!("slack_adhoc must assemble as Slack, got {other:?}"),
     }
     assert_eq!(job.bench_args, vec!["--block", "184231", "--repetitions", "5"]);
+
+    // Persist the live-timeline plan message ts, then re-load: a reclaimed job
+    // reads it back so it resumes updating the same card (no duplicate).
+    source
+        .set_plan_message_ts(&job, "1700000000.000999")
+        .await
+        .unwrap();
+    let reloaded = source
+        .load_runnable(job.id)
+        .await
+        .unwrap()
+        .expect("job still loadable");
+    match reloaded.progress {
+        ProgressTarget::Slack { plan_message_ts, .. } => {
+            assert_eq!(
+                plan_message_ts.as_deref(),
+                Some("1700000000.000999"),
+                "plan message ts read back on re-claim",
+            );
+        }
+        other => panic!("expected Slack, got {other:?}"),
+    }
 }
 
 #[tokio::test]

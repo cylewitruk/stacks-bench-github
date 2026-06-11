@@ -56,12 +56,12 @@ instance.
 
 ## Architecture
 
-- **Shared artifact store (the foundation) — [`0001`](0001-artifact-store.md).**
+- **Shared artifact store (the foundation) — [`0001`](../archive/completed/0001-artifact-store.md).**
   An `ArtifactStore` (local-FS today → **Hetzner object storage**, S3-compatible),
   shipping each run's bundle (SQLite, `run.json`, flamegraph, binary) on
   completion, with signed-URL fetch. **Free intra-Hetzner egress** keeps
   orchestrator → store → portal-machine cheap. The portal reads SQLite from it;
-  it also backs [`0002`](0002-slack-adhoc-profiling.md)'s Slack links. Built first, as
+  it also backs [`0002`](../archive/completed/0002-slack-adhoc-profiling.md)'s Slack links. Built first, as
   its own slice.
 - **Portal is an API client of the orchestrator, not a second DB client**
   (consistent with v9's "orchestrator is sole DB client"). The orchestrator
@@ -93,7 +93,7 @@ browser ──GH OAuth/session──▶ portal backend ──read API──▶ o
 
 ### Phase 1: Shared artifact store (object storage)
 
-**Extracted to its own slice — [`0001`](0001-artifact-store.md).** The
+**Extracted to its own slice — [`0001`](../archive/completed/0001-artifact-store.md).** The
 `ArtifactStore` (local + S3-compatible, ship-on-completion, signed URLs) is a
 shared foundation for both this portal and v10, so it's tracked separately and
 built **first**. v11 depends on it: the portal fetches a run's SQLite from object
@@ -156,7 +156,7 @@ it behind the portal session. The deep-inspection payoff.
 
 ## Relationship to the other roadmaps
 
-- **Shares the artifact store ([`0001`](0001-artifact-store.md)) with v10** —
+- **Shares the artifact store ([`0001`](../archive/completed/0001-artifact-store.md)) with v10** —
   build v12 first; both this portal and v10's Slack links consume it.
 - **Independent of v6 and v9** — it reads results, agnostic to task kind or
   execution backend. Rides the v8 artifact seam.

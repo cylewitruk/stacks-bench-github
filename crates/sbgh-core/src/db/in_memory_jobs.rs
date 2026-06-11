@@ -739,6 +739,23 @@ impl JobStore for InMemoryJobStore {
             }))
     }
 
+    async fn latest_plan_message_ts(&self, job_id: Uuid) -> Result<Option<String>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.events
+            .iter()
+            .filter(|e| e.job_id == job_id && matches!(e.event_kind, JobEventKind::PlanMessageSent))
+            .max_by_key(|e| e.id)
+            .and_then(|e| {
+                e.detail
+                    .as_ref()
+                    .and_then(|d| {
+                        d.0.get("plan_message_ts")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+            }))
+    }
+
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {
         let row = JobEvent {
             id: self

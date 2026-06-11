@@ -802,6 +802,25 @@ impl JobStore for PostgresJobStore {
         Ok(row.map(|(id, url)| (id.unwrap_or_default(), url)))
     }
 
+    async fn latest_plan_message_ts(&self, job_id: Uuid) -> Result<Option<String>> {
+        // The newest `plan_message_sent` event's Slack `ts`, from the JSONB
+        // detail (a string id — unlike the BIGINT comment/check ids).
+        let ts: Option<String> = sqlx::query_scalar(
+            "SELECT detail->>'plan_message_ts'
+               FROM job_event
+              WHERE job_id = $1
+                AND event_kind = 'plan_message_sent'
+                AND detail->>'plan_message_ts' IS NOT NULL
+           ORDER BY occurred_at DESC, id DESC
+              LIMIT 1",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(ts)
+    }
+
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {
         let row = sqlx::query_as::<_, JobEvent>(
             r#"

@@ -16,7 +16,8 @@
       "mcp__rust-mcp__source_search",
       "mcp__rust-mcp__crate_search",
       "mcp__rust-mcp__crate_compare",
-      "mcp__rust-mcp__source_read"
+      "mcp__rust-mcp__source_read",
+      "mcp__rust-mcp__crate_features"
     ]
   }
 }

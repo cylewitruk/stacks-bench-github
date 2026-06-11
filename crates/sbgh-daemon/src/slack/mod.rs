@@ -9,7 +9,8 @@
 //! This module is built in slices (v5 phases): [`workload`] is the pure
 //! resolve-then-validate seam, [`connector`] the mention→job orchestration,
 //! [`target`] the startup repo resolution, [`api_client`] the Web API client,
-//! and [`socket`] the Socket Mode receive loop wired into `main` behind
+//! [`socket`] the Socket Mode receive loop, and [`timeline`] the live
+//! `plan`-card reporting surface — all wired into `main` behind
 //! `[slack].enabled`.
 
 pub mod api_client;
@@ -17,4 +18,5 @@ pub mod client;
 pub mod connector;
 pub mod socket;
 pub mod target;
+pub mod timeline;
 pub mod workload;

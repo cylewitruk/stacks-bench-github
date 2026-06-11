@@ -33,6 +33,7 @@ use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
 use crate::progress::ProgressReporter;
 use crate::slack::client::SlackClient;
+use crate::slack::timeline::SlackTimeline;
 
 /// Resolve the App's numeric id via `GET /app`, cached on **success** in `cell`
 /// (a `get_or_try_init` that leaves the cell empty on error, so a transient
@@ -159,8 +160,31 @@ impl Reporter {
             "job running (claimed → running)",
         );
 
+        // item 0002: the Slack live-timeline `plan` card — created for a Slack
+        // job with a wired client, resuming the persisted card on re-claim. The
+        // reporter drives it (started → advance → completed/failed) and the
+        // drain loop's sink advances it per worker phase.
+        let timeline: Option<Arc<SlackTimeline>> = match (&self.job.progress, &self.slack) {
+            (
+                ProgressTarget::Slack {
+                    channel,
+                    message_ts,
+                    plan_message_ts,
+                },
+                Some(client),
+            ) => Some(Arc::new(SlackTimeline::new(
+                client.clone(),
+                self.jobs.clone(),
+                self.job.clone(),
+                channel.clone(),
+                message_ts.clone(),
+                plan_message_ts.clone(),
+            ))),
+            _ => None,
+        };
+
         let reporter =
-            ProgressReporter::new(self.gh.as_ref(), &self.job).with_slack(self.slack.as_deref());
+            ProgressReporter::new(self.gh.as_ref(), &self.job).with_timeline(timeline.as_ref());
 
         // Defensive empty-commit guard: now `running`, fail terminally so it
         // records a terminal state instead of looping via the sweep.
@@ -193,7 +217,7 @@ impl Reporter {
         }
 
         // ── drain the worker's event stream ───────────────────────────
-        let sink = ProgressSink::new(self.gh.clone(), self.job.clone());
+        let sink = ProgressSink::new(self.gh.clone(), self.job.clone(), timeline.clone());
         let mut terminal_err: Option<anyhow::Error> = None;
         let mut saw_terminal = false;
         while let Some(ev) = events_rx.recv().await {
@@ -710,6 +734,9 @@ impl Reporter {
 struct ProgressSink {
     gh: Arc<dyn GitHubApi>,
     job: RunnableJob,
+    /// item 0002: the Slack live-timeline, advanced per worker phase. `None`
+    /// for non-Slack jobs (the GitHub comment/check path runs instead).
+    timeline: Option<Arc<SlackTimeline>>,
     state: Mutex<PhaseState>,
 }
 
@@ -719,10 +746,11 @@ struct PhaseState {
 }
 
 impl ProgressSink {
-    fn new(gh: Arc<dyn GitHubApi>, job: RunnableJob) -> Self {
+    fn new(gh: Arc<dyn GitHubApi>, job: RunnableJob, timeline: Option<Arc<SlackTimeline>>) -> Self {
         Self {
             gh,
             job,
+            timeline,
             state: Mutex::new(PhaseState::default()),
         }
     }
@@ -823,6 +851,14 @@ impl ProgressSink {
 #[async_trait]
 impl EventSink for ProgressSink {
     async fn phase(&self, label: PhaseLabel, elapsed: Duration) -> SinkResult {
+        // Slack live timeline: advance the `plan` card to the phase's stage.
+        // `advance` is monotonic, so a non-stage / terminal phase (mapped to
+        // `None`) or a repeat is a no-op; the reporter owns the terminal card.
+        if let Some(tl) = &self.timeline
+            && let Some(stage) = crate::slack::timeline::stage_for_phase(&label.to_string())
+        {
+            tl.advance(stage).await;
+        }
         // Terminal phases bypass debounce so the comment shows the final state
         // immediately.
         let force = label.is_terminal();
@@ -855,6 +891,7 @@ mod tests {
 
     use super::*;
     use crate::job_source::BaselineRef;
+    use crate::slack::client::COMPLETED_REACTION;
 
     fn job_with(progress: ProgressTarget) -> RunnableJob {
         RunnableJob {
@@ -956,6 +993,14 @@ mod tests {
             _id: i64,
             _url: Option<&str>,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_plan_message_ts(
+            &self,
+            _job: &RunnableJob,
+            _message_ts: &str,
+        ) -> anyhow::Result<()> {
+            self.rec("set_plan_message_ts");
             Ok(())
         }
         async fn running_job_ids(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
@@ -1123,6 +1168,118 @@ mod tests {
             sbgh_core::github::CheckRunState::Completed(
                 sbgh_core::github::CheckRunConclusion::Cancelled
             ),
+        );
+    }
+
+    // ─── item 0002: Slack live-timeline wiring ───
+
+    /// Counts the Slack calls the reporter's timeline makes through `run`.
+    #[derive(Default)]
+    struct TimelineFakeSlack {
+        posts: StdMutex<usize>,
+        updates: StdMutex<usize>,
+        added: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SlackClient for TimelineFakeSlack {
+        async fn post_ephemeral(&self, _c: &str, _u: &str, _t: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_blocks_in_thread(
+            &self,
+            _c: &str,
+            _ts: &str,
+            _b: &serde_json::Value,
+            _f: &str,
+        ) -> anyhow::Result<String> {
+            *self.posts.lock().unwrap() += 1;
+            Ok("PLAN_TS".into())
+        }
+        async fn update_blocks(
+            &self,
+            _c: &str,
+            _ts: &str,
+            _b: &serde_json::Value,
+            _f: &str,
+        ) -> anyhow::Result<()> {
+            *self.updates.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn add_reaction(&self, _c: &str, _ts: &str, r: &str) -> anyhow::Result<()> {
+            self.added
+                .lock()
+                .unwrap()
+                .push(r.into());
+            Ok(())
+        }
+        async fn remove_reaction(&self, _c: &str, _ts: &str, _r: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A Slack job driven through `run` posts the live `plan` card at start,
+    /// `chat.update`s it as the worker reports a phase + completes, and swaps
+    /// ⏳→✅ — proving the reporter wires the timeline into `started`, the
+    /// drain sink, and `finish`.
+    #[tokio::test]
+    async fn slack_job_drives_the_live_timeline_through_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let slack = Arc::new(TimelineFakeSlack::default());
+        let reporter = Reporter::new(
+            Arc::new(no_report_config(&tmp)),
+            store.clone(),
+            Arc::new(FakeGitHub::new()),
+            Arc::new(OnceCell::new()),
+            Some(slack.clone()),
+            job_with(ProgressTarget::Slack {
+                channel: "C1".into(),
+                message_ts: "REQ".into(),
+                plan_message_ts: None,
+            }),
+        );
+
+        // A phase event (advances the card), then a clean completion.
+        let (events_tx, events_rx) = mpsc::channel(4);
+        events_tx
+            .send(WorkerEvent::Phase {
+                label: crate::events::PhaseLabel::new("running", false),
+                elapsed: std::time::Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        events_tx
+            .send(WorkerEvent::Finished(Terminal::Completed { summary: serde_json::json!({}) }))
+            .await
+            .unwrap();
+        drop(events_tx);
+        let (prepared_tx, _prepared_rx) = oneshot::channel();
+
+        reporter
+            .run(events_rx, prepared_tx)
+            .await
+            .unwrap();
+
+        // started() posted the card once; phase(running) + completed updated it.
+        assert_eq!(
+            *slack.posts.lock().unwrap(),
+            1,
+            "the plan card is posted exactly once at start"
+        );
+        assert!(*slack.updates.lock().unwrap() >= 2, "advanced + finalized via chat.update");
+        assert_eq!(
+            *slack.added.lock().unwrap(),
+            vec![COMPLETED_REACTION.to_string()],
+            "⏳ swapped to ✅",
+        );
+        // The posted ts was persisted for resume-on-reclaim.
+        assert!(
+            store
+                .calls()
+                .contains(&"set_plan_message_ts"),
+            "{:?}",
+            store.calls()
         );
     }
 
@@ -1320,6 +1477,7 @@ mod tests {
         let sink = ProgressSink::new(
             gh.clone(),
             job_with(ProgressTarget::CommitCheck { check_run_id: Some(777) }),
+            None,
         );
         sink.phase(PhaseLabel::new("building", false), Duration::ZERO)
             .await
@@ -1348,6 +1506,7 @@ mod tests {
                 check_run_id: Some(900),
                 check_run_url: None,
             }),
+            None,
         );
         sink.phase(PhaseLabel::new("running", false), Duration::ZERO)
             .await
@@ -1375,6 +1534,7 @@ mod tests {
         let sink = ProgressSink::new(
             gh.clone(),
             job_with(ProgressTarget::CommitCheck { check_run_id: Some(5) }),
+            None,
         );
         sink.phase(PhaseLabel::new("done", true), Duration::ZERO)
             .await

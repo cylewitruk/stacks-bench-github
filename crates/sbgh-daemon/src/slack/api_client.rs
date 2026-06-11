@@ -48,9 +48,14 @@ impl WebApiClient {
         }
     }
 
-    /// POST `body` to a Web API `method` with bot-token auth and surface a
-    /// logical failure (`ok=false`) — or a transport/HTTP error — as `Err`.
-    async fn call(&self, method: &str, body: serde_json::Value) -> anyhow::Result<()> {
+    /// POST `body` to a Web API `method` with bot-token auth, returning the
+    /// parsed envelope on success. A transport/HTTP error or a logical failure
+    /// (`ok=false`) is surfaced as `Err`.
+    async fn call(
+        &self,
+        method: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<SlackApiResponse> {
         let url = format!("{}/{method}", self.api_base);
         let resp = self
             .http
@@ -65,16 +70,18 @@ impl WebApiClient {
             anyhow::bail!("slack {method} HTTP {status}");
         }
         let parsed: SlackApiResponse = resp.json().await?;
-        interpret_response(method, parsed.ok, parsed.error.as_deref())
+        interpret_response(method, parsed.ok, parsed.error.as_deref())?;
+        Ok(parsed)
     }
 }
 
-/// The common `{ ok, error }` envelope every Web API method returns (extra
-/// per-method fields are ignored).
+/// The common `{ ok, error }` envelope every Web API method returns (plus the
+/// posted message `ts`, present on `chat.postMessage`; other fields ignored).
 #[derive(Deserialize)]
 struct SlackApiResponse {
     ok: bool,
     error: Option<String>,
+    ts: Option<String>,
 }
 
 /// Map a parsed `{ ok, error }` envelope to a `Result` — `Ok` on `ok=true`,
@@ -95,20 +102,8 @@ impl SlackClient for WebApiClient {
             "chat.postEphemeral",
             serde_json::json!({ "channel": channel, "user": user, "text": text }),
         )
-        .await
-    }
-
-    async fn post_in_thread(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        text: &str,
-    ) -> anyhow::Result<()> {
-        self.call(
-            "chat.postMessage",
-            serde_json::json!({ "channel": channel, "thread_ts": thread_ts, "text": text }),
-        )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn post_blocks_in_thread(
@@ -117,17 +112,40 @@ impl SlackClient for WebApiClient {
         thread_ts: &str,
         blocks: &serde_json::Value,
         fallback: &str,
+    ) -> anyhow::Result<String> {
+        let resp = self
+            .call(
+                "chat.postMessage",
+                serde_json::json!({
+                    "channel": channel,
+                    "thread_ts": thread_ts,
+                    "blocks": blocks,
+                    "text": fallback,
+                }),
+            )
+            .await?;
+        resp.ts
+            .ok_or_else(|| anyhow::anyhow!("slack chat.postMessage returned ok but no ts"))
+    }
+
+    async fn update_blocks(
+        &self,
+        channel: &str,
+        ts: &str,
+        blocks: &serde_json::Value,
+        fallback: &str,
     ) -> anyhow::Result<()> {
         self.call(
-            "chat.postMessage",
+            "chat.update",
             serde_json::json!({
                 "channel": channel,
-                "thread_ts": thread_ts,
+                "ts": ts,
                 "blocks": blocks,
                 "text": fallback,
             }),
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn add_reaction(&self, channel: &str, ts: &str, reaction: &str) -> anyhow::Result<()> {
@@ -135,7 +153,8 @@ impl SlackClient for WebApiClient {
             "reactions.add",
             serde_json::json!({ "channel": channel, "timestamp": ts, "name": reaction }),
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn remove_reaction(&self, channel: &str, ts: &str, reaction: &str) -> anyhow::Result<()> {
@@ -143,7 +162,8 @@ impl SlackClient for WebApiClient {
             "reactions.remove",
             serde_json::json!({ "channel": channel, "timestamp": ts, "name": reaction }),
         )
-        .await
+        .await?;
+        Ok(())
     }
 }
 

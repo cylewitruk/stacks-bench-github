@@ -9,13 +9,17 @@ tasks.
 Design docs use the same item ID as their backlog/iteration entry:
 
 ```text
-planning/design/0001-artifact-store.md
+planning/design/0003-results-portal.md
 ```
 
-> **Currently empty** — during the skeleton phase, item detail still lives in the
-> linked `docs/roadmap-vN.md`. As we work an item, its roadmap doc's *how-to*
-> content is converted into a design doc here (and its durable rules into
-> [decisions/](../decisions/)).
+> **Current contents:** living design docs for the unshipped items —
+> [`0003-results-portal`](0003-results-portal.md),
+> [`0004-worker-fleet`](0004-worker-fleet.md),
+> [`0005-task-kind-platform`](0005-task-kind-platform.md), and
+> [`0019-block-validation-recipe`](0019-block-validation-recipe.md). Shipped items
+> keep **no** live design here: `0001`/`0002` were folded into
+> [archive/completed/](../archive/completed/) on ship and removed (per the rule
+> below); their durable rules live in [decisions/](../decisions/).
 
 Use this directory for living design detail. Once the work ships, consolidate the
 backlog/iteration entry and this design into one `archive/completed/` file with

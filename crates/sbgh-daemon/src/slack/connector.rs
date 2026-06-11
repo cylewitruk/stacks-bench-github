@@ -187,7 +187,6 @@ mod tests {
     #[derive(Default)]
     struct FakeSlackClient {
         ephemerals: Mutex<Vec<(String, String, String)>>, // (channel, user, text)
-        threads: Mutex<Vec<(String, String, String)>>,    // (channel, thread_ts, text)
         reactions: Mutex<Vec<(String, String, String)>>,  // (channel, ts, reaction)
         removed: Mutex<Vec<(String, String, String)>>,    // (channel, ts, reaction)
     }
@@ -206,22 +205,19 @@ mod tests {
                 .push((channel.into(), user.into(), text.into()));
             Ok(())
         }
-        async fn post_in_thread(
-            &self,
-            channel: &str,
-            thread_ts: &str,
-            text: &str,
-        ) -> anyhow::Result<()> {
-            self.threads
-                .lock()
-                .unwrap()
-                .push((channel.into(), thread_ts.into(), text.into()));
-            Ok(())
-        }
         async fn post_blocks_in_thread(
             &self,
             _channel: &str,
             _thread_ts: &str,
+            _blocks: &serde_json::Value,
+            _fallback: &str,
+        ) -> anyhow::Result<String> {
+            Ok("ts".into())
+        }
+        async fn update_blocks(
+            &self,
+            _channel: &str,
+            _ts: &str,
             _blocks: &serde_json::Value,
             _fallback: &str,
         ) -> anyhow::Result<()> {

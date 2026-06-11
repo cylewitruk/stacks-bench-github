@@ -3,6 +3,7 @@
 //! a reporting error is logged and swallowed, never failing the benchmark.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sbgh_core::github::{
@@ -13,7 +14,7 @@ use crate::artifact_store::ArtifactStore;
 use crate::bench_summary::{self, RunResult};
 use crate::comparison::BaselineComparison;
 use crate::job_source::{ProgressTarget, RunnableJob};
-use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
+use crate::slack::timeline::SlackTimeline;
 
 /// Lifetime of the presigned `stacks-bench.db` download link in a Slack card.
 /// Kept in sync with [`bench_summary::DB_LINK_TTL_HUMAN`] (the "expires in …"
@@ -24,27 +25,32 @@ const DB_LINK_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 pub struct ProgressReporter<'a> {
     gh: &'a dyn GitHubApi,
     job: &'a RunnableJob,
-    /// The Slack surface for `ProgressTarget::Slack` jobs (item 0002): a
-    /// threaded result + a ⏳→✅/❌ reaction swap at terminal. `None` for
-    /// GitHub-only jobs, or until the wiring slice injects a real client.
-    slack: Option<&'a dyn SlackClient>,
+    /// The live-timeline surface for `ProgressTarget::Slack` jobs (item 0002) —
+    /// the `plan` card + reaction swap. `None` for GitHub-only jobs, or when no
+    /// Slack client is wired; the Slack lifecycle methods then no-op.
+    timeline: Option<&'a Arc<SlackTimeline>>,
 }
 
 impl<'a> ProgressReporter<'a> {
     pub fn new(gh: &'a dyn GitHubApi, job: &'a RunnableJob) -> Self {
-        Self { gh, job, slack: None }
+        Self { gh, job, timeline: None }
     }
 
-    /// Attach the Slack client used to report `ProgressTarget::Slack` jobs at
-    /// terminal. A no-op for GitHub-target jobs (they never touch it).
-    pub fn with_slack(mut self, slack: Option<&'a dyn SlackClient>) -> Self {
-        self.slack = slack;
+    /// Attach the Slack live-timeline used to report `ProgressTarget::Slack`
+    /// jobs. A no-op for GitHub-target jobs (they never touch it).
+    pub fn with_timeline(mut self, timeline: Option<&'a Arc<SlackTimeline>>) -> Self {
+        self.timeline = timeline;
         self
     }
 
-    /// Claimed → running. Refresh the comment; the check stays `in_progress`
-    /// (it concludes `success`/`failure` only at a terminal state).
+    /// Claimed → running. For a Slack job, post (or resume) the live `plan`
+    /// card; for a GitHub job, refresh the comment (the check stays
+    /// `in_progress` until a terminal state).
     pub async fn started(&self) {
+        if let (ProgressTarget::Slack { .. }, Some(tl)) = (&self.job.progress, self.timeline) {
+            tl.started().await;
+            return;
+        }
         self.update_comment(&format!(
             ":rocket: benchmark `{id}` is running on commit `{sha}`.",
             id = self.job.id,
@@ -59,38 +65,20 @@ impl<'a> ProgressReporter<'a> {
         summary: &serde_json::Value,
         comparison: Option<&BaselineComparison>,
     ) {
-        // Slack ad-hoc job → a threaded Block Kit result card + ⏳→✅ reaction
-        // swap, no GitHub surface (and no vs-baseline — ad-hoc runs aren't PRs).
-        if let ProgressTarget::Slack { channel, message_ts } = &self.job.progress {
+        // Slack ad-hoc job → finalize the live `plan` card (metrics + DB link)
+        // and swap ⏳→✅, no GitHub surface (and no vs-baseline — ad-hoc runs
+        // aren't PRs). The metrics + presigned DB link are computed here (they
+        // need the store), then handed to the timeline.
+        if let (ProgressTarget::Slack { .. }, Some(tl)) = (&self.job.progress, self.timeline) {
             let result = self
                 .parsed_run(store, summary)
                 .await;
-            // A presigned download link for the archived DB — `Some` only in S3
-            // mode with the object in the bucket; absent → the card omits it.
+            // `Some` only in S3 mode with the object in the bucket; absent →
+            // the card omits the download link.
             let db_url = self
                 .signed_db_url(store, summary)
                 .await;
-            let commit_url =
-                format!("https://github.com/{}/commit/{}", self.job.repository, self.job.commit);
-            let blocks = bench_summary::render_slack_blocks(
-                &self.job.git_ref_display,
-                &self.job.commit,
-                &self.job.id.to_string(),
-                result.as_ref(),
-                db_url.as_deref(),
-                Some(&commit_url),
-            );
-            let fallback = format!(
-                ":white_check_mark: Benchmark complete — commit `{}` (job `{}`)",
-                self.job
-                    .commit
-                    .get(..8)
-                    .unwrap_or(&self.job.commit),
-                self.job.id,
-            );
-            self.post_thread_blocks(channel, message_ts, &blocks, &fallback)
-                .await;
-            self.swap_reaction(channel, message_ts, COMPLETED_REACTION)
+            tl.completed(result, db_url)
                 .await;
             return;
         }
@@ -128,17 +116,10 @@ impl<'a> ProgressReporter<'a> {
     /// run) — a red ✗ that's non-blocking because the check isn't required.
     pub async fn failed(&self, error: &str) {
         let snippet = short_pr_error(error);
-        // Slack ad-hoc job → a threaded failure note + ⏳→❌ reaction swap.
-        if let ProgressTarget::Slack { channel, message_ts } = &self.job.progress {
-            let body = format!(
-                ":x: *Benchmark failed* (job `{id}`): `{snippet}`\n_(full details in the daemon \
-                 logs)_",
-                id = self.job.id,
-            );
-            self.post_thread(channel, message_ts, &body)
-                .await;
-            self.swap_reaction(channel, message_ts, FAILED_REACTION)
-                .await;
+        // Slack ad-hoc job → mark the failed row on the live `plan` card +
+        // ⏳→❌ reaction swap.
+        if let (ProgressTarget::Slack { .. }, Some(tl)) = (&self.job.progress, self.timeline) {
+            tl.failed(&snippet).await;
             return;
         }
         self.update_comment(&format!(
@@ -163,18 +144,10 @@ impl<'a> ProgressReporter<'a> {
     /// GitHub renders it neutral-gray, not a red ✗ — and notes it on the
     /// comment. `reason` is a short, already-safe phrase (no error chain).
     pub async fn cancelled(&self, reason: &str) {
-        // Slack ad-hoc job → a threaded cancellation note (with its re-trigger
-        // hint) + ⏳→❌ reaction swap.
-        if let ProgressTarget::Slack { channel, message_ts } = &self.job.progress {
-            let body = format!(
-                ":no_entry_sign: *Benchmark cancelled* (job `{id}`): {reason}. {hint}",
-                id = self.job.id,
-                hint = self.retrigger_hint(),
-            );
-            self.post_thread(channel, message_ts, &body)
-                .await;
-            self.swap_reaction(channel, message_ts, FAILED_REACTION)
-                .await;
+        // Slack ad-hoc job → mark the current row cancelled on the live `plan`
+        // card (with its re-trigger hint) + ⏳→❌ reaction swap.
+        if let (ProgressTarget::Slack { .. }, Some(tl)) = (&self.job.progress, self.timeline) {
+            tl.cancelled(reason).await;
             return;
         }
         // The comment surface only exists for PR jobs (`update_comment` is a
@@ -255,42 +228,6 @@ impl<'a> ProgressReporter<'a> {
             .and_then(read_run_json)
     }
 
-    /// Post a terminal result as a threaded reply on the Slack request message.
-    /// Non-fatal; a no-op when no client is wired (pre-wiring slice).
-    async fn post_thread(&self, channel: &str, thread_ts: &str, body: &str) {
-        let Some(slack) = self.slack else {
-            tracing::debug!(job_id = %self.job.id, "slack terminal (no client wired)");
-            return;
-        };
-        if let Err(e) = slack
-            .post_in_thread(channel, thread_ts, body)
-            .await
-        {
-            tracing::warn!(job_id = %self.job.id, error = ?e, "slack: post_in_thread failed (non-fatal)");
-        }
-    }
-
-    /// Post a Block Kit card (the completed-result surface) as a threaded
-    /// reply. Non-fatal; a no-op when no client is wired.
-    async fn post_thread_blocks(
-        &self,
-        channel: &str,
-        thread_ts: &str,
-        blocks: &serde_json::Value,
-        fallback: &str,
-    ) {
-        let Some(slack) = self.slack else {
-            tracing::debug!(job_id = %self.job.id, "slack terminal (no client wired)");
-            return;
-        };
-        if let Err(e) = slack
-            .post_blocks_in_thread(channel, thread_ts, blocks, fallback)
-            .await
-        {
-            tracing::warn!(job_id = %self.job.id, error = ?e, "slack: post_blocks_in_thread failed (non-fatal)");
-        }
-    }
-
     /// A presigned download URL for the run's archived `stacks-bench.db`, or
     /// `None`. `Some` only in S3 mode with the object **actually in the
     /// bucket** (`signed_url_if_fetchable` HEADs it first — the v5
@@ -308,27 +245,6 @@ impl<'a> ProgressReporter<'a> {
         store
             .signed_url_if_fetchable(key, DB_LINK_TTL)
             .await
-    }
-
-    /// Retire the queued ⏳ and add the terminal `to` reaction (✅/❌) on the
-    /// request message. Each step is non-fatal and independent — a failed
-    /// remove still attempts the add. No-op when no client is wired.
-    async fn swap_reaction(&self, channel: &str, ts: &str, to: &str) {
-        let Some(slack) = self.slack else {
-            return;
-        };
-        if let Err(e) = slack
-            .remove_reaction(channel, ts, QUEUED_REACTION)
-            .await
-        {
-            tracing::warn!(job_id = %self.job.id, error = ?e, "slack: removing ⏳ reaction failed (non-fatal)");
-        }
-        if let Err(e) = slack
-            .add_reaction(channel, ts, to)
-            .await
-        {
-            tracing::warn!(job_id = %self.job.id, error = ?e, "slack: adding terminal reaction failed (non-fatal)");
-        }
     }
 
     /// Edit the PR comment if this job has one. Non-fatal.
@@ -582,240 +498,5 @@ mod tests {
     fn empty_input_has_placeholder() {
         assert_eq!(short_pr_error(""), "(no error message)");
         assert_eq!(short_pr_error("\n\n   \n"), "(no error message)");
-    }
-
-    // ─── item 0002: Slack terminal threaded reporting ───
-
-    use std::sync::Mutex as StdMutex;
-
-    use async_trait::async_trait;
-    use tempfile::TempDir;
-
-    use crate::artifact_store::LocalFsStore;
-    use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
-
-    /// Records every terminal Slack call so tests can assert the thread reply /
-    /// card + the ⏳→✅/❌ reaction swap.
-    #[derive(Default)]
-    struct FakeSlackClient {
-        threads: StdMutex<Vec<(String, String, String)>>, // (channel, thread_ts, text)
-        blocks: StdMutex<Vec<(String, String, String)>>,  // (channel, thread_ts, blocks-json)
-        added: StdMutex<Vec<(String, String, String)>>,   // (channel, ts, reaction)
-        removed: StdMutex<Vec<(String, String, String)>>, // (channel, ts, reaction)
-    }
-
-    #[async_trait]
-    impl SlackClient for FakeSlackClient {
-        async fn post_ephemeral(&self, _c: &str, _u: &str, _t: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn post_in_thread(&self, c: &str, ts: &str, t: &str) -> anyhow::Result<()> {
-            self.threads
-                .lock()
-                .unwrap()
-                .push((c.into(), ts.into(), t.into()));
-            Ok(())
-        }
-        async fn post_blocks_in_thread(
-            &self,
-            c: &str,
-            ts: &str,
-            blocks: &serde_json::Value,
-            _fallback: &str,
-        ) -> anyhow::Result<()> {
-            self.blocks
-                .lock()
-                .unwrap()
-                .push((c.into(), ts.into(), blocks.to_string()));
-            Ok(())
-        }
-        async fn add_reaction(&self, c: &str, ts: &str, r: &str) -> anyhow::Result<()> {
-            self.added
-                .lock()
-                .unwrap()
-                .push((c.into(), ts.into(), r.into()));
-            Ok(())
-        }
-        async fn remove_reaction(&self, c: &str, ts: &str, r: &str) -> anyhow::Result<()> {
-            self.removed
-                .lock()
-                .unwrap()
-                .push((c.into(), ts.into(), r.into()));
-            Ok(())
-        }
-    }
-
-    fn slack_job() -> RunnableJob {
-        RunnableJob {
-            progress: ProgressTarget::Slack {
-                channel: "C1".into(),
-                message_ts: "1700000000.000100".into(),
-            },
-            ..check_job(0)
-        }
-    }
-
-    /// A completed Slack ad-hoc job posts a Block Kit card (in the request
-    /// thread) carrying the metrics, and swaps ⏳→✅ — never touching GitHub.
-    /// A `local` store mints no download link, so the card omits it.
-    #[tokio::test]
-    async fn slack_completed_posts_thread_and_swaps_to_check() {
-        let tmp = TempDir::new().unwrap();
-        // Stage a run.json the store resolves by key (LocalFsStore → root/key).
-        std::fs::write(
-            tmp.path().join("run.json"),
-            r#"{"success":true,"data":{"measured_blocks":5000,"warmup_blocks":1000,
-               "summary":{"execution_duration_us":72940000,"commit_duration_us":18280000}}}"#,
-        )
-        .unwrap();
-        let store = LocalFsStore::new(tmp.path().to_path_buf());
-        let slack = FakeSlackClient::default();
-        let gh = FakeGitHub::new();
-        let job = slack_job();
-
-        ProgressReporter::new(&gh, &job)
-            .with_slack(Some(&slack))
-            .completed(
-                &store,
-                // sqlite key present, but a local store can't presign → no link.
-                &serde_json::json!({
-                    "run_json_archived_path": "run.json",
-                    "sqlite_archived_path": "job/appdata/stacks-bench.db",
-                }),
-                None,
-            )
-            .await;
-
-        // One Block Kit card on the request's ts, carrying the metrics; the
-        // plain-text post_in_thread is unused for the completed surface.
-        assert!(
-            slack
-                .threads
-                .lock()
-                .unwrap()
-                .is_empty(),
-            "completed posts blocks, not text"
-        );
-        let blocks = slack.blocks.lock().unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].0, "C1");
-        assert_eq!(blocks[0].1, "1700000000.000100", "card is in the request thread");
-        // A plan card titled for the job's ref @ commit (slack_job → develop@abc123).
-        assert!(
-            blocks[0]
-                .2
-                .contains("Benchmark develop @ abc123"),
-            "{}",
-            blocks[0].2
-        );
-        assert!(
-            blocks[0]
-                .2
-                .contains("Blocks measured"),
-            "metrics rendered: {}",
-            blocks[0].2
-        );
-        assert!(
-            !blocks[0]
-                .2
-                .contains("Download stacks-bench.db"),
-            "local store → no download link: {}",
-            blocks[0].2
-        );
-
-        // ⏳ removed, ✅ added — on the same message.
-        assert_eq!(
-            *slack.removed.lock().unwrap(),
-            vec![("C1".into(), "1700000000.000100".into(), QUEUED_REACTION.into())],
-        );
-        assert_eq!(
-            *slack.added.lock().unwrap(),
-            vec![("C1".into(), "1700000000.000100".into(), COMPLETED_REACTION.into())],
-        );
-        // No GitHub surface for a Slack job.
-        assert!(gh.calls().is_empty(), "a Slack job must make no GitHub calls");
-    }
-
-    /// A failed Slack job posts the error snippet in-thread and swaps ⏳→❌.
-    #[tokio::test]
-    async fn slack_failed_posts_thread_and_swaps_to_x() {
-        let slack = FakeSlackClient::default();
-        let gh = FakeGitHub::new();
-        let job = slack_job();
-
-        ProgressReporter::new(&gh, &job)
-            .with_slack(Some(&slack))
-            .failed("boom: VM died")
-            .await;
-
-        let threads = slack.threads.lock().unwrap();
-        assert_eq!(threads.len(), 1);
-        assert!(
-            threads[0]
-                .2
-                .contains("*Benchmark failed*"),
-            "{}",
-            threads[0].2
-        );
-        assert!(
-            threads[0]
-                .2
-                .contains("boom: VM died"),
-            "{}",
-            threads[0].2
-        );
-        assert_eq!(slack.removed.lock().unwrap()[0].2, QUEUED_REACTION,);
-        assert_eq!(slack.added.lock().unwrap()[0].2, FAILED_REACTION,);
-        assert!(gh.calls().is_empty());
-    }
-
-    /// A cancelled Slack job posts a cancellation note (with the name-agnostic
-    /// re-trigger hint) and swaps ⏳→❌.
-    #[tokio::test]
-    async fn slack_cancelled_posts_thread_with_hint_and_swaps_to_x() {
-        let slack = FakeSlackClient::default();
-        let gh = FakeGitHub::new();
-        let job = slack_job();
-
-        ProgressReporter::new(&gh, &job)
-            .with_slack(Some(&slack))
-            .cancelled("aborted by shutdown")
-            .await;
-
-        let threads = slack.threads.lock().unwrap();
-        assert!(
-            threads[0]
-                .2
-                .contains("*Benchmark cancelled*"),
-            "{}",
-            threads[0].2
-        );
-        assert!(
-            threads[0]
-                .2
-                .contains("aborted by shutdown"),
-            "{}",
-            threads[0].2
-        );
-        assert!(
-            threads[0]
-                .2
-                .contains("mentioning me with a new `bench …`"),
-            "carries the re-trigger hint: {}",
-            threads[0].2
-        );
-        assert_eq!(slack.added.lock().unwrap()[0].2, FAILED_REACTION,);
-    }
-
-    /// With no client wired (GitHub-only deployment, or pre-wiring), a Slack
-    /// job's terminal is a silent no-op — no panic, nothing posted.
-    #[tokio::test]
-    async fn slack_terminal_without_client_is_a_noop() {
-        let gh = FakeGitHub::new();
-        let job = slack_job();
-        ProgressReporter::new(&gh, &job)
-            .failed("boom")
-            .await;
-        assert!(gh.calls().is_empty(), "no GitHub surface; no client → nothing happens");
     }
 }
