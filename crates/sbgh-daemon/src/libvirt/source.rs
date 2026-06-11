@@ -21,6 +21,7 @@
 //!
 //! At job teardown the raw file is deleted along with the rest of the job dir.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use sbgh_core::config::PathsConfig;
@@ -103,6 +104,54 @@ impl SourceDisk {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Re-attach + mount this (already-provisioned, unmounted) raw disk, seed
+    /// `binary` at `target/release/stacks-bench` — where `sbgh-bench.sh.tmpl`
+    /// execs it — chown the tree to root to match the build VM's hand-off, then
+    /// unmount + detach (guaranteed, even on error). The v9 binary-cache
+    /// build-skip uses this to hand the bench VM a source disk carrying a
+    /// prebuilt binary, with no build VM. Same cleanup invariant as
+    /// [`provision`](Self::provision): once `losetup`/`mount` succeed, they
+    /// MUST be torn down before returning.
+    pub async fn seed_binary(
+        &self,
+        shell: &dyn Shell,
+        mount_dir: &Path,
+        binary: &Path,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(mount_dir)?;
+        let raw_s = self
+            .path
+            .display()
+            .to_string();
+
+        // losetup — MUST detach before returning, regardless of outcome.
+        let out = shell
+            .run(spec_priv(Path::new("/usr/sbin/losetup"), &["-fP", "--show", &raw_s]))
+            .await?;
+        check(&out, "losetup attach (seed)")?;
+        let loop_dev = String::from_utf8(out.stdout)?
+            .trim()
+            .to_string();
+        if loop_dev.is_empty() {
+            anyhow::bail!("losetup returned empty loop device");
+        }
+
+        let seed_result = mount_and_seed(shell, &loop_dev, mount_dir, binary).await;
+        let detach_result = detach_loop(shell, &loop_dev).await;
+
+        match (seed_result, detach_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(detach_err)) => Err(detach_err.context(format!(
+                "loop device {loop_dev} still attached after seed; refusing to hand off"
+            ))),
+            (Err(seed_err), Ok(())) => Err(seed_err),
+            (Err(seed_err), Err(detach_err)) => {
+                tracing::warn!(error = %detach_err, "losetup -d also failed during seed cleanup");
+                Err(seed_err)
+            }
         }
     }
 }
@@ -204,6 +253,62 @@ async fn populate_checkout(
     check(&out, &format!("git checkout {sha}"))?;
 
     Ok(())
+}
+
+/// Mount the loop device, seed the binary, then unmount — same
+/// guaranteed-unmount structure as [`mount_and_populate`].
+async fn mount_and_seed(
+    shell: &dyn Shell,
+    loop_dev: &str,
+    mount_dir: &Path,
+    binary: &Path,
+) -> anyhow::Result<()> {
+    let mount_s = mount_dir
+        .display()
+        .to_string();
+
+    let out = shell
+        .run(spec_priv(Path::new("/usr/bin/mount"), &[loop_dev, &mount_s]))
+        .await?;
+    check(&out, &format!("mount {loop_dev} -> {mount_s} (seed)"))?;
+
+    let inner = seed_into_mount(shell, mount_dir, binary).await;
+    let unmount_result = unmount(shell, &mount_s).await;
+
+    match (inner, unmount_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(unmount_err)) => Err(unmount_err
+            .context(format!("{mount_s} still mounted after seed; refusing to hand off"))),
+        (Err(seed_err), Ok(())) => Err(seed_err),
+        (Err(seed_err), Err(unmount_err)) => {
+            tracing::warn!(error = %unmount_err, "umount also failed during seed cleanup");
+            Err(seed_err)
+        }
+    }
+}
+
+/// Copy `binary` to `<mount>/target/release/stacks-bench` (creating the dir),
+/// then chown the mounted tree to root so the root bench VM gets the same
+/// hand-off state the build VM's `chown` produces.
+async fn seed_into_mount(shell: &dyn Shell, mount_dir: &Path, binary: &Path) -> anyhow::Result<()> {
+    // The mount is owned by the service user from provisioning, so the daemon can
+    // create dirs + copy before the root chown.
+    let dest = mount_dir.join("target/release/stacks-bench");
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(binary, &dest)?;
+    // Force executable mode: a cache copy that lost its `+x` bit would pass sha
+    // verification but fail at exec time in the bench VM.
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+
+    let mount_s = mount_dir
+        .display()
+        .to_string();
+    let out = shell
+        .run(spec_priv(Path::new("/usr/bin/chown"), &["-R", "root:root", &mount_s]))
+        .await?;
+    check(&out, &format!("chown -R root:root {mount_s} (seed)"))
 }
 
 async fn unmount(shell: &dyn Shell, mount_s: &str) -> anyhow::Result<()> {
@@ -495,5 +600,88 @@ mod tests {
                     .contains(&"-d".to_string())
         });
         assert!(detach_ran, "losetup -d must run after mount failure");
+    }
+
+    /// v9 binary cache: `seed_binary` re-attaches + mounts the raw disk, copies
+    /// the binary to `target/release/stacks-bench` (where the bench VM execs
+    /// it), chowns to root, then unmounts + detaches.
+    #[tokio::test]
+    async fn seed_binary_mounts_seeds_chowns_and_detaches() {
+        let tmp = TempDir::new().unwrap();
+        let job_dir = tmp.path().join("jobs/job1");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        let mount_dir = tmp.path().join("mnt");
+        let binary = tmp
+            .path()
+            .join("cached-stacks-bench");
+        std::fs::write(&binary, b"BINARY").unwrap();
+
+        let shell = RecordingShell::new();
+        shell
+            .reply(PreparedReply::with_stdout("/dev/loop7\n")) // losetup -fP
+            .expect_ok(1) // mount
+            .expect_ok(1) // chown
+            .expect_ok(1) // umount
+            .expect_ok(1); // losetup -d
+
+        let disk = SourceDisk {
+            path: job_dir.join("source.raw"),
+        };
+        disk.seed_binary(&shell, &mount_dir, &binary)
+            .await
+            .unwrap();
+
+        // The binary landed where the bench VM execs it, with an executable mode.
+        let seeded = mount_dir.join("target/release/stacks-bench");
+        assert_eq!(std::fs::read(&seeded).unwrap(), b"BINARY");
+        assert_eq!(
+            std::fs::metadata(&seeded)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "seeded binary is executable"
+        );
+
+        let calls = shell.calls();
+        assert!(
+            calls[0]
+                .program
+                .ends_with("losetup")
+                && calls[0]
+                    .args
+                    .contains(&"--show".to_string())
+        );
+        assert!(
+            calls[1]
+                .program
+                .ends_with("mount")
+                && calls[1]
+                    .args
+                    .contains(&"/dev/loop7".to_string())
+        );
+        assert!(
+            calls[2]
+                .program
+                .ends_with("chown")
+                && calls[2]
+                    .args
+                    .iter()
+                    .any(|a| a == "root:root")
+        );
+        assert!(
+            calls[3]
+                .program
+                .ends_with("umount")
+        );
+        assert!(
+            calls[4]
+                .program
+                .ends_with("losetup")
+                && calls[4]
+                    .args
+                    .contains(&"-d".to_string())
+        );
     }
 }

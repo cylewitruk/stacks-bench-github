@@ -240,8 +240,19 @@ pub struct GithubInstallationRepo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerMatchSpec {
-    BranchPush { branch_name: String },
-    TagCreated { tag_pattern: String },
+    BranchPush {
+        branch_name: String,
+    },
+    /// Match any branch whose name starts with `prefix` — a plain prefix,
+    /// **not** a glob/regex (item 0025, v9): `sb-integration/3.` matches
+    /// the release-branch family for auto-triggering + binary-cache
+    /// pinning. Carried under `trigger_kind = BranchPush`.
+    BranchPrefix {
+        prefix: String,
+    },
+    TagCreated {
+        tag_pattern: String,
+    },
 }
 
 /// `trigger_kind` enum mirror. Slice 5 only USES `BranchPush` and

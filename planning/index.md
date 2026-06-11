@@ -42,7 +42,7 @@ need editing when an item's status or location changes.
 | `0022-report-surface-trait` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
 | `0023-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
 | `0024-slack-card-stage-timings` | Slack card stage timings | `backlog` | [backlog.md](backlog.md) |
-| `0025-baseline-binary-cache` | Release-baseline binary cache | `backlog` | [backlog.md](backlog.md) |
+| `0025-baseline-binary-cache` | Release-baseline binary cache | `in_progress` | [iterations/v9-baseline-binary-cache.md](iterations/v9-baseline-binary-cache.md) |
 | `0026-central-block-index-cache` | Central block/tx index cache | `backlog` | [backlog.md](backlog.md) |
 | `0027-fine-grained-progress` | Fine-grained bench progress | `backlog` | [backlog.md](backlog.md) |
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
@@ -58,6 +58,7 @@ need editing when an item's status or location changes.
 | `v6-slack-live-timeline` | Slack live timeline | `shipped` | [archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md) |
 | `v7-reporting-surface` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
 | `v8-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
+| `v9-baseline-binary-cache` | Release-baseline binary cache | `in_progress` | [iterations/v9-baseline-binary-cache.md](iterations/v9-baseline-binary-cache.md) |
 
 ## Decisions
 

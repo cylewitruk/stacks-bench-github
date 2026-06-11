@@ -26,6 +26,7 @@ use sbgh_core::config::DaemonConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::artifact_store::{artifact_key, build_store_or_local};
+use crate::binary_cache::{self, BinaryCache, BuildFingerprint};
 use crate::driver::{Driver, DriverOutcome, DriverStatus, Placement, TaskSpec};
 use crate::events::{EventSink, PhaseLabel};
 use crate::libvirt::boot::BootDisk;
@@ -33,7 +34,7 @@ use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitC
 use crate::libvirt::domain::{self, DomainSpec};
 use crate::libvirt::lvm::ChainstateSnapshot;
 use crate::libvirt::phase::{self, Phase, PollMode};
-use crate::libvirt::shell::{Shell, spec_priv};
+use crate::libvirt::shell::{Shell, spec, spec_priv};
 use crate::libvirt::source::SourceDisk;
 use crate::libvirt::tmpfs::ResultsTmpfs;
 use crate::libvirt::virsh::{self, DomState};
@@ -62,6 +63,78 @@ const SCCACHE_MOUNT: &str = "/var/cache/sccache";
 /// `paths.sccache_dir` won't grow past this regardless of how many
 /// jobs run against it.
 const SCCACHE_MAX_SIZE: &str = "20G";
+
+// ── Binary-cache build fingerprint constants (item 0025, v9) ──
+// The repo-pinned `[profile.release]` (lto/codegen-units) is commit-determined;
+// these capture the daemon's invariant build invocation + environment
+// dimensions (the rest of the fingerprint — commit, resolved toolchain, golden
+// image — is per-run).
+const BUILD_PROFILE: &str = "release";
+const BUILD_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+/// Bump on any binary-affecting change to `sbgh-build.sh.tmpl`.
+const BUILD_RECIPE_VERSION: u32 = 1;
+/// Until `0027`'s profiler-protocol versioning lands.
+const BUILD_PROTOCOL_VERSION: &str = "v1";
+
+/// Unix seconds now (binary-cache LRU timestamps). Saturates to 0 pre-epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Assemble the build fingerprint for `commit` (item 0025, v9). Reads
+/// `rust-toolchain.toml` from the **bare git mirror** (no source-disk mount —
+/// the disk is detached after provisioning), keys by the **declared** toolchain
+/// channel (pragmatic reuse, not `rustc -vV` provenance), and folds in the
+/// golden-image identity. `None` when `rust-toolchain.toml` / the golden image
+/// is unreadable.
+async fn assemble_fingerprint(
+    shell: &dyn Shell,
+    git_binary: &Path,
+    mirror: &Path,
+    golden_image: &Path,
+    commit: &str,
+) -> Option<BuildFingerprint> {
+    let toolchain_toml =
+        show_repo_file(shell, git_binary, mirror, commit, "rust-toolchain.toml").await?;
+    let toolchain = binary_cache::toolchain_channel(&toolchain_toml)?;
+    let image_id = binary_cache::image_proxy_id(golden_image).ok()?;
+    Some(BuildFingerprint {
+        commit: commit.to_string(),
+        toolchain,
+        profile: BUILD_PROFILE.to_string(),
+        features: String::new(),
+        rustflags: String::new(),
+        target_triple: BUILD_TARGET_TRIPLE.to_string(),
+        recipe_version: BUILD_RECIPE_VERSION,
+        image_id,
+        protocol_version: BUILD_PROTOCOL_VERSION.to_string(),
+    })
+}
+
+/// `git --git-dir=<mirror> show <sha>:<rel>` → file contents, or `None` if the
+/// path is absent at that commit (or git errs). Reads from the bare mirror, so
+/// the fingerprint needs no source-disk mount.
+async fn show_repo_file(
+    shell: &dyn Shell,
+    git_binary: &Path,
+    mirror: &Path,
+    sha: &str,
+    rel: &str,
+) -> Option<String> {
+    let mirror_s = mirror.display().to_string();
+    let target = format!("{sha}:{rel}");
+    let out = shell
+        .run(spec(git_binary, &["--git-dir", &mirror_s, "show", &target]))
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
 
 #[async_trait]
 pub trait PhaseListener: Send + Sync {
@@ -144,11 +217,33 @@ struct RunInputs<'a> {
 pub struct LibvirtDriver {
     config: Arc<DaemonConfig>,
     shell: Arc<dyn Shell>,
+    /// Opt-in `stacks-bench` binary cache (item 0025, v9). `None` when
+    /// `[artifacts.binary_cache].enabled` is false (the default), in which case
+    /// the build/bench flow is byte-identical to before.
+    binary_cache: Option<Arc<BinaryCache>>,
 }
 
 impl LibvirtDriver {
     pub fn new(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Self {
-        Self { config, shell }
+        let binary_cache = config
+            .artifacts
+            .binary_cache
+            .enabled
+            .then(|| {
+                Arc::new(BinaryCache::new(
+                    config
+                        .artifacts
+                        .binary_cache
+                        .dir
+                        .clone(),
+                    config
+                        .artifacts
+                        .binary_cache
+                        .max_size
+                        .as_bytes(),
+                ))
+            });
+        Self { config, shell, binary_cache }
     }
 
     pub async fn run_benchmark(
@@ -377,33 +472,44 @@ impl LibvirtDriver {
             .provision_artifacts(inputs, job_id, job_dir, arts)
             .await?;
 
-        // ── phase 1: build VM ─────────────────────────────────────────
-        // Succeeds on phase=build_done OR (ShutOff after seeing
-        // BuildDone). Anything else (error phase, ShutOff without
-        // BuildDone, timeout) aborts the whole job — no bench attempt.
-        let build_reason = self
-            .run_phase(
-                "build",
-                PollMode::Build,
-                self.config.vm.build_vcpus,
-                self.config
-                    .vm
-                    .build_memory
-                    .as_bytes(),
-                &cidata.build_iso_path,
-                job_dir,
-                domain_name,
-                arts,
-                listener,
-                cancel,
-                vcpu_cpuset,
-            )
-            .await?;
-        match build_reason {
-            FinishReason::PhaseDone => {
-                // success path — fall through to bench
+        // ── phase 1: build VM (skipped on a binary-cache hit) ─────────
+        // item 0025 (v9): if a fingerprint-matched binary is cached, stage it
+        // onto the source disk and skip the build VM entirely. Gated by
+        // `[artifacts.binary_cache].enabled` — disabled (default) always builds.
+        let reused = self
+            .try_reuse_cached_binary(inputs, arts, job_dir, listener)
+            .await;
+        if !reused {
+            // Succeeds on phase=build_done OR (ShutOff after seeing
+            // BuildDone). Anything else (error phase, ShutOff without
+            // BuildDone, timeout) aborts the whole job — no bench attempt.
+            let build_reason = self
+                .run_phase(
+                    "build",
+                    PollMode::Build,
+                    self.config.vm.build_vcpus,
+                    self.config
+                        .vm
+                        .build_memory
+                        .as_bytes(),
+                    &cidata.build_iso_path,
+                    job_dir,
+                    domain_name,
+                    arts,
+                    listener,
+                    cancel,
+                    vcpu_cpuset,
+                )
+                .await?;
+            match build_reason {
+                FinishReason::PhaseDone => {
+                    // success path — fall through to bench
+                }
+                other => return Ok(other),
             }
-            other => return Ok(other),
+            // Populate the cache from the freshly-built binary (best-effort).
+            self.publish_built_binary(inputs, arts)
+                .await;
         }
 
         // ── phase 2: bench VM ─────────────────────────────────────────
@@ -429,6 +535,117 @@ impl LibvirtDriver {
             )
             .await?;
         Ok(bench_reason)
+    }
+
+    /// Binary-cache hit path (item 0025, v9): if a fingerprint-matched binary
+    /// is cached, seed it into the **source disk** (where the bench VM
+    /// execs it) and report the build phase done, returning `true` to skip
+    /// the build VM. Best-effort — any miss (cache miss, missing/unreadable
+    /// `rust-toolchain.toml`, seed error) returns `false` and the caller builds
+    /// normally. No-op (returns `false`) when the cache is disabled.
+    ///
+    /// NOTE: the VM-skip orchestration is **not** integration-tested (needs a
+    /// libvirt host); gated behind `[artifacts.binary_cache].enabled`. The
+    /// fingerprint is read from the bare git mirror (no source-disk mount);
+    /// only the seed re-mounts the raw disk.
+    async fn try_reuse_cached_binary(
+        &self,
+        inputs: &RunInputs<'_>,
+        arts: &JobArtifacts,
+        job_dir: &Path,
+        listener: &dyn PhaseListener,
+    ) -> bool {
+        let Some(cache) = self.binary_cache.as_deref() else {
+            return false;
+        };
+        let Some(fp) = self
+            .fingerprint_for(inputs.commit)
+            .await
+        else {
+            tracing::info!(
+                commit = inputs.commit,
+                "binary cache: no fingerprint (missing/unreadable rust-toolchain.toml or golden \
+                 image); building"
+            );
+            return false;
+        };
+        let Some(hit) = cache.get(&fp, unix_now()) else {
+            return false;
+        };
+        let Some(source) = arts.source.as_ref() else {
+            return false;
+        };
+        // Seed the binary into the (unmounted) source RAW disk — the bench VM
+        // execs `$SRC/target/release/stacks-bench`, NOT the results share, so a
+        // host-dir copy would be invisible to the VM.
+        let mount_dir = job_dir.join("source.mnt");
+        if let Err(e) = source
+            .seed_binary(self.shell.as_ref(), &mount_dir, &hit.path)
+            .await
+        {
+            tracing::warn!(error = %e, "binary cache: seeding the cached binary into the source disk failed; building");
+            return false;
+        }
+        // Archival parity: mirror into the results share (→ the per-job archive +
+        // `binary_archived_path`).
+        if let Some(t) = arts.tmpfs.as_ref() {
+            let _ = std::fs::copy(&hit.path, t.stacks_bench_binary());
+        }
+        tracing::info!(
+            commit = inputs.commit,
+            digest = %fp.digest(),
+            "binary cache: reusing cached stacks-bench binary; skipping the build VM"
+        );
+        // Drive the reporter through the build phase so the card stays coherent
+        // — the build VM that normally emits these transitions never runs.
+        listener
+            .on_phase(&Phase::Building)
+            .await;
+        listener
+            .on_phase(&Phase::BuildDone)
+            .await;
+        true
+    }
+
+    /// Publish a freshly-built binary into the cache (best-effort, no-op when
+    /// the cache is disabled). Called after a successful build so the next
+    /// run of the same `(commit, environment)` can skip the build.
+    async fn publish_built_binary(&self, inputs: &RunInputs<'_>, arts: &JobArtifacts) {
+        let Some(cache) = self.binary_cache.as_deref() else {
+            return;
+        };
+        let Some(t) = arts.tmpfs.as_ref() else {
+            return;
+        };
+        let binary = t.stacks_bench_binary();
+        if !binary.exists() {
+            return;
+        }
+        let Some(fp) = self
+            .fingerprint_for(inputs.commit)
+            .await
+        else {
+            return;
+        };
+        match cache.publish(&fp, &binary, unix_now(), false) {
+            Ok(_) => tracing::info!(commit = inputs.commit, "binary cache: published built binary"),
+            Err(e) => {
+                tracing::warn!(error = %e, "binary cache: publishing the built binary failed")
+            }
+        }
+    }
+
+    /// This run's build fingerprint — a config-bound wrapper over the free
+    /// [`assemble_fingerprint`] (reads the toolchain from the bare git mirror).
+    async fn fingerprint_for(&self, commit: &str) -> Option<BuildFingerprint> {
+        assemble_fingerprint(
+            self.shell.as_ref(),
+            &self.config.paths.git_binary,
+            &self.config.paths.git_mirror,
+            &self.config.vm.golden_image,
+            commit,
+        )
+        .await
     }
 
     /// One-time provisioning: artifacts that live across both VM
@@ -1129,6 +1346,222 @@ mod tests {
             repository: &job.repository,
             commit: &job.commit,
         }
+    }
+
+    // ── binary-cache fingerprint (item 0025, v9) ──
+
+    #[tokio::test]
+    async fn assemble_fingerprint_reads_toolchain_from_the_mirror() {
+        let tmp = TempDir::new().unwrap();
+        let golden = tmp
+            .path()
+            .join("golden.qcow2");
+        std::fs::write(&golden, b"img").unwrap();
+        let shell = RecordingShell::new();
+        shell.reply(PreparedReply::with_stdout("[toolchain]\nchannel = \"1.95.0\"\n"));
+
+        let fp = assemble_fingerprint(
+            &shell,
+            std::path::Path::new("/usr/bin/git"),
+            std::path::Path::new("/var/lib/sbgh/mirror.git"),
+            &golden,
+            "deadbeef",
+        )
+        .await
+        .expect("declared toolchain → Some fingerprint");
+        assert_eq!(fp.commit, "deadbeef");
+        assert_eq!(fp.toolchain, "1.95.0");
+        assert_eq!(fp.target_triple, "x86_64-unknown-linux-gnu");
+
+        // Read from the bare mirror via `git --git-dir … show <sha>:<file>` — no
+        // source-disk mount (the disk is detached after provisioning).
+        let calls = shell.calls();
+        assert!(
+            calls[0]
+                .program
+                .ends_with("git")
+        );
+        assert!(
+            calls[0]
+                .args
+                .iter()
+                .any(|a| a == "--git-dir")
+        );
+        assert!(
+            calls[0]
+                .args
+                .iter()
+                .any(|a| a == "show")
+        );
+        assert!(
+            calls[0]
+                .args
+                .iter()
+                .any(|a| a == "deadbeef:rust-toolchain.toml")
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_fingerprint_keys_floating_channel_and_none_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let golden = tmp
+            .path()
+            .join("golden.qcow2");
+        std::fs::write(&golden, b"img").unwrap();
+
+        // A floating channel is keyed as itself (pragmatic reuse, not provenance).
+        let floating = RecordingShell::new();
+        floating.reply(PreparedReply::with_stdout("[toolchain]\nchannel = \"stable\"\n"));
+        let fp = assemble_fingerprint(
+            &floating,
+            std::path::Path::new("/git"),
+            std::path::Path::new("/m"),
+            &golden,
+            "sha",
+        )
+        .await
+        .expect("floating channel still keys");
+        assert_eq!(fp.toolchain, "stable");
+
+        // `git show` fails (no rust-toolchain.toml at that commit) → None.
+        let missing = RecordingShell::new();
+        missing.reply(PreparedReply::fail("fatal: path does not exist"));
+        assert!(
+            assemble_fingerprint(
+                &missing,
+                std::path::Path::new("/git"),
+                std::path::Path::new("/m"),
+                &golden,
+                "sha",
+            )
+            .await
+            .is_none(),
+            "missing toolchain file → None"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingListener {
+        phases: std::sync::Mutex<Vec<Phase>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhaseListener for RecordingListener {
+        async fn on_phase(&self, phase: &Phase) {
+            self.phases
+                .lock()
+                .unwrap()
+                .push(phase.clone());
+        }
+    }
+
+    /// Enabled cache + a fingerprint-matched entry: the hit seeds the binary
+    /// into the source disk (executable), reports the build phase done, and
+    /// skips the build VM (no `virsh`). Driver-level regression for the
+    /// build-skip path.
+    #[tokio::test]
+    async fn enabled_cache_hit_seeds_source_disk_and_skips_build_vm() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(&tmp);
+        // `image_proxy_id` needs a real golden-image file; enable the cache.
+        std::fs::write(&cfg.vm.golden_image, b"golden").unwrap();
+        let cache_dir = tmp.path().join("bincache");
+        cfg.artifacts
+            .binary_cache
+            .enabled = true;
+        cfg.artifacts.binary_cache.dir = cache_dir.clone();
+
+        // The exact fingerprint the driver will compute for this run, then a
+        // cached binary published under it.
+        let toolchain = "[toolchain]\nchannel = \"1.95.0\"\n";
+        let fp = BuildFingerprint {
+            commit: "abc123def456".into(),
+            toolchain: binary_cache::toolchain_channel(toolchain).unwrap(),
+            profile: BUILD_PROFILE.into(),
+            features: String::new(),
+            rustflags: String::new(),
+            target_triple: BUILD_TARGET_TRIPLE.into(),
+            recipe_version: BUILD_RECIPE_VERSION,
+            image_id: binary_cache::image_proxy_id(&cfg.vm.golden_image).unwrap(),
+            protocol_version: BUILD_PROTOCOL_VERSION.into(),
+        };
+        let cached_bin = tmp.path().join("cached-bin");
+        std::fs::write(&cached_bin, b"CACHED").unwrap();
+        binary_cache::BinaryCache::new(cache_dir.clone(), 1 << 30)
+            .publish(&fp, &cached_bin, 1, false)
+            .unwrap();
+
+        // Shell: `git show` (toolchain) then the seed sequence.
+        let shell = RecordingShell::new();
+        shell
+            .reply(PreparedReply::with_stdout(toolchain)) // git show <sha>:rust-toolchain.toml
+            .reply(PreparedReply::with_stdout("/dev/loop9\n")) // losetup --show
+            .expect_ok(1) // mount
+            .expect_ok(1) // chown
+            .expect_ok(1) // umount
+            .expect_ok(1); // losetup -d
+        let shell = Arc::new(shell);
+
+        let job_dir = tmp.path().join("jobs/job1");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        let raw = job_dir.join("source.raw");
+        std::fs::write(&raw, b"").unwrap();
+        let results_mnt = tmp.path().join("results-mnt");
+        std::fs::create_dir_all(&results_mnt).unwrap();
+        let arts = JobArtifacts {
+            source: Some(SourceDisk { path: raw }),
+            tmpfs: Some(ResultsTmpfs {
+                mount_dir: results_mnt,
+                size_mib: 256,
+            }),
+            ..Default::default()
+        };
+
+        let driver = LibvirtDriver::new(Arc::new(cfg), shell.clone());
+        let inputs = RunInputs {
+            repository: "acme/widgets",
+            commit: "abc123def456",
+            bench_args: &[],
+        };
+        let listener = RecordingListener::default();
+
+        let reused = driver
+            .try_reuse_cached_binary(&inputs, &arts, &job_dir, &listener)
+            .await;
+        assert!(reused, "fingerprint-matched entry → reuse + skip build");
+
+        // The cached binary was seeded where the bench VM execs it.
+        assert_eq!(
+            std::fs::read(job_dir.join("source.mnt/target/release/stacks-bench")).unwrap(),
+            b"CACHED"
+        );
+        // The reporter advanced Build → done.
+        assert_eq!(
+            *listener
+                .phases
+                .lock()
+                .unwrap(),
+            vec![Phase::Building, Phase::BuildDone]
+        );
+        // It read the toolchain from the mirror + ran the seed sequence, and
+        // never touched a build VM.
+        let calls = shell.calls();
+        assert!(calls.iter().any(|c| {
+            c.args
+                .iter()
+                .any(|a| a == "abc123def456:rust-toolchain.toml")
+        }));
+        assert!(calls.iter().any(|c| {
+            c.program.ends_with("losetup")
+                && c.args
+                    .contains(&"-d".to_string())
+        }));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.program.ends_with("virsh")),
+            "no build VM define/start on a cache hit"
+        );
     }
 
     fn test_config(tmp: &TempDir) -> DaemonConfig {

@@ -2,6 +2,7 @@ mod api;
 mod artifact_store;
 mod bench_recipe;
 mod bench_summary;
+mod binary_cache;
 mod comparison;
 mod driver;
 mod events;

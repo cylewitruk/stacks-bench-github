@@ -2014,6 +2014,9 @@ impl EventHandler for CreateHandler {
 fn matches_branch_push(match_spec: &serde_json::Value, branch: &str) -> bool {
     match serde_json::from_value::<TriggerMatchSpec>(match_spec.clone()) {
         Ok(TriggerMatchSpec::BranchPush { branch_name }) => branch_name == branch,
+        // Plain prefix (item 0025, v9): release-branch families like
+        // `sb-integration/3.` auto-trigger + get their binary pin-cached.
+        Ok(TriggerMatchSpec::BranchPrefix { prefix }) => branch.starts_with(&prefix),
         _ => false,
     }
 }
@@ -5149,6 +5152,25 @@ mod tests {
                 .pr_links()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn branch_prefix_matches_release_family_only() {
+        // item 0025 (v9): a plain-prefix matcher for release-branch families.
+        let spec = serde_json::to_value(TriggerMatchSpec::BranchPrefix {
+            prefix: "sb-integration/3.".into(),
+        })
+        .unwrap();
+        assert!(matches_branch_push(&spec, "sb-integration/3.4.0.0.3"));
+        assert!(matches_branch_push(&spec, "sb-integration/3.3.0.0.4"));
+        assert!(!matches_branch_push(&spec, "sb-integration/2.9.0.0.1"));
+        assert!(!matches_branch_push(&spec, "feature/unrelated"));
+        // Exact `BranchPush` is unaffected.
+        let exact =
+            serde_json::to_value(TriggerMatchSpec::BranchPush { branch_name: "develop".into() })
+                .unwrap();
+        assert!(matches_branch_push(&exact, "develop"));
+        assert!(!matches_branch_push(&exact, "develop-2"));
     }
 
     #[tokio::test]

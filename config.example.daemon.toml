@@ -218,6 +218,21 @@ kind = "local"
 #   SBGH_ARTIFACTS_KIND=s3
 #   SBGH_ARTIFACTS_S3_ENDPOINT / _BUCKET / _REGION
 
+# Local `stacks-bench` binary cache (item 0025, iteration v9). Opt-in: when
+# enabled, a fingerprint-matched binary (commit + resolved toolchain + golden
+# image + recipe/protocol version) is reused instead of rebuilt, skipping the
+# ~5-7 min build VM. Disabled (default) keeps today's always-build behavior.
+# Local-only — fleet / S3 sharing is deferred. Pinned entries (v9 Phase 2 release
+# policy) are kept past `max_size`; non-pinned evict least-recently-used.
+#
+# [artifacts.binary_cache]
+# enabled  = true
+# max_size = "10G"                     # default; pins kept past it, rest LRU
+# dir      = "/var/lib/sbgh/binary-cache"
+#
+# Env equivalents:
+#   SBGH_ARTIFACTS_BINARY_CACHE_ENABLED / _MAX_SIZE / _DIR
+
 # Slack ad-hoc profiling connector (item 0002, iteration v5). Disabled by
 # default — when off, the connector never starts and the rest of this section is
 # inert. Enable it to serve `@BenchBot bench …` mention benches over Socket Mode.

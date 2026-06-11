@@ -380,6 +380,8 @@ pub struct ArtifactsConfig {
     pub kind: ArtifactStoreKind,
     /// S3 settings — `Some` iff `kind == S3` (enforced at load).
     pub s3: Option<S3Config>,
+    /// Local fingerprint-keyed `stacks-bench` binary cache (item 0025, v9).
+    pub binary_cache: BinaryCacheConfig,
 }
 
 impl Default for ArtifactsConfig {
@@ -388,6 +390,32 @@ impl Default for ArtifactsConfig {
         Self {
             kind: ArtifactStoreKind::Local,
             s3: None,
+            binary_cache: BinaryCacheConfig::default(),
+        }
+    }
+}
+
+/// Local cache of built `stacks-bench` binaries (item
+/// `0025-baseline-binary-cache`, iteration v9). Opt-in: a fingerprint-matched
+/// binary is reused instead of rebuilt, skipping the ~5–7 min build VM.
+/// Local-only — fleet / S3 sharing is deferred.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinaryCacheConfig {
+    /// Gate the cache — `false` (default) keeps today's always-build behavior.
+    pub enabled: bool,
+    /// On-disk size budget. Pinned entries are kept past it; non-pinned evict
+    /// least-recently-used. Default `10G`.
+    pub max_size: MemorySize,
+    /// Cache root directory. Default `/var/lib/sbgh/binary-cache`.
+    pub dir: PathBuf,
+}
+
+impl Default for BinaryCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_size: MemorySize::from_gib(10),
+            dir: PathBuf::from("/var/lib/sbgh/binary-cache"),
         }
     }
 }
@@ -530,6 +558,15 @@ struct RawArtifacts {
     /// **Env-only** (`SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY`).
     #[serde(skip)]
     secret_access_key: Option<String>,
+    binary_cache: RawBinaryCache,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawBinaryCache {
+    enabled: Option<bool>,
+    max_size: Option<MemorySize>,
+    dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -744,6 +781,36 @@ impl RawDaemon {
         merge_opt(&mut self.artifacts.bucket, other.artifacts.bucket);
         merge_opt(&mut self.artifacts.region, other.artifacts.region);
         // `artifacts.{access_key_id,secret_access_key}` are env-only.
+        merge_opt(
+            &mut self
+                .artifacts
+                .binary_cache
+                .enabled,
+            other
+                .artifacts
+                .binary_cache
+                .enabled,
+        );
+        merge_opt(
+            &mut self
+                .artifacts
+                .binary_cache
+                .max_size,
+            other
+                .artifacts
+                .binary_cache
+                .max_size,
+        );
+        merge_opt(
+            &mut self
+                .artifacts
+                .binary_cache
+                .dir,
+            other
+                .artifacts
+                .binary_cache
+                .dir,
+        );
 
         merge_opt(&mut self.slack.enabled, other.slack.enabled);
         merge_opt(&mut self.slack.default_repository, other.slack.default_repository);
@@ -842,6 +909,27 @@ impl RawDaemon {
                 .artifacts
                 .secret_access_key,
             "SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY",
+        );
+        env_parse_into(
+            &mut self
+                .artifacts
+                .binary_cache
+                .enabled,
+            "SBGH_ARTIFACTS_BINARY_CACHE_ENABLED",
+        );
+        env_parse_into(
+            &mut self
+                .artifacts
+                .binary_cache
+                .max_size,
+            "SBGH_ARTIFACTS_BINARY_CACHE_MAX_SIZE",
+        );
+        env_path_into(
+            &mut self
+                .artifacts
+                .binary_cache
+                .dir,
+            "SBGH_ARTIFACTS_BINARY_CACHE_DIR",
         );
 
         env_parse_into(&mut self.slack.enabled, "SBGH_SLACK_ENABLED");
@@ -1058,7 +1146,20 @@ impl RawDaemon {
                         )?,
                     }),
                 };
-                ArtifactsConfig { kind, s3 }
+                let raw_bc = self.artifacts.binary_cache;
+                let default_bc = BinaryCacheConfig::default();
+                let binary_cache = BinaryCacheConfig {
+                    enabled: raw_bc
+                        .enabled
+                        .unwrap_or(default_bc.enabled),
+                    max_size: raw_bc
+                        .max_size
+                        .unwrap_or(default_bc.max_size),
+                    dir: raw_bc
+                        .dir
+                        .unwrap_or(default_bc.dir),
+                };
+                ArtifactsConfig { kind, s3, binary_cache }
             },
             slack: {
                 let enabled = self
@@ -1366,6 +1467,32 @@ mod tests {
         assert_eq!(cfg.runner.max_concurrent_jobs, 1);
         assert!(cfg.runner.cpu_sets.is_empty(), "no pinning by default");
         assert!(cfg.runner.host_cpus.is_none());
+    }
+
+    #[test]
+    fn daemon_binary_cache_defaults_off() {
+        let _g = EnvGuard::set(&daemon_env());
+        let cfg = DaemonConfig::load_layered(None).unwrap();
+        let bc = &cfg.artifacts.binary_cache;
+        assert!(!bc.enabled, "binary cache is opt-in (default off)");
+        assert_eq!(bc.max_size, crate::memory::MemorySize::from_gib(10));
+        assert_eq!(bc.dir, std::path::PathBuf::from("/var/lib/sbgh/binary-cache"));
+    }
+
+    #[test]
+    fn daemon_binary_cache_toml_then_env_override() {
+        let mut env = daemon_env();
+        env.push(("SBGH_ARTIFACTS_BINARY_CACHE_MAX_SIZE", "20G"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[artifacts.binary_cache]\nenabled = true\nmax_size = \"5G\"\ndir = \"/srv/cache\"\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        let bc = &cfg.artifacts.binary_cache;
+        assert!(bc.enabled, "TOML enables the cache");
+        // Env wins over TOML for max_size; dir falls through from TOML.
+        assert_eq!(bc.max_size, crate::memory::MemorySize::from_gib(20));
+        assert_eq!(bc.dir, std::path::PathBuf::from("/srv/cache"));
     }
 
     #[test]

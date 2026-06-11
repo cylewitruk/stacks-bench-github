@@ -46,6 +46,11 @@ rusty-s3.workspace = true
 url.workspace = true
 # Slice 5 trigger_policy: regex matching for tag_pattern matchers.
 regex.workspace = true
+# Binary cache (item 0025): fingerprint hashing + binary integrity sha256;
+# `toml` parses `rust-toolchain.toml` for the pinned-channel fingerprint input.
+sha2.workspace = true
+hex.workspace = true
+toml.workspace = true
 # Slack ad-hoc profiling connector (item 0002): Socket Mode client + typed
 # Block Kit builders for the result card.
 slack-morphism.workspace = true

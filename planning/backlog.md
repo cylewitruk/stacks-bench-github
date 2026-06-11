@@ -216,40 +216,6 @@ rows show their stage duration; all survive a resume.
 **Deferred / non-goals:** No card-layout change (rides the v8 render); kept
 **separate from v8 Phase 3** so the pre-claim queue seam stays uncluttered.
 
-### 0025 — Release-baseline binary cache
-
-- **id:** `0025-baseline-binary-cache`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** *(none hard)* — interacts with `0004-worker-fleet` (the cache
-  wants to be fleet-shareable) and the `measurement_profile` baseline-trust model
-- **source:** high-value list (2026-06)
-
-**Problem:** Every bench rebuilds `stacks-bench` from source (~5–7 min), even for
-the handful of designated release/baseline refs that are benched repeatedly
-(`cylewitruk/stacks-core` `sb-integration/3.W.X.Y.Z`). A Slack request like "bench
-blocks n..m on 3.4.0.0.3" pays full build latency for an unchanging binary.
-
-**Scope:** A **release-prefix policy** in config — one or more branch/tag prefixes
-(e.g. `sb-integration/3.`) flagged as baselines/releases, extending the existing
-baseline-trigger surface rather than a parallel mechanism. Plus a **prebuild and
-pinned local cache** of the `stacks-bench` binary, keyed by **resolved commit SHA
-plus a full build fingerprint** — target triple, cargo profile/features/`RUSTFLAGS`,
-the daemon/build-template version, the VM/worker image (or `measurement_profile`),
-and any artifact-affecting protocol/schema version — and built via the *identical*
-recipe a real job uses, so a "hit" can't silently reuse a binary built under
-different assumptions. Designated baselines are **pinned** (never evicted);
-ad-hoc builds stay LRU. Warm on policy-ref push/tag and on daemon start; a hit
-skips the build phase outright.
-
-**Acceptance:** A bench against a designated release ref reuses a cached binary
-(no build phase) when SHA + fingerprint match; a miss falls back to a normal
-build and populates the cache.
-
-**Deferred / non-goals:** Fleet-shared store (S3) vs purely-local, eviction
-budget, and fingerprint inputs are design questions. Distinct from *measurement*
-baselines — this is a build-time cache, not the delta-comparison reference.
-
 ### 0026 — Central block/tx index cache (pre-seed)
 
 - **id:** `0026-central-block-index-cache`
