@@ -5,8 +5,9 @@
 //!   2. **resolve** the workload (the deterministic parser seam);
 //!   3. **enqueue** an ad-hoc job (default repo/rev, no webhook) carrying the
 //!      Slack reporting provenance;
-//!   4. **react** ⏳ on the request — the only channel-visible signal for an
-//!      accepted job.
+//!   4. **post** the queued live-timeline card in-thread (persisting its `ts`
+//!      by job id, so the claim-time reporter resumes the same card) and
+//!      **react** ⏳ on the request.
 //!
 //! A rejection at step 1 or 2 is an **ephemeral** reply (invoker-only) with
 //! **no enqueue and no reaction**, so a denied/garbled request leaves the
@@ -19,7 +20,9 @@ use std::sync::Arc;
 use sbgh_core::config::SlackConfig;
 use sbgh_core::db::JobStore;
 use sbgh_core::models::{GitRefKind, JobKind, NewJob, QueuedEventDetail, TriggerKind};
+use uuid::Uuid;
 
+use crate::slack::card::{self, CardCtx};
 use crate::slack::client::{QUEUED_REACTION, SlackClient};
 use crate::slack::target::SlackJobTarget;
 use crate::slack::workload::resolve_workload;
@@ -110,24 +113,67 @@ impl SlackConnector {
             workload_key: None,
         };
 
-        if let Err(e) = self
+        let job = match self
             .jobs
             .create_adhoc_job(&new_job, &detail)
             .await
         {
-            tracing::error!(error = %e, "slack: enqueue failed");
-            self.reject(&event, "couldn't enqueue the benchmark — please retry")
-                .await;
-            return;
-        }
+            Ok(job) => job,
+            Err(e) => {
+                tracing::error!(error = %e, "slack: enqueue failed");
+                self.reject(&event, "couldn't enqueue the benchmark — please retry")
+                    .await;
+                return;
+            }
+        };
 
-        // 4. Exactly one ⏳ reaction on the request — the accepted-job signal.
+        // 4. Post the queued live-timeline card + persist its ts by job id, so the
+        //    claim-time reporter resumes the SAME card (item 0023, Phase 3).
+        self.post_queued_card(&event, &new_job.git_ref_display, job.id)
+            .await;
+
+        // 5. Exactly one ⏳ reaction on the request — the accepted-job signal.
         if let Err(e) = self
             .client
             .add_reaction(&event.channel, &event.message_ts, QUEUED_REACTION)
             .await
         {
             tracing::warn!(error = %e, "slack: add_reaction failed (job still enqueued)");
+        }
+    }
+
+    /// Post the queued live-timeline card in-thread + persist its `ts` by
+    /// `job_id` (the connector holds no `RunnableJob` pre-claim). Best-effort:
+    /// a post or persist failure just means the claim-time reporter posts a
+    /// fresh card. Pre-claim, the rev hasn't resolved to a commit yet, so
+    /// the card carries the rev (not a SHA) until the reporter takes over.
+    async fn post_queued_card(&self, event: &MentionEvent, rev: &str, job_id: Uuid) {
+        let job_id_str = job_id.to_string();
+        let ctx = CardCtx {
+            rev,
+            commit: None,
+            commit_url: None,
+            job_id: &job_id_str,
+        };
+        let blocks = card::queued(&ctx, None);
+        let fallback = format!("Benchmarking {rev}");
+        match self
+            .client
+            .post_blocks_in_thread(&event.channel, &event.message_ts, &blocks, &fallback)
+            .await
+        {
+            Ok(ts) => {
+                if let Err(e) = self
+                    .jobs
+                    .record_plan_message_ts(job_id, &ts)
+                    .await
+                {
+                    tracing::warn!(error = %e, "slack: persisting queued plan ts failed (non-fatal)");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "slack: posting queued plan card failed (non-fatal)")
+            }
         }
     }
 
@@ -192,6 +238,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSlackClient {
         ephemerals: Mutex<Vec<(String, String, String)>>, // (channel, user, text)
+        posts: Mutex<Vec<(String, String, String)>>,      // (channel, thread_ts, blocks-json)
         reactions: Mutex<Vec<(String, String, String)>>,  // (channel, ts, reaction)
         removed: Mutex<Vec<(String, String, String)>>,    // (channel, ts, reaction)
     }
@@ -213,11 +260,15 @@ mod tests {
 
         async fn post_blocks_in_thread(
             &self,
-            _channel: &str,
-            _thread_ts: &str,
-            _blocks: &serde_json::Value,
+            channel: &str,
+            thread_ts: &str,
+            blocks: &serde_json::Value,
             _fallback: &str,
         ) -> anyhow::Result<String> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((channel.into(), thread_ts.into(), blocks.to_string()));
             Ok("ts".into())
         }
 
@@ -335,6 +386,46 @@ mod tests {
                 .lock()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// At enqueue, the connector posts the queued live-timeline card in-thread
+    /// and persists its ts **by job id** (the pre-claim path), so the
+    /// claim-time reporter resumes the same card.
+    #[tokio::test]
+    async fn accepted_request_posts_queued_card_and_records_its_ts() {
+        let (c, store, slack) = harness();
+        c.handle_mention(event("<@U07BOT> bench --block 184231"))
+            .await;
+
+        // One card posted under the request ts: the queued plan, Job row "Queued".
+        // Scoped so the guard drops before the `await` below (clippy).
+        {
+            let posts = slack.posts.lock().unwrap();
+            assert_eq!(posts.len(), 1);
+            assert_eq!(posts[0].0, "C1");
+            assert_eq!(posts[0].1, "1700000000.000100");
+            assert!(
+                posts[0]
+                    .2
+                    .contains("\"type\":\"plan\""),
+                "{}",
+                posts[0].2
+            );
+            assert!(posts[0].2.contains("Queued"), "Job row queued: {}", posts[0].2);
+        }
+
+        // The card ts was persisted by job id (read back via latest_plan_message_ts).
+        let jobs = store.all_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            store
+                .latest_plan_message_ts(jobs[0].id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ts"),
+            "queued card ts persisted by job_id",
         );
     }
 

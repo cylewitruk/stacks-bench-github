@@ -32,6 +32,7 @@ use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 use crate::report::build_report_surface;
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
+use crate::slack::card::{self, CardCtx};
 use crate::slack::client::SlackClient;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
@@ -376,18 +377,20 @@ impl Coordinator {
             .await;
     }
 
-    /// Phase 5: report each waiting job its queue position on a Check Run.
-    /// Called each loop iteration after `fill_slots`, so `in_flight()` reflects
-    /// the just-claimed jobs and the queue is what genuinely remains. For a
-    /// queued job at index `i`, `ahead = in_flight + i` (the runs that finish
-    /// or get claimed before it). The check is created/refreshed in the
-    /// existing `in_progress` state with a "queued — N ahead" body; on
-    /// claim the reporter adopts the same check (its id is persisted) and
-    /// phase updates replace the text. Best-effort: a GitHub or DB hiccup
-    /// is logged, never fatal.
+    /// Phase 5 (+ v8 Slice C): report each waiting job its queue position on
+    /// its surface — a GitHub Check Run ("queued — N ahead"), or, for a
+    /// Slack job whose card was posted, the live card's Job row ("position
+    /// N/M"). Called each loop after `fill_slots`, so `in_flight()`
+    /// reflects the just-claimed jobs and the queue is what genuinely
+    /// remains. A queued job at index `i` has `ahead` runs before it
+    /// (`in_flight()` plus `i`). The GitHub check is created/refreshed
+    /// `in_progress` and a later claim adopts its persisted id; the Slack
+    /// card's Job row is `chat.update`d. Best-effort: a surface or
+    /// DB hiccup is logged, never fatal.
     ///
-    /// The `last_positions` map suppresses redundant GitHub edits (only push
-    /// when a job's position changed) and is pruned to the current queue.
+    /// The `last_positions` map suppresses redundant **surface edits** (only
+    /// push when a job's position changed) and is pruned to the current
+    /// queue.
     async fn update_queue_positions(&mut self) {
         let queued = match self
             .deps
@@ -402,33 +405,91 @@ impl Coordinator {
             }
         };
         let in_flight = self.in_flight();
+        let total = in_flight + queued.len();
         let mut seen = HashSet::new();
         for (i, job) in queued.iter().enumerate() {
-            // Only jobs whose `[reporting]` wants a check and that already carry
-            // a head SHA (PR / branch-push; a tag job resolves only at claim) get
-            // a pre-claim position check.
-            if job.commit.is_empty() || !wants_position_check(&self.deps.config.reporting, job) {
+            let ahead = in_flight + i;
+            // Position-reportable: a **Slack** job whose pre-claim card was
+            // already posted (it carries a `plan_message_ts`), or a **GitHub**
+            // job whose `[reporting]` wants a pre-claim position check and that
+            // already carries a head SHA (PR / branch-push; a tag job resolves
+            // only at claim).
+            let reportable = match &job.progress {
+                ProgressTarget::Slack { plan_message_ts, .. } => plan_message_ts.is_some(),
+                _ => {
+                    !job.commit.is_empty() && wants_position_check(&self.deps.config.reporting, job)
+                }
+            };
+            if !reportable {
                 continue;
             }
-            let ahead = in_flight + i;
             seen.insert(job.id);
             if self
                 .last_positions
                 .get(&job.id)
                 == Some(&ahead)
             {
-                continue; // unchanged → no GitHub edit
+                continue; // unchanged → no edit
             }
-            if self
-                .ensure_position_check(job, ahead)
-                .await
-            {
+            let updated = match &job.progress {
+                ProgressTarget::Slack {
+                    channel,
+                    plan_message_ts: Some(plan_ts),
+                    ..
+                } => {
+                    self.update_slack_queue_position(job, channel, plan_ts, ahead, total)
+                        .await
+                }
+                _ => {
+                    self.ensure_position_check(job, ahead)
+                        .await
+                }
+            };
+            if updated {
                 self.last_positions
                     .insert(job.id, ahead);
             }
         }
         self.last_positions
             .retain(|id, _| seen.contains(id));
+    }
+
+    /// Update the queued Slack card's **Job row** with the live queue position
+    /// ("position N/M"). The pre-claim card was posted by the connector (its
+    /// `plan_ts`); this `chat.update`s it while the job waits. Pre-claim, the
+    /// rev hasn't resolved, so the card carries the rev (not a SHA).
+    /// Best-effort — returns whether the card is now up to date.
+    async fn update_slack_queue_position(
+        &self,
+        job: &RunnableJob,
+        channel: &str,
+        plan_ts: &str,
+        ahead: usize,
+        total: usize,
+    ) -> bool {
+        let Some(slack) = &self.deps.slack else {
+            return false; // no client wired → nothing to update
+        };
+        let job_id = job.id.to_string();
+        let ctx = CardCtx {
+            rev: &job.git_ref_display,
+            commit: None,
+            commit_url: None,
+            job_id: &job_id,
+        };
+        let detail = format!("position {}/{}", ahead + 1, total);
+        let blocks = card::queued(&ctx, Some(&detail));
+        let fallback = format!("Benchmarking {} — queued ({detail})", job.git_ref_display);
+        match slack
+            .update_blocks(channel, plan_ts, &blocks, &fallback)
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(job_id = %job.id, error = ?e, "queue-position: slack card update failed (non-fatal)");
+                false
+            }
+        }
     }
 
     /// Create-or-update the queued job's position Check Run (`in_progress`
@@ -2265,6 +2326,134 @@ mod tests {
             create_count(&gh),
             2,
             "a persist failure must leave the position un-debounced so it retries",
+        );
+    }
+
+    /// Records Slack `chat.update` calls so the queue-position test can assert
+    /// the queued card was edited (and debounced).
+    #[derive(Default)]
+    struct FakePositionSlack {
+        updates: StdMutex<Vec<(String, String, String)>>, // (channel, ts, blocks-json)
+    }
+
+    #[async_trait]
+    impl SlackClient for FakePositionSlack {
+        async fn post_ephemeral(&self, _c: &str, _u: &str, _t: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_blocks_in_thread(
+            &self,
+            _c: &str,
+            _t: &str,
+            _b: &serde_json::Value,
+            _f: &str,
+        ) -> anyhow::Result<String> {
+            Ok("ts".into())
+        }
+        async fn update_blocks(
+            &self,
+            channel: &str,
+            ts: &str,
+            blocks: &serde_json::Value,
+            _f: &str,
+        ) -> anyhow::Result<()> {
+            self.updates
+                .lock()
+                .unwrap()
+                .push((channel.into(), ts.into(), blocks.to_string()));
+            Ok(())
+        }
+        async fn add_reaction(&self, _c: &str, _t: &str, _r: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _c: &str, _t: &str, _r: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A queued Slack job (pre-claim: empty commit) with an optional
+    /// posted-card `plan_message_ts`.
+    fn slack_job(plan_message_ts: Option<&str>) -> RunnableJob {
+        RunnableJob {
+            commit: String::new(),
+            progress: ProgressTarget::Slack {
+                channel: "C1".into(),
+                message_ts: "REQ".into(),
+                plan_message_ts: plan_message_ts.map(Into::into),
+            },
+            ..pr_job("unused", None)
+        }
+    }
+
+    fn position_coord_with_slack(
+        config: DaemonConfig,
+        source: Arc<FakeSource>,
+        slack: Arc<dyn SlackClient>,
+    ) -> Coordinator {
+        let config = Arc::new(config);
+        let driver: Arc<dyn Driver> =
+            Arc::new(LibvirtDriver::new(config.clone(), Arc::new(RecordingShell::new())));
+        let deps = JobDeps {
+            config,
+            jobs: source,
+            gh: Arc::new(FakeGitHub::new()),
+            driver,
+            app_id: Arc::new(OnceCell::new()),
+            slack: Some(slack),
+        };
+        Coordinator::new(deps, 1, CancellationToken::new())
+    }
+
+    /// item 0023 Slice C: a queued Slack job whose pre-claim card was posted
+    /// (it carries a `plan_message_ts`) gets its Job row `chat.update`d
+    /// with the live queue position, debounced like the GitHub position
+    /// check.
+    #[tokio::test]
+    async fn coordinator_updates_slack_queue_position_and_debounces() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("unused", None)));
+        source.set_queued(vec![slack_job(Some("PLAN_TS"))]);
+        let slack = Arc::new(FakePositionSlack::default());
+        let mut coord = position_coord_with_slack(config, source.clone(), slack.clone());
+
+        coord
+            .update_queue_positions()
+            .await;
+
+        {
+            let updates = slack.updates.lock().unwrap();
+            assert_eq!(updates.len(), 1, "the queued card was chat.update'd once");
+            assert_eq!(updates[0].1, "PLAN_TS", "updated the persisted card ts");
+            // in_flight 0 + 1 queued → total 1, ahead 0 → "position 1/1".
+            assert!(
+                updates[0]
+                    .2
+                    .contains("position 1/1"),
+                "{}",
+                updates[0].2
+            );
+            assert!(
+                updates[0]
+                    .2
+                    .contains("Queued"),
+                "Job row queued: {}",
+                updates[0].2
+            );
+        }
+
+        // Second pass, unchanged position → debounced (no new chat.update).
+        coord
+            .update_queue_positions()
+            .await;
+        assert_eq!(
+            slack
+                .updates
+                .lock()
+                .unwrap()
+                .len(),
+            1,
+            "an unchanged position makes no new edit",
         );
     }
 

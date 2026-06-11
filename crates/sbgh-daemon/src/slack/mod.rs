@@ -14,6 +14,7 @@
 //! `[slack].enabled`.
 
 pub mod api_client;
+pub mod card;
 pub mod client;
 pub mod connector;
 pub mod socket;

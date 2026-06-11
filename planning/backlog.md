@@ -180,6 +180,30 @@ guards as the flag parser.
 **Deferred / non-goals:** No new task/execution work; rides v5's surface + bench
 path. Model/provider choice + prompt design are part of its own design.
 
+### 0024 — Slack card stage timings
+
+- **id:** `0024-slack-card-stage-timings`
+- **status:** `backlog`
+- **priority:** `low`
+- **depends_on:** `0023-slack-card-redesign` (the 4-stage card it annotates)
+- **source:** v8 Phase 2 (2026-06) — timing deferred from the card redesign
+
+**Problem:** The v8 card shows tense titles + descriptive italic details, but a
+completed row carries no duration ("Built in 1m 45s") and the in-progress detail
+doesn't tick a live elapsed ("Building… [1m 30s]") — the mock's timing.
+
+**Scope:** Per-row **live elapsed** (heartbeat-driven, debounced like the PR
+comment) + **completed durations** in each row's `output`, and a total on the
+Finalize row. Needs **persisted per-stage timing** so durations survive a daemon
+restart (resume re-renders the card), and a debounce so the ticking doesn't spam
+`chat.update`.
+
+**Acceptance:** A running card's active row shows a ticking elapsed; completed
+rows show their stage duration; all survive a resume.
+
+**Deferred / non-goals:** No card-layout change (rides the v8 render); kept
+**separate from v8 Phase 3** so the pre-claim queue seam stays uncluttered.
+
 *`0022-report-surface-trait` shipped (iteration v7, 2026-06) →
 [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md).*
 

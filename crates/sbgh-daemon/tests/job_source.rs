@@ -15,6 +15,7 @@ use sbgh_core::models::{
     GitRefKind, JobCreationRequest, JobKind, NewJob, NewPullRequestLink, QueuedEventDetail,
     TriggerKind,
 };
+use uuid::Uuid;
 
 // Daemon is a bin-only crate; pull in the modules under test via
 // path include (same pattern as processor_e2e). `job_source` references
@@ -113,7 +114,7 @@ async fn enqueue_branch_push(store: &PostgresJobStore, webhook_id: i64) {
 
 /// Create a queued `slack_adhoc` ad-hoc job carrying a `SlackAdhoc` queued
 /// event (channel/message_ts reporting provenance + the resolved workload).
-async fn enqueue_slack_adhoc(store: &PostgresJobStore, webhook_id: i64) {
+async fn enqueue_slack_adhoc(store: &PostgresJobStore, webhook_id: i64) -> Uuid {
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
@@ -140,7 +141,10 @@ async fn enqueue_slack_adhoc(store: &PostgresJobStore, webhook_id: i64) {
         })
         .await
         .unwrap();
-    assert!(matches!(outcome, JobCreationOutcome::Created(_)));
+    match outcome {
+        JobCreationOutcome::Created(created) => created.job.id,
+        other => panic!("expected Created, got {other:?}"),
+    }
 }
 
 /// Codex acceptance point (v5): a `slack_adhoc` job MUST assemble as
@@ -202,6 +206,69 @@ async fn slack_adhoc_job_assembles_as_slack_progress() {
                 plan_message_ts.as_deref(),
                 Some("1700000000.000999"),
                 "plan message ts read back on re-claim",
+            );
+        }
+        other => panic!("expected Slack, got {other:?}"),
+    }
+
+    // The pre-claim Slack connector (item 0023) persists by `job.id` via the
+    // shared `JobStore::record_plan_message_ts` — no `RunnableJob` needed — and
+    // the same `latest_plan_message_ts` read returns the most-recent.
+    store
+        .record_plan_message_ts(job.id, "1700000000.000888")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .latest_plan_message_ts(job.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1700000000.000888"),
+        "the by-job_id writer round-trips through latest_plan_message_ts",
+    );
+}
+
+/// The pre-claim flow (item 0023, Phase 3): the connector records the queued
+/// card's `ts` **before** the job is claimed, and `claim_next` assembles the
+/// Slack progress with that `plan_message_ts` — so the reporter resumes the
+/// same card instead of reposting.
+#[tokio::test]
+async fn slack_queued_card_ts_assembles_on_claim() {
+    let (_db, pool) = setup_pg_db().await;
+    let webhook_id = seed(&pool, 100, 10).await;
+    let store = Arc::new(PostgresJobStore::new(pool.clone()));
+    let job_id = enqueue_slack_adhoc(&store, webhook_id).await;
+
+    // The connector's pre-claim record — by job id, with no `RunnableJob` yet.
+    store
+        .record_plan_message_ts(job_id, "1700000000.000777")
+        .await
+        .unwrap();
+
+    let archive_root = tempfile::tempdir().unwrap();
+    let source = JobSource::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        Arc::new(artifact_store::LocalFsStore::new(
+            archive_root
+                .path()
+                .to_path_buf(),
+        )),
+    );
+
+    let job = source
+        .claim_next()
+        .await
+        .unwrap()
+        .expect("the queued slack job");
+    match job.progress {
+        ProgressTarget::Slack { plan_message_ts, .. } => {
+            assert_eq!(
+                plan_message_ts.as_deref(),
+                Some("1700000000.000777"),
+                "the pre-claim queued card ts assembles on claim",
             );
         }
         other => panic!("expected Slack, got {other:?}"),

@@ -37,7 +37,8 @@ use uuid::Uuid;
 use crate::Result;
 use crate::models::{
     GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
-    JobMetric, JobResult, NewJob, NewJobEvent, ResolvedCommit, TerminalJobStatus,
+    JobEventKind, JobEventStatus, JobMetric, JobResult, NewJob, NewJobEvent, ResolvedCommit,
+    TerminalJobStatus,
 };
 
 /// Slice 10: atomic "the run completed" write. Bundles the terminal
@@ -358,6 +359,32 @@ pub trait JobStore: Send + Sync + 'static {
     /// job `chat.update`s the existing live-timeline card instead of posting a
     /// duplicate.
     async fn latest_plan_message_ts(&self, job_id: Uuid) -> Result<Option<String>>;
+
+    /// Record a Slack `plan` message `ts` on the job's timeline (a
+    /// `plan_message_sent` event) — the writer behind
+    /// [`latest_plan_message_ts`]. Keyed by `job_id` so the **pre-claim**
+    /// Slack connector (item `0023`, which holds a core [`Job`], not a
+    /// `RunnableJob`) can persist the queued card's identity; the daemon's
+    /// claimed-world `RunnableJobStore::set_plan_message_ts`
+    /// delegates here, so the event shape lives in one place. The default impl
+    /// rides [`insert_event`](Self::insert_event); a failure is non-fatal at
+    /// the call site, like the comment/check identity writes.
+    ///
+    /// [`latest_plan_message_ts`]: Self::latest_plan_message_ts
+    async fn record_plan_message_ts(&self, job_id: Uuid, message_ts: &str) -> Result<()> {
+        self.insert_event(&NewJobEvent {
+            job_id,
+            event_kind: JobEventKind::PlanMessageSent,
+            event_status: JobEventStatus::Success,
+            github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
+            remark: None,
+            detail: Some(serde_json::json!({ "plan_message_ts": message_ts })),
+        })
+        .await?;
+        Ok(())
+    }
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 

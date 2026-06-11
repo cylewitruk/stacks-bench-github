@@ -1,26 +1,28 @@
-//! The Slack live-timeline `plan` card (item 0002, slice B).
+//! The Slack live-timeline `plan` card (item `0023`, iteration v8).
 //!
 //! One [`SlackTimeline`] per Slack ad-hoc job, driven by the reporter at three
-//! points: posted when the job starts running (`started`), `chat.update`d as it
-//! advances Build → Benchmark → Archive (`advance`, from the worker's phase
-//! events), and finalized at terminal (`completed`/`failed`/`cancelled`) with
-//! the ⏳ → ✅/❌ reaction swap on the request message.
+//! points: posted when the job starts running ([`SlackTimeline::started`]),
+//! `chat.update`d as it advances **Job → Build → Run → Finalize**
+//! ([`SlackTimeline::advance`], from the worker's phase events), and finalized
+//! at terminal ([`SlackTimeline::completed`]/[`failed`](SlackTimeline::failed)/
+//! [`cancelled`](SlackTimeline::cancelled)) — the ⏳ → ✅/❌ reaction swap
+//! plus, on success, the results table + download button (via
+//! [`crate::slack::card`]).
 //!
-//! The posted card's `ts` is persisted (`set_plan_message_ts`) and read back on
-//! re-claim, so a daemon restart resumes updating the **same** card instead of
-//! posting a duplicate. Every Slack call is non-fatal (logged, never failing
-//! the benchmark).
+//! Each row's title **tense-progresses** (future → present → past) and carries
+//! an italic "what's happening now" detail while it's pending/in-progress that
+//! the render layer clears on complete. The posted card's `ts` is persisted
+//! (`set_plan_message_ts`) and read back on re-claim, so a daemon restart
+//! resumes the **same** card. Every Slack call is non-fatal.
 
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::bench_summary::{self, PlanCard, PlanTaskStatus, RunResult};
+use crate::bench_summary::RunResult;
 use crate::job_source::{RunnableJob, RunnableJobStore};
+use crate::slack::card::{self, CardCtx, Results, STAGES};
 use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
-
-/// The number of plan stages (Build, Benchmark, Archive).
-const STAGES: usize = 3;
 
 pub struct SlackTimeline {
     client: Arc<dyn SlackClient>,
@@ -41,7 +43,7 @@ struct State {
     /// The plan card's own message `ts` (`None` until posted; pre-seeded from
     /// the persisted value on re-claim so we resume the existing card).
     plan_ts: Option<String>,
-    /// The furthest stage reached (0..STAGES). Monotonic.
+    /// The furthest stage reached — the in-progress row (0..STAGES). Monotonic.
     stage: usize,
 }
 
@@ -75,15 +77,22 @@ impl SlackTimeline {
         }
     }
 
-    /// Post (or, on re-claim, resume) the card with the Build row in progress.
+    /// Post (or, on re-claim, resume) the card with the job started — Job
+    /// complete, Build in progress.
     pub async fn started(&self) {
-        let blocks = self.plan_blocks(live_statuses(0), Default::default(), None);
-        self.upsert(&blocks).await;
+        let stage = {
+            let mut st = self.state.lock().await;
+            // The job has started → Build is the active row (Job is complete).
+            st.stage = st.stage.max(1);
+            st.stage
+        };
+        self.upsert(&card::running(&self.ctx(), stage))
+            .await;
     }
 
-    /// Advance to `stage` (Build=0, Benchmark=1, Archive=2) — `chat.update` the
-    /// card so the prior rows show complete and `stage` shows in-progress.
-    /// Monotonic: a same/earlier stage (e.g. a heartbeat) is a no-op.
+    /// Advance to `stage` — `chat.update` the card so the prior rows show
+    /// complete and `stage` shows in-progress. Monotonic: a same/earlier stage
+    /// (e.g. a repeat or out-of-order phase) is a no-op.
     pub async fn advance(&self, stage: usize) {
         let stage = stage.min(STAGES - 1);
         {
@@ -93,63 +102,64 @@ impl SlackTimeline {
             }
             st.stage = stage;
         }
-        let blocks = self.plan_blocks(live_statuses(stage), Default::default(), None);
-        self.upsert(&blocks).await;
+        self.upsert(&card::running(&self.ctx(), stage))
+            .await;
     }
 
-    /// Terminal success: all rows complete, metrics in the Benchmark row, the
-    /// DB download on the Archive row (S3 only); swap ⏳ → ✅.
+    /// Terminal success: all rows complete, the results table + download button
+    /// beneath the plan; swap ⏳ → ✅.
     pub async fn completed(&self, result: Option<RunResult>, db_url: Option<String>) {
-        let metrics = bench_summary::metrics_output_text(result.as_ref());
-        let outputs = [None, Some(metrics), None];
-        let blocks =
-            self.plan_blocks([PlanTaskStatus::Complete; STAGES], outputs, db_url.as_deref());
+        self.state.lock().await.stage = STAGES;
+        let blocks = card::completed(
+            &self.ctx(),
+            Results {
+                metrics: result.as_ref(),
+                db_url: db_url.as_deref(),
+            },
+        );
         self.upsert(&blocks).await;
         self.swap_reaction(COMPLETED_REACTION)
             .await;
     }
 
-    /// Terminal failure: the current row → error (carrying the message), later
-    /// rows pending; swap ⏳ → ❌.
+    /// Terminal failure: the current row → error (carrying the message),
+    /// earlier rows complete, later rows pending; swap ⏳ → ❌.
     pub async fn failed(&self, error: &str) {
-        self.terminate_error(format!("Failed: {error}"))
+        self.terminate_error(&format!("Failed: {error}"))
             .await;
     }
 
     /// Terminal cancellation: like [`failed`](Self::failed) but a cancel note.
     pub async fn cancelled(&self, reason: &str) {
-        self.terminate_error(format!(
+        self.terminate_error(&format!(
             "Cancelled: {reason}. Re-run by mentioning me with a new `bench …` request."
         ))
         .await;
     }
 
-    async fn terminate_error(&self, message: String) {
-        let stage = self.state.lock().await.stage;
-        let mut outputs: [Option<String>; STAGES] = Default::default();
-        outputs[stage] = Some(message);
-        let blocks = self.plan_blocks(error_statuses(stage), outputs, None);
+    async fn terminate_error(&self, message: &str) {
+        let stage = self
+            .state
+            .lock()
+            .await
+            .stage
+            .min(STAGES - 1);
+        let blocks = card::failed(&self.ctx(), stage, message);
         self.upsert(&blocks).await;
         self.swap_reaction(FAILED_REACTION)
             .await;
     }
 
-    /// Render the `plan` blocks for the given per-row statuses + outputs.
-    fn plan_blocks(
-        &self,
-        statuses: [PlanTaskStatus; STAGES],
-        outputs: [Option<String>; STAGES],
-        db_url: Option<&str>,
-    ) -> serde_json::Value {
-        bench_summary::render_plan_blocks(&PlanCard {
+    /// The render context for this job — claimed, so the commit is resolved
+    /// (the title carries the short SHA and the Build row links the
+    /// commit).
+    fn ctx(&self) -> CardCtx<'_> {
+        CardCtx {
             rev: &self.rev,
-            commit: &self.commit,
-            job_id: &self.job_id,
-            statuses,
-            outputs,
-            db_url,
+            commit: Some(&self.commit),
             commit_url: Some(&self.commit_url),
-        })
+            job_id: &self.job_id,
+        }
     }
 
     /// Post the card if we don't yet have one (persisting its `ts` for
@@ -227,35 +237,16 @@ impl SlackTimeline {
     }
 }
 
-/// Live statuses for `stage`: earlier rows complete, `stage` in-progress, later
-/// pending.
-fn live_statuses(stage: usize) -> [PlanTaskStatus; STAGES] {
-    std::array::from_fn(|i| match i.cmp(&stage) {
-        std::cmp::Ordering::Less => PlanTaskStatus::Complete,
-        std::cmp::Ordering::Equal => PlanTaskStatus::InProgress,
-        std::cmp::Ordering::Greater => PlanTaskStatus::Pending,
-    })
-}
-
-/// Terminal-error statuses: earlier rows complete, `stage` error, later
-/// pending.
-fn error_statuses(stage: usize) -> [PlanTaskStatus; STAGES] {
-    std::array::from_fn(|i| match i.cmp(&stage) {
-        std::cmp::Ordering::Less => PlanTaskStatus::Complete,
-        std::cmp::Ordering::Equal => PlanTaskStatus::Error,
-        std::cmp::Ordering::Greater => PlanTaskStatus::Pending,
-    })
-}
-
-/// Map a worker phase label to its plan stage (Build=0, Benchmark=1,
-/// Archive=2), or `None` for phases that don't advance the live timeline
-/// (terminal `done`/`error`, or an unknown label). Drives the reporter's
+/// Map a worker phase label to its plan stage (Build=1, Run=2, Finalize=3), or
+/// `None` for phases that don't advance the live timeline (terminal `done`/
+/// `error`, or an unknown label). The Job row (0) is complete once the job
+/// starts; Phase 3 drives its queued/preparing states. Drives the reporter's
 /// per-phase [`SlackTimeline::advance`] calls.
 pub fn stage_for_phase(label: &str) -> Option<usize> {
     match label {
-        "starting" | "building" => Some(0),
-        "build_done" | "running" => Some(1),
-        "collecting" => Some(2),
+        "starting" | "building" => Some(1),
+        "build_done" | "running" => Some(2),
+        "collecting" => Some(3),
         _ => None,
     }
 }
@@ -276,7 +267,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSlack {
         posts: StdMutex<Vec<String>>, // blocks json of each post_blocks_in_thread
-        updates: StdMutex<Vec<String>>, // blocks json of each update_blocks (by ts)
+        updates: StdMutex<Vec<String>>, // "{ts}:{blocks}" of each update_blocks
         added: StdMutex<Vec<String>>,
         removed: StdMutex<Vec<String>>,
     }
@@ -437,18 +428,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn started_posts_the_plan_and_persists_its_ts() {
+    async fn started_posts_four_row_plan_and_persists_its_ts() {
         let slack = Arc::new(FakeSlack::default());
         let store = Arc::new(RecordingStore::default());
         let tl = timeline(slack.clone(), store.clone(), None);
 
         tl.started().await;
 
-        // One post (the card), and its ts persisted for resume.
         let posts = slack.posts.lock().unwrap();
         assert_eq!(posts.len(), 1);
         assert!(posts[0].contains("\"type\":\"plan\""), "{}", posts[0]);
-        assert!(posts[0].contains("in_progress"), "Build row in progress: {}", posts[0]);
+        assert_eq!(
+            posts[0]
+                .matches("\"task_id\"")
+                .count(),
+            4,
+            "four rows (Job/Build/Run/Finalize): {}",
+            posts[0]
+        );
+        // Job complete (past tense), Build the active row (present tense, italic).
+        assert!(posts[0].contains("Job started"), "{}", posts[0]);
+        assert!(posts[0].contains("Building benchmark binaries"), "{}", posts[0]);
+        assert!(posts[0].contains("\"status\":\"in_progress\""), "{}", posts[0]);
+        assert!(posts[0].contains("\"italic\":true"), "active detail is italic: {}", posts[0]);
+        assert!(posts[0].contains("Benchmarking develop @ abcdef12"), "live title: {}", posts[0]);
         assert_eq!(
             *store
                 .persisted
@@ -456,29 +459,20 @@ mod tests {
                 .unwrap(),
             vec!["PLAN_TS".to_string()]
         );
-        assert!(
-            slack
-                .updates
-                .lock()
-                .unwrap()
-                .is_empty(),
-            "no update before terminal"
-        );
     }
 
     #[tokio::test]
-    async fn advance_then_complete_updates_in_place_and_swaps_reaction() {
+    async fn advance_then_complete_appends_results_and_swaps_reaction() {
         let slack = Arc::new(FakeSlack::default());
         let store = Arc::new(RecordingStore::default());
         let tl = timeline(slack.clone(), store.clone(), None);
 
         tl.started().await; // post (Build in_progress)
-        tl.advance(1).await; // update (Benchmark in_progress)
-        tl.advance(0).await; // monotonic: no-op (earlier stage)
-        tl.completed(None, Some("https://s3/db".into()))
-            .await; // update (complete)
+        tl.advance(2).await; // update (Run in_progress)
+        tl.advance(1).await; // monotonic: no-op (earlier stage)
+        tl.completed(None, Some("https://s3/stacks-bench.db".into()))
+            .await; // update (all complete + results)
 
-        // Exactly one post (the initial card); the rest are in-place updates.
         assert_eq!(
             slack
                 .posts
@@ -489,17 +483,28 @@ mod tests {
             "only the first card is posted"
         );
         let updates = slack.updates.lock().unwrap();
-        assert_eq!(updates.len(), 2, "advance(1) + completed (advance(0) was a no-op)");
-        // All updates target the same persisted ts.
+        assert_eq!(updates.len(), 2, "advance(2) + completed (advance(1) was a no-op)");
         assert!(
             updates
                 .iter()
                 .all(|u| u.starts_with("PLAN_TS:")),
             "{updates:?}"
         );
-        // The completed update carries the DB link + all-complete.
-        assert!(updates[1].contains("Download stacks-bench.db"), "{}", updates[1]);
-        assert!(!updates[1].contains("in_progress"), "all rows complete: {}", updates[1]);
+        // The completed update carries the results blocks + the download button.
+        assert!(updates[1].contains("\"type\":\"markdown\""), "{}", updates[1]);
+        assert!(updates[1].contains("## Benchmark Results"), "{}", updates[1]);
+        assert!(updates[1].contains("Download Profiler Data"), "{}", updates[1]);
+        assert!(updates[1].contains("\"style\":\"primary\""), "{}", updates[1]);
+        assert!(
+            !updates[1].contains("\"status\":\"in_progress\""),
+            "all rows complete: {}",
+            updates[1]
+        );
+        assert!(
+            updates[1].contains("Benchmark develop @ abcdef12"),
+            "terminal title: {}",
+            updates[1]
+        );
         // ⏳ → ✅ swap.
         assert_eq!(*slack.removed.lock().unwrap(), vec![QUEUED_REACTION.to_string()]);
         assert_eq!(*slack.added.lock().unwrap(), vec![COMPLETED_REACTION.to_string()]);
@@ -542,24 +547,28 @@ mod tests {
         let tl = timeline(slack.clone(), store.clone(), None);
 
         tl.started().await;
-        tl.advance(1).await; // failure during the Benchmark stage
+        tl.advance(2).await; // failure during the Run stage
         tl.failed("boom: VM died")
             .await;
 
         let updates = slack.updates.lock().unwrap();
         let last = updates.last().unwrap();
         assert!(last.contains("\"status\":\"error\""), "an errored row: {last}");
-        assert!(last.contains("boom: VM died"), "carries the error: {last}");
+        assert!(last.contains("Failed: boom: VM died"), "carries the reason: {last}");
+        // The errored row shows `output` not italic details — that contract is
+        // pinned in `card`'s `error_row_shows_output_not_details`; here the
+        // still-pending Finalize row legitimately keeps its italic detail.
+        assert!(last.contains("Running benchmark"), "errored at the Run row: {last}");
         assert_eq!(*slack.added.lock().unwrap(), vec![FAILED_REACTION.to_string()]);
     }
 
     #[test]
     fn phase_labels_map_to_stages() {
-        assert_eq!(stage_for_phase("starting"), Some(0));
-        assert_eq!(stage_for_phase("building"), Some(0));
-        assert_eq!(stage_for_phase("build_done"), Some(1));
-        assert_eq!(stage_for_phase("running"), Some(1));
-        assert_eq!(stage_for_phase("collecting"), Some(2));
+        assert_eq!(stage_for_phase("starting"), Some(1));
+        assert_eq!(stage_for_phase("building"), Some(1));
+        assert_eq!(stage_for_phase("build_done"), Some(2));
+        assert_eq!(stage_for_phase("running"), Some(2));
+        assert_eq!(stage_for_phase("collecting"), Some(3));
         assert_eq!(stage_for_phase("done"), None);
         assert_eq!(stage_for_phase("error"), None);
         assert_eq!(stage_for_phase("whatever"), None);

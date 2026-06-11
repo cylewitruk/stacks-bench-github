@@ -492,20 +492,12 @@ impl RunnableJobStore for JobSource {
     }
 
     async fn set_plan_message_ts(&self, job: &RunnableJob, message_ts: &str) -> anyhow::Result<()> {
-        // The Slack `ts` is a string id, so it rides the JSONB `detail` (the
-        // comment/check id columns are BIGINT); `latest_plan_message_ts` reads
-        // it back on (re-)claim for resume-without-duplicate.
+        // The claimed-world convenience wrapper over `JobStore::record_plan_message_ts`
+        // (which the pre-claim Slack connector also uses, by `job.id`) — the
+        // `plan_message_sent` event shape lives there. Read back on (re-)claim via
+        // `latest_plan_message_ts` for resume-without-duplicate.
         self.jobs
-            .insert_event(&NewJobEvent {
-                job_id: job.id,
-                event_kind: JobEventKind::PlanMessageSent,
-                event_status: JobEventStatus::Success,
-                github_comment_id: None,
-                github_check_run_id: None,
-                github_check_run_url: None,
-                remark: None,
-                detail: Some(serde_json::json!({ "plan_message_ts": message_ts })),
-            })
+            .record_plan_message_ts(job.id, message_ts)
             .await?;
         Ok(())
     }

@@ -40,6 +40,8 @@ need editing when an item's status or location changes.
 | `0020-llm-intent-resolution` | LLM intent resolution (Slack) | `backlog` | [backlog.md](backlog.md) |
 | `0021-slack-live-timeline` | Slack live timeline | `shipped` | [archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md) |
 | `0022-report-surface-trait` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
+| `0023-slack-card-redesign` | Slack card redesign (live queue + rich results) | `in_progress` | [iterations/v8-slack-card-redesign.md](iterations/v8-slack-card-redesign.md) |
+| `0024-slack-card-stage-timings` | Slack card stage timings | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 
@@ -49,6 +51,7 @@ need editing when an item's status or location changes.
 | `v5-slack-adhoc-profiling` | Slack ad-hoc profiling | `shipped` | [archive/completed/0002-slack-adhoc-profiling.md](archive/completed/0002-slack-adhoc-profiling.md) |
 | `v6-slack-live-timeline` | Slack live timeline | `shipped` | [archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md) |
 | `v7-reporting-surface` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
+| `v8-slack-card-redesign` | Slack card redesign (live queue + rich results) | `in_progress` | [iterations/v8-slack-card-redesign.md](iterations/v8-slack-card-redesign.md) |
 
 ## Decisions
 
