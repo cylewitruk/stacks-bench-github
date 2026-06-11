@@ -16,10 +16,11 @@ When an iteration ships, archive each completed item under its own `NNNN-slug.md
 in `archive/completed/`. Keep the iteration file only if it's still useful as a
 validation recipe; otherwise move it to `archive/superseded/`.
 
-> **Active:** [v8-slack-card-redesign](v8-slack-card-redesign.md)
-> (`0023-slack-card-redesign`, planned). Shipped: v4 (`0001-artifact-store`),
-> v5 (`0002-slack-adhoc-profiling`), v6 (`0021-slack-live-timeline`), v7
-> (`0022-report-surface-trait`) → [archive/completed/](../archive/completed/).
+> **Active:** *none* — v8 shipped; next iteration is unselected (see
+> [backlog.md](../backlog.md)). Shipped: v4 (`0001-artifact-store`), v5
+> (`0002-slack-adhoc-profiling`), v6 (`0021-slack-live-timeline`), v7
+> (`0022-report-surface-trait`), v8 (`0023-slack-card-redesign`) →
+> [archive/completed/](../archive/completed/).
 
 ## Iteration Template
 

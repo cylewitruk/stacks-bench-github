@@ -1,28 +1,44 @@
-# v8: Slack card redesign (live queue + rich results)
+# 0023: Slack card redesign (live queue + rich results)
 
-Successor to [v7-reporting-surface](../archive/completed/0022-report-surface-trait.md).
-Refine the Slack benchmark card into a **richer live timeline**: a 4-row `plan`
-that posts **at enqueue** (showing live queue position), tense-progresses each
-row (future → present → past) with italic "what's happening" details that resolve
+- **id:** `0023-slack-card-redesign`
+- **status:** `shipped`
+- **date:** 2026-06
+- **iteration:** v8
+- **predecessor:** v7 reporting-surface trait ([0022](0022-report-surface-trait.md))
+
+Refined the Slack benchmark card into a **richer live timeline**: a 4-row `plan`
+posted **at enqueue** (live queue position), tense-progressing each row
+(future → present → past) with italic "what's happening" details that resolve
 into output summaries, and a **redesigned completion** view — the timeline plan
 above a rich-markdown results table and a primary "Download Profiler Data" button.
 
-*(Deployment-version lineage; last deployed was v7. Canonical item identity is
-`0023-slack-card-redesign`.)*
+> **Status:** shipped — all phases (1 render, 2 timeline, 3 live-queue slices
+> A/B1/B2/C) implemented, Codex-signed-off, and **live-verified** end-to-end: a
+> queued card animated through Build → Run → Finalize to the results table + a
+> green download button on a real `@BenchBot` run. Per-row timing was deferred to
+> [`0024`](../../backlog.md). The spec below is retained as the validation recipe.
 
-> **Status:** in_progress
->
-> Builds on the v7 `ReportSurface` seam and the v6 `SlackTimeline`. **Phases 1
-> (render) + 2 (4-stage tense timeline) are shipped + Codex-signed-off**; **Phase
-> 3 (live queue from enqueue) is in progress**. Per-row timing was deferred to
-> [`0024`](../backlog.md). Feasibility checked against `slack-messaging` 0.7.4
-> (below).
+## What shipped
+
+- **Card model (`slack/card.rs`)** — owns the 4-stage model (`STAGES = 4`,
+  `STAGE_TEXT`) + builders `queued` / `running` / `completed` / `failed`. The
+  render layer enforces the contract: italic `details` only on non-terminal rows,
+  plain `output` only on terminal ones.
+- **Timeline (`slack/timeline.rs`)** — `SlackTimeline` slimmed to runtime state +
+  Slack mutation, mapping worker phases onto Job/Build/Run/Finalize.
+- **Live queue from enqueue** — `JobStore::record_plan_message_ts(job_id, …)` (a
+  default method over `insert_event`, no migration); the connector posts the
+  queued card pre-claim and persists its `ts`; the runner's
+  `update_queue_positions` edits the Slack card's position; the Reporter's
+  timeline **resumes** the same card on claim (never reposts).
+- **Rich completion** — a `markdown` results table (reusing `metric_table`) + a
+  primary "Download Profiler Data" `section` (presence-gated S3 `stacks-bench.db`).
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0023-slack-card-redesign` | primary | planned |
+| `0023-slack-card-redesign` | primary | shipped |
 
 Folds the **Slack-card slice** of queue visibility (`0014`) onto the card; the
 GitHub-check pre-claim slice of `0014` and the generic phase-event work (`0017`)
@@ -71,7 +87,7 @@ the errored row carries the reason and the results blocks are omitted.
 > `[t]` elapsed and completed `in t` outputs) is **not** in v8 — a completed row
 > shows its past-tense title + ✓, with the numbers in the results table. Live
 > ticking needs heartbeat-driven updates and per-stage durations need to survive
-> a resume, so it's its own item ([`0024-slack-card-stage-timings`](../backlog.md)).
+> a resume, so it's its own item ([`0024-slack-card-stage-timings`](../../backlog.md)).
 
 ## Phases
 
@@ -119,12 +135,12 @@ completion shows the results table + download button; the suite stays green.
 - **New writer — `JobStore::record_plan_message_ts(job_id, &str)`.** The connector
   holds `Arc<dyn JobStore>` and an **unclaimed** core `Job` (no `RunnableJob`
   exists pre-claim), so today's `RunnableJobStore::set_plan_message_ts(&RunnableJob, …)`
-  ([job_source.rs](../../crates/sbgh-daemon/src/job_source.rs)) isn't callable from
+  ([job_source.rs](../../../crates/sbgh-daemon/src/job_source.rs)) isn't callable from
   it. Add a by-`job_id` writer on `JobStore` that emits the same
   `plan_message_sent` event; `RunnableJobStore::set_plan_message_ts` delegates to
   it, and `JobStore::latest_plan_message_ts` reads it back **unchanged**.
 - **Connector at enqueue, in order:** `create_adhoc_job` → returns `Job`; post the
-  queued card in-thread (Job row in-progress, "Queued"); `record_plan_message_ts(job.id, ts)`.
+  queued card in-thread (all rows pending; the Job row reads "Queued"); `record_plan_message_ts(job.id, ts)`.
   Recording is **non-fatal** — on failure, log loudly and let the claim-time
   reporter post a replacement card (today's comment/check identity-persistence
   semantics). The ⏳ reaction stays the at-a-glance status.

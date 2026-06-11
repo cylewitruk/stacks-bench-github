@@ -154,31 +154,43 @@ physically present, awaiting a soak window.
 
 **Acceptance:** The legacy table is gone; nothing references it.
 
-### 0020 — LLM intent resolution for Slack benches
+### 0020 — LLM intent resolution (Slack + PRs)
 
 - **id:** `0020-llm-intent-resolution`
 - **status:** `backlog`
-- **priority:** `low`
+- **priority:** `medium`
 - **depends_on:** `0002-slack-adhoc-profiling` (the mention surface + the
   `resolve_workload` seam it defines)
-- **source:** v5 scoping (2026-06)
+- **source:** v5 scoping (2026-06); high-value list (2026-06) added the PR
+  surface, a concrete provider, and the abuse cap
 
-**Problem:** v5 resolves a Slack bench request with a deterministic flag parser;
-the team would prefer **natural language** ("profile yesterday's slow block
-~5×") over memorized flags.
+**Problem:** Bench requests are resolved with a deterministic flag parser; the
+team would prefer **natural language** ("bench blocks n..m on 3.4.0.0.3",
+"profile yesterday's slow block ~5×") over memorized flags, on **both** the
+Slack mention surface and PR comments.
 
-**Scope:** An LLM-backed `resolve_workload` impl behind v5's seam — raw mention
-text → structured `WorkloadSpec` (txid/block/repetitions/rev), then the **same**
-deterministic validator (the LLM never emits raw `bench_args`, so it can't
-inject flags). Authz stays *before* resolution; an uncertain resolver asks a
-clarifying question in-thread.
+**Scope:** An LLM-backed `resolve_workload` impl behind v5's seam, shared by the
+Slack and PR surfaces. **Grammar-first** — the deterministic parser stays
+authoritative; the LLM runs only when the flag grammar doesn't match (or the
+text is plainly NL). Raw text → structured `WorkloadSpec`
+(txid/block/repetitions/rev) via the provider's **structured-output / JSON-schema
+mode**, then the **same** deterministic validator (the LLM never emits raw
+`bench_args`, so it can't inject flags). Authz stays *before* resolution; an
+uncertain resolver asks a clarifying question in-thread / on the PR. Provider is
+**configurable** (default: the current small structured-output-capable OpenAI
+model, exact name chosen at implementation time) behind a provider-agnostic
+trait; the API key is **env-only** (`SBGH_OPENAI_API_KEY`, a TOML key is a hard
+error — mirrors `slack.*_token` / `artifacts.s3.*`). Abuse guards: an **input
+length cap** + per-user rate limit + ref-existence validation.
 
-**Acceptance:** A natural-language `@BenchBot` request resolves to the correct
-`WorkloadSpec` (or asks a clarifying question), under the same authz + validation
-guards as the flag parser.
+**Acceptance:** A natural-language request on Slack or a PR resolves to the
+correct `WorkloadSpec` (or asks a clarifying question), under the same authz +
+validation guards as the flag parser, with the grammar path still taken when it
+matches.
 
 **Deferred / non-goals:** No new task/execution work; rides v5's surface + bench
-path. Model/provider choice + prompt design are part of its own design.
+path. Prompt design + the exact provider/structured-output binding are part of
+its own design.
 
 ### 0024 — Slack card stage timings
 
@@ -204,8 +216,112 @@ rows show their stage duration; all survive a resume.
 **Deferred / non-goals:** No card-layout change (rides the v8 render); kept
 **separate from v8 Phase 3** so the pre-claim queue seam stays uncluttered.
 
+### 0025 — Release-baseline binary cache
+
+- **id:** `0025-baseline-binary-cache`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** *(none hard)* — interacts with `0004-worker-fleet` (the cache
+  wants to be fleet-shareable) and the `measurement_profile` baseline-trust model
+- **source:** high-value list (2026-06)
+
+**Problem:** Every bench rebuilds `stacks-bench` from source (~5–7 min), even for
+the handful of designated release/baseline refs that are benched repeatedly
+(`cylewitruk/stacks-core` `sb-integration/3.W.X.Y.Z`). A Slack request like "bench
+blocks n..m on 3.4.0.0.3" pays full build latency for an unchanging binary.
+
+**Scope:** A **release-prefix policy** in config — one or more branch/tag prefixes
+(e.g. `sb-integration/3.`) flagged as baselines/releases, extending the existing
+baseline-trigger surface rather than a parallel mechanism. Plus a **prebuild and
+pinned local cache** of the `stacks-bench` binary, keyed by **resolved commit SHA
+plus a full build fingerprint** — target triple, cargo profile/features/`RUSTFLAGS`,
+the daemon/build-template version, the VM/worker image (or `measurement_profile`),
+and any artifact-affecting protocol/schema version — and built via the *identical*
+recipe a real job uses, so a "hit" can't silently reuse a binary built under
+different assumptions. Designated baselines are **pinned** (never evicted);
+ad-hoc builds stay LRU. Warm on policy-ref push/tag and on daemon start; a hit
+skips the build phase outright.
+
+**Acceptance:** A bench against a designated release ref reuses a cached binary
+(no build phase) when SHA + fingerprint match; a miss falls back to a normal
+build and populates the cache.
+
+**Deferred / non-goals:** Fleet-shared store (S3) vs purely-local, eviction
+budget, and fingerprint inputs are design questions. Distinct from *measurement*
+baselines — this is a build-time cache, not the delta-comparison reference.
+
+### 0026 — Central block/tx index cache (pre-seed)
+
+- **id:** `0026-central-block-index-cache`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** *(none)* — gated on a schema spike of `stacks-bench.db`
+- **source:** high-value list (2026-06)
+
+**Problem:** Benching a range far from chain tip pays a large indexing cost —
+`stacks-bench` walks backward from tip (8.2M+ blocks, +1/~5s) to resolve the
+canonical Stacks block per height. That walk is recomputed per job even though,
+below the reorg horizon, the canonical mapping is stable.
+
+**Scope:** Extract the **block/tx index portion** (resolved canonical
+height→block mapping and tx index) from completed `stacks-bench.db` files and
+**merge into a central store** — idempotent, conflict-aware (deeper/newer wins; a
+disagreement *below* the finality depth is flagged, not merged). The store is
+**keyed and validated by provenance** — network (mainnet/testnet),
+chainstate/source identity, the index-schema version, and the
+stacks-core/stacks-bench DB-schema version — so a pre-seed can never mix networks
+or incompatible layouts. **Pre-seed** a fresh bench DB with the requested range
+when present and final, so the bench only indexes the uncovered tail, then merges
+its new portion back. A **finality-depth guard** is load-bearing — pre-seeding a
+not-yet-final block corrupts the run.
+
+**Acceptance:** A bench over a previously-indexed, final range starts measuring
+without re-walking from tip; a partially-covered range indexes only the
+uncovered tail and merges it back.
+
+**Deferred / non-goals:** Storage model (canonical SQLite "index pack" copied
+range-wise vs Postgres + re-inject), exact tables to extract, per-network
+scoping, and the finality depth are design questions. **Highest-risk of the
+batch** (reorg correctness + stacks-core schema coupling) — wants a schema spike
+before an iteration.
+
+### 0027 — Fine-grained bench progress (JSONL)
+
+- **id:** `0027-fine-grained-progress`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** a profiler-protocol change in the `stacks-bench` integration
+  branches; feeds `0024-slack-card-stage-timings` + the `ReportSurface` heartbeat
+- **relates_to:** `0017-generic-phase-events`
+- **source:** high-value list (2026-06)
+
+**Problem:** `--json` emits only the final result on stdout, so the daemon can't
+surface sub-phase progress ("indexing 2345/5000", "warming up 111/2000",
+"measuring 4876/10000") — the card's in-progress rows show only a static detail.
+
+**Scope:** `stacks-bench` emits **structured progress** as JSONL on a **dedicated
+channel**, with a small stable schema (`{phase, current, total}` plus phase-change
+events), **versioned** with the profiler protocol since it lands across all 7
+integration branches. **Invariant:** stdout stays reserved for the final `--json`
+result and raw stderr is excluded (it carries log/rustc noise); the leading
+options are a dedicated `--progress-json-fd N` or a sentinel-prefixed line, and if
+the sentinel wins it must name the exact stream/file it rides and guarantee it
+can't corrupt an existing parser. Daemon-side, the runner parses the stream,
+**debounces** (the PR-comment / queue-position throttle discipline), and feeds
+`ReportSurface` heartbeats → the v8 card's active-row detail.
+
+**Acceptance:** A running bench drives a live sub-phase counter on its surface
+(Slack card / PR comment) without spamming `chat.update`.
+
+**Deferred / non-goals:** Progress schema fields, channel choice (fd vs
+sentinel), and throttle interval are design questions. Dovetails with `0024`
+(durations) — candidates to co-schedule.
+
 *`0022-report-surface-trait` shipped (iteration v7, 2026-06) →
 [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md).*
+
+*`0023-slack-card-redesign` shipped (iteration v8, 2026-06) →
+[archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md).*
 
 ## Parked
 
