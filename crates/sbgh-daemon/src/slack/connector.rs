@@ -182,6 +182,11 @@ mod tests {
 
     use super::*;
 
+    const TARGET: SlackJobTarget = SlackJobTarget {
+        installation_id: 100,
+        repo_id: 10,
+    };
+
     /// Records every Slack call so tests can assert exactly what was (and
     /// wasn't) posted.
     #[derive(Default)]
@@ -205,6 +210,7 @@ mod tests {
                 .push((channel.into(), user.into(), text.into()));
             Ok(())
         }
+
         async fn post_blocks_in_thread(
             &self,
             _channel: &str,
@@ -214,6 +220,7 @@ mod tests {
         ) -> anyhow::Result<String> {
             Ok("ts".into())
         }
+
         async fn update_blocks(
             &self,
             _channel: &str,
@@ -223,6 +230,7 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+
         async fn add_reaction(
             &self,
             channel: &str,
@@ -235,6 +243,7 @@ mod tests {
                 .push((channel.into(), ts.into(), reaction.into()));
             Ok(())
         }
+
         async fn remove_reaction(
             &self,
             channel: &str,
@@ -260,11 +269,6 @@ mod tests {
             allowed_user_ids: vec!["U_OK".into()],
         }
     }
-
-    const TARGET: SlackJobTarget = SlackJobTarget {
-        installation_id: 100,
-        repo_id: 10,
-    };
 
     fn event(text: &str) -> MentionEvent {
         MentionEvent {

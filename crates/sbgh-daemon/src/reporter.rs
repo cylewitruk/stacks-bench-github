@@ -9,31 +9,28 @@
 //!      → running`.
 //!   2. **gate the worker** — hand the resolved commit to the inline worker via
 //!      a `oneshot` (or tell it to abort if prepare failed).
-//!   3. **drain** the worker's [`WorkerEvent`] stream onto the PR comment +
-//!      Check Run (`ProgressSink`), and write the terminal state on `Finished`.
+//!   3. **drain** the worker's [`WorkerEvent`] stream onto the job's
+//!      [`ReportSurface`](crate::report::ReportSurface), and write the terminal
+//!      state on `Finished`.
 //!
 //! `run` returns `Err` only for setup-level failures that should back off the
 //! poll loop (preflight resolve failure, a lost claim on `start_running`, a
 //! recipe `SetupError`) — matching the prior inline `execute` semantics.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use sbgh_core::models::{GitRefKind, ResolvedCommit};
-use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
+use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use crate::artifact_store::build_store_or_local;
 use crate::bench_summary::RunResult;
 use crate::comparison::{BaselineComparison, compare};
-use crate::events::{EventSink, PhaseLabel, SinkResult, Terminal, WorkerEvent};
+use crate::events::{Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
-use crate::libvirt::format_elapsed;
-use crate::progress::ProgressReporter;
+use crate::report::{ReportSurface, build_report_surface};
 use crate::slack::client::SlackClient;
-use crate::slack::timeline::SlackTimeline;
 
 /// Resolve the App's numeric id via `GET /app`, cached on **success** in `cell`
 /// (a `get_or_try_init` that leaves the cell empty on error, so a transient
@@ -61,15 +58,6 @@ pub async fn resolved_app_id(cell: &OnceCell<i64>, gh: &dyn GitHubApi) -> Option
 /// Display name of the Check Run the daemon posts (roadmap-v4). Stable so the
 /// reconcile filter (`check_name`) and GitHub's per-name dedup both work.
 pub const CHECK_NAME: &str = "stacks-bench";
-
-/// Minimum interval between per-phase reporting edits (comment + check). Phase
-/// transitions and heartbeats both go through this debounce; terminal phases
-/// (done/error) bypass it so the user always sees the final state immediately.
-/// The first edit after pickup is always allowed through.
-///
-/// 30s gives us at most ~2 edits/min in the worst case, well below any
-/// plausible GitHub secondary rate limit and calm in the PR's "edit history".
-const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// What `prepare` tells the inline worker: the resolved commit to run, or that
 /// it must not run (prepare failed / no commit / lost claim).
@@ -160,31 +148,19 @@ impl Reporter {
             "job running (claimed → running)",
         );
 
-        // item 0002: the Slack live-timeline `plan` card — created for a Slack
-        // job with a wired client, resuming the persisted card on re-claim. The
-        // reporter drives it (started → advance → completed/failed) and the
-        // drain loop's sink advances it per worker phase.
-        let timeline: Option<Arc<SlackTimeline>> = match (&self.job.progress, &self.slack) {
-            (
-                ProgressTarget::Slack {
-                    channel,
-                    message_ts,
-                    plan_message_ts,
-                },
-                Some(client),
-            ) => Some(Arc::new(SlackTimeline::new(
-                client.clone(),
-                self.jobs.clone(),
-                self.job.clone(),
-                channel.clone(),
-                message_ts.clone(),
-                plan_message_ts.clone(),
-            ))),
-            _ => None,
-        };
-
-        let reporter =
-            ProgressReporter::new(self.gh.as_ref(), &self.job).with_timeline(timeline.as_ref());
+        // item 0022: the one reporting surface for this job — the Slack live
+        // card (Slack job + wired client), an explicit no-op (Slack, no client),
+        // or the GitHub comment+check. Built **once** and shared across
+        // `started`, the drain loop, and `finish`, so a stateful surface (the
+        // Slack card) keeps a single timeline across the whole run.
+        let store = build_store_or_local(self.config.as_ref());
+        let surface = build_report_surface(
+            self.gh.clone(),
+            self.jobs.clone(),
+            store,
+            self.slack.as_ref(),
+            &self.job,
+        );
 
         // Defensive empty-commit guard: now `running`, fail terminally so it
         // records a terminal state instead of looping via the sweep.
@@ -195,12 +171,12 @@ impl Reporter {
                 .jobs
                 .fail(&self.job, msg, None)
                 .await;
-            reporter.failed(msg).await;
+            surface.failed(msg).await;
             let _ = prepared_tx.send(Prepared::Abort);
             return Ok(());
         }
 
-        reporter.started().await;
+        surface.started().await;
 
         // ── gate the worker on the resolved commit ────────────────────
         if prepared_tx
@@ -212,29 +188,29 @@ impl Reporter {
             // The worker dropped before the hand-off — it won't run, and the
             // job is already `running`. Terminal-fail it so it can't hang.
             return self
-                .abandon(&reporter, "worker dropped before the run could start")
+                .abandon(surface.as_ref(), "worker dropped before the run could start")
                 .await;
         }
 
         // ── drain the worker's event stream ───────────────────────────
-        let sink = ProgressSink::new(self.gh.clone(), self.job.clone(), timeline.clone());
         let mut terminal_err: Option<anyhow::Error> = None;
         let mut saw_terminal = false;
         while let Some(ev) = events_rx.recv().await {
             match ev {
                 WorkerEvent::Phase { label, elapsed } => {
-                    let _ = sink
-                        .phase(label, elapsed)
+                    surface
+                        .phase(&label, elapsed)
                         .await;
                 }
                 WorkerEvent::Heartbeat { label, elapsed } => {
-                    sink.heartbeat(label, elapsed)
+                    surface
+                        .heartbeat(&label, elapsed)
                         .await;
                 }
                 WorkerEvent::Finished(terminal) => {
                     saw_terminal = true;
                     terminal_err = self
-                        .finish(&reporter, terminal)
+                        .finish(surface.as_ref(), terminal)
                         .await;
                     // The worker drops its senders after `Finished`, so the
                     // next `recv` returns `None` and the loop ends.
@@ -247,7 +223,7 @@ impl Reporter {
         // `running`: terminal-fail and back off the loop.
         if !saw_terminal {
             return self
-                .abandon(&reporter, "worker exited before reporting a terminal outcome")
+                .abandon(surface.as_ref(), "worker exited before reporting a terminal outcome")
                 .await;
         }
 
@@ -261,13 +237,13 @@ impl Reporter {
     /// (so it can't hang in `running`) and back off the poll loop. The job is
     /// already `running` by the time the worker is gated, so there's nothing to
     /// leave for the `claimed`-only stuck-claim sweep.
-    async fn abandon(&self, reporter: &ProgressReporter<'_>, msg: &str) -> anyhow::Result<()> {
+    async fn abandon(&self, surface: &dyn ReportSurface, msg: &str) -> anyhow::Result<()> {
         tracing::error!(job_id = %self.job.id, "{msg}");
         let _ = self
             .jobs
             .fail(&self.job, msg, None)
             .await;
-        reporter.failed(msg).await;
+        surface.failed(msg).await;
         Err(anyhow::anyhow!("{msg}"))
     }
 
@@ -393,7 +369,7 @@ impl Reporter {
 
     async fn finish(
         &self,
-        reporter: &ProgressReporter<'_>,
+        surface: &dyn ReportSurface,
         terminal: Terminal,
     ) -> Option<anyhow::Error> {
         match terminal {
@@ -416,9 +392,8 @@ impl Reporter {
                 let comparison = self
                     .baseline_comparison(&summary)
                     .await;
-                let store = build_store_or_local(self.config.as_ref());
-                reporter
-                    .completed(store.as_ref(), &summary, comparison.as_ref())
+                surface
+                    .completed(&summary, comparison.as_ref())
                     .await;
                 None
             }
@@ -440,7 +415,7 @@ impl Reporter {
                     tracing::error!(job_id = %self.job.id, error = ?e, "persisting failed result failed");
                     return Some(e);
                 }
-                reporter.failed(&error).await;
+                surface.failed(&error).await;
                 None
             }
             Terminal::SetupError { error } => {
@@ -451,7 +426,7 @@ impl Reporter {
                     .jobs
                     .fail(&self.job, &error, None)
                     .await;
-                reporter.failed(&error).await;
+                surface.failed(&error).await;
                 Some(anyhow::anyhow!("{error}"))
             }
             Terminal::Aborted => {
@@ -472,7 +447,7 @@ impl Reporter {
                     tracing::error!(job_id = %self.job.id, error = ?e, "persisting cancelled terminal failed");
                     return Some(e);
                 }
-                reporter.cancelled(msg).await;
+                surface.cancelled(msg).await;
                 None
             }
         }
@@ -722,164 +697,12 @@ impl Reporter {
     }
 }
 
-/// Applies a recipe's per-phase progress onto the job's reporting surface(s) —
-/// the PR comment and/or the Check Run's `output` (roadmap-v4). Per-phase
-/// updates set the check's `output.title` (the consolidated-view one-liner —
-/// "building", "running", …) and `output.summary` (the detail panel).
-///
-/// Driven by the reporter's drain loop: `Phase` events (terminal phases bypass
-/// the debounce) and `Heartbeat` events (always debounced). Updates are
-/// NON-FATAL; the check's terminal state is owned by [`ProgressReporter`], so
-/// this skips the check on terminal phases (no flicker / redundant PATCH).
-struct ProgressSink {
-    gh: Arc<dyn GitHubApi>,
-    job: RunnableJob,
-    /// item 0002: the Slack live-timeline, advanced per worker phase. `None`
-    /// for non-Slack jobs (the GitHub comment/check path runs instead).
-    timeline: Option<Arc<SlackTimeline>>,
-    state: Mutex<PhaseState>,
-}
-
-#[derive(Default)]
-struct PhaseState {
-    last_update_at: Option<Instant>,
-}
-
-impl ProgressSink {
-    fn new(gh: Arc<dyn GitHubApi>, job: RunnableJob, timeline: Option<Arc<SlackTimeline>>) -> Self {
-        Self {
-            gh,
-            job,
-            timeline,
-            state: Mutex::new(PhaseState::default()),
-        }
-    }
-
-    fn comment_id(&self) -> Option<i64> {
-        match self.job.progress {
-            ProgressTarget::PullRequest { comment_id, .. } => comment_id,
-            ProgressTarget::CommitCheck { .. } | ProgressTarget::Slack { .. } => None,
-        }
-    }
-
-    fn check_run_id(&self) -> Option<i64> {
-        match self.job.progress {
-            ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
-            ProgressTarget::CommitCheck { check_run_id } => check_run_id,
-            // No GitHub check for a Slack job.
-            ProgressTarget::Slack { .. } => None,
-        }
-    }
-
-    async fn try_update(&self, label: &PhaseLabel, elapsed: Duration, force: bool) {
-        let comment_id = self.comment_id();
-        // The reporter owns the check's terminal state; don't churn it here.
-        let check_run_id = if label.is_terminal() { None } else { self.check_run_id() };
-        if comment_id.is_none() && check_run_id.is_none() {
-            tracing::debug!(job_id = %self.job.id, phase = %label, "phase (no reporting surface)");
-            return;
-        }
-
-        // Shared debounce. Brief lock — not held across the network calls.
-        {
-            let mut state = self.state.lock().await;
-            if !force
-                && let Some(last) = state.last_update_at
-                && last.elapsed() < PR_UPDATE_MIN_INTERVAL
-            {
-                tracing::trace!(phase = %label, since_last = ?last.elapsed(), "phase update debounced");
-                return;
-            }
-            state.last_update_at = Some(Instant::now());
-        }
-
-        // PR comment (when present): the verbose progress line.
-        if let Some(comment_id) = comment_id {
-            let body = format!(
-                ":construction: benchmark `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
-                id = self.job.id,
-                phase = label,
-                elapsed = format_elapsed(elapsed),
-                sha = self.job.commit,
-            );
-            if let Err(e) = self
-                .gh
-                .update_pr_comment(
-                    self.job.installation_id,
-                    &self.job.repository,
-                    comment_id,
-                    &body,
-                )
-                .await
-            {
-                tracing::warn!(error = ?e, "phase comment update failed (non-fatal)");
-            }
-        }
-
-        // Check Run output (when present): `title` → the consolidated-view
-        // one-liner; `summary` → the detail panel. Stays `in_progress`.
-        if let Some(check_run_id) = check_run_id {
-            let output = CheckRunOutput {
-                title: label.to_string(),
-                summary: format!(
-                    "**{phase}** for `{elapsed}` — commit `{sha}`",
-                    phase = label,
-                    elapsed = format_elapsed(elapsed),
-                    sha = self.job.commit,
-                ),
-                text: None,
-            };
-            if let Err(e) = self
-                .gh
-                .update_check_run(
-                    self.job.installation_id,
-                    &self.job.repository,
-                    check_run_id,
-                    CheckRunUpdate {
-                        state: CheckRunState::InProgress,
-                        output,
-                    },
-                )
-                .await
-            {
-                tracing::warn!(error = ?e, "phase check update failed (non-fatal)");
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl EventSink for ProgressSink {
-    async fn phase(&self, label: PhaseLabel, elapsed: Duration) -> SinkResult {
-        // Slack live timeline: advance the `plan` card to the phase's stage.
-        // `advance` is monotonic, so a non-stage / terminal phase (mapped to
-        // `None`) or a repeat is a no-op; the reporter owns the terminal card.
-        if let Some(tl) = &self.timeline
-            && let Some(stage) = crate::slack::timeline::stage_for_phase(&label.to_string())
-        {
-            tl.advance(stage).await;
-        }
-        // Terminal phases bypass debounce so the comment shows the final state
-        // immediately.
-        let force = label.is_terminal();
-        self.try_update(&label, elapsed, force)
-            .await;
-        Ok(())
-    }
-
-    async fn heartbeat(&self, label: PhaseLabel, elapsed: Duration) {
-        // Heartbeats are always debounced — a "still alive" signal where missing
-        // one is fine.
-        self.try_update(&label, elapsed, false)
-            .await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
 
+    use async_trait::async_trait;
     use sbgh_core::config::{
         ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
         PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
@@ -1466,84 +1289,6 @@ mod tests {
                 .await
                 .is_none(),
             "a moved PR head must not compare across commits",
-        );
-    }
-
-    /// A non-terminal phase sets the check's `output.title` to the phase name —
-    /// that's the one-liner shown in the PR's consolidated checks view.
-    #[tokio::test]
-    async fn phase_sink_sets_check_title_to_phase() {
-        let gh = Arc::new(FakeGitHub::new());
-        let sink = ProgressSink::new(
-            gh.clone(),
-            job_with(ProgressTarget::CommitCheck { check_run_id: Some(777) }),
-            None,
-        );
-        sink.phase(PhaseLabel::new("building", false), Duration::ZERO)
-            .await
-            .unwrap();
-        let title = gh
-            .calls()
-            .into_iter()
-            .find_map(|c| match c {
-                FakeCall::UpdateCheckRun { check_run_id: 777, output, .. } => Some(output.title),
-                _ => None,
-            })
-            .expect("check updated on phase");
-        assert_eq!(title, "building");
-    }
-
-    /// A PR job updates BOTH surfaces per phase (verbose comment + check
-    /// title).
-    #[tokio::test]
-    async fn phase_sink_updates_both_comment_and_check() {
-        let gh = Arc::new(FakeGitHub::new());
-        let sink = ProgressSink::new(
-            gh.clone(),
-            job_with(ProgressTarget::PullRequest {
-                pr_number: 7,
-                comment_id: Some(800),
-                check_run_id: Some(900),
-                check_run_url: None,
-            }),
-            None,
-        );
-        sink.phase(PhaseLabel::new("running", false), Duration::ZERO)
-            .await
-            .unwrap();
-        let calls = gh.calls();
-        assert!(
-            calls
-                .iter()
-                .any(|c| matches!(c, FakeCall::UpdateComment { .. })),
-            "comment updated"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
-            "check updated"
-        );
-    }
-
-    /// Terminal phases are owned by the reporter's `complete_check`; the sink
-    /// must not churn the check there.
-    #[tokio::test]
-    async fn phase_sink_skips_check_on_terminal_phase() {
-        let gh = Arc::new(FakeGitHub::new());
-        let sink = ProgressSink::new(
-            gh.clone(),
-            job_with(ProgressTarget::CommitCheck { check_run_id: Some(5) }),
-            None,
-        );
-        sink.phase(PhaseLabel::new("done", true), Duration::ZERO)
-            .await
-            .unwrap();
-        assert!(
-            !gh.calls()
-                .iter()
-                .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
-            "no check churn on a terminal phase"
         );
     }
 }

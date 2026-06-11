@@ -11,8 +11,8 @@ keep entries here compact and push worked-through detail to `design/`.
 
 *`0002-slack-adhoc-profiling` shipped (iteration v5, 2026-06) →
 [archive/completed/0002-slack-adhoc-profiling.md](archive/completed/0002-slack-adhoc-profiling.md).
-Its live-timeline follow-on is `0021-slack-live-timeline` (iteration
-[v6](iterations/v6-slack-live-timeline.md)).*
+Its live-timeline follow-on `0021-slack-live-timeline` shipped (iteration v6) →
+[archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md).*
 
 ## Backlog (unscheduled)
 
@@ -180,35 +180,8 @@ guards as the flag parser.
 **Deferred / non-goals:** No new task/execution work; rides v5's surface + bench
 path. Model/provider choice + prompt design are part of its own design.
 
-### 0022 — Reporting-surface trait (collapse `ProgressReporter` + `ProgressSink`)
-
-- **id:** `0022-report-surface-trait`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0021-slack-live-timeline` (ship + verify first)
-- **unblocks:** `0003-results-portal` (a clean third surface, not a third branch)
-- **review:** `Codex signed off` (design)
-- **design:** [design/0022-report-surface-trait.md](design/0022-report-surface-trait.md)
-
-**Problem:** Reporting is split by **call-site timing** (`ProgressReporter` for
-the lifecycle, `ProgressSink` for the worker stream), not by **surface
-ownership** — so the same `ProgressTarget` interpretation is repeated across ~6
-methods × 2 types, and the Slack-surface construction is duplicated in the
-reporter and the runner's orphan recovery.
-
-**Scope:** One `ReportSurface` lifecycle trait
-(`started/phase/heartbeat/completed/failed/cancelled`) with one impl per surface
-— `GitHubReportSurface` (comment + check together) and `SlackReportSurface`
-(timeline) — built once per job behind a shared factory. Pure internal refactor:
-no behavior change, no schema.
-
-**Acceptance:** `ProgressReporter` + `ProgressSink` are gone, replaced by one
-surface per job; surface construction is DRY; every existing
-reporter/sink/timeline test passes unchanged.
-
-**Deferred / non-goals:** No `ReportEvent` enum or `broadcast` spine — surfaces
-own their durable identity; revisit a dynamic stream only when the portal
-(`0003`) needs one (then it's +1 surface).
+*`0022-report-surface-trait` shipped (iteration v7, 2026-06) →
+[archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md).*
 
 ## Parked
 

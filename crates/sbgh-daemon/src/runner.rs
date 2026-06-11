@@ -22,17 +22,17 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::artifact_store::build_store_or_local;
 use crate::bench_recipe::BenchRecipe;
 use crate::driver::Driver;
 use crate::events::{ChannelSink, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, Shell};
-use crate::progress::ProgressReporter;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
+use crate::report::build_report_surface;
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
 use crate::slack::client::SlackClient;
-use crate::slack::timeline::SlackTimeline;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -360,29 +360,18 @@ impl Coordinator {
                 return;
             }
         };
-        // Reconstruct the Slack live-timeline for an orphaned Slack job (resuming
-        // its persisted card) so recovery marks it cancelled + swaps the stuck ⏳,
-        // mirroring how it concludes a GitHub check.
-        let timeline: Option<Arc<SlackTimeline>> = match (&job.progress, &self.deps.slack) {
-            (
-                ProgressTarget::Slack {
-                    channel,
-                    message_ts,
-                    plan_message_ts,
-                },
-                Some(client),
-            ) => Some(Arc::new(SlackTimeline::new(
-                client.clone(),
-                self.deps.jobs.clone(),
-                job.clone(),
-                channel.clone(),
-                message_ts.clone(),
-                plan_message_ts.clone(),
-            ))),
-            _ => None,
-        };
-        ProgressReporter::new(self.deps.gh.as_ref(), &job)
-            .with_timeline(timeline.as_ref())
+        // Build the orphan's reporting surface (the same factory the reporter
+        // uses) and conclude it cancelled — for a Slack orphan this resumes the
+        // persisted card + swaps the stuck ⏳; for GitHub it concludes the check.
+        let store = build_store_or_local(self.deps.config.as_ref());
+        let surface = build_report_surface(
+            self.deps.gh.clone(),
+            self.deps.jobs.clone(),
+            store,
+            self.deps.slack.as_ref(),
+            &job,
+        );
+        surface
             .cancelled(ORPHAN_CHECK_REASON)
             .await;
     }
@@ -2050,8 +2039,8 @@ mod tests {
 
     /// Phase 4C-2: a recovered orphan's stuck `in_progress` Check Run is
     /// concluded `cancelled` (gray) via the normal reporting path —
-    /// `load_runnable` reconstructs the orphan's reporting context and
-    /// `ProgressReporter::cancelled` concludes its check.
+    /// `load_runnable` reconstructs the orphan's reporting context and the
+    /// surface's `cancelled` concludes its check.
     #[tokio::test]
     async fn startup_concludes_orphan_check_as_cancelled() {
         let tmp = TempDir::new().unwrap();
