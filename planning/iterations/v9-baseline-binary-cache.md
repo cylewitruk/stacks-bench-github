@@ -8,14 +8,14 @@ phase. **Local-only first**; fleet / S3 sharing deferred.
 *(Deployment-version lineage; last deployed was v8. Canonical item identity is
 `0025-baseline-binary-cache`.)*
 
-> **Status:** in_progress — Phase 0 spike Codex-signed-off; **Phase 1 built +
-> green** (cache module, config, fingerprint inputs, gated driver build-skip), and
-> the **`BranchPrefix`** matcher (a Phase 2 slice) landed. The driver's VM-skip
-> orchestration is **not** host-validated (no libvirt in CI) — it's gated behind
-> `[artifacts.binary_cache].enabled` so the default path is byte-identical.
-> **Remaining:** Phase 2 pin policy (migration + `pinned`/`pinned_until` + warm),
-> pin-set→eviction wiring, and the "reused cached binary" build-row text. Scope is
-> **local-only**; fleet / S3 sharing rides `0004-worker-fleet`.
+> **Status:** in_progress — Phase 0 spike Codex-signed-off; **Phase 1 built,
+> green, and host-validated** (a real `@BenchBot` run skipped the build VM:
+> ~15–20s "build" phase vs minutes), plus the **`BranchPrefix`** matcher and the
+> **"Reused cached build · …"** Build-row subtext (Phase 1e). The cache is
+> gated behind `[artifacts.binary_cache].enabled` (default path byte-identical).
+> **Remaining:** Phase 2 pin policy (migration + `pinned`/`pinned_until` + warm)
+> and pin-set→eviction wiring. Scope is **local-only**; fleet / S3 sharing rides
+> `0004-worker-fleet`.
 >
 > **Implemented (green, lint-clean):** `crates/sbgh-daemon/src/binary_cache.rs`
 > (`BuildFingerprint` + `BinaryCache`: atomic publish, size-bounded LRU,
@@ -160,8 +160,9 @@ provisioning**:
   build VM is **skipped**; the bench VM boots and runs the binary unchanged — **no
   bench-template edit**, since the run path is byte-identical to a normal build.
   This saves cargo **and** the build VM's boot / mount / teardown. The Reporter
-  emits the Build row instantly-done ("Reused cached binary @ `<sha>`") and bumps
-  `last_used_at`.
+  emits the Build row instantly-done with a "Reused cached build · …" subtext on
+  the Slack card (the short fingerprint digest) and "build (cached)" on GitHub,
+  and bumps `last_used_at`.
 - **Ownership normalization moves to the host.** The build VM's
   `chown -R root:root "$SRC"`
   ([sbgh-build.sh.tmpl:45](../../crates/sbgh-daemon/src/libvirt/templates/sbgh-build.sh.tmpl)
@@ -190,8 +191,9 @@ write to a temp path, verify `sha256` + metadata, then `rename` into the
 `<fingerprint>/` dir — under a **per-fingerprint lock** so concurrent same-commit
 jobs never race a half-written binary or double-build; populate-on-finish from the
 archived binary; the host-side hit probe + **source-disk staging** + build-VM
-skip; the Reporter "reused cached binary" Build-row state. **No pinning yet** —
-every repeated `(commit, env)` already benefits from LRU alone.
+skip; the Reporter's "Reused cached build · …" Build-row subtext (Phase 1e).
+**No pinning yet** — every repeated `(commit, env)` already benefits from LRU
+alone.
 
 **Acceptance:** a second bench of the same commit + env **skips the build VM** and
 reuses the `sha`-verified cached binary; concurrent same-commit jobs never observe

@@ -154,6 +154,7 @@ impl SlackConnector {
             commit: None,
             commit_url: None,
             job_id: &job_id_str,
+            cached_build: None,
         };
         let blocks = card::queued(&ctx, None);
         let fallback = format!("Benchmarking {rev}");

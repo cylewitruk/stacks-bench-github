@@ -36,6 +36,11 @@ pub struct SlackTimeline {
     rev: String,
     commit: String,
     commit_url: String,
+    /// Set once when this run's Build phase is served from the binary cache
+    /// (item 0025, v9): the short fingerprint digest, surfaced on the Build row
+    /// as "Reused cached build · …". A `OnceLock` so `ctx()` can borrow it
+    /// without the state lock.
+    cached_build: std::sync::OnceLock<String>,
     state: Mutex<State>,
 }
 
@@ -70,6 +75,7 @@ impl SlackTimeline {
             rev,
             commit,
             commit_url,
+            cached_build: std::sync::OnceLock::new(),
             state: Mutex::new(State {
                 plan_ts: plan_message_ts,
                 stage: 0,
@@ -104,6 +110,16 @@ impl SlackTimeline {
         }
         self.upsert(&card::running(&self.ctx(), stage))
             .await;
+    }
+
+    /// The Build phase was served from the binary cache (item 0025, v9): record
+    /// the short fingerprint `digest` (surfaced on the Build row as "Reused
+    /// cached build · …") and advance to Run. The digest is set once.
+    pub async fn mark_build_cached(&self, digest: &str) {
+        let _ = self
+            .cached_build
+            .set(digest.to_string());
+        self.advance(2).await;
     }
 
     /// Terminal success: all rows complete, the results table + download button
@@ -159,6 +175,10 @@ impl SlackTimeline {
             commit: Some(&self.commit),
             commit_url: Some(&self.commit_url),
             job_id: &self.job_id,
+            cached_build: self
+                .cached_build
+                .get()
+                .map(String::as_str),
         }
     }
 

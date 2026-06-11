@@ -72,6 +72,12 @@ pub struct CardCtx<'a> {
     pub commit: Option<&'a str>,
     pub commit_url: Option<&'a str>,
     pub job_id: &'a str,
+    /// Set when the Build phase was served from the binary cache (item 0025,
+    /// v9) — the short fingerprint digest, surfaced as the Build row's
+    /// subtext ("Reused cached build · …") instead of the plain "Built
+    /// benchmark binaries". `None` for a normal build (and the pre-claim /
+    /// queue cards).
+    pub cached_build: Option<&'a str>,
 }
 
 /// Per-row display strings — the tense-progressing titles + italic detail
@@ -217,11 +223,22 @@ fn card_row(ctx: &CardCtx, i: usize, state: RowState) -> CardRow {
         RowState::Done => (text.done_title, PlanTaskStatus::Complete, None, None),
         RowState::Errored(reason) => (text.active_title, PlanTaskStatus::Error, None, Some(reason)),
     };
+    // Build row (item 0025, v9): when this run reused a cached binary, its
+    // terminal subtext notes the reused build instead of an empty "Built
+    // benchmark binaries".
+    let output: Option<String> = if i == 1
+        && matches!(status, PlanTaskStatus::Complete)
+        && let Some(id) = ctx.cached_build
+    {
+        Some(format!("Reused cached build · {id}"))
+    } else {
+        output.map(str::to_string)
+    };
     CardRow {
         title: title.to_string(),
         status,
         details: details.map(str::to_string),
-        output: output.map(str::to_string),
+        output,
         source: row_source(ctx, i),
     }
 }
@@ -608,7 +625,32 @@ mod tests {
             commit: Some("56e9fcba1234"),
             commit_url: Some("https://github.com/o/r/commit/56e9fcba1234"),
             job_id: "job-1",
+            cached_build: None,
         }
+    }
+
+    /// item 0025 (v9): a cache-hit Build row carries the "Reused cached build"
+    /// subtext; a normal build does not.
+    #[test]
+    fn build_row_notes_a_reused_cached_build() {
+        let cached = CardCtx {
+            rev: "feat/x",
+            commit: Some("56e9fcba1234"),
+            commit_url: Some("https://github.com/o/r/commit/56e9fcba1234"),
+            job_id: "job-1",
+            cached_build: Some("abc123def456"),
+        };
+        // Stage 2 (Run active) → the Build row is done.
+        let s = running(&cached, 2).to_string();
+        assert!(s.contains("Reused cached build · abc123def456"), "cached subtext: {s}");
+        assert!(s.contains("Built benchmark binaries"), "Build row keeps its done title: {s}");
+        // A normal build (the default ctx, no cache) has no such subtext.
+        assert!(
+            !running(&ctx(), 2)
+                .to_string()
+                .contains("Reused cached build"),
+            "no cached subtext without a hit",
+        );
     }
 
     /// `running(stage)` builds the four rows with earlier-complete / active /
@@ -687,6 +729,7 @@ mod tests {
             commit: None,
             commit_url: None,
             job_id: "j",
+            cached_build: None,
         };
         let s = running(&pre, 0).to_string();
         assert!(s.contains("Benchmarking feat/x"), "rev-only title: {s}");
@@ -703,6 +746,7 @@ mod tests {
             commit: None,
             commit_url: None,
             job_id: "j",
+            cached_build: None,
         };
         let v = queued(&pre, Some("position 3/5, waiting 15m"));
         let tasks = v.as_array().unwrap()[0]["tasks"]
@@ -728,6 +772,7 @@ mod tests {
             commit: None,
             commit_url: None,
             job_id: "j",
+            cached_build: None,
         };
         let s = queued(&pre, None).to_string();
         assert!(s.contains("Waiting for an available slot"), "{s}");

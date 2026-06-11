@@ -476,6 +476,7 @@ impl Coordinator {
             commit: None,
             commit_url: None,
             job_id: &job_id,
+            cached_build: None,
         };
         let detail = format!("position {}/{}", ahead + 1, total);
         let blocks = card::queued(&ctx, Some(&detail));

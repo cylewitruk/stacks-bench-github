@@ -253,7 +253,7 @@ impl GitHubReportSurface {
             let body = format!(
                 ":construction: benchmark `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
                 id = self.job.id,
-                phase = label,
+                phase = humanize_phase(label),
                 elapsed = format_elapsed(elapsed),
                 sha = self.job.commit,
             );
@@ -273,10 +273,10 @@ impl GitHubReportSurface {
 
         if let Some(check_run_id) = check_run_id {
             let output = CheckRunOutput {
-                title: label.to_string(),
+                title: humanize_phase(label),
                 summary: format!(
                     "**{phase}** for `{elapsed}` — commit `{sha}`",
-                    phase = label,
+                    phase = humanize_phase(label),
                     elapsed = format_elapsed(elapsed),
                     sha = self.job.commit,
                 ),
@@ -408,9 +408,18 @@ impl ReportSurface for SlackReportSurface {
     }
 
     async fn phase(&self, label: &PhaseLabel, _elapsed: Duration) {
+        let name = label.to_string();
+        // A binary-cache hit (item 0025, v9) arrives as `build_cached:<digest>`:
+        // mark the Build row done with the reused-build subtext + advance to Run.
+        if let Some(digest) = name.strip_prefix("build_cached:") {
+            self.timeline
+                .mark_build_cached(digest)
+                .await;
+            return;
+        }
         // Monotonic: a non-stage / terminal phase (mapped to `None`) or a repeat
         // is a no-op; the terminal card is owned by `completed`/`failed`.
-        if let Some(stage) = stage_for_phase(&label.to_string()) {
+        if let Some(stage) = stage_for_phase(&name) {
             self.timeline
                 .advance(stage)
                 .await;
@@ -505,6 +514,15 @@ fn read_run_json(path: &Path) -> Option<RunResult> {
             None
         }
     }
+}
+
+/// Human display for a phase label on the GitHub surfaces. The binary-cache hit
+/// (item 0025, v9) arrives as the opaque `build_cached:<digest>`; render it as
+/// "build (cached)" rather than leaking the raw digest into the PR comment /
+/// check. Any other label is shown verbatim.
+fn humanize_phase(label: &PhaseLabel) -> String {
+    let name = label.to_string();
+    if name.starts_with("build_cached:") { "build (cached)".to_string() } else { name }
 }
 
 /// Trim an error chain to something safe to show a PR author: the first

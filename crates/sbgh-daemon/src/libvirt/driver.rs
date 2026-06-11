@@ -596,13 +596,15 @@ impl LibvirtDriver {
             digest = %fp.digest(),
             "binary cache: reusing cached stacks-bench binary; skipping the build VM"
         );
-        // Drive the reporter through the build phase so the card stays coherent
-        // — the build VM that normally emits these transitions never runs.
+        // Drive the reporter with a single opaque `build_cached:<digest>` phase
+        // (item 0025, v9): each surface interprets it — the Slack card marks the
+        // Build row done with a "Reused cached build · <digest>" subtext; the
+        // GitHub surface shows "build (cached)". The build VM that normally emits
+        // `building`/`build_done` never runs.
+        let digest = fp.digest();
+        let short = &digest[..digest.len().min(12)];
         listener
-            .on_phase(&Phase::Building)
-            .await;
-        listener
-            .on_phase(&Phase::BuildDone)
+            .on_phase(&Phase::Other(format!("build_cached:{short}")))
             .await;
         true
     }
@@ -1535,13 +1537,14 @@ mod tests {
             std::fs::read(job_dir.join("source.mnt/target/release/stacks-bench")).unwrap(),
             b"CACHED"
         );
-        // The reporter advanced Build → done.
+        // The reporter gets a single opaque `build_cached:<short-digest>` phase
+        // (Build done + the reused-build subtext on the card).
         assert_eq!(
             *listener
                 .phases
                 .lock()
                 .unwrap(),
-            vec![Phase::Building, Phase::BuildDone]
+            vec![Phase::Other(format!("build_cached:{}", &fp.digest()[..12]))]
         );
         // It read the toolchain from the mirror + ran the seed sequence, and
         // never touched a build VM.
