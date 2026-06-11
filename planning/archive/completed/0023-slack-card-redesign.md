@@ -34,6 +34,21 @@ above a rich-markdown results table and a primary "Download Profiler Data" butto
 - **Rich completion** — a `markdown` results table (reusing `metric_table`) + a
   primary "Download Profiler Data" `section` (presence-gated S3 `stacks-bench.db`).
 
+## Post-ship fixes
+
+- **2026-06 — removed the download button's `action_id`** (`slack/card.rs`). The
+  primary "Download Profiler Data" URL button carried
+  `action_id = download_profiler_db`, which made Slack dispatch a `block_actions`
+  interaction over Socket Mode whose **echoed message contained this card's
+  `plan` block**. `slack-morphism` can't deserialize a `plan` block, so the
+  envelope was never ACKed → Slack redelivered it → listener-error / reconnect
+  churn (the `unknown variant 'plan'` WARN + `ResetWithoutClosingHandshake`). The
+  download is client-side and we register no interaction handler, so the
+  `action_id` was pure liability; removed it (regression test pins "no
+  `action_id` on the card"). **Forward constraint:** cards must stay
+  **non-interactive** (URL buttons, no `action_id`s) until `slack-morphism`
+  learns the `plan` block, else Slack echoes it back and chokes the listener.
+
 ## Items
 
 | Item | Role | Status |

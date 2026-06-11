@@ -382,12 +382,18 @@ fn download_section(url: &str) -> Value {
             "type": "mrkdwn",
             "text": format!("Profiler artifacts are available for download for {DB_LINK_TTL_HUMAN}."),
         },
+        // Deliberately NO `action_id`. A URL button with one makes Slack
+        // dispatch a `block_actions` interaction over Socket Mode whose echoed
+        // message carries this card's `plan` block — which `slack-morphism`
+        // can't deserialize, so the envelope is never ACKed, Slack redelivers it,
+        // and the listener churns (errors → reconnect). The download is
+        // client-side (the `url`) and we handle no interactions, so the action_id
+        // was pure liability.
         "accessory": {
             "type": "button",
             "text": { "type": "plain_text", "text": "Download Profiler Data", "emoji": true },
             "style": "primary",
             "url": url,
-            "action_id": "download_profiler_db",
         },
     })
 }
@@ -509,6 +515,11 @@ mod tests {
         assert!(s.contains("\"style\":\"primary\""), "primary button: {s}");
         assert!(s.contains("Download Profiler Data"), "{s}");
         assert!(s.contains("https://s3/stacks-bench.db"), "the presigned url: {s}");
+        // No `action_id` anywhere: a URL button with one makes Slack dispatch a
+        // `block_actions` interaction echoing the `plan` block, which
+        // slack-morphism can't deserialize (un-acked envelope → redelivery +
+        // reconnect churn). The card carries no interactive elements we handle.
+        assert!(!s.contains("action_id"), "card must carry no interactive action_id: {s}");
     }
 
     /// No in-bucket DB link → the markdown table renders but the button section
