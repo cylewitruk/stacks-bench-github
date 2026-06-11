@@ -317,6 +317,105 @@ can't corrupt an existing parser. Daemon-side, the runner parses the stream,
 sentinel), and throttle interval are design questions. Dovetails with `0024`
 (durations) — candidates to co-schedule.
 
+### 0028 — Results-summary restructure
+
+- **id:** `0028-results-summary-restructure`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** *(none)* — render-side, over the existing `RunResult` / `metric_table`
+- **source:** high-value list (2026-06)
+
+**Problem:** The single metrics table mixes run *context* with timing *numbers*,
+sits the headline Setup/Execution/Commit figures next to Clarity cost, and renders
+raw microseconds (`1,655,018 µs avg`) — noisy and hard to read.
+
+**Scope:**
+
+- An **overview/intro** section, separate from the timings: blocks measured (with
+  range), transactions, warmup, baseline calibration time, active filtering flags,
+  repeats. Most is on hand — `RunData.{blocks,warmup_blocks,measured_blocks}`,
+  `RunSummary.transactions`, and the job's effective args / `WorkloadSpec`.
+- **Re-section** the numbers: the core **Setup, Execution, Commit** table stands
+  alone; **Clarity execution cost** (runtime, read/write) moves to its own section
+  so it doesn't dilute the headline bench figures.
+- **Humanize durations** — render the largest sensible unit (`1,655,018 µs` →
+  `1.66s`) via a shared formatter reused by the PR comment and the Slack card.
+
+**Acceptance:** A completed run renders an overview block, a core-timing table in
+human units, and a separate Clarity-cost section, on both the PR comment and the
+Slack card.
+
+**Deferred / non-goals / upstream:** Clarity **read/write counts** and **baseline
+calibration time** are **not** in `run.json` today (only read/write *lengths*
+exist) — surfacing them is a `stacks-bench` change across the integration
+branches, tracked here but landing with the protocol bump (cf. `0027`). Per-block
+detail is `0029`.
+
+### 0029 — Per-block / per-tx timing detail
+
+- **id:** `0029-per-block-timing-detail`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** `0028-results-summary-restructure` (rides the restructured
+  summary); the portal `0003` for the full table
+- **source:** high-value list (2026-06)
+
+**Problem:** The summary shows only run-level aggregates — no way to see *which*
+block or transaction was slow.
+
+**Scope:**
+
+- **Per-block** timings render from `run.json`'s `targets[]` (each a
+  `TargetSummary` with its own setup/exec/commit) — no db query for block-level.
+- Slack can't show the full set (50-block / 12k-char message limits; a run can
+  measure thousands of blocks), so the card shows a **top-N slowest** table; the
+  **full, sortable** table is the **portal's** job (`0003`).
+- **Per-tx** timings aren't in `run.json` (only an aggregate `transactions`
+  count) — they need querying the archived `stacks-bench.db` (a new sqlite-read
+  capability), so per-tx sits behind per-block.
+
+**Acceptance:** A completed run's card shows the top-N slowest blocks with their
+per-phase timings; the full breakdown is reachable in the portal.
+
+**Deferred / non-goals:** Slack has **no carousel block** — interactive "paging"
+would be button/menu interactivity that `chat.update`s the message, a new
+interaction-handler wiring beyond today's `app_mention` path; prefer top-N inline
+plus the portal over building paging. Per-tx detail and the full sortable table
+are deferred as above.
+
+### 0030 — Results Q&A agent ("why was this slow?")
+
+- **id:** `0030-results-qa-agent`
+- **status:** `backlog`
+- **priority:** `low`
+- **depends_on:** `0020-llm-intent-resolution` (provider / structured-output
+  infra); `0001-artifact-store` (the fetchable `stacks-bench.db`)
+- **relates_to:** `0003-results-portal`, `0029-per-block-timing-detail`
+- **source:** high-value list (2026-06)
+
+**Problem:** Deep-diving a result ("why was this transaction slow?") today means
+downloading `stacks-bench.db` and writing SQL by hand.
+
+**Scope:** A **schema-aware agent** over a run's `stacks-bench.db` that answers
+natural-language questions by querying it. **Read-only** against a fetched copy
+(sandboxed), via a constrained query tool (parameterized / whitelisted SQL, never
+arbitrary writes), with row/time/cost caps. Rides the **same provider
+abstraction** as `0020` (env-only key, configurable model). Surface: a thread
+reply on a Slack results card and/or the portal.
+
+**Acceptance:**
+
+- A user asks a results question in-thread and gets a grounded answer derived
+  from that run's db, under read-only and resource guards.
+- The agent connects in **read-only SQLite mode** (`mode=ro` / `query_only`)
+  against an **immutable, fetched copy** of `stacks-bench.db` — never the live
+  archive, never a writable handle — enforced as an explicit guard, not left to
+  prompt discipline.
+
+**Deferred / non-goals:** No write access, ever; not a general SQL console.
+Distinct from `0020` (which resolves bench *inputs*); this answers over *outputs*.
+Prompt / tooling design is its own design.
+
 *`0022-report-surface-trait` shipped (iteration v7, 2026-06) →
 [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md).*
 

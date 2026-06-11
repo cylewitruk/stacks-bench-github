@@ -104,6 +104,18 @@ pub trait ArtifactStore: Send + Sync {
     /// mirror's (Decision 0003 — a failed S3 upload still returns `Some`).
     async fn put(&self, key: &str, src: &Path) -> Option<u64>;
 
+    /// Like [`put`](ArtifactStore::put), but archive to the **local mirror
+    /// only** — never upload to a remote backend. For a large, non-portable
+    /// artifact (the in-VM `stacks-bench` binary: ~250-300 MB, built for the
+    /// VM's arch) a host-side forensic copy is worth keeping, but shipping it
+    /// to object storage every run is pure cost; cross-host binary reuse
+    /// belongs in a keyed cache (`0025`), not this forensic archive.
+    /// Default = [`put`](ArtifactStore::put) (for a local-only store the
+    /// two coincide).
+    async fn put_local_only(&self, key: &str, src: &Path) -> Option<u64> {
+        self.put(key, src).await
+    }
+
     /// Resolve `key` to a **local readable path** — for a remote store this
     /// materializes the object locally first. `Err(NotFound)` if absent.
     async fn get(&self, key: &str) -> std::io::Result<PathBuf>;
@@ -381,6 +393,13 @@ impl ArtifactStore for S3Store {
             tracing::warn!(error = %e, key, "artifact store: S3 upload failed; local copy retained");
         }
         Some(size)
+    }
+
+    /// Local mirror only — no S3 upload (see the trait default's rationale).
+    /// For the large, non-portable run binary: a host-side forensic copy
+    /// that's kept out of object storage.
+    async fn put_local_only(&self, key: &str, src: &Path) -> Option<u64> {
+        self.local.put(key, src).await
     }
 
     async fn get(&self, key: &str) -> std::io::Result<PathBuf> {

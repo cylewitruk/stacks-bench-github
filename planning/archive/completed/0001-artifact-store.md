@@ -23,6 +23,9 @@ default `local` mode.
 - The libvirt driver archives each artifact (`run.json`, `stacks-bench.db`, the
   `stacks-bench` binary, the phase log) through `put`; the reporter / job-source
   resolve them back through `get` by **store key** (`<job_id>/<relative>`).
+  *(Since updated: the `stacks-bench` binary archives via `put_local_only` — a
+  host-only forensic copy, never S3-uploaded — as it's large (~250-300 MB) and
+  non-portable across host arches.)*
 - Live S3 round-trip proven in CI against a pinned MinIO (`s3_round_trip.rs`):
   upload → bucket → presigned GET with no credentials on the client.
 

@@ -233,13 +233,17 @@ impl LibvirtDriver {
         };
         let phase_log_archived_path = phase_log_size_bytes.map(|_| phase_log_key);
 
-        // The stacks-bench binary that produced this run — the exact-version
-        // reader for the DB. Missing when the VM didn't reach collecting.
+        // The stacks-bench binary that produced this run — kept as a host-side
+        // forensic copy (the exact-version DB reader), but archived **locally
+        // only**: it's large (~250-300 MB) and non-portable (built for the VM's
+        // arch), so uploading every run's binary to object storage is pure cost.
+        // Cross-host binary reuse is a keyed cache's job (0025), not this
+        // archive. Missing when the VM didn't reach collecting.
         let binary_key = artifact_key(&job_id, forensics::BINARY_RELATIVE);
         let binary_size_bytes = match tmpfs {
             Some(t) => {
                 store
-                    .put(&binary_key, &t.stacks_bench_binary())
+                    .put_local_only(&binary_key, &t.stacks_bench_binary())
                     .await
             }
             None => None,

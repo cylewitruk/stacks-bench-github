@@ -187,3 +187,61 @@ async fn signed_url_if_fetchable_requires_bucket_presence() {
         "a local-only object must NOT be linked (bucket HEAD declines)",
     );
 }
+
+/// `put_local_only` archives to the host mirror but never uploads — the binary
+/// path: the in-VM `stacks-bench` build is large (~250-300 MB) and
+/// non-portable, so it stays a host-side forensic copy and is kept out of
+/// object storage, while the rest of the run (db/run.json/phase log) still
+/// ships via `put`.
+#[tokio::test]
+async fn put_local_only_mirrors_without_uploading() {
+    ensure_bucket().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = s3_config();
+    let job = format!("it-{}", Uuid::new_v4());
+    let mirror = tmp.path().join("mirror");
+    let store = S3Store::new(mirror.clone(), &cfg, http()).unwrap();
+
+    let key = artifact_key(&job, "stacks-bench");
+    let payload = b"\x7fELF-pretend-binary";
+    let src = tmp
+        .path()
+        .join("stacks-bench");
+    std::fs::write(&src, payload).unwrap();
+
+    // Local mirror is written, byte size returned (same contract as `put`).
+    let size = store
+        .put_local_only(&key, &src)
+        .await;
+    assert_eq!(size, Some(payload.len() as u64), "put_local_only returns the local byte size");
+
+    // The host copy is fetchable via the mirror fast-path.
+    let got = store
+        .get(&key)
+        .await
+        .expect("local mirror serves get()");
+    assert_eq!(std::fs::read(&got).unwrap(), payload);
+
+    // But it never reached the bucket: a FRESH-mirror store (no local copy) does
+    // an authoritative S3 HEAD and finds nothing.
+    let fresh = S3Store::new(
+        tmp.path()
+            .join("mirror-fresh"),
+        &cfg,
+        http(),
+    )
+    .unwrap();
+    assert!(
+        !fresh.exists(&key).await,
+        "put_local_only must NOT upload — a fresh mirror finds nothing in the bucket",
+    );
+    // And the download-link gate declines (not in the bucket).
+    assert!(
+        store
+            .signed_url_if_fetchable(&key, Duration::from_secs(300))
+            .await
+            .is_none(),
+        "a local-only artifact is never offered as a download link",
+    );
+}
