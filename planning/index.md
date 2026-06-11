@@ -39,6 +39,7 @@ need editing when an item's status or location changes.
 | `0019-block-validation-recipe` | Block-validation recipe | `backlog` | [backlog.md](backlog.md) |
 | `0020-llm-intent-resolution` | LLM intent resolution (Slack) | `backlog` | [backlog.md](backlog.md) |
 | `0021-slack-live-timeline` | Slack live timeline | `in_progress` | [iterations/v6-slack-live-timeline.md](iterations/v6-slack-live-timeline.md) |
+| `0022-report-surface-trait` | Reporting-surface trait | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 
