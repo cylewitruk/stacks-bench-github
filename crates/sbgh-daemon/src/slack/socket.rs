@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use sbgh_core::config::SlackConfig;
 use sbgh_core::db::JobStore;
+use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 use tokio_util::sync::CancellationToken;
 
@@ -87,6 +88,46 @@ fn spawn_dispatch(connector: Option<Arc<SlackConnector>>, mention: MentionEvent)
     }
 }
 
+/// The listener error handler. slack-morphism **auto-reconnects** after *any*
+/// listener error (it drops the dead socket and dials a fresh one, looping
+/// until shutdown), so this only chooses the log severity — it never affects
+/// recovery. Slack recycles each WSS connection roughly every ~10 min and often
+/// drops it without a close handshake (`ResetWithoutClosingHandshake`); that
+/// transport churn is **routine** → `debug`. Anything else is unexpected →
+/// `warn`. Without this handler the library default logs *every* such reset at
+/// `error`, which inverts the real severity (and a persistent connect failure
+/// only whispers at `trace`).
+///
+/// The returned status matters only to the HTTP Events API listener; it's
+/// ignored on the Socket Mode path (we mirror the library default).
+fn on_listener_error(
+    err: Box<dyn std::error::Error + Send + Sync + 'static>,
+    _client: Arc<SlackHyperClient>,
+    _state: SlackClientEventsUserState,
+) -> HttpStatusCode {
+    if is_transient_socket_error(&*err) {
+        tracing::debug!(error = %err, "slack: socket transport reset; slack-morphism is reconnecting");
+    } else {
+        tracing::warn!(error = %err, "slack: listener error; slack-morphism will attempt to reconnect");
+    }
+    HttpStatusCode::BAD_REQUEST
+}
+
+/// Whether a listener error is routine socket-transport churn (Slack's periodic
+/// WSS recycle / abrupt reset) rather than something unexpected. slack-morphism
+/// wraps a tungstenite read error as a `SocketModeProtocolError` whose message
+/// is `"Slack WSS error: …"`, but **reuses that same variant** for genuine
+/// anomalies (e.g. `"Unexpected binary received from Slack: …"`) — so match the
+/// transport-error prefix, not just the variant, to leave anomalies at `warn`.
+fn is_transient_socket_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    let Some(SlackClientError::SocketModeProtocolError(e)) = err.downcast_ref::<SlackClientError>()
+    else {
+        return false;
+    };
+    e.message
+        .starts_with("Slack WSS error:")
+}
+
 /// Run the Socket Mode receive loop until `shutdown` fires, then close the
 /// socket cleanly. `app_token` (xapp-) opens the WS; `web_client` is the shared
 /// Web API client (same bot token the reporter posts results with). Returns
@@ -112,7 +153,9 @@ pub async fn run(
 
     let slack_client = Arc::new(SlackHyperClient::new(SlackClientHyperConnector::new()?));
     let environment = Arc::new(
-        SlackClientEventsListenerEnvironment::new(slack_client).with_user_state(connector),
+        SlackClientEventsListenerEnvironment::new(slack_client)
+            .with_error_handler(on_listener_error)
+            .with_user_state(connector),
     );
     let callbacks = SlackSocketModeListenerCallbacks::new().with_push_events(on_push_event);
     let listener = SlackClientSocketModeListener::new(
@@ -143,6 +186,7 @@ mod tests {
     use async_trait::async_trait;
     use sbgh_core::db::InMemoryJobStore;
     use sbgh_core::models::TriggerKind;
+    use slack_morphism::errors::{SlackClientEndOfStreamError, SlackClientSocketModeProtocolError};
 
     use super::*;
     use crate::slack::client::{QUEUED_REACTION, SlackClient};
@@ -285,5 +329,38 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(store.all_jobs().len(), 1, "spawned dispatch must enqueue the job");
+    }
+
+    /// A `ResetWithoutClosingHandshake` (any socket-transport error) classifies
+    /// as transient → logged at `debug`, since slack-morphism just reconnects.
+    #[test]
+    fn socket_reset_is_transient() {
+        let err: Box<dyn std::error::Error + Send + Sync + 'static> = Box::new(
+            SlackClientError::SocketModeProtocolError(SlackClientSocketModeProtocolError::new(
+                "Slack WSS error: Protocol(ResetWithoutClosingHandshake)".into(),
+            )),
+        );
+        assert!(is_transient_socket_error(&*err));
+    }
+
+    /// A non-transport listener error is **not** transient → logged at `warn`.
+    #[test]
+    fn other_listener_errors_are_not_transient() {
+        let err: Box<dyn std::error::Error + Send + Sync + 'static> =
+            Box::new(SlackClientError::EndOfStream(SlackClientEndOfStreamError::new()));
+        assert!(!is_transient_socket_error(&*err));
+    }
+
+    /// slack-morphism reuses `SocketModeProtocolError` for genuine anomalies
+    /// (e.g. an unexpected binary frame), not just routine resets — those must
+    /// **not** be classified transient, so they stay at `warn`.
+    #[test]
+    fn unexpected_binary_is_not_transient() {
+        let err: Box<dyn std::error::Error + Send + Sync + 'static> = Box::new(
+            SlackClientError::SocketModeProtocolError(SlackClientSocketModeProtocolError::new(
+                "Unexpected binary received from Slack: [1, 2, 3]".into(),
+            )),
+        );
+        assert!(!is_transient_socket_error(&*err));
     }
 }
