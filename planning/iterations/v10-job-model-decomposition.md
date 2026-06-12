@@ -7,12 +7,14 @@ conflate several concepts — so the platform can honestly express build-only jo
 bending measurement-shaped, webhook-coupled enums. Canonical item:
 [`0005-task-kind-platform`](../design/0005-task-kind-platform.md) (redesigned).
 
-> **Status:** planned — **Phase 0 (design) for review.** This is the
+> **Status:** in_progress — **Phases 0–3 landed** (axes + migration, the
+> expand-migrate-contract pipeline rewire, and the build-only proof). The
 > highest-blast-radius change in the system (job creation, dedup, claim,
-> reporting, provenance, **+ a migration of every existing `job` row**), so the
-> model + migration map go to Codex before Phase 1. Replaces the parked
+> reporting, provenance, **+ a migration of every existing `job` row**); the
+> model + migration map were reviewed before Phase 1. Replaces the parked
 > "v10-reusable-build-jobs" — that work (`0031`) is a *consumer* of these axes and
-> follows.
+> follows. **Pending host-validation:** the build-only path's actual cache-write
+> byte-landing (like v9 pin-protect — the engine wiring is unit-proven).
 
 ## Items
 

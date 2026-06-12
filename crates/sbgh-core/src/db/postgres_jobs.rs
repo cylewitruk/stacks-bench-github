@@ -62,30 +62,33 @@ impl BaselineRow {
 #[async_trait]
 impl JobStore for PostgresJobStore {
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
-        // status defaults to 'queued'; claim_token + claimed_at stay
-        // NULL on insert (queued-state invariant).
+        // status defaults to 'queued'; claim_token + claimed_at stay NULL on
+        // insert (queued-state invariant). v10 (0005): jobs carry the axes
+        // natively — `trigger_kind` / `job_kind` are retired on the `job` table.
         let row = sqlx::query_as::<_, Job>(
             r#"
             INSERT INTO job
-                (github_installation_id, github_repo_id, job_kind, trigger_kind,
-                 git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
-                 workload_key)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id, github_installation_id, github_repo_id, status, job_kind,
-                      trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                      git_committed_at, workload_key, claim_token, claimed_at,
-                      created_at, updated_at
+                (github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
+                 git_commit_hash, git_committed_at, workload_key,
+                 source, intent, task_kind, build_target)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING id, github_installation_id, github_repo_id, status,
+                      source, intent, task_kind, build_target, git_ref_kind,
+                      git_ref_display, git_commit_hash, git_committed_at, workload_key,
+                      claim_token, claimed_at, created_at, updated_at
             "#,
         )
         .bind(new.github_installation_id)
         .bind(new.github_repo_id)
-        .bind(new.job_kind)
-        .bind(new.trigger_kind)
         .bind(new.git_ref_kind)
         .bind(&new.git_ref_display)
         .bind(&new.git_commit_hash)
         .bind(new.git_committed_at)
         .bind(&new.workload_key)
+        .bind(new.axes.source)
+        .bind(new.axes.intent)
+        .bind(new.axes.task_kind)
+        .bind(new.axes.build_target)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -106,17 +109,18 @@ impl JobStore for PostgresJobStore {
         // `job` we just inserted) and report `AlreadyEnqueued`.
         let mut tx = self.pool.begin().await?;
 
+        // v10 (0005): jobs carry the axes natively — set by the handler.
         let job: Job = sqlx::query_as(
             r#"
             INSERT INTO job
-                (github_installation_id, github_repo_id, job_kind, trigger_kind,
-                 git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
-                 workload_key)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id, github_installation_id, github_repo_id, status, job_kind,
-                      trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                      git_committed_at, workload_key, claim_token, claimed_at,
-                      created_at, updated_at
+                (github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
+                 git_commit_hash, git_committed_at, workload_key,
+                 source, intent, task_kind, build_target)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING id, github_installation_id, github_repo_id, status,
+                      source, intent, task_kind, build_target, git_ref_kind,
+                      git_ref_display, git_commit_hash, git_committed_at, workload_key,
+                      claim_token, claimed_at, created_at, updated_at
             "#,
         )
         .bind(
@@ -125,8 +129,6 @@ impl JobStore for PostgresJobStore {
                 .github_installation_id,
         )
         .bind(request.new_job.github_repo_id)
-        .bind(request.new_job.job_kind)
-        .bind(request.new_job.trigger_kind)
         .bind(request.new_job.git_ref_kind)
         .bind(
             &request
@@ -144,6 +146,15 @@ impl JobStore for PostgresJobStore {
                 .git_committed_at,
         )
         .bind(&request.new_job.workload_key)
+        .bind(request.new_job.axes.source)
+        .bind(request.new_job.axes.intent)
+        .bind(request.new_job.axes.task_kind)
+        .bind(
+            request
+                .new_job
+                .axes
+                .build_target,
+        )
         .fetch_one(&mut *tx)
         .await?;
 
@@ -234,28 +245,31 @@ impl JobStore for PostgresJobStore {
         // guard (see the trait docs). A failure on either insert rolls back.
         let mut tx = self.pool.begin().await?;
 
+        // v10 (0005): jobs carry the axes natively — set by the connector.
         let job: Job = sqlx::query_as(
             r#"
             INSERT INTO job
-                (github_installation_id, github_repo_id, job_kind, trigger_kind,
-                 git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
-                 workload_key)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id, github_installation_id, github_repo_id, status, job_kind,
-                      trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                      git_committed_at, workload_key, claim_token, claimed_at,
-                      created_at, updated_at
+                (github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
+                 git_commit_hash, git_committed_at, workload_key,
+                 source, intent, task_kind, build_target)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING id, github_installation_id, github_repo_id, status,
+                      source, intent, task_kind, build_target, git_ref_kind,
+                      git_ref_display, git_commit_hash, git_committed_at, workload_key,
+                      claim_token, claimed_at, created_at, updated_at
             "#,
         )
         .bind(new_job.github_installation_id)
         .bind(new_job.github_repo_id)
-        .bind(new_job.job_kind)
-        .bind(new_job.trigger_kind)
         .bind(new_job.git_ref_kind)
         .bind(&new_job.git_ref_display)
         .bind(&new_job.git_commit_hash)
         .bind(new_job.git_committed_at)
         .bind(&new_job.workload_key)
+        .bind(new_job.axes.source)
+        .bind(new_job.axes.intent)
+        .bind(new_job.axes.task_kind)
+        .bind(new_job.axes.build_target)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -281,9 +295,10 @@ impl JobStore for PostgresJobStore {
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, Job>(
             r#"
-            SELECT id, github_installation_id, github_repo_id, status, job_kind,
-                   trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                   git_committed_at, workload_key, claim_token, claimed_at, created_at, updated_at
+            SELECT id, github_installation_id, github_repo_id, status,
+                   source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
+                   git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
+                   created_at, updated_at
               FROM job
              WHERE id = $1
             "#,
@@ -313,9 +328,10 @@ impl JobStore for PostgresJobStore {
                   FOR UPDATE SKIP LOCKED
                   LIMIT 1
              )
-         RETURNING id, github_installation_id, github_repo_id, status, job_kind,
-                   trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                   git_committed_at, workload_key, claim_token, claimed_at, created_at, updated_at
+         RETURNING id, github_installation_id, github_repo_id, status,
+                   source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
+                   git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
+                   created_at, updated_at
             "#,
         )
         .bind(claim_token)
@@ -584,16 +600,18 @@ impl JobStore for PostgresJobStore {
         &self,
         github_repo_id: i64,
         commit: &str,
-        trigger_kind: crate::models::TriggerKind,
+        source: crate::models::JobSource,
         workload_key: &str,
     ) -> Result<Option<Uuid>> {
+        // v10 (0005): the dedup keys on the job-model `source` axis — the
+        // `pr_comment` trigger is `source = github_comment`.
         let id: Option<Uuid> = sqlx::query_scalar(
             r#"
             SELECT id
               FROM job
              WHERE github_repo_id = $1
                AND git_commit_hash = $2
-               AND trigger_kind = $3
+               AND source = $3
                AND workload_key = $4
                AND status IN ('queued', 'claimed', 'running')
              LIMIT 1
@@ -601,7 +619,7 @@ impl JobStore for PostgresJobStore {
         )
         .bind(github_repo_id)
         .bind(commit)
-        .bind(trigger_kind)
+        .bind(source)
         .bind(workload_key)
         .fetch_optional(&self.pool)
         .await?;
@@ -633,7 +651,7 @@ impl JobStore for PostgresJobStore {
               JOIN job_metric m ON m.job_id = j.id
              WHERE j.git_commit_hash = $1
                AND j.workload_key = $2
-               AND j.job_kind = 'baseline'
+               AND j.intent = 'baseline_benchmark'
                AND j.status = 'completed'
           -- Deterministic: freshest measurement, then job id, so the same SHA
           -- benchmarked more than once always resolves to one stable row.
@@ -670,7 +688,7 @@ impl JobStore for PostgresJobStore {
              WHERE j.git_ref_display = $1
                AND j.workload_key = $2
                AND j.git_committed_at <= $3
-               AND j.job_kind = 'baseline'
+               AND j.intent = 'baseline_benchmark'
                AND j.status = 'completed'
           -- Newest commit at/before the fork-point; ties (shared timestamp /
           -- same commit re-run) break to freshest measurement, then job id.
@@ -691,9 +709,10 @@ impl JobStore for PostgresJobStore {
         // the order jobs are actually claimed.
         let rows = sqlx::query_as::<_, Job>(
             r#"
-            SELECT id, github_installation_id, github_repo_id, status, job_kind,
-                   trigger_kind, git_ref_kind, git_ref_display, git_commit_hash,
-                   git_committed_at, workload_key, claim_token, claimed_at, created_at, updated_at
+            SELECT id, github_installation_id, github_repo_id, status,
+                   source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
+                   git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
+                   created_at, updated_at
               FROM job
              WHERE status = 'queued'
           ORDER BY created_at, id

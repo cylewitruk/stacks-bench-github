@@ -224,6 +224,9 @@ struct RunInputs<'a> {
     repository: &'a str,
     commit: &'a str,
     bench_args: &'a [String],
+    /// v10 (0005): build-only mode — stop after the build VM publishes the
+    /// artifact; skip the bench phase entirely.
+    build_only: bool,
 }
 
 pub struct LibvirtDriver {
@@ -241,10 +244,17 @@ impl LibvirtDriver {
         Self { config, shell, binary_cache }
     }
 
+    /// Run one libvirt job to a terminal outcome. The shared
+    /// provision → build → publish path, then either the bench phase
+    /// (`build_only = false`) or a stop after publish (`build_only = true`,
+    /// v10 0005 — the warming primitive). Forensics + teardown are identical.
     pub async fn run_benchmark(
         &self,
         ctx: &TaskContext<'_>,
         bench_args: &[String],
+        // v10 (0005): build-only — build + publish the artifact, then stop
+        // before the bench phase.
+        build_only: bool,
         listener: &dyn PhaseListener,
         cancel: &CancellationToken,
         // Phase 5 CPU pinning: the libvirt cpuset this job's slot owns, or
@@ -266,6 +276,7 @@ impl LibvirtDriver {
             repository: ctx.repository,
             commit: ctx.commit,
             bench_args,
+            build_only,
         };
 
         // Run the inner pipeline. Any error becomes a Failed outcome with
@@ -474,6 +485,7 @@ impl LibvirtDriver {
         let reused = self
             .try_reuse_cached_binary(inputs, arts, job_dir, listener)
             .await;
+        let mut published = false;
         if !reused {
             // Succeeds on phase=build_done OR (ShutOff after seeing
             // BuildDone). Anything else (error phase, ShutOff without
@@ -502,9 +514,26 @@ impl LibvirtDriver {
                 }
                 other => return Ok(other),
             }
-            // Populate the cache from the freshly-built binary (best-effort).
-            self.publish_built_binary(inputs, arts)
+            // Populate the cache from the freshly-built binary.
+            published = self
+                .publish_built_binary(inputs, arts)
                 .await;
+        }
+
+        // v10 (0005): a build-only job stops here — there is no bench phase. Its
+        // purpose is the cached artifact, so it succeeds ONLY if the artifact is
+        // now in the cache: `reused` (already warm) or freshly `published`.
+        // Otherwise fail closed — cache disabled, no binary, or a fingerprint /
+        // publish error (a benchmark run keeps caching best-effort; here the
+        // artifact *is* the job).
+        if inputs.build_only {
+            if reused || published {
+                return Ok(FinishReason::PhaseDone);
+            }
+            anyhow::bail!(
+                "build-only job produced no cached artifact (the binary cache is disabled, the \
+                 build produced no binary, or publishing failed)"
+            );
         }
 
         // ── phase 2: bench VM ─────────────────────────────────────────
@@ -604,30 +633,38 @@ impl LibvirtDriver {
         true
     }
 
-    /// Publish a freshly-built binary into the cache (best-effort, no-op when
-    /// the cache is disabled). Called after a successful build so the next
-    /// run of the same `(commit, environment)` can skip the build.
-    async fn publish_built_binary(&self, inputs: &RunInputs<'_>, arts: &JobArtifacts) {
+    /// Publish a freshly-built binary into the cache. Called after a successful
+    /// build so the next run of the same `(commit, environment)` can skip it.
+    /// Returns whether the artifact is now cached — best-effort for a benchmark
+    /// run (a miss just means the next run rebuilds), but the build-only path
+    /// treats a `false` as failure (the cached artifact *is* the job). A miss
+    /// (`false`) means: the cache is disabled, no binary was produced, or
+    /// fingerprinting / publishing failed.
+    async fn publish_built_binary(&self, inputs: &RunInputs<'_>, arts: &JobArtifacts) -> bool {
         let Some(cache) = self.binary_cache.as_deref() else {
-            return;
+            return false;
         };
         let Some(t) = arts.tmpfs.as_ref() else {
-            return;
+            return false;
         };
         let binary = t.stacks_bench_binary();
         if !binary.exists() {
-            return;
+            return false;
         }
         let Some(fp) = self
             .fingerprint_for(inputs.commit)
             .await
         else {
-            return;
+            return false;
         };
         match cache.publish(&fp, &binary, unix_now(), false) {
-            Ok(_) => tracing::info!(commit = inputs.commit, "binary cache: published built binary"),
+            Ok(_) => {
+                tracing::info!(commit = inputs.commit, "binary cache: published built binary");
+                true
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "binary cache: publishing the built binary failed")
+                tracing::warn!(error = %e, "binary cache: publishing the built binary failed");
+                false
             }
         }
     }
@@ -1295,6 +1332,7 @@ impl Driver for LibvirtDriver {
             .run_benchmark(
                 ctx,
                 &spec.args,
+                spec.build_only,
                 &adapter,
                 cancel,
                 placement
@@ -1526,6 +1564,7 @@ mod tests {
             repository: "acme/widgets",
             commit: "abc123def456",
             bench_args: &[],
+            build_only: false,
         };
         let listener = RecordingListener::default();
 
@@ -1644,6 +1683,8 @@ mod tests {
             git_ref_display: "PR #42".into(),
             git_ref_kind: sbgh_core::models::GitRefKind::Branch,
             installation_id: 7,
+            task_kind: sbgh_core::models::TaskKind::Benchmark,
+            build_target: sbgh_core::models::BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec!["--iters=2".into()],
             progress: ProgressTarget::PullRequest {
@@ -1700,6 +1741,136 @@ mod tests {
         shell
     }
 
+    /// Like [`happy_path_shell`] but for a **build-only** run: the bench VM
+    /// lifecycle is absent — the driver stops after the build VM publishes.
+    fn build_only_shell() -> RecordingShell {
+        let shell = RecordingShell::new();
+        shell
+            .expect_ok(1) // git fetch_sha
+            .expect_ok(1) // qemu-img create
+            .expect_ok(1) // truncate (source)
+            .expect_ok(1) // mkfs.ext4
+            .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP --show
+            .expect_ok(1) // mount loop
+            .expect_ok(1) // chown
+            .expect_ok(1) // rmdir lost+found
+            .expect_ok(1) // git clone --reference
+            .expect_ok(1) // git checkout
+            .expect_ok(1) // umount source
+            .expect_ok(1) // losetup -d
+            .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+            .expect_ok(1) // lvcreate snapshot
+            .expect_ok(1) // mount tmpfs
+            // Both cidata ISOs are still provisioned upfront (provision is shared).
+            .expect_ok(1) // cloud-localds (build)
+            .expect_ok(1) // cloud-localds (bench)
+            // ── build VM lifecycle ──────────────────────────────────
+            .expect_ok(1) // virsh define (build)
+            .expect_ok(1) // virsh start (build)
+            .reply(PreparedReply::with_stdout("shut off\n")) // virsh domstate (build poll, ShutOff after BuildDone)
+            // ── NO bench VM lifecycle — build-only stops after publish ──
+            // ── teardown ────────────────────────────────────────────
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount tmpfs
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git update-ref -d (prune)
+        shell
+    }
+
+    /// v10 (0005): a build-only run goes provision → build → stop — the bench
+    /// VM lifecycle is skipped entirely. And (M1, Codex) because its
+    /// purpose is the cached artifact, with the binary cache disabled (the
+    /// default test config) it **fails closed** instead of reporting a
+    /// hollow success — while still never touching the bench VM.
+    #[tokio::test]
+    async fn build_only_skips_bench_and_fails_closed_without_cache() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Arc::new(test_config(&tmp));
+        let job = fake_job();
+
+        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+        let tmpfs_dir = cfg
+            .paths
+            .results_tmpfs_root
+            .join(job.id.to_string());
+        std::fs::create_dir_all(&tmpfs_dir).unwrap();
+        // Build-only: only the build VM runs, so seed `build_done` (no `done`).
+        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 build_done\n").unwrap();
+
+        let shell = Arc::new(build_only_shell());
+        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
+        let outcome = driver
+            .run_benchmark(
+                &ctx_of(&job),
+                &[],
+                true, // build_only
+                &NoopPhaseListener,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("driver returns Ok even when the run fails");
+
+        // M1: the build ran but nothing was cached (cache disabled) → fail closed
+        // rather than a hollow "build-only succeeded".
+        match outcome.status {
+            OutcomeStatus::Failed(ref m) => {
+                assert!(m.contains("no cached artifact"), "fail-closed reason: {m}")
+            }
+            other => panic!("expected fail-closed Failed, got {other:?}"),
+        }
+        // The build VM still ran (last phase = build) and no bench measurement
+        // was produced.
+        assert_eq!(outcome.summary["last_phase"], "build_done");
+        assert!(
+            outcome.summary["run_json_archived_path"].is_null(),
+            "build-only produces no run.json",
+        );
+
+        // The command sequence proves the bench VM lifecycle is absent.
+        let programs: Vec<String> = shell
+            .calls()
+            .iter()
+            .map(|c| {
+                std::path::Path::new(&c.program)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let expected = [
+            "git",
+            "qemu-img",
+            "truncate",
+            "mkfs.ext4",
+            "losetup",
+            "mount",
+            "chown",
+            "rmdir",
+            "git",
+            "git",
+            "umount",
+            "losetup",
+            "lvs",
+            "lvcreate",
+            "mount",
+            "cloud-localds", // build ISO
+            "cloud-localds", // bench ISO (still provisioned)
+            "virsh",         // define (build)
+            "virsh",         // start (build)
+            "virsh",         // domstate poll → ShutOff after BuildDone
+            // no bench define/start/poll
+            "virsh",    // destroy
+            "virsh",    // undefine
+            "umount",   // tmpfs
+            "lvremove", // chainstate
+            "git",      // mirror prune
+        ];
+        assert_eq!(programs, expected, "build-only must skip the bench VM lifecycle");
+    }
+
     #[tokio::test]
     async fn end_to_end_happy_path_with_recording_shell() {
         let tmp = TempDir::new().unwrap();
@@ -1728,6 +1899,7 @@ mod tests {
             .run_benchmark(
                 &ctx_of(&job),
                 &job.bench_args,
+                false,
                 &NoopPhaseListener,
                 &CancellationToken::new(),
                 None,
@@ -1871,6 +2043,7 @@ mod tests {
             .run_benchmark(
                 &ctx_of(&job),
                 &job.bench_args,
+                false,
                 &NoopPhaseListener,
                 &CancellationToken::new(),
                 None,
@@ -1919,6 +2092,7 @@ mod tests {
             .run_benchmark(
                 &ctx_of(&job),
                 &job.bench_args,
+                false,
                 &NoopPhaseListener,
                 &CancellationToken::new(),
                 None,
@@ -1963,7 +2137,7 @@ mod tests {
         cancel.cancel(); // pre-cancelled → the poll loop's top check fires first
 
         let outcome = driver
-            .run_benchmark(&ctx_of(&job), &job.bench_args, &NoopPhaseListener, &cancel, None)
+            .run_benchmark(&ctx_of(&job), &job.bench_args, false, &NoopPhaseListener, &cancel, None)
             .await
             .expect("driver returns Ok");
 

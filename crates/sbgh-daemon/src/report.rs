@@ -101,6 +101,9 @@ pub fn build_report_surface(
             store,
         )),
         (ProgressTarget::Slack { .. }, None) => Box::new(NoopReportSurface),
+        // Build-only/silent jobs (v10 0005) report nothing — the empty surface
+        // set, explicit rather than a GitHub surface coincidentally no-opping.
+        (ProgressTarget::Silent, _) => Box::new(NoopReportSurface),
         _ => Box::new(GitHubReportSurface::new(gh, job.clone(), store)),
     }
 }
@@ -142,7 +145,11 @@ impl GitHubReportSurface {
     fn comment_id(&self) -> Option<i64> {
         match self.job.progress {
             ProgressTarget::PullRequest { comment_id, .. } => comment_id,
-            ProgressTarget::CommitCheck { .. } | ProgressTarget::Slack { .. } => None,
+            // Build-only/silent jobs are routed to `NoopReportSurface`, never
+            // here — the arm exists only for exhaustiveness.
+            ProgressTarget::CommitCheck { .. }
+            | ProgressTarget::Slack { .. }
+            | ProgressTarget::Silent => None,
         }
     }
 
@@ -150,7 +157,7 @@ impl GitHubReportSurface {
         match self.job.progress {
             ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
             ProgressTarget::CommitCheck { check_run_id } => check_run_id,
-            ProgressTarget::Slack { .. } => None,
+            ProgressTarget::Slack { .. } | ProgressTarget::Silent => None,
         }
     }
 
@@ -160,6 +167,9 @@ impl GitHubReportSurface {
             ProgressTarget::PullRequest { .. } => "Re-run with `/benchmark`.",
             ProgressTarget::CommitCheck { .. } => "Re-run by pushing the branch/tag again.",
             ProgressTarget::Slack { .. } => "Re-run by mentioning me with a new `bench …` request.",
+            // Unreachable for a silent job (no surface renders this), but the
+            // match must cover it.
+            ProgressTarget::Silent => "Re-run the build.",
         }
     }
 
@@ -583,6 +593,8 @@ mod tests {
             git_ref_display: "develop".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            task_kind: sbgh_core::models::TaskKind::Benchmark,
+            build_target: sbgh_core::models::BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec![],
             progress,

@@ -127,15 +127,19 @@ pub struct InstallationView {
     pub created_at: String,
 }
 
-/// A `job` row (run visibility).
+/// A `job` row (run visibility). v10 (0005): the job-model axes
+/// (`source`/`intent`/`task_kind`/`build_target`) replace the retired
+/// `kind` / `trigger_kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobView {
     pub id: String,
     pub install_id: i64,
     pub repo_id: i64,
     pub status: String,
-    pub kind: String,
-    pub trigger_kind: String,
+    pub source: String,
+    pub intent: String,
+    pub task_kind: String,
+    pub build_target: String,
     pub git_ref_kind: String,
     pub git_ref_display: String,
     pub commit: Option<String>,

@@ -13,8 +13,8 @@ use sbgh_core::db::{
     BaselineSelection, InMemoryJobStore, JobCompletion, JobCreationOutcome, JobFailure, JobStore,
 };
 use sbgh_core::models::{
-    GitRefKind, JobCreationRequest, JobKind, JobMetric, JobResult, JobStatus, NewJob,
-    NewPullRequestLink, QueuedEventDetail, TriggerKind,
+    GitRefKind, JobAxes, JobCreationRequest, JobKind, JobMetric, JobResult, JobSource, JobStatus,
+    NewJob, NewPullRequestLink, QueuedEventDetail, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -23,8 +23,7 @@ fn make_request(webhook_id: i64) -> JobCreationRequest {
         new_job: NewJob {
             github_installation_id: 100,
             github_repo_id: 10,
-            job_kind: JobKind::AdHoc,
-            trigger_kind: TriggerKind::PrComment,
+            axes: JobAxes::from_legacy(TriggerKind::PrComment, JobKind::AdHoc),
             git_ref_kind: GitRefKind::Branch,
             git_ref_display: "main".into(),
             git_commit_hash: None,
@@ -56,8 +55,7 @@ async fn create_adhoc_job_is_webhook_less_and_preserves_detail() {
     let new_job = NewJob {
         github_installation_id: 100,
         github_repo_id: 10,
-        job_kind: JobKind::AdHoc,
-        trigger_kind: TriggerKind::SlackAdhoc,
+        axes: JobAxes::from_legacy(TriggerKind::SlackAdhoc, JobKind::AdHoc),
         git_ref_kind: GitRefKind::Branch,
         git_ref_display: "develop".into(),
         git_commit_hash: None,
@@ -70,7 +68,7 @@ async fn create_adhoc_job_is_webhook_less_and_preserves_detail() {
         .await
         .unwrap();
     assert_eq!(job.status, JobStatus::Queued);
-    assert_eq!(job.trigger_kind, TriggerKind::SlackAdhoc);
+    assert_eq!(job.source, JobSource::Slack);
     assert!(job.claim_token.is_none() && job.claimed_at.is_none());
 
     // No webhook link — same boundary as the Postgres path.
@@ -321,8 +319,7 @@ async fn seed_completed_baseline(
         .insert_job(&NewJob {
             github_installation_id: 100,
             github_repo_id: 10,
-            job_kind: JobKind::Baseline,
-            trigger_kind: TriggerKind::BranchPush,
+            axes: JobAxes::from_legacy(TriggerKind::BranchPush, JobKind::Baseline),
             git_ref_kind: GitRefKind::Branch,
             git_ref_display: ref_display.into(),
             git_commit_hash: Some(sha.into()),

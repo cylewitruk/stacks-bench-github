@@ -37,8 +37,9 @@ use sbgh_core::github::{
     PullRequestEvent, PushEvent, RepoRef, RepoSummary, parse_command,
 };
 use sbgh_core::models::{
-    GitRefKind, GithubAccountType, JobCreationRequest, JobKind, NewJob, NewPullRequestLink,
-    QueuedEventDetail, TriggerKind, TriggerMatchSpec, TriggerPolicy, UserRole, WebhookOutcome,
+    BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobCreationRequest, JobIntent, JobSource,
+    NewJob, NewPullRequestLink, QueuedEventDetail, TaskKind, TriggerKind, TriggerMatchSpec,
+    TriggerPolicy, UserRole, WebhookOutcome,
 };
 
 /// What a [`Classifier`] decides to do with a claimed webhook.
@@ -473,8 +474,12 @@ impl EventHandler for IssueCommentHandler {
                             new_job: NewJob {
                                 github_installation_id: install_id,
                                 github_repo_id: pr.base.repo.id,
-                                job_kind: JobKind::AdHoc,
-                                trigger_kind: TriggerKind::PrComment,
+                                axes: JobAxes {
+                                    source: JobSource::GithubComment,
+                                    intent: JobIntent::AdhocBenchmark,
+                                    task_kind: TaskKind::Benchmark,
+                                    build_target: BuildTarget::StacksBench,
+                                },
                                 git_ref_kind: GitRefKind::Branch,
                                 git_ref_display: pr.head.branch.clone(),
                                 git_commit_hash: Some(pr.head.sha.clone()),
@@ -510,7 +515,7 @@ impl EventHandler for IssueCommentHandler {
                         // a redundant *re-run* after the original concluded — NOT
                         // the concurrent check collision this prevents. A partial
                         // unique index on active `(github_repo_id, git_commit_hash,
-                        // workload_key) WHERE trigger_kind='pr_comment'` is the
+                        // workload_key) WHERE source='github_comment'` is the
                         // structural hardening if a hard guarantee / multi-processor
                         // is ever needed (see roadmap-v5 Phase 5).
                         match self
@@ -518,7 +523,7 @@ impl EventHandler for IssueCommentHandler {
                             .find_active_job(
                                 pr.base.repo.id,
                                 &pr.head.sha,
-                                TriggerKind::PrComment,
+                                JobSource::GithubComment,
                                 &workload_key,
                             )
                             .await
@@ -1313,8 +1318,10 @@ async fn enqueue_job(job_store: &dyn JobStore, request: JobCreationRequest) -> C
                 webhook_id = request.github_webhook_id,
                 installation_id = created.job.github_installation_id,
                 repo_id = created.job.github_repo_id,
-                trigger_kind = ?created.job.trigger_kind,
-                job_kind = ?created.job.job_kind,
+                source = ?created.job.source,
+                intent = ?created.job.intent,
+                task_kind = ?created.job.task_kind,
+                build_target = ?created.job.build_target,
                 git_ref = %created.job.git_ref_display,
                 "enqueued new-schema job"
             );
@@ -1828,8 +1835,12 @@ impl EventHandler for PushHandler {
             new_job: NewJob {
                 github_installation_id: event.installation.id,
                 github_repo_id: event.repository.id,
-                job_kind: JobKind::Baseline,
-                trigger_kind: TriggerKind::BranchPush,
+                axes: JobAxes {
+                    source: JobSource::GithubWebhook,
+                    intent: JobIntent::BaselineBenchmark,
+                    task_kind: TaskKind::Benchmark,
+                    build_target: BuildTarget::StacksBench,
+                },
                 git_ref_kind: GitRefKind::Branch,
                 git_ref_display: branch.to_string(),
                 git_commit_hash: Some(head_commit.id.clone()),
@@ -1987,8 +1998,12 @@ impl EventHandler for CreateHandler {
             new_job: NewJob {
                 github_installation_id: event.installation.id,
                 github_repo_id: event.repository.id,
-                job_kind: JobKind::Baseline,
-                trigger_kind: TriggerKind::TagCreated,
+                axes: JobAxes {
+                    source: JobSource::GithubWebhook,
+                    intent: JobIntent::BaselineBenchmark,
+                    task_kind: TaskKind::Benchmark,
+                    build_target: BuildTarget::StacksBench,
+                },
                 git_ref_kind: GitRefKind::Tag,
                 git_ref_display: event.ref_field.clone(),
                 // The create event carries no SHA; the daemon
@@ -2861,8 +2876,8 @@ mod tests {
         assert_eq!(jobs.len(), 1, "exactly one job created");
         let job = &jobs[0];
         assert_eq!(job.github_repo_id, 10, "job runs against the target (base) repo");
-        assert_eq!(job.job_kind, sbgh_core::models::JobKind::AdHoc);
-        assert_eq!(job.trigger_kind, TriggerKind::PrComment);
+        assert_eq!(job.intent, sbgh_core::models::JobIntent::AdhocBenchmark);
+        assert_eq!(job.source, sbgh_core::models::JobSource::GithubComment);
         assert_eq!(job.git_ref_kind, GitRefKind::Branch);
         assert_eq!(job.git_ref_display, "feat", "PR head branch");
         assert_eq!(job.git_commit_hash.as_deref(), Some("headsha"));
@@ -5143,8 +5158,8 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         let job = &jobs[0];
         assert_eq!(job.github_repo_id, 10);
-        assert_eq!(job.job_kind, sbgh_core::models::JobKind::Baseline);
-        assert_eq!(job.trigger_kind, TriggerKind::BranchPush);
+        assert_eq!(job.intent, sbgh_core::models::JobIntent::BaselineBenchmark);
+        assert_eq!(job.source, sbgh_core::models::JobSource::GithubWebhook);
         assert_eq!(job.git_ref_kind, GitRefKind::Branch);
         assert_eq!(job.git_ref_display, "develop");
         assert_eq!(job.git_commit_hash.as_deref(), Some("pushsha"), "resolved at enqueue");
@@ -5386,8 +5401,8 @@ mod tests {
         let jobs = job_store.all_jobs();
         assert_eq!(jobs.len(), 1);
         let job = &jobs[0];
-        assert_eq!(job.job_kind, sbgh_core::models::JobKind::Baseline);
-        assert_eq!(job.trigger_kind, TriggerKind::TagCreated);
+        assert_eq!(job.intent, sbgh_core::models::JobIntent::BaselineBenchmark);
+        assert_eq!(job.source, sbgh_core::models::JobSource::GithubWebhook);
         assert_eq!(job.git_ref_kind, GitRefKind::Tag);
         assert_eq!(job.git_ref_display, "release/1.2");
         assert!(

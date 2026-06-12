@@ -405,8 +405,13 @@ pub struct Job {
     pub github_installation_id: i64,
     pub github_repo_id: i64,
     pub status: JobStatus,
-    pub job_kind: JobKind,
-    pub trigger_kind: TriggerKind,
+    /// v10 (0005) job-model axes. Replace the retired `trigger_kind` /
+    /// `job_kind` columns on jobs (those survive on `trigger_policy` +
+    /// `QueuedEventDetail` provenance, not here).
+    pub source: JobSource,
+    pub intent: JobIntent,
+    pub task_kind: TaskKind,
+    pub build_target: BuildTarget,
     pub git_ref_kind: GitRefKind,
     pub git_ref_display: String,
     pub git_commit_hash: Option<String>,
@@ -428,8 +433,10 @@ pub struct Job {
 pub struct NewJob {
     pub github_installation_id: i64,
     pub github_repo_id: i64,
-    pub job_kind: JobKind,
-    pub trigger_kind: TriggerKind,
+    /// v10 (0005): the job-model axes (source / intent / task_kind /
+    /// build_target), set **natively** by the request's handler. Replaces the
+    /// retired `trigger_kind` / `job_kind` on jobs.
+    pub axes: JobAxes,
     pub git_ref_kind: GitRefKind,
     pub git_ref_display: String,
     /// Slice 9 leaves this `None` for triggers that enqueue with an
@@ -478,8 +485,11 @@ pub struct JobCreationRequest {
     pub triggering_user_id: Option<i64>,
     /// PR association (target = `new_job.github_repo_id`).
     pub pull_request_link: Option<NewPullRequestLink>,
-    /// Provenance JSONB for the queued event. Shape is a tagged Rust
-    /// enum keyed off `new_job.trigger_kind` (slice 9 defines).
+    /// Provenance JSONB for the queued event. Shape is the tagged
+    /// [`QueuedEventDetail`] enum; its `trigger` tag records the **enqueue
+    /// provenance** (the originating event), which is finer-grained than any
+    /// job axis — e.g. `branch_push` and `tag_created` both map to
+    /// `source = github_webhook` but stay distinct here.
     pub queued_event_detail: Option<serde_json::Value>,
 }
 
@@ -505,6 +515,102 @@ pub enum GitRefKind {
     Branch,
     Tag,
     Commit,
+}
+
+// ─── v10 (0005) job-model axes ─────────────────────────────────────────
+//
+// The job is decomposed into orthogonal axes (Design 0005): the retiring
+// `TriggerKind` (source + intent, entangled) and `JobKind` (result-role) are
+// replaced by `source` / `intent` / `task_kind` / `build_target`. The fifth
+// axis — the report *surface set* — is **derived** at claim from `(source,
+// intent, config)`, not stored. `git_ref_kind` survives as its own (ref-shape)
+// axis.
+//
+// v10 Phase 1 is additive: these land + back-fill existing rows; the pipeline
+// still runs off the old enums (Phase 2 rewires reads/writes).
+
+/// WHO requested a job. Replaces the *source* half of [`TriggerKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "job_source", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum JobSource {
+    GithubWebhook,
+    GithubComment,
+    Slack,
+    Cli,
+    Scheduler,
+    Daemon,
+}
+
+/// WHY a job runs + how its result is used. **Absorbs** [`JobKind`] —
+/// `adhoc_benchmark` / `baseline_benchmark` carry the `AdHoc` / `Baseline`
+/// result-role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "job_intent", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum JobIntent {
+    AdhocBenchmark,
+    BaselineBenchmark,
+    BlockValidation,
+    CacheWarm,
+}
+
+/// WHICH VM workload runs after build — the recipe-dispatch axis. `BuildOnly`
+/// produces + caches an artifact and stops (no measurement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "task_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    Benchmark,
+    BlockValidation,
+    BuildOnly,
+}
+
+/// WHICH artifact binary a job produces / consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "build_target", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum BuildTarget {
+    StacksBench,
+    StacksInspect,
+}
+
+/// The four **stored** job-model axes. (The report surface set is derived, not
+/// stored — so it isn't here.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobAxes {
+    pub source: JobSource,
+    pub intent: JobIntent,
+    pub task_kind: TaskKind,
+    pub build_target: BuildTarget,
+}
+
+impl JobAxes {
+    /// The **back-fill mapping**: legacy `(TriggerKind, JobKind)` → axes. The
+    /// v10 Phase-1 migration mirrors this `CASE`-for-`CASE` in SQL, so this
+    /// is the tested source of truth. Exhaustive on both enums (no
+    /// wildcard). Every legacy job is a `stacks_bench` `benchmark`;
+    /// `git_ref_kind` is untouched (it stays its own axis, so a
+    /// `branch_push` vs `tag_created` baseline keeps its ref distinction).
+    pub fn from_legacy(trigger_kind: TriggerKind, job_kind: JobKind) -> Self {
+        let source = match trigger_kind {
+            TriggerKind::PrComment => JobSource::GithubComment,
+            TriggerKind::BranchPush | TriggerKind::TagCreated => JobSource::GithubWebhook,
+            TriggerKind::SlackAdhoc => JobSource::Slack,
+            TriggerKind::Scheduled => JobSource::Scheduler,
+            TriggerKind::Manual => JobSource::Cli,
+        };
+        let intent = match job_kind {
+            JobKind::AdHoc => JobIntent::AdhocBenchmark,
+            JobKind::Baseline => JobIntent::BaselineBenchmark,
+        };
+        JobAxes {
+            source,
+            intent,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -548,7 +654,7 @@ pub enum JobEventStatus {
 }
 
 /// Append-only job timeline row. `detail` JSONB shape is a tagged
-/// Rust enum keyed off the parent job's `trigger_kind` (slice 9
+/// Rust enum keyed off the queued-event `trigger` provenance tag (slice 9
 /// defines the queued-event provenance shape; later phases extend
 /// for the other event kinds).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -566,8 +672,10 @@ pub struct JobEvent {
 }
 
 /// Slice 9: typed provenance for the `queued` job_event's `detail`
-/// JSONB. Tagged by `trigger` (mirrors `job.trigger_kind`) so the
-/// audit/inspection reader knows which envelope caused the enqueue
+/// JSONB. Tagged by `trigger` — the enqueue provenance (which originating
+/// event caused this run), finer-grained than the job's `source` axis
+/// (e.g. `branch_push` / `tag_created` both have `source = github_webhook`)
+/// — so the audit/inspection reader knows which envelope caused the enqueue
 /// without inspecting `job` columns. Per the SUBJECT-vs-PROVENANCE
 /// design principle, this is provenance — `bench_args` lives here
 /// (and is what slice 10's daemon reads to assemble the run's
@@ -678,4 +786,52 @@ pub struct GithubUserJob {
     pub github_user_id: i64,
     pub job_id: Uuid,
     pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The v10 back-fill map (`JobAxes::from_legacy`) — the source of truth the
+    /// Phase-1 migration's SQL `CASE` mirrors. Exhaustive over the legacy
+    /// combos.
+    #[test]
+    fn job_axes_from_legacy_maps_every_combo() {
+        let stacks_bench_benchmark = |source, intent| JobAxes {
+            source,
+            intent,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+        };
+
+        // The four live combos (every legacy job is a stacks_bench benchmark;
+        // source ← trigger_kind, intent ← job_kind).
+        assert_eq!(
+            JobAxes::from_legacy(TriggerKind::PrComment, JobKind::AdHoc),
+            stacks_bench_benchmark(JobSource::GithubComment, JobIntent::AdhocBenchmark),
+        );
+        assert_eq!(
+            JobAxes::from_legacy(TriggerKind::BranchPush, JobKind::Baseline),
+            stacks_bench_benchmark(JobSource::GithubWebhook, JobIntent::BaselineBenchmark),
+        );
+        assert_eq!(
+            JobAxes::from_legacy(TriggerKind::TagCreated, JobKind::Baseline),
+            stacks_bench_benchmark(JobSource::GithubWebhook, JobIntent::BaselineBenchmark),
+        );
+        assert_eq!(
+            JobAxes::from_legacy(TriggerKind::SlackAdhoc, JobKind::AdHoc),
+            stacks_bench_benchmark(JobSource::Slack, JobIntent::AdhocBenchmark),
+        );
+
+        // Reserved daemon-ish sources (no live rows today): source still maps
+        // by trigger, intent by kind — exhaustively, no wildcard.
+        assert_eq!(
+            JobAxes::from_legacy(TriggerKind::Scheduled, JobKind::Baseline).source,
+            JobSource::Scheduler,
+        );
+        assert_eq!(
+            JobAxes::from_legacy(TriggerKind::Manual, JobKind::AdHoc).source,
+            JobSource::Cli,
+        );
+    }
 }

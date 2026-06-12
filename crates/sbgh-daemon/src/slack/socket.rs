@@ -185,7 +185,7 @@ mod tests {
 
     use async_trait::async_trait;
     use sbgh_core::db::InMemoryJobStore;
-    use sbgh_core::models::TriggerKind;
+    use sbgh_core::models::JobSource;
     use slack_morphism::errors::{SlackClientEndOfStreamError, SlackClientSocketModeProtocolError};
 
     use super::*;
@@ -294,7 +294,7 @@ mod tests {
 
         let jobs = store.all_jobs();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].trigger_kind, TriggerKind::SlackAdhoc);
+        assert_eq!(jobs[0].source, JobSource::Slack);
         assert_eq!(
             *slack
                 .reactions

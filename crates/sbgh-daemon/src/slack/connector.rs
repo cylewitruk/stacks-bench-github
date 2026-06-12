@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use sbgh_core::config::SlackConfig;
 use sbgh_core::db::JobStore;
-use sbgh_core::models::{GitRefKind, JobKind, NewJob, QueuedEventDetail, TriggerKind};
+use sbgh_core::models::{
+    BuildTarget, GitRefKind, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail, TaskKind,
+};
 use uuid::Uuid;
 
 use crate::slack::card::{self, CardCtx};
@@ -99,8 +101,12 @@ impl SlackConnector {
         let new_job = NewJob {
             github_installation_id: self.target.installation_id,
             github_repo_id: self.target.repo_id,
-            job_kind: JobKind::AdHoc,
-            trigger_kind: TriggerKind::SlackAdhoc,
+            axes: JobAxes {
+                source: JobSource::Slack,
+                intent: JobIntent::AdhocBenchmark,
+                task_kind: TaskKind::Benchmark,
+                build_target: BuildTarget::StacksBench,
+            },
             // `Branch` is the neutral default for a default-rev like `develop`;
             // `git_commit_hash` is `None`, so the rev resolves to a commit at
             // claim time — the reporter's `prepare` resolves a Slack job's bare
@@ -225,7 +231,7 @@ mod tests {
 
     use async_trait::async_trait;
     use sbgh_core::db::InMemoryJobStore;
-    use sbgh_core::models::TriggerKind;
+    use sbgh_core::models::JobSource;
 
     use super::*;
 
@@ -349,7 +355,7 @@ mod tests {
         // Exactly one ad-hoc job, with the resolved workload + default rev.
         let jobs = store.all_jobs();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].trigger_kind, TriggerKind::SlackAdhoc);
+        assert_eq!(jobs[0].source, JobSource::Slack);
         assert_eq!(jobs[0].github_installation_id, 100);
         assert_eq!(jobs[0].github_repo_id, 10);
         assert_eq!(jobs[0].git_ref_display, "develop", "default rev when no --rev");

@@ -565,6 +565,8 @@ impl Reporter {
             // reaction is added by the connector at enqueue, and the threaded
             // result is posted at terminal (connector slice). Nothing here.
             ProgressTarget::Slack { .. } => {}
+            // Build-only/silent jobs (v10 0005) surface nothing.
+            ProgressTarget::Silent => {}
         }
     }
 
@@ -724,6 +726,8 @@ mod tests {
             git_ref_display: "feature".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            task_kind: sbgh_core::models::TaskKind::Benchmark,
+            build_target: sbgh_core::models::BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec![],
             progress,

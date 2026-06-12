@@ -131,13 +131,16 @@ impl JobStore for InMemoryJobStore {
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
         let now = Utc::now();
         let id = Uuid::new_v4();
+        // v10 (0005): jobs carry the axes natively — set by the handler.
         let job = Job {
             id,
             github_installation_id: new.github_installation_id,
             github_repo_id: new.github_repo_id,
             status: JobStatus::Queued,
-            job_kind: new.job_kind,
-            trigger_kind: new.trigger_kind,
+            source: new.axes.source,
+            intent: new.axes.intent,
+            task_kind: new.axes.task_kind,
+            build_target: new.axes.build_target,
             git_ref_kind: new.git_ref_kind,
             git_ref_display: new.git_ref_display.clone(),
             git_commit_hash: new.git_commit_hash.clone(),
@@ -173,6 +176,7 @@ impl JobStore for InMemoryJobStore {
         let now = Utc::now();
         let job_id = Uuid::new_v4();
 
+        // v10 (0005): jobs carry the axes natively — set by the handler.
         // Build all the rows locally.
         let job = Job {
             id: job_id,
@@ -181,8 +185,13 @@ impl JobStore for InMemoryJobStore {
                 .github_installation_id,
             github_repo_id: request.new_job.github_repo_id,
             status: JobStatus::Queued,
-            job_kind: request.new_job.job_kind,
-            trigger_kind: request.new_job.trigger_kind,
+            source: request.new_job.axes.source,
+            intent: request.new_job.axes.intent,
+            task_kind: request.new_job.axes.task_kind,
+            build_target: request
+                .new_job
+                .axes
+                .build_target,
             git_ref_kind: request.new_job.git_ref_kind,
             git_ref_display: request
                 .new_job
@@ -287,13 +296,16 @@ impl JobStore for InMemoryJobStore {
     ) -> Result<Job> {
         let now = Utc::now();
         let job_id = Uuid::new_v4();
+        // v10 (0005): jobs carry the axes natively — set by the connector.
         let job = Job {
             id: job_id,
             github_installation_id: new_job.github_installation_id,
             github_repo_id: new_job.github_repo_id,
             status: JobStatus::Queued,
-            job_kind: new_job.job_kind,
-            trigger_kind: new_job.trigger_kind,
+            source: new_job.axes.source,
+            intent: new_job.axes.intent,
+            task_kind: new_job.axes.task_kind,
+            build_target: new_job.axes.build_target,
             git_ref_kind: new_job.git_ref_kind,
             git_ref_display: new_job
                 .git_ref_display
@@ -567,7 +579,7 @@ impl JobStore for InMemoryJobStore {
         &self,
         github_repo_id: i64,
         commit: &str,
-        trigger_kind: crate::models::TriggerKind,
+        source: crate::models::JobSource,
         workload_key: &str,
     ) -> Result<Option<Uuid>> {
         let s = self.state.lock().unwrap();
@@ -576,7 +588,7 @@ impl JobStore for InMemoryJobStore {
             .find(|j| {
                 j.github_repo_id == github_repo_id
                     && j.git_commit_hash.as_deref() == Some(commit)
-                    && j.trigger_kind == trigger_kind
+                    && j.source == source
                     && j.workload_key.as_deref() == Some(workload_key)
                     && matches!(
                         j.status,
@@ -595,8 +607,9 @@ impl JobStore for InMemoryJobStore {
     ) -> Result<Option<BaselineMatch>> {
         let s = self.state.lock().unwrap();
         // Eligible = completed baseline, same workload, with a recorded metric.
+        // v10 (0005): keys on the `intent` axis (`baseline_benchmark`).
         let eligible = |j: &&Job| {
-            j.job_kind == crate::models::JobKind::Baseline
+            j.intent == crate::models::JobIntent::BaselineBenchmark
                 && j.status == JobStatus::Completed
                 && j.workload_key.as_deref() == Some(workload_key)
                 && s.metrics.contains_key(&j.id)

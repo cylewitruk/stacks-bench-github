@@ -18,9 +18,9 @@ use sbgh_core::db::{
     PostgresJobStore, setup_pg_db,
 };
 use sbgh_core::models::{
-    GitRefKind, GithubAccountType, JobCreationRequest, JobEventKind, JobEventStatus, JobKind,
-    JobMetric, JobResult, JobStatus, NewJob, NewJobEvent, NewPullRequestLink, QueuedEventDetail,
-    ResolvedCommit, TerminalJobStatus, TriggerKind,
+    GitRefKind, GithubAccountType, JobAxes, JobCreationRequest, JobEventKind, JobEventStatus,
+    JobKind, JobMetric, JobResult, JobSource, JobStatus, NewJob, NewJobEvent, NewPullRequestLink,
+    QueuedEventDetail, ResolvedCommit, TerminalJobStatus, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -74,8 +74,10 @@ fn make_new_job(install_id: i64, repo_id: i64) -> NewJob {
     NewJob {
         github_installation_id: install_id,
         github_repo_id: repo_id,
-        job_kind: JobKind::AdHoc,
-        trigger_kind: TriggerKind::PrComment,
+        // v10 (0005): a PR-comment ad-hoc, expressed via the axes. Helpers keep
+        // taking the legacy `(trigger_kind, job_kind)` shape and convert through
+        // `from_legacy` so call sites read unchanged.
+        axes: JobAxes::from_legacy(TriggerKind::PrComment, JobKind::AdHoc),
         git_ref_kind: GitRefKind::Branch,
         git_ref_display: "main".into(),
         git_commit_hash: None,
@@ -125,8 +127,7 @@ async fn create_adhoc_job_inserts_queued_job_and_event_without_webhook() {
     let new_job = NewJob {
         github_installation_id: 100,
         github_repo_id: 10,
-        job_kind: JobKind::AdHoc,
-        trigger_kind: TriggerKind::SlackAdhoc,
+        axes: JobAxes::from_legacy(TriggerKind::SlackAdhoc, JobKind::AdHoc),
         git_ref_kind: GitRefKind::Branch,
         git_ref_display: "develop".into(),
         git_commit_hash: None,
@@ -139,7 +140,7 @@ async fn create_adhoc_job_inserts_queued_job_and_event_without_webhook() {
         .await
         .unwrap();
     assert_eq!(job.status, JobStatus::Queued);
-    assert_eq!(job.trigger_kind, TriggerKind::SlackAdhoc);
+    assert_eq!(job.source, JobSource::Slack);
     assert!(
         job.claim_token.is_none() && job.claimed_at.is_none(),
         "queued-state invariant holds for an ad-hoc job"
@@ -696,7 +697,7 @@ async fn create_job_with_links_optional_user_and_pr_links_are_skipped_when_none(
         store
             .create_job_with_links(&JobCreationRequest {
                 new_job: NewJob {
-                    trigger_kind: TriggerKind::BranchPush,
+                    axes: JobAxes::from_legacy(TriggerKind::BranchPush, JobKind::AdHoc),
                     ..make_new_job(100, 10)
                 },
                 github_webhook_id: webhook_id,
@@ -735,7 +736,7 @@ async fn create_job_with_links_is_idempotent_on_webhook_id() {
     .unwrap();
     let request = JobCreationRequest {
         new_job: NewJob {
-            trigger_kind: TriggerKind::BranchPush,
+            axes: JobAxes::from_legacy(TriggerKind::BranchPush, JobKind::AdHoc),
             ..make_new_job(100, 10)
         },
         github_webhook_id: webhook_id,
@@ -1294,8 +1295,7 @@ async fn find_active_job_matches_repo_commit_kind_and_excludes_terminal() {
         .insert_job(&NewJob {
             github_installation_id: 100,
             github_repo_id: 10,
-            job_kind: JobKind::AdHoc,
-            trigger_kind: TriggerKind::PrComment,
+            axes: JobAxes::from_legacy(TriggerKind::PrComment, JobKind::AdHoc),
             git_ref_kind: GitRefKind::Branch,
             git_ref_display: "feat".into(),
             git_commit_hash: Some("abc".into()),
@@ -1308,29 +1308,29 @@ async fn find_active_job_matches_repo_commit_kind_and_excludes_terminal() {
     // Exact (repo, commit, kind, workload) match.
     assert_eq!(
         store
-            .find_active_job(10, "abc", TriggerKind::PrComment, "wk1")
+            .find_active_job(10, "abc", JobSource::GithubComment, "wk1")
             .await
             .unwrap(),
         Some(job.id),
     );
-    // A different commit / repo / trigger kind does not match.
+    // A different commit / repo / source does not match.
     assert!(
         store
-            .find_active_job(10, "xyz", TriggerKind::PrComment, "wk1")
+            .find_active_job(10, "xyz", JobSource::GithubComment, "wk1")
             .await
             .unwrap()
             .is_none(),
     );
     assert!(
         store
-            .find_active_job(99, "abc", TriggerKind::PrComment, "wk1")
+            .find_active_job(99, "abc", JobSource::GithubComment, "wk1")
             .await
             .unwrap()
             .is_none(),
     );
     assert!(
         store
-            .find_active_job(10, "abc", TriggerKind::BranchPush, "wk1")
+            .find_active_job(10, "abc", JobSource::GithubWebhook, "wk1")
             .await
             .unwrap()
             .is_none(),
@@ -1339,7 +1339,7 @@ async fn find_active_job_matches_repo_commit_kind_and_excludes_terminal() {
     // a genuinely different benchmark, so it must enqueue.
     assert!(
         store
-            .find_active_job(10, "abc", TriggerKind::PrComment, "wk2")
+            .find_active_job(10, "abc", JobSource::GithubComment, "wk2")
             .await
             .unwrap()
             .is_none(),
@@ -1354,7 +1354,7 @@ async fn find_active_job_matches_repo_commit_kind_and_excludes_terminal() {
         .unwrap();
     assert_eq!(
         store
-            .find_active_job(10, "abc", TriggerKind::PrComment, "wk1")
+            .find_active_job(10, "abc", JobSource::GithubComment, "wk1")
             .await
             .unwrap(),
         Some(job.id),
@@ -1372,7 +1372,7 @@ async fn find_active_job_matches_repo_commit_kind_and_excludes_terminal() {
         .unwrap();
     assert!(
         store
-            .find_active_job(10, "abc", TriggerKind::PrComment, "wk1")
+            .find_active_job(10, "abc", JobSource::GithubComment, "wk1")
             .await
             .unwrap()
             .is_none(),
@@ -1400,8 +1400,7 @@ async fn seed_completed_baseline(
         .insert_job(&NewJob {
             github_installation_id: install_id,
             github_repo_id: repo_id,
-            job_kind: JobKind::Baseline,
-            trigger_kind: TriggerKind::BranchPush,
+            axes: JobAxes::from_legacy(TriggerKind::BranchPush, JobKind::Baseline),
             git_ref_kind: GitRefKind::Branch,
             git_ref_display: ref_display.into(),
             git_commit_hash: Some(sha.into()),

@@ -428,6 +428,8 @@ mod tests {
             git_ref_display: "develop".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            task_kind: sbgh_core::models::TaskKind::Benchmark,
+            build_target: sbgh_core::models::BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::Slack {

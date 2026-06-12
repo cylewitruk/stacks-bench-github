@@ -67,7 +67,10 @@ impl Recipe for BenchRecipe {
         sink: &dyn EventSink,
         cancel: &CancellationToken,
     ) -> anyhow::Result<Self::Outcome> {
-        let spec = TaskSpec { args: self.bench_args.clone() };
+        let spec = TaskSpec {
+            args: self.bench_args.clone(),
+            build_only: false,
+        };
         let placement = Placement {
             vcpu_cpuset: self.vcpu_cpuset.clone(),
         };

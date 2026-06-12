@@ -30,7 +30,7 @@ use sbgh_core::db::{
 };
 use sbgh_core::models::{
     GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent,
-    QueuedEventDetail, ResolvedCommit, TriggerKind,
+    QueuedEventDetail, ResolvedCommit,
 };
 use uuid::Uuid;
 
@@ -73,6 +73,11 @@ pub enum ProgressTarget {
         /// card is first posted.
         plan_message_ts: Option<String>,
     },
+    /// Build-only job (v10 0005 / item 0031 warming) — builds + caches an
+    /// artifact and stops. It has no measurement to render, so it reports
+    /// nothing: the empty report surface set (`report = none`). Derived for
+    /// `task_kind = build_only`; routed to a no-op report surface.
+    Silent,
 }
 
 /// Storage-neutral execution context for one benchmark run. Assembled by
@@ -95,6 +100,14 @@ pub struct RunnableJob {
     /// `GitHubApi::resolve_commit`.
     pub git_ref_kind: GitRefKind,
     pub installation_id: i64,
+    /// v10 (0005): the run-shape axis — selects the recipe at dispatch
+    /// (`benchmark` → bench, `build_only` → build + cache, silent).
+    pub task_kind: sbgh_core::models::TaskKind,
+    /// v10 (0005): which artifact binary the recipe builds/runs. Dispatch keys
+    /// on `(task_kind, build_target)` and fails closed on unsupported combos,
+    /// so a `stacks_inspect` row can't silently run the `stacks_bench`
+    /// path.
+    pub build_target: sbgh_core::models::BuildTarget,
     /// roadmap-v7: the job's workload key, for the vs-baseline lookup (only a
     /// baseline of the *same* workload is comparable). `None` on pre-v7 rows.
     pub workload_key: Option<String>,
@@ -560,12 +573,16 @@ impl JobSource {
             .map(|d| normalize_stored_value(&d.0))
             .unwrap_or_default();
 
-        // A `slack_adhoc` job reports into its Slack thread (no GitHub surface);
-        // PR-linked jobs (`pr_comment`) report on a Check Run + comment; baseline
-        // jobs (`branch_push`/`tag_created`) on a commit-level Check Run. The
-        // already-created comment/check ids are read back so a reclaimed (or
-        // recovered) job updates them rather than duplicating.
-        let progress = if job.trigger_kind == TriggerKind::SlackAdhoc {
+        // The report surface is derived from the job's axes (v10 0005): a
+        // `task_kind = build_only` job has no measurement to render and reports
+        // nothing (`report = none`); a `source = slack` job reports into its
+        // Slack thread (no GitHub surface); PR-linked jobs report on a Check Run
+        // + comment; the rest on a commit-level Check Run. The already-created
+        // comment/check ids are read back so a reclaimed (or recovered) job
+        // updates them rather than duplicating.
+        let progress = if job.task_kind == sbgh_core::models::TaskKind::BuildOnly {
+            ProgressTarget::Silent
+        } else if job.source == sbgh_core::models::JobSource::Slack {
             // `channel`/`message_ts` are reporting provenance in the
             // `SlackAdhoc` queued detail — a `slack_adhoc` job MUST carry it (and
             // never falls through to a commit check).
@@ -647,6 +664,8 @@ impl JobSource {
             git_ref_display: job.git_ref_display,
             git_ref_kind: job.git_ref_kind,
             installation_id: job.github_installation_id,
+            task_kind: job.task_kind,
+            build_target: job.build_target,
             workload_key: job.workload_key,
             bench_args,
             progress,

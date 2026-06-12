@@ -18,6 +18,7 @@ use anyhow::Context;
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::db::{PolicyStore, RepoStore};
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
+use sbgh_core::models::{BuildTarget, TaskKind};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -25,12 +26,13 @@ use uuid::Uuid;
 
 use crate::artifact_store::build_store_or_local;
 use crate::bench_recipe::BenchRecipe;
+use crate::build_recipe::BuildOnlyRecipe;
 use crate::driver::Driver;
 use crate::events::{ChannelSink, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, Shell};
 use crate::pin_manager::PinManager;
-use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
+use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus, UnsupportedRecipe};
 use crate::report::build_report_surface;
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
@@ -556,9 +558,10 @@ impl Coordinator {
         let existing = match job.progress {
             ProgressTarget::PullRequest { check_run_id, .. } => check_run_id,
             ProgressTarget::CommitCheck { check_run_id } => check_run_id,
-            // Slack jobs carry no GitHub check (this runs only for jobs whose
-            // `[reporting]` wants a position check — see `wants_position_check`).
-            ProgressTarget::Slack { .. } => None,
+            // Slack + silent jobs carry no GitHub check (this runs only for jobs
+            // whose `[reporting]` wants a position check — see
+            // `wants_position_check`).
+            ProgressTarget::Slack { .. } | ProgressTarget::Silent => None,
         };
 
         // Already have a check (a prior tick / re-claim) → just refresh the text.
@@ -828,11 +831,12 @@ impl JobDeps {
                 ProgressTarget::PullRequest { .. } => "pull_request",
                 ProgressTarget::CommitCheck { .. } => "commit_check",
                 ProgressTarget::Slack { .. } => "slack",
+                ProgressTarget::Silent => "silent",
             },
+            task_kind = ?job.task_kind,
+            build_target = ?job.build_target,
             "claimed job; starting",
         );
-
-        let recipe = BenchRecipe::new(self.driver.clone(), job.bench_args.clone(), vcpu_cpuset);
 
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
         let (prepared_tx, prepared_rx) = oneshot::channel();
@@ -852,8 +856,27 @@ impl JobDeps {
 
         // The worker runs inline: it waits for prepare's resolved commit, runs
         // the recipe (emitting progress to the channel), and sends the terminal.
-        // On `token` cancellation it cleans up + reports aborted.
-        run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+        // On `token` cancellation it cleans up + reports aborted. Recipe is
+        // selected by the `(task_kind, build_target)` axes (v10 0005), failing
+        // closed on any unsupported pair so a `stacks_inspect` or
+        // `block_validation` row can't silently run the stacks-bench path:
+        // `build_only` builds + caches the artifact silently; `benchmark` runs
+        // the bench.
+        let driver = self.driver.clone();
+        match (job.task_kind, job.build_target) {
+            (TaskKind::Benchmark, BuildTarget::StacksBench) => {
+                let recipe = BenchRecipe::new(driver, job.bench_args.clone(), vcpu_cpuset);
+                run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+            }
+            (TaskKind::BuildOnly, BuildTarget::StacksBench) => {
+                let recipe = BuildOnlyRecipe::new(driver, vcpu_cpuset);
+                run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+            }
+            (task_kind, build_target) => {
+                let recipe = UnsupportedRecipe::new(format!("{task_kind:?}/{build_target:?}"));
+                run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+            }
+        }
 
         // After the job's execution (which may have published a freshly-built
         // binary), recompute the pinned set so a newly-built pinned ref is
@@ -878,8 +901,8 @@ impl JobDeps {
 /// The inline worker: await prepare's go/abort signal, run the recipe (emitting
 /// progress onto the channel), and send the terminal outcome. Pure execution —
 /// it never touches GitHub or the DB; the reporter owns all of that.
-async fn run_worker(
-    recipe: &BenchRecipe,
+async fn run_worker<R: Recipe>(
+    recipe: &R,
     job: &RunnableJob,
     prepared_rx: oneshot::Receiver<Prepared>,
     events_tx: mpsc::Sender<WorkerEvent>,
@@ -948,8 +971,8 @@ fn wants_position_check(reporting: &sbgh_core::config::ReportingConfig, job: &Ru
             .baseline_report
             .wants_check(),
         // Slack jobs report into their thread, not a GitHub queue-position
-        // check.
-        ProgressTarget::Slack { .. } => false,
+        // check; build-only/silent jobs report nothing at all.
+        ProgressTarget::Slack { .. } | ProgressTarget::Silent => false,
     }
 }
 
@@ -981,7 +1004,7 @@ mod tests {
         PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
     };
     use sbgh_core::github::test_support::FakeGitHub;
-    use sbgh_core::models::{GitRefKind, ResolvedCommit};
+    use sbgh_core::models::{BuildTarget, GitRefKind, ResolvedCommit, TaskKind};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -1277,6 +1300,8 @@ mod tests {
             git_ref_display: "develop".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::CommitCheck { check_run_id: None },
@@ -1315,6 +1340,53 @@ mod tests {
         );
     }
 
+    /// v10 (0005): a build-only job (`task_kind = build_only` → a `Silent`
+    /// report target) dispatches the build-only recipe and reports nothing —
+    /// GitHub is never touched, even on a build failure. The build itself
+    /// (provision → build → publish → stop, no bench) is driver-tested in
+    /// `build_only_skips_bench_phase`.
+    #[tokio::test]
+    async fn run_once_build_only_job_is_silent() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(), // pre-resolved → preflight is a no-op
+            git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            task_kind: TaskKind::BuildOnly,
+            build_target: BuildTarget::StacksBench,
+            workload_key: None,
+            bench_args: vec![],
+            progress: ProgressTarget::Silent,
+            claim_token: Some(Uuid::new_v4()),
+        };
+        let source = Arc::new(FakeSource::new(job));
+
+        // The first provisioning command fails → the build-only run terminalizes
+        // as Failed; a silent job must still make zero GitHub calls.
+        let gh = Arc::new(FakeGitHub::new());
+        let shell = Arc::new(RecordingShell::new());
+        shell.reply(PreparedReply::fail(b"boom: git fetch failed"));
+
+        let runner = Runner::new(config, source.clone(), gh.clone(), shell);
+        assert!(
+            runner
+                .run_once()
+                .await
+                .unwrap(),
+            "claimed + executed one job",
+        );
+
+        // Lifecycle ran (start_running → fail), but the silent report surface
+        // posted nothing.
+        assert_eq!(source.calls(), vec!["start_running", "fail"]);
+        assert!(gh.calls().is_empty(), "a build-only (silent) job must make no GitHub calls",);
+    }
+
     /// A `tag_created` job is enqueued with no commit; the runner
     /// resolves the tag → commit at claim time (via `resolve_commit`) and
     /// hands the resolved commit (with its authored date) to
@@ -1331,6 +1403,8 @@ mod tests {
             git_ref_display: "release/1.2".into(),
             git_ref_kind: GitRefKind::Tag,
             installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::CommitCheck { check_run_id: None },
@@ -1393,6 +1467,8 @@ mod tests {
             git_ref_display: "develop".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::Slack {
@@ -1473,6 +1549,8 @@ mod tests {
             git_ref_display: "feature".into(),
             git_ref_kind: GitRefKind::Branch,
             installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec![],
             progress: ProgressTarget::PullRequest {

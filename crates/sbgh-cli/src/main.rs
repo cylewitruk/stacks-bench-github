@@ -968,12 +968,15 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
                 return Ok(());
             }
             for j in rows {
+                // Compact axes: `source/intent` (task_kind/build_target are
+                // near-constant today — surfaced once build jobs land).
                 println!(
-                    "{}  {:<12} install={:>12} repo={:>12}  {} {}  {}",
+                    "{}  {:<12} install={:>12} repo={:>12}  {:<24} {} {}  {}",
                     j.id,
                     j.status,
                     j.install_id,
                     j.repo_id,
+                    format!("{}/{}", j.source, j.intent),
                     j.git_ref_kind,
                     j.git_ref_display,
                     j.created_at,

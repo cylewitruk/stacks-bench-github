@@ -325,7 +325,7 @@ async fn pipeline_classifies_pr_benchmark_as_enqueued_job() {
 
     // Slice 9: exactly one job, against the TARGET repo, ref = PR head,
     // queued, with all links + the queued event committed atomically.
-    let (job_id, job_repo, job_kind, trigger, ref_kind, ref_display, commit, job_status): (
+    let (job_id, job_repo, source, intent, ref_kind, ref_display, commit, job_status): (
         uuid::Uuid,
         i64,
         String,
@@ -335,15 +335,17 @@ async fn pipeline_classifies_pr_benchmark_as_enqueued_job() {
         Option<String>,
         String,
     ) = sqlx::query_as(
-        "SELECT id, github_repo_id, job_kind::text, trigger_kind::text, git_ref_kind::text, \
+        "SELECT id, github_repo_id, source::text, intent::text, git_ref_kind::text, \
          git_ref_display, git_commit_hash, status::text FROM job",
     )
     .fetch_one(&pool)
     .await
     .expect("exactly one job row");
     assert_eq!(job_repo, 10, "job runs against the target (base) repo");
-    assert_eq!(job_kind, "ad_hoc");
-    assert_eq!(trigger, "pr_comment");
+    // v10 (0005): a PR-comment ad-hoc → source=github_comment,
+    // intent=adhoc_benchmark.
+    assert_eq!(source, "github_comment");
+    assert_eq!(intent, "adhoc_benchmark");
     assert_eq!(ref_kind, "branch");
     assert_eq!(ref_display, "feat", "PR head branch");
     assert_eq!(commit.as_deref(), Some("headsha"));
@@ -1422,7 +1424,7 @@ async fn pipeline_push_with_matching_branch_trigger_enqueues_baseline_job() {
     assert_eq!(status, WebhookStatus::Processed);
     assert_eq!(outcome, Some(WebhookOutcome::EnqueuedJob));
 
-    let (job_id, repo, kind, trigger, ref_display, commit): (
+    let (job_id, repo, source, intent, ref_display, commit): (
         uuid::Uuid,
         i64,
         String,
@@ -1430,15 +1432,17 @@ async fn pipeline_push_with_matching_branch_trigger_enqueues_baseline_job() {
         String,
         Option<String>,
     ) = sqlx::query_as(
-        "SELECT id, github_repo_id, job_kind::text, trigger_kind::text, git_ref_display, \
-         git_commit_hash FROM job",
+        "SELECT id, github_repo_id, source::text, intent::text, git_ref_display, git_commit_hash \
+         FROM job",
     )
     .fetch_one(&pool)
     .await
     .expect("exactly one job");
     assert_eq!(repo, 10);
-    assert_eq!(kind, "baseline");
-    assert_eq!(trigger, "branch_push");
+    // v10 (0005): a branch-push baseline → source=github_webhook,
+    // intent=baseline_benchmark.
+    assert_eq!(source, "github_webhook");
+    assert_eq!(intent, "baseline_benchmark");
     assert_eq!(ref_display, "develop");
     assert_eq!(commit.as_deref(), Some("e2epushsha"), "resolved at enqueue");
     // Automated trigger: webhook link present, no user/PR link.
@@ -1535,21 +1539,23 @@ async fn pipeline_create_tag_with_matching_pattern_trigger_enqueues_baseline_job
     assert_eq!(status, WebhookStatus::Processed);
     assert_eq!(outcome, Some(WebhookOutcome::EnqueuedJob));
 
-    let (kind, trigger, ref_kind, ref_display, commit): (
+    let (source, intent, ref_kind, ref_display, commit): (
         String,
         String,
         String,
         String,
         Option<String>,
     ) = sqlx::query_as(
-        "SELECT job_kind::text, trigger_kind::text, git_ref_kind::text, git_ref_display, \
-         git_commit_hash FROM job",
+        "SELECT source::text, intent::text, git_ref_kind::text, git_ref_display, git_commit_hash \
+         FROM job",
     )
     .fetch_one(&pool)
     .await
     .expect("exactly one job");
-    assert_eq!(kind, "baseline");
-    assert_eq!(trigger, "tag_created");
+    // v10 (0005): a tag-created baseline → source=github_webhook,
+    // intent=baseline_benchmark.
+    assert_eq!(source, "github_webhook");
+    assert_eq!(intent, "baseline_benchmark");
     assert_eq!(ref_kind, "tag");
     assert_eq!(ref_display, "release/1.2");
     assert!(commit.is_none(), "tag job queued with unresolved commit");

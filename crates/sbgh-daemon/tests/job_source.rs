@@ -12,8 +12,8 @@ use sbgh_core::db::{
     PostgresRepoStore, setup_pg_db,
 };
 use sbgh_core::models::{
-    GitRefKind, JobCreationRequest, JobKind, NewJob, NewPullRequestLink, QueuedEventDetail,
-    TriggerKind,
+    GitRefKind, JobAxes, JobCreationRequest, JobKind, NewJob, NewPullRequestLink,
+    QueuedEventDetail, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -94,8 +94,7 @@ async fn enqueue_branch_push(store: &PostgresJobStore, webhook_id: i64) {
             new_job: NewJob {
                 github_installation_id: 100,
                 github_repo_id: 10,
-                job_kind: JobKind::Baseline,
-                trigger_kind: TriggerKind::BranchPush,
+                axes: JobAxes::from_legacy(TriggerKind::BranchPush, JobKind::Baseline),
                 git_ref_kind: GitRefKind::Branch,
                 git_ref_display: "develop".into(),
                 git_commit_hash: Some("pushsha".into()),
@@ -126,8 +125,7 @@ async fn enqueue_slack_adhoc(store: &PostgresJobStore, webhook_id: i64) -> Uuid 
             new_job: NewJob {
                 github_installation_id: 100,
                 github_repo_id: 10,
-                job_kind: JobKind::AdHoc,
-                trigger_kind: TriggerKind::SlackAdhoc,
+                axes: JobAxes::from_legacy(TriggerKind::SlackAdhoc, JobKind::AdHoc),
                 git_ref_kind: GitRefKind::Branch,
                 git_ref_display: "develop".into(),
                 git_commit_hash: Some("revsha".into()),
@@ -484,8 +482,7 @@ async fn v2_source_load_runnable_surfaces_existing_check_for_conclusion() {
             new_job: NewJob {
                 github_installation_id: 100,
                 github_repo_id: 10,
-                job_kind: JobKind::AdHoc,
-                trigger_kind: TriggerKind::PrComment,
+                axes: JobAxes::from_legacy(TriggerKind::PrComment, JobKind::AdHoc),
                 git_ref_kind: GitRefKind::Branch,
                 git_ref_display: "feat".into(),
                 git_commit_hash: Some("headsha".into()),
@@ -750,8 +747,7 @@ async fn v2_source_pr_comment_job_assembles_pr_progress_and_records_comment_id()
             new_job: NewJob {
                 github_installation_id: 100,
                 github_repo_id: 10,
-                job_kind: JobKind::AdHoc,
-                trigger_kind: TriggerKind::PrComment,
+                axes: JobAxes::from_legacy(TriggerKind::PrComment, JobKind::AdHoc),
                 git_ref_kind: GitRefKind::Branch,
                 git_ref_display: "feat".into(),
                 git_commit_hash: Some("headsha".into()),

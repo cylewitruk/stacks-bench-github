@@ -14,6 +14,7 @@
 //! its rendering, so behavior is unchanged.
 
 use async_trait::async_trait;
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -69,4 +70,94 @@ pub trait Recipe: Send + Sync {
         sink: &dyn EventSink,
         cancel: &CancellationToken,
     ) -> anyhow::Result<Self::Outcome>;
+}
+
+/// A recipe for an unsupported `(task_kind, build_target)` combination (today:
+/// any `block_validation`, or a `stacks_inspect` target — items 0019 / 0031).
+/// No creation path produces such a job, so this is purely defensive — it fails
+/// the job fast with a clear reason rather than silently routing it to the
+/// wrong recipe. Touches no execution backend.
+pub struct UnsupportedRecipe {
+    combo: String,
+}
+
+impl UnsupportedRecipe {
+    pub fn new(combo: impl Into<String>) -> Self {
+        Self { combo: combo.into() }
+    }
+}
+
+/// Terminal outcome of an unsupported task kind — always `Failed`, with an
+/// empty forensics blob (nothing ran).
+pub struct UnsupportedOutcome {
+    status: TaskStatus,
+    summary: serde_json::Value,
+}
+
+impl TaskOutcome for UnsupportedOutcome {
+    fn status(&self) -> TaskStatus {
+        self.status.clone()
+    }
+
+    fn summary(&self) -> &serde_json::Value {
+        &self.summary
+    }
+}
+
+#[async_trait]
+impl Recipe for UnsupportedRecipe {
+    type Outcome = UnsupportedOutcome;
+
+    async fn execute(
+        &self,
+        _ctx: &TaskContext<'_>,
+        _sink: &dyn EventSink,
+        _cancel: &CancellationToken,
+    ) -> anyhow::Result<Self::Outcome> {
+        Ok(UnsupportedOutcome {
+            status: TaskStatus::Failed(format!(
+                "unsupported task_kind/build_target combination `{}` is not implemented",
+                self.combo
+            )),
+            summary: json!({ "unsupported_combo": self.combo }),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::events::{PhaseLabel, SinkResult};
+
+    struct NoopSink;
+
+    #[async_trait]
+    impl EventSink for NoopSink {
+        async fn phase(&self, _label: PhaseLabel, _elapsed: Duration) -> SinkResult {
+            Ok(())
+        }
+        async fn heartbeat(&self, _label: PhaseLabel, _elapsed: Duration) {}
+    }
+
+    /// An unimplemented `task_kind` fails the run fast (with a naming reason)
+    /// and touches no execution backend.
+    #[tokio::test]
+    async fn unsupported_recipe_fails_fast() {
+        let recipe = UnsupportedRecipe::new("block_validation");
+        let ctx = TaskContext {
+            job_id: Uuid::nil(),
+            repository: "octo/core",
+            commit: "abc",
+        };
+        let outcome = recipe
+            .execute(&ctx, &NoopSink, &CancellationToken::new())
+            .await
+            .unwrap();
+        match outcome.status() {
+            TaskStatus::Failed(msg) => assert!(msg.contains("block_validation"), "reason: {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
 }

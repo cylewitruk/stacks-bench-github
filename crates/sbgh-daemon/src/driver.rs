@@ -33,6 +33,10 @@ pub struct TaskSpec {
     /// The task's invocation args (bench: `bench_args`), replayed into the
     /// backend's in-VM task.
     pub args: Vec<String>,
+    /// v10 (0005): build-only mode — provision + build + publish the artifact
+    /// to the cache, then stop (no in-VM task phase). `false` is the
+    /// benchmark shape; `true` is the `0031` warming primitive.
+    pub build_only: bool,
 }
 
 /// A backend-interpreted placement hint. Today the only knob is CPU pinning

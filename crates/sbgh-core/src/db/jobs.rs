@@ -267,7 +267,7 @@ pub trait JobStore: Send + Sync + 'static {
 
     /// roadmap-v5 Phase 5 (dedup): the id of an **active** (`queued` /
     /// `claimed` / `running`) job for this exact `(github_repo_id,
-    /// git_commit_hash, trigger_kind, workload_key)`, if any. Used to skip
+    /// git_commit_hash, source, workload_key)`, if any. Used to skip
     /// enqueuing a duplicate `/benchmark` for a commit already being
     /// benchmarked — two jobs on one head SHA would otherwise fight over
     /// the single GitHub check GitHub surfaces per `(name, head_sha)`.
@@ -286,7 +286,7 @@ pub trait JobStore: Send + Sync + 'static {
         &self,
         github_repo_id: i64,
         commit: &str,
-        trigger_kind: crate::models::TriggerKind,
+        source: crate::models::JobSource,
         workload_key: &str,
     ) -> Result<Option<Uuid>>;
 
@@ -302,7 +302,7 @@ pub trait JobStore: Send + Sync + 'static {
     ///    on `base_ref` for the same `workload_key` with `git_committed_at <=`
     ///    the fork-point. Best-effort, labelled as such.
     ///
-    /// Only `job_kind='baseline'`, `status='completed'`,
+    /// Only `intent='baseline_benchmark'`, `status='completed'`,
     /// matching-`workload_key` rows are eligible; a NULL `workload_key`
     /// never matches. `None` when neither step finds one. Ties (a commit
     /// benchmarked more than once, or two commits sharing a timestamp) resolve
