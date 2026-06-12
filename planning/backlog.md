@@ -368,34 +368,9 @@ reply on a Slack results card and/or the portal.
 Distinct from `0020` (which resolves bench *inputs*); this answers over *outputs*.
 Prompt / tooling design is its own design.
 
-### 0031 — Reusable build jobs (artifact production + target axis)
-
-- **id:** `0031-reusable-build-jobs`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0005-task-kind-platform` (the redesigned job-model axes —
-  `task_kind` / `build_target` / source / intent — a daemon-initiated build-only
-  job needs)
-- **relates_to:** `0025-baseline-binary-cache` (consumes its cache; supersedes its
-  *warming*), `0019-block-validation-recipe`, `0004-worker-fleet`
-- **design:** [design/0031-reusable-build-jobs.md](design/0031-reusable-build-jobs.md)
-- **source:** v9 (`0025`) Phase-2 warming pivot (2026-06)
-
-**Problem:** Warming a pinned release binary is a daemon-initiated, **build-only**,
-silent job — which the current measurement-shaped, webhook-coupled
-`JobKind`/`TriggerKind` model can't express without a fake webhook / measurement /
-check. It needs `0005`'s clean job-model axes first.
-
-**Scope:** A **build-only** task that produces + caches a `build_target` binary
-(no measurement, silent), and **pin warming** that enqueues it for pinned refs
-missing from the cache → `0025`'s recompute then protects them. Build-only + the
-`build_target` axis are the **first consumers** of `0005`'s redesigned job model,
-so this **follows `0005`**. Builds on shipped v9 groundwork
-(`pin_resolver::PinnedTarget`, `BinaryCache::has_entry_for`).
-
-**Acceptance:** A pinned release ref with no cached binary is pre-built by a
-daemon-initiated build-only job (`source=daemon`, `intent=cache_warm`,
-`task_kind=build_only`, `report=none`) and then protected by `0025`'s pin recompute.
+*`0031-reusable-build-jobs` promoted → iteration **v11**
+([iterations/v11-reusable-build-jobs.md](iterations/v11-reusable-build-jobs.md));
+full scope + design live there.*
 
 *`0022-report-surface-trait` shipped (iteration v7, 2026-06) →
 [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md).*

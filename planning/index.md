@@ -48,7 +48,7 @@ need editing when an item's status or location changes.
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
-| `0031-reusable-build-jobs` | Reusable build jobs (artifact + target axis) | `backlog` | [backlog.md](backlog.md) |
+| `0031-reusable-build-jobs` | Reusable build jobs (artifact + target axis) | `in_progress` | [iterations/v11-reusable-build-jobs.md](iterations/v11-reusable-build-jobs.md) |
 
 ## Iterations
 
@@ -61,6 +61,7 @@ need editing when an item's status or location changes.
 | `v8-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
 | `v9-baseline-binary-cache` | Release-baseline binary cache | `in_progress` | [iterations/v9-baseline-binary-cache.md](iterations/v9-baseline-binary-cache.md) |
 | `v10-job-model-decomposition` | Job-model decomposition (source/intent/task/target axes) | `shipped` | [archive/completed/0005-task-kind-platform.md](archive/completed/0005-task-kind-platform.md) |
+| `v11-reusable-build-jobs` | Reusable build jobs (pin warming) | `in_progress` | [iterations/v11-reusable-build-jobs.md](iterations/v11-reusable-build-jobs.md) |
 
 ## Decisions
 
