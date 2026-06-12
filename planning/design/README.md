@@ -14,12 +14,11 @@ planning/design/0003-results-portal.md
 
 > **Current contents:** living design docs for the unshipped items —
 > [`0003-results-portal`](0003-results-portal.md),
-> [`0004-worker-fleet`](0004-worker-fleet.md),
-> [`0005-task-kind-platform`](0005-task-kind-platform.md), and
+> [`0004-worker-fleet`](0004-worker-fleet.md), and
 > [`0019-block-validation-recipe`](0019-block-validation-recipe.md). Shipped items
-> keep **no** live design here: `0001`/`0002` were folded into
-> [archive/completed/](../archive/completed/) on ship and removed (per the rule
-> below); their durable rules live in [decisions/](../decisions/).
+> keep **no** live design here: on ship, each is folded into
+> [archive/completed/](../archive/completed/) and removed (per the rule below);
+> durable rules live in [decisions/](../decisions/).
 
 Use this directory for living design detail. Once the work ships, consolidate the
 backlog/iteration entry and this design into one `archive/completed/` file with

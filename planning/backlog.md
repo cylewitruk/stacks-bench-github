@@ -52,11 +52,10 @@ trust.
 **Acceptance:** A remote worker runs a bench end-to-end; orchestrator stays the sole
 DB client.
 
-*`0005-task-kind-platform` selected → iteration **v10**
-([iterations/v10-job-model-decomposition.md](iterations/v10-job-model-decomposition.md));
-**redesigned** around the multi-axis job model (source / intent / task_kind /
-build_target / report) — design in
-[design/0005-task-kind-platform.md](design/0005-task-kind-platform.md).*
+*`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
+model: source / intent / task_kind / build_target / derived report; build-only
+proven) — as-built record in
+[archive/completed/0005-task-kind-platform.md](archive/completed/0005-task-kind-platform.md).*
 
 ### 0019 — Block-validation recipe (second task kind)
 
