@@ -3,10 +3,21 @@
 - **id:** `0031-reusable-build-jobs`
 - **status:** `backlog`
 - **priority:** `medium`
+- **depends_on:** `0005-task-kind-platform` — `build_only` is a `task_kind` and
+  warming is a `source=daemon` / `intent=cache_warm` job; both need `0005`'s
+  redesigned **job-model axes** (source / intent / task_kind / build_target /
+  report) to exist first. This item is the **first consumer** of that model.
 - **relates_to:** `0025-baseline-binary-cache` (consumes its cache; supersedes its
-  *warming*), `0005-task-kind-platform` (measurement axis), `0019-block-validation-recipe`
-  (second target), `0004-worker-fleet` (route build vs measure separately)
+  *warming*), `0019-block-validation-recipe` (second `build_target`),
+  `0004-worker-fleet` (route build vs measure separately)
 - **source:** v9 (`0025`) Phase-2 warming pivot, 2026-06
+
+> **Sequencing (2026-06):** this item is **parked behind `0005`**. The warming
+> design below is sound, but it can't be built honestly until the job model is
+> decomposed — `JobKind::Build`-vs-`job_class` and the source/intent/report axes
+> are `0005`'s redesign, not this item's. Once `0005` lands the axes, warming is a
+> thin first consumer: enqueue a `task_kind=build_only` job. The `task_kind` /
+> `build_target` framing here folds into `0005`.
 
 Promote **artifact production** to a first-class job, separate from
 **measurement**. Today the only durable unit is "a benchmark job that happens to
@@ -79,11 +90,11 @@ A build job is `{target} × {backend}`; a measurement job is
 
 ## Scope (sketch)
 
-- **Schema/model:** the produce job class (a `JobKind::Build` value or a sibling
-  `job_class`, per Open question 1) + a `build_target` column (`TEXT`,
-  app-validated — mirrors `0005`'s `task_kind` decision). Build jobs have no
-  PR/owner/webhook links → reuse the **webhook-optional** job-creation path this
-  item introduces (also unblocks the reserved `Scheduled`/`Manual` cadences).
+- **Schema/model:** *superseded by `0005`* — the produce shape is
+  `task_kind=build_only` and `build_target` is a PG enum (per `0005`'s redesigned
+  axes; not a `JobKind::Build` value or a `TEXT` column). Build jobs have no
+  PR/owner/webhook links → they ride `0005`'s daemon-initiated (webhook-less)
+  creation path.
 - **Recipe/driver:** a build-only path (provision → build VM → publish → teardown,
   skip the measurement VM). Reuses `0025`'s `publish_built_binary`.
 - **Runner:** claim/assemble `Build` jobs; they take a normal concurrency slot.

@@ -52,24 +52,11 @@ trust.
 **Acceptance:** A remote worker runs a bench end-to-end; orchestrator stays the sole
 DB client.
 
-### 0005 — Task-kind platform (registry + job typing)
-
-- **id:** `0005-task-kind-platform`
-- **status:** `backlog`
-- **priority:** `medium`
-- **unblocks:** `0019-block-validation-recipe`
-- **design:** [design/0005-task-kind-platform.md](design/0005-task-kind-platform.md)
-  *(from roadmap-v6 platform work)*
-
-**Problem:** The engine is implicitly bench-only; a second task kind needs a task-kind
-registry + job typing so adding a kind is ~a new crate, not an engine change.
-
-**Scope:** Crate split along the `Recipe`/`Driver` boundary (crate **naming TBD**
-— the `sbgh-*`→`sgh-*` rename is an open question, not committed), a task-kind
-registry + `task_kind` job typing, per-kind result tables/render; the three-layer
-model (platform / Stacks substrate / task).
-
-**Acceptance:** A new task kind registers + types its jobs without engine edits.
+*`0005-task-kind-platform` selected → iteration **v10**
+([iterations/v10-job-model-decomposition.md](iterations/v10-job-model-decomposition.md));
+**redesigned** around the multi-axis job model (source / intent / task_kind /
+build_target / report) — design in
+[design/0005-task-kind-platform.md](design/0005-task-kind-platform.md).*
 
 ### 0019 — Block-validation recipe (second task kind)
 
@@ -387,27 +374,29 @@ Prompt / tooling design is its own design.
 - **id:** `0031-reusable-build-jobs`
 - **status:** `backlog`
 - **priority:** `medium`
+- **depends_on:** `0005-task-kind-platform` (the redesigned job-model axes —
+  `task_kind` / `build_target` / source / intent — a daemon-initiated build-only
+  job needs)
 - **relates_to:** `0025-baseline-binary-cache` (consumes its cache; supersedes its
-  *warming*), `0005-task-kind-platform`, `0019-block-validation-recipe`,
-  `0004-worker-fleet`
+  *warming*), `0019-block-validation-recipe`, `0004-worker-fleet`
 - **design:** [design/0031-reusable-build-jobs.md](design/0031-reusable-build-jobs.md)
 - **source:** v9 (`0025`) Phase-2 warming pivot (2026-06)
 
-**Problem:** Warming a pinned release binary has no honest home — the only
-job-creation path is webhook-coupled + measurement-shaped, so warming-as-a-baseline
-forces a fake webhook, a meaningless measurement, and an unwanted GitHub check.
+**Problem:** Warming a pinned release binary is a daemon-initiated, **build-only**,
+silent job — which the current measurement-shaped, webhook-coupled
+`JobKind`/`TriggerKind` model can't express without a fake webhook / measurement /
+check. It needs `0005`'s clean job-model axes first.
 
-**Scope:** Promote **artifact production** to a first-class **build job class** (a
-`JobKind::Build` value or a sibling `job_class` — design-open) with a **target
-axis** (`stacks-bench` · `stacks-inspect` · …), decoupled from measurement.
-Measurement jobs prefer the cached artifact; **pin warming enqueues build jobs**.
-Introduces the **webhook-optional** job-creation path (also groundwork for the
-reserved `Scheduled`/`Manual` cadences). Builds on shipped `0025` groundwork
+**Scope:** A **build-only** task that produces + caches a `build_target` binary
+(no measurement, silent), and **pin warming** that enqueues it for pinned refs
+missing from the cache → `0025`'s recompute then protects them. Build-only + the
+`build_target` axis are the **first consumers** of `0005`'s redesigned job model,
+so this **follows `0005`**. Builds on shipped v9 groundwork
 (`pin_resolver::PinnedTarget`, `BinaryCache::has_entry_for`).
 
 **Acceptance:** A pinned release ref with no cached binary is pre-built by a
-daemon-initiated build job (no webhook / measurement / GitHub check) and then
-protected by `0025`'s pin recompute.
+daemon-initiated build-only job (`source=daemon`, `intent=cache_warm`,
+`task_kind=build_only`, `report=none`) and then protected by `0025`'s pin recompute.
 
 *`0022-report-surface-trait` shipped (iteration v7, 2026-06) →
 [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md).*

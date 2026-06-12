@@ -22,7 +22,7 @@ need editing when an item's status or location changes.
 | `0002-slack-adhoc-profiling` | Slack ad-hoc profiling | `shipped` | [archive/completed/0002-slack-adhoc-profiling.md](archive/completed/0002-slack-adhoc-profiling.md) |
 | `0003-results-portal` | Results portal | `backlog` | [backlog.md](backlog.md) |
 | `0004-worker-fleet` | Worker fleet (`remote-daemon`) | `backlog` | [backlog.md](backlog.md) |
-| `0005-task-kind-platform` | Task-kind platform | `backlog` | [backlog.md](backlog.md) |
+| `0005-task-kind-platform` | Job-model decomposition + task-kind platform | `in_progress` | [iterations/v10-job-model-decomposition.md](iterations/v10-job-model-decomposition.md) |
 | `0006-aws-cloud-backend` | AWS / cloud backend | `parked` | [backlog.md](backlog.md) |
 | `0007-check-run-surface` | Check-run surface | `shipped` | [archive/completed/0007-check-run-surface.md](archive/completed/0007-check-run-surface.md) |
 | `0008-execution-architecture` | Execution architecture | `shipped` | [archive/completed/0008-execution-architecture.md](archive/completed/0008-execution-architecture.md) |
@@ -60,6 +60,7 @@ need editing when an item's status or location changes.
 | `v7-reporting-surface` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
 | `v8-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
 | `v9-baseline-binary-cache` | Release-baseline binary cache | `in_progress` | [iterations/v9-baseline-binary-cache.md](iterations/v9-baseline-binary-cache.md) |
+| `v10-job-model-decomposition` | Job-model decomposition (source/intent/task/target axes) | `in_progress` | [iterations/v10-job-model-decomposition.md](iterations/v10-job-model-decomposition.md) |
 
 ## Decisions
 
