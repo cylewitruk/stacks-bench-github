@@ -317,6 +317,13 @@ pub struct TriggerPolicy {
     pub bench_args: Option<String>,
     pub is_enabled: bool,
     pub note: Option<String>,
+    /// v9 (item 0025): when `true`, this ref's built `stacks-bench` binary is
+    /// **pin-protected** in the host binary cache (kept past the LRU size
+    /// budget, so a release ref stays warm). The pinned set follows the ref
+    /// → current commit → fingerprint.
+    pub pinned: bool,
+    /// Optional pin expiry; past this the binary drops back to the LRU tail.
+    pub pinned_until: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

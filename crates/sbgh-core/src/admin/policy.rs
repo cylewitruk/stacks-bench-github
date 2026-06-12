@@ -13,6 +13,7 @@
 //! repos" is small enough that requiring numeric ids avoids
 //! ambiguity (whose `octo-org` did the operator mean?).
 
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::db::Pool;
@@ -286,7 +287,7 @@ pub async fn add_trigger_policy(
              is_enabled, note)
         VALUES ($1, $2, $3, $4, $5, TRUE, $6)
         RETURNING id, github_installation_id, github_repo_id, trigger_kind,
-                  match_spec, bench_args, is_enabled, note, created_at, updated_at
+                  match_spec, bench_args, is_enabled, note, pinned, pinned_until, created_at, updated_at
         "#,
     )
     .bind(install_id)
@@ -310,10 +311,44 @@ pub async fn disable_trigger_policy(
            SET is_enabled = FALSE, updated_at = NOW()
          WHERE id = $1
      RETURNING id, github_installation_id, github_repo_id, trigger_kind,
-               match_spec, bench_args, is_enabled, note, created_at, updated_at
+               match_spec, bench_args, is_enabled, note, pinned, pinned_until, created_at, updated_at
         "#,
     )
     .bind(trigger_id)
+    .fetch_optional(pool)
+    .await?;
+    row.ok_or(PolicyError::TriggerNotFound(trigger_id))
+}
+
+/// Pin (or unpin) a trigger policy by id (v9, item
+/// `0025-baseline-binary-cache`). When `pinned`, this ref's built
+/// `stacks-bench` binary is kept in the host binary cache **past the LRU size
+/// budget** (so a release ref stays warm); `pinned_until` optionally expires
+/// the pin, after which the entry drops back to the LRU tail. Returns the
+/// updated row, or `TriggerNotFound`.
+pub async fn pin_trigger_policy(
+    pool: &Pool,
+    trigger_id: i64,
+    pinned: bool,
+    pinned_until: Option<DateTime<Utc>>,
+) -> Result<TriggerPolicy, PolicyError> {
+    // An unpinned policy never carries an expiry — drop any stray `pinned_until`
+    // so list output / the resolver never see a `pinned = false, pinned_until =
+    // <ts>` state (Codex).
+    let pinned_until = if pinned { pinned_until } else { None };
+    let row: Option<TriggerPolicy> = sqlx::query_as(
+        r#"
+        UPDATE trigger_policy
+           SET pinned = $2, pinned_until = $3, updated_at = NOW()
+         WHERE id = $1
+     RETURNING id, github_installation_id, github_repo_id, trigger_kind,
+               match_spec, bench_args, is_enabled, note, pinned, pinned_until,
+               created_at, updated_at
+        "#,
+    )
+    .bind(trigger_id)
+    .bind(pinned)
+    .bind(pinned_until)
     .fetch_optional(pool)
     .await?;
     row.ok_or(PolicyError::TriggerNotFound(trigger_id))
@@ -329,7 +364,7 @@ pub async fn list_trigger_policies(
     let rows = sqlx::query_as::<_, TriggerPolicy>(
         r#"
         SELECT id, github_installation_id, github_repo_id, trigger_kind,
-               match_spec, bench_args, is_enabled, note, created_at, updated_at
+               match_spec, bench_args, is_enabled, note, pinned, pinned_until, created_at, updated_at
           FROM trigger_policy
          WHERE ($1::BIGINT IS NULL OR github_installation_id = $1)
            AND ($2::BIGINT IS NULL OR github_repo_id = $2)

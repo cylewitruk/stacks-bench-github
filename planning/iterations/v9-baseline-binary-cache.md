@@ -13,9 +13,22 @@ phase. **Local-only first**; fleet / S3 sharing deferred.
 > ~15–20s "build" phase vs minutes), plus the **`BranchPrefix`** matcher and the
 > **"Reused cached build · …"** Build-row subtext (Phase 1e). The cache is
 > gated behind `[artifacts.binary_cache].enabled` (default path byte-identical).
-> **Remaining:** Phase 2 pin policy (migration + `pinned`/`pinned_until` + warm)
-> and pin-set→eviction wiring. Scope is **local-only**; fleet / S3 sharing rides
-> `0004-worker-fleet`.
+> **Phase 2 (pin *protect*) built, green, lint-clean (uncommitted):**
+> `pinned` / `pinned_until` schema + admin/CLI/API (`policy trigger pin`); the
+> pin-set resolver (`list_pinned_triggers` → read-only `ls-remote` → repo-scoped
+> `PinnedTarget`, tag-peeled, expiry-filtered); recompute on startup + after each
+> job over the driver's **shared cache `Arc`** (`set_pinned_by_commit` with a
+> commit+env eviction guard, then `evict_to_budget`); **all-or-nothing** on a
+> resolution failure (a transient `ls-remote` failure preserves the pin set), with
+> a **kill-and-reap bounded** `ls-remote`.
+>
+> **Warming (pre-*building* a cold pin) is pivoted OUT** to
+> [`0031-reusable-build-jobs`](../design/0031-reusable-build-jobs.md): it needs
+> a first-class **artifact-production build job** (with a `target` axis), not a
+> baseline job bent into a fake-webhook / fake-measurement shape. **v9's final
+> scope is pin-*protect*.** The `0031` groundwork banked during v9 — `PinnedTarget`
+> provenance + `BinaryCache::has_entry_for(commit, env)` — is `0031`'s warm-planner
+> input. Scope is **local-only**; fleet / S3 sharing rides `0004-worker-fleet`.
 >
 > **Implemented (green, lint-clean):** `crates/sbgh-daemon/src/binary_cache.rs`
 > (`BuildFingerprint` + `BinaryCache`: atomic publish, size-bounded LRU,
@@ -200,16 +213,20 @@ reuses the `sha`-verified cached binary; concurrent same-commit jobs never obser
 a partial entry; the cache stays under its size budget via LRU; a miss or
 guard-failure falls back to a clean build.
 
-### Phase 2: Pinned release policy + prefix matching + warm
+### Phase 2: Pinned release policy + prefix matching (pin-protect)
 
-**Scope:** `pinned` / `pinned_until` on `trigger_policy` (migration + admin CLI +
-the `TriggerPolicy` struct); pinned-set resolution (ref → commit → fingerprint),
-pin-protected from LRU; branch **prefix** matching; warm pinned binaries on
-policy-ref push / tag and on daemon start.
+**Scope:** `pinned` / `pinned_until` on `trigger_policy` (migration + admin CLI /
+API + the `TriggerPolicy` struct); branch **prefix** matching; pinned-set
+resolution (ref → current commit via read-only `ls-remote` → fingerprint),
+recomputed on startup + after each job over the driver's shared cache `Arc`,
+**pin-protected** from LRU (commit + env eviction guard); all-or-nothing on a
+resolution failure (preserve pins); leak-safe bounded `ls-remote`.
 
-**Acceptance:** a pinned release ref's binary survives LRU pressure and is
-warm-built on push / start, so a Slack `bench … on <release>` skips the build with
-**no** prior on-demand run.
+**Acceptance:** an already-built pinned release ref's binary **survives LRU
+pressure** past the size budget, so a repeat Slack `bench … on <release>` skips the
+build. *Cold-pin **pre-build** (warming) is deferred to
+[`0031-reusable-build-jobs`](../design/0031-reusable-build-jobs.md)* — a pin
+protects an existing binary; it does not yet build a missing one.
 
 ### Deferred — fleet / S3 sharing
 

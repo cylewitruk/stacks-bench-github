@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::Result;
 use crate::db::policy::PolicyStore;
@@ -105,11 +105,30 @@ impl InMemoryPolicyStore {
                     bench_args: None,
                     is_enabled,
                     note: None,
+                    pinned: false,
+                    pinned_until: None,
                     created_at: now,
                     updated_at: now,
                 },
             );
         id
+    }
+
+    /// Test helper: set the pin flag (+ optional expiry) on a seeded trigger,
+    /// normalizing `pinned_until` to `None` on unpin (mirrors the admin layer).
+    /// No-op if `id` is unknown.
+    pub fn set_trigger_pinned(&self, id: i64, pinned: bool, pinned_until: Option<DateTime<Utc>>) {
+        if let Some(t) = self
+            .state
+            .lock()
+            .unwrap()
+            .triggers
+            .get_mut(&id)
+        {
+            t.pinned = pinned;
+            t.pinned_until = if pinned { pinned_until } else { None };
+            t.updated_at = Utc::now();
+        }
     }
 }
 
@@ -168,6 +187,27 @@ impl PolicyStore for InMemoryPolicyStore {
                     && t.github_repo_id == repo_id
                     && t.trigger_kind == kind
                     && t.is_enabled
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|t| t.id);
+        Ok(rows)
+    }
+
+    async fn list_pinned_triggers(&self) -> Result<Vec<TriggerPolicy>> {
+        // Mirrors the Postgres impl: enabled + pinned triggers whose parent
+        // target_repo_policy is also enabled, across every (install, repo).
+        let state = self.state.lock().unwrap();
+        let mut rows: Vec<TriggerPolicy> = state
+            .triggers
+            .values()
+            .filter(|t| {
+                t.is_enabled
+                    && t.pinned
+                    && state
+                        .target
+                        .get(&(t.github_installation_id, t.github_repo_id))
+                        .is_some_and(|p| p.is_enabled)
             })
             .cloned()
             .collect();
@@ -297,6 +337,8 @@ impl PolicyStore for InMemoryPolicyStore {
             bench_args: bench_args.map(str::to_string),
             is_enabled: true,
             note: note.map(str::to_string),
+            pinned: false,
+            pinned_until: None,
             created_at: now,
             updated_at: now,
         };

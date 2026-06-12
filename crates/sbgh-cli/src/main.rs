@@ -19,7 +19,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use sbgh_api::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest, Client,
-    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, RoleRequest, read_cookie,
+    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, PinTriggerRequest,
+    RoleRequest, TriggerView, read_cookie,
 };
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -325,6 +326,20 @@ enum PolicyTriggerAction {
         install_id: Option<i64>,
         #[arg(long)]
         repo_id: Option<i64>,
+    },
+    /// Pin a trigger's built binary in the host cache (kept past the LRU budget
+    /// so a release ref stays warm). Optionally expire the pin with `--until`.
+    Pin {
+        #[arg(long)]
+        id: i64,
+        /// RFC3339 expiry, e.g. `2026-07-01T00:00:00Z`. Omit for no expiry.
+        #[arg(long, value_name = "RFC3339")]
+        until: Option<String>,
+    },
+    /// Unpin a trigger (clears the pin + any expiry).
+    Unpin {
+        #[arg(long)]
+        id: i64,
     },
 }
 
@@ -709,18 +724,63 @@ async fn run_policy_trigger(client: &Client, action: PolicyTriggerAction) -> any
             }
             for r in rows {
                 println!(
-                    "{:>6} {:>12} {:>12}  {:<12}  {}  spec={}",
+                    "{:>6} {:>12} {:>12}  {:<12}  {}  {}  spec={}",
                     r.id,
                     r.install_id,
                     r.repo_id,
                     r.kind,
                     if r.is_enabled { "ENABLED " } else { "disabled" },
+                    pin_label(&r),
                     r.match_spec,
                 );
             }
         }
+        PolicyTriggerAction::Pin { id, until } => {
+            let row = client
+                .pin_trigger(
+                    id,
+                    &PinTriggerRequest {
+                        pinned: true,
+                        pinned_until: until,
+                    },
+                )
+                .await
+                .context("pin trigger policy")?;
+            println!("pinned: id={} {}", row.id, pin_label(&row));
+        }
+        PolicyTriggerAction::Unpin { id } => {
+            let row = client
+                .pin_trigger(
+                    id,
+                    &PinTriggerRequest {
+                        pinned: false,
+                        pinned_until: None,
+                    },
+                )
+                .await
+                .context("unpin trigger policy")?;
+            println!("unpinned: id={} {}", row.id, pin_label(&row));
+        }
     }
     Ok(())
+}
+
+/// Operator-friendly pin state for a trigger row (v9, item 0025):
+/// `pin=none` / `pin=pinned` / `pin=pinned_until:<rfc3339>` /
+/// `pin=expired:<rfc3339>` (a pin whose `pinned_until` is already in the past —
+/// the resolver treats it as unpinned).
+fn pin_label(r: &TriggerView) -> String {
+    match (r.pinned, r.pinned_until.as_deref()) {
+        (false, _) => "pin=none".to_owned(),
+        (true, None) => "pin=pinned".to_owned(),
+        (true, Some(until)) => {
+            let expired = chrono::DateTime::parse_from_rfc3339(until)
+                .map(|t| t.with_timezone(&chrono::Utc) <= chrono::Utc::now())
+                .unwrap_or(false);
+            let state = if expired { "expired" } else { "pinned_until" };
+            format!("pin={state}:{until}")
+        }
+    }
 }
 
 async fn run_user(client: &Client, action: UserAction) -> anyhow::Result<()> {
@@ -991,6 +1051,38 @@ mod tests {
         let (kind, spec) = build_trigger_spec(Some("develop".into()), None, None, None).unwrap();
         assert_eq!(kind, "branch_push");
         assert_eq!(spec, serde_json::json!({ "kind": "branch_push", "branch_name": "develop" }));
+    }
+
+    fn tv(pinned: bool, pinned_until: Option<&str>) -> TriggerView {
+        TriggerView {
+            id: 1,
+            install_id: 1,
+            repo_id: 1,
+            kind: "branch_push".into(),
+            match_spec: serde_json::json!({}),
+            bench_args: None,
+            is_enabled: true,
+            note: None,
+            pinned,
+            pinned_until: pinned_until.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pin_label_renders_each_state() {
+        assert_eq!(pin_label(&tv(false, None)), "pin=none");
+        // An unpinned row never shows an expiry, even if one lingers.
+        assert_eq!(pin_label(&tv(false, Some("2099-01-01T00:00:00Z"))), "pin=none");
+        assert_eq!(pin_label(&tv(true, None)), "pin=pinned");
+        assert_eq!(
+            pin_label(&tv(true, Some("2099-01-01T00:00:00Z"))),
+            "pin=pinned_until:2099-01-01T00:00:00Z"
+        );
+        // A pin whose expiry is already past renders as expired.
+        assert_eq!(
+            pin_label(&tv(true, Some("2000-01-01T00:00:00Z"))),
+            "pin=expired:2000-01-01T00:00:00Z"
+        );
     }
 
     #[test]

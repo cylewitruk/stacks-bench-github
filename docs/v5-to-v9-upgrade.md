@@ -21,7 +21,9 @@ only for upgrading a host already running v5 (see
 > **opt-in** (`[artifacts.binary_cache].enabled = false` by default), so Part A is
 > a behavior-preserving code bump. Part B (turn the cache on) is optional, needs
 > **no new sudoers and no new secrets**, and is the only place new config appears.
-> Phase 1 has **no database migration**.
+> The one schema change is the Phase-2 pin policy's **additive** migration
+> (`trigger_policy.pinned` / `pinned_until`) — auto-applied at startup, safe on
+> rollback (older binaries never select the new columns).
 
 ## What actually changes
 
@@ -32,7 +34,7 @@ only for upgrading a host already running v5 (see
 | Config | `[slack]` (v5) | **+ a new optional `[artifacts.binary_cache]`; default `enabled = false`** |
 | Secrets | unchanged | **none new** — the cache is local-only |
 | Sudoers / permissions | `losetup` / `mount` / `umount` / `chown` (source-disk provisioning) | **unchanged** — the cache's seed path reuses that exact privileged set |
-| Database | — | **none** (Phase 1 is filesystem-only; the Phase-2 pin policy adds `trigger_policy.pinned` / `pinned_until` later) |
+| Database | — | **one additive migration** — `trigger_policy.pinned` / `pinned_until` (the Phase-2 release-pin policy), auto-applied at startup, idempotent, safe on rollback |
 | Disk | per-job artifacts + archive on `/var/lib/sbgh` | **+ the cache** under `/var/lib/sbgh/binary-cache` (`max_size`, default `10G`) |
 | Host binary / units / containers | `sbgh-daemon`, the compose stack | **unchanged** (daemon-only code; handler/webhook/smee untouched) |
 
@@ -52,7 +54,7 @@ just build                                            # → target/release/sbgh-
 # install-daemon.sh is idempotent — overwrites the binary + restarts the service.
 sudo ./scripts/install-daemon.sh
 journalctl -u sbgh-daemon -f
-#   expect a normal startup: "migrations applied" (no NEW migration this upgrade),
+#   expect a normal startup: "migrations applied" (the additive trigger-pin migration),
 #   "api listening", and the Slack lines as before. No binary-cache line (it's off).
 #   Ctrl-C once it's serving.
 ```
@@ -127,9 +129,19 @@ it never fails a job.
 - **Golden-image changes self-invalidate.** The fingerprint includes the golden
   image's identity, so rebuilding / swapping the image makes prior cached binaries
   miss automatically — no manual purge.
-- **Phase 2 (later).** Pinning release refs (`trigger_policy.pinned` /
-  `pinned_until`, `BranchPrefix` warm-on-push) will ship separately and **will**
-  carry an additive migration; this upgrade does not.
+- **Phase 2 pin policy.** The additive `trigger_policy.pinned` / `pinned_until`
+  migration ships with this upgrade; pin/unpin a release trigger with
+  `sbgh-cli policy trigger pin --id <id> [--until <rfc3339>]` (and see it in
+  `policy trigger list` as `pin=…`). The pin's **effect is active**: the daemon
+  recomputes the pinned set on startup and after each job run — resolving
+  each pinned ref to its current commit via `git ls-remote` (public repos;
+  unauthenticated) — and **protects** those binaries from LRU eviction past the
+  size budget. An expired `pinned_until` drops the binary back to the LRU tail.
+  Resolution is best-effort + all-or-nothing: a transient `ls-remote`/network
+  failure preserves the last pinned set rather than clearing it. *Still to come
+  (2c): pre-**building** a pinned ref's binary even if it's never been
+  benchmarked — today a pin protects an already-built binary, it doesn't yet
+  warm a missing one.*
 
 ## Rollback
 
@@ -138,9 +150,11 @@ it never fails a job.
   `systemctl restart sbgh-daemon`. Every job builds again, exactly as v8. The
   cache dir is harmless to leave or delete. This is the preferred back-out.
 - **From v9 back to v8/v5 (code):** revert and redeploy
-  (`git checkout <tag> && just build && sudo ./scripts/install-daemon.sh`). There
-  is **no Phase-1 migration to unwind**, and the cache dir is just files — leave
-  or delete it. (If you're rolling back past v5 and Slack created `slack_adhoc`
-  jobs, see the [v4-to-v5 enum caveat](./v4-to-v5-upgrade.md#rollback).)
+  (`git checkout <tag> && just build && sudo ./scripts/install-daemon.sh`). The
+  pin migration is **additive** — an older binary never selects
+  `trigger_policy.pinned` / `pinned_until`, so the columns simply sit unused (no
+  unwind needed; Postgres keeps them, harmless). The cache dir is just files —
+  leave or delete it. (If you're rolling back past v5 and Slack created
+  `slack_adhoc` jobs, see the [v4-to-v5 enum caveat](./v4-to-v5-upgrade.md#rollback).)
 
 No DB snapshot is required for this upgrade.

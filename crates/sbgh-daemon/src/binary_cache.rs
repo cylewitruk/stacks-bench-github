@@ -27,8 +27,9 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use sbgh_core::config::DaemonConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -83,6 +84,95 @@ impl BuildFingerprint {
         let json = serde_json::to_vec(self).expect("BuildFingerprint always serializes");
         hex::encode(Sha256::digest(&json))
     }
+
+    /// The build-environment projection — every field except the source
+    /// identity (`commit`, `toolchain`). The pin resolver matches a cached
+    /// entry by commit **and** this environment (v9 Phase 2).
+    pub fn environment(&self) -> CacheEnvironment {
+        CacheEnvironment {
+            profile: self.profile.clone(),
+            features: self.features.clone(),
+            rustflags: self.rustflags.clone(),
+            target_triple: self.target_triple.clone(),
+            recipe_version: self.recipe_version,
+            image_id: self.image_id.clone(),
+            protocol_version: self.protocol_version.clone(),
+        }
+    }
+}
+
+/// The build-environment half of a [`BuildFingerprint`] — every field *except*
+/// the source identity (`commit`, `toolchain`). Pinning matches a cached entry
+/// by commit **and** this environment, so a golden-image / recipe / protocol
+/// change retires stale same-commit pins instead of keeping them warm forever.
+/// Toolchain is deliberately out: same commit implies the same declared
+/// `rust-toolchain` under the Phase 1 reuse contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEnvironment {
+    pub profile: String,
+    pub features: String,
+    pub rustflags: String,
+    pub target_triple: String,
+    pub recipe_version: u32,
+    pub image_id: String,
+    pub protocol_version: String,
+}
+
+impl CacheEnvironment {
+    /// Whether `fp` was built under this environment (source identity aside).
+    fn matches(&self, fp: &BuildFingerprint) -> bool {
+        self.profile == fp.profile
+            && self.features == fp.features
+            && self.rustflags == fp.rustflags
+            && self.target_triple == fp.target_triple
+            && self.recipe_version == fp.recipe_version
+            && self.image_id == fp.image_id
+            && self.protocol_version == fp.protocol_version
+    }
+
+    /// Complete this environment into a full [`BuildFingerprint`] by adding the
+    /// source identity (`commit` + declared `toolchain`). The inverse of
+    /// [`BuildFingerprint::environment`] — so the driver's fingerprint assembly
+    /// and the pin resolver share one definition of the environment and can't
+    /// drift.
+    pub fn fingerprint(&self, commit: String, toolchain: String) -> BuildFingerprint {
+        BuildFingerprint {
+            commit,
+            toolchain,
+            profile: self.profile.clone(),
+            features: self.features.clone(),
+            rustflags: self.rustflags.clone(),
+            target_triple: self.target_triple.clone(),
+            recipe_version: self.recipe_version,
+            image_id: self.image_id.clone(),
+            protocol_version: self.protocol_version.clone(),
+        }
+    }
+}
+
+/// Construct the opt-in binary cache from config, or `None` when
+/// `[artifacts.binary_cache].enabled` is false (the default). Shared by the
+/// driver (publish / get) and the pin resolver (set-pinned / evict) so both
+/// agree on the same on-disk dir + size budget.
+pub fn build_binary_cache(config: &DaemonConfig) -> Option<Arc<BinaryCache>> {
+    config
+        .artifacts
+        .binary_cache
+        .enabled
+        .then(|| {
+            Arc::new(BinaryCache::new(
+                config
+                    .artifacts
+                    .binary_cache
+                    .dir
+                    .clone(),
+                config
+                    .artifacts
+                    .binary_cache
+                    .max_size
+                    .as_bytes(),
+            ))
+        })
 }
 
 /// Per-entry metadata, stored alongside the binary as `meta.json`.
@@ -213,25 +303,25 @@ impl BinaryCache {
         Ok(sha)
     }
 
-    /// Re-evaluate the size budget, treating `pinned_digests` (plus anything
-    /// with `meta.pinned`) as protected. Used by Phase 2 after the
-    /// pinned-ref set changes. No-op when already under budget.
-    pub fn evict_to_budget(&self, pinned_digests: &HashSet<String>) {
+    /// Re-evaluate the size budget, evicting non-pinned entries LRU until the
+    /// store fits. Pinned entries (flagged by [`Self::set_pinned_by_commit`])
+    /// are never evicted. The v9 Phase-2 resolver calls this after re-pinning.
+    /// No-op when already under budget.
+    pub fn evict_to_budget(&self) {
         let _g = self.lock();
-        let protected: Vec<String> = pinned_digests
-            .iter()
-            .cloned()
-            .collect();
-        self.evict_locked(&protected);
+        self.evict_locked(&[]);
     }
 
-    /// Mark exactly `pinned_digests` as pin-protected and clear the flag on
-    /// every other entry — the pinned set follows the refs, so a ref that
-    /// moved off a commit un-pins the old binary. Phase 2 hook.
-    pub fn set_pinned(&self, pinned_digests: &HashSet<String>) {
+    /// Pin exactly the entries whose source `commit` is in `commits` **and**
+    /// whose build environment matches `env`; clear the flag on every other
+    /// entry. The pinned set follows the resolved refs (a ref that moved off a
+    /// commit un-pins the old binary), and the env guard keeps a pin from
+    /// protecting a stale same-commit binary built under a prior image / recipe
+    /// era. The v9 Phase-2 resolver calls this on startup + after each publish.
+    pub fn set_pinned_by_commit(&self, commits: &HashSet<String>, env: &CacheEnvironment) {
         let _g = self.lock();
         for meta in self.scan_entries() {
-            let want = pinned_digests.contains(&meta.digest);
+            let want = commits.contains(&meta.fingerprint.commit) && env.matches(&meta.fingerprint);
             if meta.pinned != want {
                 let mut updated = meta;
                 let dir = self.entry_dir(&updated.digest);
@@ -239,6 +329,19 @@ impl BinaryCache {
                 let _ = write_meta(&dir, &updated);
             }
         }
+    }
+
+    /// Whether a built binary for `commit` under `env` is already cached — the
+    /// warming skip-check (item `0031-reusable-build-jobs`). **Repo-agnostic by
+    /// design**: the cache is keyed by `(commit, build env)`, not repo, so a
+    /// commit's binary counts as present regardless of which repo / fork
+    /// reached it. Same match as [`Self::set_pinned_by_commit`] (commit +
+    /// env), so a stale-env entry for the commit does NOT count as warm.
+    pub fn has_entry_for(&self, commit: &str, env: &CacheEnvironment) -> bool {
+        let _g = self.lock();
+        self.scan_entries()
+            .iter()
+            .any(|m| m.fingerprint.commit == commit && env.matches(&m.fingerprint))
     }
 
     /// Evict non-pinned entries LRU until the store fits the budget. Caller
@@ -561,34 +664,79 @@ mod tests {
     }
 
     #[test]
-    fn set_pinned_follows_the_resolved_set() {
+    fn set_pinned_by_commit_follows_the_resolved_set() {
         let tmp = TempDir::new().unwrap();
         let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
         cache
             .publish(&fp("aaa"), &write_src(&tmp, "a", 64, 1), 10, false)
             .unwrap();
-        let digest = fp("aaa").digest();
+        let env = fp("aaa").environment();
 
-        let mut pinned = HashSet::new();
-        pinned.insert(digest.clone());
-        cache.set_pinned(&pinned);
+        let pinned = HashSet::from(["aaa".to_string()]);
+        cache.set_pinned_by_commit(&pinned, &env);
         assert!(
             cache
                 .get(&fp("aaa"), 11)
                 .unwrap()
                 .meta
                 .pinned,
-            "now pinned"
+            "matching commit + env → pinned"
         );
 
-        cache.set_pinned(&HashSet::new());
+        cache.set_pinned_by_commit(&HashSet::new(), &env);
         assert!(
             !cache
                 .get(&fp("aaa"), 12)
                 .unwrap()
                 .meta
                 .pinned,
-            "un-pinned when ref moves off"
+            "un-pinned when the ref moves off the commit"
+        );
+    }
+
+    #[test]
+    fn set_pinned_by_commit_skips_a_stale_environment() {
+        let tmp = TempDir::new().unwrap();
+        let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
+        // An entry for commit "aaa" built under a *prior* golden image.
+        let mut old = fp("aaa");
+        old.image_id = "ubuntu24-golden-OLD".into();
+        cache
+            .publish(&old, &write_src(&tmp, "a", 64, 1), 10, false)
+            .unwrap();
+
+        // The resolver pins commit "aaa", but under the *current* environment.
+        let current_env = fp("aaa").environment();
+        cache.set_pinned_by_commit(&HashSet::from(["aaa".to_string()]), &current_env);
+
+        assert!(
+            !cache
+                .get(&old, 11)
+                .unwrap()
+                .meta
+                .pinned,
+            "same commit but a prior-image entry must NOT be pinned",
+        );
+    }
+
+    #[test]
+    fn has_entry_for_is_commit_and_env_scoped() {
+        let tmp = TempDir::new().unwrap();
+        let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
+        cache
+            .publish(&fp("aaa"), &write_src(&tmp, "a", 64, 1), 10, false)
+            .unwrap();
+        let env = fp("aaa").environment();
+
+        assert!(cache.has_entry_for("aaa", &env), "the published commit + env is present");
+        assert!(!cache.has_entry_for("bbb", &env), "a different commit is absent");
+
+        // Same commit, prior environment (image) → not 'warm' under current env.
+        let mut prior = fp("aaa");
+        prior.image_id = "ubuntu26".into();
+        assert!(
+            !cache.has_entry_for("aaa", &prior.environment()),
+            "a prior-env entry doesn't count as warm under the current env",
         );
     }
 

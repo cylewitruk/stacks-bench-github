@@ -382,6 +382,33 @@ reply on a Slack results card and/or the portal.
 Distinct from `0020` (which resolves bench *inputs*); this answers over *outputs*.
 Prompt / tooling design is its own design.
 
+### 0031 — Reusable build jobs (artifact production + target axis)
+
+- **id:** `0031-reusable-build-jobs`
+- **status:** `backlog`
+- **priority:** `medium`
+- **relates_to:** `0025-baseline-binary-cache` (consumes its cache; supersedes its
+  *warming*), `0005-task-kind-platform`, `0019-block-validation-recipe`,
+  `0004-worker-fleet`
+- **design:** [design/0031-reusable-build-jobs.md](design/0031-reusable-build-jobs.md)
+- **source:** v9 (`0025`) Phase-2 warming pivot (2026-06)
+
+**Problem:** Warming a pinned release binary has no honest home — the only
+job-creation path is webhook-coupled + measurement-shaped, so warming-as-a-baseline
+forces a fake webhook, a meaningless measurement, and an unwanted GitHub check.
+
+**Scope:** Promote **artifact production** to a first-class **build job class** (a
+`JobKind::Build` value or a sibling `job_class` — design-open) with a **target
+axis** (`stacks-bench` · `stacks-inspect` · …), decoupled from measurement.
+Measurement jobs prefer the cached artifact; **pin warming enqueues build jobs**.
+Introduces the **webhook-optional** job-creation path (also groundwork for the
+reserved `Scheduled`/`Manual` cadences). Builds on shipped `0025` groundwork
+(`pin_resolver::PinnedTarget`, `BinaryCache::has_entry_for`).
+
+**Acceptance:** A pinned release ref with no cached binary is pre-built by a
+daemon-initiated build job (no webhook / measurement / GitHub check) and then
+protected by `0025`'s pin recompute.
+
 *`0022-report-surface-trait` shipped (iteration v7, 2026-06) →
 [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md).*
 

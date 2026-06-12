@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use sbgh_core::config::DaemonConfig;
+use sbgh_core::db::{PolicyStore, RepoStore};
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 use tokio::task::{Id, JoinError, JoinSet};
@@ -28,6 +29,7 @@ use crate::driver::Driver;
 use crate::events::{ChannelSink, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, Shell};
+use crate::pin_manager::PinManager;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 use crate::report::build_report_surface;
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
@@ -84,6 +86,10 @@ struct JobDeps {
     /// startup (the Socket Mode adapter slice injects it via
     /// [`Runner::with_slack`]).
     slack: Option<Arc<dyn SlackClient>>,
+    /// Binary-cache pin recompute (item 0025, v9 Phase 2). `None` unless the
+    /// cache is enabled and [`Runner::with_pin_recompute`] wired it. Recomputed
+    /// on startup + after each job execution, sharing the driver's cache `Arc`.
+    pin_manager: Option<Arc<PinManager>>,
 }
 
 pub struct Runner {
@@ -115,6 +121,7 @@ impl Runner {
                 driver,
                 app_id: Arc::new(OnceCell::new()),
                 slack: None,
+                pin_manager: None,
             },
             max_concurrent,
         }
@@ -129,6 +136,43 @@ impl Runner {
         self
     }
 
+    /// Enable binary-cache pin recompute (item 0025, v9 Phase 2). A no-op
+    /// unless the driver runs a cache: the [`PinManager`] is built from the
+    /// driver's **shared** cache `Arc` (so re-pin / evict and the driver's
+    /// publish coordinate under one mutex) plus the policy / repo stores
+    /// and `shell` for `ls-remote`. Wired by `main`; absent (or cache off),
+    /// pins are never recomputed and the cache behaves exactly as before.
+    pub fn with_pin_recompute(
+        mut self,
+        policy_store: Arc<dyn PolicyStore>,
+        repo_store: Arc<dyn RepoStore>,
+        shell: Arc<dyn Shell>,
+    ) -> Self {
+        if let Some(cache) = self
+            .deps
+            .driver
+            .binary_cache()
+        {
+            self.deps.pin_manager = Some(Arc::new(PinManager::new(
+                cache,
+                policy_store,
+                repo_store,
+                shell,
+                self.deps
+                    .config
+                    .paths
+                    .git_binary
+                    .clone(),
+                self.deps
+                    .config
+                    .vm
+                    .golden_image
+                    .clone(),
+            )));
+        }
+        self
+    }
+
     /// The coordinator loop: sweep stranded claims, fill every free slot from
     /// the queue (until a drain/abort is requested), then wait for a task to
     /// free a slot or the poll tick. Returns when drained/aborted **and** idle,
@@ -137,6 +181,14 @@ impl Runner {
     /// without the loop.
     pub async fn run(self, shutdown: Shutdown) -> anyhow::Result<()> {
         tracing::info!(max_concurrent = self.max_concurrent, "daemon started");
+        // Binary-cache pin recompute on startup (item 0025, v9 Phase 2): re-pin
+        // the resolved set BEFORE claiming/recovering, so the first publish's
+        // eviction protects the right binaries. Best-effort + bounded; shares
+        // the driver's cache `Arc`.
+        if let Some(pm) = &self.deps.pin_manager {
+            pm.recompute(chrono::Utc::now())
+                .await;
+        }
         let lease = chrono::Duration::minutes(CLAIM_LEASE_MINUTES);
         // The job tasks get child tokens of `abort`, so an abort cancels them
         // all at once.
@@ -802,6 +854,17 @@ impl JobDeps {
         // the recipe (emitting progress to the channel), and sends the terminal.
         // On `token` cancellation it cleans up + reports aborted.
         run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+
+        // After the job's execution (which may have published a freshly-built
+        // binary), recompute the pinned set so a newly-built pinned ref is
+        // protected from the next eviction (item 0025, v9 Phase 2). Best-effort
+        // + bounded; the shared cache `Arc` makes this safe alongside concurrent
+        // jobs' publishes (one mutex). Idempotent — a cache-hit/failed job that
+        // published nothing simply re-affirms the set.
+        if let Some(pm) = &self.pin_manager {
+            pm.recompute(chrono::Utc::now())
+                .await;
+        }
 
         // Surface the reporter's result (setup-level failures back off the loop;
         // a panic in the reporter task becomes an iteration error).
@@ -1689,6 +1752,7 @@ mod tests {
                 driver,
                 app_id: app_id.clone(),
                 slack: None,
+                pin_manager: None,
             };
             handles.push(tokio::spawn(deps.run(job, None, CancellationToken::new())));
             sources.push(source);
@@ -1863,6 +1927,7 @@ mod tests {
             driver,
             app_id: Arc::new(OnceCell::new()),
             slack: None,
+            pin_manager: None,
         };
         let mut coord = Coordinator::new(deps, 2, CancellationToken::new()); // max_concurrent = 2
         let never_draining = CancellationToken::new();
@@ -2180,6 +2245,7 @@ mod tests {
             driver,
             app_id: Arc::new(OnceCell::new()),
             slack: None,
+            pin_manager: None,
         };
         Coordinator::new(deps, 1, CancellationToken::new())
     }
@@ -2401,6 +2467,7 @@ mod tests {
             driver,
             app_id: Arc::new(OnceCell::new()),
             slack: Some(slack),
+            pin_manager: None,
         };
         Coordinator::new(deps, 1, CancellationToken::new())
     }

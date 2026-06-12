@@ -48,6 +48,7 @@ need editing when an item's status or location changes.
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
+| `0031-reusable-build-jobs` | Reusable build jobs (artifact + target axis) | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 

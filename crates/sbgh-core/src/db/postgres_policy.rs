@@ -83,7 +83,7 @@ impl PolicyStore for PostgresPolicyStore {
             r#"
             SELECT t.id, t.github_installation_id, t.github_repo_id, t.trigger_kind,
                    t.match_spec, t.bench_args, t.is_enabled, t.note,
-                   t.created_at, t.updated_at
+                   t.pinned, t.pinned_until, t.created_at, t.updated_at
               FROM trigger_policy t
               JOIN target_repo_policy p
                 ON p.github_installation_id = t.github_installation_id
@@ -99,6 +99,30 @@ impl PolicyStore for PostgresPolicyStore {
         .bind(install_id)
         .bind(repo_id)
         .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_pinned_triggers(&self) -> Result<Vec<TriggerPolicy>> {
+        // Same parent-target-enabled guard as `list_enabled_triggers`, but
+        // global (every install/repo) and filtered to pinned rows. Expiry is
+        // applied by the resolver, not here.
+        let rows = sqlx::query_as::<_, TriggerPolicy>(
+            r#"
+            SELECT t.id, t.github_installation_id, t.github_repo_id, t.trigger_kind,
+                   t.match_spec, t.bench_args, t.is_enabled, t.note,
+                   t.pinned, t.pinned_until, t.created_at, t.updated_at
+              FROM trigger_policy t
+              JOIN target_repo_policy p
+                ON p.github_installation_id = t.github_installation_id
+               AND p.github_repo_id = t.github_repo_id
+             WHERE t.is_enabled = TRUE
+               AND t.pinned = TRUE
+               AND p.is_enabled = TRUE
+          ORDER BY t.id
+            "#,
+        )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -218,7 +242,7 @@ impl PolicyStore for PostgresPolicyStore {
             VALUES ($1, $2, $3, $4, $5, TRUE, $6)
             RETURNING id, github_installation_id, github_repo_id, trigger_kind,
                       match_spec, bench_args, is_enabled, note,
-                      created_at, updated_at
+                      pinned, pinned_until, created_at, updated_at
             "#,
         )
         .bind(install_id)
@@ -240,7 +264,7 @@ impl PolicyStore for PostgresPolicyStore {
              WHERE id = $1
          RETURNING id, github_installation_id, github_repo_id, trigger_kind,
                    match_spec, bench_args, is_enabled, note,
-                   created_at, updated_at
+                   pinned, pinned_until, created_at, updated_at
             "#,
         )
         .bind(trigger_id)
@@ -254,7 +278,7 @@ impl PolicyStore for PostgresPolicyStore {
             r#"
             SELECT id, github_installation_id, github_repo_id, trigger_kind,
                    match_spec, bench_args, is_enabled, note,
-                   created_at, updated_at
+                   pinned, pinned_until, created_at, updated_at
               FROM trigger_policy
              WHERE github_installation_id = $1
                AND github_repo_id = $2

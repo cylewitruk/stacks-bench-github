@@ -22,6 +22,28 @@ pub struct CommandSpec {
 #[async_trait]
 pub trait Shell: Send + Sync {
     async fn run(&self, cmd: CommandSpec) -> anyhow::Result<Output>;
+
+    /// Like [`run`](Shell::run), but bounds the command with `timeout` and
+    /// **kills + reaps the child on timeout** so a wedged process can't leak.
+    /// For callers where the slot / boot is time-bounded and a hung
+    /// subprocess must not accumulate — the pin manager's `git ls-remote` (item
+    /// 0025). The default delegates to `run` (test fakes complete promptly, so
+    /// the bound is moot); [`SystemShell`] overrides it with the real timeout +
+    /// kill.
+    ///
+    /// **Scope:** the bound covers the spawn + `wait` phase, **not** an
+    /// optional `stdin` write. That's fine for stdinless commands (the
+    /// `ls-remote` use case); a large-`stdin` command could still block on
+    /// the write before the timeout applies — bound the whole write+wait
+    /// yourself for those.
+    async fn run_bounded(
+        &self,
+        cmd: CommandSpec,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Output> {
+        let _ = timeout;
+        self.run(cmd).await
+    }
 }
 
 // ─────────────────────────── helpers used by provisioners
@@ -73,14 +95,13 @@ impl SystemShell {
     pub fn new(sudo: impl Into<std::path::PathBuf>) -> Self {
         Self { sudo: sudo.into() }
     }
-}
 
-#[async_trait]
-impl Shell for SystemShell {
-    async fn run(&self, cmd: CommandSpec) -> anyhow::Result<Output> {
+    /// Build (but don't spawn) the `tokio` command for `cmd` — privilege
+    /// wrapper + piped stdio. Shared by [`run`](Shell::run) and
+    /// [`run_bounded`](Shell::run_bounded).
+    fn build_command(&self, cmd: &CommandSpec) -> tokio::process::Command {
         use std::process::Stdio;
 
-        use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
 
         let mut command = if cmd.privileged {
@@ -95,11 +116,18 @@ impl Shell for SystemShell {
             c.args(&cmd.args);
             c
         };
-
         command
             .stdin(if cmd.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command
+    }
+}
+
+#[async_trait]
+impl Shell for SystemShell {
+    async fn run(&self, cmd: CommandSpec) -> anyhow::Result<Output> {
+        use tokio::io::AsyncWriteExt;
 
         // TRACE rather than DEBUG: the daemon polls `virsh
         // domstate` every few seconds for the duration of every job,
@@ -107,17 +135,86 @@ impl Shell for SystemShell {
         // phase-change / heartbeat / failure lines. Re-enable with
         // RUST_LOG=trace if you need the per-invocation detail.
         tracing::trace!(?cmd, "executing");
-        let mut child = command.spawn()?;
-        if let Some(input) = cmd.stdin
+        let mut child = self
+            .build_command(&cmd)
+            .spawn()?;
+        if let Some(input) = &cmd.stdin
             && let Some(mut sin) = child.stdin.take()
         {
-            sin.write_all(&input).await?;
+            sin.write_all(input).await?;
             sin.shutdown().await?;
         }
         let output = child
             .wait_with_output()
             .await?;
         Ok(output)
+    }
+
+    async fn run_bounded(
+        &self,
+        cmd: CommandSpec,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Output> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tracing::trace!(?cmd, ?timeout, "executing (bounded)");
+        let mut command = self.build_command(&cmd);
+        // Backstop only: if this whole future is dropped before we reap (e.g. an
+        // *outer* timeout), kill the child rather than leak it. The inner
+        // timeout below reaps explicitly.
+        command.kill_on_drop(true);
+        let mut child = command.spawn()?;
+        if let Some(input) = &cmd.stdin
+            && let Some(mut sin) = child.stdin.take()
+        {
+            sin.write_all(input).await?;
+            sin.shutdown().await?;
+        }
+        // Own the pipes so `child.wait()` can borrow `&mut child` while we drain
+        // stdout/stderr **concurrently** — draining sequentially could deadlock
+        // on a full pipe buffer. (`wait_with_output` does this internally but
+        // consumes the child, leaving nothing to kill on timeout.)
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let collect = async {
+            let read_out = async {
+                match out_pipe.as_mut() {
+                    Some(p) => {
+                        p.read_to_end(&mut stdout)
+                            .await
+                    }
+                    None => Ok(0),
+                }
+            };
+            let read_err = async {
+                match err_pipe.as_mut() {
+                    Some(p) => {
+                        p.read_to_end(&mut stderr)
+                            .await
+                    }
+                    None => Ok(0),
+                }
+            };
+            let (ro, re, status) = tokio::join!(read_out, read_err, child.wait());
+            ro?;
+            re?;
+            status
+        };
+        match tokio::time::timeout(timeout, collect).await {
+            Ok(status) => Ok(Output {
+                status: status?,
+                stdout,
+                stderr,
+            }),
+            Err(_) => {
+                // Explicit SIGKILL **and reap** so no zombie/leaked child
+                // outlives the call (the `kill_on_drop` backstop reaps lazily).
+                let _ = child.kill().await;
+                anyhow::bail!("`{}` timed out after {timeout:?} (process killed)", cmd.program)
+            }
+        }
     }
 }
 
@@ -218,5 +315,43 @@ pub mod test_support {
                 stderr: reply.stderr,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// `run_bounded` returns the output normally when the command finishes
+    /// inside the bound.
+    #[tokio::test]
+    async fn run_bounded_completes_a_fast_command() {
+        let shell = SystemShell::new("/usr/bin/sudo");
+        let out = shell
+            .run_bounded(spec(Path::new("/bin/echo"), &["hi"]), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
+    /// A command that outlives the bound errors (timed out). The child is
+    /// killed via `kill_on_drop` — the bound is what `ls-remote` relies on so a
+    /// wedged remote can't hold the runner slot or leak a git process.
+    #[tokio::test]
+    async fn run_bounded_times_out_and_errors_on_a_slow_command() {
+        let shell = SystemShell::new("/usr/bin/sudo");
+        let err = shell
+            .run_bounded(spec(Path::new("/bin/sleep"), &["5"]), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("timed out"),
+            "got: {err}"
+        );
     }
 }

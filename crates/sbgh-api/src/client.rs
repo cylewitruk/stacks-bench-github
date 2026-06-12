@@ -4,9 +4,9 @@ use std::time::Duration;
 use crate::dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
     DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, GrantRoleResult,
-    HealthResponse, InstallationView, InstallerView, JobView, PolicyView, RepoRootView,
-    ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse,
-    WebhookSummary, WhoamiResponse,
+    HealthResponse, InstallationView, InstallerView, JobView, PinTriggerRequest, PolicyView,
+    RepoRootView, ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView,
+    WebhookSubmitResponse, WebhookSummary, WhoamiResponse,
 };
 use crate::error::ApiError;
 
@@ -225,6 +225,14 @@ impl Client {
     }
     pub async fn disable_trigger(&self, id: i64) -> Result<TriggerView, ClientError> {
         self.post_json(&format!("/api/policies/triggers/{id}/disable"), &())
+            .await
+    }
+    pub async fn pin_trigger(
+        &self,
+        id: i64,
+        req: &PinTriggerRequest,
+    ) -> Result<TriggerView, ClientError> {
+        self.post_json(&format!("/api/policies/triggers/{id}/pin"), req)
             .await
     }
 

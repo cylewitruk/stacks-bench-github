@@ -83,6 +83,7 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/policies/source/disable", post(policies::disable_source))
             .route("/api/policies/triggers", post(policies::add_trigger))
             .route("/api/policies/triggers/{id}/disable", post(policies::disable_trigger))
+            .route("/api/policies/triggers/{id}/pin", post(policies::pin_trigger))
             .route("/api/roles", post(users::grant))
             .route("/api/roles/revoke", post(users::revoke)),
         tokens,

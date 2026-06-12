@@ -2011,7 +2011,12 @@ impl EventHandler for CreateHandler {
 /// Compare a `branch_push` match_spec JSON against the inbound branch
 /// name. Returns true on exact match; ignores unknown / wrong-kind
 /// match_specs (the trigger_kind column already disambiguates).
-fn matches_branch_push(match_spec: &serde_json::Value, branch: &str) -> bool {
+///
+/// Also reused by the binary-cache pin resolver ([`crate::pin_resolver`]) so
+/// the pinned-ref set is selected by the *exact same* predicate that fires the
+/// trigger — a ref the daemon would auto-bench is the ref whose binary gets
+/// pinned.
+pub fn matches_branch_push(match_spec: &serde_json::Value, branch: &str) -> bool {
     match serde_json::from_value::<TriggerMatchSpec>(match_spec.clone()) {
         Ok(TriggerMatchSpec::BranchPush { branch_name }) => branch_name == branch,
         // Plain prefix (item 0025, v9): release-branch families like
@@ -2024,7 +2029,10 @@ fn matches_branch_push(match_spec: &serde_json::Value, branch: &str) -> bool {
 /// Compare a `tag_created` match_spec JSON's regex against the inbound
 /// tag name. Returns `Err(msg)` on regex parse failure so the caller
 /// can log + skip the trigger without blowing up the whole batch.
-fn matches_tag_created(match_spec: &serde_json::Value, tag: &str) -> Result<bool, String> {
+///
+/// Reused by the binary-cache pin resolver ([`crate::pin_resolver`]) — see
+/// [`matches_branch_push`].
+pub fn matches_tag_created(match_spec: &serde_json::Value, tag: &str) -> Result<bool, String> {
     match serde_json::from_value::<TriggerMatchSpec>(match_spec.clone()) {
         Ok(TriggerMatchSpec::TagCreated { tag_pattern }) => regex::Regex::new(&tag_pattern)
             .map(|re| re.is_match(tag))

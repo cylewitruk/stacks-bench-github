@@ -14,8 +14,8 @@ pub use client::{Client, ClientError, read_cookie};
 pub use dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
     DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, GrantRoleResult,
-    HealthResponse, InstallationView, InstallerView, JobView, PolicyView, RepoRootView,
-    ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse,
-    WebhookSummary, WhoamiResponse,
+    HealthResponse, InstallationView, InstallerView, JobView, PinTriggerRequest, PolicyView,
+    RepoRootView, ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView,
+    WebhookSubmitResponse, WebhookSummary, WhoamiResponse,
 };
 pub use error::{ApiError, ErrorBody};

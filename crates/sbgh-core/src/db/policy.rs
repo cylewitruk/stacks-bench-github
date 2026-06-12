@@ -63,6 +63,15 @@ pub trait PolicyStore: Send + Sync + 'static {
         kind: TriggerKind,
     ) -> Result<Vec<TriggerPolicy>>;
 
+    /// List every enabled, **pinned** trigger_policy row across all (install,
+    /// repo) whose parent target_repo_policy is also enabled. The v9 binary
+    /// cache pin resolver (item 0025) calls this to compute the protected set.
+    /// `pinned_until` is NOT filtered here — the resolver applies expiry
+    /// against the current time, so an expired pin is treated as unpinned
+    /// without a DB write (and the operator view can still surface it as
+    /// `expired`).
+    async fn list_pinned_triggers(&self) -> Result<Vec<TriggerPolicy>>;
+
     // ─── CLI write paths ───────────────────────────────────────────────
 
     /// Upsert a `target_repo_policy` row with `is_enabled = TRUE`.

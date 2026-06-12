@@ -14,9 +14,12 @@
 //! split (driver-owned generic shell vs. a task-supplied in-VM script) is
 //! deferred to when a second task kind needs a different script (roadmap-v6).
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use crate::binary_cache::BinaryCache;
 use crate::events::EventSink;
 use crate::recipe::TaskContext;
 
@@ -86,4 +89,13 @@ pub trait Driver: Send + Sync {
     /// handle. Returns `false` if cleanup couldn't be verified complete, so the
     /// caller leaves the row `running` to retry on the next boot.
     async fn cleanup_by_job_id(&self, job_id: &str) -> bool;
+
+    /// The backend's binary cache, if it runs one — shared as an `Arc` so the
+    /// pin manager re-pins / evicts under the **same** mutex the driver
+    /// publishes under (item 0025, v9 Phase 2). Default `None` for backends
+    /// without a cache; the runner builds its `PinManager` only when this is
+    /// `Some`.
+    fn binary_cache(&self) -> Option<Arc<BinaryCache>> {
+        None
+    }
 }

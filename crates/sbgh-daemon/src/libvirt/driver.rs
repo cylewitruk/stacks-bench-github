@@ -26,7 +26,7 @@ use sbgh_core::config::DaemonConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::artifact_store::{artifact_key, build_store_or_local};
-use crate::binary_cache::{self, BinaryCache, BuildFingerprint};
+use crate::binary_cache::{self, BinaryCache, BuildFingerprint, CacheEnvironment};
 use crate::driver::{Driver, DriverOutcome, DriverStatus, Placement, TaskSpec};
 use crate::events::{EventSink, PhaseLabel};
 use crate::libvirt::boot::BootDisk;
@@ -100,10 +100,22 @@ async fn assemble_fingerprint(
     let toolchain_toml =
         show_repo_file(shell, git_binary, mirror, commit, "rust-toolchain.toml").await?;
     let toolchain = binary_cache::toolchain_channel(&toolchain_toml)?;
+    let env = current_cache_environment(golden_image)?;
+    Some(env.fingerprint(commit.to_string(), toolchain))
+}
+
+/// The daemon's **current** build environment — the [`CacheEnvironment`] half
+/// of a fingerprint (everything but the per-run `commit` + `toolchain`): the
+/// invariant build invocation (profile / triple / recipe / protocol) plus the
+/// golden-image identity. `None` when the golden image is unreadable.
+///
+/// Single source of truth for the env, shared by [`assemble_fingerprint`] (the
+/// build path) and the pin resolver (`set_pinned_by_commit`), so a cached
+/// entry's stored env and the daemon's current env are compared on identical
+/// terms.
+pub fn current_cache_environment(golden_image: &Path) -> Option<CacheEnvironment> {
     let image_id = binary_cache::image_proxy_id(golden_image).ok()?;
-    Some(BuildFingerprint {
-        commit: commit.to_string(),
-        toolchain,
+    Some(CacheEnvironment {
         profile: BUILD_PROFILE.to_string(),
         features: String::new(),
         rustflags: String::new(),
@@ -225,24 +237,7 @@ pub struct LibvirtDriver {
 
 impl LibvirtDriver {
     pub fn new(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Self {
-        let binary_cache = config
-            .artifacts
-            .binary_cache
-            .enabled
-            .then(|| {
-                Arc::new(BinaryCache::new(
-                    config
-                        .artifacts
-                        .binary_cache
-                        .dir
-                        .clone(),
-                    config
-                        .artifacts
-                        .binary_cache
-                        .max_size
-                        .as_bytes(),
-                ))
-            });
+        let binary_cache = binary_cache::build_binary_cache(&config);
         Self { config, shell, binary_cache }
     }
 
@@ -1322,6 +1317,13 @@ impl Driver for LibvirtDriver {
         // in path resolution, so this is unambiguously the inherent impl — not a
         // recursive trait call.
         LibvirtDriver::cleanup_by_job_id(self, job_id).await
+    }
+
+    /// Share this driver's binary-cache `Arc` (when the cache is enabled) so
+    /// the runner's pin manager re-pins / evicts under the same mutex (item
+    /// 0025).
+    fn binary_cache(&self) -> Option<Arc<BinaryCache>> {
+        self.binary_cache.clone()
     }
 }
 

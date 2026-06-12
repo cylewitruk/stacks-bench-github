@@ -27,6 +27,8 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 serde_json.workspace = true
+# v9 (item 0025): flag an expired `pinned_until` in `policy trigger list`.
+chrono.workspace = true
 
 [dev-dependencies]
 # Re-imports sbgh-core with the `testing` feature so integration tests

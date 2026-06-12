@@ -244,6 +244,180 @@ async fn add_then_list_enabled_triggers_round_trip() {
     assert!(rows.is_empty(), "disabled trigger must NOT appear in enabled list");
 }
 
+/// v9 (item 0025): `admin::pin_trigger_policy` round-trips the pin flag +
+/// optional expiry, and the pinned state surfaces through the processor's
+/// `list_enabled_triggers` read path. (Also exercises a `BranchPrefix`
+/// trigger.)
+#[tokio::test]
+async fn pin_trigger_policy_round_trip() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresPolicyStore::new(pool.clone());
+    store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+
+    let trigger = store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPrefix {
+                prefix: "sb-integration/3.".into(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // A new trigger is unpinned by default.
+    assert!(!trigger.pinned, "new trigger unpinned by default");
+    assert!(trigger.pinned_until.is_none());
+
+    // Pin with an expiry (reuse a real timestamp to avoid a chrono dep here).
+    let until = trigger.created_at;
+    let pinned = sbgh_core::admin::pin_trigger_policy(&pool, trigger.id, true, Some(until))
+        .await
+        .unwrap();
+    assert!(pinned.pinned);
+    assert_eq!(pinned.pinned_until, Some(until));
+
+    // The pin surfaces on the processor's read path too.
+    let listed = store
+        .list_enabled_triggers(100, 10, TriggerKind::BranchPush)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].pinned, "pinned flag visible to list_enabled_triggers");
+    assert_eq!(listed[0].pinned_until, Some(until));
+
+    // Unpin clears both.
+    let unpinned = sbgh_core::admin::pin_trigger_policy(&pool, trigger.id, false, None)
+        .await
+        .unwrap();
+    assert!(!unpinned.pinned);
+    assert!(
+        unpinned
+            .pinned_until
+            .is_none()
+    );
+
+    // Unpinning with a stray expiry normalizes pinned_until to NULL (no orphan
+    // `pinned = false, pinned_until = <ts>` state).
+    let renorm = sbgh_core::admin::pin_trigger_policy(&pool, trigger.id, false, Some(until))
+        .await
+        .unwrap();
+    assert!(!renorm.pinned);
+    assert!(renorm.pinned_until.is_none(), "unpin clears pinned_until even when one is passed",);
+
+    // Pinning a missing id errors.
+    assert!(
+        sbgh_core::admin::pin_trigger_policy(&pool, 999_999, true, None)
+            .await
+            .is_err()
+    );
+}
+
+/// v9 (item 0025): `list_pinned_triggers` returns enabled + pinned triggers
+/// across **all** installs whose parent target is enabled, and excludes the
+/// three non-qualifying shapes — unpinned, disabled-trigger, and
+/// disabled-parent. Expiry is NOT filtered here (the resolver applies it).
+#[tokio::test]
+async fn list_pinned_triggers_filters_to_enabled_pinned_with_enabled_parent() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    seed_install_repo(&pool, 200, 10).await;
+    seed_install_repo(&pool, 300, 10).await;
+    let store = PostgresPolicyStore::new(pool.clone());
+    for install in [100, 200, 300] {
+        store
+            .upsert_target_policy(install, 10, None)
+            .await
+            .unwrap();
+    }
+
+    // (a) install 100, enabled parent, pinned → the only row that should surface.
+    let surface = store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPrefix {
+                prefix: "sb-integration/3.".into(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    sbgh_core::admin::pin_trigger_policy(&pool, surface.id, true, None)
+        .await
+        .unwrap();
+
+    // (b) install 100, left unpinned → excluded.
+    store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // (c) install 200, pinned then disabled → excluded (trigger disabled).
+    let disabled = store
+        .add_trigger_policy(
+            200,
+            10,
+            TriggerKind::TagCreated,
+            &TriggerMatchSpec::TagCreated { tag_pattern: r"^3\.".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    sbgh_core::admin::pin_trigger_policy(&pool, disabled.id, true, None)
+        .await
+        .unwrap();
+    store
+        .disable_trigger_policy(disabled.id)
+        .await
+        .unwrap();
+
+    // (d) install 300, pinned + enabled trigger but parent target disabled →
+    // excluded.
+    let orphan = store
+        .add_trigger_policy(
+            300,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "main".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    sbgh_core::admin::pin_trigger_policy(&pool, orphan.id, true, None)
+        .await
+        .unwrap();
+    store
+        .disable_target_policy(300, 10)
+        .await
+        .unwrap();
+
+    let pinned = store
+        .list_pinned_triggers()
+        .await
+        .unwrap();
+    assert_eq!(pinned.len(), 1, "only the enabled+pinned+enabled-parent trigger surfaces");
+    assert_eq!(pinned[0].id, surface.id);
+    assert!(pinned[0].pinned);
+}
+
 #[tokio::test]
 async fn list_enabled_triggers_excludes_triggers_whose_parent_target_is_disabled() {
     // Slice 5 second-pass review fix: even with `trigger_policy.is_enabled

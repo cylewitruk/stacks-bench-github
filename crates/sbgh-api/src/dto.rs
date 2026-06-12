@@ -90,6 +90,9 @@ pub struct TriggerView {
     pub bench_args: Option<String>,
     pub is_enabled: bool,
     pub note: Option<String>,
+    /// v9 (item 0025): binary-cache pin. `pinned_until` is RFC3339 when set.
+    pub pinned: bool,
+    pub pinned_until: Option<String>,
 }
 
 /// A `github_user` row.
@@ -223,6 +226,18 @@ pub struct AddTriggerRequest {
     pub bench_args: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// Set/clear the binary-cache pin on a trigger policy (v9, item 0025). When
+/// `pinned`, this ref's built `stacks-bench` binary is kept past the cache LRU
+/// budget. `pinned_until` is an optional RFC3339 expiry (e.g.
+/// `2026-07-01T00:00:00Z`), ignored when `pinned` is false.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinTriggerRequest {
+    pub pinned: bool,
+    #[serde(default)]
+    pub pinned_until: Option<String>,
 }
 
 /// Exactly one of `login` / `user_id`. `repo` narrows the grant; omit for

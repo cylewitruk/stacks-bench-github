@@ -8,6 +8,8 @@ mod driver;
 mod events;
 mod job_source;
 mod libvirt;
+mod pin_manager;
+mod pin_resolver;
 mod recipe;
 mod report;
 mod reporter;
@@ -88,6 +90,10 @@ async fn main() -> anyhow::Result<()> {
     let installation_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
     let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
     let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
+    // Captured before these stores are moved into handlers/sources below — the
+    // startup binary-cache pin recompute (item 0025, v9) reuses them.
+    let pin_policy_store = policy_store.clone();
+    let pin_repo_store = repo_store.clone();
     let user_store = Arc::new(PostgresUserStore::new(pool.clone()));
     let pull_request_store = Arc::new(PostgresPullRequestStore::new(pool.clone()));
     // The job store. The three job-creating handlers (issue_comment
@@ -235,10 +241,15 @@ async fn main() -> anyhow::Result<()> {
 
     // The reporter posts Slack ad-hoc results through the same Web API client
     // the socket connector uses (one bot token, one client).
-    let mut runner = Runner::new(config, runnable_jobs, gh, shell);
+    let mut runner = Runner::new(config, runnable_jobs, gh, shell.clone());
     if let Some((_, _, _, web_client)) = &slack_runtime {
         runner = runner.with_slack(web_client.clone());
     }
+    // Binary-cache pin recompute (item 0025, v9 Phase 2): the runner recomputes
+    // pins on startup (before claiming) + after each completed job, sharing the
+    // driver's cache `Arc` so publish / re-pin / evict coordinate under one
+    // mutex. A no-op when the cache is disabled.
+    runner = runner.with_pin_recompute(pin_policy_store, pin_repo_store, shell);
 
     // Lifecycle shutdown (roadmap-v5 Phase 4B): a `SIGINT` drains (stop
     // claiming, finish in-flight), a second `SIGINT` or `SIGTERM` aborts. The

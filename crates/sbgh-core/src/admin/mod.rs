@@ -21,7 +21,7 @@ pub use installer::{
 pub use policy::{
     PolicyError, add_trigger_policy, allow_source_policy, allow_target_policy,
     disable_source_policy, disable_target_policy, disable_trigger_policy, list_source_policies,
-    list_target_policies, list_trigger_policies,
+    list_target_policies, list_trigger_policies, pin_trigger_policy,
 };
 pub use repo::{
     AllowedRepoRoot, RepoError, allow_repo_root, disable_repo_root, disable_repo_root_by_id,
