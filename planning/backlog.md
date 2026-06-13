@@ -1,10 +1,11 @@
 # Backlog
 
 **Unscheduled items only** (`backlog` / `candidate` / `parked`). Once an item is
-selected it **moves** to an iteration; once terminal it moves to `archive/` — see
-the single-home rule in the [README](README.md#item-ids). The complete registry
-of every item (all statuses, incl. shipped/in-flight) is [index.md](index.md);
-keep entries here compact and push worked-through detail to `design/`.
+selected it **moves** to an iteration; once terminal it moves to `archive/` —
+see the single-home rule in the [README](README.md#item-ids). The complete
+registry of every item (all statuses, incl. shipped/in-flight) is
+[index.md](index.md); keep entries here compact and push worked-through detail
+to `design/`.
 
 *`0001-artifact-store` shipped (iteration v4, 2026-06) →
 [archive/completed/0001-artifact-store.md](archive/completed/0001-artifact-store.md).*
@@ -16,23 +17,6 @@ Its live-timeline follow-on `0021-slack-live-timeline` shipped (iteration v6) �
 
 ## Backlog (unscheduled)
 
-### 0003 — Results portal (web UI + GitHub login)
-
-- **id:** `0003-results-portal`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0001-artifact-store`
-- **review:** `Codex signed off` (design)
-- **design:** [design/0003-results-portal.md](design/0003-results-portal.md)
-
-**Problem:** No way to browse runs, watch the queue, or deep-inspect a run's profile.
-
-**Scope:** A permissioned portal (GitHub OAuth → existing roles, visibility-scoped)
-that's an **API client of the orchestrator** (never a second DB client), reusing the
-upstream `stacks-bench` explorer version-matched + proxied.
-
-**Acceptance:** A logged-in user browses runs they may see and opens a profiler trace.
-
 ### 0004 — Distributed worker fleet (`remote-daemon`)
 
 - **id:** `0004-worker-fleet`
@@ -42,15 +26,15 @@ upstream `stacks-bench` explorer version-matched + proxied.
 - **review:** `Codex signed off` (design)
 - **design:** [design/0004-worker-fleet.md](design/0004-worker-fleet.md)
 
-**Problem:** A single host caps concurrency and can't serve heterogeneous hardware
-(pinned bench boxes vs. big-local-NVMe block-val boxes).
+**Problem:** A single host caps concurrency and can't serve heterogeneous
+hardware (pinned bench boxes vs. big-local-NVMe block-val boxes).
 
-**Scope:** Split `sbgh-daemon` into orchestrator + `sbgh-worker` (shared `sbgh-exec`);
-thin pull-based worker API; capability matching; per-`measurement_profile` baseline
-trust.
+**Scope:** Split `sbgh-daemon` into orchestrator + `sbgh-worker` (shared
+`sbgh-exec`); thin pull-based worker API; capability matching;
+per-`measurement_profile` baseline trust.
 
-**Acceptance:** A remote worker runs a bench end-to-end; orchestrator stays the sole
-DB client.
+**Acceptance:** A remote worker runs a bench end-to-end; orchestrator stays the
+sole DB client.
 
 *`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
 model: source / intent / task_kind / build_target / derived report; build-only
@@ -64,15 +48,16 @@ proven) — as-built record in
 - **priority:** `medium`
 - **depends_on:** `0005-task-kind-platform`
 - **review:** `Codex signed off` (design sketch)
-- **design:** [design/0019-block-validation-recipe.md](design/0019-block-validation-recipe.md)
+- **design:**
+  [design/0019-block-validation-recipe.md](design/0019-block-validation-recipe.md)
   *(from roadmap-v6 Phase 3 + block-validation-taskspec)*
 
-**Problem:** Block validation is the planned second task kind — the proof that the
-platform costs ~one crate per kind.
+**Problem:** Block validation is the planned second task kind — the proof that
+the platform costs ~one crate per kind.
 
-**Scope:** A `BlockValidationRecipe` with a probe-driven, K-shard fan-out over CoW
-chainstate workspaces; terminal semantics (invalid-blocks = red check, not infra
-failure).
+**Scope:** A `BlockValidationRecipe` with a probe-driven, K-shard fan-out over
+CoW chainstate workspaces; terminal semantics (invalid-blocks = red check, not
+infra failure).
 
 **Acceptance:** Block validation lands on top of `0005` with no engine edits.
 
@@ -83,15 +68,39 @@ failure).
 - **priority:** `medium`
 - **source:** `archive/completed/0007` (v4 Phase 3) + `0008` (v5 Phase 5.3)
 
-**Problem:** A still-DB-queued job has no reporter, so there's no pre-`/benchmark`
-check or pre-claim position visibility; a denied source leaves no `skipped`
-breadcrumb.
+**Problem:** A still-DB-queued job has no reporter, so there's no
+pre-`/benchmark` check or pre-claim position visibility; a denied source leaves
+no `skipped` breadcrumb.
 
 **Scope:** Policy-gated placeholder/`skipped` checks on PR sync + a pre-claim
 queued-position updater keyed by `(installation, repo, PR, head_sha)`
 (migration-bearing).
 
 **Acceptance:** A PR shows a placeholder/queued check before its job is claimed.
+
+### 0032 — Supersede stale PR-head benchmarks
+
+- **id:** `0032-supersede-stale-pr-head-runs`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** `0008-execution-architecture`
+- **relates_to:** `0014-preclaim-placeholder-checks`
+- **source:** operational UX follow-up (2026-06)
+
+**Problem:** When a PR receives a new push while an older-head benchmark is still
+queued or running, the daemon may finish work for a commit nobody cares about
+anymore, wasting host time and leaving the useful new HEAD waiting.
+
+**Scope:** On `pull_request.synchronize`, detect active PR benchmark jobs for the
+same PR whose `git_commit_hash` is not the new `head_sha`, cancel/supersede them
+with neutral reporting ("superseded by newer PR head …"), then enqueue the new
+HEAD normally. Queued stale jobs can be cancelled directly; running stale jobs
+use the runner's cancellation path so VM teardown and reporting stay normal.
+Baseline/push/tag jobs are unaffected.
+
+**Acceptance:** Pushing a new commit to a PR cancels any queued/running benchmark
+for the previous PR HEAD and schedules exactly one run for the new HEAD, with the
+old surface marked neutral/cancelled rather than failed.
 
 ### 0015 — Resource-aware admission / budgets
 
@@ -100,8 +109,8 @@ queued-position updater keyed by `(installation, repo, PR, head_sha)`
 - **priority:** `low`
 - **source:** `archive/completed/0008` (v5 Phase 5.2/5.4)
 
-**Problem:** Admission is a flat `max_concurrent_jobs` count, ignoring heterogeneous
-per-job resource shapes.
+**Problem:** Admission is a flat `max_concurrent_jobs` count, ignoring
+heterogeneous per-job resource shapes.
 
 **Scope:** Admit by Σ(per-job vCPU/memory) ≤ host capacity + in-flight position
 reporting.
@@ -118,13 +127,14 @@ reporting.
 - **unblocks:** `0019-block-validation-recipe`
 - **source:** `archive/completed/0008` (v5 forward-looking constraint)
 
-**Problem:** `job_event` carries bench-specific `PhaseBuild*`/`PhaseBench*`; a second
-task kind needs task-agnostic phase events.
+**Problem:** `job_event` carries bench-specific `PhaseBuild*`/`PhaseBench*`; a
+second task kind needs task-agnostic phase events.
 
-**Scope:** Collapse to `PhaseStarted{label}`/`PhaseFinished{label}` via an additive
-`ALTER TYPE … ADD VALUE` migration.
+**Scope:** Collapse to `PhaseStarted{label}`/`PhaseFinished{label}` via an
+additive `ALTER TYPE … ADD VALUE` migration.
 
-**Acceptance:** Phase events carry a task-agnostic label; bench + block-val both fit.
+**Acceptance:** Phase events carry a task-agnostic label; bench + block-val both
+fit.
 
 ### 0013 — Drop legacy `jobs` table
 
@@ -133,8 +143,8 @@ task kind needs task-agnostic phase events.
 - **priority:** `low`
 - **source:** `archive/completed/0011` (v2 slice 12) + `0012` (v3 Phase 1)
 
-**Problem:** The legacy `jobs` table is abandoned (no code path, no grants) but still
-physically present, awaiting a soak window.
+**Problem:** The legacy `jobs` table is abandoned (no code path, no grants) but
+still physically present, awaiting a soak window.
 
 **Scope:** A one-line `DROP TABLE jobs` migration.
 
@@ -178,29 +188,10 @@ matches.
 path. Prompt design + the exact provider/structured-output binding are part of
 its own design.
 
-### 0024 — Slack card stage timings
-
-- **id:** `0024-slack-card-stage-timings`
-- **status:** `backlog`
-- **priority:** `low`
-- **depends_on:** `0023-slack-card-redesign` (the 4-stage card it annotates)
-- **source:** v8 Phase 2 (2026-06) — timing deferred from the card redesign
-
-**Problem:** The v8 card shows tense titles + descriptive italic details, but a
-completed row carries no duration ("Built in 1m 45s") and the in-progress detail
-doesn't tick a live elapsed ("Building… [1m 30s]") — the mock's timing.
-
-**Scope:** Per-row **live elapsed** (heartbeat-driven, debounced like the PR
-comment) + **completed durations** in each row's `output`, and a total on the
-Finalize row. Needs **persisted per-stage timing** so durations survive a daemon
-restart (resume re-renders the card), and a debounce so the ticking doesn't spam
-`chat.update`.
-
-**Acceptance:** A running card's active row shows a ticking elapsed; completed
-rows show their stage duration; all survive a resume.
-
-**Deferred / non-goals:** No card-layout change (rides the v8 render); kept
-**separate from v8 Phase 3** so the pre-claim queue seam stays uncluttered.
+*`0024-slack-card-stage-timings` promoted → iteration **v12**
+([iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md));
+bundled with `0033-slack-streamed-plan-updates` because streaming removes the
+`chat.update` spam/collapse problem that made live timing unattractive.*
 
 ### 0026 — Central block/tx index cache (pre-seed)
 
@@ -217,15 +208,15 @@ below the reorg horizon, the canonical mapping is stable.
 
 **Scope:** Extract the **block/tx index portion** (resolved canonical
 height→block mapping and tx index) from completed `stacks-bench.db` files and
-**merge into a central store** — idempotent, conflict-aware (deeper/newer wins; a
-disagreement *below* the finality depth is flagged, not merged). The store is
+**merge into a central store** — idempotent, conflict-aware (deeper/newer wins;
+a disagreement *below* the finality depth is flagged, not merged). The store is
 **keyed and validated by provenance** — network (mainnet/testnet),
 chainstate/source identity, the index-schema version, and the
-stacks-core/stacks-bench DB-schema version — so a pre-seed can never mix networks
-or incompatible layouts. **Pre-seed** a fresh bench DB with the requested range
-when present and final, so the bench only indexes the uncovered tail, then merges
-its new portion back. A **finality-depth guard** is load-bearing — pre-seeding a
-not-yet-final block corrupts the run.
+stacks-core/stacks-bench DB-schema version — so a pre-seed can never mix
+networks or incompatible layouts. **Pre-seed** a fresh bench DB with the
+requested range when present and final, so the bench only indexes the uncovered
+tail, then merges its new portion back. A **finality-depth guard** is
+load-bearing — pre-seeding a not-yet-final block corrupts the run.
 
 **Acceptance:** A bench over a previously-indexed, final range starts measuring
 without re-walking from tip; a partially-covered range indexes only the
@@ -243,7 +234,8 @@ before an iteration.
 - **status:** `backlog`
 - **priority:** `medium`
 - **depends_on:** a profiler-protocol change in the `stacks-bench` integration
-  branches; feeds `0024-slack-card-stage-timings` + the `ReportSurface` heartbeat
+  branches; feeds `0024-slack-card-stage-timings` + the `ReportSurface`
+  heartbeat
 - **relates_to:** `0017-generic-phase-events`
 - **source:** high-value list (2026-06)
 
@@ -251,16 +243,17 @@ before an iteration.
 surface sub-phase progress ("indexing 2345/5000", "warming up 111/2000",
 "measuring 4876/10000") — the card's in-progress rows show only a static detail.
 
-**Scope:** `stacks-bench` emits **structured progress** as JSONL on a **dedicated
-channel**, with a small stable schema (`{phase, current, total}` plus phase-change
-events), **versioned** with the profiler protocol since it lands across all 7
-integration branches. **Invariant:** stdout stays reserved for the final `--json`
-result and raw stderr is excluded (it carries log/rustc noise); the leading
-options are a dedicated `--progress-json-fd N` or a sentinel-prefixed line, and if
-the sentinel wins it must name the exact stream/file it rides and guarantee it
-can't corrupt an existing parser. Daemon-side, the runner parses the stream,
-**debounces** (the PR-comment / queue-position throttle discipline), and feeds
-`ReportSurface` heartbeats → the v8 card's active-row detail.
+**Scope:** `stacks-bench` emits **structured progress** as JSONL on a
+**dedicated channel**, with a small stable schema (`{phase, current, total}`
+plus phase-change events), **versioned** with the profiler protocol since it
+lands across all 7 integration branches. **Invariant:** stdout stays reserved
+for the final `--json` result and raw stderr is excluded (it carries log/rustc
+noise); the leading options are a dedicated `--progress-json-fd N` or a
+sentinel-prefixed line, and if the sentinel wins it must name the exact
+stream/file it rides and guarantee it can't corrupt an existing parser.
+Daemon-side, the runner parses the stream, **debounces** (the PR-comment /
+queue-position throttle discipline), and feeds `ReportSurface` heartbeats → the
+v8 card's active-row detail.
 
 **Acceptance:** A running bench drives a live sub-phase counter on its surface
 (Slack card / PR comment) without spamming `chat.update`.
@@ -274,28 +267,30 @@ sentinel), and throttle interval are design questions. Dovetails with `0024`
 - **id:** `0028-results-summary-restructure`
 - **status:** `backlog`
 - **priority:** `medium`
-- **depends_on:** *(none)* — render-side, over the existing `RunResult` / `metric_table`
+- **depends_on:** *(none)* — render-side, over the existing `RunResult` /
+  `metric_table`
 - **source:** high-value list (2026-06)
 
 **Problem:** The single metrics table mixes run *context* with timing *numbers*,
-sits the headline Setup/Execution/Commit figures next to Clarity cost, and renders
-raw microseconds (`1,655,018 µs avg`) — noisy and hard to read.
+sits the headline Setup/Execution/Commit figures next to Clarity cost, and
+renders raw microseconds (`1,655,018 µs avg`) — noisy and hard to read.
 
 **Scope:**
 
-- An **overview/intro** section, separate from the timings: blocks measured (with
-  range), transactions, warmup, baseline calibration time, active filtering flags,
-  repeats. Most is on hand — `RunData.{blocks,warmup_blocks,measured_blocks}`,
-  `RunSummary.transactions`, and the job's effective args / `WorkloadSpec`.
+- An **overview/intro** section, separate from the timings: blocks measured
+  (with range), transactions, warmup, baseline calibration time, active
+  filtering flags, repeats. Most is on hand —
+  `RunData.{blocks,warmup_blocks,measured_blocks}`, `RunSummary.transactions`,
+  and the job's effective args / `WorkloadSpec`.
 - **Re-section** the numbers: the core **Setup, Execution, Commit** table stands
-  alone; **Clarity execution cost** (runtime, read/write) moves to its own section
-  so it doesn't dilute the headline bench figures.
+  alone; **Clarity execution cost** (runtime, read/write) moves to its own
+  section so it doesn't dilute the headline bench figures.
 - **Humanize durations** — render the largest sensible unit (`1,655,018 µs` →
   `1.66s`) via a shared formatter reused by the PR comment and the Slack card.
 
-**Acceptance:** A completed run renders an overview block, a core-timing table in
-human units, and a separate Clarity-cost section, on both the PR comment and the
-Slack card.
+**Acceptance:** A completed run renders an overview block, a core-timing table
+in human units, and a separate Clarity-cost section, on both the PR comment and
+the Slack card.
 
 **Deferred / non-goals / upstream:** Clarity **read/write counts** and **baseline
 calibration time** are **not** in `run.json` today (only read/write *lengths*
@@ -331,9 +326,9 @@ per-phase timings; the full breakdown is reachable in the portal.
 
 **Deferred / non-goals:** Slack has **no carousel block** — interactive "paging"
 would be button/menu interactivity that `chat.update`s the message, a new
-interaction-handler wiring beyond today's `app_mention` path; prefer top-N inline
-plus the portal over building paging. Per-tx detail and the full sortable table
-are deferred as above.
+interaction-handler wiring beyond today's `app_mention` path; prefer top-N
+inline plus the portal over building paging. Per-tx detail and the full sortable
+table are deferred as above.
 
 ### 0030 — Results Q&A agent ("why was this slow?")
 
@@ -350,8 +345,8 @@ downloading `stacks-bench.db` and writing SQL by hand.
 
 **Scope:** A **schema-aware agent** over a run's `stacks-bench.db` that answers
 natural-language questions by querying it. **Read-only** against a fetched copy
-(sandboxed), via a constrained query tool (parameterized / whitelisted SQL, never
-arbitrary writes), with row/time/cost caps. Rides the **same provider
+(sandboxed), via a constrained query tool (parameterized / whitelisted SQL,
+never arbitrary writes), with row/time/cost caps. Rides the **same provider
 abstraction** as `0020` (env-only key, configurable model). Surface: a thread
 reply on a Slack results card and/or the portal.
 
@@ -365,8 +360,8 @@ reply on a Slack results card and/or the portal.
   prompt discipline.
 
 **Deferred / non-goals:** No write access, ever; not a general SQL console.
-Distinct from `0020` (which resolves bench *inputs*); this answers over *outputs*.
-Prompt / tooling design is its own design.
+Distinct from `0020` (which resolves bench *inputs*); this answers over
+*outputs*. Prompt / tooling design is its own design.
 
 *`0031-reusable-build-jobs` promoted → iteration **v11**
 ([iterations/v11-reusable-build-jobs.md](iterations/v11-reusable-build-jobs.md));
@@ -379,6 +374,29 @@ full scope + design live there.*
 [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md).*
 
 ## Parked
+
+### 0003 — Results portal (web UI + GitHub login)
+
+- **id:** `0003-results-portal`
+- **status:** `parked`
+- **priority:** `medium`
+- **depends_on:** `0001-artifact-store`
+- **review:** `Codex signed off` (design)
+- **design:** [design/0003-results-portal.md](design/0003-results-portal.md)
+
+**Problem:** No way to browse runs, watch the queue, or deep-inspect a run's
+profile.
+
+**Scope:** A permissioned portal (GitHub OAuth → existing roles,
+visibility-scoped) that's an **API client of the orchestrator** (never a second
+DB client), reusing the upstream `stacks-bench` explorer version-matched +
+proxied.
+
+**Acceptance:** A logged-in user browses runs they may see and opens a profiler
+trace.
+
+**Deferred / non-goals:** Parked — we may be able to expose these interactions
+via the Slack app instead.
 
 ### 0006 — AWS / cloud execution backend
 
@@ -404,11 +422,12 @@ full scope + design live there.*
 - **priority:** `low`
 - **source:** `archive/completed/0008` (v5 Phase 5.1 follow-up)
 
-**Problem:** Same-SHA PR `/benchmark` dedup is best-effort (check-then-insert outside
-the atomic boundary).
+**Problem:** Same-SHA PR `/benchmark` dedup is best-effort (check-then-insert
+outside the atomic boundary).
 
-**Scope:** A partial unique index on `(repo, commit) WHERE trigger_kind='pr_comment'
-AND status IN active`, with the violation mapped to `AlreadyEnqueued`.
+**Scope:** A partial unique index on `(repo, commit) WHERE
+trigger_kind='pr_comment' AND status IN active`, with the violation mapped to
+`AlreadyEnqueued`.
 
 **Deferred / non-goals:** Parked — premature for a single processor; revisit at
 multi-processor.
@@ -420,12 +439,12 @@ multi-processor.
 - **priority:** `low`
 - **source:** `archive/completed/0009` (v7 Phase 4)
 
-**Problem:** A single run can't separate a real regression from noise on suspicious
-(~1–2σ) or shock (>20%) deltas.
+**Problem:** A single run can't separate a real regression from noise on
+suspicious (~1–2σ) or shock (>20%) deltas.
 
 **Scope:** Rerun on suspicious/shock bands (bypassing same-SHA dedup), aggregate
 `(repo, commit)` metrics to a CI (`SEM = σ/√N`), cap at `max_reruns`, surface
 "confirmed over N runs".
 
-**Deferred / non-goals:** Parked — design-only, gated on the operational re-baseline
-that sets the noise floor.
+**Deferred / non-goals:** Parked — design-only, gated on the operational
+re-baseline that sets the noise floor.
