@@ -38,7 +38,7 @@ use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
 use crate::slack::card::{self, CardCtx};
 use crate::slack::client::SlackClient;
-use crate::slack::stream::chunks_for_card;
+use crate::slack::stream::{chunks_for_card, status_log_chunk};
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -538,7 +538,8 @@ impl Coordinator {
         };
         let detail = format!("position {}/{}", ahead + 1, total);
         let card = card::queued_card(&ctx, Some(&detail));
-        let chunks = chunks_for_card(&card);
+        let mut chunks = chunks_for_card(&card);
+        chunks.push(status_log_chunk(format!("Queued at {detail}.")));
         let fallback = format!("Benchmarking {} — queued ({detail})", job.git_ref_display);
         match slack
             .append_stream(channel, plan_ts, &chunks)

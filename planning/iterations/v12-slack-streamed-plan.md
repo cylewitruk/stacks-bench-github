@@ -136,18 +136,22 @@ Rules:
   request `ts`. For channel streams, include `recipient_user_id` and
   `recipient_team_id` from the mention event. Like append updates, stream starts
   send chunks only; the live API rejects `markdown_text` and `chunks` together.
-- Queue updates send a `task_update` for `job` only.
-- Claimed/running updates send `task_update`s for the current card state; live
-  elapsed heartbeat updates are debounced.
-- Completion sends final `task_update`s, then `chat.stopStream` with bottom
-  `blocks` for the markdown results table + download button.
-- Failure/cancellation sends an error `task_update` and stops the stream without
-  result blocks.
+- Queue updates send a `task_update` for `job` plus a short `markdown_text`
+  status line.
+- Claimed/running transitions send `task_update`s for the current card state and
+  append short `markdown_text` status lines such as "Benchmark started." or
+  "Built benchmark binaries after 1m 36s." Heartbeat ticks do not emit Slack
+  updates.
+- Completion sends final `task_update`s plus a terminal status line, then
+  `chat.stopStream` with bottom `blocks` for the markdown results table +
+  download button.
+- Failure/cancellation sends an error `task_update` plus a terminal status line
+  and stops the stream without result blocks.
 - `task_update` / `plan_update` fields are truncated under Slack's
   256-character chunk limit; detailed metrics stay in final blocks.
 - Stream task updates use `title` + `status` only. Slack appends `details`,
-  `output`, and `sources` across repeated updates for the same task id, so the
-  current subtext is folded into the title to keep the visible card clean.
+  `output`, and `sources` across repeated updates for the same task id, so
+  current subtext lives in appended `markdown_text` log lines instead.
 - `chat.appendStream` documents `markdown_text` as required, but the live API
   rejects `markdown_text` and `chunks` together. Chunk updates therefore send
   `chunks` only.
@@ -159,7 +163,8 @@ All Slack calls remain non-fatal to the benchmark.
 - If `startStream` fails at enqueue, fall back to the current `postMessage` plan
   path for that job and log a warning.
 - If `appendStream` fails with a non-streaming/stopped-message error, fall back
-  to one whole-card update or a replacement in-thread card, then keep going.
+  to one whole-card update or a replacement in-thread card, then keep that card
+  on block updates for the rest of the job.
 - If `stopStream` fails, log and best-effort post the terminal blocks in-thread.
 - Persisted `plan_message_ts` remains the identity; no schema change unless a
   live test proves Slack needs a separate "stream state" marker.

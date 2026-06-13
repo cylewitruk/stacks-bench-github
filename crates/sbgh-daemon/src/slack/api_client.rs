@@ -308,7 +308,7 @@ mod tests {
                 "chunks": [{
                     "type": "task_update",
                     "id": "job",
-                    "title": "Queued · position 1/2",
+                    "title": "Queued",
                     "status": "pending",
                 }],
             })

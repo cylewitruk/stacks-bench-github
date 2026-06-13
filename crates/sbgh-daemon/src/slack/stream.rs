@@ -16,6 +16,7 @@ const STREAM_TEXT_LIMIT: usize = 256;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamChunk {
+    MarkdownText { text: String },
     TaskUpdate(TaskUpdate),
     PlanUpdate { title: String },
 }
@@ -36,6 +37,14 @@ pub fn chunks_for_card(card: &Card) -> Vec<StreamChunk> {
     chunks
 }
 
+/// A short human-readable status line appended to the stream log. The plan
+/// card state is carried by `task_update`; this is the narrative timeline.
+pub fn status_log_chunk(text: impl AsRef<str>) -> StreamChunk {
+    StreamChunk::MarkdownText {
+        text: text.as_ref().to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskUpdate {
     pub id: String,
@@ -51,11 +60,9 @@ pub struct TaskUpdate {
 
 impl TaskUpdate {
     pub fn from_row(id: impl Into<String>, row: &CardRow) -> Self {
-        let terminal = matches!(row.status, PlanTaskStatus::Complete | PlanTaskStatus::Error);
-        let title = stream_row_title(row, terminal);
         Self {
             id: id.into(),
-            title,
+            title: stream_text(&row.title),
             status: row.status.into(),
             details: None,
             output: None,
@@ -111,14 +118,6 @@ fn stream_text(s: &str) -> String {
     out
 }
 
-fn stream_row_title(row: &CardRow, terminal: bool) -> String {
-    let suffix = if terminal { row.output.as_deref() } else { row.details.as_deref() };
-    match suffix {
-        Some(suffix) => stream_text(&format!("{} · {suffix}", row.title)),
-        None => stream_text(&row.title),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamFailure {
     NotStreaming,
@@ -167,7 +166,7 @@ mod tests {
             json!({
                 "type": "task_update",
                 "id": "build",
-                "title": "Building benchmark binaries · Building for 1m 02s",
+                "title": "Building benchmark binaries",
                 "status": "in_progress",
             })
         );
@@ -187,8 +186,20 @@ mod tests {
             v,
             json!({
                 "id": "build",
-                "title": "Built benchmark binaries · Built in 6m 04s",
+                "title": "Built benchmark binaries",
                 "status": "complete",
+            })
+        );
+    }
+
+    #[test]
+    fn status_log_chunk_serializes_markdown_text() {
+        let v = serde_json::to_value(status_log_chunk("Benchmark started.")).expect("serializes");
+        assert_eq!(
+            v,
+            json!({
+                "type": "markdown_text",
+                "text": "Benchmark started.",
             })
         );
     }
