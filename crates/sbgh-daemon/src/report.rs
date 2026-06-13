@@ -436,8 +436,12 @@ impl ReportSurface for SlackReportSurface {
         }
     }
 
-    async fn heartbeat(&self, _label: &PhaseLabel, _elapsed: Duration) {
-        // The plan card has no heartbeat surface.
+    async fn heartbeat(&self, label: &PhaseLabel, _elapsed: Duration) {
+        if stage_for_phase(&label.to_string()).is_some() {
+            self.timeline
+                .heartbeat()
+                .await;
+        }
     }
 
     async fn completed(
@@ -886,9 +890,10 @@ mod tests {
         })
     }
 
-    /// The Slack surface delegates the lifecycle to the timeline: `started`
-    /// posts the card once; `phase(running)` + `completed` `chat.update` it;
-    /// `heartbeat` is a no-op; the reaction swaps to ✅.
+    /// The Slack surface delegates the lifecycle to the timeline. This fake
+    /// client does not implement streaming, so the timeline exercises the
+    /// block fallback path while still proving heartbeat/phase/completion reach
+    /// Slack and the reaction swaps to ✅.
     #[tokio::test]
     async fn slack_surface_drives_the_timeline() {
         let recording = Arc::new(FakeSlack::default());

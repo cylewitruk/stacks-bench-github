@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::slack::client::SlackClient;
+use crate::slack::stream::StreamChunk;
 
 /// Slack Web API root. Slack does not offer per-workspace API hosts, so this is
 /// a constant (unlike the configurable GitHub base).
@@ -75,6 +76,62 @@ impl WebApiClient {
     }
 }
 
+fn start_stream_body(
+    channel: &str,
+    thread_ts: &str,
+    recipient_user_id: &str,
+    recipient_team_id: &str,
+    markdown_text: &str,
+    chunks: &[StreamChunk],
+) -> serde_json::Value {
+    serde_json::json!({
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "recipient_user_id": recipient_user_id,
+        "recipient_team_id": recipient_team_id,
+        "task_display_mode": "plan",
+        "markdown_text": markdown_text,
+        "chunks": chunks,
+    })
+}
+
+fn append_stream_body(
+    channel: &str,
+    ts: &str,
+    markdown_text: &str,
+    chunks: &[StreamChunk],
+) -> serde_json::Value {
+    serde_json::json!({
+        "channel": channel,
+        "ts": ts,
+        "markdown_text": markdown_text,
+        "chunks": chunks,
+    })
+}
+
+fn stop_stream_body(
+    channel: &str,
+    ts: &str,
+    markdown_text: Option<&str>,
+    chunks: &[StreamChunk],
+    blocks: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "channel": channel,
+        "ts": ts,
+    });
+    if let Some(text) = markdown_text {
+        body["markdown_text"] = serde_json::Value::String(text.to_string());
+    }
+    if !chunks.is_empty() {
+        body["chunks"] = serde_json::to_value(chunks).expect("stream chunks serialize");
+    }
+    if let Some(blocks) = blocks {
+        body["blocks"] = blocks.clone();
+    }
+    body
+}
+
 /// The common `{ ok, error }` envelope every Web API method returns (plus the
 /// posted message `ts`, present on `chat.postMessage`; other fields ignored).
 #[derive(Deserialize)]
@@ -128,6 +185,57 @@ impl SlackClient for WebApiClient {
             .ok_or_else(|| anyhow::anyhow!("slack chat.postMessage returned ok but no ts"))
     }
 
+    async fn start_plan_stream(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        recipient_user_id: &str,
+        recipient_team_id: &str,
+        markdown_text: &str,
+        chunks: &[StreamChunk],
+    ) -> anyhow::Result<String> {
+        let resp = self
+            .call(
+                "chat.startStream",
+                start_stream_body(
+                    channel,
+                    thread_ts,
+                    recipient_user_id,
+                    recipient_team_id,
+                    markdown_text,
+                    chunks,
+                ),
+            )
+            .await?;
+        resp.ts
+            .ok_or_else(|| anyhow::anyhow!("slack chat.startStream returned ok but no ts"))
+    }
+
+    async fn append_stream(
+        &self,
+        channel: &str,
+        ts: &str,
+        markdown_text: &str,
+        chunks: &[StreamChunk],
+    ) -> anyhow::Result<()> {
+        self.call("chat.appendStream", append_stream_body(channel, ts, markdown_text, chunks))
+            .await?;
+        Ok(())
+    }
+
+    async fn stop_stream(
+        &self,
+        channel: &str,
+        ts: &str,
+        markdown_text: Option<&str>,
+        chunks: &[StreamChunk],
+        blocks: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        self.call("chat.stopStream", stop_stream_body(channel, ts, markdown_text, chunks, blocks))
+            .await?;
+        Ok(())
+    }
+
     async fn update_blocks(
         &self,
         channel: &str,
@@ -170,6 +278,9 @@ impl SlackClient for WebApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench_summary::PlanTaskStatus;
+    use crate::slack::card::CardRow;
+    use crate::slack::stream::{STREAM_NOOP_MARKDOWN, StreamChunk, TaskUpdate};
 
     #[test]
     fn ok_response_is_success() {
@@ -188,5 +299,68 @@ mod tests {
     #[test]
     fn not_ok_without_error_is_still_an_error() {
         assert!(interpret_response("chat.postMessage", false, None).is_err());
+    }
+
+    #[test]
+    fn start_stream_body_matches_slack_contract() {
+        let row = CardRow {
+            title: "Queued".into(),
+            status: PlanTaskStatus::Pending,
+            details: Some("position 1/2".into()),
+            output: None,
+            source: None,
+        };
+        let chunks = vec![StreamChunk::TaskUpdate(TaskUpdate::from_row("job", &row))];
+        assert_eq!(
+            start_stream_body("C1", "111.222", "U1", "T1", "Benchmarking develop", &chunks),
+            serde_json::json!({
+                "channel": "C1",
+                "thread_ts": "111.222",
+                "recipient_user_id": "U1",
+                "recipient_team_id": "T1",
+                "task_display_mode": "plan",
+                "markdown_text": "Benchmarking develop",
+                "chunks": [{
+                    "type": "task_update",
+                    "id": "job",
+                    "title": "Queued",
+                    "status": "pending",
+                    "details": "position 1/2",
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn append_stream_body_includes_required_noop_markdown() {
+        let chunks = vec![StreamChunk::PlanUpdate {
+            title: "Benchmark develop @ abcdef12".into(),
+        }];
+        assert_eq!(
+            append_stream_body("C1", "222.333", STREAM_NOOP_MARKDOWN, &chunks),
+            serde_json::json!({
+                "channel": "C1",
+                "ts": "222.333",
+                "markdown_text": STREAM_NOOP_MARKDOWN,
+                "chunks": [{
+                    "type": "plan_update",
+                    "title": "Benchmark develop @ abcdef12",
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn stop_stream_body_can_finalize_with_bottom_blocks() {
+        let blocks = serde_json::json!([{ "type": "divider" }]);
+        assert_eq!(
+            stop_stream_body("C1", "222.333", Some("Done"), &[], Some(&blocks)),
+            serde_json::json!({
+                "channel": "C1",
+                "ts": "222.333",
+                "markdown_text": "Done",
+                "blocks": [{ "type": "divider" }],
+            })
+        );
     }
 }

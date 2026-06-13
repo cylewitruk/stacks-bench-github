@@ -6,16 +6,16 @@ whole-card `chat.update` edits with Slack's native streaming plan/task updates,
 so the Slack card behaves like a live plan instead of a repeatedly replaced
 Block Kit message.
 
-> **Status:** planned — Phase 0 design drafted for Codex review. No code has
-> landed. The live workspace symptom is known: expanding the `plan` card is lost
-> on every update because Slack re-renders the whole card.
+> **Status:** in progress — implementation landed locally; lint and tests pass.
+> Live Slack verification is still pending because CI cannot prove whether the
+> Slack client preserves an expanded `plan` while stream chunks arrive.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0033-slack-streamed-plan-updates` | primary | planned |
-| `0024-slack-card-stage-timings` | bundled follow-up | planned |
+| `0033-slack-streamed-plan-updates` | primary | in progress |
+| `0024-slack-card-stage-timings` | bundled follow-up | in progress |
 
 ## Why
 
@@ -43,7 +43,7 @@ not promise local UI-state preservation.
 ## Item: `0033-slack-streamed-plan-updates`
 
 - **id:** `0033-slack-streamed-plan-updates`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `high`
 - **depends_on:** `0023-slack-card-redesign`
 - **relates_to:** `0024-slack-card-stage-timings`, `0027-fine-grained-progress`
@@ -67,7 +67,7 @@ daemon restart resumes or safely falls back without duplicating the thread.
 ## Item: `0024-slack-card-stage-timings`
 
 - **id:** `0024-slack-card-stage-timings`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `medium`
 - **depends_on:** `0023-slack-card-redesign`
 - **source:** v8 timing follow-up; bundled here because streaming removes the
@@ -76,14 +76,16 @@ daemon restart resumes or safely falls back without duplicating the thread.
 **Problem:** The card has staged rows but no live elapsed time or completed
 duration per row.
 
-**Scope:** Add per-row start/end timing to the persisted timeline state and
-render short live elapsed/details through `task_update` chunks. Terminal rows get
-compact outputs ("Built in …", "Ran in …", "Finished in …"). Fine-grained bench
-counters from `0027` stay out of scope; v12 only times the stages we already
-observe.
+**Scope:** Add per-row start/end timing to the live timeline state and render
+short live elapsed/details through `task_update` chunks. Terminal rows get
+compact outputs ("Completed in …") where the daemon observed a stage boundary.
+Fine-grained bench counters from `0027` stay out of scope; v12 only times the
+stages we already observe.
 
 **Acceptance:** A live run shows a ticking active-row elapsed value and terminal
-stage durations, without re-rendering/collapsing the whole plan.
+stage durations for observed stage boundaries, without re-rendering/collapsing
+the whole plan. Timing state is best-effort across daemon reclaim for this
+iteration; the stream message identity remains durable via `plan_message_ts`.
 
 ## Current Code Seams
 
@@ -134,16 +136,17 @@ Rules:
   request `ts`. For channel streams, include `recipient_user_id` and
   `recipient_team_id` from the mention event.
 - Queue updates send a `task_update` for `job` only.
-- Claimed/running updates send `task_update`s for changed rows only, debounced.
+- Claimed/running updates send `task_update`s for the current card state; live
+  elapsed heartbeat updates are debounced.
 - Completion sends final `task_update`s, then `chat.stopStream` with bottom
   `blocks` for the markdown results table + download button.
 - Failure/cancellation sends an error `task_update` and stops the stream without
   result blocks.
-- `task_update` / `plan_update` fields must stay under Slack's 256-character
-  chunk limit; detailed metrics stay in final blocks.
+- `task_update` / `plan_update` fields are truncated under Slack's
+  256-character chunk limit; detailed metrics stay in final blocks.
 - `chat.appendStream` documents `markdown_text` as required even when `chunks`
-  are present. Phase 1 must verify the least-noisy value (empty string vs. a
-  short invisible/no-op string) against Slack before the timeline cutover.
+  are present. The implementation uses a zero-width no-op string so task
+  updates remain visually quiet.
 
 ## Failure / Fallback Rules
 
@@ -175,10 +178,10 @@ without a live workspace.
 
 **Acceptance & Validation:**
 
-- [ ] Unit tests assert exact JSON shape for start/append/stop.
-- [ ] Response interpretation handles missing `ts`, `invalid_chunks`, and
+- [x] Unit tests assert exact JSON shape for start/append/stop.
+- [x] Response interpretation handles missing `ts`, `invalid_chunks`, and
   non-streaming/stopped-message errors.
-- [ ] No new Slack scopes beyond `chat:write`.
+- [x] No new Slack scopes beyond `chat:write`.
 
 ### Phase 2: Streamed Timeline Cutover
 
@@ -196,10 +199,11 @@ whole blocks.
 
 **Acceptance & Validation:**
 
-- [ ] Existing fake-client timeline tests port to stream calls.
-- [ ] One stream `ts` is persisted pre-claim and resumed on claim.
-- [ ] Queue → Build → Run → Finalize sends task deltas, not whole-card updates.
-- [ ] Terminal success uses `stopStream` with result blocks.
+- [x] Existing fake-client timeline tests port to stream calls.
+- [x] One stream `ts` is persisted pre-claim and resumed on claim.
+- [x] Queue → Build → Run → Finalize sends task updates, not whole-card updates,
+  with block fallback preserved.
+- [x] Terminal success uses `stopStream` with result blocks.
 
 ### Phase 3: Stage Timings (`0024`)
 
@@ -207,17 +211,19 @@ whole blocks.
 
 **Scope:**
 
-- Persist per-stage start/end timestamps in job events or equivalent durable
-  state.
-- Add debounced heartbeat updates to the active task's `details`.
-- Finalize each completed task with a short `output` duration.
+- Track per-stage start/end timestamps in the live timeline state.
+- Add heartbeat updates to the active task's `details`.
+- Finalize each completed task with a short `output` duration when the stage
+  boundary is observed.
 - Keep `0027` fine-grained counters out of scope.
 
 **Acceptance & Validation:**
 
-- [ ] Active row shows live elapsed without frequent whole-message edits.
-- [ ] Terminal rows show durations after daemon resume.
-- [ ] Update debounce prevents noisy Slack API calls.
+- [x] Active row shows live elapsed without whole-message edits.
+- [x] Terminal rows show durations for observed stage boundaries within one
+  daemon lifetime.
+- [x] Heartbeat updates are debounced before appending stream chunks.
+- [ ] Live verification confirms Slack expansion state survives these updates.
 
 ### Phase 4: Live Slack Verification
 

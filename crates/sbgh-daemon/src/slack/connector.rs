@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::slack::card::{self, CardCtx};
 use crate::slack::client::{QUEUED_REACTION, SlackClient};
+use crate::slack::stream::chunks_for_card;
 use crate::slack::target::SlackJobTarget;
 use crate::slack::workload::resolve_workload;
 
@@ -162,25 +163,43 @@ impl SlackConnector {
             job_id: &job_id_str,
             cached_build: None,
         };
-        let blocks = card::queued(&ctx, None);
+        let card = card::queued_card(&ctx, None);
         let fallback = format!("Benchmarking {rev}");
-        match self
+        let stream_result = self
             .client
-            .post_blocks_in_thread(&event.channel, &event.message_ts, &blocks, &fallback)
-            .await
-        {
-            Ok(ts) => {
-                if let Err(e) = self
-                    .jobs
-                    .record_plan_message_ts(job_id, &ts)
+            .start_plan_stream(
+                &event.channel,
+                &event.message_ts,
+                &event.user,
+                &event.team_id,
+                &fallback,
+                &chunks_for_card(&card),
+            )
+            .await;
+        let ts = match stream_result {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::warn!(error = ?e, "slack: start stream failed; falling back to block card");
+                let blocks = card::render(&card);
+                match self
+                    .client
+                    .post_blocks_in_thread(&event.channel, &event.message_ts, &blocks, &fallback)
                     .await
                 {
-                    tracing::warn!(error = %e, "slack: persisting queued plan ts failed (non-fatal)");
+                    Ok(ts) => ts,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "slack: posting queued plan card failed (non-fatal)");
+                        return;
+                    }
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "slack: posting queued plan card failed (non-fatal)")
-            }
+        };
+        if let Err(e) = self
+            .jobs
+            .record_plan_message_ts(job_id, &ts)
+            .await
+        {
+            tracing::warn!(error = %e, "slack: persisting queued plan ts failed (non-fatal)");
         }
     }
 
@@ -245,6 +264,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSlackClient {
         ephemerals: Mutex<Vec<(String, String, String)>>, // (channel, user, text)
+        streams: Mutex<Vec<(String, String, String)>>,    // (channel, thread_ts, chunks-json)
         posts: Mutex<Vec<(String, String, String)>>,      // (channel, thread_ts, blocks-json)
         reactions: Mutex<Vec<(String, String, String)>>,  // (channel, ts, reaction)
         removed: Mutex<Vec<(String, String, String)>>,    // (channel, ts, reaction)
@@ -277,6 +297,22 @@ mod tests {
                 .unwrap()
                 .push((channel.into(), thread_ts.into(), blocks.to_string()));
             Ok("ts".into())
+        }
+
+        async fn start_plan_stream(
+            &self,
+            channel: &str,
+            thread_ts: &str,
+            _recipient_user_id: &str,
+            _recipient_team_id: &str,
+            _markdown_text: &str,
+            chunks: &[crate::slack::stream::StreamChunk],
+        ) -> anyhow::Result<String> {
+            self.streams
+                .lock()
+                .unwrap()
+                .push((channel.into(), thread_ts.into(), serde_json::to_string(chunks).unwrap()));
+            Ok("stream_ts".into())
         }
 
         async fn update_blocks(
@@ -405,21 +441,35 @@ mod tests {
         c.handle_mention(event("<@U07BOT> bench --block 184231"))
             .await;
 
-        // One card posted under the request ts: the queued plan, Job row "Queued".
+        // One stream started under the request ts: the queued plan, Job row "Queued".
         // Scoped so the guard drops before the `await` below (clippy).
         {
-            let posts = slack.posts.lock().unwrap();
-            assert_eq!(posts.len(), 1);
-            assert_eq!(posts[0].0, "C1");
-            assert_eq!(posts[0].1, "1700000000.000100");
+            let streams = slack.streams.lock().unwrap();
+            assert_eq!(streams.len(), 1);
+            assert_eq!(streams[0].0, "C1");
+            assert_eq!(streams[0].1, "1700000000.000100");
             assert!(
-                posts[0]
+                streams[0]
                     .2
-                    .contains("\"type\":\"plan\""),
+                    .contains("\"type\":\"task_update\""),
                 "{}",
-                posts[0].2
+                streams[0].2
             );
-            assert!(posts[0].2.contains("Queued"), "Job row queued: {}", posts[0].2);
+            assert!(
+                streams[0]
+                    .2
+                    .contains("Queued"),
+                "Job row queued: {}",
+                streams[0].2
+            );
+            assert!(
+                slack
+                    .posts
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "stream start succeeded, so no block fallback"
+            );
         }
 
         // The card ts was persisted by job id (read back via latest_plan_message_ts).
@@ -431,8 +481,8 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("ts"),
-            "queued card ts persisted by job_id",
+            Some("stream_ts"),
+            "queued stream ts persisted by job_id",
         );
     }
 

@@ -18,6 +18,7 @@ pub mod card;
 pub mod client;
 pub mod connector;
 pub mod socket;
+pub mod stream;
 pub mod target;
 pub mod timeline;
 pub mod workload;

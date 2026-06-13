@@ -1050,9 +1050,9 @@ mod tests {
     }
 
     /// A Slack job driven through `run` posts the live `plan` card at start,
-    /// `chat.update`s it as the worker reports a phase + completes, and swaps
-    /// ⏳→✅ — proving the reporter wires the timeline into `started`, the
-    /// drain sink, and `finish`.
+    /// advances it as the worker reports a phase + completes, and swaps ⏳→✅.
+    /// This fake client exercises the block fallback path; timeline-specific
+    /// tests pin the streaming path.
     #[tokio::test]
     async fn slack_job_drives_the_live_timeline_through_run() {
         let tmp = TempDir::new().unwrap();
@@ -1098,7 +1098,7 @@ mod tests {
             1,
             "the plan card is posted exactly once at start"
         );
-        assert!(*slack.updates.lock().unwrap() >= 2, "advanced + finalized via chat.update");
+        assert!(*slack.updates.lock().unwrap() >= 2, "advanced + finalized via fallback update");
         assert_eq!(
             *slack.added.lock().unwrap(),
             vec![COMPLETED_REACTION.to_string()],

@@ -9,8 +9,9 @@
 //! beneath the plan (the plan stays above — Block Kit has no API to force it
 //! collapsed).
 //!
-//! The stage model + card builders ([`queued`] / [`running`] / [`completed`] /
-//! [`failed`]) live here so both [`SlackTimeline`](crate::slack::timeline)
+//! The stage model + card builders ([`queued_card`] / [`running_card`] /
+//! [`completed_card`] / [`failed_card`]) live here so both
+//! [`SlackTimeline`](crate::slack::timeline)
 //! (running state) and the pre-claim Slack connector (the queued card) share
 //! **one** visual language without duplicating row strings. A [`CardCtx`]
 //! carries the per-job bits; `commit`/`commit_url` are `None` pre-claim.
@@ -62,6 +63,9 @@ pub struct Card<'a> {
 
 /// The four plan rows: Job → Build → Run → Finalize.
 pub const STAGES: usize = 4;
+
+/// Stable task ids for the streamed Slack `plan`.
+pub const TASK_IDS: [&str; STAGES] = ["job", "build", "run", "finalize"];
 
 /// Per-job render context shared by the card builders — the bits of the job
 /// that don't change between renders. `commit`/`commit_url` are `None`
@@ -136,7 +140,14 @@ enum RowState<'a> {
 /// The **running** card: `stage` (1..=`STAGES`-1) is the in-progress row,
 /// earlier rows complete, later pending. The pre-claim **queued** view is
 /// [`queued`] (Job row pending), *not* `running(0)` (which renders Job active).
-pub fn running(ctx: &CardCtx, stage: usize) -> Value {
+#[cfg(test)]
+fn running(ctx: &CardCtx, stage: usize) -> Value {
+    render(&running_card(ctx, stage))
+}
+
+/// The typed **running** card. Used by both the Block Kit fallback renderer and
+/// the streaming `task_update` path.
+pub fn running_card<'a>(ctx: &'a CardCtx<'a>, stage: usize) -> Card<'a> {
     let rows = (0..STAGES)
         .map(|i| {
             let state = match i.cmp(&stage) {
@@ -147,12 +158,12 @@ pub fn running(ctx: &CardCtx, stage: usize) -> Value {
             card_row(ctx, i, state)
         })
         .collect();
-    render(&Card {
+    Card {
         title: title(ctx, false),
         job_id: ctx.job_id,
         rows,
         results: None,
-    })
+    }
 }
 
 /// The **queued** card (pre-claim): every row pending, the Job row showing
@@ -160,37 +171,55 @@ pub fn running(ctx: &CardCtx, stage: usize) -> Value {
 /// "Waiting for an available slot". Posted by the connector at enqueue and
 /// updated by the runner's queue-position updater; the rev resolves to a commit
 /// only at claim, so [`CardCtx::commit`] is `None` here.
-pub fn queued(ctx: &CardCtx, detail: Option<&str>) -> Value {
+#[cfg(test)]
+fn queued(ctx: &CardCtx, detail: Option<&str>) -> Value {
+    render(&queued_card(ctx, detail))
+}
+
+/// The typed **queued** card (pre-claim).
+pub fn queued_card<'a>(ctx: &'a CardCtx<'a>, detail: Option<&str>) -> Card<'a> {
     let mut rows: Vec<CardRow> = (0..STAGES)
         .map(|i| card_row(ctx, i, RowState::Pending))
         .collect();
     if let Some(detail) = detail {
         rows[0].details = Some(detail.to_string());
     }
-    render(&Card {
+    Card {
         title: title(ctx, false),
         job_id: ctx.job_id,
         rows,
         results: None,
-    })
+    }
 }
 
 /// The **completed** card: every row complete + the results table/button.
-pub fn completed(ctx: &CardCtx, results: Results) -> Value {
+#[cfg(test)]
+fn completed(ctx: &CardCtx, results: Results) -> Value {
+    render(&completed_card(ctx, results))
+}
+
+/// The typed **completed** card: every row complete + the results.
+pub fn completed_card<'a>(ctx: &'a CardCtx<'a>, results: Results<'a>) -> Card<'a> {
     let rows = (0..STAGES)
         .map(|i| card_row(ctx, i, RowState::Done))
         .collect();
-    render(&Card {
+    Card {
         title: title(ctx, true),
         job_id: ctx.job_id,
         rows,
         results: Some(results),
-    })
+    }
 }
 
 /// The **failed** card: `stage` errored (carrying `reason`), earlier rows
 /// complete, later pending.
-pub fn failed(ctx: &CardCtx, stage: usize, reason: &str) -> Value {
+#[cfg(test)]
+fn failed(ctx: &CardCtx, stage: usize, reason: &str) -> Value {
+    render(&failed_card(ctx, stage, reason))
+}
+
+/// The typed **failed** card.
+pub fn failed_card<'a>(ctx: &'a CardCtx<'a>, stage: usize, reason: &str) -> Card<'a> {
     let rows = (0..STAGES)
         .map(|i| {
             let state = match i.cmp(&stage) {
@@ -201,12 +230,12 @@ pub fn failed(ctx: &CardCtx, stage: usize, reason: &str) -> Value {
             card_row(ctx, i, state)
         })
         .collect();
-    render(&Card {
+    Card {
         title: title(ctx, true),
         job_id: ctx.job_id,
         rows,
         results: None,
-    })
+    }
 }
 
 /// One [`CardRow`] for stage `i` in `state`. The render layer owns the
@@ -289,15 +318,22 @@ pub fn render(card: &Card) -> Value {
 fn build(card: &Card) -> Result<Value, Box<dyn std::error::Error>> {
     let mut blocks: Vec<Value> = vec![serde_json::to_value(build_plan(card)?)?];
     if let Some(results) = &card.results {
-        blocks.push(json!({ "type": "divider" }));
-        blocks.push(markdown_block(results.metrics));
-        // The primary download button — only when an in-bucket DB link exists.
-        if let Some(url) = results.db_url {
-            blocks.push(json!({ "type": "divider" }));
-            blocks.push(download_section(url));
-        }
+        blocks.extend(result_blocks(results));
     }
     Ok(Value::Array(blocks))
+}
+
+/// The terminal result blocks appended below the plan. Used directly by
+/// `chat.stopStream`, where Slack renders final `blocks` below the streamed
+/// plan instead of replacing the plan itself.
+pub fn result_blocks(results: &Results) -> Vec<Value> {
+    let mut blocks = vec![json!({ "type": "divider" }), markdown_block(results.metrics)];
+    // The primary download button — only when an in-bucket DB link exists.
+    if let Some(url) = results.db_url {
+        blocks.push(json!({ "type": "divider" }));
+        blocks.push(download_section(url));
+    }
+    blocks
 }
 
 fn build_plan(card: &Card) -> Result<slack_messaging::blocks::Plan, Box<dyn std::error::Error>> {

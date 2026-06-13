@@ -38,6 +38,7 @@ use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
 use crate::slack::card::{self, CardCtx};
 use crate::slack::client::SlackClient;
+use crate::slack::stream::{STREAM_NOOP_MARKDOWN, chunks_for_card};
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -441,8 +442,8 @@ impl Coordinator {
     /// remains. A queued job at index `i` has `ahead` runs before it
     /// (`in_flight()` plus `i`). The GitHub check is created/refreshed
     /// `in_progress` and a later claim adopts its persisted id; the Slack
-    /// card's Job row is `chat.update`d. Best-effort: a surface or
-    /// DB hiccup is logged, never fatal.
+    /// card's Job row is streamed with `chat.update` kept as fallback.
+    /// Best-effort: a surface or DB hiccup is logged, never fatal.
     ///
     /// The `last_positions` map suppresses redundant **surface edits** (only
     /// push when a job's position changed) and is pruned to the current
@@ -465,8 +466,8 @@ impl Coordinator {
         let mut seen = HashSet::new();
         for (i, job) in queued.iter().enumerate() {
             let ahead = in_flight + i;
-            // Position-reportable: a **Slack** job whose pre-claim card was
-            // already posted (it carries a `plan_message_ts`), or a **GitHub**
+            // Position-reportable: a **Slack** job whose pre-claim stream/card
+            // was already posted (it carries a `plan_message_ts`), or a **GitHub**
             // job whose `[reporting]` wants a pre-claim position check and that
             // already carries a head SHA (PR / branch-push; a tag job resolves
             // only at claim).
@@ -511,9 +512,10 @@ impl Coordinator {
     }
 
     /// Update the queued Slack card's **Job row** with the live queue position
-    /// ("position N/M"). The pre-claim card was posted by the connector (its
-    /// `plan_ts`); this `chat.update`s it while the job waits. Pre-claim, the
-    /// rev hasn't resolved, so the card carries the rev (not a SHA).
+    /// ("position N/M"). The pre-claim stream/card was posted by the connector
+    /// (its `plan_ts`); this appends a `task_update` while the job waits, with
+    /// `chat.update` kept as fallback. Pre-claim, the rev hasn't resolved, so
+    /// the card carries the rev (not a SHA).
     /// Best-effort — returns whether the card is now up to date.
     async fn update_slack_queue_position(
         &self,
@@ -535,8 +537,19 @@ impl Coordinator {
             cached_build: None,
         };
         let detail = format!("position {}/{}", ahead + 1, total);
-        let blocks = card::queued(&ctx, Some(&detail));
+        let card = card::queued_card(&ctx, Some(&detail));
+        let chunks = chunks_for_card(&card);
         let fallback = format!("Benchmarking {} — queued ({detail})", job.git_ref_display);
+        match slack
+            .append_stream(channel, plan_ts, STREAM_NOOP_MARKDOWN, &chunks)
+            .await
+        {
+            Ok(()) => return true,
+            Err(e) => {
+                tracing::warn!(job_id = %job.id, error = ?e, "queue-position: slack stream update failed; falling back to block update");
+            }
+        }
+        let blocks = card::render(&card);
         match slack
             .update_blocks(channel, plan_ts, &blocks, &fallback)
             .await
@@ -2476,11 +2489,12 @@ mod tests {
         );
     }
 
-    /// Records Slack `chat.update` calls so the queue-position test can assert
-    /// the queued card was edited (and debounced).
+    /// Records Slack stream appends (and fallback `chat.update` calls) so the
+    /// queue-position test can assert the queued card was edited and debounced.
     #[derive(Default)]
     struct FakePositionSlack {
         updates: StdMutex<Vec<(String, String, String)>>, // (channel, ts, blocks-json)
+        appends: StdMutex<Vec<(String, String, String)>>, // (channel, ts, chunks-json)
     }
 
     #[async_trait]
@@ -2508,6 +2522,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((channel.into(), ts.into(), blocks.to_string()));
+            Ok(())
+        }
+        async fn append_stream(
+            &self,
+            channel: &str,
+            ts: &str,
+            _markdown_text: &str,
+            chunks: &[crate::slack::stream::StreamChunk],
+        ) -> anyhow::Result<()> {
+            self.appends
+                .lock()
+                .unwrap()
+                .push((channel.into(), ts.into(), serde_json::to_string(chunks).unwrap()));
             Ok(())
         }
         async fn add_reaction(&self, _c: &str, _t: &str, _r: &str) -> anyhow::Result<()> {
@@ -2552,10 +2579,9 @@ mod tests {
         Coordinator::new(deps, 1, CancellationToken::new())
     }
 
-    /// item 0023 Slice C: a queued Slack job whose pre-claim card was posted
-    /// (it carries a `plan_message_ts`) gets its Job row `chat.update`d
-    /// with the live queue position, debounced like the GitHub position
-    /// check.
+    /// item 0033 (v12): a queued Slack job whose pre-claim stream was posted
+    /// (it carries a `plan_message_ts`) gets its Job row updated with a
+    /// streamed `task_update`, debounced like the GitHub position check.
     #[tokio::test]
     async fn coordinator_updates_slack_queue_position_and_debounces() {
         let tmp = TempDir::new().unwrap();
@@ -2570,33 +2596,41 @@ mod tests {
             .await;
 
         {
-            let updates = slack.updates.lock().unwrap();
-            assert_eq!(updates.len(), 1, "the queued card was chat.update'd once");
-            assert_eq!(updates[0].1, "PLAN_TS", "updated the persisted card ts");
+            let appends = slack.appends.lock().unwrap();
+            assert_eq!(appends.len(), 1, "the queued stream was appended once");
+            assert_eq!(appends[0].1, "PLAN_TS", "updated the persisted stream ts");
             // in_flight 0 + 1 queued → total 1, ahead 0 → "position 1/1".
             assert!(
-                updates[0]
+                appends[0]
                     .2
                     .contains("position 1/1"),
                 "{}",
-                updates[0].2
+                appends[0].2
             );
             assert!(
-                updates[0]
+                appends[0]
                     .2
                     .contains("Queued"),
                 "Job row queued: {}",
-                updates[0].2
+                appends[0].2
+            );
+            assert!(
+                slack
+                    .updates
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "stream update succeeded, so no block fallback"
             );
         }
 
-        // Second pass, unchanged position → debounced (no new chat.update).
+        // Second pass, unchanged position → debounced (no new stream append).
         coord
             .update_queue_positions()
             .await;
         assert_eq!(
             slack
-                .updates
+                .appends
                 .lock()
                 .unwrap()
                 .len(),

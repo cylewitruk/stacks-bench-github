@@ -5,6 +5,8 @@
 
 use async_trait::async_trait;
 
+use crate::slack::stream::StreamChunk;
+
 /// The lifecycle-status reaction added to a request message while its job is
 /// queued (the connector adds it; the reporter swaps it for one of the two
 /// terminals below).
@@ -37,6 +39,46 @@ pub trait SlackClient: Send + Sync {
         blocks: &serde_json::Value,
         fallback: &str,
     ) -> anyhow::Result<String>;
+
+    /// Start a Slack streamed reply using `task_display_mode=plan`. Returns the
+    /// stream message's `ts`, which is also the persisted plan-message
+    /// identity.
+    async fn start_plan_stream(
+        &self,
+        _channel: &str,
+        _thread_ts: &str,
+        _recipient_user_id: &str,
+        _recipient_team_id: &str,
+        _markdown_text: &str,
+        _chunks: &[StreamChunk],
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("slack streaming is not implemented by this client")
+    }
+
+    /// Append semantic stream chunks to an existing stream. Slack currently
+    /// requires `markdown_text` even when `chunks` carry the meaningful update.
+    async fn append_stream(
+        &self,
+        _channel: &str,
+        _ts: &str,
+        _markdown_text: &str,
+        _chunks: &[StreamChunk],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("slack streaming is not implemented by this client")
+    }
+
+    /// Stop a stream and optionally render bottom blocks (the terminal results
+    /// table/download button).
+    async fn stop_stream(
+        &self,
+        _channel: &str,
+        _ts: &str,
+        _markdown_text: Option<&str>,
+        _chunks: &[StreamChunk],
+        _blocks: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("slack streaming is not implemented by this client")
+    }
 
     /// `chat.update` the message at `ts` in `channel` with new `blocks` — the
     /// live-timeline edit (Build → Benchmark → Archive status transitions).

@@ -2,9 +2,10 @@
 //!
 //! One [`SlackTimeline`] per Slack ad-hoc job, driven by the reporter at three
 //! points: posted when the job starts running ([`SlackTimeline::started`]),
-//! `chat.update`d as it advances **Job → Build → Run → Finalize**
-//! ([`SlackTimeline::advance`], from the worker's phase events), and finalized
-//! at terminal ([`SlackTimeline::completed`]/[`failed`](SlackTimeline::failed)/
+//! streamed forward as it advances **Job → Build → Run → Finalize**
+//! ([`SlackTimeline::advance`], from the worker's phase events; `chat.update`
+//! remains the fallback), and finalized at terminal
+//! ([`SlackTimeline::completed`]/[`failed`](SlackTimeline::failed)/
 //! [`cancelled`](SlackTimeline::cancelled)) — the ⏳ → ✅/❌ reaction swap
 //! plus, on success, the results table + download button (via
 //! [`crate::slack::card`]).
@@ -16,13 +17,22 @@
 //! resumes the **same** card. Every Slack call is non-fatal.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
 use crate::bench_summary::RunResult;
 use crate::job_source::{RunnableJob, RunnableJobStore};
+use crate::libvirt::format_elapsed;
 use crate::slack::card::{self, CardCtx, Results, STAGES};
 use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
+use crate::slack::stream::{
+    STREAM_NOOP_MARKDOWN, StreamFailure, chunks_for_card, classify_stream_error,
+};
+
+/// Minimum interval between live elapsed-only stream appends. Phase transitions
+/// and terminal updates bypass this; heartbeat ticks are just polish.
+const SLACK_HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct SlackTimeline {
     client: Arc<dyn SlackClient>,
@@ -50,6 +60,14 @@ struct State {
     plan_ts: Option<String>,
     /// The furthest stage reached — the in-progress row (0..STAGES). Monotonic.
     stage: usize,
+    /// Local stage start used for live elapsed details. Reconstructed on
+    /// reclaim from "now", so timings stay best-effort without a schema
+    /// change.
+    stage_started_at: Instant,
+    /// Terminal per-stage outputs captured as each row completes.
+    stage_outputs: [Option<String>; STAGES],
+    /// Debounce for heartbeat-only elapsed updates.
+    last_heartbeat_at: Option<Instant>,
 }
 
 impl SlackTimeline {
@@ -79,6 +97,9 @@ impl SlackTimeline {
             state: Mutex::new(State {
                 plan_ts: plan_message_ts,
                 stage: 0,
+                stage_started_at: Instant::now(),
+                stage_outputs: std::array::from_fn(|_| None),
+                last_heartbeat_at: None,
             }),
         }
     }
@@ -86,29 +107,55 @@ impl SlackTimeline {
     /// Post (or, on re-claim, resume) the card with the job started — Job
     /// complete, Build in progress.
     pub async fn started(&self) {
-        let stage = {
+        let (_stage, blocks, chunks, fallback) = {
             let mut st = self.state.lock().await;
             // The job has started → Build is the active row (Job is complete).
-            st.stage = st.stage.max(1);
-            st.stage
+            if st.stage < 1 {
+                st.stage = 1;
+                st.stage_started_at = Instant::now();
+            }
+            self.render_running_locked(&st, st.stage)
         };
-        self.upsert(&card::running(&self.ctx(), stage))
+        self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
             .await;
     }
 
-    /// Advance to `stage` — `chat.update` the card so the prior rows show
-    /// complete and `stage` shows in-progress. Monotonic: a same/earlier stage
-    /// (e.g. a repeat or out-of-order phase) is a no-op.
+    pub async fn heartbeat(&self) {
+        let (blocks, chunks, fallback) = {
+            let mut st = self.state.lock().await;
+            let now = Instant::now();
+            if st
+                .last_heartbeat_at
+                .is_some_and(|last| now.duration_since(last) < SLACK_HEARTBEAT_MIN_INTERVAL)
+            {
+                return;
+            }
+            st.last_heartbeat_at = Some(now);
+            let (_, blocks, chunks, fallback) = self.render_running_locked(&st, st.stage);
+            (blocks, chunks, fallback)
+        };
+        self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
+            .await;
+    }
+
+    /// Advance to `stage` — append stream `task_update`s so the prior rows show
+    /// complete and `stage` shows in-progress (`chat.update` fallback if the
+    /// stream is inactive). Monotonic: a same/earlier stage (e.g. a repeat or
+    /// out-of-order phase) is a no-op.
     pub async fn advance(&self, stage: usize) {
         let stage = stage.min(STAGES - 1);
-        {
+        let (blocks, chunks, fallback) = {
             let mut st = self.state.lock().await;
             if stage <= st.stage {
                 return;
             }
+            self.finish_stage_locked(&mut st);
             st.stage = stage;
-        }
-        self.upsert(&card::running(&self.ctx(), stage))
+            st.stage_started_at = Instant::now();
+            let (_, blocks, chunks, fallback) = self.render_running_locked(&st, stage);
+            (blocks, chunks, fallback)
+        };
+        self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
             .await;
     }
 
@@ -125,15 +172,28 @@ impl SlackTimeline {
     /// Terminal success: all rows complete, the results table + download button
     /// beneath the plan; swap ⏳ → ✅.
     pub async fn completed(&self, result: Option<RunResult>, db_url: Option<String>) {
-        self.state.lock().await.stage = STAGES;
-        let blocks = card::completed(
-            &self.ctx(),
-            Results {
-                metrics: result.as_ref(),
-                db_url: db_url.as_deref(),
-            },
-        );
-        self.upsert(&blocks).await;
+        let results = Results {
+            metrics: result.as_ref(),
+            db_url: db_url.as_deref(),
+        };
+        let (blocks, chunks, result_blocks, fallback) = {
+            let mut st = self.state.lock().await;
+            self.finish_stage_locked(&mut st);
+            st.stage = STAGES;
+            let ctx = self.ctx();
+            let mut card = card::completed_card(&ctx, results);
+            self.apply_timing(&mut card, &st);
+            let blocks = card::render(&card);
+            let chunks = chunks_for_card(&card);
+            let result_blocks = serde_json::Value::Array(card::result_blocks(
+                card.results
+                    .as_ref()
+                    .expect("completed card has results"),
+            ));
+            (blocks, chunks, result_blocks, card.title)
+        };
+        self.finish_stream_or_blocks(&blocks, &chunks, Some(&fallback), Some(&result_blocks))
+            .await;
         self.swap_reaction(COMPLETED_REACTION)
             .await;
     }
@@ -154,14 +214,18 @@ impl SlackTimeline {
     }
 
     async fn terminate_error(&self, message: &str) {
-        let stage = self
-            .state
-            .lock()
-            .await
-            .stage
-            .min(STAGES - 1);
-        let blocks = card::failed(&self.ctx(), stage, message);
-        self.upsert(&blocks).await;
+        let (blocks, chunks, fallback) = {
+            let st = self.state.lock().await;
+            let stage = st.stage.min(STAGES - 1);
+            let ctx = self.ctx();
+            let mut card = card::failed_card(&ctx, stage, message);
+            self.apply_timing(&mut card, &st);
+            let blocks = card::render(&card);
+            let chunks = chunks_for_card(&card);
+            (blocks, chunks, card.title)
+        };
+        self.finish_stream_or_blocks(&blocks, &chunks, Some(&fallback), None)
+            .await;
         self.swap_reaction(FAILED_REACTION)
             .await;
     }
@@ -182,51 +246,168 @@ impl SlackTimeline {
         }
     }
 
-    /// Post the card if we don't yet have one (persisting its `ts` for
-    /// resume-on-reclaim), else `chat.update` the existing one. Non-fatal.
-    async fn upsert(&self, blocks: &serde_json::Value) {
-        let fallback = format!("Benchmark {} @ {}", self.rev, self.short_commit());
+    fn render_running_locked(
+        &self,
+        st: &State,
+        stage: usize,
+    ) -> (usize, serde_json::Value, Vec<crate::slack::stream::StreamChunk>, String) {
+        let ctx = self.ctx();
+        let mut card = card::running_card(&ctx, stage);
+        self.apply_timing(&mut card, st);
+        let blocks = card::render(&card);
+        let chunks = chunks_for_card(&card);
+        (stage, blocks, chunks, card.title)
+    }
+
+    fn finish_stage_locked(&self, st: &mut State) {
+        if (1..STAGES).contains(&st.stage) && st.stage_outputs[st.stage].is_none() {
+            st.stage_outputs[st.stage] =
+                Some(format!("Completed in {}", format_elapsed(st.stage_started_at.elapsed())));
+        }
+    }
+
+    fn apply_timing(&self, card: &mut card::Card, st: &State) {
+        for (i, row) in card
+            .rows
+            .iter_mut()
+            .enumerate()
+        {
+            if let Some(output) = &st.stage_outputs[i]
+                && row.output.is_none()
+            {
+                row.output = Some(output.clone());
+            }
+            if i == st.stage
+                && matches!(row.status, crate::bench_summary::PlanTaskStatus::InProgress)
+                && let Some(details) = &row.details
+            {
+                row.details =
+                    Some(format!("{details} · {}", format_elapsed(st.stage_started_at.elapsed())));
+            }
+        }
+    }
+
+    /// Stream the semantic task updates when the card was started as a stream;
+    /// otherwise fall back to the legacy block post/update path. Non-fatal.
+    async fn upsert_stream_or_blocks(
+        &self,
+        blocks: &serde_json::Value,
+        chunks: &[crate::slack::stream::StreamChunk],
+        fallback: &str,
+    ) {
         let existing = self
             .state
             .lock()
             .await
             .plan_ts
             .clone();
-        match existing {
-            Some(ts) => {
-                if let Err(e) = self
-                    .client
-                    .update_blocks(&self.channel, &ts, blocks, &fallback)
-                    .await
-                {
-                    tracing::warn!(job_id = %self.job_id, error = ?e, "slack: plan update failed (non-fatal)");
+        if let Some(ts) = existing {
+            match self
+                .client
+                .append_stream(&self.channel, &ts, STREAM_NOOP_MARKDOWN, chunks)
+                .await
+            {
+                Ok(()) => return,
+                Err(e) => {
+                    if matches!(classify_stream_error(&e.to_string()), StreamFailure::NotStreaming)
+                    {
+                        tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream inactive; falling back to block update");
+                    } else {
+                        tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream append failed; falling back to block update");
+                    }
                 }
             }
-            None => {
-                match self
-                    .client
-                    .post_blocks_in_thread(&self.channel, &self.request_ts, blocks, &fallback)
-                    .await
-                {
-                    Ok(ts) => {
-                        self.state
-                            .lock()
-                            .await
-                            .plan_ts = Some(ts.clone());
-                        // Persist so a reclaimed job resumes this card. A failure
-                        // is non-fatal: a restart would post a fresh card.
-                        if let Err(e) = self
-                            .jobs
-                            .set_plan_message_ts(&self.job, &ts)
-                            .await
-                        {
-                            tracing::warn!(job_id = %self.job_id, error = ?e, "slack: persisting plan ts failed (non-fatal)");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(job_id = %self.job_id, error = ?e, "slack: plan post failed (non-fatal)")
+            self.update_blocks(&ts, blocks, fallback)
+                .await;
+        } else {
+            self.post_blocks(blocks, fallback)
+                .await;
+        }
+    }
+
+    async fn finish_stream_or_blocks(
+        &self,
+        blocks: &serde_json::Value,
+        chunks: &[crate::slack::stream::StreamChunk],
+        markdown_text: Option<&str>,
+        result_blocks: Option<&serde_json::Value>,
+    ) {
+        let existing = self
+            .state
+            .lock()
+            .await
+            .plan_ts
+            .clone();
+        if let Some(ts) = existing {
+            match self
+                .client
+                .stop_stream(&self.channel, &ts, markdown_text, chunks, result_blocks)
+                .await
+            {
+                Ok(()) => return,
+                Err(e) => {
+                    if matches!(classify_stream_error(&e.to_string()), StreamFailure::NotStreaming)
+                    {
+                        tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream inactive at terminal; falling back to block update");
+                    } else {
+                        tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream stop failed; falling back to block update");
                     }
                 }
+            }
+            self.update_blocks(&ts, blocks, markdown_text.unwrap_or("Benchmark finished"))
+                .await;
+        } else {
+            self.post_blocks(blocks, markdown_text.unwrap_or("Benchmark finished"))
+                .await;
+        }
+    }
+
+    async fn update_blocks(&self, ts: &str, blocks: &serde_json::Value, fallback: &str) {
+        if let Err(e) = self
+            .client
+            .update_blocks(&self.channel, ts, blocks, fallback)
+            .await
+        {
+            tracing::warn!(job_id = %self.job_id, error = ?e, "slack: plan update failed (non-fatal)");
+        }
+    }
+
+    /// Post the block fallback if we don't yet have a stream/card (persisting
+    /// its `ts` for resume-on-reclaim). Non-fatal.
+    async fn post_blocks(&self, blocks: &serde_json::Value, fallback: &str) {
+        let existing = self
+            .state
+            .lock()
+            .await
+            .plan_ts
+            .clone();
+        if let Some(ts) = existing {
+            self.update_blocks(&ts, blocks, fallback)
+                .await;
+            return;
+        }
+        match self
+            .client
+            .post_blocks_in_thread(&self.channel, &self.request_ts, blocks, fallback)
+            .await
+        {
+            Ok(ts) => {
+                self.state
+                    .lock()
+                    .await
+                    .plan_ts = Some(ts.clone());
+                // Persist so a reclaimed job resumes this card. A failure
+                // is non-fatal: a restart would post a fresh card.
+                if let Err(e) = self
+                    .jobs
+                    .set_plan_message_ts(&self.job, &ts)
+                    .await
+                {
+                    tracing::warn!(job_id = %self.job_id, error = ?e, "slack: persisting plan ts failed (non-fatal)");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %self.job_id, error = ?e, "slack: plan post failed (non-fatal)")
             }
         }
     }
@@ -248,12 +429,6 @@ impl SlackTimeline {
         {
             tracing::warn!(job_id = %self.job_id, error = ?e, "slack: adding terminal reaction failed (non-fatal)");
         }
-    }
-
-    fn short_commit(&self) -> &str {
-        self.commit
-            .get(..8)
-            .unwrap_or(&self.commit)
     }
 }
 
@@ -288,6 +463,8 @@ mod tests {
     struct FakeSlack {
         posts: StdMutex<Vec<String>>, // blocks json of each post_blocks_in_thread
         updates: StdMutex<Vec<String>>, // "{ts}:{blocks}" of each update_blocks
+        appends: StdMutex<Vec<String>>, // "{ts}:{chunks}" of each append_stream
+        stops: StdMutex<Vec<String>>, // "{ts}:{chunks}:{blocks?}" of each stop_stream
         added: StdMutex<Vec<String>>,
         removed: StdMutex<Vec<String>>,
     }
@@ -321,6 +498,39 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("{ts}:{blocks}"));
+            Ok(())
+        }
+        async fn append_stream(
+            &self,
+            _channel: &str,
+            ts: &str,
+            _markdown_text: &str,
+            chunks: &[crate::slack::stream::StreamChunk],
+        ) -> anyhow::Result<()> {
+            self.appends
+                .lock()
+                .unwrap()
+                .push(format!("{ts}:{}", serde_json::to_string(chunks).unwrap()));
+            Ok(())
+        }
+        async fn stop_stream(
+            &self,
+            _channel: &str,
+            ts: &str,
+            _markdown_text: Option<&str>,
+            chunks: &[crate::slack::stream::StreamChunk],
+            blocks: Option<&serde_json::Value>,
+        ) -> anyhow::Result<()> {
+            self.stops
+                .lock()
+                .unwrap()
+                .push(format!(
+                    "{ts}:{}:{}",
+                    serde_json::to_string(chunks).unwrap(),
+                    blocks
+                        .map(serde_json::Value::to_string)
+                        .unwrap_or_default()
+                ));
             Ok(())
         }
         async fn add_reaction(&self, _c: &str, _ts: &str, r: &str) -> anyhow::Result<()> {
@@ -504,29 +714,22 @@ mod tests {
             1,
             "only the first card is posted"
         );
-        let updates = slack.updates.lock().unwrap();
-        assert_eq!(updates.len(), 2, "advance(2) + completed (advance(1) was a no-op)");
+        let appends = slack.appends.lock().unwrap();
+        assert_eq!(appends.len(), 1, "advance(2) streamed (advance(1) was a no-op)");
+        assert!(appends[0].starts_with("PLAN_TS:"), "{appends:?}");
+        let stops = slack.stops.lock().unwrap();
+        assert_eq!(stops.len(), 1, "completed stops the stream");
+        // The completed stop carries the final result blocks + the download button.
+        assert!(stops[0].contains("\"type\":\"markdown\""), "{}", stops[0]);
+        assert!(stops[0].contains("## Benchmark Results"), "{}", stops[0]);
+        assert!(stops[0].contains("Download Profiler Data"), "{}", stops[0]);
+        assert!(stops[0].contains("\"style\":\"primary\""), "{}", stops[0]);
         assert!(
-            updates
-                .iter()
-                .all(|u| u.starts_with("PLAN_TS:")),
-            "{updates:?}"
-        );
-        // The completed update carries the results blocks + the download button.
-        assert!(updates[1].contains("\"type\":\"markdown\""), "{}", updates[1]);
-        assert!(updates[1].contains("## Benchmark Results"), "{}", updates[1]);
-        assert!(updates[1].contains("Download Profiler Data"), "{}", updates[1]);
-        assert!(updates[1].contains("\"style\":\"primary\""), "{}", updates[1]);
-        assert!(
-            !updates[1].contains("\"status\":\"in_progress\""),
+            !stops[0].contains("\"status\":\"in_progress\""),
             "all rows complete: {}",
-            updates[1]
+            stops[0]
         );
-        assert!(
-            updates[1].contains("Benchmark develop @ abcdef12"),
-            "terminal title: {}",
-            updates[1]
-        );
+        assert!(stops[0].contains("Benchmark develop @ abcdef12"), "terminal title: {}", stops[0]);
         // ⏳ → ✅ swap.
         assert_eq!(*slack.removed.lock().unwrap(), vec![QUEUED_REACTION.to_string()]);
         assert_eq!(*slack.added.lock().unwrap(), vec![COMPLETED_REACTION.to_string()]);
@@ -549,9 +752,22 @@ mod tests {
                 .is_empty(),
             "reclaim must not repost"
         );
-        let updates = slack.updates.lock().unwrap();
-        assert_eq!(updates.len(), 1);
-        assert!(updates[0].starts_with("OLD_TS:"), "resumes the persisted card: {}", updates[0]);
+        assert!(
+            slack
+                .updates
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a live stream resumes via append, not chat.update"
+        );
+        let appends = slack.appends.lock().unwrap();
+        assert_eq!(appends.len(), 1);
+        assert!(appends[0].starts_with("OLD_TS:"), "resumes the persisted stream: {}", appends[0]);
+        assert!(
+            appends[0].contains("\"type\":\"task_update\""),
+            "semantic task updates: {}",
+            appends[0]
+        );
         assert!(
             store
                 .persisted
@@ -559,6 +775,56 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "no re-persist on resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_completion_stops_stream_with_result_blocks() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
+
+        tl.started().await;
+        tl.completed(None, Some("https://s3/stacks-bench.db".into()))
+            .await;
+
+        assert!(
+            slack
+                .updates
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "no chat.update while streaming"
+        );
+        let stops = slack.stops.lock().unwrap();
+        assert_eq!(stops.len(), 1);
+        assert!(stops[0].starts_with("STREAM_TS:"), "{}", stops[0]);
+        assert!(stops[0].contains("\"type\":\"task_update\""), "{}", stops[0]);
+        assert!(
+            stops[0].contains("\"type\":\"markdown\""),
+            "results render as final bottom blocks: {}",
+            stops[0]
+        );
+        assert!(stops[0].contains("Download Profiler Data"), "{}", stops[0]);
+        assert_eq!(*slack.removed.lock().unwrap(), vec![QUEUED_REACTION.to_string()]);
+        assert_eq!(*slack.added.lock().unwrap(), vec![COMPLETED_REACTION.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stream_updates_are_debounced() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
+
+        tl.started().await;
+        tl.heartbeat().await;
+        tl.heartbeat().await;
+
+        let appends = slack.appends.lock().unwrap();
+        assert_eq!(
+            appends.len(),
+            2,
+            "started append + first heartbeat append; second heartbeat is debounced: {appends:?}",
         );
     }
 
@@ -573,8 +839,8 @@ mod tests {
         tl.failed("boom: VM died")
             .await;
 
-        let updates = slack.updates.lock().unwrap();
-        let last = updates.last().unwrap();
+        let stops = slack.stops.lock().unwrap();
+        let last = stops.last().unwrap();
         assert!(last.contains("\"status\":\"error\""), "an errored row: {last}");
         assert!(last.contains("Failed: boom: VM died"), "carries the reason: {last}");
         // The errored row shows `output` not italic details — that contract is
