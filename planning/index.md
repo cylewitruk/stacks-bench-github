@@ -42,13 +42,13 @@ need editing when an item's status or location changes.
 | `0022-report-surface-trait` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
 | `0023-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
 | `0024-slack-card-stage-timings` | Slack card stage timings | `planned` | [iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md) |
-| `0025-baseline-binary-cache` | Release-baseline binary cache | `in_progress` | [iterations/v9-baseline-binary-cache.md](iterations/v9-baseline-binary-cache.md) |
+| `0025-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
 | `0026-central-block-index-cache` | Central block/tx index cache | `backlog` | [backlog.md](backlog.md) |
 | `0027-fine-grained-progress` | Fine-grained bench progress | `backlog` | [backlog.md](backlog.md) |
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
-| `0031-reusable-build-jobs` | Reusable build jobs (artifact + target axis) | `in_progress` | [iterations/v11-reusable-build-jobs.md](iterations/v11-reusable-build-jobs.md) |
+| `0031-reusable-build-jobs` | Reusable build jobs (artifact + target axis) | `shipped` | [archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md) |
 | `0032-supersede-stale-pr-head-runs` | Supersede stale PR-head benchmarks | `backlog` | [backlog.md](backlog.md) |
 | `0033-slack-streamed-plan-updates` | Slack streamed plan updates | `planned` | [iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md) |
 
@@ -61,9 +61,9 @@ need editing when an item's status or location changes.
 | `v6-slack-live-timeline` | Slack live timeline | `shipped` | [archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md) |
 | `v7-reporting-surface` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
 | `v8-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
-| `v9-baseline-binary-cache` | Release-baseline binary cache | `in_progress` | [iterations/v9-baseline-binary-cache.md](iterations/v9-baseline-binary-cache.md) |
+| `v9-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
 | `v10-job-model-decomposition` | Job-model decomposition (source/intent/task/target axes) | `shipped` | [archive/completed/0005-task-kind-platform.md](archive/completed/0005-task-kind-platform.md) |
-| `v11-reusable-build-jobs` | Reusable build jobs (pin warming) | `in_progress` | [iterations/v11-reusable-build-jobs.md](iterations/v11-reusable-build-jobs.md) |
+| `v11-reusable-build-jobs` | Reusable build jobs (pin warming) | `shipped` | [archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md) |
 | `v12-slack-streamed-plan` | Slack streamed plan updates | `planned` | [iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md) |
 
 ## Decisions

@@ -363,9 +363,8 @@ reply on a Slack results card and/or the portal.
 Distinct from `0020` (which resolves bench *inputs*); this answers over
 *outputs*. Prompt / tooling design is its own design.
 
-*`0031-reusable-build-jobs` promoted → iteration **v11**
-([iterations/v11-reusable-build-jobs.md](iterations/v11-reusable-build-jobs.md));
-full scope + design live there.*
+*`0031-reusable-build-jobs` shipped (iteration v11, 2026-06) →
+[archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md).*
 
 *`0022-report-surface-trait` shipped (iteration v7, 2026-06) →
 [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md).*
