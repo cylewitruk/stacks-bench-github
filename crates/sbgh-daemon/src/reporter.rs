@@ -378,7 +378,9 @@ impl Reporter {
                     job_id = %self.job.id,
                     repo = %self.job.repository,
                     commit = %self.job.commit,
-                    "benchmark completed; persisting result",
+                    task_kind = ?self.job.task_kind,
+                    build_target = ?self.job.build_target,
+                    "job completed; persisting result",
                 );
                 if let Err(e) = self
                     .jobs
@@ -402,10 +404,12 @@ impl Reporter {
                 // powered off before phase=done, timeout, etc.).
                 tracing::error!(
                     job_id = %self.job.id,
+                    task_kind = ?self.job.task_kind,
+                    build_target = ?self.job.build_target,
                     finish_reason = ?summary.get("finish_reason"),
                     last_phase = ?summary.get("last_phase"),
                     error = %error,
-                    "benchmark failed",
+                    "job failed",
                 );
                 if let Err(e) = self
                     .jobs
