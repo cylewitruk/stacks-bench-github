@@ -145,6 +145,9 @@ Rules:
   result blocks.
 - `task_update` / `plan_update` fields are truncated under Slack's
   256-character chunk limit; detailed metrics stay in final blocks.
+- Stream task updates use `title` + `status` only. Slack appends `details`,
+  `output`, and `sources` across repeated updates for the same task id, so the
+  current subtext is folded into the title to keep the visible card clean.
 - `chat.appendStream` documents `markdown_text` as required, but the live API
   rejects `markdown_text` and `chunks` together. Chunk updates therefore send
   `chunks` only.

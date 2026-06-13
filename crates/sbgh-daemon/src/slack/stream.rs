@@ -52,24 +52,14 @@ pub struct TaskUpdate {
 impl TaskUpdate {
     pub fn from_row(id: impl Into<String>, row: &CardRow) -> Self {
         let terminal = matches!(row.status, PlanTaskStatus::Complete | PlanTaskStatus::Error);
+        let title = stream_row_title(row, terminal);
         Self {
             id: id.into(),
-            title: stream_text(&row.title),
+            title,
             status: row.status.into(),
-            details: (!terminal)
-                .then(|| row.details.clone())
-                .flatten()
-                .map(|s| stream_text(&s)),
-            output: terminal
-                .then(|| row.output.clone())
-                .flatten()
-                .map(|s| stream_text(&s)),
-            sources: row
-                .source
-                .as_ref()
-                .map(StreamSource::from)
-                .into_iter()
-                .collect(),
+            details: None,
+            output: None,
+            sources: Vec::new(),
         }
     }
 }
@@ -121,6 +111,14 @@ fn stream_text(s: &str) -> String {
     out
 }
 
+fn stream_row_title(row: &CardRow, terminal: bool) -> String {
+    let suffix = if terminal { row.output.as_deref() } else { row.details.as_deref() };
+    match suffix {
+        Some(suffix) => stream_text(&format!("{} · {suffix}", row.title)),
+        None => stream_text(&row.title),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamFailure {
     NotStreaming,
@@ -169,14 +167,8 @@ mod tests {
             json!({
                 "type": "task_update",
                 "id": "build",
-                "title": "Building benchmark binaries",
+                "title": "Building benchmark binaries · Building for 1m 02s",
                 "status": "in_progress",
-                "details": "Building for 1m 02s",
-                "sources": [{
-                    "type": "url",
-                    "text": "View commit",
-                    "url": "https://github.com/o/r/commit/abc",
-                }],
             })
         );
     }
@@ -195,9 +187,8 @@ mod tests {
             v,
             json!({
                 "id": "build",
-                "title": "Built benchmark binaries",
+                "title": "Built benchmark binaries · Built in 6m 04s",
                 "status": "complete",
-                "output": "Built in 6m 04s",
             })
         );
     }
@@ -231,15 +222,7 @@ mod tests {
         let task = TaskUpdate::from_row("run", &row);
         assert_eq!(task.title.chars().count(), STREAM_TEXT_LIMIT);
         assert!(task.title.ends_with('…'));
-        assert_eq!(
-            task.output
-                .unwrap()
-                .chars()
-                .count(),
-            STREAM_TEXT_LIMIT
-        );
-        let StreamSource::Url { text, url } = &task.sources[0];
-        assert_eq!(text.chars().count(), STREAM_TEXT_LIMIT);
-        assert_eq!(url, "https://example.test");
+        assert!(task.output.is_none());
+        assert!(task.sources.is_empty());
     }
 }
