@@ -27,12 +27,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sbgh_core::db::{PolicyStore, RepoStore};
+use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
+use sbgh_core::models::{
+    BuildTarget, GitRefKind, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail, TaskKind,
+};
 
 use crate::binary_cache::{BinaryCache, CacheEnvironment};
 use crate::libvirt::driver;
 use crate::libvirt::shell::{Shell, spec};
-use crate::pin_resolver::{RefKind, RemoteRef, commits_of, pinned_targets};
+use crate::pin_resolver::{PinnedTarget, RefKind, RemoteRef, commits_of, pinned_targets};
 
 /// Bound a whole recompute so a slow / hung `ls-remote` can't stall its caller
 /// (boot, or a job task's completion).
@@ -42,6 +45,14 @@ const RECOMPUTE_TIMEOUT_SECS: u64 = 30;
 /// [`Shell::run_bounded`]) so a hung remote can't leak a git process — distinct
 /// from the overall [`RECOMPUTE_TIMEOUT_SECS`], which bounds the slot.
 const LS_REMOTE_TIMEOUT_SECS: u64 = 20;
+
+/// Warm-retry cooldown (item 0031): once a warm build for a `(repo, commit,
+/// build_target)` fails/cancels and leaves the cache cold, don't re-enqueue it
+/// for this long. Without it, the after-each-job recompute would re-fire the
+/// same failing build forever (a bad pin → an endless one-at-a-time loop). A
+/// transient failure recovers on the first recompute past the window; a fuller
+/// retry policy (backoff / max attempts) is future work.
+const WARM_RETRY_COOLDOWN_HOURS: i64 = 6;
 
 /// Owns the deps + the **shared** cache `Arc` for recomputing the pinned set.
 /// The runner drives it on startup (before claiming) and after each job
@@ -53,6 +64,8 @@ pub struct PinManager {
     cache: Arc<BinaryCache>,
     policy_store: Arc<dyn PolicyStore>,
     repo_store: Arc<dyn RepoStore>,
+    /// v11 (item 0031): the store warming enqueues build-only jobs into.
+    jobs: Arc<dyn JobStore>,
     shell: Arc<dyn Shell>,
     git_binary: PathBuf,
     golden_image: PathBuf,
@@ -63,6 +76,7 @@ impl PinManager {
         cache: Arc<BinaryCache>,
         policy_store: Arc<dyn PolicyStore>,
         repo_store: Arc<dyn RepoStore>,
+        jobs: Arc<dyn JobStore>,
         shell: Arc<dyn Shell>,
         git_binary: PathBuf,
         golden_image: PathBuf,
@@ -71,6 +85,7 @@ impl PinManager {
             cache,
             policy_store,
             repo_store,
+            jobs,
             shell,
             git_binary,
             golden_image,
@@ -78,8 +93,9 @@ impl PinManager {
     }
 
     /// Best-effort, timeout-bounded recompute against the current refs. Derives
-    /// the daemon's current build environment from the golden image, then runs
-    /// [`recompute_pins`]. Logs + swallows everything (never propagates): a
+    /// the daemon's current build environment from the golden image, runs
+    /// [`recompute_pins`] (protect), then [`warm_missing`] (warm) over the same
+    /// resolved target set. Logs + swallows everything (never propagates): a
     /// slow `ls-remote` is bounded so it can't stall the caller.
     pub async fn recompute(&self, now: DateTime<Utc>) {
         let Some(env) = driver::current_cache_environment(&self.golden_image) else {
@@ -97,25 +113,37 @@ impl PinManager {
             &env,
             now,
         );
-        match tokio::time::timeout(Duration::from_secs(RECOMPUTE_TIMEOUT_SECS), fut).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "pin recompute failed (best-effort)"),
-            Err(_) => tracing::warn!(
-                secs = RECOMPUTE_TIMEOUT_SECS,
-                "pin recompute timed out (best-effort)"
-            ),
-        }
+        let targets =
+            match tokio::time::timeout(Duration::from_secs(RECOMPUTE_TIMEOUT_SECS), fut).await {
+                Ok(Ok(targets)) => targets,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "pin recompute failed (best-effort)");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        secs = RECOMPUTE_TIMEOUT_SECS,
+                        "pin recompute timed out (best-effort)"
+                    );
+                    return;
+                }
+            };
+        // Warm any pinned ref whose binary the protect pass found missing
+        // (resolve once → protect → warm). Local DB work, no network — not
+        // inside the `ls-remote` timeout.
+        warm_missing(self.jobs.as_ref(), self.cache.as_ref(), &targets, &env, now).await;
     }
 }
 
 /// Recompute the pinned set against the **current** remote refs and apply it to
 /// `cache`: resolve each distinct pinned repo's refs (`ls-remote`), pin the
-/// matching entries under `env`, then re-evaluate the budget. `env` is the
-/// daemon's current build environment (see
+/// matching entries under `env`, then re-evaluate the budget. Returns the
+/// resolved `PinnedTarget`s so the caller can warm them (see
+/// [`warm_missing`]). `env` is the daemon's current build environment (see
 /// [`driver::current_cache_environment`]) — only same-environment entries get
 /// pinned. **All-or-nothing:** if any pinned repo can't be resolved, returns
-/// `Ok(())` *without* mutating pins (the existing set is preserved). Errors
-/// only on a store failure.
+/// `Ok(Vec::new())` *without* mutating pins (the existing set is preserved, and
+/// nothing is warmed). Errors only on a store failure.
 pub async fn recompute_pins(
     cache: &BinaryCache,
     policy_store: &dyn PolicyStore,
@@ -124,7 +152,7 @@ pub async fn recompute_pins(
     git_binary: &Path,
     env: &CacheEnvironment,
     now: DateTime<Utc>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<PinnedTarget>> {
     let policies = policy_store
         .list_pinned_triggers()
         .await?;
@@ -152,7 +180,7 @@ pub async fn recompute_pins(
                 "pin resolver: repo identity not found; preserving the existing pin set \
                  (recompute skipped)"
             );
-            return Ok(());
+            return Ok(Vec::new());
         };
         let url = format!("https://github.com/{}/{}.git", repo.owner, repo.name);
         let Some(repo_refs) = ls_remote_refs(shell, git_binary, repo_id, &url).await else {
@@ -162,7 +190,7 @@ pub async fn recompute_pins(
                 "pin resolver: could not resolve refs; preserving the existing pin set \
                  (recompute skipped)"
             );
-            return Ok(());
+            return Ok(Vec::new());
         };
         refs.extend(repo_refs);
     }
@@ -176,7 +204,110 @@ pub async fn recompute_pins(
         pinned_commits = commits.len(),
         "pin resolver: recomputed pinned set"
     );
-    Ok(())
+    Ok(targets)
+}
+
+/// Map a resolved ref's kind to the `job`-table ref-kind axis.
+fn git_ref_kind(kind: RefKind) -> GitRefKind {
+    match kind {
+        RefKind::Branch => GitRefKind::Branch,
+        RefKind::Tag => GitRefKind::Tag,
+    }
+}
+
+/// Pin warming (item `0031`, v11): for each resolved pinned target whose binary
+/// is **missing** from the cache and which isn't already building (or only
+/// recently failed — the [`WARM_RETRY_COOLDOWN_HOURS`] cooldown), enqueue a
+/// silent build-only job (`source=daemon`, `intent=cache_warm`,
+/// `task_kind=build_only`, `build_target=stacks_bench`). Best-effort — a
+/// per-job store error is logged and skipped, never failing the recompute.
+///
+/// Today the only `build_target` is `stacks-bench`. The dedup is per
+/// `(repo, commit, build_target)` (the build job's own slice of the queue); the
+/// cache itself is commit-keyed (repo-agnostic), so a build at a commit warms
+/// every repo's pin at that commit — an in-pass `seen` set avoids enqueuing the
+/// same commit twice when two repos pin it.
+async fn warm_missing(
+    jobs: &dyn JobStore,
+    cache: &BinaryCache,
+    targets: &[PinnedTarget],
+    env: &CacheEnvironment,
+    now: DateTime<Utc>,
+) {
+    let build_target = BuildTarget::StacksBench;
+    // A warm that failed/cancelled at or after this instant is still in cooldown.
+    let failed_since = now - chrono::Duration::hours(WARM_RETRY_COOLDOWN_HOURS);
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut enqueued = 0usize;
+    for t in targets {
+        // Already warm: the cache holds a binary for this commit + environment.
+        if cache.has_entry_for(&t.commit, env) {
+            continue;
+        }
+        // Same commit already enqueued earlier this pass (two repos pinning it).
+        if seen.contains(&t.commit) {
+            continue;
+        }
+        // Already building, or recently failed (within the retry cooldown), for
+        // this repo — don't enqueue a duplicate or hammer a failing build.
+        match jobs
+            .recent_build_attempt(t.repo_id, &t.commit, build_target, failed_since)
+            .await
+        {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, repo_id = t.repo_id, commit = %t.commit, "warming: build dedup query failed; skipping");
+                continue;
+            }
+        }
+
+        let new_job = NewJob {
+            github_installation_id: t.installation_id,
+            github_repo_id: t.repo_id,
+            axes: JobAxes {
+                source: JobSource::Daemon,
+                intent: JobIntent::CacheWarm,
+                task_kind: TaskKind::BuildOnly,
+                build_target,
+            },
+            git_ref_kind: git_ref_kind(t.ref_kind),
+            git_ref_display: t.ref_name.clone(),
+            git_commit_hash: Some(t.commit.clone()),
+            git_committed_at: None,
+            workload_key: None,
+        };
+        let detail = serde_json::to_value(QueuedEventDetail::CacheWarm {
+            trigger_id: t.trigger_id,
+            git_ref: t.ref_name.clone(),
+            commit: t.commit.clone(),
+            build_target,
+        })
+        .expect("QueuedEventDetail::CacheWarm serializes");
+
+        match jobs
+            .create_unlinked_job(&new_job, &detail)
+            .await
+        {
+            Ok(job) => {
+                seen.insert(t.commit.clone());
+                enqueued += 1;
+                tracing::info!(
+                    job_id = %job.id,
+                    repo_id = t.repo_id,
+                    git_ref = %t.ref_name,
+                    commit = %t.commit,
+                    "warming: enqueued build-only job for an uncached pinned ref"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, repo_id = t.repo_id, commit = %t.commit, "warming: failed to enqueue build-only job");
+            }
+        }
+    }
+    if enqueued > 0 {
+        tracing::info!(enqueued, "warming: enqueued build-only jobs this recompute");
+    }
 }
 
 /// Run `git ls-remote <repo_url>` and parse its refs. `None` signals a
@@ -278,9 +409,12 @@ fn parse_ls_remote(repo_id: i64, stdout: &str) -> Vec<RemoteRef> {
 mod tests {
     use std::collections::HashSet;
 
-    use sbgh_core::db::{InMemoryPolicyStore, InMemoryRepoStore};
-    use sbgh_core::models::{TriggerKind, TriggerMatchSpec};
+    use sbgh_core::db::{InMemoryJobStore, InMemoryPolicyStore, InMemoryRepoStore, JobFailure};
+    use sbgh_core::models::{
+        BuildTarget, JobIntent, JobSource, TaskKind, TriggerKind, TriggerMatchSpec,
+    };
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     use super::*;
     use crate::binary_cache::BinaryCache;
@@ -534,6 +668,7 @@ mod tests {
             cache.clone(),
             policy_store,
             repo_store,
+            Arc::new(InMemoryJobStore::new()),
             shell,
             PathBuf::from("/usr/bin/git"),
             golden,
@@ -549,5 +684,138 @@ mod tests {
                 .pinned,
             "PinManager recompute derives the env + pins the matching entry"
         );
+    }
+
+    // ─── v11 (0031) pin warming ───────────────────────────────────────────
+
+    fn warm_target(commit: &str) -> PinnedTarget {
+        PinnedTarget {
+            trigger_id: 7,
+            installation_id: 1,
+            repo_id: 10,
+            ref_kind: RefKind::Branch,
+            ref_name: "develop".into(),
+            commit: commit.into(),
+            bench_args: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_missing_enqueues_build_only_for_uncached_pin() {
+        let tmp = TempDir::new().unwrap();
+        let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
+        let env = test_env();
+        let jobs = InMemoryJobStore::new();
+
+        warm_missing(&jobs, &cache, &[warm_target("c-cold")], &env, at("2026-06-01T00:00:00Z"))
+            .await;
+
+        let all = jobs.all_jobs();
+        assert_eq!(all.len(), 1, "one build-only job enqueued for the uncached pin");
+        let job = &all[0];
+        assert_eq!(job.source, JobSource::Daemon);
+        assert_eq!(job.intent, JobIntent::CacheWarm);
+        assert_eq!(job.task_kind, TaskKind::BuildOnly);
+        assert_eq!(job.build_target, BuildTarget::StacksBench);
+        assert_eq!(job.git_commit_hash.as_deref(), Some("c-cold"));
+        assert_eq!(job.git_ref_display, "develop");
+    }
+
+    #[tokio::test]
+    async fn warm_missing_skips_cached_pin() {
+        let tmp = TempDir::new().unwrap();
+        let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
+        let env = test_env();
+        // The cache already holds a binary for c-warm.
+        let bin = tmp.path().join("bin");
+        std::fs::write(&bin, vec![1u8; 64]).unwrap();
+        let fp = env.fingerprint("c-warm".into(), "1.95.0".into());
+        cache
+            .publish(&fp, &bin, 10, false)
+            .unwrap();
+
+        let jobs = InMemoryJobStore::new();
+        warm_missing(&jobs, &cache, &[warm_target("c-warm")], &env, at("2026-06-01T00:00:00Z"))
+            .await;
+
+        assert!(jobs.all_jobs().is_empty(), "a cached pin must not enqueue a warming build");
+    }
+
+    #[tokio::test]
+    async fn warm_missing_skips_in_flight_build() {
+        let tmp = TempDir::new().unwrap();
+        let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
+        let env = test_env();
+        let jobs = InMemoryJobStore::new();
+
+        // First pass enqueues a build-only job for the uncached pin.
+        warm_missing(&jobs, &cache, &[warm_target("c-cold")], &env, at("2026-06-01T00:00:00Z"))
+            .await;
+        assert_eq!(jobs.all_jobs().len(), 1);
+
+        // A second pass while the build is still in-flight (uncached, not yet
+        // published) must NOT enqueue a duplicate.
+        warm_missing(&jobs, &cache, &[warm_target("c-cold")], &env, at("2026-06-01T00:00:00Z"))
+            .await;
+        assert_eq!(
+            jobs.all_jobs().len(),
+            1,
+            "an in-flight build-only job dedups the next warming pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_missing_respects_failed_cooldown() {
+        let tmp = TempDir::new().unwrap();
+        let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
+        let env = test_env();
+        let jobs = InMemoryJobStore::new();
+
+        // Enqueue a warm build, then drive it to a terminal FAILURE (the cache
+        // stays cold — the fail-closed build-only contract).
+        warm_missing(&jobs, &cache, &[warm_target("c-fail")], &env, at("2026-06-01T00:00:00Z"))
+            .await;
+        let job_id = jobs.all_jobs()[0].id;
+        let claimed = jobs
+            .claim_next_queued(Uuid::new_v4())
+            .await
+            .unwrap()
+            .unwrap();
+        let token = claimed
+            .claim_token
+            .expect("claimed job carries a token");
+        jobs.mark_running(job_id, token, None)
+            .await
+            .unwrap();
+        jobs.fail_job(&JobFailure {
+            job_id,
+            claim_token: token,
+            result: None,
+            remark: "build failed".into(),
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+        let after_fail = Utc::now();
+
+        // Within the cooldown: the recent failure blocks a re-enqueue — without
+        // this guard the after-each-job recompute would retry it forever.
+        warm_missing(&jobs, &cache, &[warm_target("c-fail")], &env, after_fail).await;
+        assert_eq!(
+            jobs.all_jobs().len(),
+            1,
+            "a warm that just failed must not be retried immediately"
+        );
+
+        // Past the cooldown: warming retries the failed build once.
+        warm_missing(
+            &jobs,
+            &cache,
+            &[warm_target("c-fail")],
+            &env,
+            after_fail + chrono::Duration::hours(WARM_RETRY_COOLDOWN_HOURS + 1),
+        )
+        .await;
+        assert_eq!(jobs.all_jobs().len(), 2, "past the cooldown, warming retries the failed build");
     }
 }

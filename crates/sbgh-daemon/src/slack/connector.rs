@@ -121,7 +121,7 @@ impl SlackConnector {
 
         let job = match self
             .jobs
-            .create_adhoc_job(&new_job, &detail)
+            .create_unlinked_job(&new_job, &detail)
             .await
         {
             Ok(job) => job,

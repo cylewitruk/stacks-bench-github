@@ -235,17 +235,18 @@ impl JobStore for PostgresJobStore {
         })))
     }
 
-    async fn create_adhoc_job(
+    async fn create_unlinked_job(
         &self,
         new_job: &NewJob,
         queued_event_detail: &serde_json::Value,
     ) -> Result<Job> {
         // One transaction: job insert → queued event. No webhook/user/PR links
-        // (an ad-hoc Slack trigger has no GitHub subject) and no idempotency
-        // guard (see the trait docs). A failure on either insert rolls back.
+        // (a non-webhook trigger — Slack ad-hoc or daemon warming — has no GitHub
+        // subject) and no idempotency guard (see the trait docs). A failure on
+        // either insert rolls back.
         let mut tx = self.pool.begin().await?;
 
-        // v10 (0005): jobs carry the axes natively — set by the connector.
+        // v10 (0005): jobs carry the axes natively — set by the caller.
         let job: Job = sqlx::query_as(
             r#"
             INSERT INTO job
@@ -621,6 +622,42 @@ impl JobStore for PostgresJobStore {
         .bind(commit)
         .bind(source)
         .bind(workload_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    async fn recent_build_attempt(
+        &self,
+        github_repo_id: i64,
+        commit: &str,
+        build_target: crate::models::BuildTarget,
+        failed_since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Uuid>> {
+        // v11 (0031): build-only warm dedup — keyed on the job-model `task_kind`
+        // + `build_target` axes (a build job has no `workload_key`). Matches an
+        // active build OR one that failed/cancelled within the retry cooldown
+        // (`updated_at >= failed_since`), so a persistently-failing warm isn't
+        // re-enqueued on every recompute.
+        let id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id
+              FROM job
+             WHERE github_repo_id = $1
+               AND git_commit_hash = $2
+               AND task_kind = 'build_only'
+               AND build_target = $3
+               AND (
+                     status IN ('queued', 'claimed', 'running')
+                  OR (status IN ('failed', 'cancelled') AND updated_at >= $4)
+               )
+             LIMIT 1
+            "#,
+        )
+        .bind(github_repo_id)
+        .bind(commit)
+        .bind(build_target)
+        .bind(failed_since)
         .fetch_optional(&self.pool)
         .await?;
         Ok(id)

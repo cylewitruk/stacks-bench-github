@@ -134,10 +134,10 @@ async fn v10_create_job_with_links_writes_derived_axes() {
     );
 }
 
-/// `create_adhoc_job` (transactional) — a Slack ad-hoc (the SlackConnector
+/// `create_unlinked_job` (transactional) — a Slack ad-hoc (the SlackConnector
 /// shape).
 #[tokio::test]
-async fn v10_create_adhoc_job_writes_derived_axes() {
+async fn v10_create_unlinked_job_writes_derived_axes() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresJobStore::new(pool.clone());
@@ -146,7 +146,7 @@ async fn v10_create_adhoc_job_writes_derived_axes() {
         "trigger": "slack_adhoc", "channel": "C1", "message_ts": "1", "bench_args": []
     });
     let job = store
-        .create_adhoc_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)
+        .create_unlinked_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)
         .await
         .unwrap();
 

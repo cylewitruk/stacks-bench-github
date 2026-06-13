@@ -200,9 +200,15 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // The runner claims from the `job` family and posts PR comments for
-    // `pr_comment` jobs.
-    let runnable_jobs: Arc<dyn RunnableJobStore> =
-        Arc::new(JobSource::new(jobs_store, repo_store, pull_request_store, artifact_store));
+    // `pr_comment` jobs. `jobs_store` is also handed to the pin manager (v11
+    // warming enqueues build-only jobs through the raw `JobStore`), so clone the
+    // `Arc` before it moves into the `JobSource`.
+    let runnable_jobs: Arc<dyn RunnableJobStore> = Arc::new(JobSource::new(
+        jobs_store.clone(),
+        repo_store,
+        pull_request_store,
+        artifact_store,
+    ));
 
     // API server (roadmap-v3 Phase 2). Operator `admin` token is a cookie
     // regenerated each boot; the handler's `ingest` token comes from
@@ -249,8 +255,10 @@ async fn main() -> anyhow::Result<()> {
     // Binary-cache pin recompute (item 0025, v9 Phase 2): the runner recomputes
     // pins on startup (before claiming) + after each completed job, sharing the
     // driver's cache `Arc` so publish / re-pin / evict coordinate under one
-    // mutex. A no-op when the cache is disabled.
-    runner = runner.with_pin_recompute(pin_policy_store, pin_repo_store, shell);
+    // mutex. A no-op when the cache is disabled. v11 (0031): the same recompute
+    // also warms — enqueues build-only jobs for uncached pinned refs via
+    // `jobs_store`.
+    runner = runner.with_pin_recompute(pin_policy_store, pin_repo_store, jobs_store, shell);
 
     // Lifecycle shutdown (roadmap-v5 Phase 4B): a `SIGINT` drains (stop
     // claiming, finish in-flight), a second `SIGINT` or `SIGTERM` aborts. The

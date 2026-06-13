@@ -32,7 +32,8 @@ pub struct ResolvedBenchArgs {
 
 /// Normalize a queued event's stored bench args to a token vec. `pr_comment`
 /// carries a token vec directly; `branch_push`/`tag_created` carry a single
-/// optional string split on whitespace; a `None` string yields no tokens.
+/// optional string split on whitespace; a `None` string yields no tokens;
+/// `cache_warm` is a build-only job with no bench input → no tokens.
 pub fn normalize_stored(detail: &QueuedEventDetail) -> Vec<String> {
     match detail {
         // `pr_comment` and `slack_adhoc` carry a token vec directly.
@@ -47,6 +48,8 @@ pub fn normalize_stored(detail: &QueuedEventDetail) -> Vec<String> {
                     .collect()
             })
             .unwrap_or_default(),
+        // `cache_warm` is a build-only job — it runs no benchmark, so no args.
+        QueuedEventDetail::CacheWarm { .. } => Vec::new(),
     }
 }
 
@@ -144,6 +147,21 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
         }
+    }
+
+    fn cache_warm() -> QueuedEventDetail {
+        QueuedEventDetail::CacheWarm {
+            trigger_id: 3,
+            git_ref: "release/3.2".into(),
+            commit: "abc123".into(),
+            build_target: crate::models::BuildTarget::StacksBench,
+        }
+    }
+
+    #[test]
+    fn normalize_cache_warm_has_no_args() {
+        // A build-only warming job runs no benchmark → no tokens.
+        assert!(normalize_stored(&cache_warm()).is_empty());
     }
 
     #[test]

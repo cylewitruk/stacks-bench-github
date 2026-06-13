@@ -169,20 +169,18 @@ pub trait JobStore: Send + Sync + 'static {
         request: &JobCreationRequest,
     ) -> Result<JobCreationOutcome>;
 
-    /// v5 (item 0002): create an **ad-hoc** job with no GitHub webhook/PR
-    /// subject — the Slack trigger. Inserts the `job` row + its queued
-    /// `job_event` (carrying the `SlackAdhoc` provenance) in one transaction,
-    /// returning the inserted job.
+    /// Create a job with **no GitHub webhook/PR/owner links** — a non-webhook
+    /// trigger (v5 Slack ad-hoc, or v11 daemon `cache_warm` warming). Inserts
+    /// the `job` row + its queued `job_event` (carrying the provenance
+    /// detail) in one transaction, returning the inserted job.
     ///
     /// Deliberately **separate** from
     /// [`create_job_with_links`](Self::create_job_with_links) so the GitHub
     /// webhook path is untouched: there's no webhook link and **no
-    /// webhook-keyed idempotency**. An ad-hoc trigger has no at-least-once
-    /// inbox behind it — the connector acks the Slack socket envelope
-    /// before enqueuing, so a redelivery can't double-fire — making this a
-    /// plain create. (At-most- once is the right semantic for an ad-hoc
-    /// profile: a lost request is simply re-issued by the user.)
-    async fn create_adhoc_job(
+    /// webhook-keyed idempotency**. These triggers have no at-least-once inbox
+    /// behind them — a Slack envelope is acked before enqueuing, and warming
+    /// dedups itself against in-flight builds — making this a plain create.
+    async fn create_unlinked_job(
         &self,
         new_job: &NewJob,
         queued_event_detail: &serde_json::Value,
@@ -288,6 +286,33 @@ pub trait JobStore: Send + Sync + 'static {
         commit: &str,
         source: crate::models::JobSource,
         workload_key: &str,
+    ) -> Result<Option<Uuid>>;
+
+    /// v11 (item 0031): is there a **build-only** job for `(github_repo_id,
+    /// commit, build_target)` that should **block a new warm enqueue** — either
+    /// active (queued/claimed/running) OR a **recent terminal failure**
+    /// (failed/cancelled with `updated_at >= failed_since`)?
+    ///
+    /// Pin warming uses it to dedup: an active build avoids a duplicate, and
+    /// the recent-failure window is the **warm-retry cooldown** — a build
+    /// that fails and leaves the cache cold becomes terminal, so an
+    /// active-only check would let the after-each-job recompute re-enqueue
+    /// it forever (an endless one-at-a-time retry loop). `completed` builds
+    /// are NOT matched: a success caches the binary (the cache check then
+    /// skips it), and if that entry is later evicted, re-warming is
+    /// correct.
+    ///
+    /// Deliberately **separate** from
+    /// [`find_active_job`](Self::find_active_job) — a build job carries no
+    /// `workload_key` (measurement-specific), so it keys on `task_kind =
+    /// build_only` + `build_target`. Best-effort check-then-insert, same
+    /// caveat as `find_active_job`.
+    async fn recent_build_attempt(
+        &self,
+        github_repo_id: i64,
+        commit: &str,
+        build_target: crate::models::BuildTarget,
+        failed_since: DateTime<Utc>,
     ) -> Result<Option<Uuid>>;
 
     /// roadmap-v7: find the baseline a PR run should be compared against.

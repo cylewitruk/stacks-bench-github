@@ -289,14 +289,14 @@ impl JobStore for InMemoryJobStore {
         })))
     }
 
-    async fn create_adhoc_job(
+    async fn create_unlinked_job(
         &self,
         new_job: &NewJob,
         queued_event_detail: &serde_json::Value,
     ) -> Result<Job> {
         let now = Utc::now();
         let job_id = Uuid::new_v4();
-        // v10 (0005): jobs carry the axes natively — set by the connector.
+        // v10 (0005): jobs carry the axes natively — set by the caller.
         let job = Job {
             id: job_id,
             github_installation_id: new_job.github_installation_id,
@@ -594,6 +594,30 @@ impl JobStore for InMemoryJobStore {
                         j.status,
                         JobStatus::Queued | JobStatus::Claimed | JobStatus::Running
                     )
+            })
+            .map(|j| j.id))
+    }
+
+    async fn recent_build_attempt(
+        &self,
+        github_repo_id: i64,
+        commit: &str,
+        build_target: crate::models::BuildTarget,
+        failed_since: chrono::DateTime<Utc>,
+    ) -> Result<Option<Uuid>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.jobs
+            .values()
+            .find(|j| {
+                j.github_repo_id == github_repo_id
+                    && j.git_commit_hash.as_deref() == Some(commit)
+                    && j.task_kind == crate::models::TaskKind::BuildOnly
+                    && j.build_target == build_target
+                    && (matches!(
+                        j.status,
+                        JobStatus::Queued | JobStatus::Claimed | JobStatus::Running
+                    ) || (matches!(j.status, JobStatus::Failed | JobStatus::Cancelled)
+                        && j.updated_at >= failed_since))
             })
             .map(|j| j.id))
     }

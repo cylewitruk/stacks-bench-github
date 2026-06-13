@@ -40,11 +40,11 @@ fn make_request(webhook_id: i64) -> JobCreationRequest {
     }
 }
 
-/// v5 (item 0002): in-memory parity for `create_adhoc_job` (the store the Slack
-/// connector tests use) — a webhook-less queued job whose queued event carries
-/// the `SlackAdhoc` provenance, with no webhook link.
+/// v5 (item 0002): in-memory parity for `create_unlinked_job` (the store the
+/// Slack connector tests use) — a webhook-less queued job whose queued event
+/// carries the `SlackAdhoc` provenance, with no webhook link.
 #[tokio::test]
-async fn create_adhoc_job_is_webhook_less_and_preserves_detail() {
+async fn create_unlinked_job_is_webhook_less_and_preserves_detail() {
     let store = InMemoryJobStore::new();
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
@@ -64,7 +64,7 @@ async fn create_adhoc_job_is_webhook_less_and_preserves_detail() {
     };
 
     let job = store
-        .create_adhoc_job(&new_job, &detail)
+        .create_unlinked_job(&new_job, &detail)
         .await
         .unwrap();
     assert_eq!(job.status, JobStatus::Queued);

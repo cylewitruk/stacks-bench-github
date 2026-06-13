@@ -18,9 +18,10 @@ use sbgh_core::db::{
     PostgresJobStore, setup_pg_db,
 };
 use sbgh_core::models::{
-    GitRefKind, GithubAccountType, JobAxes, JobCreationRequest, JobEventKind, JobEventStatus,
-    JobKind, JobMetric, JobResult, JobSource, JobStatus, NewJob, NewJobEvent, NewPullRequestLink,
-    QueuedEventDetail, ResolvedCommit, TerminalJobStatus, TriggerKind,
+    BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobCreationRequest, JobEventKind,
+    JobEventStatus, JobIntent, JobKind, JobMetric, JobResult, JobSource, JobStatus, NewJob,
+    NewJobEvent, NewPullRequestLink, QueuedEventDetail, ResolvedCommit, TaskKind,
+    TerminalJobStatus, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -108,12 +109,12 @@ async fn trigger_kind_slack_adhoc_round_trips() {
     assert_eq!(round, TriggerKind::SlackAdhoc);
 }
 
-/// v5 (item 0002): `create_adhoc_job` inserts a webhook-less queued job + its
-/// queued `job_event` (carrying the `SlackAdhoc` provenance) in one
+/// v5 (item 0002): `create_unlinked_job` inserts a webhook-less queued job +
+/// its queued `job_event` (carrying the `SlackAdhoc` provenance) in one
 /// transaction, with **no** `github_webhook_job` link — the non-webhook trigger
 /// entry path, kept separate from the GitHub webhook flow.
 #[tokio::test]
-async fn create_adhoc_job_inserts_queued_job_and_event_without_webhook() {
+async fn create_unlinked_job_inserts_queued_job_and_event_without_webhook() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresJobStore::new(pool.clone());
@@ -136,7 +137,7 @@ async fn create_adhoc_job_inserts_queued_job_and_event_without_webhook() {
     };
 
     let job = store
-        .create_adhoc_job(&new_job, &detail)
+        .create_unlinked_job(&new_job, &detail)
         .await
         .unwrap();
     assert_eq!(job.status, JobStatus::Queued);
@@ -171,6 +172,85 @@ async fn create_adhoc_job_inserts_queued_job_and_event_without_webhook() {
     assert!(
         matches!(parsed, QueuedEventDetail::SlackAdhoc { channel, .. } if channel == "C123"),
         "queued event carries the SlackAdhoc detail"
+    );
+}
+
+/// v11 (item 0031): `create_unlinked_job` is the webhook-less path **warming**
+/// rides — a build-only job with daemon axes (`source=daemon`,
+/// `intent=cache_warm`, `task_kind=build_only`, `build_target=stacks_bench`)
+/// and a `CacheWarm` provenance detail, with no webhook/PR/owner links.
+#[tokio::test]
+async fn create_unlinked_job_writes_build_only_cache_warm() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+
+    let detail = serde_json::to_value(QueuedEventDetail::CacheWarm {
+        trigger_id: 7,
+        git_ref: "release/3.2".into(),
+        commit: "abc123".into(),
+        build_target: BuildTarget::StacksBench,
+    })
+    .unwrap();
+    let new_job = NewJob {
+        github_installation_id: 100,
+        github_repo_id: 10,
+        axes: JobAxes {
+            source: JobSource::Daemon,
+            intent: JobIntent::CacheWarm,
+            task_kind: TaskKind::BuildOnly,
+            build_target: BuildTarget::StacksBench,
+        },
+        git_ref_kind: GitRefKind::Branch,
+        git_ref_display: "release/3.2".into(),
+        git_commit_hash: Some("abc123".into()),
+        git_committed_at: None,
+        workload_key: None,
+    };
+
+    let job = store
+        .create_unlinked_job(&new_job, &detail)
+        .await
+        .unwrap();
+
+    assert_eq!(job.source, JobSource::Daemon);
+    assert_eq!(job.intent, JobIntent::CacheWarm);
+    assert_eq!(job.task_kind, TaskKind::BuildOnly);
+    assert_eq!(job.build_target, BuildTarget::StacksBench);
+    assert_eq!(job.status, JobStatus::Queued);
+
+    // No webhook/PR/owner links — daemon warming has no GitHub subject.
+    let webhook_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM github_webhook_job WHERE job_id = $1")
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(webhook_count, 0, "a warming job must have no webhook link");
+
+    // The CacheWarm provenance round-trips for the audit trail.
+    let queued = store
+        .queued_event(job.id)
+        .await
+        .unwrap()
+        .expect("warming job has a queued event");
+    let parsed: QueuedEventDetail = serde_json::from_value(
+        queued
+            .detail
+            .expect("queued event carries detail")
+            .0,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            parsed,
+            QueuedEventDetail::CacheWarm {
+                trigger_id: 7,
+                build_target: BuildTarget::StacksBench,
+                ..
+            }
+        ),
+        "queued event carries the CacheWarm provenance",
     );
 }
 

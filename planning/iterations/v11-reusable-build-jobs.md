@@ -7,12 +7,37 @@ measurement, no GitHub check. Canonical item:
 [`0031-reusable-build-jobs`](../design/0031-reusable-build-jobs.md), re-cast onto
 v10's shipped axes.
 
-> **Status:** in_progress — **Phase 0 settled (Codex-reviewed); Phase 1 next.** v10
-> shipped the build-only **run** path (`task_kind=build_only` → `BuildOnlyRecipe`,
-> `Silent` reporting, fail-closed cache contract, `(task_kind, build_target)`
-> dispatch). v11 is the **enqueue side + planner** — a thin consumer. It also
-> closes v10's one deferred host-validation: the first warming run is the on-host
-> proof that a freshly-built binary lands in the real cache.
+> **Status:** in_progress — **Phases 1–2 implemented, staged for review** (engine
+> + tests, 821 green + lint-clean); **Phase 3 (host-validation) pending** the
+> Hetzner host. v10 shipped the build-only **run** path (`task_kind=build_only` →
+> `BuildOnlyRecipe`, `Silent` reporting, fail-closed cache contract,
+> `(task_kind, build_target)` dispatch). v11 is the **enqueue side + planner** — a
+> thin consumer. Phase 3 also closes v10's one deferred host-validation: the first
+> warming run is the on-host proof that a freshly-built binary lands in the real
+> cache.
+>
+> **Notes for review:**
+> 1. **Warm-retry cooldown (Codex Medium, fixed).** A warm build that fails leaves
+>    the cache cold and is terminal, so an active-only dedup would let the
+>    after-each-job recompute re-enqueue it forever. The dedup
+>    (`JobStore::recent_build_attempt`) now also skips a `(repo, commit,
+>    build_target)` that **failed/cancelled within `WARM_RETRY_COOLDOWN_HOURS`**
+>    (6h) — DB-backed, so it survives restart. A fuller retry policy (backoff /
+>    max attempts) is future work.
+> 2. **Per-repo build dedup vs repo-agnostic cache.** Per Codex's settled call,
+>    the dedup keys on `(repo_id, commit, build_target)`. But the cache is
+>    **commit-keyed** (repo-agnostic), so two repos pinning the same commit could
+>    each enqueue a build across passes (an in-pass `seen` set dedups within one
+>    pass). Harmless — the commit-keyed cache no-ops the second publish — but a
+>    repo-agnostic dedup `(commit, build_target)` would fully prevent it.
+> 3. **Warming + inline-build overlap (OQ2).** A measurement job still builds
+>    inline on a cache miss even if warming enqueued a build for the same commit;
+>    both build, the cache de-dups the publish. The accepted "keep inline" call
+>    (enqueue-and-wait deferred to `0004`).
+> 4. **Warming is always-on when the cache + pins exist** (no separate config gate
+>    — pinning a ref is the opt-in). Deploying v11 onto a v9 host with the cache
+>    enabled + pins set starts warming uncached pins on the next recompute —
+>    bounded by the dedup + cooldown. Flagging in case you want an opt-out flag.
 
 ## Items
 
@@ -81,23 +106,21 @@ GitHub/Slack surface for build jobs.
 
 ## Phases
 
-- **Phase 0 — design (this doc).** Resolve the three open points above + the
-  phasing. Review before Phase 1.
-- **Phase 1 — webhook-less cache-warm creation.** Rename `create_adhoc_job →
-  create_unlinked_job`; add `QueuedEventDetail::CacheWarm` carrying the enqueue
-  provenance (trigger/policy id, repo + ref, commit, `build_target` — enough to
-  answer *"why did this build happen?"*); enqueue the build-only axes through the
-  no-link path. **Note:** the bench-arg normalization paths (`normalize_stored*` /
-  `resolve_bench_args`) match on `QueuedEventDetail`, so the new variant lands on
-  those sites — `CacheWarm` returns **empty args** (build-only has no bench input).
-  Per-path tests. **Acceptance:** a cache-warm job inserts with the right axes +
-  provenance, empty bench args, and no webhook/PR/owner links.
-- **Phase 2 — warming planner.** Resolve pins → skip-if-cached + skip-if-in-flight
-  → enqueue, wired to the recompute hook. **Acceptance:** a pinned ref missing from
-  the cache yields exactly one build-only job; none if cached or already in-flight.
-- **Phase 3 — host-validation.** On the Hetzner host, a cold pinned ref warms
-  (builds → publishes → the cache has the entry → pin recompute protects it),
-  silently. **Closes v10's build-only-success thread.**
+- **Phase 0 — design (this doc).** ✅ Codex-signed-off.
+- **Phase 1 — webhook-less cache-warm creation.** ✅ **Implemented.** Renamed
+  `create_adhoc_job → create_unlinked_job`; added `QueuedEventDetail::CacheWarm`
+  (trigger_id / git_ref / commit / build_target), handled in `normalize_stored`
+  (→ empty args). Per-path test: `create_unlinked_job_writes_build_only_cache_warm`.
+- **Phase 2 — warming planner.** ✅ **Implemented.** `recompute_pins` returns the
+  resolved `PinnedTarget`s; `PinManager::recompute` warms over them
+  (`warm_missing`) after protecting. Skip-if-cached (`has_entry_for`) +
+  skip-if-building-or-recently-failed (`recent_build_attempt`, the cooldown) → one
+  build-only job per uncached pin. Tests: enqueue / skip-cached / skip-in-flight /
+  respects-failed-cooldown.
+- **Phase 3 — host-validation (pending).** On the Hetzner host, a cold pinned ref
+  warms (builds → publishes → the cache has the entry → pin recompute protects
+  it), silently. **Closes v10's build-only-success thread.** Needs the libvirt
+  host — not unit-reachable.
 
 ## Acceptance (iteration)
 

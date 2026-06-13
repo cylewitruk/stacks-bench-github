@@ -681,8 +681,8 @@ pub struct JobEvent {
 /// (and is what slice 10's daemon reads to assemble the run's
 /// CLI args) because the `job` table has no dedicated column for it.
 ///
-/// Only the three slice-9 job-creating triggers have variants;
-/// `scheduled` / `manual` arrive in later work.
+/// One variant per job-creating trigger: the slice-9 GitHub triggers, the v5
+/// Slack ad-hoc, and the v11 daemon `cache_warm`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "trigger", rename_all = "snake_case")]
 pub enum QueuedEventDetail {
@@ -708,6 +708,20 @@ pub enum QueuedEventDetail {
     /// `channel`/`message_ts` are the reporting provenance — the Slack channel
     /// and the user's request-message timestamp the result threads under.
     SlackAdhoc { channel: String, message_ts: String, bench_args: Vec<String> },
+    /// Daemon-initiated cache-warm (v11 / `0031`): a build-only job
+    /// pre-building a pinned release binary so the cache is warm before a
+    /// measurement needs it. Pure provenance — answers *"why did the daemon
+    /// build this?"*; a build-only run executes no bench args.
+    CacheWarm {
+        /// The pinned `trigger_policy` whose ref this warms.
+        trigger_id: i64,
+        /// The pinned ref name (branch/tag) the build is for.
+        git_ref: String,
+        /// Resolved commit the binary is built at.
+        commit: String,
+        /// Which artifact binary is produced (`stacks_bench` today).
+        build_target: BuildTarget,
+    },
 }
 
 /// Slice 8 insert payload for `job_event`. occurred_at defaults to

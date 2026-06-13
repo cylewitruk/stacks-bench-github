@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use sbgh_core::config::DaemonConfig;
-use sbgh_core::db::{PolicyStore, RepoStore};
+use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use sbgh_core::models::{BuildTarget, TaskKind};
 use tokio::sync::{OnceCell, mpsc, oneshot};
@@ -148,6 +148,7 @@ impl Runner {
         mut self,
         policy_store: Arc<dyn PolicyStore>,
         repo_store: Arc<dyn RepoStore>,
+        jobs: Arc<dyn JobStore>,
         shell: Arc<dyn Shell>,
     ) -> Self {
         if let Some(cache) = self
@@ -159,6 +160,7 @@ impl Runner {
                 cache,
                 policy_store,
                 repo_store,
+                jobs,
                 shell,
                 self.deps
                     .config
