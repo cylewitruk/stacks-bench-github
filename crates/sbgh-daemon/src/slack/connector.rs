@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::slack::card::{self, CardCtx};
 use crate::slack::client::{QUEUED_REACTION, SlackClient};
-use crate::slack::stream::chunks_for_card;
+use crate::slack::stream::initial_chunks_for_card;
 use crate::slack::target::SlackJobTarget;
 use crate::slack::workload::resolve_workload;
 
@@ -93,10 +93,11 @@ impl SlackConnector {
             .rev
             .clone()
             .unwrap_or_else(|| self.cfg.default_rev.clone());
+        let bench_args = spec.to_bench_args();
         let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
             channel: event.channel.clone(),
             message_ts: event.message_ts.clone(),
-            bench_args: spec.to_bench_args(),
+            bench_args: bench_args.clone(),
         })
         .expect("QueuedEventDetail serializes");
         let new_job = NewJob {
@@ -136,7 +137,7 @@ impl SlackConnector {
 
         // 4. Post the queued live-timeline card + persist its ts by job id, so the
         //    claim-time reporter resumes the SAME card (item 0023, Phase 3).
-        self.post_queued_card(&event, &new_job.git_ref_display, job.id)
+        self.post_queued_card(&event, &new_job.git_ref_display, &bench_args, job.id)
             .await;
 
         // 5. Exactly one ⏳ reaction on the request — the accepted-job signal.
@@ -154,13 +155,20 @@ impl SlackConnector {
     /// a post or persist failure just means the claim-time reporter posts a
     /// fresh card. Pre-claim, the rev hasn't resolved to a commit yet, so
     /// the card carries the rev (not a SHA) until the reporter takes over.
-    async fn post_queued_card(&self, event: &MentionEvent, rev: &str, job_id: Uuid) {
+    async fn post_queued_card(
+        &self,
+        event: &MentionEvent,
+        rev: &str,
+        bench_args: &[String],
+        job_id: Uuid,
+    ) {
         let job_id_str = job_id.to_string();
         let ctx = CardCtx {
             rev,
             commit: None,
             commit_url: None,
             job_id: &job_id_str,
+            bench_args,
             cached_build: None,
         };
         let card = card::queued_card(&ctx, None);
@@ -173,7 +181,7 @@ impl SlackConnector {
                 &event.user,
                 &event.team_id,
                 &fallback,
-                &chunks_for_card(&card),
+                &initial_chunks_for_card(&card),
             )
             .await;
         let ts = match stream_result {

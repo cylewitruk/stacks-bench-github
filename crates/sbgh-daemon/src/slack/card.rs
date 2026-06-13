@@ -57,6 +57,9 @@ pub struct Results<'a> {
 pub struct Card<'a> {
     pub title: String,
     pub job_id: &'a str,
+    pub rev: &'a str,
+    pub commit: Option<&'a str>,
+    pub bench_args: &'a [String],
     pub rows: Vec<CardRow>,
     pub results: Option<Results<'a>>,
 }
@@ -76,6 +79,9 @@ pub struct CardCtx<'a> {
     pub commit: Option<&'a str>,
     pub commit_url: Option<&'a str>,
     pub job_id: &'a str,
+    /// Effective workload args for this job (Slack ad-hoc/user-tunable
+    /// arguments). Used only for the compact context header above the plan.
+    pub bench_args: &'a [String],
     /// Set when the Build phase was served from the binary cache (item 0025,
     /// v9) — the short fingerprint digest, surfaced as the Build row's
     /// subtext ("Reused cached build · …") instead of the plain "Built
@@ -161,6 +167,9 @@ pub fn running_card<'a>(ctx: &'a CardCtx<'a>, stage: usize) -> Card<'a> {
     Card {
         title: title(ctx, false),
         job_id: ctx.job_id,
+        rev: ctx.rev,
+        commit: ctx.commit,
+        bench_args: ctx.bench_args,
         rows,
         results: None,
     }
@@ -187,6 +196,9 @@ pub fn queued_card<'a>(ctx: &'a CardCtx<'a>, detail: Option<&str>) -> Card<'a> {
     Card {
         title: title(ctx, false),
         job_id: ctx.job_id,
+        rev: ctx.rev,
+        commit: ctx.commit,
+        bench_args: ctx.bench_args,
         rows,
         results: None,
     }
@@ -206,6 +218,9 @@ pub fn completed_card<'a>(ctx: &'a CardCtx<'a>, results: Results<'a>) -> Card<'a
     Card {
         title: title(ctx, true),
         job_id: ctx.job_id,
+        rev: ctx.rev,
+        commit: ctx.commit,
+        bench_args: ctx.bench_args,
         rows,
         results: Some(results),
     }
@@ -233,6 +248,9 @@ pub fn failed_card<'a>(ctx: &'a CardCtx<'a>, stage: usize, reason: &str) -> Card
     Card {
         title: title(ctx, true),
         job_id: ctx.job_id,
+        rev: ctx.rev,
+        commit: ctx.commit,
+        bench_args: ctx.bench_args,
         rows,
         results: None,
     }
@@ -316,11 +334,135 @@ pub fn render(card: &Card) -> Value {
 }
 
 fn build(card: &Card) -> Result<Value, Box<dyn std::error::Error>> {
-    let mut blocks: Vec<Value> = vec![serde_json::to_value(build_plan(card)?)?];
+    let mut blocks: Vec<Value> = context_blocks(card);
+    blocks.push(serde_json::to_value(build_plan(card)?)?);
     if let Some(results) = &card.results {
         blocks.extend(result_blocks(results));
     }
     Ok(Value::Array(blocks))
+}
+
+pub(crate) fn context_blocks(card: &Card) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    let workload = workload_context(card);
+    if !workload.is_empty() {
+        let mut elements = Vec::with_capacity(workload.len() + 1);
+        elements.push(json!({
+            "type": "mrkdwn",
+            "text": ":chart_with_upwards_trend:",
+        }));
+        elements.extend(
+            workload
+                .into_iter()
+                .map(|text| {
+                    json!({
+                        "type": "mrkdwn",
+                        "text": text,
+                    })
+                }),
+        );
+        blocks.push(json!({
+            "type": "context",
+            "elements": elements,
+        }));
+    }
+
+    let ref_label = match card.commit {
+        Some(commit) => {
+            format!("*{}*  _{}_", escape_mrkdwn(card.rev), escape_mrkdwn(short_commit(commit)))
+        }
+        None => format!("*{}*", escape_mrkdwn(card.rev)),
+    };
+    blocks.push(json!({
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": ":label:",
+            },
+            {
+                "type": "mrkdwn",
+                "text": ref_label,
+            },
+        ],
+    }));
+    blocks
+}
+
+fn workload_context(card: &Card) -> Vec<String> {
+    let mut parts = Vec::new();
+    if let Some(target) = workload_target_context(card.bench_args) {
+        parts.push(target);
+    }
+    if let Some(warmup) = flag_value(card.bench_args, "--warmup") {
+        parts.push(format!("*{}* warmup", escape_mrkdwn(warmup)));
+    }
+    if let Some(repetitions) = flag_value(card.bench_args, "--repetitions") {
+        parts.push(format!("*{}* repetitions", escape_mrkdwn(repetitions)));
+    }
+    parts
+}
+
+fn workload_target_context(args: &[String]) -> Option<String> {
+    let blocks = flag_values(args, "--block");
+    if !blocks.is_empty() {
+        return Some(match blocks.as_slice() {
+            [one] => format!("*Measuring* block *{}*", escape_mrkdwn(one)),
+            [first, last] => format!(
+                "*Measuring* blocks *{}* to *{}*",
+                escape_mrkdwn(first),
+                escape_mrkdwn(last)
+            ),
+            many => format!("*Measuring* *{}* blocks", many.len()),
+        });
+    }
+
+    let txids = flag_values(args, "--txid");
+    if !txids.is_empty() {
+        return Some(match txids.as_slice() {
+            [one] => format!("*Measuring* tx *{}*", short_txid(one)),
+            many => format!("*Measuring* *{}* txs", many.len()),
+        });
+    }
+    None
+}
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    flag_values(args, flag)
+        .into_iter()
+        .next()
+}
+
+fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+    let mut values = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            if let Some(value) = iter.next() {
+                values.push(value.as_str());
+            }
+        } else if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn short_txid(txid: &str) -> String {
+    let trimmed = txid
+        .strip_prefix("0x")
+        .or_else(|| txid.strip_prefix("0X"))
+        .unwrap_or(txid);
+    let short = trimmed
+        .get(..12)
+        .unwrap_or(trimmed);
+    format!("{}…", escape_mrkdwn(short))
+}
+
+fn escape_mrkdwn(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// The terminal result blocks appended below the plan. Used directly by
@@ -501,6 +643,9 @@ mod tests {
         Card {
             title: "Benchmarking feat/stacks-bench @ 56e9fcba".into(),
             job_id: "job-1",
+            rev: "feat/stacks-bench",
+            commit: Some("56e9fcba1234"),
+            bench_args: &[],
             rows: vec![
                 row("Job started", PlanTaskStatus::Complete, None, Some("Started after 17m 23s")),
                 row(
@@ -516,18 +661,20 @@ mod tests {
         }
     }
 
-    /// The live card is a single `plan` block with four tense rows; the
-    /// in-progress row's `details` carries the italic style; no results blocks.
+    /// The live card renders the compact context header, then a `plan` block
+    /// with four tense rows; the in-progress row's `details` carries the italic
+    /// style; no results blocks.
     #[test]
     fn live_card_renders_four_italic_rows() {
         let v = render(&live_card());
         let blocks = v
             .as_array()
             .expect("a blocks array");
-        assert_eq!(blocks.len(), 1, "live card is just the plan: {v}");
-        assert_eq!(blocks[0]["type"], "plan");
+        assert_eq!(blocks.len(), 2, "context + plan: {v}");
+        assert_eq!(blocks[0]["type"], "context");
+        assert_eq!(blocks[1]["type"], "plan");
         assert_eq!(
-            blocks[0]["tasks"]
+            blocks[1]["tasks"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -537,6 +684,39 @@ mod tests {
         assert!(s.contains("\"status\":\"in_progress\""), "{s}");
         assert!(s.contains("\"italic\":true"), "details are italic: {s}");
         assert!(!s.contains("\"type\":\"markdown\""), "no results while live: {s}");
+    }
+
+    /// The compact context header summarizes the requested workload and the
+    /// ref/commit above the plan.
+    #[test]
+    fn context_header_summarizes_workload_and_ref() {
+        let args = vec![
+            "--block".to_string(),
+            "8123456".to_string(),
+            "--block".to_string(),
+            "8200000".to_string(),
+            "--warmup".to_string(),
+            "1000".to_string(),
+            "--repetitions=10".to_string(),
+        ];
+        let ctx = CardCtx {
+            rev: "sb-integration/3.4.0.0.3",
+            commit: Some("c3b1aad4eeff"),
+            commit_url: Some("https://github.com/o/r/commit/c3b1aad4eeff"),
+            job_id: "job-1",
+            bench_args: &args,
+            cached_build: None,
+        };
+        let v = queued(&ctx, None);
+        let blocks = v.as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "context");
+        assert_eq!(blocks[1]["type"], "context");
+        assert_eq!(blocks[2]["type"], "plan");
+        let s = v.to_string();
+        assert!(s.contains("*Measuring* blocks *8123456* to *8200000*"), "{s}");
+        assert!(s.contains("*1000* warmup"), "{s}");
+        assert!(s.contains("*10* repetitions"), "{s}");
+        assert!(s.contains("*sb-integration/3.4.0.0.3*  _c3b1aad4_"), "{s}");
     }
 
     /// A completed card appends the results: plan → divider → markdown table →
@@ -562,7 +742,7 @@ mod tests {
             .iter()
             .map(|b| b["type"].as_str().unwrap())
             .collect();
-        assert_eq!(types, ["plan", "divider", "markdown", "divider", "section"], "{v}");
+        assert_eq!(types, ["context", "plan", "divider", "markdown", "divider", "section"], "{v}",);
         assert!(s.contains("## Benchmark Results"), "{s}");
         assert!(s.contains("| Metric | Value |"), "the GFM table: {s}");
         assert!(s.contains("\"style\":\"primary\""), "primary button: {s}");
@@ -592,7 +772,7 @@ mod tests {
             .iter()
             .map(|b| b["type"].as_str().unwrap())
             .collect();
-        assert_eq!(types, ["plan", "divider", "markdown"], "no button section: {v}");
+        assert_eq!(types, ["context", "plan", "divider", "markdown"], "no button section: {v}",);
         assert!(
             !v.to_string()
                 .contains("\"style\":\"primary\"")
@@ -607,6 +787,9 @@ mod tests {
         let card = Card {
             title: "t".into(),
             job_id: "j",
+            rev: "develop",
+            commit: None,
+            bench_args: &[],
             rows: vec![row(
                 "Built benchmark binaries",
                 PlanTaskStatus::Complete,
@@ -628,6 +811,9 @@ mod tests {
         let card = Card {
             title: "t".into(),
             job_id: "j",
+            rev: "develop",
+            commit: None,
+            bench_args: &[],
             rows: vec![row(
                 "Run benchmark",
                 PlanTaskStatus::Error,
@@ -661,6 +847,7 @@ mod tests {
             commit: Some("56e9fcba1234"),
             commit_url: Some("https://github.com/o/r/commit/56e9fcba1234"),
             job_id: "job-1",
+            bench_args: &[],
             cached_build: None,
         }
     }
@@ -674,6 +861,7 @@ mod tests {
             commit: Some("56e9fcba1234"),
             commit_url: Some("https://github.com/o/r/commit/56e9fcba1234"),
             job_id: "job-1",
+            bench_args: &[],
             cached_build: Some("abc123def456"),
         };
         // Stage 2 (Run active) → the Build row is done.
@@ -695,9 +883,10 @@ mod tests {
     fn running_builds_four_rows_with_the_active_stage() {
         let v = running(&ctx(), 1); // Build active
         let blocks = v.as_array().unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["type"], "plan");
-        let tasks = blocks[0]["tasks"]
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "context");
+        assert_eq!(blocks[1]["type"], "plan");
+        let tasks = blocks[1]["tasks"]
             .as_array()
             .unwrap();
         assert_eq!(tasks.len(), 4);
@@ -729,7 +918,7 @@ mod tests {
             .iter()
             .map(|b| b["type"].as_str().unwrap())
             .collect();
-        assert_eq!(types, ["plan", "divider", "markdown", "divider", "section"], "{v}");
+        assert_eq!(types, ["context", "plan", "divider", "markdown", "divider", "section"], "{v}",);
         let s = v.to_string();
         assert!(s.contains("Benchmark feat/stacks-bench @ 56e9fcba"), "terminal title: {s}");
         assert!(!s.contains("\"status\":\"in_progress\""), "all complete: {s}");
@@ -740,7 +929,7 @@ mod tests {
     #[test]
     fn failed_builds_errored_card() {
         let v = failed(&ctx(), 2, "Failed: VM died"); // Run errored
-        let tasks = v.as_array().unwrap()[0]["tasks"]
+        let tasks = v.as_array().unwrap()[1]["tasks"]
             .as_array()
             .unwrap()
             .clone();
@@ -765,6 +954,7 @@ mod tests {
             commit: None,
             commit_url: None,
             job_id: "j",
+            bench_args: &[],
             cached_build: None,
         };
         let s = running(&pre, 0).to_string();
@@ -782,10 +972,11 @@ mod tests {
             commit: None,
             commit_url: None,
             job_id: "j",
+            bench_args: &[],
             cached_build: None,
         };
         let v = queued(&pre, Some("position 3/5, waiting 15m"));
-        let tasks = v.as_array().unwrap()[0]["tasks"]
+        let tasks = v.as_array().unwrap()[1]["tasks"]
             .as_array()
             .unwrap()
             .clone();
@@ -808,6 +999,7 @@ mod tests {
             commit: None,
             commit_url: None,
             job_id: "j",
+            bench_args: &[],
             cached_build: None,
         };
         let s = queued(&pre, None).to_string();

@@ -6,7 +6,7 @@
 use serde::Serialize;
 
 use crate::bench_summary::PlanTaskStatus;
-use crate::slack::card::{Card, CardLink, CardRow, TASK_IDS};
+use crate::slack::card::{self, Card, CardLink, CardRow, TASK_IDS};
 
 /// Slack stream `task_update` / `plan_update` text fields currently cap at 256
 /// characters. Keep the stream path valid even for long error strings; the
@@ -17,8 +17,22 @@ const STREAM_TEXT_LIMIT: usize = 256;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamChunk {
     MarkdownText { text: String },
+    Blocks { blocks: Vec<serde_json::Value> },
     TaskUpdate(TaskUpdate),
     PlanUpdate { title: String },
+}
+
+/// Convert the first render of a card into Slack stream chunks, including the
+/// compact context header above the plan. Later updates should use
+/// [`chunks_for_card`] so the context header is not appended repeatedly.
+pub fn initial_chunks_for_card(card: &Card) -> Vec<StreamChunk> {
+    let context = card::context_blocks(card);
+    let mut chunks = Vec::with_capacity(card.rows.len() + 2);
+    if !context.is_empty() {
+        chunks.push(StreamChunk::Blocks { blocks: context });
+    }
+    chunks.extend(chunks_for_card(card));
+    chunks
 }
 
 /// Convert a typed card into Slack stream chunks. The Block Kit fallback and
@@ -146,6 +160,7 @@ mod tests {
 
     use super::*;
     use crate::bench_summary::PlanTaskStatus;
+    use crate::slack::card::Card;
 
     #[test]
     fn task_update_serializes_the_slack_shape() {
@@ -202,6 +217,33 @@ mod tests {
                 "text": "Benchmark started.",
             })
         );
+    }
+
+    #[test]
+    fn initial_chunks_include_context_once() {
+        let card = Card {
+            title: "Benchmarking develop".into(),
+            job_id: "job-1",
+            rev: "develop",
+            commit: None,
+            bench_args: &[],
+            rows: vec![CardRow {
+                title: "Queued".into(),
+                status: PlanTaskStatus::Pending,
+                details: Some("Waiting".into()),
+                output: None,
+                source: None,
+            }],
+            results: None,
+        };
+        let chunks = initial_chunks_for_card(&card);
+        let v = serde_json::to_value(&chunks).expect("serializes");
+        assert_eq!(v[0]["type"], "blocks", "{v}");
+        assert_eq!(v[1]["type"], "plan_update", "{v}");
+        assert_eq!(v[2]["type"], "task_update", "{v}");
+
+        let updates = serde_json::to_value(chunks_for_card(&card)).expect("serializes");
+        assert_eq!(updates[0]["type"], "plan_update", "{updates}");
     }
 
     #[test]

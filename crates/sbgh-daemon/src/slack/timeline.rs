@@ -243,6 +243,7 @@ impl SlackTimeline {
             commit: Some(&self.commit),
             commit_url: Some(&self.commit_url),
             job_id: &self.job_id,
+            bench_args: &self.job.bench_args,
             cached_build: self
                 .cached_build
                 .get()

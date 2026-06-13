@@ -534,6 +534,7 @@ impl Coordinator {
             commit: None,
             commit_url: None,
             job_id: &job_id,
+            bench_args: &job.bench_args,
             cached_build: None,
         };
         let detail = format!("position {}/{}", ahead + 1, total);
