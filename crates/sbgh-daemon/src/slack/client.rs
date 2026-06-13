@@ -42,7 +42,8 @@ pub trait SlackClient: Send + Sync {
 
     /// Start a Slack streamed reply using `task_display_mode=plan`. Returns the
     /// stream message's `ts`, which is also the persisted plan-message
-    /// identity.
+    /// identity. The fallback text stays in the trait boundary for callers, but
+    /// the live Slack API rejects `markdown_text` when chunks are present.
     async fn start_plan_stream(
         &self,
         _channel: &str,

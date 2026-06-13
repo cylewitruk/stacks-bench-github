@@ -134,7 +134,8 @@ Rules:
   persists the returned `ts` via the existing plan-message event.
 - Start streams with `task_display_mode=plan` and `thread_ts` equal to the user's
   request `ts`. For channel streams, include `recipient_user_id` and
-  `recipient_team_id` from the mention event.
+  `recipient_team_id` from the mention event. Like append updates, stream starts
+  send chunks only; the live API rejects `markdown_text` and `chunks` together.
 - Queue updates send a `task_update` for `job` only.
 - Claimed/running updates send `task_update`s for the current card state; live
   elapsed heartbeat updates are debounced.

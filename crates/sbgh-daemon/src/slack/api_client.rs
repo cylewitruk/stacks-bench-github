@@ -81,7 +81,6 @@ fn start_stream_body(
     thread_ts: &str,
     recipient_user_id: &str,
     recipient_team_id: &str,
-    markdown_text: &str,
     chunks: &[StreamChunk],
 ) -> serde_json::Value {
     serde_json::json!({
@@ -90,7 +89,6 @@ fn start_stream_body(
         "recipient_user_id": recipient_user_id,
         "recipient_team_id": recipient_team_id,
         "task_display_mode": "plan",
-        "markdown_text": markdown_text,
         "chunks": chunks,
     })
 }
@@ -187,20 +185,13 @@ impl SlackClient for WebApiClient {
         thread_ts: &str,
         recipient_user_id: &str,
         recipient_team_id: &str,
-        markdown_text: &str,
+        _markdown_text: &str,
         chunks: &[StreamChunk],
     ) -> anyhow::Result<String> {
         let resp = self
             .call(
                 "chat.startStream",
-                start_stream_body(
-                    channel,
-                    thread_ts,
-                    recipient_user_id,
-                    recipient_team_id,
-                    markdown_text,
-                    chunks,
-                ),
+                start_stream_body(channel, thread_ts, recipient_user_id, recipient_team_id, chunks),
             )
             .await?;
         resp.ts
@@ -307,14 +298,13 @@ mod tests {
         };
         let chunks = vec![StreamChunk::TaskUpdate(TaskUpdate::from_row("job", &row))];
         assert_eq!(
-            start_stream_body("C1", "111.222", "U1", "T1", "Benchmarking develop", &chunks),
+            start_stream_body("C1", "111.222", "U1", "T1", &chunks),
             serde_json::json!({
                 "channel": "C1",
                 "thread_ts": "111.222",
                 "recipient_user_id": "U1",
                 "recipient_team_id": "T1",
                 "task_display_mode": "plan",
-                "markdown_text": "Benchmarking develop",
                 "chunks": [{
                     "type": "task_update",
                     "id": "job",

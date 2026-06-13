@@ -128,9 +128,14 @@ pub enum StreamFailure {
 }
 
 pub fn classify_stream_error(error: &str) -> StreamFailure {
-    if ["message_not_in_streaming_state", "stopped_by_user", "message_not_owned_by_app"]
-        .iter()
-        .any(|code| error.contains(code))
+    if [
+        "message_not_in_streaming_state",
+        "stopped_by_user",
+        "message_not_owned_by_app",
+        "message_not_found",
+    ]
+    .iter()
+    .any(|code| error.contains(code))
     {
         StreamFailure::NotStreaming
     } else {
@@ -201,6 +206,10 @@ mod tests {
     fn stream_errors_identify_fallback_cases() {
         assert_eq!(
             classify_stream_error("slack chat.appendStream failed: message_not_in_streaming_state"),
+            StreamFailure::NotStreaming
+        );
+        assert_eq!(
+            classify_stream_error("slack chat.appendStream failed: message_not_found"),
             StreamFailure::NotStreaming
         );
         assert_eq!(classify_stream_error("invalid_chunks"), StreamFailure::Other);
