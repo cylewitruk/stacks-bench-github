@@ -287,9 +287,9 @@ enum PolicyPairAction {
 #[derive(Subcommand, Debug)]
 enum PolicyTriggerAction {
     /// Add a new trigger_policy row. Target with `--on <owner>/<repo>` or raw
-    /// `--install-id`/`--repo-id`. Spec with the sugar `--branch-push <branch>`
-    /// / `--tag-created <regex>`, or raw `--kind` + `--match` (JSON match_spec,
-    /// validated server-side). `--args` is forwarded to the eventual job.
+    /// `--install-id`/`--repo-id`. Spec with sugar flags (`--branch-push`,
+    /// `--tag-created`) or raw `--kind` + `--match` JSON. `--args` is forwarded
+    /// to the eventual job.
     Add {
         /// Resolve install + repo from an `owner/repo` slug (same account).
         #[arg(long, value_name = "OWNER/REPO", conflicts_with_all = ["install_id", "repo_id"])]
@@ -298,11 +298,20 @@ enum PolicyTriggerAction {
         install_id: Option<i64>,
         #[arg(long, requires = "install_id")]
         repo_id: Option<i64>,
-        /// Sugar: `branch_push` trigger on an exact branch name.
-        #[arg(long, value_name = "BRANCH", conflicts_with_all = ["kind", "match_spec", "tag_created"])]
+        /// Sugar: `branch_push` trigger on an exact branch or trailing-* prefix
+        /// glob.
+        #[arg(
+            long,
+            value_name = "BRANCH_OR_PREFIX_GLOB",
+            conflicts_with_all = ["kind", "match_spec", "tag_created"]
+        )]
         branch_push: Option<String>,
         /// Sugar: `tag_created` trigger matching a tag-name regex.
-        #[arg(long, value_name = "REGEX", conflicts_with_all = ["kind", "match_spec", "branch_push"])]
+        #[arg(
+            long,
+            value_name = "REGEX",
+            conflicts_with_all = ["kind", "match_spec", "branch_push"]
+        )]
         tag_created: Option<String>,
         /// Raw: `branch_push` or `tag_created` (use with `--match`).
         #[arg(long, requires = "match_spec")]
@@ -574,10 +583,7 @@ fn build_trigger_spec(
     match_spec: Option<String>,
 ) -> anyhow::Result<(String, serde_json::Value)> {
     if let Some(branch) = branch_push {
-        Ok((
-            "branch_push".to_string(),
-            serde_json::json!({ "kind": "branch_push", "branch_name": branch }),
-        ))
+        Ok(("branch_push".to_string(), branch_push_match_spec(&branch)?))
     } else if let Some(pattern) = tag_created {
         Ok((
             "tag_created".to_string(),
@@ -591,9 +597,33 @@ fn build_trigger_spec(
         Ok((kind, spec))
     } else {
         anyhow::bail!(
-            "provide one of: --branch-push <branch>, --tag-created <regex>, or --kind + --match"
+            "provide one of: --branch-push <branch-or-prefix-glob>, --tag-created <regex>, or \
+             --kind + --match"
         )
     }
+}
+
+fn branch_push_match_spec(pattern: &str) -> anyhow::Result<serde_json::Value> {
+    const ERR: &str = "--branch-push supports exact branches or a trailing-* prefix glob, e.g. \
+                       `develop` or `sb-integration/*`";
+    if pattern.contains('*') {
+        let Some(prefix) = pattern.strip_suffix('*') else {
+            anyhow::bail!(ERR);
+        };
+        if prefix.is_empty()
+            || prefix.contains('*')
+            || prefix.contains('?')
+            || prefix.contains('[')
+            || prefix.contains(']')
+        {
+            anyhow::bail!(ERR);
+        }
+        return Ok(serde_json::json!({ "kind": "branch_prefix", "prefix": prefix }));
+    }
+    if pattern.contains('?') || pattern.contains('[') || pattern.contains(']') {
+        anyhow::bail!(ERR);
+    }
+    Ok(serde_json::json!({ "kind": "branch_push", "branch_name": pattern }))
 }
 
 async fn run_policy_pair(
@@ -1056,6 +1086,30 @@ mod tests {
         assert_eq!(spec, serde_json::json!({ "kind": "branch_push", "branch_name": "develop" }));
     }
 
+    #[test]
+    fn build_trigger_spec_branch_push_trailing_star_is_prefix() {
+        let (kind, spec) =
+            build_trigger_spec(Some("sb-integration/*".into()), None, None, None).unwrap();
+        assert_eq!(kind, "branch_push");
+        assert_eq!(
+            spec,
+            serde_json::json!({ "kind": "branch_prefix", "prefix": "sb-integration/" })
+        );
+    }
+
+    #[test]
+    fn build_trigger_spec_branch_push_prefix_need_not_end_with_slash() {
+        let (kind, spec) = build_trigger_spec(Some("release-*".into()), None, None, None).unwrap();
+        assert_eq!(kind, "branch_push");
+        assert_eq!(spec, serde_json::json!({ "kind": "branch_prefix", "prefix": "release-" }));
+    }
+
+    #[test]
+    fn build_trigger_spec_branch_push_rejects_complex_globs() {
+        assert!(build_trigger_spec(Some("release/*/hotfix".into()), None, None, None).is_err());
+        assert!(build_trigger_spec(Some("*".into()), None, None, None).is_err());
+    }
+
     fn tv(pinned: bool, pinned_until: Option<&str>) -> TriggerView {
         TriggerView {
             id: 1,
@@ -1116,7 +1170,7 @@ mod tests {
     #[test]
     fn build_trigger_spec_raw_match_must_be_json() {
         assert!(
-            build_trigger_spec(None, None, Some("branch_push".into()), Some("not json".into()))
+            build_trigger_spec(None, None, Some("branch_push".into()), Some("not json".into()),)
                 .is_err()
         );
     }
