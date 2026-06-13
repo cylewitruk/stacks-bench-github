@@ -348,8 +348,9 @@ pub(crate) fn context_blocks(card: &Card) -> Vec<Value> {
     if !workload.is_empty() {
         let mut elements = Vec::with_capacity(workload.len() + 1);
         elements.push(json!({
-            "type": "mrkdwn",
-            "text": ":chart_with_upwards_trend:",
+            "type": "image",
+            "image_url": "https://static.vecteezy.com/system/resources/previews/026/123/690/non_2x/benchmark-measure-icon-in-flat-style-dashboard-rating-illustration-on-white-isolated-background-progress-service-business-concept-vector.jpg",
+            "alt_text": "benchmark",
         }));
         elements.extend(
             workload
@@ -377,8 +378,9 @@ pub(crate) fn context_blocks(card: &Card) -> Vec<Value> {
         "type": "context",
         "elements": [
             {
-                "type": "mrkdwn",
-                "text": ":label:",
+                "type": "image",
+                "image_url": "https://images.icon-icons.com/2582/PNG/512/price_tag_icon_153994.png",
+                "alt_text": "ref",
             },
             {
                 "type": "mrkdwn",
@@ -391,40 +393,80 @@ pub(crate) fn context_blocks(card: &Card) -> Vec<Value> {
 
 fn workload_context(card: &Card) -> Vec<String> {
     let mut parts = Vec::new();
-    if let Some(target) = workload_target_context(card.bench_args) {
-        parts.push(target);
+    let target = workload_target_context(card.bench_args);
+    let target_unit = target
+        .as_ref()
+        .map(|target| target.unit)
+        .unwrap_or("block");
+    if let Some(target) = target {
+        parts.push(target.text);
     }
     if let Some(warmup) = flag_value(card.bench_args, "--warmup") {
-        parts.push(format!("*{}* warmup", escape_mrkdwn(warmup)));
+        parts.push(format!("*{}* {target_unit} warmup", escape_mrkdwn(&format_count(warmup))));
+    } else {
+        parts.push(format!("*0* {target_unit} warmup"));
     }
+
     if let Some(repetitions) = flag_value(card.bench_args, "--repetitions") {
-        parts.push(format!("*{}* repetitions", escape_mrkdwn(repetitions)));
+        parts.push(format!(
+            "*{}* {}",
+            escape_mrkdwn(&format_count(repetitions)),
+            pluralize("repetition", repetitions)
+        ));
+    } else {
+        parts.push("*1* repetition".to_string());
     }
     parts
 }
 
-fn workload_target_context(args: &[String]) -> Option<String> {
+struct WorkloadTarget {
+    text: String,
+    unit: &'static str,
+}
+
+fn workload_target_context(args: &[String]) -> Option<WorkloadTarget> {
     let blocks = flag_values(args, "--block");
     if !blocks.is_empty() {
-        return Some(match blocks.as_slice() {
-            [one] => format!("*Measuring* block *{}*", escape_mrkdwn(one)),
+        let text = match blocks.as_slice() {
+            [one] => format!("*Measuring* block *{}*", escape_mrkdwn(&format_count(one))),
             [first, last] => format!(
                 "*Measuring* blocks *{}* to *{}*",
-                escape_mrkdwn(first),
-                escape_mrkdwn(last)
+                escape_mrkdwn(&format_count(first)),
+                escape_mrkdwn(&format_count(last))
             ),
             many => format!("*Measuring* *{}* blocks", many.len()),
-        });
+        };
+        return Some(WorkloadTarget { text, unit: "block" });
     }
 
     let txids = flag_values(args, "--txid");
     if !txids.is_empty() {
-        return Some(match txids.as_slice() {
+        let text = match txids.as_slice() {
             [one] => format!("*Measuring* tx *{}*", short_txid(one)),
             many => format!("*Measuring* *{}* txs", many.len()),
-        });
+        };
+        return Some(WorkloadTarget { text, unit: "tx" });
     }
     None
+}
+
+fn format_count(s: &str) -> String {
+    let Ok(n) = s.parse::<u64>() else {
+        return s.to_string();
+    };
+    let raw = n.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (i, ch) in raw.chars().enumerate() {
+        if i > 0 && (raw.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn pluralize<'a>(singular: &'a str, count: &str) -> &'a str {
+    if count == "1" { singular } else { "repetitions" }
 }
 
 fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -670,11 +712,12 @@ mod tests {
         let blocks = v
             .as_array()
             .expect("a blocks array");
-        assert_eq!(blocks.len(), 2, "context + plan: {v}");
+        assert_eq!(blocks.len(), 3, "workload context + ref context + plan: {v}");
         assert_eq!(blocks[0]["type"], "context");
-        assert_eq!(blocks[1]["type"], "plan");
+        assert_eq!(blocks[1]["type"], "context");
+        assert_eq!(blocks[2]["type"], "plan");
         assert_eq!(
-            blocks[1]["tasks"]
+            blocks[2]["tasks"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -713,8 +756,8 @@ mod tests {
         assert_eq!(blocks[1]["type"], "context");
         assert_eq!(blocks[2]["type"], "plan");
         let s = v.to_string();
-        assert!(s.contains("*Measuring* blocks *8123456* to *8200000*"), "{s}");
-        assert!(s.contains("*1000* warmup"), "{s}");
+        assert!(s.contains("*Measuring* blocks *8,123,456* to *8,200,000*"), "{s}");
+        assert!(s.contains("*1,000* block warmup"), "{s}");
         assert!(s.contains("*10* repetitions"), "{s}");
         assert!(s.contains("*sb-integration/3.4.0.0.3*  _c3b1aad4_"), "{s}");
     }
@@ -742,7 +785,11 @@ mod tests {
             .iter()
             .map(|b| b["type"].as_str().unwrap())
             .collect();
-        assert_eq!(types, ["context", "plan", "divider", "markdown", "divider", "section"], "{v}",);
+        assert_eq!(
+            types,
+            ["context", "context", "plan", "divider", "markdown", "divider", "section"],
+            "{v}",
+        );
         assert!(s.contains("## Benchmark Results"), "{s}");
         assert!(s.contains("| Metric | Value |"), "the GFM table: {s}");
         assert!(s.contains("\"style\":\"primary\""), "primary button: {s}");
@@ -772,7 +819,11 @@ mod tests {
             .iter()
             .map(|b| b["type"].as_str().unwrap())
             .collect();
-        assert_eq!(types, ["context", "plan", "divider", "markdown"], "no button section: {v}",);
+        assert_eq!(
+            types,
+            ["context", "context", "plan", "divider", "markdown"],
+            "no button section: {v}",
+        );
         assert!(
             !v.to_string()
                 .contains("\"style\":\"primary\"")
@@ -883,10 +934,11 @@ mod tests {
     fn running_builds_four_rows_with_the_active_stage() {
         let v = running(&ctx(), 1); // Build active
         let blocks = v.as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0]["type"], "context");
-        assert_eq!(blocks[1]["type"], "plan");
-        let tasks = blocks[1]["tasks"]
+        assert_eq!(blocks[1]["type"], "context");
+        assert_eq!(blocks[2]["type"], "plan");
+        let tasks = blocks[2]["tasks"]
             .as_array()
             .unwrap();
         assert_eq!(tasks.len(), 4);
@@ -918,7 +970,11 @@ mod tests {
             .iter()
             .map(|b| b["type"].as_str().unwrap())
             .collect();
-        assert_eq!(types, ["context", "plan", "divider", "markdown", "divider", "section"], "{v}",);
+        assert_eq!(
+            types,
+            ["context", "context", "plan", "divider", "markdown", "divider", "section"],
+            "{v}",
+        );
         let s = v.to_string();
         assert!(s.contains("Benchmark feat/stacks-bench @ 56e9fcba"), "terminal title: {s}");
         assert!(!s.contains("\"status\":\"in_progress\""), "all complete: {s}");
@@ -929,7 +985,7 @@ mod tests {
     #[test]
     fn failed_builds_errored_card() {
         let v = failed(&ctx(), 2, "Failed: VM died"); // Run errored
-        let tasks = v.as_array().unwrap()[1]["tasks"]
+        let tasks = v.as_array().unwrap()[2]["tasks"]
             .as_array()
             .unwrap()
             .clone();
@@ -976,7 +1032,7 @@ mod tests {
             cached_build: None,
         };
         let v = queued(&pre, Some("position 3/5, waiting 15m"));
-        let tasks = v.as_array().unwrap()[1]["tasks"]
+        let tasks = v.as_array().unwrap()[2]["tasks"]
             .as_array()
             .unwrap()
             .clone();
