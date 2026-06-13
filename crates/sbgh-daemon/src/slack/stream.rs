@@ -13,11 +13,6 @@ use crate::slack::card::{Card, CardLink, CardRow, TASK_IDS};
 /// block fallback still carries the full text if Slack ever rejects a chunk.
 const STREAM_TEXT_LIMIT: usize = 256;
 
-/// Slack requires `markdown_text` on `chat.appendStream`; this value keeps the
-/// append call visually quiet while the semantic `task_update` chunk does the
-/// real UI work.
-pub const STREAM_NOOP_MARKDOWN: &str = "\u{200B}";
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamChunk {

@@ -144,9 +144,9 @@ Rules:
   result blocks.
 - `task_update` / `plan_update` fields are truncated under Slack's
   256-character chunk limit; detailed metrics stay in final blocks.
-- `chat.appendStream` documents `markdown_text` as required even when `chunks`
-  are present. The implementation uses a zero-width no-op string so task
-  updates remain visually quiet.
+- `chat.appendStream` documents `markdown_text` as required, but the live API
+  rejects `markdown_text` and `chunks` together. Chunk updates therefore send
+  `chunks` only.
 
 ## Failure / Fallback Rules
 

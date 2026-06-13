@@ -55,13 +55,13 @@ pub trait SlackClient: Send + Sync {
         anyhow::bail!("slack streaming is not implemented by this client")
     }
 
-    /// Append semantic stream chunks to an existing stream. Slack currently
-    /// requires `markdown_text` even when `chunks` carry the meaningful update.
+    /// Append semantic stream chunks to an existing stream. The live Slack API
+    /// rejects `markdown_text` when `chunks` are present, even though the docs
+    /// still mark it as required for append calls.
     async fn append_stream(
         &self,
         _channel: &str,
         _ts: &str,
-        _markdown_text: &str,
         _chunks: &[StreamChunk],
     ) -> anyhow::Result<()> {
         anyhow::bail!("slack streaming is not implemented by this client")

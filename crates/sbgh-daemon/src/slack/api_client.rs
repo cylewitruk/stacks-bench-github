@@ -95,16 +95,10 @@ fn start_stream_body(
     })
 }
 
-fn append_stream_body(
-    channel: &str,
-    ts: &str,
-    markdown_text: &str,
-    chunks: &[StreamChunk],
-) -> serde_json::Value {
+fn append_stream_body(channel: &str, ts: &str, chunks: &[StreamChunk]) -> serde_json::Value {
     serde_json::json!({
         "channel": channel,
         "ts": ts,
-        "markdown_text": markdown_text,
         "chunks": chunks,
     })
 }
@@ -120,7 +114,9 @@ fn stop_stream_body(
         "channel": channel,
         "ts": ts,
     });
-    if let Some(text) = markdown_text {
+    if chunks.is_empty()
+        && let Some(text) = markdown_text
+    {
         body["markdown_text"] = serde_json::Value::String(text.to_string());
     }
     if !chunks.is_empty() {
@@ -215,10 +211,9 @@ impl SlackClient for WebApiClient {
         &self,
         channel: &str,
         ts: &str,
-        markdown_text: &str,
         chunks: &[StreamChunk],
     ) -> anyhow::Result<()> {
-        self.call("chat.appendStream", append_stream_body(channel, ts, markdown_text, chunks))
+        self.call("chat.appendStream", append_stream_body(channel, ts, chunks))
             .await?;
         Ok(())
     }
@@ -280,7 +275,7 @@ mod tests {
     use super::*;
     use crate::bench_summary::PlanTaskStatus;
     use crate::slack::card::CardRow;
-    use crate::slack::stream::{STREAM_NOOP_MARKDOWN, StreamChunk, TaskUpdate};
+    use crate::slack::stream::{StreamChunk, TaskUpdate};
 
     #[test]
     fn ok_response_is_success() {
@@ -332,16 +327,15 @@ mod tests {
     }
 
     #[test]
-    fn append_stream_body_includes_required_noop_markdown() {
+    fn append_stream_body_sends_chunks_without_markdown_text() {
         let chunks = vec![StreamChunk::PlanUpdate {
             title: "Benchmark develop @ abcdef12".into(),
         }];
         assert_eq!(
-            append_stream_body("C1", "222.333", STREAM_NOOP_MARKDOWN, &chunks),
+            append_stream_body("C1", "222.333", &chunks),
             serde_json::json!({
                 "channel": "C1",
                 "ts": "222.333",
-                "markdown_text": STREAM_NOOP_MARKDOWN,
                 "chunks": [{
                     "type": "plan_update",
                     "title": "Benchmark develop @ abcdef12",
@@ -360,6 +354,24 @@ mod tests {
                 "ts": "222.333",
                 "markdown_text": "Done",
                 "blocks": [{ "type": "divider" }],
+            })
+        );
+    }
+
+    #[test]
+    fn stop_stream_body_prefers_chunks_over_markdown_text() {
+        let chunks = vec![StreamChunk::PlanUpdate {
+            title: "Benchmark develop @ abcdef12".into(),
+        }];
+        assert_eq!(
+            stop_stream_body("C1", "222.333", Some("Done"), &chunks, None),
+            serde_json::json!({
+                "channel": "C1",
+                "ts": "222.333",
+                "chunks": [{
+                    "type": "plan_update",
+                    "title": "Benchmark develop @ abcdef12",
+                }],
             })
         );
     }

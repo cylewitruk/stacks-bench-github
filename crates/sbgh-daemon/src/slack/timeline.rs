@@ -26,9 +26,7 @@ use crate::job_source::{RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
 use crate::slack::card::{self, CardCtx, Results, STAGES};
 use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
-use crate::slack::stream::{
-    STREAM_NOOP_MARKDOWN, StreamFailure, chunks_for_card, classify_stream_error,
-};
+use crate::slack::stream::{StreamFailure, chunks_for_card, classify_stream_error};
 
 /// Minimum interval between live elapsed-only stream appends. Phase transitions
 /// and terminal updates bypass this; heartbeat ticks are just polish.
@@ -304,7 +302,7 @@ impl SlackTimeline {
         if let Some(ts) = existing {
             match self
                 .client
-                .append_stream(&self.channel, &ts, STREAM_NOOP_MARKDOWN, chunks)
+                .append_stream(&self.channel, &ts, chunks)
                 .await
             {
                 Ok(()) => return,
@@ -504,7 +502,6 @@ mod tests {
             &self,
             _channel: &str,
             ts: &str,
-            _markdown_text: &str,
             chunks: &[crate::slack::stream::StreamChunk],
         ) -> anyhow::Result<()> {
             self.appends
