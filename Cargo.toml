@@ -75,6 +75,7 @@ serde = { version = "1", features = ["derive"] }
 # insertion order through the round-trip, matching V8's behaviour that
 # upstream smee-client relies on.
 serde_json = { version = "1", features = ["preserve_order"] }
+schemars = "1"
 
 # Errors
 thiserror = "2"

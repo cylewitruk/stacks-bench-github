@@ -176,6 +176,7 @@ pub struct DaemonConfig {
     pub runner: RunnerConfig,
     pub artifacts: ArtifactsConfig,
     pub slack: SlackConfig,
+    pub llm: LlmConfig,
 }
 
 /// Daemon run-loop tuning (roadmap-v5). Deliberately **not** under `[vm]`: the
@@ -372,6 +373,59 @@ pub struct StacksBenchConfig {
     pub default_args: String,
 }
 
+/// LLM-backed intent extraction (item `0020`, iteration v13). Disabled by
+/// default; when enabled, Slack input can be resolved through a structured
+/// OpenAI response. The API key is env-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmConfig {
+    pub enabled: bool,
+    pub provider: LlmProvider,
+    pub model: String,
+    pub input_max_chars: usize,
+    pub timeout_secs: u64,
+    pub per_user_rate_limit_per_minute: u32,
+    /// Env-only (`SBGH_OPENAI_API_KEY`). `Some` iff enabled.
+    pub openai_api_key: Option<String>,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: LlmProvider::OpenAi,
+            // Small structured-output-capable default; operators can override
+            // as newer OpenAI model families land.
+            model: "gpt-5-mini".into(),
+            input_max_chars: 1_000,
+            timeout_secs: 15,
+            per_user_rate_limit_per_minute: 5,
+            openai_api_key: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    #[serde(rename = "openai")]
+    #[default]
+    OpenAi,
+}
+
+impl std::str::FromStr for LlmProvider {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "openai" => Ok(Self::OpenAi),
+            other => Err(format!("unknown llm provider: {other} (expected `openai`)")),
+        }
+    }
+}
+
 /// Where run artifacts are stored and fetched (item `0001-artifact-store`,
 /// iteration v4). `local` (default) keeps today's on-disk behavior; `s3` ships
 /// artifacts to S3-compatible object storage (e.g. Hetzner) for off-box fetch.
@@ -541,6 +595,7 @@ struct RawDaemon {
     runner: RawRunner,
     artifacts: RawArtifacts,
     slack: RawSlack,
+    llm: RawLlm,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -584,6 +639,20 @@ struct RawSlack {
     /// **Env-only** (`SBGH_SLACK_BOT_TOKEN`).
     #[serde(skip)]
     bot_token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawLlm {
+    enabled: Option<bool>,
+    provider: Option<LlmProvider>,
+    model: Option<String>,
+    input_max_chars: Option<usize>,
+    timeout_secs: Option<u64>,
+    per_user_rate_limit_per_minute: Option<u32>,
+    /// **Env-only** (`SBGH_OPENAI_API_KEY`) — never read from TOML.
+    #[serde(skip)]
+    openai_api_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -818,6 +887,21 @@ impl RawDaemon {
         merge_opt(&mut self.slack.allowed_team_ids, other.slack.allowed_team_ids);
         merge_opt(&mut self.slack.allowed_user_ids, other.slack.allowed_user_ids);
         // `slack.{app_token,bot_token}` are env-only.
+
+        merge_opt(&mut self.llm.enabled, other.llm.enabled);
+        merge_opt(&mut self.llm.provider, other.llm.provider);
+        merge_opt(&mut self.llm.model, other.llm.model);
+        merge_opt(&mut self.llm.input_max_chars, other.llm.input_max_chars);
+        merge_opt(&mut self.llm.timeout_secs, other.llm.timeout_secs);
+        merge_opt(
+            &mut self
+                .llm
+                .per_user_rate_limit_per_minute,
+            other
+                .llm
+                .per_user_rate_limit_per_minute,
+        );
+        // `llm.openai_api_key` is env-only.
     }
 
     fn apply_env(&mut self) {
@@ -939,6 +1023,19 @@ impl RawDaemon {
         env_csv_into(&mut self.slack.allowed_user_ids, "SBGH_SLACK_ALLOWED_USER_IDS");
         env_into(&mut self.slack.app_token, "SBGH_SLACK_APP_TOKEN");
         env_into(&mut self.slack.bot_token, "SBGH_SLACK_BOT_TOKEN");
+
+        env_parse_into(&mut self.llm.enabled, "SBGH_LLM_ENABLED");
+        env_parse_into(&mut self.llm.provider, "SBGH_LLM_PROVIDER");
+        env_into(&mut self.llm.model, "SBGH_LLM_MODEL");
+        env_parse_into(&mut self.llm.input_max_chars, "SBGH_LLM_INPUT_MAX_CHARS");
+        env_parse_into(&mut self.llm.timeout_secs, "SBGH_LLM_TIMEOUT_SECS");
+        env_parse_into(
+            &mut self
+                .llm
+                .per_user_rate_limit_per_minute,
+            "SBGH_LLM_PER_USER_RATE_LIMIT_PER_MINUTE",
+        );
+        env_into(&mut self.llm.openai_api_key, "SBGH_OPENAI_API_KEY");
     }
 
     fn into_config(self) -> Result<DaemonConfig> {
@@ -1211,6 +1308,42 @@ impl RawDaemon {
                     }
                 } else {
                     SlackConfig::default()
+                }
+            },
+            llm: {
+                let raw = self.llm;
+                let default = LlmConfig::default();
+                let enabled = raw
+                    .enabled
+                    .unwrap_or(default.enabled);
+                let provider = raw
+                    .provider
+                    .unwrap_or(default.provider);
+                let model = raw
+                    .model
+                    .unwrap_or(default.model);
+                let input_max_chars = raw
+                    .input_max_chars
+                    .unwrap_or(default.input_max_chars);
+                let timeout_secs = raw
+                    .timeout_secs
+                    .unwrap_or(default.timeout_secs);
+                let per_user_rate_limit_per_minute = raw
+                    .per_user_rate_limit_per_minute
+                    .unwrap_or(default.per_user_rate_limit_per_minute);
+                let openai_api_key = if enabled {
+                    Some(required(raw.openai_api_key, "SBGH_OPENAI_API_KEY (llm enabled)")?)
+                } else {
+                    raw.openai_api_key
+                };
+                LlmConfig {
+                    enabled,
+                    provider,
+                    model,
+                    input_max_chars,
+                    timeout_secs,
+                    per_user_rate_limit_per_minute,
+                    openai_api_key,
                 }
             },
         })
@@ -1714,6 +1847,66 @@ mod tests {
         );
         let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
         assert!(matches!(err, Error::Config(_)), "got: {err:?}");
+    }
+
+    // ─── LlmConfig ───
+
+    #[test]
+    fn daemon_llm_defaults_to_disabled() {
+        let _g = EnvGuard::set(&daemon_env());
+        let cfg = DaemonConfig::load_layered(None).unwrap();
+        assert!(!cfg.llm.enabled);
+        assert_eq!(cfg.llm.provider, LlmProvider::OpenAi);
+        assert_eq!(cfg.llm.model, "gpt-5-mini");
+        assert!(
+            cfg.llm
+                .openai_api_key
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn daemon_llm_enabled_from_toml_and_env() {
+        let mut env = daemon_env();
+        env.push(("SBGH_OPENAI_API_KEY", "sk-test"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[llm]\nenabled = true\nprovider = \"openai\"\nmodel = \"gpt-test\"\ninput_max_chars \
+             = 500\ntimeout_secs = 7\nper_user_rate_limit_per_minute = 3\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert!(cfg.llm.enabled);
+        assert_eq!(cfg.llm.provider, LlmProvider::OpenAi);
+        assert_eq!(cfg.llm.model, "gpt-test");
+        assert_eq!(cfg.llm.input_max_chars, 500);
+        assert_eq!(cfg.llm.timeout_secs, 7);
+        assert_eq!(
+            cfg.llm
+                .per_user_rate_limit_per_minute,
+            3
+        );
+        assert_eq!(
+            cfg.llm
+                .openai_api_key
+                .as_deref(),
+            Some("sk-test")
+        );
+    }
+
+    #[test]
+    fn daemon_llm_enabled_missing_key_errors() {
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write("[llm]\nenabled = true\n");
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn daemon_llm_openai_key_in_toml_is_rejected() {
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write("[llm]\nopenai_api_key = \"should-not-be-in-config\"\n");
+        let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
     }
 
     #[test]

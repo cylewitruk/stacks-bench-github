@@ -425,6 +425,22 @@ struct WorkloadTarget {
 }
 
 fn workload_target_context(args: &[String]) -> Option<WorkloadTarget> {
+    if let (Some(start), Some(count)) =
+        (flag_value(args, "--start-at"), flag_value(args, "--count"))
+        && let (Ok(start_n), Ok(count_n)) = (start.parse::<u64>(), count.parse::<u64>())
+        && count_n > 0
+    {
+        let end = start_n.saturating_add(count_n - 1);
+        return Some(WorkloadTarget {
+            text: format!(
+                "*Measuring* blocks *{}* to *{}*",
+                escape_mrkdwn(&format_count(start)),
+                escape_mrkdwn(&format_count(&end.to_string()))
+            ),
+            unit: "block",
+        });
+    }
+
     let blocks = flag_values(args, "--block");
     if !blocks.is_empty() {
         let text = match blocks.as_slice() {

@@ -9,6 +9,7 @@ mod driver;
 mod events;
 mod job_source;
 mod libvirt;
+mod llm;
 mod pin_manager;
 mod pin_resolver;
 mod recipe;
@@ -18,6 +19,7 @@ mod runner;
 mod shutdown;
 mod slack;
 mod webhook_processor;
+mod workload;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -188,13 +190,30 @@ async fn main() -> anyhow::Result<()> {
             .context("[slack].enabled but SBGH_SLACK_BOT_TOKEN is unset")?;
         let web_client: Arc<dyn slack::client::SlackClient> =
             Arc::new(slack::api_client::WebApiClient::new(bot_token));
+        let intent_resolver: Option<Arc<dyn llm::intent::IntentResolver>> = if config.llm.enabled {
+            Some(Arc::new(
+                llm::openai::OpenAiIntentResolver::from_config(&config.llm)
+                    .context("building OpenAI intent resolver")?,
+            ))
+        } else {
+            None
+        };
         tracing::info!(
             repo = %config.slack.default_repository,
             installation_id = target.installation_id,
             repo_id = target.repo_id,
             "slack: ad-hoc profiling enabled",
         );
-        Some((config.slack.clone(), target, jobs_store.clone(), web_client))
+        Some((
+            config.slack.clone(),
+            target,
+            jobs_store.clone(),
+            web_client,
+            intent_resolver,
+            config
+                .llm
+                .per_user_rate_limit_per_minute,
+        ))
     } else {
         None
     };
@@ -249,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
     // The reporter posts Slack ad-hoc results through the same Web API client
     // the socket connector uses (one bot token, one client).
     let mut runner = Runner::new(config, runnable_jobs, gh, shell.clone());
-    if let Some((_, _, _, web_client)) = &slack_runtime {
+    if let Some((_, _, _, web_client, ..)) = &slack_runtime {
         runner = runner.with_slack(web_client.clone());
     }
     // Binary-cache pin recompute (item 0025, v9 Phase 2): the runner recomputes
@@ -284,10 +303,19 @@ async fn main() -> anyhow::Result<()> {
             // app token, TLS) is logged but never crashes the daemon — Slack is
             // an optional surface. This arm then idles until full exit so it
             // never collapses the `try_join!` early.
-            if let Some((cfg, target, jobs, web_client)) = slack_runtime {
-                if let Err(e) =
-                    slack::socket::run(cfg, target, jobs, web_client, shutdown.draining.clone())
-                        .await
+            if let Some((cfg, target, jobs, web_client, intent_resolver, intent_rate_limit)) =
+                slack_runtime
+            {
+                if let Err(e) = slack::socket::run(
+                    cfg,
+                    target,
+                    jobs,
+                    web_client,
+                    intent_resolver,
+                    intent_rate_limit,
+                    shutdown.draining.clone(),
+                )
+                .await
                 {
                     tracing::error!(error = ?e, "slack: socket mode failed; continuing without Slack");
                 }

@@ -6,7 +6,8 @@ think in flags. v13 makes the normal path "user input → schema-validated
 spec", with the current flag parser kept only as compatibility/disabled-mode
 plumbing and an internal fast path for already-structured input.
 
-> **Status:** planned — Phase 0 design drafted for review. No code has landed.
+> **Status:** in progress — Slack resolver implementation landed for review.
+> Phase 4 (PR comments), real-model eval, and live Slack validation remain open.
 >
 > The load-bearing rule is that the model returns only a strict JSON object that
 > decodes to our intent schema. If it cannot produce a valid spec, it returns an
@@ -17,7 +18,7 @@ plumbing and an internal fast path for already-structured input.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0020-llm-intent-resolution` | primary | planned |
+| `0020-llm-intent-resolution` | primary | in_progress |
 
 ## Why
 
@@ -38,7 +39,7 @@ a Slack modal; the text flag parser should not be the primary UX.
 ## Item: `0020-llm-intent-resolution`
 
 - **id:** `0020-llm-intent-resolution`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `medium`
 - **depends_on:** `0002-slack-adhoc-profiling`
 - **source:** v5 seam + high-value list (2026-06); user direction to replace
@@ -88,7 +89,8 @@ The model output is one of two states:
   "repetitions": 10,
   "warmup": 1000,
   "rev": "3.4.0.0.3",
-  "reason": null
+  "reason": null,
+  "issues": null
 }
 ```
 
@@ -111,7 +113,8 @@ For an explicit block list, `block` carries selectors:
   "repetitions": 1,
   "warmup": 0,
   "rev": null,
-  "reason": null
+  "reason": null,
+  "issues": null
 }
 ```
 
@@ -127,7 +130,14 @@ or:
   "repetitions": null,
   "warmup": null,
   "rev": null,
-  "reason": "I need a block height, block range, or transaction id to benchmark."
+  "reason": "I need a block height, block range, or transaction id to benchmark.",
+  "issues": [
+    {
+      "field": "target",
+      "code": "missing",
+      "message": "Specify a txid, block height/hash, or block range."
+    }
+  ]
 }
 ```
 
@@ -152,12 +162,19 @@ Rules:
 - `block_range` means an inclusive range from height `start` to height `end`; it
   is not a two-block list and does not accept hashes. The validator rejects
   `start > end`.
-- For `status = "invalid"`, `reason` is required and every target/run field is
-  null.
+- For `status = "invalid"`, `reason` is required, `issues` may carry
+  field-level diagnostics, and every target/run field is null.
 - `repetitions` is always populated and must be `>= 1`. Default: `1`.
 - `warmup` is always populated and must be `>= 0`. Default: `0`.
 - `rev` is `null` or a branch/tag/SHA string. `null` means `[slack].default_rev`.
-- `invalid.reason` is short, user-facing, and safe to post back.
+- `invalid.reason` is short, user-facing, and safe to post back. `issues` is a
+  typed list with `field` (`target`, `block`, `block_range`, `txids`,
+  `repetitions`, `warmup`, `rev`) and `code` (`missing`, `invalid`,
+  `ambiguous`, `unsupported`, `needs_context`) so Slack/modals can point at the
+  missing or incorrect input without trusting free-form model text for control
+  flow.
+- The daemon bounds model-controlled rejection text before posting it: reason
+  and issue messages are truncated and the issue list is capped.
 
 The daemon validates the decoded object again before constructing `WorkloadSpec`.
 Schema conformance is necessary but not sufficient: strict Structured Outputs
@@ -194,16 +211,16 @@ real provider.
 
 **Acceptance & Validation:**
 
-- [ ] Config defaults disabled and requires the env key only when enabled.
-- [ ] Malformed/extra-field intent JSON is rejected.
-- [ ] Resolved block-height, block-hash, block-range, txid, warmup, repetition,
+- [x] Config defaults disabled and requires the env key only when enabled.
+- [x] Malformed/extra-field intent JSON is rejected.
+- [x] Resolved block-height, block-hash, block-range, txid, warmup, repetition,
       and rev examples validate into the expected `WorkloadSpec`.
-- [ ] Txid and block-hash examples accept optional `0x` prefixes, reject
+- [x] Txid and block-hash examples accept optional `0x` prefixes, reject
       non-hex / wrong-length values, and normalize to bare 64-character hex.
 - [ ] Normalized bare-hex txid and block-hash args are accepted by the
       downstream `stacks-bench` parser/CLI path.
-- [ ] Invalid intent produces a user-facing message and no spec.
-- [ ] The eval fixture set exists with at least 15 prompts covering common,
+- [x] Invalid intent produces a user-facing message and no spec.
+- [x] The eval fixture set exists with at least 15 prompts covering common,
       ambiguous, invalid, and flag-shaped inputs.
 
 **Tests:**
@@ -229,10 +246,10 @@ real provider.
 
 **Acceptance & Validation:**
 
-- [ ] Exact JSON request-body tests pin the schema and model request shape.
-- [ ] Response parsing tests cover resolved, invalid, malformed, and provider
+- [x] Exact JSON request-body tests pin the schema and model request shape.
+- [x] Response parsing tests cover resolved, invalid, malformed, and provider
       error envelopes.
-- [ ] Provider timeout/error returns a safe "could not resolve request" message.
+- [x] Provider timeout/error returns a safe "could not resolve request" message.
 - [ ] Real-model eval pass rate meets the implementation-pinned threshold
       before Phase 3 makes the resolver the normal Slack path. Suggested
       starting gate: 90% exact target/run-field match and 100% no unsafe
@@ -263,13 +280,13 @@ model name into the plan.
 
 **Acceptance & Validation:**
 
-- [ ] NL Slack request enqueues with the expected `bench_args` and rev.
-- [ ] Invalid/ambiguous NL request posts an ephemeral message and enqueues
+- [x] NL Slack request enqueues with the expected `bench_args` and rev.
+- [x] Invalid/ambiguous NL request posts an ephemeral message and enqueues
       nothing.
-- [ ] Off-allowlist users are rejected before any provider call.
-- [ ] A flag-shaped request that parses cleanly takes the parser fast-path and
+- [x] Off-allowlist users are rejected before any provider call.
+- [x] A flag-shaped request that parses cleanly takes the parser fast-path and
       does not call the provider.
-- [ ] Provider/rate-limit failures do not enqueue.
+- [x] Provider/rate-limit failures do not enqueue.
 - [ ] A hallucinated/nonexistent `rev` fails cleanly through the daemon-owned
       commit-resolution path (no new risk class).
 - [ ] If provider latency is noticeable, the Slack handler either posts an

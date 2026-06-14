@@ -2,7 +2,8 @@
 //!
 //! Flow for one `@BenchBot bench …` mention, in this order:
 //!   1. **authz** (team + user allowlist) — *before* anything else;
-//!   2. **resolve** the workload (the deterministic parser seam);
+//!   2. **resolve** the workload (deterministic parser fast-path, then optional
+//!      LLM intent resolver);
 //!   3. **enqueue** an ad-hoc job (default repo/rev, no webhook) carrying the
 //!      Slack reporting provenance;
 //!   4. **post** the queued live-timeline card in-thread (persisting its `ts`
@@ -15,7 +16,9 @@
 //! resolved to its FK ids) is held as [`SlackJobTarget`]; resolving
 //! `default_repository` → ids is the wiring slice's job, not this layer's.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sbgh_core::config::SlackConfig;
 use sbgh_core::db::JobStore;
@@ -24,11 +27,12 @@ use sbgh_core::models::{
 };
 use uuid::Uuid;
 
+use crate::llm::intent::{IntentOutcome, IntentResolver};
 use crate::slack::card::{self, CardCtx};
 use crate::slack::client::{QUEUED_REACTION, SlackClient};
 use crate::slack::stream::initial_chunks_for_card;
 use crate::slack::target::SlackJobTarget;
-use crate::slack::workload::resolve_workload;
+use crate::workload::{WorkloadSpec, resolve_workload};
 
 /// One inbound Slack mention, normalized from the Socket Mode `app_mention`
 /// envelope (the receive loop, wiring slice, builds these).
@@ -52,6 +56,9 @@ pub struct SlackConnector {
     target: SlackJobTarget,
     jobs: Arc<dyn JobStore>,
     client: Arc<dyn SlackClient>,
+    intent_resolver: Option<Arc<dyn IntentResolver>>,
+    intent_rate_limit_per_minute: u32,
+    intent_calls: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
 impl SlackConnector {
@@ -61,7 +68,25 @@ impl SlackConnector {
         jobs: Arc<dyn JobStore>,
         client: Arc<dyn SlackClient>,
     ) -> Self {
-        Self { cfg, target, jobs, client }
+        Self {
+            cfg,
+            target,
+            jobs,
+            client,
+            intent_resolver: None,
+            intent_rate_limit_per_minute: 0,
+            intent_calls: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_intent_resolver(
+        mut self,
+        resolver: Arc<dyn IntentResolver>,
+        rate_limit_per_minute: u32,
+    ) -> Self {
+        self.intent_resolver = Some(resolver);
+        self.intent_rate_limit_per_minute = rate_limit_per_minute.max(1);
+        self
     }
 
     /// Handle one mention end to end. Never returns an error — every failure is
@@ -76,11 +101,16 @@ impl SlackConnector {
             return;
         }
 
-        // 2. Resolve the workload (mention stripped → the parser seam).
-        let spec = match resolve_workload(strip_leading_mention(&event.text)) {
+        // 2. Resolve the workload (mention stripped → parser fast-path, then optional
+        //    LLM resolver).
+        let text = strip_leading_mention(&event.text);
+        let spec = match self
+            .resolve_workload_for_event(&event, text)
+            .await
+        {
             Ok(spec) => spec,
-            Err(e) => {
-                self.reject(&event, &e.to_string())
+            Err(reason) => {
+                self.reject(&event, &reason)
                     .await;
                 return;
             }
@@ -148,6 +178,65 @@ impl SlackConnector {
         {
             tracing::warn!(error = %e, "slack: add_reaction failed (job still enqueued)");
         }
+    }
+
+    async fn resolve_workload_for_event(
+        &self,
+        event: &MentionEvent,
+        text: &str,
+    ) -> Result<WorkloadSpec, String> {
+        match resolve_workload(text) {
+            Ok(spec) => return Ok(spec),
+            Err(e) if self.intent_resolver.is_none() => return Err(e.to_string()),
+            Err(_) => {}
+        }
+
+        let resolver = self
+            .intent_resolver
+            .as_ref()
+            .expect("checked above");
+        if !self.allow_intent_call(&event.user) {
+            return Err("too many benchmark requests using natural language — please try again \
+                        shortly"
+                .into());
+        }
+        match resolver.resolve(text).await {
+            Ok(IntentOutcome::Resolved(spec)) => Ok(spec),
+            Ok(IntentOutcome::Invalid(invalid)) => Err(invalid.user_message()),
+            Err(e) => {
+                tracing::warn!(error = %e, "slack: intent resolver failed");
+                Err("couldn't resolve that benchmark request — please try again or use explicit \
+                     flags"
+                    .into())
+            }
+        }
+    }
+
+    fn allow_intent_call(&self, user: &str) -> bool {
+        let limit = self
+            .intent_rate_limit_per_minute
+            .max(1) as usize;
+        let now = Instant::now();
+        let mut calls = self
+            .intent_calls
+            .lock()
+            .unwrap();
+        let user_calls = calls
+            .entry(user.to_string())
+            .or_default();
+        if let Some(cutoff) = now.checked_sub(Duration::from_secs(60)) {
+            while user_calls
+                .front()
+                .is_some_and(|t| *t < cutoff)
+            {
+                user_calls.pop_front();
+            }
+        }
+        if user_calls.len() >= limit {
+            return false;
+        }
+        user_calls.push_back(now);
+        true
     }
 
     /// Post the queued live-timeline card in-thread + persist its `ts` by
@@ -255,6 +344,7 @@ fn strip_leading_mention(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use sbgh_core::db::InMemoryJobStore;
@@ -276,6 +366,53 @@ mod tests {
         posts: Mutex<Vec<(String, String, String)>>,      // (channel, thread_ts, blocks-json)
         reactions: Mutex<Vec<(String, String, String)>>,  // (channel, ts, reaction)
         removed: Mutex<Vec<(String, String, String)>>,    // (channel, ts, reaction)
+    }
+
+    struct FakeIntentResolver {
+        calls: AtomicUsize,
+        outcome: Result<IntentOutcome, String>,
+    }
+
+    impl FakeIntentResolver {
+        fn resolved(spec: WorkloadSpec) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                outcome: Ok(IntentOutcome::Resolved(spec)),
+            }
+        }
+
+        fn invalid(reason: &str) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                outcome: Ok(IntentOutcome::Invalid(reason.into())),
+            }
+        }
+
+        fn error(reason: &str) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                outcome: Err(reason.into()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls
+                .load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl IntentResolver for FakeIntentResolver {
+        async fn resolve(
+            &self,
+            _text: &str,
+        ) -> Result<IntentOutcome, crate::llm::intent::IntentProviderError> {
+            self.calls
+                .fetch_add(1, Ordering::SeqCst);
+            self.outcome
+                .clone()
+                .map_err(crate::llm::intent::IntentProviderError::Message)
+        }
     }
 
     #[async_trait]
@@ -388,6 +525,25 @@ mod tests {
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone());
         (connector, store, client)
+    }
+
+    fn harness_with_intent(
+        resolver: Arc<FakeIntentResolver>,
+    ) -> (SlackConnector, Arc<InMemoryJobStore>, Arc<FakeSlackClient>, Arc<FakeIntentResolver>)
+    {
+        harness_with_intent_rate(resolver, 5)
+    }
+
+    fn harness_with_intent_rate(
+        resolver: Arc<FakeIntentResolver>,
+        rate_limit_per_minute: u32,
+    ) -> (SlackConnector, Arc<InMemoryJobStore>, Arc<FakeSlackClient>, Arc<FakeIntentResolver>)
+    {
+        let store = Arc::new(InMemoryJobStore::new());
+        let client = Arc::new(FakeSlackClient::default());
+        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
+            .with_intent_resolver(resolver.clone(), rate_limit_per_minute);
+        (connector, store, client, resolver)
     }
 
     #[tokio::test]
@@ -581,6 +737,174 @@ mod tests {
                 .contains("only one of"),
             "ephemeral carries the parse reason: {}",
             eph[0].2
+        );
+    }
+
+    #[tokio::test]
+    async fn flag_shaped_request_uses_parser_fast_path_without_llm_call() {
+        let resolver = Arc::new(FakeIntentResolver::invalid("should not be used"));
+        let (c, store, _slack, resolver) = harness_with_intent(resolver);
+        c.handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 5"))
+            .await;
+
+        assert_eq!(resolver.calls(), 0, "clean parser input bypasses LLM");
+        assert_eq!(store.all_jobs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn natural_language_can_resolve_through_llm() {
+        let spec = WorkloadSpec {
+            target: crate::workload::WorkloadTarget::BlockRange { start: 10, end: 12 },
+            repetitions: Some(2),
+            warmup: Some(1),
+            rev: Some("feature/nl".into()),
+        };
+        let resolver = Arc::new(FakeIntentResolver::resolved(spec));
+        let (c, store, _slack, resolver) = harness_with_intent(resolver);
+        c.handle_mention(event("<@U07BOT> bench blocks 10 to 12 twice on feature/nl"))
+            .await;
+
+        assert_eq!(resolver.calls(), 1);
+        let jobs = store.all_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].git_ref_display, "feature/nl");
+        let queued = store
+            .queued_event(jobs[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap().0).unwrap();
+        let QueuedEventDetail::SlackAdhoc { bench_args, .. } = detail else {
+            panic!("expected SlackAdhoc");
+        };
+        assert_eq!(
+            bench_args,
+            vec!["--start-at", "10", "--count", "3", "--repetitions", "2", "--warmup", "1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_llm_resolution_rejects_without_enqueue_or_reaction() {
+        let resolver = Arc::new(FakeIntentResolver::invalid("I need a block or txid"));
+        let (c, store, slack, resolver) = harness_with_intent(resolver);
+        c.handle_mention(event("<@U07BOT> please benchmark something"))
+            .await;
+
+        assert_eq!(resolver.calls(), 1);
+        assert!(store.all_jobs().is_empty());
+        assert!(
+            slack
+                .reactions
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        let eph = slack
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert_eq!(eph[0].2, "I need a block or txid");
+    }
+
+    #[tokio::test]
+    async fn provider_failure_rejects_without_enqueue_or_reaction() {
+        let resolver = Arc::new(FakeIntentResolver::error("provider unavailable"));
+        let (c, store, slack, resolver) = harness_with_intent(resolver);
+        c.handle_mention(event("<@U07BOT> please benchmark block ten"))
+            .await;
+
+        assert_eq!(resolver.calls(), 1);
+        assert!(store.all_jobs().is_empty());
+        assert!(
+            slack
+                .reactions
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        let eph = slack
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("couldn't resolve"),
+            "ephemeral should be safe/generic: {}",
+            eph[0].2
+        );
+    }
+
+    #[tokio::test]
+    async fn natural_language_rate_limit_rejects_without_second_provider_call() {
+        let spec = WorkloadSpec {
+            target: crate::workload::WorkloadTarget::Blocks(vec![
+                crate::workload::BlockSelector::Height(1),
+            ]),
+            repetitions: Some(1),
+            warmup: Some(0),
+            rev: None,
+        };
+        let resolver = Arc::new(FakeIntentResolver::resolved(spec));
+        let (c, store, slack, resolver) = harness_with_intent_rate(resolver, 1);
+
+        c.handle_mention(event("<@U07BOT> please benchmark block one"))
+            .await;
+        c.handle_mention(event("<@U07BOT> please benchmark block two"))
+            .await;
+
+        assert_eq!(resolver.calls(), 1, "second NL request is rejected before provider call");
+        assert_eq!(store.all_jobs().len(), 1);
+        assert_eq!(
+            slack
+                .reactions
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        let eph = slack
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("too many benchmark requests"),
+            "{}",
+            eph[0].2
+        );
+    }
+
+    #[tokio::test]
+    async fn authz_is_checked_before_llm_resolution() {
+        let spec = WorkloadSpec {
+            target: crate::workload::WorkloadTarget::Blocks(vec![
+                crate::workload::BlockSelector::Height(1),
+            ]),
+            repetitions: Some(1),
+            warmup: Some(0),
+            rev: None,
+        };
+        let resolver = Arc::new(FakeIntentResolver::resolved(spec));
+        let (c, _store, slack, resolver) = harness_with_intent(resolver);
+        let mut ev = event("<@U07BOT> natural language please");
+        ev.user = "U_EVIL".into();
+        c.handle_mention(ev).await;
+
+        assert_eq!(resolver.calls(), 0, "unauthorized input must not spend an LLM call");
+        let eph = slack
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("not authorized")
         );
     }
 

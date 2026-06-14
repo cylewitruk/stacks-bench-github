@@ -256,3 +256,22 @@ enabled = false
 #   SBGH_SLACK_ENABLED=true
 #   SBGH_SLACK_DEFAULT_REPOSITORY / _DEFAULT_REV
 #   SBGH_SLACK_ALLOWED_TEAM_IDS / _ALLOWED_USER_IDS   # comma-separated
+
+# LLM-backed intent resolution (item 0020, iteration v13). Disabled by default.
+# When enabled, explicit flag-shaped Slack input still takes the deterministic
+# parser fast-path; natural-language input is sent to OpenAI for strict
+# schema-filled intent JSON, then revalidated by the daemon before enqueue.
+[llm]
+enabled = false
+provider = "openai"
+model = "gpt-5-mini"
+input_max_chars = 1000
+timeout_secs = 15
+per_user_rate_limit_per_minute = 5
+
+# API key is ENV-ONLY (never in this file — a TOML key here is a hard error):
+#   SBGH_OPENAI_API_KEY
+#
+# Env equivalents for non-secret knobs:
+#   SBGH_LLM_ENABLED / _PROVIDER / _MODEL / _INPUT_MAX_CHARS / _TIMEOUT_SECS
+#   SBGH_LLM_PER_USER_RATE_LIMIT_PER_MINUTE

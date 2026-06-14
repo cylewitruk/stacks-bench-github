@@ -1,16 +1,17 @@
-//! Intent resolution: a Slack request's text → a validated [`WorkloadSpec`].
+//! Workload resolution: user text → a validated [`WorkloadSpec`].
 //!
-//! This is the **seam** the design pins (v5): *capture* (the mention surface) ⟂
-//! *resolution* (text → spec) ⟂ *execution* (the existing bench path). The v1
-//! impl ([`resolve_workload`]) is a deterministic flag parser; a future LLM
-//! resolver (`0020`) plugs in behind the same signature. Either way the output
-//! is a **structured** spec that the same validation produces — a resolver
-//! never emits raw `bench_args`, so it can't inject arbitrary CLI flags.
+//! This is the shared seam between *capture* (Slack mentions today, PR comments
+//! later), *resolution* (text → spec), and *execution* (the existing bench
+//! path). The deterministic impl ([`resolve_workload`]) is a flag parser; the
+//! LLM path in [`crate::llm::intent`] produces the same structured spec. Either
+//! way, a resolver never emits raw `bench_args`, so it can't inject arbitrary
+//! CLI flags.
 //!
 //! The grammar (provisional pending the Phase-0 `stacks-bench` spike): an
 //! optional `bench` verb, then flags (each value as `--flag value` **or**
 //! `--flag=value`) —
-//!   `--txid <hex>` | `--block <height>` (repeatable, **mutually exclusive**)
+//!   `--txid <hex>` | `--block <height-or-hash>` (repeatable,
+//!   **mutually exclusive**)
 //!   `--repetitions <n>`              (how many times to run each, ≥ 1)
 //!   `--warmup <n>`                   (warmup iterations)
 //!   `--rev <ref>`                    (override the code-under-test rev)
@@ -20,21 +21,43 @@
 //! are normalized by stripping an optional user-facing `0x` prefix before they
 //! become `WorkloadSpec` values.
 //!
-//! The caller passes text with the leading `@BenchBot` mention already stripped
-//! (Slack-formatting concerns stay in the connector; this layer is surface- and
-//! Slack-agnostic so the LLM resolver can reuse it).
+//! Callers pass surface-specific wrappers already stripped (for example the
+//! leading `@BenchBot` mention). Formatting concerns stay in the surface
+//! adapter; this layer is deliberately surface-agnostic.
 
-/// A Stacks txid is 32 bytes = 64 hex chars (an optional `0x` prefix aside).
-const TXID_HEX_LEN: usize = 64;
+/// A Stacks txid/block hash is 32 bytes = 64 hex chars (an optional `0x`
+/// prefix aside).
+const HASH_HEX_LEN: usize = 64;
+
+/// One block selector accepted by `stacks-bench --block`: either a canonical
+/// block height or a 32-byte block hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockSelector {
+    Height(u64),
+    Hash(String),
+}
+
+impl BlockSelector {
+    fn as_bench_arg(&self) -> String {
+        match self {
+            Self::Height(h) => h.to_string(),
+            Self::Hash(h) => h.clone(),
+        }
+    }
+}
 
 /// What to profile — `--txid` and `--block` are mutually exclusive, so exactly
 /// one variant is present, each with ≥ 1 value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkloadTarget {
     Txids(Vec<String>),
-    /// Canonical block heights today. v13 will widen this to a selector type
-    /// that can also carry 32-byte hex block hashes.
-    Blocks(Vec<u64>),
+    Blocks(Vec<BlockSelector>),
+    /// Inclusive canonical block-height range. Emitted as `--start-at` +
+    /// `--count`, not as one `--block` arg per height.
+    BlockRange {
+        start: u64,
+        end: u64,
+    },
 }
 
 /// A validated ad-hoc workload: the target plus the run parameters. The **code
@@ -70,8 +93,14 @@ impl WorkloadSpec {
             WorkloadTarget::Blocks(blocks) => {
                 for b in blocks {
                     args.push("--block".to_string());
-                    args.push(b.to_string());
+                    args.push(b.as_bench_arg());
                 }
+            }
+            WorkloadTarget::BlockRange { start, end } => {
+                args.push("--start-at".to_string());
+                args.push(start.to_string());
+                args.push("--count".to_string());
+                args.push((end - start + 1).to_string());
             }
         }
         if let Some(r) = self.repetitions {
@@ -113,9 +142,11 @@ impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => {
-                write!(f, "empty request — try `bench --block <height> --repetitions <n>`")
+                write!(f, "empty request — try `bench --block <height-or-hash> --repetitions <n>`")
             }
-            Self::NoTarget => write!(f, "no workload — give `--txid <hex>` or `--block <height>`"),
+            Self::NoTarget => {
+                write!(f, "no workload — give `--txid <hex>` or `--block <height-or-hash>`")
+            }
             Self::MixedTargets => {
                 write!(f, "use only one of `--txid` or `--block`, not both")
             }
@@ -149,7 +180,7 @@ pub fn resolve_workload(text: &str) -> Result<WorkloadSpec, ResolveError> {
     }
 
     let mut txids: Vec<String> = Vec::new();
-    let mut blocks: Vec<u64> = Vec::new();
+    let mut blocks: Vec<BlockSelector> = Vec::new();
     let mut repetitions: Option<u32> = None;
     let mut warmup: Option<u32> = None;
     let mut rev: Option<String> = None;
@@ -177,8 +208,8 @@ pub fn resolve_workload(text: &str) -> Result<WorkloadSpec, ResolveError> {
             return Err(ResolveError::MissingValue(flag.to_string()));
         }
         match flag {
-            "--txid" => txids.push(validate_txid(flag, value)?),
-            "--block" => blocks.push(parse_u64(flag, value)?),
+            "--txid" => txids.push(validate_hash_hex(flag, value, "txid")?),
+            "--block" => blocks.push(parse_block_selector(flag, value)?),
             "--repetitions" => set_once(&mut repetitions, flag, parse_repetitions(flag, value)?)?,
             "--warmup" => set_once(&mut warmup, flag, parse_u32(flag, value)?)?,
             "--rev" => set_once(&mut rev, flag, value.to_string())?,
@@ -215,14 +246,11 @@ fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), Resolve
     Ok(())
 }
 
-fn parse_u64(flag: &str, value: &str) -> Result<u64, ResolveError> {
-    value
-        .parse::<u64>()
-        .map_err(|_| ResolveError::InvalidValue {
-            flag: flag.to_string(),
-            value: value.to_string(),
-            reason: "expected a non-negative integer".to_string(),
-        })
+fn parse_block_selector(flag: &str, value: &str) -> Result<BlockSelector, ResolveError> {
+    match value.parse::<u64>() {
+        Ok(h) => Ok(BlockSelector::Height(h)),
+        Err(_) => validate_hash_hex(flag, value, "block hash").map(BlockSelector::Hash),
+    }
 }
 
 fn parse_u32(flag: &str, value: &str) -> Result<u32, ResolveError> {
@@ -248,13 +276,10 @@ fn parse_repetitions(flag: &str, value: &str) -> Result<u32, ResolveError> {
     Ok(n)
 }
 
-/// Validate a txid (provisional, pending the v13 resolver cleanup): an optional
-/// `0x` prefix then [`TXID_HEX_LEN`] hex chars.
-///
-/// The current deterministic parser preserves the spelling the user typed; v13
-/// will share this validation with block hashes and normalize accepted values to
-/// bare 64-character hex before building `WorkloadSpec`.
-fn validate_txid(flag: &str, value: &str) -> Result<String, ResolveError> {
+/// Validate a txid or block hash: an optional `0x` prefix then
+/// [`HASH_HEX_LEN`] hex chars. Accepted values are normalized to bare lowercase
+/// hex before building [`WorkloadSpec`].
+fn validate_hash_hex(flag: &str, value: &str, label: &str) -> Result<String, ResolveError> {
     let hex = value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
@@ -264,8 +289,8 @@ fn validate_txid(flag: &str, value: &str) -> Result<String, ResolveError> {
         value: value.to_string(),
         reason: reason.to_string(),
     };
-    if hex.len() != TXID_HEX_LEN {
-        return Err(invalid("expected a 64-character hex txid"));
+    if hex.len() != HASH_HEX_LEN {
+        return Err(invalid(&format!("expected a 64-character hex {label}")));
     }
     if !hex
         .bytes()
@@ -273,7 +298,7 @@ fn validate_txid(flag: &str, value: &str) -> Result<String, ResolveError> {
     {
         return Err(invalid("expected hex digits"));
     }
-    Ok(value.to_string())
+    Ok(hex.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -289,7 +314,7 @@ mod tests {
     #[test]
     fn parses_a_block_workload_with_reps() {
         let spec = ok("bench --block 184231 --repetitions 5");
-        assert_eq!(spec.target, WorkloadTarget::Blocks(vec![184231]));
+        assert_eq!(spec.target, WorkloadTarget::Blocks(vec![BlockSelector::Height(184231)]));
         assert_eq!(spec.repetitions, Some(5));
         assert_eq!(spec.warmup, None);
         assert_eq!(spec.rev, None);
@@ -300,9 +325,12 @@ mod tests {
     fn accepts_equals_value_syntax() {
         // `--flag=value` is equivalent to `--flag value`, and the two forms mix.
         let spec = ok("bench --block=184231 --repetitions=5");
-        assert_eq!(spec.target, WorkloadTarget::Blocks(vec![184231]));
+        assert_eq!(spec.target, WorkloadTarget::Blocks(vec![BlockSelector::Height(184231)]));
         assert_eq!(spec.repetitions, Some(5));
-        assert_eq!(ok("--block=1 --block 2").target, WorkloadTarget::Blocks(vec![1, 2]));
+        assert_eq!(
+            ok("--block=1 --block 2").target,
+            WorkloadTarget::Blocks(vec![BlockSelector::Height(1), BlockSelector::Height(2)])
+        );
         // A rev may itself contain `=` (split on the first only).
         assert_eq!(
             ok("--block=1 --rev=a=b")
@@ -322,19 +350,24 @@ mod tests {
 
     #[test]
     fn bench_verb_is_optional() {
-        assert_eq!(ok("--block 7").target, WorkloadTarget::Blocks(vec![7]));
+        assert_eq!(ok("--block 7").target, WorkloadTarget::Blocks(vec![BlockSelector::Height(7)]));
     }
 
     #[test]
     fn repeatable_blocks_and_txids() {
         assert_eq!(
             ok("--block 1 --block 2 --block 3").target,
-            WorkloadTarget::Blocks(vec![1, 2, 3])
+            WorkloadTarget::Blocks(vec![
+                BlockSelector::Height(1),
+                BlockSelector::Height(2),
+                BlockSelector::Height(3)
+            ])
         );
         let two_txids = format!("--txid {TXID} --txid {TXID}");
+        let bare = TXID.trim_start_matches("0x");
         assert_eq!(
             ok(&two_txids).target,
-            WorkloadTarget::Txids(vec![TXID.to_string(), TXID.to_string()])
+            WorkloadTarget::Txids(vec![bare.to_string(), bare.to_string()])
         );
     }
 
@@ -352,6 +385,34 @@ mod tests {
         let bare = &TXID[2..]; // strip 0x
         let spec = ok(&format!("--txid {bare}"));
         assert_eq!(spec.target, WorkloadTarget::Txids(vec![bare.to_string()]));
+    }
+
+    #[test]
+    fn txid_prefix_is_stripped_and_normalized() {
+        let mixed = "0xABCDEFabcdef1111111111111111111111111111111111111111111111111111";
+        let spec = ok(&format!("--txid {mixed}"));
+        assert_eq!(
+            spec.target,
+            WorkloadTarget::Txids(vec![
+                "abcdefabcdef1111111111111111111111111111111111111111111111111111".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn block_hash_prefix_is_stripped_and_normalized() {
+        let hash = "0xABCDEFabcdef2222222222222222222222222222222222222222222222222222";
+        let spec = ok(&format!("--block {hash}"));
+        assert_eq!(
+            spec.target,
+            WorkloadTarget::Blocks(vec![BlockSelector::Hash(
+                "abcdefabcdef2222222222222222222222222222222222222222222222222222".to_string()
+            )])
+        );
+        assert_eq!(
+            spec.to_bench_args(),
+            vec!["--block", "abcdefabcdef2222222222222222222222222222222222222222222222222222"]
+        );
     }
 
     #[test]

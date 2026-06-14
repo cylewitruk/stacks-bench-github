@@ -37,7 +37,7 @@ need editing when an item's status or location changes.
 | `0017-generic-phase-events` | Generic phase-event enum | `backlog` | [backlog.md](backlog.md) |
 | `0018-auto-rerun-confidence-gate` | Auto-rerun confidence gate | `parked` | [backlog.md](backlog.md) |
 | `0019-block-validation-recipe` | Block-validation recipe | `backlog` | [backlog.md](backlog.md) |
-| `0020-llm-intent-resolution` | LLM intent resolution (Slack + PRs) | `planned` | [iterations/v13-llm-intent-resolution.md](iterations/v13-llm-intent-resolution.md) |
+| `0020-llm-intent-resolution` | LLM intent resolution (Slack + PRs) | `in_progress` | [iterations/v13-llm-intent-resolution.md](iterations/v13-llm-intent-resolution.md) |
 | `0021-slack-live-timeline` | Slack live timeline | `shipped` | [archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md) |
 | `0022-report-surface-trait` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
 | `0023-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
@@ -66,7 +66,7 @@ need editing when an item's status or location changes.
 | `v10-job-model-decomposition` | Job-model decomposition (source/intent/task/target axes) | `shipped` | [archive/completed/0005-task-kind-platform.md](archive/completed/0005-task-kind-platform.md) |
 | `v11-reusable-build-jobs` | Reusable build jobs (pin warming) | `shipped` | [archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md) |
 | `v12-slack-streamed-plan` | Slack streamed plan updates | `in_progress` | [iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md) |
-| `v13-llm-intent-resolution` | LLM intent resolution | `planned` | [iterations/v13-llm-intent-resolution.md](iterations/v13-llm-intent-resolution.md) |
+| `v13-llm-intent-resolution` | LLM intent resolution | `in_progress` | [iterations/v13-llm-intent-resolution.md](iterations/v13-llm-intent-resolution.md) |
 
 ## Decisions
 

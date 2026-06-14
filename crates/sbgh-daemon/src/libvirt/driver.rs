@@ -1724,6 +1724,7 @@ mod tests {
             },
             artifacts: Default::default(),
             slack: Default::default(),
+            llm: Default::default(),
         }
     }
 

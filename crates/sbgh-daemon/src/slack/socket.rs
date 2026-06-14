@@ -138,6 +138,8 @@ pub async fn run(
     target: SlackJobTarget,
     jobs: Arc<dyn JobStore>,
     web_client: Arc<dyn crate::slack::client::SlackClient>,
+    intent_resolver: Option<Arc<dyn crate::llm::intent::IntentResolver>>,
+    intent_rate_limit_per_minute: u32,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let app_token_value = cfg
@@ -149,7 +151,11 @@ pub async fn run(
 
     // The connector (authz/resolve/enqueue/react) shares the Web API client and
     // rides into the listener via user state.
-    let connector = Arc::new(SlackConnector::new(cfg, target, jobs, web_client));
+    let mut connector = SlackConnector::new(cfg, target, jobs, web_client);
+    if let Some(resolver) = intent_resolver {
+        connector = connector.with_intent_resolver(resolver, intent_rate_limit_per_minute);
+    }
+    let connector = Arc::new(connector);
 
     let slack_client = Arc::new(SlackHyperClient::new(SlackClientHyperConnector::new()?));
     let environment = Arc::new(
