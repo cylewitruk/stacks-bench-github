@@ -4,7 +4,7 @@ Successor to [v5 (`0002`)](../archive/completed/0002-slack-adhoc-profiling.md):
 the mention surface and `WorkloadSpec` seam exist, but users still need to
 think in flags. v13 makes the normal path "user input → schema-validated
 spec", with the current flag parser kept only as compatibility/disabled-mode
-plumbing.
+plumbing and an internal fast path for already-structured input.
 
 > **Status:** planned — Phase 0 design drafted for review. No code has landed.
 >
@@ -59,7 +59,8 @@ flags, or enqueue jobs directly.
 request. Ambiguous or invalid input produces a short user-facing rejection or
 clarifying message, with no enqueue and no reaction. If the provider returns
 non-schema JSON, malformed JSON, an invalid enum/value, or an invalid spec, the
-request is rejected.
+request is rejected. Before flipping this on as the normal Slack path, a small
+real-model eval set must pass the threshold pinned in Phase 2.
 
 ## External API Grounding
 
@@ -80,13 +81,37 @@ The model output is one of two states:
 ```json
 {
   "status": "resolved",
-  "target": {
-    "kind": "blocks",
-    "blocks": [8123456, 8200000]
-  },
+  "target_kind": "block_range",
+  "block": null,
+  "block_range": { "start": 8123456, "end": 8200000 },
+  "txids": null,
   "repetitions": 10,
   "warmup": 1000,
-  "rev": "3.4.0.0.3"
+  "rev": "3.4.0.0.3",
+  "reason": null
+}
+```
+
+For an explicit block list, `block` carries selectors:
+
+```json
+{
+  "status": "resolved",
+  "target_kind": "block",
+  "block": [
+    { "kind": "height", "height": 8123456, "hash": null },
+    {
+      "kind": "hash",
+      "height": null,
+      "hash": "c3b1aad400000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "block_range": null,
+  "txids": null,
+  "repetitions": 1,
+  "warmup": 0,
+  "rev": null,
+  "reason": null
 }
 ```
 
@@ -95,6 +120,13 @@ or:
 ```json
 {
   "status": "invalid",
+  "target_kind": null,
+  "block": null,
+  "block_range": null,
+  "txids": null,
+  "repetitions": null,
+  "warmup": null,
+  "rev": null,
   "reason": "I need a block height, block range, or transaction id to benchmark."
 }
 ```
@@ -102,16 +134,36 @@ or:
 Rules:
 
 - `status` is required.
-- `resolved.target.kind` is `blocks` or `txids`; exactly one target form is
-  present.
+- Use one strict-mode-friendly object with a `status` discriminant and nullable
+  fields, not a root `anyOf`. Unknown fields are rejected
+  (`additionalProperties: false`).
+- For `status = "resolved"`, `target_kind` is one of `block`, `block_range`, or
+  `txids`, and exactly the matching target field is non-null.
+- A `block` target is a list of block selectors. Each selector is either a
+  canonical block height or a hex-encoded block hash; the schema uses a
+  per-selector `kind` discriminant plus nullable `height` / `hash` fields so the
+  daemon can validate exactly one representation.
+- Block selector validation is exact: `kind = "height"` requires `height` and
+  `hash = null`; `kind = "hash"` requires `hash` and `height = null`.
+- Hex inputs for txids and block hashes may include a user-facing `0x` prefix
+  (as block explorers often display them). The daemon strips that prefix,
+  validates the remaining value is exactly 32 bytes / 64 hex characters, and
+  stores/emits the normalized bare hex form.
+- `block_range` means an inclusive range from height `start` to height `end`; it
+  is not a two-block list and does not accept hashes. The validator rejects
+  `start > end`.
+- For `status = "invalid"`, `reason` is required and every target/run field is
+  null.
 - `repetitions` is always populated and must be `>= 1`. Default: `1`.
 - `warmup` is always populated and must be `>= 0`. Default: `0`.
 - `rev` is `null` or a branch/tag/SHA string. `null` means `[slack].default_rev`.
 - `invalid.reason` is short, user-facing, and safe to post back.
-- Unknown fields are rejected (`additionalProperties: false`).
 
-The daemon validates the decoded object again before constructing
-`WorkloadSpec`; schema conformance is necessary but not sufficient.
+The daemon validates the decoded object again before constructing `WorkloadSpec`.
+Schema conformance is necessary but not sufficient: strict Structured Outputs
+enforce shape (required fields, enums, no unknown properties), while the daemon
+owns numeric/value bounds (`repetitions >= 1`, `warmup >= 0`, txid format, range
+ordering, non-empty lists, and later ref existence).
 
 ## Phases
 
@@ -129,15 +181,30 @@ real provider.
 - Add typed `IntentResolution` / `IntentTarget` structs and a
   `validate_intent_resolution` function that produces `WorkloadSpec` or a
   user-facing rejection.
+- Update the internal workload target model as needed so `--block` can carry
+  both canonical heights and hex-encoded block hashes; the current height-only
+  `Vec<u64>` is too narrow for the LLM schema and the eventual parser cleanup.
+- Verify the downstream `stacks-bench` CLI accepts normalized bare 64-character
+  hex for `--txid` and block-hash `--block` inputs before v13 emits normalized
+  values.
+- Add a small representative eval fixture format (prompt + expected
+  `IntentResolution` or invalid reason class). The fake resolver can replay it;
+  the real provider runs it in Phase 2.
 - Add an `IntentResolver` trait and a fake/test resolver.
 
 **Acceptance & Validation:**
 
 - [ ] Config defaults disabled and requires the env key only when enabled.
 - [ ] Malformed/extra-field intent JSON is rejected.
-- [ ] Resolved block, block-range, txid, warmup, repetition, and rev examples
-      validate into the expected `WorkloadSpec`.
+- [ ] Resolved block-height, block-hash, block-range, txid, warmup, repetition,
+      and rev examples validate into the expected `WorkloadSpec`.
+- [ ] Txid and block-hash examples accept optional `0x` prefixes, reject
+      non-hex / wrong-length values, and normalize to bare 64-character hex.
+- [ ] Normalized bare-hex txid and block-hash args are accepted by the
+      downstream `stacks-bench` parser/CLI path.
 - [ ] Invalid intent produces a user-facing message and no spec.
+- [ ] The eval fixture set exists with at least 15 prompts covering common,
+      ambiguous, invalid, and flag-shaped inputs.
 
 **Tests:**
 
@@ -157,6 +224,8 @@ real provider.
 - Parse only the schema-constrained response body into `IntentResolution`.
 - Treat provider errors, refusals, incomplete responses, non-schema output, and
   validation failures as user-facing rejection/clarification, never as enqueue.
+- Add an offline/manual eval command or test harness that runs the fixture set
+  against the configured real model when `SBGH_OPENAI_API_KEY` is present.
 
 **Acceptance & Validation:**
 
@@ -164,6 +233,10 @@ real provider.
 - [ ] Response parsing tests cover resolved, invalid, malformed, and provider
       error envelopes.
 - [ ] Provider timeout/error returns a safe "could not resolve request" message.
+- [ ] Real-model eval pass rate meets the implementation-pinned threshold
+      before Phase 3 makes the resolver the normal Slack path. Suggested
+      starting gate: 90% exact target/run-field match and 100% no unsafe
+      enqueue for invalid/ambiguous prompts.
 
 **Notes:** The default model should be chosen at implementation time from the
 current small structured-output-capable OpenAI model family. Do not bake a stale
@@ -171,16 +244,19 @@ model name into the plan.
 
 ### Phase 3: Slack Wiring
 
-**Goal:** Use the LLM resolver as the normal Slack input path when enabled.
+**Goal:** Use the LLM resolver as the normal Slack product path when enabled.
 
 **Scope:**
 
 - Authz remains first.
-- Strip the leading mention, then resolve text through the configured resolver.
+- Strip the leading mention, then resolve text into `WorkloadSpec`.
 - If `[llm].enabled = false`, retain the current deterministic parser for
   compatibility and local operation.
-- If `[llm].enabled = true`, the LLM resolver is primary; the flag parser is not
-  the product path.
+- If `[llm].enabled = true`, keep the deterministic parser as an internal
+  fast-path for already-structured requests that parse cleanly. It avoids
+  latency/cost/provider dependency for explicit input, but it is not the desired
+  user-facing UX.
+- If the parser fails and the input is natural language, call the LLM resolver.
 - Rejections/clarifications are posted as ephemeral replies; no enqueue and no
   reaction.
 - Successful resolutions enqueue exactly as today from `WorkloadSpec`.
@@ -191,7 +267,14 @@ model name into the plan.
 - [ ] Invalid/ambiguous NL request posts an ephemeral message and enqueues
       nothing.
 - [ ] Off-allowlist users are rejected before any provider call.
+- [ ] A flag-shaped request that parses cleanly takes the parser fast-path and
+      does not call the provider.
 - [ ] Provider/rate-limit failures do not enqueue.
+- [ ] A hallucinated/nonexistent `rev` fails cleanly through the daemon-owned
+      commit-resolution path (no new risk class).
+- [ ] If provider latency is noticeable, the Slack handler either posts an
+      immediate short acknowledgement or otherwise gives the user timely
+      feedback without enqueuing early.
 
 **Tests:**
 
@@ -221,8 +304,9 @@ model name into the plan.
    Anything else is a rejection.
 2. **Spec, not args.** The model fills a structured intent object; daemon code
    owns validation and conversion to `WorkloadSpec` / `bench_args`.
-3. **LLM primary when enabled.** The flag parser remains only for disabled-mode
-   compatibility and tests; it is not the desired Slack UX.
+3. **LLM primary UX, parser fast-path.** Natural language is the desired Slack
+   interface, but the deterministic parser stays as an internal fast-path for
+   already-structured text. Both paths produce the same `WorkloadSpec`.
 4. **Authz before spend.** Team/user authorization and PR policy checks happen
    before provider calls.
 5. **No model-side tools.** v13 is intent extraction only. The model cannot

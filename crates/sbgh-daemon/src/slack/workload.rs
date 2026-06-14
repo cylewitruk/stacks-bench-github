@@ -10,10 +10,15 @@
 //! The grammar (provisional pending the Phase-0 `stacks-bench` spike): an
 //! optional `bench` verb, then flags (each value as `--flag value` **or**
 //! `--flag=value`) —
-//!   `--txid <hex>` | `--block <n>`   (each repeatable, **mutually exclusive**)
+//!   `--txid <hex>` | `--block <height>` (repeatable, **mutually exclusive**)
 //!   `--repetitions <n>`              (how many times to run each, ≥ 1)
 //!   `--warmup <n>`                   (warmup iterations)
 //!   `--rev <ref>`                    (override the code-under-test rev)
+//!
+//! v13 widens this seam: `--block` targets may be canonical heights or
+//! hex-encoded block hashes, and all 32-byte hex inputs (`txid` / block hash)
+//! are normalized by stripping an optional user-facing `0x` prefix before they
+//! become `WorkloadSpec` values.
 //!
 //! The caller passes text with the leading `@BenchBot` mention already stripped
 //! (Slack-formatting concerns stay in the connector; this layer is surface- and
@@ -27,6 +32,8 @@ const TXID_HEX_LEN: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkloadTarget {
     Txids(Vec<String>),
+    /// Canonical block heights today. v13 will widen this to a selector type
+    /// that can also carry 32-byte hex block hashes.
     Blocks(Vec<u64>),
 }
 
@@ -241,9 +248,12 @@ fn parse_repetitions(flag: &str, value: &str) -> Result<u32, ResolveError> {
     Ok(n)
 }
 
-/// Validate a txid (provisional, pending the Phase-0 spike): an optional `0x`
-/// prefix then [`TXID_HEX_LEN`] hex chars. Stored verbatim (trimmed) so the
-/// exact form the user typed reaches `stacks-bench`.
+/// Validate a txid (provisional, pending the v13 resolver cleanup): an optional
+/// `0x` prefix then [`TXID_HEX_LEN`] hex chars.
+///
+/// The current deterministic parser preserves the spelling the user typed; v13
+/// will share this validation with block hashes and normalize accepted values to
+/// bare 64-character hex before building `WorkloadSpec`.
 fn validate_txid(flag: &str, value: &str) -> Result<String, ResolveError> {
     let hex = value
         .strip_prefix("0x")
