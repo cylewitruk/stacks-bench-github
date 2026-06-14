@@ -85,11 +85,11 @@ fn unix_now() -> u64 {
 }
 
 /// Assemble the build fingerprint for `commit` (item 0025, v9). Reads
-/// `rust-toolchain.toml` from the **bare git mirror** (no source-disk mount —
-/// the disk is detached after provisioning), keys by the **declared** toolchain
-/// channel (pragmatic reuse, not `rustc -vV` provenance), and folds in the
-/// golden-image identity. `None` when `rust-toolchain.toml` / the golden image
-/// is unreadable.
+/// `rust-toolchain.toml` (or legacy `rust-toolchain`) from the **bare git
+/// mirror** (no source-disk mount — the disk is detached after provisioning),
+/// keys by the **declared** toolchain channel (pragmatic reuse, not `rustc -vV`
+/// provenance), and folds in the golden-image identity. `None` when no
+/// supported toolchain file / golden image is readable.
 async fn assemble_fingerprint(
     shell: &dyn Shell,
     git_binary: &Path,
@@ -97,11 +97,25 @@ async fn assemble_fingerprint(
     golden_image: &Path,
     commit: &str,
 ) -> Option<BuildFingerprint> {
-    let toolchain_toml =
-        show_repo_file(shell, git_binary, mirror, commit, "rust-toolchain.toml").await?;
-    let toolchain = binary_cache::toolchain_channel(&toolchain_toml)?;
+    let toolchain = read_declared_toolchain(shell, git_binary, mirror, commit).await?;
     let env = current_cache_environment(golden_image)?;
     Some(env.fingerprint(commit.to_string(), toolchain))
+}
+
+async fn read_declared_toolchain(
+    shell: &dyn Shell,
+    git_binary: &Path,
+    mirror: &Path,
+    commit: &str,
+) -> Option<String> {
+    if let Some(toolchain_toml) =
+        show_repo_file(shell, git_binary, mirror, commit, "rust-toolchain.toml").await
+        && let Some(channel) = binary_cache::toolchain_channel(&toolchain_toml)
+    {
+        return Some(channel);
+    }
+    let legacy = show_repo_file(shell, git_binary, mirror, commit, "rust-toolchain").await?;
+    binary_cache::legacy_toolchain_channel(&legacy)
 }
 
 /// The daemon's **current** build environment — the [`CacheEnvironment`] half
@@ -565,8 +579,8 @@ impl LibvirtDriver {
     /// is cached, seed it into the **source disk** (where the bench VM
     /// execs it) and report the build phase done, returning `true` to skip
     /// the build VM. Best-effort — any miss (cache miss, missing/unreadable
-    /// `rust-toolchain.toml`, seed error) returns `false` and the caller builds
-    /// normally. No-op (returns `false`) when the cache is disabled.
+    /// `rust-toolchain(.toml)`, seed error) returns `false` and the caller
+    /// builds normally. No-op (returns `false`) when the cache is disabled.
     ///
     /// NOTE: the VM-skip orchestration is **not** integration-tested (needs a
     /// libvirt host); gated behind `[artifacts.binary_cache].enabled`. The
@@ -588,7 +602,7 @@ impl LibvirtDriver {
         else {
             tracing::info!(
                 commit = inputs.commit,
-                "binary cache: no fingerprint (missing/unreadable rust-toolchain.toml or golden \
+                "binary cache: no fingerprint (missing/unreadable rust-toolchain(.toml) or golden \
                  image); building"
             );
             return false;
@@ -1444,6 +1458,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assemble_fingerprint_falls_back_to_legacy_toolchain_file() {
+        let tmp = TempDir::new().unwrap();
+        let golden = tmp
+            .path()
+            .join("golden.qcow2");
+        std::fs::write(&golden, b"img").unwrap();
+        let shell = RecordingShell::new();
+        shell.reply(PreparedReply::fail("fatal: path does not exist"));
+        shell.reply(PreparedReply::with_stdout("stable\n"));
+
+        let fp = assemble_fingerprint(
+            &shell,
+            std::path::Path::new("/usr/bin/git"),
+            std::path::Path::new("/var/lib/sbgh/mirror.git"),
+            &golden,
+            "deadbeef",
+        )
+        .await
+        .expect("legacy rust-toolchain → Some fingerprint");
+        assert_eq!(fp.toolchain, "stable");
+
+        let calls = shell.calls();
+        assert!(
+            calls[0]
+                .args
+                .iter()
+                .any(|a| a == "deadbeef:rust-toolchain.toml")
+        );
+        assert!(
+            calls[1]
+                .args
+                .iter()
+                .any(|a| a == "deadbeef:rust-toolchain")
+        );
+    }
+
+    #[tokio::test]
     async fn assemble_fingerprint_keys_floating_channel_and_none_when_missing() {
         let tmp = TempDir::new().unwrap();
         let golden = tmp
@@ -1465,8 +1516,9 @@ mod tests {
         .expect("floating channel still keys");
         assert_eq!(fp.toolchain, "stable");
 
-        // `git show` fails (no rust-toolchain.toml at that commit) → None.
+        // Both toolchain file probes fail → None.
         let missing = RecordingShell::new();
+        missing.reply(PreparedReply::fail("fatal: path does not exist"));
         missing.reply(PreparedReply::fail("fatal: path does not exist"));
         assert!(
             assemble_fingerprint(
@@ -1478,7 +1530,7 @@ mod tests {
             )
             .await
             .is_none(),
-            "missing toolchain file → None"
+            "missing toolchain files → None"
         );
     }
 

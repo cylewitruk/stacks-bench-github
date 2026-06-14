@@ -51,6 +51,7 @@ need editing when an item's status or location changes.
 | `0031-reusable-build-jobs` | Reusable build jobs (artifact + target axis) | `shipped` | [archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md) |
 | `0032-supersede-stale-pr-head-runs` | Supersede stale PR-head benchmarks | `backlog` | [backlog.md](backlog.md) |
 | `0033-slack-streamed-plan-updates` | Slack streamed plan updates | `in_progress` | [iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md) |
+| `0034-historical-stable-toolchain` | Historical stable toolchain resolution | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 

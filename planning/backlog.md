@@ -160,6 +160,38 @@ Promoted → iteration **v13**
 bundled with `0033-slack-streamed-plan-updates` because streaming removes the
 `chat.update` spam/collapse problem that made live timing unattractive.*
 
+### 0034 — Historical stable toolchain resolution
+
+- **id:** `0034-historical-stable-toolchain`
+- **status:** `backlog`
+- **priority:** `low`
+- **depends_on:** `0025-baseline-binary-cache`
+- **source:** Hetzner v11 warm-build observation (2026-06): old integration
+  branches used legacy `rust-toolchain` containing `stable`
+
+**Problem:** Legacy `rust-toolchain` files that say `stable` currently cache
+under the literal `stable` declaration. That matches Rust's normal "use current
+stable at build time" meaning, but it is not necessarily what we want for
+benchmark archaeology: an old release branch may be better built with the
+stable compiler that was current when the commit/tag was made.
+
+**Scope:** Decide whether `stable` in a legacy `rust-toolchain` should remain a
+literal cache key or resolve to a historical concrete Rust version. If adopted,
+resolve by commit date for branch refs; for tags, prefer annotated tagger date
+and fall back to commit date for lightweight tags. The resolved concrete version
+must be used both in the cache fingerprint and in the build VM's selected
+toolchain (for example via `RUSTUP_TOOLCHAIN`), with a local date→version cache
+so builds do not depend on network availability.
+
+**Acceptance:** The policy is explicit and tested. If historical resolution is
+enabled, a legacy `stable` commit from an older date builds with the expected
+concrete toolchain and caches under that concrete version; if disabled, it keeps
+today's literal `stable` behavior.
+
+**Deferred / non-goals:** Do not change current v9/v11 cache semantics as an
+implicit bug fix. This is a policy choice and should be opt-in or clearly
+documented if made default.
+
 ### 0026 — Central block/tx index cache (pre-seed)
 
 - **id:** `0026-central-block-index-cache`

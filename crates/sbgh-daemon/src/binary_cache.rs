@@ -460,6 +460,17 @@ pub fn toolchain_channel(toolchain_toml: &str) -> Option<String> {
     (!channel.is_empty()).then_some(channel)
 }
 
+/// Read the legacy `rust-toolchain` format: a single declared channel name,
+/// e.g. `stable`, `1.85.0`, or `nightly-2026-01-01`. The cache treats this as
+/// the same pragmatic declaration key as `rust-toolchain.toml`.
+pub fn legacy_toolchain_channel(toolchain: &str) -> Option<String> {
+    let channel = toolchain
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    (!channel.contains(char::is_whitespace)).then(|| channel.to_string())
+}
+
 /// A cheap identity for the golden VM image: `<size>:<mtime_secs>`. The image's
 /// OS / glibc / linker fix the binary's runtime ABI, so a changed image must
 /// invalidate cached binaries. Interim per the v9 spike's open question — an
@@ -749,6 +760,17 @@ mod tests {
         }
         assert!(toolchain_channel("[toolchain]\n").is_none(), "no channel key");
         assert!(toolchain_channel("not toml {{{").is_none(), "garbage");
+    }
+
+    #[test]
+    fn legacy_toolchain_channel_reads_single_line_declaration() {
+        for ch in ["1.95.0", "stable", "nightly-2026-01-01"] {
+            let t = format!("{ch}\n");
+            assert_eq!(legacy_toolchain_channel(&t).as_deref(), Some(ch), "channel {ch}");
+        }
+        assert_eq!(legacy_toolchain_channel("\n  stable  \n").as_deref(), Some("stable"));
+        assert!(legacy_toolchain_channel("").is_none(), "empty");
+        assert!(legacy_toolchain_channel("stable extra").is_none(), "not a single channel token");
     }
 
     #[test]
