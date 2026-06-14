@@ -152,41 +152,8 @@ still physically present, awaiting a soak window.
 
 ### 0020 — LLM intent resolution (Slack + PRs)
 
-- **id:** `0020-llm-intent-resolution`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0002-slack-adhoc-profiling` (the mention surface + the
-  `resolve_workload` seam it defines)
-- **source:** v5 scoping (2026-06); high-value list (2026-06) added the PR
-  surface, a concrete provider, and the abuse cap
-
-**Problem:** Bench requests are resolved with a deterministic flag parser; the
-team would prefer **natural language** ("bench blocks n..m on 3.4.0.0.3",
-"profile yesterday's slow block ~5×") over memorized flags, on **both** the
-Slack mention surface and PR comments.
-
-**Scope:** An LLM-backed `resolve_workload` impl behind v5's seam, shared by the
-Slack and PR surfaces. **Grammar-first** — the deterministic parser stays
-authoritative; the LLM runs only when the flag grammar doesn't match (or the
-text is plainly NL). Raw text → structured `WorkloadSpec`
-(txid/block/repetitions/rev) via the provider's **structured-output / JSON-schema
-mode**, then the **same** deterministic validator (the LLM never emits raw
-`bench_args`, so it can't inject flags). Authz stays *before* resolution; an
-uncertain resolver asks a clarifying question in-thread / on the PR. Provider is
-**configurable** (default: the current small structured-output-capable OpenAI
-model, exact name chosen at implementation time) behind a provider-agnostic
-trait; the API key is **env-only** (`SBGH_OPENAI_API_KEY`, a TOML key is a hard
-error — mirrors `slack.*_token` / `artifacts.s3.*`). Abuse guards: an **input
-length cap** + per-user rate limit + ref-existence validation.
-
-**Acceptance:** A natural-language request on Slack or a PR resolves to the
-correct `WorkloadSpec` (or asks a clarifying question), under the same authz +
-validation guards as the flag parser, with the grammar path still taken when it
-matches.
-
-**Deferred / non-goals:** No new task/execution work; rides v5's surface + bench
-path. Prompt design + the exact provider/structured-output binding are part of
-its own design.
+Promoted → iteration **v13**
+([iterations/v13-llm-intent-resolution.md](iterations/v13-llm-intent-resolution.md)).
 
 *`0024-slack-card-stage-timings` promoted → iteration **v12**
 ([iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md));
