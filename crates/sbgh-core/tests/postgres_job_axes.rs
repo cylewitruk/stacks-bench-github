@@ -143,7 +143,11 @@ async fn v10_create_unlinked_job_writes_derived_axes() {
     let store = PostgresJobStore::new(pool.clone());
 
     let detail = serde_json::json!({
-        "trigger": "slack_adhoc", "channel": "C1", "message_ts": "1", "bench_args": []
+        "trigger": "slack_adhoc",
+        "channel": "C1",
+        "message_ts": "1",
+        "bench_args": [],
+        "clean_repetitions": 1
     });
     let job = store
         .create_unlinked_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)

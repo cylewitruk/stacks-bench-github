@@ -285,7 +285,7 @@ fn validate_resolved_intent(
 
     Ok(IntentOutcome::Resolved(WorkloadSpec {
         target,
-        repetitions: Some(repetitions),
+        clean_repetitions: repetitions,
         warmup: Some(warmup),
         rev,
     }))
@@ -671,6 +671,7 @@ mod tests {
         let IntentOutcome::Resolved(spec) = validate_intent_resolution(intent).unwrap() else {
             panic!("expected resolved");
         };
+        assert_eq!(spec.clean_repetitions, 1);
         assert_eq!(
             spec.target,
             WorkloadTarget::Blocks(vec![
@@ -693,10 +694,11 @@ mod tests {
         let IntentOutcome::Resolved(spec) = validate_intent_resolution(intent).unwrap() else {
             panic!("expected resolved");
         };
+        assert_eq!(spec.clean_repetitions, 3);
         assert_eq!(spec.target, WorkloadTarget::BlockRange { start: 10, end: 12 });
         assert_eq!(
             spec.to_bench_args(),
-            vec!["--start-at", "10", "--count", "3", "--repetitions", "3", "--warmup", "2"]
+            vec!["--start-at", "10", "--count", "3", "--repetitions", "1", "--warmup", "2"]
         );
         assert_eq!(spec.rev.as_deref(), Some("develop"));
     }

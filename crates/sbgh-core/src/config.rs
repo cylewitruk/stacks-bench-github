@@ -188,6 +188,10 @@ pub struct RunnerConfig {
     /// historical behavior). Raise it only when the host can run that many
     /// jobs at once (each is a full VM today). Values below 1 are clamped to 1.
     pub max_concurrent_jobs: usize,
+    /// Maximum daemon-level clean VM repetitions a user request may fan out to
+    /// once grouped execution lands. v15 Phase 1 parses/caps the value before
+    /// enqueue; later phases consume it to create one VM run per repetition.
+    pub max_clean_repetitions: u32,
     /// Optional CPU pinning (roadmap-v5 Phase 5), one **libvirt cpuset** per
     /// concurrency slot — e.g. `["0-1", "2-3"]` pins slot 0's VM to cores 0,1
     /// and slot 1's to 2,3. Length must be ≥ `max_concurrent_jobs`. Empty (the
@@ -667,6 +671,7 @@ struct RawReporting {
 #[serde(default, deny_unknown_fields)]
 struct RawRunner {
     max_concurrent_jobs: Option<usize>,
+    max_clean_repetitions: Option<u32>,
     cpu_sets: Option<Vec<String>>,
     host_cpus: Option<String>,
 }
@@ -772,6 +777,14 @@ impl RawDaemon {
         );
         merge_opt(&mut self.runner.cpu_sets, other.runner.cpu_sets);
         merge_opt(&mut self.runner.host_cpus, other.runner.host_cpus);
+        merge_opt(
+            &mut self
+                .runner
+                .max_clean_repetitions,
+            other
+                .runner
+                .max_clean_repetitions,
+        );
 
         merge_opt(&mut self.vm.golden_image, other.vm.golden_image);
         merge_opt(&mut self.vm.build_vcpus, other.vm.build_vcpus);
@@ -970,6 +983,12 @@ impl RawDaemon {
                 .runner
                 .max_concurrent_jobs,
             "SBGH_RUNNER_MAX_CONCURRENT_JOBS",
+        );
+        env_parse_into(
+            &mut self
+                .runner
+                .max_clean_repetitions,
+            "SBGH_RUNNER_MAX_CLEAN_REPETITIONS",
         );
         // cpu_sets is a list of cpusets (each may contain commas, e.g. "0,2"),
         // so it's `;`-separated rather than CSV.
@@ -1212,6 +1231,11 @@ impl RawDaemon {
                 }
                 RunnerConfig {
                     max_concurrent_jobs,
+                    max_clean_repetitions: self
+                        .runner
+                        .max_clean_repetitions
+                        .unwrap_or(5)
+                        .max(1),
                     cpu_sets,
                     host_cpus: self.runner.host_cpus,
                 }
@@ -1584,6 +1608,11 @@ mod tests {
         );
         let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         assert_eq!(cfg.runner.max_concurrent_jobs, 2);
+        assert_eq!(
+            cfg.runner
+                .max_clean_repetitions,
+            5
+        );
         assert_eq!(cfg.runner.cpu_sets, vec!["0-1".to_string(), "2-3".to_string()]);
         assert_eq!(
             cfg.runner
@@ -1598,8 +1627,27 @@ mod tests {
         let _g = EnvGuard::set(&daemon_env());
         let cfg = DaemonConfig::load_layered(None).unwrap();
         assert_eq!(cfg.runner.max_concurrent_jobs, 1);
+        assert_eq!(
+            cfg.runner
+                .max_clean_repetitions,
+            5
+        );
         assert!(cfg.runner.cpu_sets.is_empty(), "no pinning by default");
         assert!(cfg.runner.host_cpus.is_none());
+    }
+
+    #[test]
+    fn daemon_runner_clean_repetition_cap_toml_then_env_override() {
+        let mut env = daemon_env();
+        env.push(("SBGH_RUNNER_MAX_CLEAN_REPETITIONS", "7"));
+        let _g = EnvGuard::set(&env);
+        let f = write("[runner]\nmax_clean_repetitions = 3\n");
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.runner
+                .max_clean_repetitions,
+            7
+        );
     }
 
     #[test]

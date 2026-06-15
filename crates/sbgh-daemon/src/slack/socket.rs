@@ -22,6 +22,12 @@ use tokio_util::sync::CancellationToken;
 use crate::slack::connector::{MentionEvent, SlackConnector};
 use crate::slack::target::SlackJobTarget;
 
+#[derive(Debug, Clone, Copy)]
+pub struct SocketRunOptions {
+    pub intent_rate_limit_per_minute: u32,
+    pub max_clean_repetitions: u32,
+}
+
 /// Map a Slack push event to our [`MentionEvent`], or `None` for any push that
 /// isn't an `app_mention` (the only kind the connector handles). Pure — the
 /// `.0`s are the slack-morphism id newtypes' public `String`; missing text
@@ -139,7 +145,7 @@ pub async fn run(
     jobs: Arc<dyn JobStore>,
     web_client: Arc<dyn crate::slack::client::SlackClient>,
     intent_resolver: Option<Arc<dyn crate::llm::intent::IntentResolver>>,
-    intent_rate_limit_per_minute: u32,
+    options: SocketRunOptions,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let app_token_value = cfg
@@ -151,9 +157,10 @@ pub async fn run(
 
     // The connector (authz/resolve/enqueue/react) shares the Web API client and
     // rides into the listener via user state.
-    let mut connector = SlackConnector::new(cfg, target, jobs, web_client);
+    let mut connector = SlackConnector::new(cfg, target, jobs, web_client)
+        .with_max_clean_repetitions(options.max_clean_repetitions);
     if let Some(resolver) = intent_resolver {
-        connector = connector.with_intent_resolver(resolver, intent_rate_limit_per_minute);
+        connector = connector.with_intent_resolver(resolver, options.intent_rate_limit_per_minute);
     }
     let connector = Arc::new(connector);
 

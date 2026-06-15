@@ -12,7 +12,7 @@
 //! `--flag=value`) —
 //!   `--txid <hex>` | `--block <height-or-hash>` (repeatable,
 //!   **mutually exclusive**)
-//!   `--repetitions <n>`              (how many times to run each, ≥ 1)
+//!   `--repetitions <n>`              (clean VM executions, ≥ 1)
 //!   `--warmup <n>`                   (warmup iterations)
 //!   `--rev <ref>`                    (override the code-under-test rev)
 //!
@@ -66,9 +66,10 @@ pub enum WorkloadTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadSpec {
     pub target: WorkloadTarget,
-    /// `--repetitions` — how many times to execute each target (≥ 1). `None` →
-    /// the driver's configured default applies.
-    pub repetitions: Option<u32>,
+    /// User-facing `--repetitions` — daemon-level clean VM executions (≥ 1).
+    /// The current v15 Phase 1 runtime still executes one run; later phases
+    /// fan this out at the benchmark-group layer.
+    pub clean_repetitions: u32,
     /// `--warmup` — warmup iterations before measurement. `None` → default.
     pub warmup: Option<u32>,
     /// `--rev` — override the code-under-test rev (branch/tag/sha). `None` →
@@ -78,9 +79,12 @@ pub struct WorkloadSpec {
 }
 
 impl WorkloadSpec {
-    /// The `stacks-bench` CLI args for this workload — the **workload** flags
-    /// only (`--txid`/`--block`/`--repetitions`/`--warmup`). `rev` is the
-    /// code-under-test, applied by the connector, not a bench arg.
+    /// The `stacks-bench` CLI args for one isolated VM execution — the
+    /// **workload** flags only (`--txid`/`--block`/`--repetitions`/`--warmup`).
+    /// `rev` is the code-under-test, applied by the connector, not a bench arg.
+    ///
+    /// v15 repurposes user-facing repetitions as daemon-level clean runs, so
+    /// every single VM invocation receives `--repetitions 1`.
     pub fn to_bench_args(&self) -> Vec<String> {
         let mut args = Vec::new();
         match &self.target {
@@ -103,10 +107,8 @@ impl WorkloadSpec {
                 args.push((end - start + 1).to_string());
             }
         }
-        if let Some(r) = self.repetitions {
-            args.push("--repetitions".to_string());
-            args.push(r.to_string());
-        }
+        args.push("--repetitions".to_string());
+        args.push("1".to_string());
         if let Some(w) = self.warmup {
             args.push("--warmup".to_string());
             args.push(w.to_string());
@@ -230,7 +232,7 @@ pub fn resolve_workload(text: &str) -> Result<WorkloadSpec, ResolveError> {
 
     Ok(WorkloadSpec {
         target,
-        repetitions,
+        clean_repetitions: repetitions.unwrap_or(1),
         warmup,
         rev,
     })
@@ -263,7 +265,7 @@ fn parse_u32(flag: &str, value: &str) -> Result<u32, ResolveError> {
         })
 }
 
-/// `--repetitions` must be ≥ 1 (zero runs profiles nothing).
+/// User-facing `--repetitions` must be ≥ 1 (zero clean runs profiles nothing).
 fn parse_repetitions(flag: &str, value: &str) -> Result<u32, ResolveError> {
     let n = parse_u32(flag, value)?;
     if n < 1 {
@@ -315,10 +317,10 @@ mod tests {
     fn parses_a_block_workload_with_reps() {
         let spec = ok("bench --block 184231 --repetitions 5");
         assert_eq!(spec.target, WorkloadTarget::Blocks(vec![BlockSelector::Height(184231)]));
-        assert_eq!(spec.repetitions, Some(5));
+        assert_eq!(spec.clean_repetitions, 5);
         assert_eq!(spec.warmup, None);
         assert_eq!(spec.rev, None);
-        assert_eq!(spec.to_bench_args(), vec!["--block", "184231", "--repetitions", "5"]);
+        assert_eq!(spec.to_bench_args(), vec!["--block", "184231", "--repetitions", "1"]);
     }
 
     #[test]
@@ -326,7 +328,7 @@ mod tests {
         // `--flag=value` is equivalent to `--flag value`, and the two forms mix.
         let spec = ok("bench --block=184231 --repetitions=5");
         assert_eq!(spec.target, WorkloadTarget::Blocks(vec![BlockSelector::Height(184231)]));
-        assert_eq!(spec.repetitions, Some(5));
+        assert_eq!(spec.clean_repetitions, 5);
         assert_eq!(
             ok("--block=1 --block 2").target,
             WorkloadTarget::Blocks(vec![BlockSelector::Height(1), BlockSelector::Height(2)])
@@ -377,7 +379,10 @@ mod tests {
         assert_eq!(spec.rev.as_deref(), Some("feature/x"));
         assert_eq!(spec.warmup, Some(2));
         // rev is the code-under-test, not a workload arg.
-        assert_eq!(spec.to_bench_args(), vec!["--block", "9", "--warmup", "2"]);
+        assert_eq!(
+            spec.to_bench_args(),
+            vec!["--block", "9", "--repetitions", "1", "--warmup", "2"]
+        );
     }
 
     #[test]
@@ -411,7 +416,12 @@ mod tests {
         );
         assert_eq!(
             spec.to_bench_args(),
-            vec!["--block", "abcdefabcdef2222222222222222222222222222222222222222222222222222"]
+            vec![
+                "--block",
+                "abcdefabcdef2222222222222222222222222222222222222222222222222222",
+                "--repetitions",
+                "1"
+            ]
         );
     }
 

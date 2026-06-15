@@ -118,6 +118,7 @@ async fn enqueue_slack_adhoc(store: &PostgresJobStore, webhook_id: i64) -> Uuid 
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "5".into()],
+        clean_repetitions: 1,
     })
     .unwrap();
     let outcome = store
@@ -185,7 +186,7 @@ async fn slack_adhoc_job_assembles_as_slack_progress() {
         }
         other => panic!("slack_adhoc must assemble as Slack, got {other:?}"),
     }
-    assert_eq!(job.bench_args, vec!["--block", "184231", "--repetitions", "5"]);
+    assert_eq!(job.bench_args, vec!["--block", "184231", "--repetitions", "1"]);
 
     // Persist the live-timeline plan message ts, then re-load: a reclaimed job
     // reads it back so it resumes updating the same card (no duplicate).

@@ -6,10 +6,9 @@ daemon-orchestrated VM executions under one benchmark group, not
 
 > **Status:** in_progress
 >
-> Phase 0 design is ready for review. The key implementation choice is to keep
-> `BenchmarkRun` as the claimable `job` row from v14, while enforcing a
-> group-ordering invariant: at most one run per group is queued, claimed, or
-> running, and runs are created in `benchmark_run_index` order.
+> Phase 1 is implemented and ready for review. Requests now carry a
+> daemon-owned clean-repeat count, enforce a conservative cap before enqueue,
+> and normalize every single VM invocation to `stacks-bench --repetitions 1`.
 
 ## Items
 
@@ -99,19 +98,19 @@ in-process repetitions.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
+- [x] Core implementation
+- [x] Unit/integration tests
 - [ ] Reviewed
 - [ ] Validated
 
 **Acceptance & Validation:**
 
-- [ ] Explicit/NL requests for repeats resolve to clean-repeat count.
-- [ ] Requests above `max_clean_repetitions` are rejected before enqueue.
-- [ ] Existing requests with no repeat count behave as one clean run.
-- [ ] A previously-cheap high repetition count is bounded by
+- [x] Explicit/NL requests for repeats resolve to clean-repeat count.
+- [x] Requests above `max_clean_repetitions` are rejected before enqueue.
+- [x] Existing requests with no repeat count behave as one clean run.
+- [x] A previously-cheap high repetition count is bounded by
   `max_clean_repetitions` before enqueue.
-- [ ] No user path can smuggle nested `stacks-bench --repetitions N` as the
+- [x] No user path can smuggle nested `stacks-bench --repetitions N` as the
   primary UX.
 
 ### Phase 2: Group Run Planning

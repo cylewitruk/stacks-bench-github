@@ -58,6 +58,7 @@ pub struct SlackConnector {
     client: Arc<dyn SlackClient>,
     intent_resolver: Option<Arc<dyn IntentResolver>>,
     intent_rate_limit_per_minute: u32,
+    max_clean_repetitions: u32,
     intent_calls: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
@@ -75,8 +76,14 @@ impl SlackConnector {
             client,
             intent_resolver: None,
             intent_rate_limit_per_minute: 0,
+            max_clean_repetitions: 5,
             intent_calls: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_max_clean_repetitions(mut self, max_clean_repetitions: u32) -> Self {
+        self.max_clean_repetitions = max_clean_repetitions.max(1);
+        self
     }
 
     pub fn with_intent_resolver(
@@ -115,6 +122,17 @@ impl SlackConnector {
                 return;
             }
         };
+        if spec.clean_repetitions > self.max_clean_repetitions {
+            self.reject(
+                &event,
+                &format!(
+                    "too many clean repetitions — requested {}, max is {}",
+                    spec.clean_repetitions, self.max_clean_repetitions
+                ),
+            )
+            .await;
+            return;
+        }
 
         // 3. Enqueue an ad-hoc job. Default repo (target ids) + rev (`--rev` override,
         //    else the configured default); the parsed workload becomes `bench_args`;
@@ -128,6 +146,7 @@ impl SlackConnector {
             channel: event.channel.clone(),
             message_ts: event.message_ts.clone(),
             bench_args: bench_args.clone(),
+            clean_repetitions: spec.clean_repetitions,
         })
         .expect("QueuedEventDetail serializes");
         let new_job = NewJob {
@@ -572,10 +591,12 @@ mod tests {
                 channel,
                 message_ts,
                 bench_args,
+                clean_repetitions,
             } => {
                 assert_eq!(channel, "C1");
                 assert_eq!(message_ts, "1700000000.000100");
-                assert_eq!(bench_args, vec!["--block", "184231", "--repetitions", "5"]);
+                assert_eq!(bench_args, vec!["--block", "184231", "--repetitions", "1"]);
+                assert_eq!(clean_repetitions, 5);
             }
             other => panic!("expected SlackAdhoc detail, got {other:?}"),
         }
@@ -741,6 +762,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_repetition_cap_rejects_before_enqueue_or_reaction() {
+        let store = Arc::new(InMemoryJobStore::new());
+        let client = Arc::new(FakeSlackClient::default());
+        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
+            .with_max_clean_repetitions(2);
+
+        connector
+            .handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 3"))
+            .await;
+
+        assert!(store.all_jobs().is_empty(), "over-cap request must not enqueue");
+        assert!(
+            client
+                .reactions
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "over-cap request must not get accepted reaction",
+        );
+        let eph = client
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("too many clean repetitions"),
+            "{}",
+            eph[0].2
+        );
+    }
+
+    #[tokio::test]
     async fn flag_shaped_request_uses_parser_fast_path_without_llm_call() {
         let resolver = Arc::new(FakeIntentResolver::invalid("should not be used"));
         let (c, store, _slack, resolver) = harness_with_intent(resolver);
@@ -755,7 +810,7 @@ mod tests {
     async fn natural_language_can_resolve_through_llm() {
         let spec = WorkloadSpec {
             target: crate::workload::WorkloadTarget::BlockRange { start: 10, end: 12 },
-            repetitions: Some(2),
+            clean_repetitions: 2,
             warmup: Some(1),
             rev: Some("feature/nl".into()),
         };
@@ -774,12 +829,56 @@ mod tests {
             .unwrap()
             .unwrap();
         let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap().0).unwrap();
-        let QueuedEventDetail::SlackAdhoc { bench_args, .. } = detail else {
+        let QueuedEventDetail::SlackAdhoc {
+            bench_args, clean_repetitions, ..
+        } = detail
+        else {
             panic!("expected SlackAdhoc");
         };
         assert_eq!(
             bench_args,
-            vec!["--start-at", "10", "--count", "3", "--repetitions", "2", "--warmup", "1"]
+            vec!["--start-at", "10", "--count", "3", "--repetitions", "1", "--warmup", "1"]
+        );
+        assert_eq!(clean_repetitions, 2);
+    }
+
+    #[tokio::test]
+    async fn llm_resolved_clean_repetitions_are_capped_before_enqueue() {
+        let spec = WorkloadSpec {
+            target: crate::workload::WorkloadTarget::Blocks(vec![
+                crate::workload::BlockSelector::Height(1),
+            ]),
+            clean_repetitions: 4,
+            warmup: Some(0),
+            rev: None,
+        };
+        let resolver = Arc::new(FakeIntentResolver::resolved(spec));
+        let store = Arc::new(InMemoryJobStore::new());
+        let slack = Arc::new(FakeSlackClient::default());
+        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), slack.clone())
+            .with_intent_resolver(resolver.clone(), 5)
+            .with_max_clean_repetitions(3);
+
+        connector
+            .handle_mention(event("<@U07BOT> benchmark block one four times"))
+            .await;
+
+        assert_eq!(resolver.calls(), 1);
+        assert!(store.all_jobs().is_empty());
+        assert!(
+            slack
+                .reactions
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            slack
+                .ephemerals
+                .lock()
+                .unwrap()[0]
+                .2
+                .contains("too many clean repetitions")
         );
     }
 
@@ -843,7 +942,7 @@ mod tests {
             target: crate::workload::WorkloadTarget::Blocks(vec![
                 crate::workload::BlockSelector::Height(1),
             ]),
-            repetitions: Some(1),
+            clean_repetitions: 1,
             warmup: Some(0),
             rev: None,
         };
@@ -885,7 +984,7 @@ mod tests {
             target: crate::workload::WorkloadTarget::Blocks(vec![
                 crate::workload::BlockSelector::Height(1),
             ]),
-            repetitions: Some(1),
+            clean_repetitions: 1,
             warmup: Some(0),
             rev: None,
         };

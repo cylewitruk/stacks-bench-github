@@ -164,6 +164,11 @@ baseline_report = "check"
 # job). Values below 1 are clamped to 1.
 max_concurrent_jobs = 1
 
+# Maximum user-requested clean VM repetitions. A Slack/LLM request's
+# "repetitions" value is capped here before enqueue; each isolated VM
+# invocation still receives stacks-bench --repetitions 1.
+max_clean_repetitions = 5
+
 # CPU pinning (optional). One libvirt cpuset per concurrency slot, so each
 # concurrent benchmark runs on dedicated physical cores — removing scheduler
 # jitter and core-sharing between jobs (essential for trustworthy concurrent

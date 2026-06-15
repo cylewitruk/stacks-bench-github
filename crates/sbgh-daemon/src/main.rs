@@ -213,6 +213,9 @@ async fn main() -> anyhow::Result<()> {
             config
                 .llm
                 .per_user_rate_limit_per_minute,
+            config
+                .runner
+                .max_clean_repetitions,
         ))
     } else {
         None
@@ -303,8 +306,15 @@ async fn main() -> anyhow::Result<()> {
             // app token, TLS) is logged but never crashes the daemon — Slack is
             // an optional surface. This arm then idles until full exit so it
             // never collapses the `try_join!` early.
-            if let Some((cfg, target, jobs, web_client, intent_resolver, intent_rate_limit)) =
-                slack_runtime
+            if let Some((
+                cfg,
+                target,
+                jobs,
+                web_client,
+                intent_resolver,
+                intent_rate_limit,
+                max_clean_repetitions,
+            )) = slack_runtime
             {
                 if let Err(e) = slack::socket::run(
                     cfg,
@@ -312,7 +322,10 @@ async fn main() -> anyhow::Result<()> {
                     jobs,
                     web_client,
                     intent_resolver,
-                    intent_rate_limit,
+                    slack::socket::SocketRunOptions {
+                        intent_rate_limit_per_minute: intent_rate_limit,
+                        max_clean_repetitions,
+                    },
                     shutdown.draining.clone(),
                 )
                 .await

@@ -15,7 +15,9 @@
 //!
 //! Order- and whitespace-sensitive by current contract: it mirrors the bench
 //! template's `read -r -a` word-splitting, so quoted/escaped values are not
-//! supported (no current bench arg needs them).
+//! supported (no current bench arg needs them). v15 normalizes any raw
+//! `--repetitions` arg to one in-process repetition; daemon-level clean
+//! repetitions are modeled above this layer.
 
 use sha2::{Digest, Sha256};
 
@@ -38,14 +40,18 @@ pub fn normalize_stored(detail: &QueuedEventDetail) -> Vec<String> {
     match detail {
         // `pr_comment` and `slack_adhoc` carry a token vec directly.
         QueuedEventDetail::PrComment { bench_args, .. }
-        | QueuedEventDetail::SlackAdhoc { bench_args, .. } => bench_args.clone(),
+        | QueuedEventDetail::SlackAdhoc { bench_args, .. } => {
+            normalize_in_process_repetitions(bench_args.clone())
+        }
         QueuedEventDetail::BranchPush { bench_args, .. }
         | QueuedEventDetail::TagCreated { bench_args, .. } => bench_args
             .as_deref()
             .map(|s| {
-                s.split_whitespace()
-                    .map(String::from)
-                    .collect()
+                normalize_in_process_repetitions(
+                    s.split_whitespace()
+                        .map(String::from)
+                        .collect(),
+                )
             })
             .unwrap_or_default(),
         // `cache_warm` is a build-only job — it runs no benchmark, so no args.
@@ -77,9 +83,11 @@ pub fn normalize_stored_value(detail: &serde_json::Value) -> Vec<String> {
 
 /// The string handed to `stacks-bench` (joined into the bench template). The
 /// stored override REPLACES `default` when non-empty; an empty override falls
-/// back to `default` verbatim.
+/// back to `default`. v15 repetitions are daemon-level clean runs, so the
+/// returned string is canonicalized to at most one in-process
+/// `--repetitions 1`.
 pub fn effective_arg_string(stored: &[String], default: &str) -> String {
-    if stored.is_empty() { default.to_string() } else { stored.join(" ") }
+    effective_arg_tokens(stored, default).join(" ")
 }
 
 /// Stable key for "the same workload": lowercase-hex SHA-256 of the compact
@@ -93,12 +101,52 @@ pub fn workload_key(effective_args: &[String]) -> String {
 /// Resolve stored args + `default_args` into the effective tokens and their
 /// [`workload_key`] in one pass.
 pub fn resolve_bench_args(stored: &[String], default: &str) -> ResolvedBenchArgs {
-    let effective_args: Vec<String> = effective_arg_string(stored, default)
-        .split_whitespace()
-        .map(String::from)
-        .collect();
+    let effective_args = effective_arg_tokens(stored, default);
     let workload_key = workload_key(&effective_args);
     ResolvedBenchArgs { effective_args, workload_key }
+}
+
+fn effective_arg_tokens(stored: &[String], default: &str) -> Vec<String> {
+    let raw = if stored.is_empty() {
+        default
+            .split_whitespace()
+            .map(String::from)
+            .collect()
+    } else {
+        stored.to_vec()
+    };
+    normalize_in_process_repetitions(raw)
+}
+
+/// Force sbgh-managed executions to one in-process measured repetition. The
+/// user-facing repetition count is now a daemon/group-level clean-run count.
+fn normalize_in_process_repetitions(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter().peekable();
+    let mut saw_repetitions = false;
+    while let Some(arg) = iter.next() {
+        if arg == "--repetitions" {
+            saw_repetitions = true;
+            if iter
+                .peek()
+                .is_some_and(|next| !next.starts_with('-'))
+            {
+                let _ = iter.next();
+            }
+        } else if arg
+            .strip_prefix("--repetitions=")
+            .is_some()
+        {
+            saw_repetitions = true;
+        } else {
+            out.push(arg);
+        }
+    }
+    if saw_repetitions {
+        out.push("--repetitions".into());
+        out.push("1".into());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -146,6 +194,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            clean_repetitions: 1,
         }
     }
 
@@ -171,12 +220,29 @@ mod tests {
     }
 
     #[test]
-    fn normalize_slack_adhoc_passes_tokens_through() {
+    fn normalize_slack_adhoc_forces_one_in_process_repetition() {
         assert_eq!(
             normalize_stored(&slack(&["--block", "184231", "--repetitions", "5"])),
-            vec!["--block", "184231", "--repetitions", "5"]
+            vec!["--block", "184231", "--repetitions", "1"]
         );
         assert!(normalize_stored(&slack(&[])).is_empty());
+    }
+
+    #[test]
+    fn resolve_forces_one_in_process_repetition() {
+        assert_eq!(
+            normalize_stored(&pr(&["--block", "1", "--repetitions", "5"])),
+            vec!["--block", "1", "--repetitions", "1"],
+        );
+        assert_eq!(
+            normalize_stored(&branch(Some("--block 1 --repetitions=5"))),
+            vec!["--block", "1", "--repetitions", "1"],
+        );
+        assert_eq!(
+            resolve_bench_args(&[], "--block 1 --repetitions 9").effective_args,
+            vec!["--block", "1", "--repetitions", "1"],
+            "configured defaults are normalized too",
+        );
     }
 
     #[test]
@@ -220,6 +286,18 @@ mod tests {
         assert_eq!(
             effective_arg_string(&["--count".into(), "5000".into()], DEFAULT),
             "--count 5000"
+        );
+    }
+
+    #[test]
+    fn driver_arg_string_normalizes_default_repetitions() {
+        assert_eq!(
+            effective_arg_string(&[], "--block 1 --repetitions 9 --warmup 2"),
+            "--block 1 --warmup 2 --repetitions 1"
+        );
+        assert_eq!(
+            effective_arg_string(&[], "--block 1 --repetitions=9 --warmup 2"),
+            "--block 1 --warmup 2 --repetitions 1"
         );
     }
 

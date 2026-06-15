@@ -772,7 +772,15 @@ pub enum QueuedEventDetail {
     /// resolved workload (already a token vec, from `resolve_workload`);
     /// `channel`/`message_ts` are the reporting provenance — the Slack channel
     /// and the user's request-message timestamp the result threads under.
-    SlackAdhoc { channel: String, message_ts: String, bench_args: Vec<String> },
+    SlackAdhoc {
+        channel: String,
+        message_ts: String,
+        bench_args: Vec<String>,
+        /// v15: user-requested daemon-level clean VM executions. Older queued
+        /// rows predate this field and default to one clean run.
+        #[serde(default = "default_clean_repetitions")]
+        clean_repetitions: u32,
+    },
     /// Daemon-initiated cache-warm (v11 / `0031`): a build-only job
     /// pre-building a pinned release binary so the cache is warm before a
     /// measurement needs it. Pure provenance — answers *"why did the daemon
@@ -787,6 +795,10 @@ pub enum QueuedEventDetail {
         /// Which artifact binary is produced (`stacks_bench` today).
         build_target: BuildTarget,
     },
+}
+
+fn default_clean_repetitions() -> u32 {
+    1
 }
 
 /// Slice 8 insert payload for `job_event`. occurred_at defaults to

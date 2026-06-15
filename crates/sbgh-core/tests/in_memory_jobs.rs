@@ -50,6 +50,7 @@ async fn create_unlinked_job_is_webhook_less_and_preserves_detail() {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
         bench_args: vec!["--block".into(), "184231".into()],
+        clean_repetitions: 1,
     })
     .unwrap();
     let new_job = NewJob {
