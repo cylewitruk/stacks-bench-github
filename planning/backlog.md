@@ -230,8 +230,8 @@ does not recreate the same expiry window.
 buttons, and no attempt to keep a pre-claim plan stream alive with heartbeats.
 This is a surface/lifecycle split, not a scheduler change.
 
-*`0037-benchmark-group-run-model` is in progress as iteration **v14** →
-[iterations/v14-benchmark-group-run-model.md](iterations/v14-benchmark-group-run-model.md).*
+*`0037-benchmark-group-run-model` shipped (iteration v14, 2026-06) →
+[archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md).*
 
 ### 0038 — Isolated benchmark repetitions
 

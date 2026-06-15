@@ -54,7 +54,7 @@ need editing when an item's status or location changes.
 | `0034-historical-stable-toolchain` | Historical stable toolchain resolution | `backlog` | [backlog.md](backlog.md) |
 | `0035-slack-app-home-status` | Slack App Home status dashboard | `backlog` | [backlog.md](backlog.md) |
 | `0036-pr-comment-llm-intent` | PR-comment LLM intent resolution | `backlog` | [backlog.md](backlog.md) |
-| `0037-benchmark-group-run-model` | Benchmark group/run model | `in_progress` | [iterations/v14-benchmark-group-run-model.md](iterations/v14-benchmark-group-run-model.md) |
+| `0037-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 | `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `backlog` | [backlog.md](backlog.md) |
 | `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `backlog` | [backlog.md](backlog.md) |
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
@@ -74,7 +74,7 @@ need editing when an item's status or location changes.
 | `v11-reusable-build-jobs` | Reusable build jobs (pin warming) | `shipped` | [archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md) |
 | `v12-slack-streamed-plan` | Slack streamed plan updates | `shipped` | [archive/completed/0033-slack-streamed-plan-updates.md](archive/completed/0033-slack-streamed-plan-updates.md) |
 | `v13-llm-intent-resolution` | LLM intent resolution | `shipped` | [archive/completed/0020-llm-intent-resolution.md](archive/completed/0020-llm-intent-resolution.md) |
-| `v14-benchmark-group-run-model` | Benchmark group/run model | `in_progress` | [iterations/v14-benchmark-group-run-model.md](iterations/v14-benchmark-group-run-model.md) |
+| `v14-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 
 ## Decisions
 

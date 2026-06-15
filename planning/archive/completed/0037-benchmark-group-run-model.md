@@ -4,17 +4,17 @@ Item `0037-benchmark-group-run-model`: introduce the neutral
 `BenchmarkGroup` / `BenchmarkSpec` / `BenchmarkRun` vocabulary without changing
 runtime behavior.
 
-> **Status:** in_progress
+> **Status:** shipped
 >
-> Implementation is in review: existing jobs are back-filled and newly-created
-> jobs become singleton `group -> spec -> run` rows. Repeated execution,
-> multi-variant comparisons, and shared calibration remain follow-ups.
+> Shipped as v14. Existing jobs are back-filled and newly-created jobs become
+> singleton `group -> spec -> run` rows. Repeated execution, multi-variant
+> comparisons, and shared calibration remain follow-ups.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0037-benchmark-group-run-model` | primary | in_progress |
+| `0037-benchmark-group-run-model` | primary | shipped |
 
 ## Why
 
@@ -63,7 +63,7 @@ fields, and no workflow executor rewrite.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [x] Validated — test suite passed
 
 **Acceptance & Validation:**
@@ -94,7 +94,7 @@ atomically.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [x] Validated — test suite passed
 
 **Acceptance & Validation:**
@@ -122,7 +122,7 @@ atomically.
 
 - [x] Core implementation
 - [x] Unit tests
-- [ ] Reviewed
+- [x] Reviewed
 - [x] Validated — test suite passed
 
 **Acceptance & Validation:**
@@ -139,7 +139,7 @@ atomically.
 - [x] `just build --no-sccache`
 - [x] `just lint --no-sccache`
 - [x] `just test --no-sccache` — 875 passed, 1 skipped
-- [ ] Dry-run the migration against a copy of the Hetzner DB before production
+- [x] Dry-run the migration against a copy of the Hetzner DB before production
   deploy, because the suite validates new-row creation paths but cannot exercise
   the one-shot pre-existing-job backfill.
 
@@ -171,6 +171,11 @@ SELECT
 
 Expected: `ungrouped_jobs = 0`; `jobs = groups = specs`; `build_steps = jobs`;
 and `run_steps = measured_jobs`.
+
+Hetzner restore-check result (2026-06-15): backup restored cleanly; v14 migration
+dry-ran against 68 pre-existing jobs; counts were `jobs=68`, `groups=68`,
+`specs=68`, `build_steps=68`, `run_steps=46`, `measured=46`; all null/orphan
+checks passed.
 
 ## Follow-Ups
 
