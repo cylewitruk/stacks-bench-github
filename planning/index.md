@@ -54,6 +54,11 @@ need editing when an item's status or location changes.
 | `0034-historical-stable-toolchain` | Historical stable toolchain resolution | `backlog` | [backlog.md](backlog.md) |
 | `0035-slack-app-home-status` | Slack App Home status dashboard | `backlog` | [backlog.md](backlog.md) |
 | `0036-pr-comment-llm-intent` | PR-comment LLM intent resolution | `backlog` | [backlog.md](backlog.md) |
+| `0037-benchmark-group-run-model` | Benchmark group/run model | `backlog` | [backlog.md](backlog.md) |
+| `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `backlog` | [backlog.md](backlog.md) |
+| `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `backlog` | [backlog.md](backlog.md) |
+| `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
+| `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 
