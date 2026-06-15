@@ -233,66 +233,8 @@ This is a surface/lifecycle split, not a scheduler change.
 *`0037-benchmark-group-run-model` shipped (iteration v14, 2026-06) →
 [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md).*
 
-### 0038 — Isolated benchmark repetitions
-
-- **id:** `0038-isolated-benchmark-repetitions`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0037-benchmark-group-run-model`
-- **relates_to:** `0015-resource-aware-admission`,
-  `0018-auto-rerun-confidence-gate`,
-  `0028-results-summary-restructure`, `0029-per-block-timing-detail`
-- **source:** experiment-group modeling follow-up (2026-06)
-
-**Problem:** `stacks-bench --repetitions` repeats work inside one process over
-one already-touched LVM snapshot and chainstate handle. For `sbgh`, the user
-word "repetitions" should mean clean VM executions, not in-process loops; cold
-vs. warm behavior should be steered by warmup, not by reusing the same process
-and snapshot for measured rows.
-
-**Scope:** Add daemon-level isolated repeats and make `sbgh` route
-"repetitions" to this clean-run count. For benchmark modes that currently accept
-`--repetitions`, the daemon passes `--repetitions 1` into each VM run and uses
-`--warmup` for pre-measurement cold/hot steering. A request with `N` clean
-repeats creates one `BenchmarkGroup` with `N` `BenchmarkRun`s for the same
-`BenchmarkSpec`. Each run gets a fresh source snapshot, VM, and bench process,
-then tears down normally. The group remains host-pinned for all repeats so the
-source host, cached binary, carried DB, and optional shared calibration are
-consistent.
-
-The shared DB uses a **carry-forward** mechanic over the existing results tmpfs:
-after run `N`, the daemon copies the group's `stacks-bench.db` out of that run's
-results disk into the group artifact namespace; before run `N+1`, it copies the
-same DB into the next VM's results tmpfs so `stacks-bench` appends to the same
-SQLite artifact. The append-into-existing-DB behavior is author-confirmed for
-`stacks-bench`. Initial execution is sequential. Parallel repeats are not ruled
-out by SQLite itself, but they require a different shared-writable-storage
-design across VMs or a per-run-DB + host-merge design; neither is in this slice.
-The carried DB is bounded for a fixed workload: block/tx indexes are
-unique-keyed and idempotent, so re-runs skip already-indexed blocks/txs and only
-append small measured-run rows after the first/indexed run. Size the results
-tmpfs for the one-time-indexed DB; `0026` should keep deep-range index material
-out of the RAM disk where possible.
-
-Land a daemon-side `max_clean_repetitions` cap before any LLM/Slack/PR field can
-fan out to VM lifecycles. The cap is enforced after parsing/resolution exactly
-like v13's other daemon-owned bounds; the LLM cannot override it. `0015` is the
-eventual home for richer resource budgets, but this hard cap is required in this
-slice. Each isolated VM run should execute one clean sample (`--repetitions 1`)
-unless a future design explicitly models nested in-process repetitions.
-
-**Acceptance:** A Slack or PR request can ask for clean repeats; the daemon runs
-each repeat in a fresh VM/snapshot, appends all run records to one SQLite DB
-artifact, and reports a group summary with at least count/min/max/mean,
-standard deviation, and coefficient of variation plus a link to the shared DB. A
-request exceeding `max_clean_repetitions` is rejected before enqueue. A failed
-repeat marks the group partial/failed according to an explicit policy, not as a
-silent missing sample. The build/artifact step runs once (or is cache-reused)
-for the group; isolated repeats do not re-run build→bench per repeat.
-
-**Deferred / non-goals:** Do not expose in-process measured repetitions through
-`sbgh` as the primary UX. If a future expert mode needs nested in-process
-repetitions, model it explicitly instead of overloading the clean-repeat field.
+*`0038-isolated-benchmark-repetitions` is in progress as iteration **v15** →
+[iterations/v15-isolated-benchmark-repetitions.md](iterations/v15-isolated-benchmark-repetitions.md).*
 
 ### 0039 — Multi-variant benchmark comparisons
 
