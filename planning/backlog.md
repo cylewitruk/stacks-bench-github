@@ -102,6 +102,71 @@ Baseline/push/tag jobs are unaffected.
 for the previous PR HEAD and schedules exactly one run for the new HEAD, with the
 old surface marked neutral/cancelled rather than failed.
 
+### 0035 — Slack App Home status dashboard
+
+- **id:** `0035-slack-app-home-status`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** `0005-task-kind-platform`
+- **relates_to:** `0003-results-portal`, `0014-preclaim-placeholder-checks`,
+  `0031-reusable-build-jobs`
+- **source:** Slack operator UX follow-up (2026-06)
+
+**Problem:** Operators and Slack users have no single place inside Slack to see
+what the daemon is doing. Queue state is scattered across thread cards and logs;
+cache-warming jobs are silent by design; recently-finished runs require a CLI or
+log tail. The full portal remains parked, but a lightweight Slack Home tab can
+cover the common "what's happening right now?" need.
+
+**Scope:** Add a Slack App Home MVP. Enable the Home tab in app/manifest
+documentation, subscribe to `app_home_opened`, and add `views.publish` to the
+Slack Web API client. Route `app_home_opened` and a single `refresh` button
+action through Socket Mode, acking immediately and spawning the publish work like
+`app_mention`. Render a private Home tab with daemon status, capacity
+(`running/max_concurrent`), currently-running jobs, queued jobs in claim order,
+recent terminal jobs, and pinned/warming context where available. The MVP is
+**pull-driven** only: publish on open and on manual refresh; do not store recent
+viewers or push background updates.
+
+**Acceptance:** Opening BenchBot's Home tab publishes a Block Kit status view
+for that user; pressing Refresh republishes the latest view; queued/running
+ordering matches the runner's claim order; silent cache-warm build jobs are
+visible as daemon work; failures to publish are logged but never affect job
+execution.
+
+**Deferred / non-goals:** No recent-viewer registry, background refresh loop,
+settings, modals, job cancellation buttons, warm-trigger buttons, or full portal
+replacement. Automatic Home-tab updates can come later once we know the view is
+useful.
+
+### 0036 — PR-comment LLM intent resolution
+
+- **id:** `0036-pr-comment-llm-intent`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** `0020-llm-intent-resolution`
+- **relates_to:** `0032-supersede-stale-pr-head-runs`
+- **source:** v13 Phase 4 follow-up
+
+**Problem:** v13 proved the LLM intent resolver on Slack, but GitHub PR comments
+still require the explicit `/benchmark` grammar. The shared `llm` and
+`WorkloadSpec` seams were built so the PR surface can reuse the same
+schema-validated resolver.
+
+**Scope:** Add natural-language benchmark intent to PR comments after existing
+policy/authz checks. Reuse the v13 resolver, validation, deterministic fast
+path, rate limiting, and structured invalid diagnostics. Preserve explicit
+`/benchmark` compatibility while NL rolls out. Invalid/ambiguous input should
+reply on the PR without enqueueing.
+
+**Acceptance:** A PR comment natural-language benchmark request resolves to the
+same `WorkloadSpec` as the equivalent Slack input and enqueues the expected job;
+invalid input receives a clear PR reply and does not enqueue; off-policy users
+do not trigger provider calls.
+
+**Deferred / non-goals:** No new provider, no model tools, no GitHub-side modal
+equivalent. Ref existence remains daemon-owned, as in v13.
+
 ### 0015 — Resource-aware admission / budgets
 
 - **id:** `0015-resource-aware-admission`
@@ -150,15 +215,13 @@ still physically present, awaiting a soak window.
 
 **Acceptance:** The legacy table is gone; nothing references it.
 
-### 0020 — LLM intent resolution (Slack + PRs)
+*`0020-llm-intent-resolution` shipped (iteration v13, 2026-06) →
+[archive/completed/0020-llm-intent-resolution.md](archive/completed/0020-llm-intent-resolution.md).
+The PR-comment follow-up is tracked as `0036`.*
 
-Promoted → iteration **v13**
-([iterations/v13-llm-intent-resolution.md](iterations/v13-llm-intent-resolution.md)).
-
-*`0024-slack-card-stage-timings` promoted → iteration **v12**
-([iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md));
-bundled with `0033-slack-streamed-plan-updates` because streaming removes the
-`chat.update` spam/collapse problem that made live timing unattractive.*
+*`0024-slack-card-stage-timings` shipped (iteration v12, 2026-06) →
+[archive/completed/0024-slack-card-stage-timings.md](archive/completed/0024-slack-card-stage-timings.md);
+it shipped with `0033-slack-streamed-plan-updates`.*
 
 ### 0034 — Historical stable toolchain resolution
 

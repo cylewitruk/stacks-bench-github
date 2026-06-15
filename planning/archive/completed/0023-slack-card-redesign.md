@@ -103,7 +103,7 @@ the errored row carries the reason and the results blocks are omitted.
 > shows its past-tense title + ✓, with the numbers in the results table. Live
 > ticking needs heartbeat-driven updates and per-stage durations need to survive
 > a resume, so it's its own item
-> ([`0024-slack-card-stage-timings`](../../iterations/v12-slack-streamed-plan.md)).
+> ([`0024-slack-card-stage-timings`](0024-slack-card-stage-timings.md)).
 
 ## Phases
 

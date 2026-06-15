@@ -36,7 +36,8 @@ workload is the variable (`--txid`/`--block`/`--repetitions`), resolved from an
 
 - The live `plan`-card **timeline** (post-early + `chat.update` through the run)
   is its own iteration — `0021-slack-live-timeline` (v6).
-- Natural-language intent resolution — `0020-llm-intent-resolution` (backlog).
+- Natural-language intent resolution — `0020-llm-intent-resolution` (shipped in
+  v13 for Slack; PR comments deferred).
 
 ## Decisions
 

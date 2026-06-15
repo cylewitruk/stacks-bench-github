@@ -37,11 +37,11 @@ need editing when an item's status or location changes.
 | `0017-generic-phase-events` | Generic phase-event enum | `backlog` | [backlog.md](backlog.md) |
 | `0018-auto-rerun-confidence-gate` | Auto-rerun confidence gate | `parked` | [backlog.md](backlog.md) |
 | `0019-block-validation-recipe` | Block-validation recipe | `backlog` | [backlog.md](backlog.md) |
-| `0020-llm-intent-resolution` | LLM intent resolution (Slack + PRs) | `in_progress` | [iterations/v13-llm-intent-resolution.md](iterations/v13-llm-intent-resolution.md) |
+| `0020-llm-intent-resolution` | LLM intent resolution (Slack) | `shipped` | [archive/completed/0020-llm-intent-resolution.md](archive/completed/0020-llm-intent-resolution.md) |
 | `0021-slack-live-timeline` | Slack live timeline | `shipped` | [archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md) |
 | `0022-report-surface-trait` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
 | `0023-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
-| `0024-slack-card-stage-timings` | Slack card stage timings | `in_progress` | [iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md) |
+| `0024-slack-card-stage-timings` | Slack card stage timings | `shipped` | [archive/completed/0024-slack-card-stage-timings.md](archive/completed/0024-slack-card-stage-timings.md) |
 | `0025-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
 | `0026-central-block-index-cache` | Central block/tx index cache | `backlog` | [backlog.md](backlog.md) |
 | `0027-fine-grained-progress` | Fine-grained bench progress | `backlog` | [backlog.md](backlog.md) |
@@ -50,8 +50,10 @@ need editing when an item's status or location changes.
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
 | `0031-reusable-build-jobs` | Reusable build jobs (artifact + target axis) | `shipped` | [archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md) |
 | `0032-supersede-stale-pr-head-runs` | Supersede stale PR-head benchmarks | `backlog` | [backlog.md](backlog.md) |
-| `0033-slack-streamed-plan-updates` | Slack streamed plan updates | `in_progress` | [iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md) |
+| `0033-slack-streamed-plan-updates` | Slack streamed plan updates | `shipped` | [archive/completed/0033-slack-streamed-plan-updates.md](archive/completed/0033-slack-streamed-plan-updates.md) |
 | `0034-historical-stable-toolchain` | Historical stable toolchain resolution | `backlog` | [backlog.md](backlog.md) |
+| `0035-slack-app-home-status` | Slack App Home status dashboard | `backlog` | [backlog.md](backlog.md) |
+| `0036-pr-comment-llm-intent` | PR-comment LLM intent resolution | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 
@@ -65,8 +67,8 @@ need editing when an item's status or location changes.
 | `v9-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
 | `v10-job-model-decomposition` | Job-model decomposition (source/intent/task/target axes) | `shipped` | [archive/completed/0005-task-kind-platform.md](archive/completed/0005-task-kind-platform.md) |
 | `v11-reusable-build-jobs` | Reusable build jobs (pin warming) | `shipped` | [archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md) |
-| `v12-slack-streamed-plan` | Slack streamed plan updates | `in_progress` | [iterations/v12-slack-streamed-plan.md](iterations/v12-slack-streamed-plan.md) |
-| `v13-llm-intent-resolution` | LLM intent resolution | `in_progress` | [iterations/v13-llm-intent-resolution.md](iterations/v13-llm-intent-resolution.md) |
+| `v12-slack-streamed-plan` | Slack streamed plan updates | `shipped` | [archive/completed/0033-slack-streamed-plan-updates.md](archive/completed/0033-slack-streamed-plan-updates.md) |
+| `v13-llm-intent-resolution` | LLM intent resolution | `shipped` | [archive/completed/0020-llm-intent-resolution.md](archive/completed/0020-llm-intent-resolution.md) |
 
 ## Decisions
 
