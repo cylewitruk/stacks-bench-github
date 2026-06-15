@@ -16,7 +16,6 @@ const STREAM_TEXT_LIMIT: usize = 256;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamChunk {
-    MarkdownText { text: String },
     Blocks { blocks: Vec<serde_json::Value> },
     TaskUpdate(TaskUpdate),
     PlanUpdate { title: String },
@@ -51,12 +50,21 @@ pub fn chunks_for_card(card: &Card) -> Vec<StreamChunk> {
     chunks
 }
 
-/// A short human-readable status line appended to the stream log. The plan
-/// card state is carried by `task_update`; this is the narrative timeline.
-pub fn status_log_chunk(text: impl AsRef<str>) -> StreamChunk {
-    StreamChunk::MarkdownText {
-        text: text.as_ref().to_string(),
+/// Convert a terminal card into Slack stream chunks, including final row
+/// outputs/sources. Live updates intentionally omit these fields because Slack
+/// appends repeated details/output visually instead of replacing them.
+pub fn terminal_chunks_for_card(card: &Card) -> Vec<StreamChunk> {
+    let mut chunks = Vec::with_capacity(card.rows.len() + 1);
+    chunks.push(StreamChunk::PlanUpdate {
+        title: stream_text(&card.title),
+    });
+    for (id, row) in TASK_IDS
+        .iter()
+        .zip(&card.rows)
+    {
+        chunks.push(StreamChunk::TaskUpdate(TaskUpdate::terminal_from_row(*id, row)));
     }
+    chunks
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +89,68 @@ impl TaskUpdate {
             details: None,
             output: None,
             sources: Vec::new(),
+        }
+    }
+
+    /// A one-shot in-progress event for a specific task. Slack appends task
+    /// details inside that task card, so callers should use this only for real
+    /// lifecycle events, not heartbeat/elapsed-time refreshes.
+    pub fn detail_event(
+        id: impl Into<String>,
+        title: impl AsRef<str>,
+        status: StreamTaskStatus,
+        details: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: stream_text(title.as_ref()),
+            status,
+            details: Some(stream_text(details.as_ref())),
+            output: None,
+            sources: Vec::new(),
+        }
+    }
+
+    /// A one-shot terminal event for a specific task. Slack appends task output
+    /// inside that task card.
+    pub fn output_event(
+        id: impl Into<String>,
+        title: impl AsRef<str>,
+        status: StreamTaskStatus,
+        output: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: stream_text(title.as_ref()),
+            status,
+            details: None,
+            output: Some(stream_text(output.as_ref())),
+            sources: Vec::new(),
+        }
+    }
+
+    fn terminal_from_row(id: impl Into<String>, row: &CardRow) -> Self {
+        let terminal = matches!(row.status, PlanTaskStatus::Complete | PlanTaskStatus::Error);
+        Self {
+            id: id.into(),
+            title: stream_text(&row.title),
+            status: row.status.into(),
+            details: None,
+            output: terminal
+                .then(|| {
+                    row.output
+                        .as_deref()
+                        .map(stream_text)
+                })
+                .flatten(),
+            sources: if terminal {
+                row.source
+                    .as_ref()
+                    .map(|source| vec![StreamSource::from(source)])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         }
     }
 }
@@ -196,25 +266,15 @@ mod tests {
             output: Some("Built in 6m 04s".into()),
             source: None,
         };
-        let v = serde_json::to_value(TaskUpdate::from_row("build", &row)).expect("serializes");
+        let v =
+            serde_json::to_value(TaskUpdate::terminal_from_row("build", &row)).expect("serializes");
         assert_eq!(
             v,
             json!({
                 "id": "build",
                 "title": "Built benchmark binaries",
                 "status": "complete",
-            })
-        );
-    }
-
-    #[test]
-    fn status_log_chunk_serializes_markdown_text() {
-        let v = serde_json::to_value(status_log_chunk("Benchmark started.")).expect("serializes");
-        assert_eq!(
-            v,
-            json!({
-                "type": "markdown_text",
-                "text": "Benchmark started.",
+                "output": "Built in 6m 04s",
             })
         );
     }
@@ -272,10 +332,21 @@ mod tests {
                 url: "https://example.test".into(),
             }),
         };
-        let task = TaskUpdate::from_row("run", &row);
+        let task = TaskUpdate::terminal_from_row("run", &row);
         assert_eq!(task.title.chars().count(), STREAM_TEXT_LIMIT);
         assert!(task.title.ends_with('…'));
-        assert!(task.output.is_none());
-        assert!(task.sources.is_empty());
+        assert_eq!(
+            task.output
+                .expect("terminal output")
+                .chars()
+                .count(),
+            STREAM_TEXT_LIMIT
+        );
+        assert_eq!(
+            match &task.sources[0] {
+                StreamSource::Url { text, .. } => text.chars().count(),
+            },
+            STREAM_TEXT_LIMIT
+        );
     }
 }
