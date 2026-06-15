@@ -17,9 +17,10 @@ use crate::db::jobs::{
     JobCreationOutcome, JobFailure, JobStore,
 };
 use crate::models::{
-    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
-    JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, NewJob, NewJobEvent,
-    ResolvedCommit, TerminalJobStatus,
+    BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, BenchmarkWorkflowStep, GithubPullRequestJob,
+    GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent, JobEventKind,
+    JobEventStatus, JobMetric, JobResult, JobStatus, NewJob, NewJobEvent, ResolvedCommit, TaskKind,
+    TerminalJobStatus,
 };
 
 #[derive(Default)]
@@ -30,6 +31,9 @@ pub struct InMemoryJobStore {
 
 #[derive(Default)]
 struct State {
+    groups: HashMap<Uuid, BenchmarkGroup>,
+    specs: HashMap<Uuid, BenchmarkSpec>,
+    steps: Vec<BenchmarkWorkflowStep>,
     jobs: HashMap<Uuid, Job>,
     /// Insertion order — `claim_next_queued` walks in (created_at, id)
     /// order, so we sort on demand.
@@ -126,14 +130,71 @@ fn make_match(job: &Job, metric: &JobMetric, selection: BaselineSelection) -> Ba
     }
 }
 
+fn singleton_group_spec(
+    new: &NewJob,
+    now: chrono::DateTime<Utc>,
+) -> (BenchmarkGroup, BenchmarkSpec, Vec<BenchmarkWorkflowStep>) {
+    let group_id = Uuid::new_v4();
+    let spec_id = Uuid::new_v4();
+    let group = BenchmarkGroup {
+        id: group_id,
+        github_installation_id: new.github_installation_id,
+        github_repo_id: new.github_repo_id,
+        source: new.axes.source,
+        intent: new.axes.intent,
+        artifact_prefix: group_id.to_string(),
+        host_key: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let spec = BenchmarkSpec {
+        id: spec_id,
+        benchmark_group_id: group_id,
+        spec_index: 0,
+        github_repo_id: new.github_repo_id,
+        task_kind: new.axes.task_kind,
+        build_target: new.axes.build_target,
+        git_ref_kind: new.git_ref_kind,
+        git_ref_display: new.git_ref_display.clone(),
+        git_commit_hash: new.git_commit_hash.clone(),
+        git_committed_at: new.git_committed_at,
+        workload_key: new.workload_key.clone(),
+        created_at: now,
+        updated_at: now,
+    };
+    let mut steps = vec![BenchmarkWorkflowStep {
+        id: Uuid::new_v4(),
+        benchmark_group_id: group_id,
+        step_index: 0,
+        step_kind: BenchmarkStepKind::Build,
+        benchmark_spec_id: Some(spec_id),
+        created_at: now,
+    }];
+    if new.axes.task_kind != TaskKind::BuildOnly {
+        steps.push(BenchmarkWorkflowStep {
+            id: Uuid::new_v4(),
+            benchmark_group_id: group_id,
+            step_index: 1,
+            step_kind: BenchmarkStepKind::Run,
+            benchmark_spec_id: Some(spec_id),
+            created_at: now,
+        });
+    }
+    (group, spec, steps)
+}
+
 #[async_trait]
 impl JobStore for InMemoryJobStore {
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
         let now = Utc::now();
         let id = Uuid::new_v4();
+        let (group, spec, steps) = singleton_group_spec(new, now);
         // v10 (0005): jobs carry the axes natively — set by the handler.
         let job = Job {
             id,
+            benchmark_group_id: group.id,
+            benchmark_spec_id: spec.id,
+            benchmark_run_index: 0,
             github_installation_id: new.github_installation_id,
             github_repo_id: new.github_repo_id,
             status: JobStatus::Queued,
@@ -152,6 +213,10 @@ impl JobStore for InMemoryJobStore {
             updated_at: now,
         };
         let mut s = self.state.lock().unwrap();
+        s.groups
+            .insert(group.id, group);
+        s.specs.insert(spec.id, spec);
+        s.steps.extend(steps);
         s.jobs.insert(id, job.clone());
         s.insertion_order.push(id);
         Ok(job)
@@ -175,11 +240,15 @@ impl JobStore for InMemoryJobStore {
         // `ON CONFLICT (github_webhook_id)` race-safety).
         let now = Utc::now();
         let job_id = Uuid::new_v4();
+        let (group, spec, steps) = singleton_group_spec(&request.new_job, now);
 
         // v10 (0005): jobs carry the axes natively — set by the handler.
         // Build all the rows locally.
         let job = Job {
             id: job_id,
+            benchmark_group_id: group.id,
+            benchmark_spec_id: spec.id,
+            benchmark_run_index: 0,
             github_installation_id: request
                 .new_job
                 .github_installation_id,
@@ -267,6 +336,10 @@ impl JobStore for InMemoryJobStore {
         }
         s.jobs
             .insert(job_id, job.clone());
+        s.groups
+            .insert(group.id, group);
+        s.specs.insert(spec.id, spec);
+        s.steps.extend(steps);
         s.insertion_order.push(job_id);
         s.webhook_links
             .push(webhook_link.clone());
@@ -296,9 +369,13 @@ impl JobStore for InMemoryJobStore {
     ) -> Result<Job> {
         let now = Utc::now();
         let job_id = Uuid::new_v4();
+        let (group, spec, steps) = singleton_group_spec(new_job, now);
         // v10 (0005): jobs carry the axes natively — set by the caller.
         let job = Job {
             id: job_id,
+            benchmark_group_id: group.id,
+            benchmark_spec_id: spec.id,
+            benchmark_run_index: 0,
             github_installation_id: new_job.github_installation_id,
             github_repo_id: new_job.github_repo_id,
             status: JobStatus::Queued,
@@ -337,6 +414,10 @@ impl JobStore for InMemoryJobStore {
         let mut s = self.state.lock().unwrap();
         s.jobs
             .insert(job_id, job.clone());
+        s.groups
+            .insert(group.id, group);
+        s.specs.insert(spec.id, spec);
+        s.steps.extend(steps);
         s.insertion_order.push(job_id);
         s.events.push(queued_event);
         Ok(job)

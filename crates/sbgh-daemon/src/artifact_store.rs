@@ -81,6 +81,13 @@ pub fn artifact_key(job_id: &str, relative: &str) -> String {
     format!("{job_id}/{relative}")
 }
 
+/// Build the store key for a future group-scoped artifact:
+/// `<group_prefix>/<relative>`. Singleton run artifacts keep using
+/// [`artifact_key`]; this reserves the shared namespace for grouped outputs.
+pub fn group_artifact_key(group_prefix: &str, relative: &str) -> String {
+    format!("{group_prefix}/{relative}")
+}
+
 /// Sibling temp path for a streamed download (`<dest>.<token>.part`), renamed
 /// to `dest` on completion so a partial transfer never lands at the key path.
 /// The `token` is unique per download so two concurrent cache misses for the
@@ -514,6 +521,14 @@ mod tests {
         assert_eq!(
             artifact_key("abc-123", "appdata/stacks-bench.db"),
             "abc-123/appdata/stacks-bench.db"
+        );
+    }
+
+    #[test]
+    fn group_artifact_key_is_group_prefix_slash_relative() {
+        assert_eq!(
+            group_artifact_key("group1", "shared/stacks-bench.db"),
+            "group1/shared/stacks-bench.db"
         );
     }
 

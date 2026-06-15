@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use chrono::Duration;
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::Result;
@@ -14,9 +15,9 @@ use crate::db::jobs::{
     JobCreationOutcome, JobFailure, JobStore,
 };
 use crate::models::{
-    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
-    JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, NewJob, NewJobEvent,
-    ResolvedCommit, TerminalJobStatus,
+    BenchmarkStepKind, GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job,
+    JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus,
+    NewJob, NewJobEvent, ResolvedCommit, TaskKind, TerminalJobStatus,
 };
 
 #[derive(Clone)]
@@ -27,6 +28,82 @@ pub struct PostgresJobStore {
 impl PostgresJobStore {
     pub fn new(pool: Pool) -> Self {
         Self { pool }
+    }
+
+    async fn create_singleton_group_spec(
+        tx: &mut Transaction<'_, Postgres>,
+        new: &NewJob,
+    ) -> Result<(Uuid, Uuid)> {
+        let group_id = Uuid::new_v4();
+        let spec_id = Uuid::new_v4();
+
+        sqlx::query(
+            r#"
+            INSERT INTO benchmark_group
+                (id, github_installation_id, github_repo_id, source, intent, artifact_prefix)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(group_id)
+        .bind(new.github_installation_id)
+        .bind(new.github_repo_id)
+        .bind(new.axes.source)
+        .bind(new.axes.intent)
+        .bind(group_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO benchmark_spec
+                (id, benchmark_group_id, spec_index, github_repo_id, task_kind,
+                 build_target, git_ref_kind, git_ref_display, git_commit_hash,
+                 git_committed_at, workload_key)
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(spec_id)
+        .bind(group_id)
+        .bind(new.github_repo_id)
+        .bind(new.axes.task_kind)
+        .bind(new.axes.build_target)
+        .bind(new.git_ref_kind)
+        .bind(&new.git_ref_display)
+        .bind(&new.git_commit_hash)
+        .bind(new.git_committed_at)
+        .bind(&new.workload_key)
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO benchmark_workflow_step
+                (benchmark_group_id, step_index, step_kind, benchmark_spec_id)
+            VALUES ($1, 0, $2, $3)
+            "#,
+        )
+        .bind(group_id)
+        .bind(BenchmarkStepKind::Build)
+        .bind(spec_id)
+        .execute(&mut **tx)
+        .await?;
+
+        if new.axes.task_kind != TaskKind::BuildOnly {
+            sqlx::query(
+                r#"
+                INSERT INTO benchmark_workflow_step
+                    (benchmark_group_id, step_index, step_kind, benchmark_spec_id)
+                VALUES ($1, 1, $2, $3)
+                "#,
+            )
+            .bind(group_id)
+            .bind(BenchmarkStepKind::Run)
+            .bind(spec_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        Ok((group_id, spec_id))
     }
 }
 
@@ -62,22 +139,28 @@ impl BaselineRow {
 #[async_trait]
 impl JobStore for PostgresJobStore {
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
+        let mut tx = self.pool.begin().await?;
+        let (group_id, spec_id) = Self::create_singleton_group_spec(&mut tx, new).await?;
         // status defaults to 'queued'; claim_token + claimed_at stay NULL on
         // insert (queued-state invariant). v10 (0005): jobs carry the axes
         // natively — `trigger_kind` / `job_kind` are retired on the `job` table.
         let row = sqlx::query_as::<_, Job>(
             r#"
             INSERT INTO job
-                (github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
+                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                 github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, github_installation_id, github_repo_id, status,
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                      github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
                       claim_token, claimed_at, created_at, updated_at
             "#,
         )
+        .bind(group_id)
+        .bind(spec_id)
         .bind(new.github_installation_id)
         .bind(new.github_repo_id)
         .bind(new.git_ref_kind)
@@ -89,8 +172,9 @@ impl JobStore for PostgresJobStore {
         .bind(new.axes.intent)
         .bind(new.axes.task_kind)
         .bind(new.axes.build_target)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row)
     }
 
@@ -108,21 +192,27 @@ impl JobStore for PostgresJobStore {
         // no row — we roll the whole transaction back (discarding the
         // `job` we just inserted) and report `AlreadyEnqueued`.
         let mut tx = self.pool.begin().await?;
+        let (group_id, spec_id) =
+            Self::create_singleton_group_spec(&mut tx, &request.new_job).await?;
 
         // v10 (0005): jobs carry the axes natively — set by the handler.
         let job: Job = sqlx::query_as(
             r#"
             INSERT INTO job
-                (github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
+                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                 github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, github_installation_id, github_repo_id, status,
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                      github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
                       claim_token, claimed_at, created_at, updated_at
             "#,
         )
+        .bind(group_id)
+        .bind(spec_id)
         .bind(
             request
                 .new_job
@@ -245,21 +335,26 @@ impl JobStore for PostgresJobStore {
         // subject) and no idempotency guard (see the trait docs). A failure on
         // either insert rolls back.
         let mut tx = self.pool.begin().await?;
+        let (group_id, spec_id) = Self::create_singleton_group_spec(&mut tx, new_job).await?;
 
         // v10 (0005): jobs carry the axes natively — set by the caller.
         let job: Job = sqlx::query_as(
             r#"
             INSERT INTO job
-                (github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
+                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                 github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, github_installation_id, github_repo_id, status,
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                      github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
                       claim_token, claimed_at, created_at, updated_at
             "#,
         )
+        .bind(group_id)
+        .bind(spec_id)
         .bind(new_job.github_installation_id)
         .bind(new_job.github_repo_id)
         .bind(new_job.git_ref_kind)
@@ -296,7 +391,8 @@ impl JobStore for PostgresJobStore {
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, Job>(
             r#"
-            SELECT id, github_installation_id, github_repo_id, status,
+            SELECT id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                   github_installation_id, github_repo_id, status,
                    source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
                    git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
                    created_at, updated_at
@@ -329,7 +425,8 @@ impl JobStore for PostgresJobStore {
                   FOR UPDATE SKIP LOCKED
                   LIMIT 1
              )
-         RETURNING id, github_installation_id, github_repo_id, status,
+         RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                   github_installation_id, github_repo_id, status,
                    source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
                    git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
                    created_at, updated_at
@@ -746,7 +843,8 @@ impl JobStore for PostgresJobStore {
         // the order jobs are actually claimed.
         let rows = sqlx::query_as::<_, Job>(
             r#"
-            SELECT id, github_installation_id, github_repo_id, status,
+            SELECT id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                   github_installation_id, github_repo_id, status,
                    source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
                    git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
                    created_at, updated_at

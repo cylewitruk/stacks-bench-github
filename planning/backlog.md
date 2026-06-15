@@ -230,68 +230,8 @@ does not recreate the same expiry window.
 buttons, and no attempt to keep a pre-claim plan stream alive with heartbeats.
 This is a surface/lifecycle split, not a scheduler change.
 
-### 0037 — Benchmark group/run model
-
-- **id:** `0037-benchmark-group-run-model`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0005-task-kind-platform`, `0031-reusable-build-jobs`
-- **relates_to:** `0001-artifact-store`, `0020-llm-intent-resolution`,
-  `0028-results-summary-restructure`
-- **source:** experiment-group modeling follow-up (2026-06)
-
-**Problem:** The daemon currently treats a benchmark request as one job → one VM
-run → one result artifact. That is too flat for clean repetitions and
-release-to-release comparisons, where a single user-facing request should own
-multiple isolated executions and one shared result record.
-
-**Scope:** Introduce the neutral experiment vocabulary without changing runtime
-behavior yet:
-
-- **BenchmarkGroup** — the user-facing request, reporting surface, shared
-  artifact identity, terminal summary, and host-pinned execution boundary. All
-  steps/runs in a group execute on one host; a future worker fleet schedules the
-  group as a unit rather than splitting repeats/variants across workers.
-- **BenchmarkSpec** — one concrete variant in the group: workload + rev/build
-  target. A group can carry multiple specs in the model from day one, but the
-  creation path caps groups to one active spec until `0039` deliberately lifts
-  that limit.
-- **BenchmarkRun** — one isolated VM/snapshot/process execution of a spec.
-
-Backfill every existing job as a singleton group with one spec and one run. A
-`BenchmarkRun` is the existing job row / claimable VM-execution unit,
-re-parented under a group/spec — do not invent a parallel lifecycle entity that
-duplicates job claiming/status/reporting. Keep current job claiming/reporting
-behavior byte-equivalent, but persist enough group/run identity that later
-slices can attach additional runs to the same group and SQLite artifact. Add a
-group-scoped artifact namespace (for example `<group_id>/...`) for future shared
-artifacts; today's job-scoped `<job_id>/...` keys remain unchanged for singleton
-runs. Preserve the reusable build step: cache warming, benchmark, and future
-block-validation jobs all invoke the same build-VM machinery with a
-`build_target`; task-specific execution composes after that artifact-production
-step instead of forking into rigid per-task pipelines. Within a group, artifact
-production executes at most once per build target (or is fully cache-reused);
-isolated repeats and variants reuse that artifact rather than re-running
-build→bench for every run. Model a group's execution as an ordered workflow of
-typed steps (initially build → measured run) so future steps like `0041`'s
-calibration pass can be inserted before measured runs without refactoring
-group/spec/run identity or artifact ownership. This is a modeling seam, not a
-new workflow engine in 0037; the step executor lands with the slices that need
-it.
-
-**Acceptance:** Existing Slack, GitHub PR, baseline, and build-only jobs still
-run exactly once and report as today, while their rows are queryable as
-`group → spec → run` singletons. The shared artifact identity for a group is
-persisted but unused by the driver until a later slice, and the group-scoped
-artifact key namespace is defined without moving existing artifacts. The schema
-supports multiple specs per group, but non-`0039` creation paths reject
-multi-spec groups before enqueue. The model leaves room for non-measured
-workflow steps (for example calibration) without making those steps look like
-additional benchmark variants. A group is host-pinned, and the build/artifact
-step is not duplicated per isolated repeat.
-
-**Deferred / non-goals:** No repeated execution, no comparison summary, no new
-LLM schema fields. This is the schema/modeling seam only.
+*`0037-benchmark-group-run-model` is in progress as iteration **v14** →
+[iterations/v14-benchmark-group-run-model.md](iterations/v14-benchmark-group-run-model.md).*
 
 ### 0038 — Isolated benchmark repetitions
 

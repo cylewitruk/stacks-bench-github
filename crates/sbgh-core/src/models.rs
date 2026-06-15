@@ -402,6 +402,12 @@ pub struct GithubPullRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Job {
     pub id: Uuid,
+    /// 0037: user-facing benchmark request this claimable run belongs to.
+    pub benchmark_group_id: Uuid,
+    /// 0037: concrete workload/rev variant within the group.
+    pub benchmark_spec_id: Uuid,
+    /// 0037: isolated execution number for this spec. Singleton jobs are `0`.
+    pub benchmark_run_index: i32,
     pub github_installation_id: i64,
     pub github_repo_id: i64,
     pub status: JobStatus,
@@ -449,6 +455,65 @@ pub struct NewJob {
     /// [`crate::bench_args`]). Computed at enqueue from the effective args
     /// (`resolve_bench_args`); `None` only in non-enqueue test fixtures.
     pub workload_key: Option<String>,
+}
+
+/// 0037: user-facing benchmark request boundary. A group owns reporting,
+/// shared artifact identity, and future multi-run/multi-variant summaries.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct BenchmarkGroup {
+    pub id: Uuid,
+    pub github_installation_id: i64,
+    pub github_repo_id: i64,
+    pub source: JobSource,
+    pub intent: JobIntent,
+    /// Store-key prefix for group-scoped artifacts. Singleton runs keep using
+    /// `<job_id>/...`; later group-aware artifacts use `<artifact_prefix>/...`.
+    pub artifact_prefix: String,
+    /// Future worker-fleet host pin. `None` on the current single-host daemon.
+    pub host_key: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 0037: one concrete variant in a benchmark group: workload + ref + target.
+/// Groups can model multiple specs now, while current creation paths cap at
+/// one.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct BenchmarkSpec {
+    pub id: Uuid,
+    pub benchmark_group_id: Uuid,
+    pub spec_index: i32,
+    pub github_repo_id: i64,
+    pub task_kind: TaskKind,
+    pub build_target: BuildTarget,
+    pub git_ref_kind: GitRefKind,
+    pub git_ref_display: String,
+    pub git_commit_hash: Option<String>,
+    pub git_committed_at: Option<DateTime<Utc>>,
+    pub workload_key: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "benchmark_step_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkStepKind {
+    Build,
+    Calibrate,
+    Run,
+}
+
+/// 0037: inert ordered workflow model for a group. Runtime execution still
+/// follows today's job path; later slices attach behavior to these steps.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct BenchmarkWorkflowStep {
+    pub id: Uuid,
+    pub benchmark_group_id: Uuid,
+    pub step_index: i32,
+    pub step_kind: BenchmarkStepKind,
+    pub benchmark_spec_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Slice 8 (post-review fix): typed handoff for the
