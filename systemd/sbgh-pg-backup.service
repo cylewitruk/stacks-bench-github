@@ -1,0 +1,28 @@
+[Unit]
+Description=stacks-bench-github Postgres backup (pg_dump -> .tar.zst)
+Documentation=https://github.com/cylewitruk/stacks-bench-github
+# pg_dump runs inside the postgres container, so docker must be up. This is a
+# oneshot pulled by sbgh-pg-backup.timer; no [Install] (the timer starts it).
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Runs as root: it shells out to `docker exec` and writes to /var/lib/sbgh.
+ExecStart=/usr/local/bin/sbgh-pg-backup.sh
+
+# Per-host config — override with `systemctl edit sbgh-pg-backup.service`
+# rather than editing this file.
+Environment=PG_CONTAINER=sbgh-postgres
+Environment=PG_USER=sbgh
+Environment=PG_DB=sbgh
+Environment=BACKUP_DIR=/var/lib/sbgh/backups
+Environment=RETENTION=7
+Environment=ZSTD_LEVEL=19
+
+# A backup must never wedge the host; cap its runtime.
+TimeoutStartSec=1800
+
+# Logs to journald:  journalctl -u sbgh-pg-backup -f
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily stacks-bench-github Postgres backup
+Documentation=https://github.com/cylewitruk/stacks-bench-github
+
+[Timer]
+# Daily at 03:00 local time. Persistent=true runs a missed backup once the
+# host is back up (e.g. after an overnight reboot); RandomizedDelaySec keeps it
+# off an exact-on-the-hour spike.
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=sbgh-pg-backup.service
+
+[Install]
+WantedBy=timers.target
