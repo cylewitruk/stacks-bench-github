@@ -9,6 +9,12 @@ daemon-orchestrated VM executions under one benchmark group, not
 > Phase 1 is implemented and ready for review. Requests now carry a
 > daemon-owned clean-repeat count, enforce a conservative cap before enqueue,
 > and normalize every single VM invocation to `stacks-bench --repetitions 1`.
+> Phase 2's deploy-safe planning foundation is implemented: requested clean-run
+> counts are persisted on `benchmark_spec`, and both stores expose tested
+> append/resume primitives for the lazy run chain. Automatic runtime chaining
+> remains deferred until the Phase 3/4 carry-forward + single-surface execution
+> pieces land, so the Slack surface temporarily rejects requests above one
+> clean repetition instead of silently under-delivering.
 
 ## Items
 
@@ -136,23 +142,28 @@ in-process repetitions.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
+- [x] Core implementation
+- [x] Unit/integration tests
 - [ ] Reviewed
 - [ ] Validated
 
 **Acceptance & Validation:**
 
-- [ ] A repeat request creates one group, one spec, and run 0 initially; later
-  run jobs appear as the sequence progresses.
-- [ ] At most one run per group is queued, claimed, or running at any time,
-  even when `max_concurrent_jobs > 1`.
-- [ ] Run jobs are created strictly in `benchmark_run_index` order.
-- [ ] A daemon restart between run K completion and run K+1 enqueue does not
-  strand the group; startup resumes the next-run enqueue from DB state.
-- [ ] The `job_benchmark_spec_run_unique` constraint catches duplicate indexes.
-- [ ] Existing `claim_next_queued` still claims ordinary job rows.
-- [ ] Build-only/cache-warm jobs remain single-run.
+- [x] A repeat request persists the requested clean-run count on the group spec
+  while still creating only run 0 initially.
+- [x] Store append/resume primitives enforce at most one active run per spec.
+- [x] Store append/resume primitives create run jobs strictly in
+  `benchmark_run_index` order.
+- [x] The next run can be derived from persisted DB state after run K
+  completed and before run K+1 exists.
+- [x] The `job_benchmark_spec_run_unique` constraint catches duplicate indexes.
+- [x] Existing `claim_next_queued` still claims ordinary job rows.
+- [x] Build-only/cache-warm jobs remain single-run.
+- [x] User-facing Slack requests for `clean_repetitions > 1` reject loudly until
+  the runtime chain is activated.
+- [ ] Runtime completion/startup hooks call the append/resume primitives after
+  Phase 3/4 can carry the DB and update one group surface without per-run
+  fan-out.
 
 ### Phase 3: Build Reuse + Sequential Execution
 

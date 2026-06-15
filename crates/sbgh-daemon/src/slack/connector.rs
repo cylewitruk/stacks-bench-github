@@ -133,6 +133,15 @@ impl SlackConnector {
             .await;
             return;
         }
+        // TEMPORARY(v15 Phase 3): remove once repeat chaining is wired into the runner.
+        if spec.clean_repetitions > 1 {
+            self.reject(
+                &event,
+                "clean repetitions are not enabled yet — please request one repetition for now",
+            )
+            .await;
+            return;
+        }
 
         // 3. Enqueue an ad-hoc job. Default repo (target ids) + rev (`--rev` override,
         //    else the configured default); the parsed workload becomes `bench_args`;
@@ -796,10 +805,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_repetitions_above_one_are_rejected_until_runtime_chaining_lands() {
+        let store = Arc::new(InMemoryJobStore::new());
+        let client = Arc::new(FakeSlackClient::default());
+        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
+            .with_max_clean_repetitions(5);
+
+        connector
+            .handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 2"))
+            .await;
+
+        assert!(store.all_jobs().is_empty(), "multi-run request must not enqueue yet");
+        assert!(
+            client
+                .reactions
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "multi-run request must not get accepted reaction yet",
+        );
+        let eph = client
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("not enabled yet"),
+            "{}",
+            eph[0].2
+        );
+    }
+
+    #[tokio::test]
     async fn flag_shaped_request_uses_parser_fast_path_without_llm_call() {
         let resolver = Arc::new(FakeIntentResolver::invalid("should not be used"));
         let (c, store, _slack, resolver) = harness_with_intent(resolver);
-        c.handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 5"))
+        c.handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 1"))
             .await;
 
         assert_eq!(resolver.calls(), 0, "clean parser input bypasses LLM");
@@ -810,7 +853,7 @@ mod tests {
     async fn natural_language_can_resolve_through_llm() {
         let spec = WorkloadSpec {
             target: crate::workload::WorkloadTarget::BlockRange { start: 10, end: 12 },
-            clean_repetitions: 2,
+            clean_repetitions: 1,
             warmup: Some(1),
             rev: Some("feature/nl".into()),
         };
@@ -839,7 +882,7 @@ mod tests {
             bench_args,
             vec!["--start-at", "10", "--count", "3", "--repetitions", "1", "--warmup", "1"]
         );
-        assert_eq!(clean_repetitions, 2);
+        assert_eq!(clean_repetitions, 1);
     }
 
     #[tokio::test]

@@ -411,6 +411,24 @@ pub trait JobStore: Send + Sync + 'static {
         Ok(())
     }
 
+    /// v15 Phase 2: append the next queued run for the same benchmark spec
+    /// after `completed_job_id` finishes. Returns `Ok(None)` when the job is
+    /// not the latest completed run, the requested run count is already
+    /// satisfied, the spec is build-only, or another run for the spec is
+    /// already queued/claimed/running.
+    ///
+    /// This is the durable lazy-enqueue primitive: the next row is an ordinary
+    /// `job` with `benchmark_run_index = previous_max + 1`, copied subject
+    /// identity, and copied queued provenance. Callers can run it after a
+    /// completion hook; startup recovery uses [`resume_pending_benchmark_runs`]
+    /// to derive the same work from DB state after a restart.
+    async fn append_next_benchmark_run(&self, completed_job_id: Uuid) -> Result<Option<Job>>;
+
+    /// v15 Phase 2: DB-resumable lazy-enqueue recovery. Finds benchmark specs
+    /// whose latest run completed, whose requested count is not yet satisfied,
+    /// and that have no active run, then appends one next run per spec.
+    async fn resume_pending_benchmark_runs(&self) -> Result<Vec<Job>>;
+
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 
     async fn record_metric(&self, metric: &JobMetric) -> Result<()>;

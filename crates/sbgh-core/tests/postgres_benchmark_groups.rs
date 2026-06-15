@@ -4,7 +4,7 @@
 use sbgh_core::db::{JobCreationOutcome, JobStore, Pool, PostgresJobStore, setup_pg_db};
 use sbgh_core::models::{
     BenchmarkStepKind, BuildTarget, GitRefKind, JobAxes, JobCreationRequest, JobIntent, JobKind,
-    JobSource, NewJob, QueuedEventDetail, TaskKind, TriggerKind,
+    JobSource, JobStatus, NewJob, QueuedEventDetail, TaskKind, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -78,23 +78,35 @@ async fn assert_singleton_model(
     let (
         spec_group_id,
         spec_index,
+        requested_run_count,
         task_kind,
         build_target,
         git_ref_kind,
         git_ref_display,
         commit,
         workload_key,
-    ): (Uuid, i32, TaskKind, BuildTarget, GitRefKind, String, Option<String>, Option<String>) =
-        sqlx::query_as(
-            "SELECT benchmark_group_id, spec_index, task_kind, build_target, git_ref_kind, \
-             git_ref_display, git_commit_hash, workload_key FROM benchmark_spec WHERE id = $1",
-        )
-        .bind(spec_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    ): (
+        Uuid,
+        i32,
+        i32,
+        TaskKind,
+        BuildTarget,
+        GitRefKind,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT benchmark_group_id, spec_index, requested_run_count, task_kind, build_target, \
+         git_ref_kind, git_ref_display, git_commit_hash, workload_key FROM benchmark_spec WHERE \
+         id = $1",
+    )
+    .bind(spec_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
     assert_eq!(spec_group_id, group_id);
     assert_eq!(spec_index, 0);
+    assert_eq!(requested_run_count, 1);
     assert_eq!(task_kind, expected_axes.task_kind);
     assert_eq!(build_target, expected_axes.build_target);
     assert_eq!(git_ref_kind, GitRefKind::Branch);
@@ -126,6 +138,141 @@ async fn assert_singleton_model(
     } else {
         assert_eq!(steps, vec![(0, BenchmarkStepKind::Build), (1, BenchmarkStepKind::Run)]);
     }
+}
+
+#[tokio::test]
+async fn slack_unlinked_job_persists_requested_clean_repetitions_on_spec() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 4,
+    })
+    .unwrap();
+    let new = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
+
+    let job = store
+        .create_unlinked_job(&new, &detail)
+        .await
+        .unwrap();
+
+    let requested: i32 =
+        sqlx::query_scalar("SELECT requested_run_count FROM benchmark_spec WHERE id = $1")
+            .bind(job.benchmark_spec_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(requested, 4);
+}
+
+#[tokio::test]
+async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 3,
+    })
+    .unwrap();
+    let first = store
+        .create_unlinked_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let second = store
+        .append_next_benchmark_run(first.id)
+        .await
+        .unwrap()
+        .expect("run 1 is queued");
+    assert_eq!(second.benchmark_group_id, first.benchmark_group_id);
+    assert_eq!(second.benchmark_spec_id, first.benchmark_spec_id);
+    assert_eq!(second.benchmark_run_index, 1);
+    assert_eq!(second.status, JobStatus::Queued);
+    assert!(
+        store
+            .append_next_benchmark_run(first.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "active run 1 prevents a duplicate run 1"
+    );
+
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(second.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let third = store
+        .append_next_benchmark_run(second.id)
+        .await
+        .unwrap()
+        .expect("run 2 is queued");
+    assert_eq!(third.benchmark_run_index, 2);
+
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(third.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .append_next_benchmark_run(third.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "requested run count is satisfied"
+    );
+}
+
+#[tokio::test]
+async fn resume_pending_benchmark_runs_derives_next_run_from_db_state() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 2,
+    })
+    .unwrap();
+    let first = store
+        .create_unlinked_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let resumed = store
+        .resume_pending_benchmark_runs()
+        .await
+        .unwrap();
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].benchmark_spec_id, first.benchmark_spec_id);
+    assert_eq!(resumed[0].benchmark_run_index, 1);
+
+    assert!(
+        store
+            .resume_pending_benchmark_runs()
+            .await
+            .unwrap()
+            .is_empty(),
+        "the active resumed run prevents duplicate startup enqueue"
+    );
 }
 
 #[tokio::test]

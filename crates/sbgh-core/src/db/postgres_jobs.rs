@@ -17,7 +17,7 @@ use crate::db::jobs::{
 use crate::models::{
     BenchmarkStepKind, GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job,
     JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus,
-    NewJob, NewJobEvent, ResolvedCommit, TaskKind, TerminalJobStatus,
+    NewJob, NewJobEvent, QueuedEventDetail, ResolvedCommit, TaskKind, TerminalJobStatus,
 };
 
 #[derive(Clone)]
@@ -33,6 +33,7 @@ impl PostgresJobStore {
     async fn create_singleton_group_spec(
         tx: &mut Transaction<'_, Postgres>,
         new: &NewJob,
+        requested_run_count: i32,
     ) -> Result<(Uuid, Uuid)> {
         let group_id = Uuid::new_v4();
         let spec_id = Uuid::new_v4();
@@ -56,14 +57,15 @@ impl PostgresJobStore {
         sqlx::query(
             r#"
             INSERT INTO benchmark_spec
-                (id, benchmark_group_id, spec_index, github_repo_id, task_kind,
+                (id, benchmark_group_id, spec_index, requested_run_count, github_repo_id, task_kind,
                  build_target, git_ref_kind, git_ref_display, git_commit_hash,
                  git_committed_at, workload_key)
-            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(spec_id)
         .bind(group_id)
+        .bind(requested_run_count.max(1))
         .bind(new.github_repo_id)
         .bind(new.axes.task_kind)
         .bind(new.axes.build_target)
@@ -105,6 +107,81 @@ impl PostgresJobStore {
 
         Ok((group_id, spec_id))
     }
+
+    fn requested_run_count_from_detail(detail: &serde_json::Value) -> i32 {
+        match serde_json::from_value::<QueuedEventDetail>(detail.clone()) {
+            Ok(QueuedEventDetail::SlackAdhoc { clean_repetitions, .. }) => {
+                clean_repetitions.max(1) as i32
+            }
+            _ => 1,
+        }
+    }
+
+    async fn insert_next_run_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        prior: &Job,
+        next_index: i32,
+    ) -> Result<Job> {
+        let job: Job = sqlx::query_as(
+            r#"
+            INSERT INTO job
+                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                 github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
+                 git_commit_hash, git_committed_at, workload_key,
+                 source, intent, task_kind, build_target)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                      github_installation_id, github_repo_id, status,
+                      source, intent, task_kind, build_target, git_ref_kind,
+                      git_ref_display, git_commit_hash, git_committed_at, workload_key,
+                      claim_token, claimed_at, created_at, updated_at
+            "#,
+        )
+        .bind(prior.benchmark_group_id)
+        .bind(prior.benchmark_spec_id)
+        .bind(next_index)
+        .bind(prior.github_installation_id)
+        .bind(prior.github_repo_id)
+        .bind(prior.git_ref_kind)
+        .bind(&prior.git_ref_display)
+        .bind(&prior.git_commit_hash)
+        .bind(prior.git_committed_at)
+        .bind(&prior.workload_key)
+        .bind(prior.source)
+        .bind(prior.intent)
+        .bind(prior.task_kind)
+        .bind(prior.build_target)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_event
+                (job_id, event_kind, event_status, github_comment_id,
+                 github_check_run_id, github_check_run_url, remark, detail)
+            SELECT $1, event_kind, event_status, NULL, NULL, NULL, remark, detail
+              FROM job_event
+             WHERE job_id = $2
+               AND event_kind = 'queued'
+          ORDER BY occurred_at DESC, id DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(job.id)
+        .bind(prior.id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(job)
+    }
+}
+
+/// Prior run + its spec's requested count for v15 lazy enqueue decisions.
+#[derive(sqlx::FromRow)]
+struct PriorRunRow {
+    #[sqlx(flatten)]
+    job: Job,
+    requested_run_count: i32,
 }
 
 /// Flattened row for `find_baseline_for`: the anchor columns + the baseline's
@@ -140,7 +217,7 @@ impl BaselineRow {
 impl JobStore for PostgresJobStore {
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
         let mut tx = self.pool.begin().await?;
-        let (group_id, spec_id) = Self::create_singleton_group_spec(&mut tx, new).await?;
+        let (group_id, spec_id) = Self::create_singleton_group_spec(&mut tx, new, 1).await?;
         // status defaults to 'queued'; claim_token + claimed_at stay NULL on
         // insert (queued-state invariant). v10 (0005): jobs carry the axes
         // natively — `trigger_kind` / `job_kind` are retired on the `job` table.
@@ -193,7 +270,7 @@ impl JobStore for PostgresJobStore {
         // `job` we just inserted) and report `AlreadyEnqueued`.
         let mut tx = self.pool.begin().await?;
         let (group_id, spec_id) =
-            Self::create_singleton_group_spec(&mut tx, &request.new_job).await?;
+            Self::create_singleton_group_spec(&mut tx, &request.new_job, 1).await?;
 
         // v10 (0005): jobs carry the axes natively — set by the handler.
         let job: Job = sqlx::query_as(
@@ -335,7 +412,9 @@ impl JobStore for PostgresJobStore {
         // subject) and no idempotency guard (see the trait docs). A failure on
         // either insert rolls back.
         let mut tx = self.pool.begin().await?;
-        let (group_id, spec_id) = Self::create_singleton_group_spec(&mut tx, new_job).await?;
+        let requested_run_count = Self::requested_run_count_from_detail(queued_event_detail);
+        let (group_id, spec_id) =
+            Self::create_singleton_group_spec(&mut tx, new_job, requested_run_count).await?;
 
         // v10 (0005): jobs carry the axes natively — set by the caller.
         let job: Job = sqlx::query_as(
@@ -386,6 +465,111 @@ impl JobStore for PostgresJobStore {
 
         tx.commit().await?;
         Ok(job)
+    }
+
+    async fn append_next_benchmark_run(&self, completed_job_id: Uuid) -> Result<Option<Job>> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<PriorRunRow> = sqlx::query_as(
+            r#"
+            SELECT j.id, j.benchmark_group_id, j.benchmark_spec_id, j.benchmark_run_index,
+                   j.github_installation_id, j.github_repo_id, j.status,
+                   j.source, j.intent, j.task_kind, j.build_target, j.git_ref_kind,
+                   j.git_ref_display, j.git_commit_hash, j.git_committed_at, j.workload_key,
+                   j.claim_token, j.claimed_at, j.created_at, j.updated_at,
+                   s.requested_run_count
+              FROM job j
+              JOIN benchmark_spec s ON s.id = j.benchmark_spec_id
+             WHERE j.id = $1
+             FOR UPDATE OF j
+            "#,
+        )
+        .bind(completed_job_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let prior = row.job;
+        let requested_run_count = row.requested_run_count;
+        if prior.status != JobStatus::Completed || prior.task_kind == TaskKind::BuildOnly {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job
+              WHERE benchmark_spec_id = $1
+                AND status IN ('queued', 'claimed', 'running')",
+        )
+        .bind(prior.benchmark_spec_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active > 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let max_index: Option<i32> = sqlx::query_scalar(
+            "SELECT MAX(benchmark_run_index) FROM job WHERE benchmark_spec_id = $1",
+        )
+        .bind(prior.benchmark_spec_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let max_index = max_index.unwrap_or(0);
+        if max_index != prior.benchmark_run_index {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let next_index = max_index + 1;
+        if next_index >= requested_run_count {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let job = Self::insert_next_run_in_tx(&mut tx, &prior, next_index).await?;
+        tx.commit().await?;
+        Ok(Some(job))
+    }
+
+    async fn resume_pending_benchmark_runs(&self) -> Result<Vec<Job>> {
+        let candidates: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            WITH latest AS (
+                SELECT DISTINCT ON (j.benchmark_spec_id) j.id, j.benchmark_spec_id,
+                       j.benchmark_run_index, j.status
+                  FROM job j
+              ORDER BY j.benchmark_spec_id, j.benchmark_run_index DESC
+            )
+            SELECT latest.id
+              FROM latest
+              JOIN benchmark_spec s ON s.id = latest.benchmark_spec_id
+             WHERE latest.status = 'completed'
+               AND latest.benchmark_run_index + 1 < s.requested_run_count
+               AND s.task_kind <> 'build_only'
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM job active
+                     WHERE active.benchmark_spec_id = latest.benchmark_spec_id
+                       AND active.status IN ('queued', 'claimed', 'running')
+               )
+          ORDER BY latest.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::new();
+        for id in candidates {
+            if let Some(job) = self
+                .append_next_benchmark_run(id)
+                .await?
+            {
+                out.push(job);
+            }
+        }
+        Ok(out)
     }
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {

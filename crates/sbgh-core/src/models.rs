@@ -483,6 +483,10 @@ pub struct BenchmarkSpec {
     pub id: Uuid,
     pub benchmark_group_id: Uuid,
     pub spec_index: i32,
+    /// v15: requested daemon-level clean VM executions for this spec.
+    /// Singleton jobs store `1`; repeat groups store the requested count and
+    /// lazily enqueue run rows in `benchmark_run_index` order.
+    pub requested_run_count: i32,
     pub github_repo_id: i64,
     pub task_kind: TaskKind,
     pub build_target: BuildTarget,

@@ -91,6 +91,84 @@ async fn create_unlinked_job_is_webhook_less_and_preserves_detail() {
 }
 
 #[tokio::test]
+async fn in_memory_repeat_planner_appends_and_resumes_next_run() {
+    let store = InMemoryJobStore::new();
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 2,
+    })
+    .unwrap();
+    let first = store
+        .create_unlinked_job(
+            &NewJob {
+                github_installation_id: 100,
+                github_repo_id: 10,
+                axes: JobAxes::from_legacy(TriggerKind::SlackAdhoc, JobKind::AdHoc),
+                git_ref_kind: GitRefKind::Branch,
+                git_ref_display: "develop".into(),
+                git_commit_hash: Some("abc".into()),
+                git_committed_at: None,
+                workload_key: Some("wk".into()),
+            },
+            &detail,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .spec(first.benchmark_spec_id)
+            .expect("spec exists")
+            .requested_run_count,
+        2
+    );
+
+    let token = Uuid::new_v4();
+    let claimed = store
+        .claim_next_queued(token)
+        .await
+        .unwrap()
+        .expect("run 0 claimed");
+    store
+        .mark_running(claimed.id, token, None)
+        .await
+        .unwrap();
+    store
+        .complete_job(&JobCompletion {
+            job_id: claimed.id,
+            claim_token: token,
+            result: JobResult {
+                job_id: claimed.id,
+                run_json: None,
+                archive_dir: "/tmp".into(),
+                created_at: chrono::Utc::now(),
+            },
+            metric: None,
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+
+    let resumed = store
+        .resume_pending_benchmark_runs()
+        .await
+        .unwrap();
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].benchmark_spec_id, first.benchmark_spec_id);
+    assert_eq!(resumed[0].benchmark_run_index, 1);
+    assert_eq!(resumed[0].status, JobStatus::Queued);
+    assert!(
+        store
+            .resume_pending_benchmark_runs()
+            .await
+            .unwrap()
+            .is_empty(),
+        "active run 1 blocks duplicate resume"
+    );
+}
+
+#[tokio::test]
 async fn create_job_with_links_is_atomically_visible() {
     // After the call returns Ok, ALL related rows must be present
     // — never a job without its webhook link or queued event.
