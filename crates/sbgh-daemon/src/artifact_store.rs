@@ -88,6 +88,9 @@ pub fn group_artifact_key(group_prefix: &str, relative: &str) -> String {
     format!("{group_prefix}/{relative}")
 }
 
+/// Group-scoped SQLite DB carried between isolated repeat VMs.
+pub const GROUP_SQLITE_RELATIVE: &str = "shared/stacks-bench.db";
+
 /// Sibling temp path for a streamed download (`<dest>.<token>.part`), renamed
 /// to `dest` on completion so a partial transfer never lands at the key path.
 /// The `token` is unique per download so two concurrent cache misses for the

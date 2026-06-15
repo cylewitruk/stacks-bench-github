@@ -26,7 +26,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sbgh_core::bench_args::normalize_stored_value;
 use sbgh_core::db::{
-    BaselineSelection, JobCompletion, JobFailure, JobStore, PullRequestStore, RepoStore,
+    BaselineSelection, BenchmarkRunMetric, JobCompletion, JobFailure, JobStore, PullRequestStore,
+    RepoStore,
 };
 use sbgh_core::models::{
     GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent,
@@ -202,6 +203,17 @@ pub trait RunnableJobStore: Send + Sync + 'static {
         merge_base_committed_at: Option<DateTime<Utc>>,
         workload_key: &str,
     ) -> anyhow::Result<Option<BaselineRef>>;
+
+    /// v15 Phase 5: promoted metrics for all completed isolated runs in the
+    /// same benchmark spec. Used by group-level reporting to render aggregate
+    /// repeat statistics from durable `job_metric` rows.
+    async fn benchmark_run_metrics(
+        &self,
+        benchmark_spec_id: Uuid,
+    ) -> anyhow::Result<Vec<BenchmarkRunMetric>> {
+        let _ = benchmark_spec_id;
+        Ok(Vec::new())
+    }
 
     /// Terminal failure. `summary` is the same forensics blob shape when
     /// available (setup-time failures may have none).
@@ -410,6 +422,16 @@ impl RunnableJobStore for JobSource {
             committed_at: m.anchor.committed_at,
             selection: m.anchor.selection,
         }))
+    }
+
+    async fn benchmark_run_metrics(
+        &self,
+        benchmark_spec_id: Uuid,
+    ) -> anyhow::Result<Vec<BenchmarkRunMetric>> {
+        Ok(self
+            .jobs
+            .benchmark_run_metrics(benchmark_spec_id)
+            .await?)
     }
 
     async fn fail(

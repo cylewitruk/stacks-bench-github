@@ -155,6 +155,13 @@ pub struct PendingBenchmarkRun {
     pub artifact_prefix: String,
 }
 
+/// Promoted metrics for one isolated run inside a benchmark spec.
+#[derive(Debug, Clone)]
+pub struct BenchmarkRunMetric {
+    pub benchmark_run_index: i32,
+    pub metric: JobMetric,
+}
+
 #[async_trait]
 pub trait JobStore: Send + Sync + 'static {
     async fn insert_job(&self, new: &NewJob) -> Result<Job>;
@@ -456,6 +463,14 @@ pub trait JobStore: Send + Sync + 'static {
     /// so daemon startup can promote the archived SQLite DB before appending
     /// the next run.
     async fn pending_completed_benchmark_runs(&self) -> Result<Vec<PendingBenchmarkRun>>;
+
+    /// v15 Phase 5: promoted metrics for all completed runs in one spec,
+    /// ordered by isolated run index. Missing/unparseable runs are absent
+    /// because they never produced a `job_metric` row.
+    async fn benchmark_run_metrics(
+        &self,
+        benchmark_spec_id: Uuid,
+    ) -> Result<Vec<BenchmarkRunMetric>>;
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 

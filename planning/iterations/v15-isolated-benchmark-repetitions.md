@@ -12,10 +12,12 @@ daemon-orchestrated VM executions under one benchmark group, not
 > and reviewed: requested clean-run counts are persisted on `benchmark_spec`,
 > and both stores expose tested append/resume primitives for the lazy run chain.
 > Phase 3 is implemented and reviewed: startup resume and after-completion
-> append hooks drive the internal chain. Phase 4 is implemented pending review:
+> append hooks drive the internal chain. Phase 4 is implemented and reviewed:
 > archived SQLite DBs are carried through a group artifact before the next run
-> is appended/started. Multi-run Slack requests remain gated until group-level
-> reporting can suppress per-run card/comment/check fan-out.
+> is appended/started. Phase 5 is implemented pending review: the group owns one
+> Slack surface with live repeat progress, aggregate variance from promoted
+> metrics, shared-DB download links, and partial summaries on failed/stalled
+> groups. Multi-run Slack requests now open when the binary cache is enabled.
 
 ## Items
 
@@ -145,7 +147,7 @@ in-process repetitions.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [ ] Validated
 
 **Acceptance & Validation:**
@@ -187,7 +189,7 @@ in-process repetitions.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [ ] Validated
 
 **Acceptance & Validation:**
@@ -196,14 +198,13 @@ in-process repetitions.
   enabled.
 - [ ] Every measured repeat still runs in a fresh VM/snapshot.
 - [ ] Cache hits and build misses both preserve the same repeat semantics.
-- [ ] A failed run stops the lazy-enqueue chain and leaves visible partial
+- [x] A failed run stops the lazy-enqueue chain and leaves visible partial
   group state.
-- [ ] A repeat group produces one user-facing Slack/GitHub surface, not one
+- [x] A repeat group produces one user-facing Slack/GitHub surface, not one
   card/comment/check per run.
 - [x] Multi-run Slack requests are rejected when the binary cache is disabled,
   avoiding an N-build fallback path.
-- [x] Multi-run Slack requests are still rejected when the binary cache is
-  enabled, until the single group reporting surface lands.
+- [x] Multi-run Slack requests are accepted when the binary cache is enabled.
 - [x] The runner resumes missing next-repeat jobs at startup.
 - [x] The runner appends the next repeat after terminal completion persistence;
   append errors are logged as retryable and do not fail the completed run.
@@ -224,15 +225,15 @@ in-process repetitions.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [ ] Validated
 
 **Acceptance & Validation:**
 
 - [ ] A multi-repeat group produces one shared DB containing rows for all clean
   runs.
-- [ ] The final result card/download links the shared DB.
-- [ ] A carry-forward failure is visible and terminal/partial according to the
+- [x] The final result card/download links the shared DB.
+- [x] A carry-forward failure is visible and terminal/partial according to the
   Phase 2 policy.
 
 ### Phase 5: Summary Reporting
@@ -253,24 +254,24 @@ in-process repetitions.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
+- [x] Core implementation
+- [x] Unit/integration tests
 - [ ] Reviewed
 - [ ] Validated
 
 **Acceptance & Validation:**
 
-- [ ] A completed repeat group reports the aggregate variance summary.
-- [ ] In-progress groups show the current repeat K/N on the single group
+- [x] A completed repeat group reports the aggregate variance summary.
+- [x] In-progress groups show the current repeat K/N on the single group
   surface.
-- [ ] The report links the shared DB.
-- [ ] Single-run jobs still render as today.
+- [x] The report links the shared DB.
+- [x] Single-run jobs still render as today.
 
 ## Final Validation
 
-- [ ] `just build`
-- [ ] `just lint`
-- [ ] `just test`
+- [x] `just build`
+- [x] `just lint`
+- [x] `just test`
 - [ ] Host smoke: request 2 clean repeats, confirm two fresh VMs/snapshots, one
   build/cache artifact, one shared DB, and a variance summary.
 

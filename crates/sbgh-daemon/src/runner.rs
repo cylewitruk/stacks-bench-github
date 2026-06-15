@@ -25,7 +25,7 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::artifact_store::{build_store_or_local, group_artifact_key};
+use crate::artifact_store::{GROUP_SQLITE_RELATIVE, build_store_or_local, group_artifact_key};
 use crate::bench_recipe::BenchRecipe;
 use crate::build_recipe::BuildOnlyRecipe;
 use crate::driver::Driver;
@@ -43,9 +43,6 @@ use crate::slack::stream::chunks_for_card;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Group-scoped SQLite DB carried between isolated repeat VMs.
-const GROUP_SQLITE_RELATIVE: &str = "shared/stacks-bench.db";
 
 /// Lease after which a job stranded in `claimed` (claimed but never
 /// transitioned to `running` — daemon crashed or preflight errored
@@ -630,7 +627,9 @@ impl Coordinator {
             // already carries a head SHA (PR / branch-push; a tag job resolves
             // only at claim).
             let reportable = match &job.progress {
-                ProgressTarget::Slack { plan_message_ts, .. } => plan_message_ts.is_some(),
+                ProgressTarget::Slack { plan_message_ts, .. } => {
+                    job.benchmark_run_index == 0 && plan_message_ts.is_some()
+                }
                 _ => {
                     !job.commit.is_empty() && wants_position_check(&self.deps.config.reporting, job)
                 }
@@ -693,6 +692,7 @@ impl Coordinator {
             commit_url: None,
             job_id: &job_id,
             bench_args: &job.bench_args,
+            repeat: None,
             cached_build: None,
         };
         let detail = format!("position {}/{}", ahead + 1, total);
@@ -1048,7 +1048,7 @@ impl JobDeps {
         // `build_only` builds + caches the artifact silently; `benchmark` runs
         // the bench.
         let driver = self.driver.clone();
-        match (job.task_kind, job.build_target) {
+        let worker_completed = match (job.task_kind, job.build_target) {
             (TaskKind::Benchmark, BuildTarget::StacksBench) => {
                 let recipe = BenchRecipe::new(
                     driver,
@@ -1056,17 +1056,17 @@ impl JobDeps {
                     vcpu_cpuset,
                     sqlite_seed_key_for(&job),
                 );
-                run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+                run_worker(&recipe, &job, prepared_rx, events_tx, token).await
             }
             (TaskKind::BuildOnly, BuildTarget::StacksBench) => {
                 let recipe = BuildOnlyRecipe::new(driver, vcpu_cpuset);
-                run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+                run_worker(&recipe, &job, prepared_rx, events_tx, token).await
             }
             (task_kind, build_target) => {
                 let recipe = UnsupportedRecipe::new(format!("{task_kind:?}/{build_target:?}"));
-                run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
+                run_worker(&recipe, &job, prepared_rx, events_tx, token).await
             }
-        }
+        };
 
         // After the job's execution (which may have published a freshly-built
         // binary), recompute the pinned set so a newly-built pinned ref is
@@ -1086,7 +1086,7 @@ impl JobDeps {
             Err(join_err) => Err(anyhow::anyhow!("reporter task panicked: {join_err}")),
         };
 
-        if reporter_result.is_ok() {
+        if worker_completed && reporter_result.is_ok() {
             self.append_next_repeat_after_terminal(&job)
                 .await;
         }
@@ -1122,10 +1122,26 @@ impl JobDeps {
                     error = ?e,
                     "repeat planner: will not enqueue next run until carried SQLite DB is available",
                 );
+                if !job_is_final_repeat(job) {
+                    self.fail_repeat_group_surface(
+                        job,
+                        "repeat group stalled: carrying the shared SQLite DB to the next run \
+                         failed",
+                    )
+                    .await;
+                }
                 return;
             }
         };
         if !promoted {
+            if !job_is_final_repeat(job) {
+                self.fail_repeat_group_surface(
+                    job,
+                    "repeat group stalled: the completed run did not produce a SQLite DB to carry \
+                     forward",
+                )
+                .await;
+            }
             return;
         }
         match planner
@@ -1198,6 +1214,18 @@ impl JobDeps {
         );
         Ok(true)
     }
+
+    async fn fail_repeat_group_surface(&self, job: &RunnableJob, reason: &str) {
+        let store = build_store_or_local(self.config.as_ref());
+        let surface = build_report_surface(
+            self.gh.clone(),
+            self.jobs.clone(),
+            store,
+            self.slack.as_ref(),
+            job,
+        );
+        surface.failed(reason).await;
+    }
 }
 
 fn group_sqlite_key(artifact_prefix: &str) -> String {
@@ -1208,6 +1236,10 @@ fn job_should_carry_sqlite(job: &RunnableJob) -> bool {
     job.task_kind == TaskKind::Benchmark
         && job.build_target == BuildTarget::StacksBench
         && job.requested_run_count > 1
+}
+
+fn job_is_final_repeat(job: &RunnableJob) -> bool {
+    job.benchmark_run_index + 1 >= job.requested_run_count
 }
 
 fn sqlite_seed_key_for(job: &RunnableJob) -> Option<String> {
@@ -1227,13 +1259,13 @@ async fn run_worker<R: Recipe>(
     prepared_rx: oneshot::Receiver<Prepared>,
     events_tx: mpsc::Sender<WorkerEvent>,
     token: CancellationToken,
-) {
+) -> bool {
     // Wait for the reporter to finish `prepare` and hand us the resolved
     // commit. `Abort` (or a dropped sender) means prepare failed / the job
     // won't run — the reporter already handled any reporting, so we stop.
     let commit = match prepared_rx.await {
         Ok(Prepared::Run { commit }) => commit,
-        Ok(Prepared::Abort) | Err(_) => return,
+        Ok(Prepared::Abort) | Err(_) => return false,
     };
 
     let sink = ChannelSink::new(events_tx.clone());
@@ -1274,9 +1306,11 @@ async fn run_worker<R: Recipe>(
 
     // Send the terminal; dropping `events_tx` + the sink's clone afterwards
     // closes the channel, ending the reporter's drain loop.
+    let completed = matches!(terminal, Terminal::Completed { .. });
     let _ = events_tx
         .send(WorkerEvent::Finished(terminal))
         .await;
+    completed
 }
 
 /// Whether a queued job's `[reporting]` config wants a Check Run surface, so a
@@ -1426,6 +1460,7 @@ mod tests {
         appended: StdMutex<Vec<Uuid>>,
         pending: StdMutex<Vec<sbgh_core::db::jobs::PendingBenchmarkRun>>,
         details: StdMutex<HashMap<Uuid, serde_json::Value>>,
+        detail_calls: StdMutex<Vec<Uuid>>,
         resume_calls: std::sync::atomic::AtomicUsize,
         fail_append: std::sync::atomic::AtomicBool,
     }
@@ -1457,6 +1492,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(job_id, detail);
+        }
+
+        fn detail_calls(&self) -> Vec<Uuid> {
+            self.detail_calls
+                .lock()
+                .unwrap()
+                .clone()
         }
     }
 
@@ -1495,6 +1537,10 @@ mod tests {
             &self,
             job_id: Uuid,
         ) -> anyhow::Result<Option<serde_json::Value>> {
+            self.detail_calls
+                .lock()
+                .unwrap()
+                .push(job_id);
             Ok(self
                 .details
                 .lock()
@@ -1519,6 +1565,29 @@ mod tests {
             Ok(DriverOutcome {
                 status: DriverStatus::Completed,
                 summary: serde_json::json!({ "finish_reason": "test" }),
+            })
+        }
+
+        async fn cleanup_by_job_id(&self, _job_id: &str) -> bool {
+            true
+        }
+    }
+
+    struct FailedDriver;
+
+    #[async_trait]
+    impl Driver for FailedDriver {
+        async fn run_task(
+            &self,
+            _ctx: &TaskContext<'_>,
+            _spec: &TaskSpec,
+            _sink: &dyn EventSink,
+            _cancel: &CancellationToken,
+            _placement: &Placement,
+        ) -> anyhow::Result<DriverOutcome> {
+            Ok(DriverOutcome {
+                status: DriverStatus::Failed("bench failed".into()),
+                summary: serde_json::json!({ "finish_reason": "bench_failed" }),
             })
         }
 
@@ -1951,6 +2020,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_repeat_does_not_try_to_carry_or_append_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(test_config(&tmp));
+        let job = RunnableJob {
+            id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 2,
+            group_artifact_prefix: "group-failed".into(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(),
+            git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+            workload_key: None,
+            bench_args: vec![],
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            claim_token: Some(Uuid::new_v4()),
+        };
+        let source = Arc::new(FakeSource::new(job.clone()));
+        let planner = Arc::new(FakeRepeatPlanner::default());
+        let deps = JobDeps {
+            config,
+            jobs: source.clone(),
+            gh: Arc::new(FakeGitHub::new()),
+            driver: Arc::new(FailedDriver),
+            app_id: Arc::new(OnceCell::new()),
+            slack: None,
+            pin_manager: None,
+            repeat_planner: Some(planner.clone()),
+        };
+
+        deps.run(job, None, CancellationToken::new())
+            .await
+            .expect("a failed run is terminalized by the reporter");
+
+        assert_eq!(source.calls(), vec!["start_running", "fail"]);
+        assert!(
+            planner
+                .detail_calls()
+                .is_empty(),
+            "failed repeats must not enter carry-forward",
+        );
+        assert!(planner.appended().is_empty(), "failed repeats must not append the next run",);
+    }
+
+    #[tokio::test]
     async fn missing_carried_sqlite_blocks_next_repeat_append() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(test_config(&tmp));
@@ -1970,22 +2089,28 @@ mod tests {
             build_target: BuildTarget::StacksBench,
             workload_key: None,
             bench_args: vec![],
-            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            progress: ProgressTarget::Slack {
+                channel: "C1".into(),
+                message_ts: "REQ".into(),
+                plan_message_ts: Some("PLAN_TS".into()),
+            },
             claim_token: Some(Uuid::new_v4()),
         };
         let source = Arc::new(FakeSource::new(job.clone()));
+        assert!(!job_is_final_repeat(&job), "fixture must be an intermediate repeat");
         let planner = Arc::new(FakeRepeatPlanner::default());
         planner.set_completed_detail(
             job.id,
             serde_json::json!({ "sqlite_archived_path": "missing/appdata/stacks-bench.db" }),
         );
+        let slack = Arc::new(FakePositionSlack::default());
         let deps = JobDeps {
             config,
             jobs: source.clone(),
             gh: Arc::new(FakeGitHub::new()),
             driver: Arc::new(CompletedDriver),
             app_id: Arc::new(OnceCell::new()),
-            slack: None,
+            slack: Some(slack.clone()),
             pin_manager: None,
             repeat_planner: Some(planner.clone()),
         };
@@ -1995,7 +2120,36 @@ mod tests {
             .expect("missing carried DB is retryable and must not fail the completed run");
 
         assert_eq!(source.calls(), vec!["start_running", "complete"]);
+        assert_eq!(planner.detail_calls(), vec![job.id]);
         assert!(planner.appended().is_empty(), "next repeat waits for carried DB");
+        let stops = slack
+            .stops
+            .lock()
+            .unwrap()
+            .clone();
+        let updates = slack
+            .updates
+            .lock()
+            .unwrap()
+            .clone();
+        let appends = slack
+            .appends
+            .lock()
+            .unwrap()
+            .clone();
+        let rendered = stops
+            .iter()
+            .chain(updates.iter())
+            .chain(appends.iter())
+            .map(|(_, _, body)| body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("repeat group stalled"),
+            "carry-forward stall must update the shared Slack surface; stops={stops:?} \
+             updates={updates:?} appends={appends:?}",
+        );
+        assert!(rendered.contains("Clean Repeat Summary"), "{rendered}");
     }
 
     #[tokio::test]
@@ -3169,6 +3323,7 @@ mod tests {
     struct FakePositionSlack {
         updates: StdMutex<Vec<(String, String, String)>>, // (channel, ts, blocks-json)
         appends: StdMutex<Vec<(String, String, String)>>, // (channel, ts, chunks-json)
+        stops: StdMutex<Vec<(String, String, String)>>,   // (channel, ts, chunks+blocks-json)
     }
 
     #[async_trait]
@@ -3208,6 +3363,27 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((channel.into(), ts.into(), serde_json::to_string(chunks).unwrap()));
+            Ok(())
+        }
+        async fn stop_stream(
+            &self,
+            channel: &str,
+            ts: &str,
+            _markdown_text: Option<&str>,
+            chunks: &[crate::slack::stream::StreamChunk],
+            blocks: Option<&serde_json::Value>,
+        ) -> anyhow::Result<()> {
+            let rendered = format!(
+                "{} {}",
+                serde_json::to_string(chunks).unwrap(),
+                blocks
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_default(),
+            );
+            self.stops
+                .lock()
+                .unwrap()
+                .push((channel.into(), ts.into(), rendered));
             Ok(())
         }
         async fn add_reaction(&self, _c: &str, _t: &str, _r: &str) -> anyhow::Result<()> {
@@ -3310,6 +3486,41 @@ mod tests {
                 .len(),
             1,
             "an unchanged position makes no new edit",
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_skips_queue_position_for_appended_repeat_slack_runs() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+        let source = Arc::new(FakeSource::new(pr_job("unused", None)));
+        let mut repeat = slack_job(Some("PLAN_TS"));
+        repeat.benchmark_run_index = 1;
+        repeat.requested_run_count = 2;
+        source.set_queued(vec![repeat]);
+        let slack = Arc::new(FakePositionSlack::default());
+        let mut coord = position_coord_with_slack(config, source.clone(), slack.clone());
+
+        coord
+            .update_queue_positions()
+            .await;
+
+        assert!(
+            slack
+                .appends
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "later repeat runs inherit the group card but must not overwrite it with queue \
+             position",
+        );
+        assert!(
+            slack
+                .updates
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "no block fallback either",
         );
     }
 

@@ -145,17 +145,6 @@ impl SlackConnector {
                 .await;
             return;
         }
-        // TEMPORARY(v15 Phase 3/5): runtime chaining is wired, but group-level
-        // reporting still needs to suppress per-run card/comment/check fan-out.
-        if spec.clean_repetitions > 1 {
-            self.reject(
-                &event,
-                "clean repetitions are not fully enabled yet — please request one repetition for \
-                 now",
-            )
-            .await;
-            return;
-        }
         // 3. Enqueue an ad-hoc job. Default repo (target ids) + rev (`--rev` override,
         //    else the configured default); the parsed workload becomes `bench_args`;
         //    channel/message_ts ride along as reporting provenance.
@@ -299,6 +288,7 @@ impl SlackConnector {
             commit_url: None,
             job_id: &job_id_str,
             bench_args,
+            repeat: None,
             cached_build: None,
         };
         let card = card::queued_card(&ctx, None);
@@ -855,7 +845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_repetitions_above_one_are_gated_until_group_reporting_lands() {
+    async fn cache_enabled_clean_repetitions_above_one_enqueue_initial_run() {
         let store = Arc::new(InMemoryJobStore::new());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
@@ -866,26 +856,26 @@ mod tests {
             .handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 2"))
             .await;
 
-        assert!(store.all_jobs().is_empty(), "multi-run request must not enqueue yet");
+        let jobs = store.all_jobs();
+        assert_eq!(jobs.len(), 1, "multi-run requests enqueue run 0");
+        assert_eq!(jobs[0].benchmark_run_index, 0);
+        let queued = store
+            .queued_event(jobs[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap().0).unwrap();
+        let QueuedEventDetail::SlackAdhoc { clean_repetitions, .. } = detail else {
+            panic!("expected SlackAdhoc detail");
+        };
+        assert_eq!(clean_repetitions, 2);
         assert!(
-            client
+            !client
                 .reactions
                 .lock()
                 .unwrap()
                 .is_empty(),
-            "gated request must not get accepted reaction",
-        );
-        let eph = client
-            .ephemerals
-            .lock()
-            .unwrap();
-        assert_eq!(eph.len(), 1);
-        assert!(
-            eph[0]
-                .2
-                .contains("not fully enabled yet"),
-            "{}",
-            eph[0].2
+            "accepted request gets a reaction",
         );
     }
 

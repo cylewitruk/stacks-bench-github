@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::db::jobs::{
-    BaselineAnchor, BaselineMatch, BaselineSelection, CreatedJob, JobCompletion,
-    JobCreationOutcome, JobFailure, JobStore, PendingBenchmarkRun,
+    BaselineAnchor, BaselineMatch, BaselineSelection, BenchmarkRunMetric, CreatedJob,
+    JobCompletion, JobCreationOutcome, JobFailure, JobStore, PendingBenchmarkRun,
 };
 use crate::models::{
     BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, BenchmarkWorkflowStep, GithubPullRequestJob,
@@ -532,8 +532,31 @@ impl JobStore for InMemoryJobStore {
             remark: None,
             detail,
         };
+        let plan_event = s
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.job_id == prior.id && e.event_kind == JobEventKind::PlanMessageSent)
+            .cloned()
+            .map(|prior_event| JobEvent {
+                id: self
+                    .next_event_id
+                    .fetch_add(1, Ordering::SeqCst),
+                job_id: job.id,
+                event_kind: prior_event.event_kind,
+                event_status: prior_event.event_status,
+                occurred_at: now,
+                github_comment_id: None,
+                github_check_run_id: None,
+                github_check_run_url: None,
+                remark: prior_event.remark,
+                detail: prior_event.detail,
+            });
         s.insertion_order.push(job.id);
         s.events.push(event);
+        if let Some(plan_event) = plan_event {
+            s.events.push(plan_event);
+        }
         s.jobs
             .insert(job.id, job.clone());
         Ok(Some(job))
@@ -601,6 +624,29 @@ impl JobStore for InMemoryJobStore {
         }
         pending.sort_by_key(|p| p.completed_job_id);
         Ok(pending)
+    }
+
+    async fn benchmark_run_metrics(
+        &self,
+        benchmark_spec_id: Uuid,
+    ) -> Result<Vec<BenchmarkRunMetric>> {
+        let s = self.state.lock().unwrap();
+        let mut rows: Vec<_> = s
+            .jobs
+            .values()
+            .filter(|j| j.benchmark_spec_id == benchmark_spec_id)
+            .filter_map(|j| {
+                s.metrics
+                    .get(&j.id)
+                    .cloned()
+                    .map(|metric| BenchmarkRunMetric {
+                        benchmark_run_index: j.benchmark_run_index,
+                        metric,
+                    })
+            })
+            .collect();
+        rows.sort_by_key(|row| row.benchmark_run_index);
+        Ok(rows)
     }
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {

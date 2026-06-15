@@ -184,6 +184,10 @@ async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
         .create_unlinked_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)
         .await
         .unwrap();
+    store
+        .record_plan_message_ts(first.id, "1700000000.000200")
+        .await
+        .unwrap();
     sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
         .bind(first.id)
         .execute(&pool)
@@ -199,6 +203,15 @@ async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
     assert_eq!(second.benchmark_spec_id, first.benchmark_spec_id);
     assert_eq!(second.benchmark_run_index, 1);
     assert_eq!(second.status, JobStatus::Queued);
+    assert_eq!(
+        store
+            .latest_plan_message_ts(second.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1700000000.000200"),
+        "repeat run reuses the group's Slack card",
+    );
     assert!(
         store
             .append_next_benchmark_run(first.id)

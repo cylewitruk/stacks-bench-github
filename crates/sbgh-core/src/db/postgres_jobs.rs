@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::Result;
 use crate::db::Pool;
 use crate::db::jobs::{
-    BaselineAnchor, BaselineMatch, BaselineSelection, CreatedJob, JobCompletion,
-    JobCreationOutcome, JobFailure, JobStore, PendingBenchmarkRun,
+    BaselineAnchor, BaselineMatch, BaselineSelection, BenchmarkRunMetric, CreatedJob,
+    JobCompletion, JobCreationOutcome, JobFailure, JobStore, PendingBenchmarkRun,
 };
 use crate::models::{
     BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, GithubPullRequestJob, GithubUserJob,
@@ -173,6 +173,24 @@ impl PostgresJobStore {
         .execute(&mut **tx)
         .await?;
 
+        sqlx::query(
+            r#"
+            INSERT INTO job_event
+                (job_id, event_kind, event_status, github_comment_id,
+                 github_check_run_id, github_check_run_url, remark, detail)
+            SELECT $1, event_kind, event_status, NULL, NULL, NULL, remark, detail
+              FROM job_event
+             WHERE job_id = $2
+               AND event_kind = 'plan_message_sent'
+          ORDER BY occurred_at DESC, id DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(job.id)
+        .bind(prior.id)
+        .execute(&mut **tx)
+        .await?;
+
         Ok(job)
     }
 }
@@ -196,6 +214,22 @@ struct BaselineRow {
     committed_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sqlx(flatten)]
     metric: crate::models::JobMetric,
+}
+
+#[derive(sqlx::FromRow)]
+struct BenchmarkRunMetricRow {
+    benchmark_run_index: i32,
+    #[sqlx(flatten)]
+    metric: crate::models::JobMetric,
+}
+
+impl From<BenchmarkRunMetricRow> for BenchmarkRunMetric {
+    fn from(row: BenchmarkRunMetricRow) -> Self {
+        Self {
+            benchmark_run_index: row.benchmark_run_index,
+            metric: row.metric,
+        }
+    }
 }
 
 impl BaselineRow {
@@ -583,6 +617,33 @@ impl JobStore for PostgresJobStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    async fn benchmark_run_metrics(
+        &self,
+        benchmark_spec_id: Uuid,
+    ) -> Result<Vec<BenchmarkRunMetric>> {
+        let rows = sqlx::query_as::<_, BenchmarkRunMetricRow>(
+            r#"
+            SELECT j.benchmark_run_index,
+                   m.job_id, m.envelope_duration_us, m.replay_duration_us,
+                   m.total_duration_us, m.setup_duration_us, m.execution_duration_us,
+                   m.commit_duration_us, m.clarity_runtime, m.transactions,
+                   m.read_length, m.write_length, m.measured_blocks,
+                   m.warmup_blocks, m.created_at
+              FROM job j
+              JOIN job_metric m ON m.job_id = j.id
+             WHERE j.benchmark_spec_id = $1
+          ORDER BY j.benchmark_run_index ASC
+            "#,
+        )
+        .bind(benchmark_spec_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {

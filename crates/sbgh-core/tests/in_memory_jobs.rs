@@ -123,6 +123,10 @@ async fn in_memory_repeat_planner_appends_and_resumes_next_run() {
             .requested_run_count,
         2
     );
+    store
+        .record_plan_message_ts(first.id, "1700000000.000200")
+        .await
+        .unwrap();
 
     let token = Uuid::new_v4();
     let claimed = store
@@ -158,6 +162,15 @@ async fn in_memory_repeat_planner_appends_and_resumes_next_run() {
     assert_eq!(resumed[0].benchmark_spec_id, first.benchmark_spec_id);
     assert_eq!(resumed[0].benchmark_run_index, 1);
     assert_eq!(resumed[0].status, JobStatus::Queued);
+    assert_eq!(
+        store
+            .latest_plan_message_ts(resumed[0].id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1700000000.000200"),
+        "repeat run reuses the group's Slack card",
+    );
     assert!(
         store
             .resume_pending_benchmark_runs()

@@ -18,6 +18,7 @@
 
 use std::cmp::Ordering;
 
+use sbgh_core::models::JobMetric;
 use serde_json::{Value, json};
 
 use crate::bench_summary::{self, DB_LINK_TTL_HUMAN, PlanTaskStatus, RunResult};
@@ -47,9 +48,56 @@ pub struct CardRow {
 /// The completion-only results, appended below the plan on terminal success.
 pub struct Results<'a> {
     pub metrics: Option<&'a RunResult>,
+    pub repeat_summary: Option<&'a RepeatSummary>,
     /// Presigned `stacks-bench.db` URL — S3-only, **presence-gated by the
     /// caller** (a dead link is never offered).
     pub db_url: Option<&'a str>,
+}
+
+/// Current isolated-repeat position for a group-owned Slack card.
+#[derive(Debug, Clone, Copy)]
+pub struct RepeatContext {
+    /// Zero-based run index stored in `job.benchmark_run_index`.
+    pub index: i32,
+    pub total: i32,
+}
+
+impl RepeatContext {
+    fn label(self) -> Option<String> {
+        (self.total > 1).then(|| format!("repeat {}/{}", self.index + 1, self.total))
+    }
+}
+
+/// Aggregate over promoted per-run metrics for an isolated-repeat group.
+#[derive(Debug, Clone)]
+pub struct RepeatSummary {
+    pub requested: i32,
+    pub completed: usize,
+    pub stats: Option<RepeatStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepeatStats {
+    pub min_us: i64,
+    pub max_us: i64,
+    pub mean_us: f64,
+    pub stddev_us: f64,
+    pub cv_pct: f64,
+}
+
+impl RepeatSummary {
+    pub fn from_metrics(requested: i32, runs: &[JobMetric]) -> Self {
+        let values: Vec<i64> = runs
+            .iter()
+            .map(|run| run.execution_duration_us + run.commit_duration_us)
+            .collect();
+        let stats = repeat_stats(&values);
+        Self {
+            requested,
+            completed: runs.len(),
+            stats,
+        }
+    }
 }
 
 /// A full render of the Slack card: the `plan` timeline, plus — when `results`
@@ -82,6 +130,8 @@ pub struct CardCtx<'a> {
     /// Effective workload args for this job (Slack ad-hoc/user-tunable
     /// arguments). Used only for the compact context header above the plan.
     pub bench_args: &'a [String],
+    /// Isolated-repeat position when this job belongs to a multi-run group.
+    pub repeat: Option<RepeatContext>,
     /// Set when the Build phase was served from the binary cache (item 0025,
     /// v9) — the short fingerprint digest, surfaced as the Build row's
     /// subtext ("Reused cached build · …") instead of the plain "Built
@@ -204,6 +254,24 @@ pub fn queued_card<'a>(ctx: &'a CardCtx<'a>, detail: Option<&str>) -> Card<'a> {
     }
 }
 
+/// Current repeat has finished, but the group has more runs to enqueue. Keep
+/// the shared Slack surface alive; final result blocks are rendered only after
+/// the last repeat completes.
+pub fn repeat_finished_card<'a>(ctx: &'a CardCtx<'a>) -> Card<'a> {
+    let rows = (0..STAGES)
+        .map(|i| card_row(ctx, i, RowState::Done))
+        .collect();
+    Card {
+        title: title(ctx, false),
+        job_id: ctx.job_id,
+        rev: ctx.rev,
+        commit: ctx.commit,
+        bench_args: ctx.bench_args,
+        rows,
+        results: None,
+    }
+}
+
 /// The **completed** card: every row complete + the results table/button.
 #[cfg(test)]
 fn completed(ctx: &CardCtx, results: Results) -> Value {
@@ -309,8 +377,18 @@ fn row_source(ctx: &CardCtx, i: usize) -> Option<CardLink> {
 fn title(ctx: &CardCtx, terminal: bool) -> String {
     let verb = if terminal { "Benchmark" } else { "Benchmarking" };
     match ctx.commit {
-        Some(commit) => format!("{verb} {} @ {}", ctx.rev, short_commit(commit)),
-        None => format!("{verb} {}", ctx.rev),
+        Some(commit) => {
+            let base = format!("{verb} {} @ {}", ctx.rev, short_commit(commit));
+            with_repeat_label(base, ctx.repeat)
+        }
+        None => with_repeat_label(format!("{verb} {}", ctx.rev), ctx.repeat),
+    }
+}
+
+fn with_repeat_label(base: String, repeat: Option<RepeatContext>) -> String {
+    match repeat.and_then(RepeatContext::label) {
+        Some(label) => format!("{base} · {label}"),
+        None => base,
     }
 }
 
@@ -527,7 +605,8 @@ fn escape_mrkdwn(s: &str) -> String {
 /// `chat.stopStream`, where Slack renders final `blocks` below the streamed
 /// plan instead of replacing the plan itself.
 pub fn result_blocks(results: &Results) -> Vec<Value> {
-    let mut blocks = vec![json!({ "type": "divider" }), markdown_block(results.metrics)];
+    let mut blocks =
+        vec![json!({ "type": "divider" }), markdown_block(results.metrics, results.repeat_summary)];
     // The primary download button — only when an in-bucket DB link exists.
     if let Some(url) = results.db_url {
         blocks.push(json!({ "type": "divider" }));
@@ -611,20 +690,86 @@ fn to_task_status(s: PlanTaskStatus) -> slack_messaging::blocks::TaskStatus {
 
 /// The `markdown` results block — a heading + the shared GFM metric table (or a
 /// fallback note when no metrics parsed).
-fn markdown_block(metrics: Option<&RunResult>) -> Value {
-    json!({ "type": "markdown", "text": results_markdown(metrics) })
+fn markdown_block(metrics: Option<&RunResult>, repeat: Option<&RepeatSummary>) -> Value {
+    json!({ "type": "markdown", "text": results_markdown(metrics, repeat) })
 }
 
-fn results_markdown(metrics: Option<&RunResult>) -> String {
+fn results_markdown(metrics: Option<&RunResult>, repeat: Option<&RepeatSummary>) -> String {
     let table = metrics
         .map(bench_summary::metric_table)
         .unwrap_or_default();
+    if let Some(repeat) = repeat {
+        let mut out = repeat_markdown(repeat);
+        if !table.is_empty() {
+            out.push_str("\n\n### Last Run\n\n");
+            out.push_str(&table);
+        }
+        return out;
+    }
     if table.is_empty() {
         "## Benchmark Results\n\n_No parsed metrics — see the daemon archive for raw output._"
             .to_string()
     } else {
         format!("## Benchmark Results\n\n{table}")
     }
+}
+
+fn repeat_markdown(repeat: &RepeatSummary) -> String {
+    let mut out = String::from("## Clean Repeat Summary\n\n| Metric | Value |\n| ---- | ---- |\n");
+    out.push_str(&format!("| Samples | {} / {} |\n", repeat.completed, repeat.requested.max(0)));
+    if let Some(stats) = &repeat.stats {
+        out.push_str(&format!("| Execution+Commit mean | {} |\n", format_us(stats.mean_us)));
+        out.push_str(&format!("| Execution+Commit min | {} |\n", format_us(stats.min_us as f64)));
+        out.push_str(&format!("| Execution+Commit max | {} |\n", format_us(stats.max_us as f64)));
+        out.push_str(&format!("| Stddev | {} |\n", format_us(stats.stddev_us)));
+        out.push_str(&format!("| CV | {:.2}% |\n", stats.cv_pct));
+    } else {
+        out.push_str("| Execution+Commit | _No promoted metrics available_ |\n");
+    }
+    out
+}
+
+fn repeat_stats(values: &[i64]) -> Option<RepeatStats> {
+    let first = *values.first()?;
+    let (mut min_us, mut max_us) = (first, first);
+    let mut sum = 0.0;
+    for &v in values {
+        min_us = min_us.min(v);
+        max_us = max_us.max(v);
+        sum += v as f64;
+    }
+    let count = values.len() as f64;
+    let mean_us = sum / count;
+    let variance = if values.len() > 1 {
+        values
+            .iter()
+            .map(|v| {
+                let d = *v as f64 - mean_us;
+                d * d
+            })
+            .sum::<f64>()
+            / (count - 1.0)
+    } else {
+        0.0
+    };
+    let stddev_us = variance.sqrt();
+    let cv_pct = if mean_us > 0.0 { stddev_us / mean_us * 100.0 } else { 0.0 };
+    Some(RepeatStats {
+        min_us,
+        max_us,
+        mean_us,
+        stddev_us,
+        cv_pct,
+    })
+}
+
+fn format_us(us: f64) -> String {
+    format!("{} µs", format_float_count(us))
+}
+
+fn format_float_count(value: f64) -> String {
+    let rounded = value.round();
+    if rounded.is_finite() { format_count(&(rounded as i64).to_string()) } else { "0".to_string() }
 }
 
 /// The download `section`: a primary-styled URL button for the presigned DB.
@@ -764,6 +909,7 @@ mod tests {
             commit_url: Some("https://github.com/o/r/commit/c3b1aad4eeff"),
             job_id: "job-1",
             bench_args: &args,
+            repeat: None,
             cached_build: None,
         };
         let v = queued(&ctx, None);
@@ -790,6 +936,7 @@ mod tests {
         }
         card.results = Some(Results {
             metrics: Some(&r),
+            repeat_summary: None,
             db_url: Some("https://s3/stacks-bench.db"),
         });
 
@@ -826,6 +973,7 @@ mod tests {
         let mut card = live_card();
         card.results = Some(Results {
             metrics: Some(&r),
+            repeat_summary: None,
             db_url: None,
         });
         let v = render(&card);
@@ -900,7 +1048,7 @@ mod tests {
     /// table.
     #[test]
     fn results_markdown_falls_back_without_metrics() {
-        let md = results_markdown(None);
+        let md = results_markdown(None, None);
         assert!(md.starts_with("## Benchmark Results"), "{md}");
         assert!(md.contains("No parsed metrics"), "{md}");
         assert!(!md.contains("| Metric |"), "no empty table: {md}");
@@ -915,6 +1063,7 @@ mod tests {
             commit_url: Some("https://github.com/o/r/commit/56e9fcba1234"),
             job_id: "job-1",
             bench_args: &[],
+            repeat: None,
             cached_build: None,
         }
     }
@@ -929,6 +1078,7 @@ mod tests {
             commit_url: Some("https://github.com/o/r/commit/56e9fcba1234"),
             job_id: "job-1",
             bench_args: &[],
+            repeat: None,
             cached_build: Some("abc123def456"),
         };
         // Stage 2 (Run active) → the Build row is done.
@@ -977,6 +1127,7 @@ mod tests {
             &ctx(),
             Results {
                 metrics: Some(&r),
+                repeat_summary: None,
                 db_url: Some("https://s3/db"),
             },
         );
@@ -995,6 +1146,75 @@ mod tests {
         assert!(s.contains("Benchmark feat/stacks-bench @ 56e9fcba"), "terminal title: {s}");
         assert!(!s.contains("\"status\":\"in_progress\""), "all complete: {s}");
         assert!(s.contains("Download Profiler Data"), "{s}");
+    }
+
+    #[test]
+    fn repeat_context_updates_title_and_intermediate_card_has_no_results() {
+        let repeat_ctx = CardCtx {
+            rev: "sb-integration/3.4.0.0.3",
+            commit: Some("e07976949c88"),
+            commit_url: Some("https://github.com/o/r/commit/e07976949c88"),
+            job_id: "job-1",
+            bench_args: &[],
+            repeat: Some(RepeatContext { index: 1, total: 3 }),
+            cached_build: None,
+        };
+
+        let s = running(&repeat_ctx, 2).to_string();
+        assert!(s.contains("repeat 2/3"), "{s}");
+
+        let v = render(&repeat_finished_card(&repeat_ctx));
+        let blocks = v.as_array().unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "markdown")
+                .count(),
+            0,
+            "{v}"
+        );
+        assert!(
+            v.to_string()
+                .contains("repeat 2/3"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn repeat_summary_renders_aggregate_before_last_run_metrics() {
+        fn metric(job_id: u128, exec: i64, commit: i64) -> JobMetric {
+            JobMetric {
+                job_id: uuid::Uuid::from_u128(job_id),
+                envelope_duration_us: 0,
+                replay_duration_us: 0,
+                total_duration_us: exec + commit,
+                setup_duration_us: 0,
+                execution_duration_us: exec,
+                commit_duration_us: commit,
+                clarity_runtime: 0,
+                transactions: 1,
+                read_length: 0,
+                write_length: 0,
+                measured_blocks: 1,
+                warmup_blocks: 0,
+                created_at: chrono::Utc::now(),
+            }
+        }
+
+        let r = run_result();
+        let summary = RepeatSummary::from_metrics(
+            3,
+            &[metric(1, 1_000, 100), metric(2, 1_200, 200), metric(3, 1_300, 300)],
+        );
+        let md = results_markdown(Some(&r), Some(&summary));
+        assert!(md.contains("## Clean Repeat Summary"), "{md}");
+        assert!(md.contains("| Samples | 3 / 3 |"), "{md}");
+        assert!(md.contains("| Execution+Commit mean | 1,367 µs |"), "{md}");
+        assert!(md.contains("| Execution+Commit min | 1,100 µs |"), "{md}");
+        assert!(md.contains("| Execution+Commit max | 1,600 µs |"), "{md}");
+        assert!(md.contains("| CV |"), "{md}");
+        assert!(md.contains("### Last Run"), "{md}");
+        assert!(md.contains("| Metric | Value |"), "{md}");
     }
 
     /// `failed(stage)` marks the errored row, earlier complete, later pending.
@@ -1027,6 +1247,7 @@ mod tests {
             commit_url: None,
             job_id: "j",
             bench_args: &[],
+            repeat: None,
             cached_build: None,
         };
         let s = running(&pre, 0).to_string();
@@ -1045,6 +1266,7 @@ mod tests {
             commit_url: None,
             job_id: "j",
             bench_args: &[],
+            repeat: None,
             cached_build: None,
         };
         let v = queued(&pre, Some("position 3/5, waiting 15m"));
@@ -1072,6 +1294,7 @@ mod tests {
             commit_url: None,
             job_id: "j",
             bench_args: &[],
+            repeat: None,
             cached_build: None,
         };
         let s = queued(&pre, None).to_string();

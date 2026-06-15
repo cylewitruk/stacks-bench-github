@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use crate::bench_summary::RunResult;
 use crate::job_source::{RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
-use crate::slack::card::{self, CardCtx, Results, STAGES, TASK_IDS};
+use crate::slack::card::{self, CardCtx, RepeatContext, RepeatSummary, Results, STAGES, TASK_IDS};
 use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
 use crate::slack::stream::{
     StreamChunk, StreamFailure, StreamTaskStatus, TaskUpdate, chunks_for_card,
@@ -195,11 +195,57 @@ impl SlackTimeline {
         self.advance(2).await;
     }
 
+    pub fn is_repeat_group(&self) -> bool {
+        self.job.requested_run_count > 1
+    }
+
+    pub fn is_final_repeat(&self) -> bool {
+        self.job.benchmark_run_index + 1 >= self.job.requested_run_count
+    }
+
+    pub fn benchmark_spec_id(&self) -> uuid::Uuid {
+        self.job.benchmark_spec_id
+    }
+
+    pub fn requested_run_count(&self) -> i32 {
+        self.job.requested_run_count
+    }
+
+    pub fn group_artifact_prefix(&self) -> &str {
+        &self.job.group_artifact_prefix
+    }
+
+    /// One repeat finished successfully, but the group still has more runs.
+    /// Keep the shared plan alive and leave the request reaction as ⏳; the
+    /// final repeat owns `chat.stopStream`, result blocks, and ✅.
+    pub async fn repeat_completed(&self) {
+        let (blocks, chunks, fallback) = {
+            let mut st = self.state.lock().await;
+            self.finish_stage_locked(&mut st);
+            st.stage = STAGES;
+            st.last_stream_update_at = Instant::now();
+            let ctx = self.ctx();
+            let mut card = card::repeat_finished_card(&ctx);
+            self.apply_timing(&mut card, &st);
+            let blocks = card::render(&card);
+            let chunks = terminal_chunks_for_card(&card);
+            (blocks, chunks, card.title)
+        };
+        self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
+            .await;
+    }
+
     /// Terminal success: all rows complete, the results table + download button
     /// beneath the plan; swap ⏳ → ✅.
-    pub async fn completed(&self, result: Option<RunResult>, db_url: Option<String>) {
+    pub async fn completed(
+        &self,
+        result: Option<RunResult>,
+        db_url: Option<String>,
+        repeat_summary: Option<RepeatSummary>,
+    ) {
         let results = Results {
             metrics: result.as_ref(),
+            repeat_summary: repeat_summary.as_ref(),
             db_url: db_url.as_deref(),
         };
         let (blocks, chunks, result_blocks, fallback) = {
@@ -228,30 +274,71 @@ impl SlackTimeline {
     /// Terminal failure: the current row → error (carrying the message),
     /// earlier rows complete, later rows pending; swap ⏳ → ❌.
     pub async fn failed(&self, error: &str) {
-        self.terminate_error(&format!("Failed: {error}"))
+        self.failed_with_results(error, None, None)
+            .await;
+    }
+
+    /// Terminal failure with partial repeat results rendered beneath the plan.
+    pub async fn failed_with_results(
+        &self,
+        error: &str,
+        repeat_summary: Option<RepeatSummary>,
+        db_url: Option<String>,
+    ) {
+        self.terminate_error(&format!("Failed: {error}"), repeat_summary, db_url)
             .await;
     }
 
     /// Terminal cancellation: like [`failed`](Self::failed) but a cancel note.
     pub async fn cancelled(&self, reason: &str) {
-        self.terminate_error(&format!(
-            "Cancelled: {reason}. Re-run by mentioning me with a new `bench …` request."
-        ))
+        self.cancelled_with_results(reason, None, None)
+            .await;
+    }
+
+    /// Terminal cancellation with partial repeat results rendered beneath the
+    /// plan.
+    pub async fn cancelled_with_results(
+        &self,
+        reason: &str,
+        repeat_summary: Option<RepeatSummary>,
+        db_url: Option<String>,
+    ) {
+        self.terminate_error(
+            &format!("Cancelled: {reason}. Re-run by mentioning me with a new `bench …` request."),
+            repeat_summary,
+            db_url,
+        )
         .await;
     }
 
-    async fn terminate_error(&self, message: &str) {
-        let (blocks, chunks, fallback) = {
+    async fn terminate_error(
+        &self,
+        message: &str,
+        repeat_summary: Option<RepeatSummary>,
+        db_url: Option<String>,
+    ) {
+        let results = (repeat_summary.is_some() || db_url.is_some()).then_some(Results {
+            metrics: None,
+            repeat_summary: repeat_summary.as_ref(),
+            db_url: db_url.as_deref(),
+        });
+        let (blocks, chunks, result_blocks, fallback) = {
             let st = self.state.lock().await;
             let stage = st.stage.min(STAGES - 1);
             let ctx = self.ctx();
             let mut card = card::failed_card(&ctx, stage, message);
+            card.results = results;
             self.apply_timing(&mut card, &st);
             let blocks = card::render(&card);
             let chunks = terminal_chunks_for_card(&card);
-            (blocks, chunks, card.title)
+            let result_blocks = card
+                .results
+                .as_ref()
+                .map(card::result_blocks)
+                .map(serde_json::Value::Array);
+            (blocks, chunks, result_blocks, card.title)
         };
-        self.finish_stream_or_blocks(&blocks, &chunks, Some(&fallback), None)
+        self.finish_stream_or_blocks(&blocks, &chunks, Some(&fallback), result_blocks.as_ref())
             .await;
         self.swap_reaction(FAILED_REACTION)
             .await;
@@ -267,6 +354,10 @@ impl SlackTimeline {
             commit_url: Some(&self.commit_url),
             job_id: &self.job_id,
             bench_args: &self.job.bench_args,
+            repeat: (self.job.requested_run_count > 1).then_some(RepeatContext {
+                index: self.job.benchmark_run_index,
+                total: self.job.requested_run_count,
+            }),
             cached_build: self
                 .cached_build
                 .get()
@@ -777,6 +868,17 @@ mod tests {
         SlackTimeline::new(slack, store, job(), "C1".into(), "REQ_TS".into(), resume_ts)
     }
 
+    fn repeat_timeline(
+        slack: Arc<FakeSlack>,
+        store: Arc<RecordingStore>,
+        resume_ts: Option<String>,
+    ) -> SlackTimeline {
+        let mut job = job();
+        job.benchmark_run_index = 0;
+        job.requested_run_count = 2;
+        SlackTimeline::new(slack, store, job, "C1".into(), "REQ_TS".into(), resume_ts)
+    }
+
     #[tokio::test]
     async fn started_posts_four_row_plan_and_persists_its_ts() {
         let slack = Arc::new(FakeSlack::default());
@@ -820,7 +922,7 @@ mod tests {
         tl.started().await; // append (Build in_progress)
         tl.advance(2).await; // update (Run in_progress)
         tl.advance(1).await; // monotonic: no-op (earlier stage)
-        tl.completed(None, Some("https://s3/stacks-bench.db".into()))
+        tl.completed(None, Some("https://s3/stacks-bench.db".into()), None)
             .await; // update (all complete + results)
 
         assert_eq!(
@@ -903,7 +1005,7 @@ mod tests {
         let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
 
         tl.started().await;
-        tl.completed(None, Some("https://s3/stacks-bench.db".into()))
+        tl.completed(None, Some("https://s3/stacks-bench.db".into()), None)
             .await;
 
         assert!(
@@ -926,6 +1028,41 @@ mod tests {
         assert!(stops[0].contains("Download Profiler Data"), "{}", stops[0]);
         assert_eq!(*slack.removed.lock().unwrap(), vec![QUEUED_REACTION.to_string()]);
         assert_eq!(*slack.added.lock().unwrap(), vec![COMPLETED_REACTION.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn repeat_completion_keeps_stream_open_for_next_run() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let tl = repeat_timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
+
+        tl.started().await;
+        tl.repeat_completed().await;
+
+        assert!(
+            slack
+                .stops
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "intermediate repeat must not stop the shared stream",
+        );
+        assert!(
+            slack
+                .added
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "intermediate repeat must not add the terminal reaction",
+        );
+        let appends = slack.appends.lock().unwrap();
+        assert_eq!(appends.len(), 2, "started + repeat-complete updates");
+        assert!(appends[1].contains("repeat 1/2"), "{}", appends[1]);
+        assert!(
+            !appends[1].contains("\"type\":\"markdown\""),
+            "no result blocks before final repeat: {}",
+            appends[1],
+        );
     }
 
     #[tokio::test]

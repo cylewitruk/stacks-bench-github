@@ -25,12 +25,13 @@ use sbgh_core::github::{
 };
 use tokio::sync::Mutex;
 
-use crate::artifact_store::ArtifactStore;
+use crate::artifact_store::{ArtifactStore, GROUP_SQLITE_RELATIVE, group_artifact_key};
 use crate::bench_summary::{self, RunResult};
 use crate::comparison::BaselineComparison;
 use crate::events::PhaseLabel;
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
+use crate::slack::card::RepeatSummary;
 use crate::slack::client::SlackClient;
 use crate::slack::timeline::{SlackTimeline, stage_for_phase};
 
@@ -92,12 +93,13 @@ pub fn build_report_surface(
         ) => Box::new(SlackReportSurface::new(
             SlackTimeline::new(
                 client.clone(),
-                jobs,
+                jobs.clone(),
                 job.clone(),
                 channel.clone(),
                 message_ts.clone(),
                 plan_message_ts.clone(),
             ),
+            jobs,
             store,
         )),
         (ProgressTarget::Slack { .. }, None) => Box::new(NoopReportSurface),
@@ -402,12 +404,17 @@ impl ReportSurface for GitHubReportSurface {
 /// the metrics + DB link in `completed`.
 pub struct SlackReportSurface {
     timeline: SlackTimeline,
+    jobs: Arc<dyn RunnableJobStore>,
     store: Arc<dyn ArtifactStore>,
 }
 
 impl SlackReportSurface {
-    pub fn new(timeline: SlackTimeline, store: Arc<dyn ArtifactStore>) -> Self {
-        Self { timeline, store }
+    pub fn new(
+        timeline: SlackTimeline,
+        jobs: Arc<dyn RunnableJobStore>,
+        store: Arc<dyn ArtifactStore>,
+    ) -> Self {
+        Self { timeline, jobs, store }
     }
 }
 
@@ -451,24 +458,137 @@ impl ReportSurface for SlackReportSurface {
     ) {
         // Ad-hoc Slack runs aren't PRs → no vs-baseline. Metrics + the presigned
         // DB link (S3 + in-bucket only) are resolved here, then handed to the card.
+        if self
+            .timeline
+            .is_repeat_group()
+            && !self
+                .timeline
+                .is_final_repeat()
+        {
+            self.timeline
+                .repeat_completed()
+                .await;
+            return;
+        }
         let result = parsed_run(self.store.as_ref(), summary).await;
-        let db_url = signed_db_url(self.store.as_ref(), summary).await;
+        let repeat_summary = if self
+            .timeline
+            .is_repeat_group()
+        {
+            self.repeat_summary().await
+        } else {
+            None
+        };
+        let db_url = if self
+            .timeline
+            .is_repeat_group()
+            && !self
+                .timeline
+                .is_final_repeat()
+        {
+            signed_group_db_url(
+                self.store.as_ref(),
+                self.timeline
+                    .group_artifact_prefix(),
+            )
+            .await
+        } else if self
+            .timeline
+            .is_repeat_group()
+        {
+            // The final run's job-scoped DB has already been seeded from the
+            // group DB and appended to by stacks-bench, while the runner's
+            // final promotion to the group namespace happens after reporting.
+            match signed_db_url(self.store.as_ref(), summary).await {
+                Some(url) => Some(url),
+                None => {
+                    signed_group_db_url(
+                        self.store.as_ref(),
+                        self.timeline
+                            .group_artifact_prefix(),
+                    )
+                    .await
+                }
+            }
+        } else {
+            signed_db_url(self.store.as_ref(), summary).await
+        };
         self.timeline
-            .completed(result, db_url)
+            .completed(result, db_url, repeat_summary)
             .await;
     }
 
     async fn failed(&self, error: &str) {
         let snippet = short_pr_error(error);
+        if self
+            .timeline
+            .is_repeat_group()
+        {
+            let (repeat_summary, db_url) = self.repeat_payload().await;
+            self.timeline
+                .failed_with_results(&snippet, repeat_summary, db_url)
+                .await;
+            return;
+        }
         self.timeline
             .failed(&snippet)
             .await;
     }
 
     async fn cancelled(&self, reason: &str) {
+        if self
+            .timeline
+            .is_repeat_group()
+        {
+            let (repeat_summary, db_url) = self.repeat_payload().await;
+            self.timeline
+                .cancelled_with_results(reason, repeat_summary, db_url)
+                .await;
+            return;
+        }
         self.timeline
             .cancelled(reason)
             .await;
+    }
+}
+
+impl SlackReportSurface {
+    async fn repeat_payload(&self) -> (Option<RepeatSummary>, Option<String>) {
+        let repeat_summary = self.repeat_summary().await;
+        let db_url = signed_group_db_url(
+            self.store.as_ref(),
+            self.timeline
+                .group_artifact_prefix(),
+        )
+        .await;
+        (repeat_summary, db_url)
+    }
+
+    async fn repeat_summary(&self) -> Option<RepeatSummary> {
+        match self
+            .jobs
+            .benchmark_run_metrics(
+                self.timeline
+                    .benchmark_spec_id(),
+            )
+            .await
+        {
+            Ok(metrics) => {
+                let metrics: Vec<_> = metrics
+                    .into_iter()
+                    .map(|run| run.metric)
+                    .collect();
+                Some(RepeatSummary::from_metrics(
+                    self.timeline
+                        .requested_run_count(),
+                    &metrics,
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "slack: loading repeat metrics failed");
+                None
+            }
+        }
     }
 }
 
@@ -515,6 +635,13 @@ async fn signed_db_url(store: &dyn ArtifactStore, summary: &serde_json::Value) -
         .and_then(|v| v.as_str())?;
     store
         .signed_url_if_fetchable(key, DB_LINK_TTL)
+        .await
+}
+
+async fn signed_group_db_url(store: &dyn ArtifactStore, group_prefix: &str) -> Option<String> {
+    let key = group_artifact_key(group_prefix, GROUP_SQLITE_RELATIVE);
+    store
+        .signed_url_if_fetchable(&key, DB_LINK_TTL)
         .await
 }
 
@@ -575,9 +702,10 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use sbgh_core::db::BenchmarkRunMetric;
     use sbgh_core::github::test_support::{FakeCall, FakeGitHub};
     use sbgh_core::github::{CheckRunConclusion, CheckRunState};
-    use sbgh_core::models::{GitRefKind, ResolvedCommit};
+    use sbgh_core::models::{GitRefKind, JobMetric, ResolvedCommit};
     use uuid::Uuid;
 
     use super::*;
@@ -771,6 +899,7 @@ mod tests {
     struct FakeSlack {
         posts: StdMutex<usize>,
         updates: StdMutex<usize>,
+        update_blocks: StdMutex<Vec<String>>,
         added: StdMutex<Vec<String>>,
     }
 
@@ -797,6 +926,10 @@ mod tests {
             _f: &str,
         ) -> anyhow::Result<()> {
             *self.updates.lock().unwrap() += 1;
+            self.update_blocks
+                .lock()
+                .unwrap()
+                .push(_b.to_string());
             Ok(())
         }
         async fn add_reaction(&self, _c: &str, _ts: &str, r: &str) -> anyhow::Result<()> {
@@ -815,6 +948,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingStore {
         persisted: StdMutex<Vec<String>>,
+        metrics: StdMutex<Vec<BenchmarkRunMetric>>,
+    }
+
+    impl RecordingStore {
+        fn with_metrics(metrics: Vec<BenchmarkRunMetric>) -> Self {
+            Self {
+                persisted: StdMutex::new(Vec::new()),
+                metrics: StdMutex::new(metrics),
+            }
+        }
     }
 
     #[async_trait]
@@ -857,6 +1000,16 @@ mod tests {
         ) -> anyhow::Result<Option<BaselineRef>> {
             Ok(None)
         }
+        async fn benchmark_run_metrics(
+            &self,
+            _benchmark_spec_id: Uuid,
+        ) -> anyhow::Result<Vec<BenchmarkRunMetric>> {
+            Ok(self
+                .metrics
+                .lock()
+                .unwrap()
+                .clone())
+        }
         async fn fail(
             &self,
             _j: &RunnableJob,
@@ -893,6 +1046,39 @@ mod tests {
             message_ts: "REQ".into(),
             plan_message_ts: None,
         })
+    }
+
+    fn repeat_slack_job() -> RunnableJob {
+        let mut job = job_with(ProgressTarget::Slack {
+            channel: "C1".into(),
+            message_ts: "REQ".into(),
+            plan_message_ts: Some("PLAN_TS".into()),
+        });
+        job.benchmark_run_index = 1;
+        job.requested_run_count = 3;
+        job
+    }
+
+    fn metric(job_id: u128, exec: i64, commit: i64) -> BenchmarkRunMetric {
+        BenchmarkRunMetric {
+            benchmark_run_index: job_id as i32,
+            metric: JobMetric {
+                job_id: Uuid::from_u128(job_id),
+                envelope_duration_us: 0,
+                replay_duration_us: 0,
+                total_duration_us: exec + commit,
+                setup_duration_us: 0,
+                execution_duration_us: exec,
+                commit_duration_us: commit,
+                clarity_runtime: 0,
+                transactions: 1,
+                read_length: 0,
+                write_length: 0,
+                measured_blocks: 1,
+                warmup_blocks: 0,
+                created_at: chrono::Utc::now(),
+            },
+        }
     }
 
     /// The Slack surface delegates the lifecycle to the timeline. This fake
@@ -946,6 +1132,45 @@ mod tests {
                 .unwrap(),
             vec![COMPLETED_REACTION.to_string()],
             "⏳ swapped to ✅",
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_repeat_failure_renders_partial_aggregate() {
+        let recording = Arc::new(FakeSlack::default());
+        let slack = recording.clone() as Arc<dyn SlackClient>;
+        let jobs: Arc<dyn RunnableJobStore> = Arc::new(RecordingStore::with_metrics(vec![
+            metric(1, 1_000, 100),
+            metric(2, 1_200, 200),
+        ]));
+        let surface = build_report_surface(
+            Arc::new(FakeGitHub::new()),
+            jobs,
+            store(),
+            Some(&slack),
+            &repeat_slack_job(),
+        );
+
+        surface
+            .failed("bench VM stopped")
+            .await;
+
+        let updates = recording
+            .update_blocks
+            .lock()
+            .unwrap();
+        let rendered = updates
+            .last()
+            .expect("failed repeat updates the shared card");
+        assert!(rendered.contains("Clean Repeat Summary"), "{rendered}");
+        assert!(rendered.contains("2 / 3"), "{rendered}");
+        assert!(rendered.contains("Failed: bench VM stopped"), "{rendered}");
+        assert_eq!(
+            *recording
+                .added
+                .lock()
+                .unwrap(),
+            vec![crate::slack::client::FAILED_REACTION.to_string()],
         );
     }
 
