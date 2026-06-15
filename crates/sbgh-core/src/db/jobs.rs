@@ -36,9 +36,9 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::models::{
-    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
-    JobEventKind, JobEventStatus, JobMetric, JobResult, NewJob, NewJobEvent, ResolvedCommit,
-    TerminalJobStatus,
+    BenchmarkGroup, BenchmarkSpec, GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job,
+    JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJob,
+    NewJobEvent, ResolvedCommit, TerminalJobStatus,
 };
 
 /// Slice 10: atomic "the run completed" write. Bundles the terminal
@@ -142,6 +142,19 @@ pub struct BaselineMatch {
     pub anchor: BaselineAnchor,
 }
 
+/// v15 Phase 4: a completed repeat run whose next run still needs to be
+/// materialized. The runner uses this to carry the group SQLite artifact
+/// before calling [`JobStore::append_next_benchmark_run`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PendingBenchmarkRun {
+    pub completed_job_id: Uuid,
+    pub benchmark_group_id: Uuid,
+    pub benchmark_spec_id: Uuid,
+    pub benchmark_run_index: i32,
+    pub requested_run_count: i32,
+    pub artifact_prefix: String,
+}
+
 #[async_trait]
 pub trait JobStore: Send + Sync + 'static {
     async fn insert_job(&self, new: &NewJob) -> Result<Job>;
@@ -187,6 +200,15 @@ pub trait JobStore: Send + Sync + 'static {
     ) -> Result<Job>;
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>>;
+
+    async fn lookup_benchmark_group(&self, group_id: Uuid) -> Result<Option<BenchmarkGroup>>;
+
+    async fn lookup_benchmark_spec(&self, spec_id: Uuid) -> Result<Option<BenchmarkSpec>>;
+
+    /// The terminal completed event detail for `job_id`, if the run completed.
+    /// Failed/cancelled runs intentionally return `None`, which stops a repeat
+    /// chain loudly via terminal state rather than carrying stale artifacts.
+    async fn completed_event_detail(&self, job_id: Uuid) -> Result<Option<serde_json::Value>>;
 
     /// `FOR UPDATE SKIP LOCKED` on the queued partial index; transitions
     /// queued → claimed and stamps `(claim_token, claimed_at)`. Returns
@@ -428,6 +450,12 @@ pub trait JobStore: Send + Sync + 'static {
     /// whose latest run completed, whose requested count is not yet satisfied,
     /// and that have no active run, then appends one next run per spec.
     async fn resume_pending_benchmark_runs(&self) -> Result<Vec<Job>>;
+
+    /// v15 Phase 4: completed repeat runs ready for carry-forward + append.
+    /// This is the read half of [`resume_pending_benchmark_runs`], split out
+    /// so daemon startup can promote the archived SQLite DB before appending
+    /// the next run.
+    async fn pending_completed_benchmark_runs(&self) -> Result<Vec<PendingBenchmarkRun>>;
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 

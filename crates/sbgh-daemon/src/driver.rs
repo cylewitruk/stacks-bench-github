@@ -37,6 +37,10 @@ pub struct TaskSpec {
     /// to the cache, then stop (no in-VM task phase). `false` is the
     /// benchmark shape; `true` is the `0031` warming primitive.
     pub build_only: bool,
+    /// Optional group-scoped SQLite DB artifact to seed into the results tmpfs
+    /// before the in-VM task starts. Used by v15 clean repetitions; ordinary
+    /// singleton runs leave this unset.
+    pub sqlite_seed_key: Option<String>,
 }
 
 /// A backend-interpreted placement hint. Today the only knob is CPU pinning

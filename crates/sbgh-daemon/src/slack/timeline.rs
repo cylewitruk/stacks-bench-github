@@ -746,6 +746,11 @@ mod tests {
     fn job() -> RunnableJob {
         RunnableJob {
             id: Uuid::nil(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 1,
+            group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
             commit: "abcdef1234567890".into(),
             git_ref_display: "develop".into(),

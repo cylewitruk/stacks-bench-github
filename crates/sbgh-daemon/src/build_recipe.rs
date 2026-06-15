@@ -63,6 +63,7 @@ impl Recipe for BuildOnlyRecipe {
         let spec = TaskSpec {
             args: Vec::new(),
             build_only: true,
+            sqlite_seed_key: None,
         };
         let placement = Placement {
             vcpu_cpuset: self.vcpu_cpuset.clone(),

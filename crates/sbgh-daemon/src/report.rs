@@ -592,6 +592,11 @@ mod tests {
     fn job_with(progress: ProgressTarget) -> RunnableJob {
         RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 1,
+            group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(),
             git_ref_display: "develop".into(),

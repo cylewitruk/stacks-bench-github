@@ -25,7 +25,7 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::artifact_store::build_store_or_local;
+use crate::artifact_store::{build_store_or_local, group_artifact_key};
 use crate::bench_recipe::BenchRecipe;
 use crate::build_recipe::BuildOnlyRecipe;
 use crate::driver::Driver;
@@ -43,6 +43,9 @@ use crate::slack::stream::chunks_for_card;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Group-scoped SQLite DB carried between isolated repeat VMs.
+const GROUP_SQLITE_RELATIVE: &str = "shared/stacks-bench.db";
 
 /// Lease after which a job stranded in `claimed` (claimed but never
 /// transitioned to `running` — daemon crashed or preflight errored
@@ -74,7 +77,13 @@ trait RepeatRunPlanner: Send + Sync + 'static {
         &self,
         completed_job_id: Uuid,
     ) -> anyhow::Result<Option<sbgh_core::models::Job>>;
-    async fn resume_pending_benchmark_runs(&self) -> anyhow::Result<Vec<sbgh_core::models::Job>>;
+    async fn pending_completed_benchmark_runs(
+        &self,
+    ) -> anyhow::Result<Vec<sbgh_core::db::jobs::PendingBenchmarkRun>>;
+    async fn completed_event_detail(
+        &self,
+        job_id: Uuid,
+    ) -> anyhow::Result<Option<serde_json::Value>>;
 }
 
 struct JobStoreRepeatRunPlanner {
@@ -93,9 +102,21 @@ impl RepeatRunPlanner for JobStoreRepeatRunPlanner {
             .map_err(Into::into)
     }
 
-    async fn resume_pending_benchmark_runs(&self) -> anyhow::Result<Vec<sbgh_core::models::Job>> {
+    async fn pending_completed_benchmark_runs(
+        &self,
+    ) -> anyhow::Result<Vec<sbgh_core::db::jobs::PendingBenchmarkRun>> {
         self.jobs
-            .resume_pending_benchmark_runs()
+            .pending_completed_benchmark_runs()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn completed_event_detail(
+        &self,
+        job_id: Uuid,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.jobs
+            .completed_event_detail(job_id)
             .await
             .map_err(Into::into)
     }
@@ -452,15 +473,74 @@ impl Coordinator {
             return;
         };
         match planner
-            .resume_pending_benchmark_runs()
+            .pending_completed_benchmark_runs()
             .await
         {
-            Ok(jobs) if jobs.is_empty() => {}
-            Ok(jobs) => {
-                tracing::info!(
-                    enqueued = jobs.len(),
-                    "repeat planner: resumed pending benchmark runs"
-                );
+            Ok(pending) if pending.is_empty() => {}
+            Ok(pending) => {
+                let mut enqueued = 0usize;
+                for item in pending {
+                    let completed_job_id = item.completed_job_id;
+                    let promoted = match self
+                        .deps
+                        .promote_completed_repeat_sqlite(
+                            completed_job_id,
+                            &item.artifact_prefix,
+                            "repeat planner: startup carry-forward failed",
+                        )
+                        .await
+                    {
+                        Ok(promoted) => promoted,
+                        Err(e) => {
+                            tracing::warn!(
+                                completed_job_id = %completed_job_id,
+                                benchmark_group_id = %item.benchmark_group_id,
+                                benchmark_spec_id = %item.benchmark_spec_id,
+                                benchmark_run_index = item.benchmark_run_index,
+                                requested_run_count = item.requested_run_count,
+                                error = ?e,
+                                "repeat planner: startup resume skipped pending run",
+                            );
+                            continue;
+                        }
+                    };
+                    if !promoted {
+                        tracing::warn!(
+                            completed_job_id = %completed_job_id,
+                            benchmark_group_id = %item.benchmark_group_id,
+                            benchmark_spec_id = %item.benchmark_spec_id,
+                            benchmark_run_index = item.benchmark_run_index,
+                            requested_run_count = item.requested_run_count,
+                            "repeat planner: startup resume found completed run without detail",
+                        );
+                        continue;
+                    }
+                    match planner
+                        .append_next_benchmark_run(completed_job_id)
+                        .await
+                    {
+                        Ok(Some(job)) => {
+                            enqueued += 1;
+                            tracing::info!(
+                                completed_job_id = %completed_job_id,
+                                next_job_id = %job.id,
+                                benchmark_run_index = job.benchmark_run_index,
+                                "repeat planner: resumed pending benchmark run",
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                completed_job_id = %completed_job_id,
+                                error = ?e,
+                                "repeat planner: startup append failed; will retry on next daemon start",
+                            );
+                        }
+                    }
+                }
+                if enqueued > 0 {
+                    tracing::info!(enqueued, "repeat planner: resumed pending benchmark runs");
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -936,6 +1016,10 @@ impl JobDeps {
             },
             task_kind = ?job.task_kind,
             build_target = ?job.build_target,
+            benchmark_group_id = %job.benchmark_group_id,
+            benchmark_spec_id = %job.benchmark_spec_id,
+            benchmark_run_index = job.benchmark_run_index,
+            requested_run_count = job.requested_run_count,
             "claimed job; starting",
         );
 
@@ -966,7 +1050,12 @@ impl JobDeps {
         let driver = self.driver.clone();
         match (job.task_kind, job.build_target) {
             (TaskKind::Benchmark, BuildTarget::StacksBench) => {
-                let recipe = BenchRecipe::new(driver, job.bench_args.clone(), vcpu_cpuset);
+                let recipe = BenchRecipe::new(
+                    driver,
+                    job.bench_args.clone(),
+                    vcpu_cpuset,
+                    sqlite_seed_key_for(&job),
+                );
                 run_worker(&recipe, &job, prepared_rx, events_tx, token).await;
             }
             (TaskKind::BuildOnly, BuildTarget::StacksBench) => {
@@ -998,7 +1087,7 @@ impl JobDeps {
         };
 
         if reporter_result.is_ok() {
-            self.append_next_repeat_after_terminal(job.id)
+            self.append_next_repeat_after_terminal(&job)
                 .await;
         }
 
@@ -1008,10 +1097,37 @@ impl JobDeps {
     /// v15 repeat groups: after the reporter has persisted the terminal state,
     /// ask the planner to append the next run. This is deliberately non-fatal
     /// to the just-finished run: a DB hiccup is retryable via startup resume.
-    async fn append_next_repeat_after_terminal(&self, completed_job_id: Uuid) {
+    async fn append_next_repeat_after_terminal(&self, job: &RunnableJob) {
+        if !job_should_carry_sqlite(job) {
+            return;
+        }
         let Some(planner) = &self.repeat_planner else {
             return;
         };
+        let completed_job_id = job.id;
+        let promoted = match self
+            .promote_completed_repeat_sqlite(
+                completed_job_id,
+                &job.group_artifact_prefix,
+                "repeat planner: carry-forward after terminal completion failed",
+            )
+            .await
+        {
+            Ok(promoted) => promoted,
+            Err(e) => {
+                tracing::warn!(
+                    completed_job_id = %completed_job_id,
+                    benchmark_run_index = job.benchmark_run_index,
+                    requested_run_count = job.requested_run_count,
+                    error = ?e,
+                    "repeat planner: will not enqueue next run until carried SQLite DB is available",
+                );
+                return;
+            }
+        };
+        if !promoted {
+            return;
+        }
         match planner
             .append_next_benchmark_run(completed_job_id)
             .await
@@ -1033,6 +1149,72 @@ impl JobDeps {
                 );
             }
         }
+    }
+
+    async fn promote_completed_repeat_sqlite(
+        &self,
+        completed_job_id: Uuid,
+        artifact_prefix: &str,
+        context: &str,
+    ) -> anyhow::Result<bool> {
+        let planner = self
+            .repeat_planner
+            .as_ref()
+            .context("repeat planner not configured")?;
+        let Some(detail) = planner
+            .completed_event_detail(completed_job_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let sqlite_key = detail
+            .get("sqlite_archived_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("{context}: sqlite_archived_path is missing"))?;
+        let store = build_store_or_local(self.config.as_ref());
+        let src = store
+            .get(sqlite_key)
+            .await
+            .with_context(|| format!("{context}: resolve archived SQLite {sqlite_key}"))?;
+        let len = std::fs::metadata(&src)
+            .with_context(|| format!("{context}: stat archived SQLite {}", src.display()))?
+            .len();
+        anyhow::ensure!(len > 0, "{context}: archived SQLite {} is empty", src.display());
+
+        let group_key = group_sqlite_key(artifact_prefix);
+        let Some(bytes) = store
+            .put(&group_key, &src)
+            .await
+        else {
+            anyhow::bail!("{context}: failed to store carried SQLite at {group_key}");
+        };
+        tracing::info!(
+            completed_job_id = %completed_job_id,
+            sqlite_archived_path = sqlite_key,
+            group_sqlite_key = group_key,
+            bytes,
+            "repeat planner: carried benchmark SQLite DB",
+        );
+        Ok(true)
+    }
+}
+
+fn group_sqlite_key(artifact_prefix: &str) -> String {
+    group_artifact_key(artifact_prefix, GROUP_SQLITE_RELATIVE)
+}
+
+fn job_should_carry_sqlite(job: &RunnableJob) -> bool {
+    job.task_kind == TaskKind::Benchmark
+        && job.build_target == BuildTarget::StacksBench
+        && job.requested_run_count > 1
+}
+
+fn sqlite_seed_key_for(job: &RunnableJob) -> Option<String> {
+    if job_should_carry_sqlite(job) && job.benchmark_run_index > 0 {
+        Some(group_sqlite_key(&job.group_artifact_prefix))
+    } else {
+        None
     }
 }
 
@@ -1133,6 +1315,7 @@ fn queue_position_output(job_id: Uuid, ahead: usize) -> CheckRunOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
 
@@ -1241,6 +1424,8 @@ mod tests {
     #[derive(Default)]
     struct FakeRepeatPlanner {
         appended: StdMutex<Vec<Uuid>>,
+        pending: StdMutex<Vec<sbgh_core::db::jobs::PendingBenchmarkRun>>,
+        details: StdMutex<HashMap<Uuid, serde_json::Value>>,
         resume_calls: std::sync::atomic::AtomicUsize,
         fail_append: std::sync::atomic::AtomicBool,
     }
@@ -1261,6 +1446,17 @@ mod tests {
         fn fail_append(&self) {
             self.fail_append
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_pending(&self, pending: Vec<sbgh_core::db::jobs::PendingBenchmarkRun>) {
+            *self.pending.lock().unwrap() = pending;
+        }
+
+        fn set_completed_detail(&self, job_id: Uuid, detail: serde_json::Value) {
+            self.details
+                .lock()
+                .unwrap()
+                .insert(job_id, detail);
         }
     }
 
@@ -1283,12 +1479,28 @@ mod tests {
             Ok(None)
         }
 
-        async fn resume_pending_benchmark_runs(
+        async fn pending_completed_benchmark_runs(
             &self,
-        ) -> anyhow::Result<Vec<sbgh_core::models::Job>> {
+        ) -> anyhow::Result<Vec<sbgh_core::db::jobs::PendingBenchmarkRun>> {
             self.resume_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(vec![])
+            Ok(self
+                .pending
+                .lock()
+                .unwrap()
+                .clone())
+        }
+
+        async fn completed_event_detail(
+            &self,
+            job_id: Uuid,
+        ) -> anyhow::Result<Option<serde_json::Value>> {
+            Ok(self
+                .details
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .cloned())
         }
     }
 
@@ -1514,6 +1726,11 @@ mod tests {
 
         let job = RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 2,
+            group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(), // pre-resolved → preflight is a no-op
             git_ref_display: "develop".into(),
@@ -1571,6 +1788,11 @@ mod tests {
 
         let job = RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 2,
+            group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(), // pre-resolved → preflight is a no-op
             git_ref_display: "develop".into(),
@@ -1612,6 +1834,11 @@ mod tests {
         let config = Arc::new(test_config(&tmp));
         let job = RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 2,
+            group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(),
             git_ref_display: "develop".into(),
@@ -1626,6 +1853,20 @@ mod tests {
         };
         let source = Arc::new(FakeSource::new(job.clone()));
         let planner = Arc::new(FakeRepeatPlanner::default());
+        let sqlite_key = crate::artifact_store::artifact_key(
+            &job.id.to_string(),
+            crate::libvirt::forensics::SQLITE_RELATIVE,
+        );
+        let sqlite_path = config
+            .paths
+            .results_archive_dir
+            .join(&sqlite_key);
+        std::fs::create_dir_all(sqlite_path.parent().unwrap()).unwrap();
+        std::fs::write(&sqlite_path, b"sqlite bytes").unwrap();
+        planner.set_completed_detail(
+            job.id,
+            serde_json::json!({ "sqlite_archived_path": sqlite_key }),
+        );
         let deps = JobDeps {
             config,
             jobs: source.clone(),
@@ -1643,6 +1884,11 @@ mod tests {
 
         assert_eq!(source.calls(), vec!["start_running", "complete"]);
         assert_eq!(planner.appended(), vec![job.id]);
+        let group_sqlite = tmp
+            .path()
+            .join("archive")
+            .join(group_sqlite_key(&job.group_artifact_prefix));
+        assert_eq!(std::fs::read(group_sqlite).unwrap(), b"sqlite bytes");
     }
 
     #[tokio::test]
@@ -1651,6 +1897,11 @@ mod tests {
         let config = Arc::new(test_config(&tmp));
         let job = RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 2,
+            group_artifact_prefix: "group-b".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(),
             git_ref_display: "develop".into(),
@@ -1665,6 +1916,20 @@ mod tests {
         };
         let source = Arc::new(FakeSource::new(job.clone()));
         let planner = Arc::new(FakeRepeatPlanner::default());
+        let sqlite_key = crate::artifact_store::artifact_key(
+            &job.id.to_string(),
+            crate::libvirt::forensics::SQLITE_RELATIVE,
+        );
+        let sqlite_path = config
+            .paths
+            .results_archive_dir
+            .join(&sqlite_key);
+        std::fs::create_dir_all(sqlite_path.parent().unwrap()).unwrap();
+        std::fs::write(&sqlite_path, b"sqlite bytes").unwrap();
+        planner.set_completed_detail(
+            job.id,
+            serde_json::json!({ "sqlite_archived_path": sqlite_key }),
+        );
         planner.fail_append();
         let deps = JobDeps {
             config,
@@ -1686,12 +1951,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_carried_sqlite_blocks_next_repeat_append() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(test_config(&tmp));
+        let job = RunnableJob {
+            id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 2,
+            group_artifact_prefix: "group-missing".into(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(),
+            git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+            workload_key: None,
+            bench_args: vec![],
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            claim_token: Some(Uuid::new_v4()),
+        };
+        let source = Arc::new(FakeSource::new(job.clone()));
+        let planner = Arc::new(FakeRepeatPlanner::default());
+        planner.set_completed_detail(
+            job.id,
+            serde_json::json!({ "sqlite_archived_path": "missing/appdata/stacks-bench.db" }),
+        );
+        let deps = JobDeps {
+            config,
+            jobs: source.clone(),
+            gh: Arc::new(FakeGitHub::new()),
+            driver: Arc::new(CompletedDriver),
+            app_id: Arc::new(OnceCell::new()),
+            slack: None,
+            pin_manager: None,
+            repeat_planner: Some(planner.clone()),
+        };
+
+        deps.run(job.clone(), None, CancellationToken::new())
+            .await
+            .expect("missing carried DB is retryable and must not fail the completed run");
+
+        assert_eq!(source.calls(), vec!["start_running", "complete"]);
+        assert!(planner.appended().is_empty(), "next repeat waits for carried DB");
+    }
+
+    #[tokio::test]
     async fn coordinator_resumes_pending_repeats_on_startup() {
         let tmp = TempDir::new().unwrap();
         let config = Arc::new(test_config(&tmp));
         let job = pr_job("abc123", None);
         let source = Arc::new(FakeSource::new(job));
         let planner = Arc::new(FakeRepeatPlanner::default());
+        let completed_job_id = Uuid::new_v4();
+        let sqlite_key = crate::artifact_store::artifact_key(
+            &completed_job_id.to_string(),
+            crate::libvirt::forensics::SQLITE_RELATIVE,
+        );
+        let sqlite_path = config
+            .paths
+            .results_archive_dir
+            .join(&sqlite_key);
+        std::fs::create_dir_all(sqlite_path.parent().unwrap()).unwrap();
+        std::fs::write(&sqlite_path, b"startup sqlite").unwrap();
+        planner.set_completed_detail(
+            completed_job_id,
+            serde_json::json!({ "sqlite_archived_path": sqlite_key }),
+        );
+        planner.set_pending(vec![sbgh_core::db::jobs::PendingBenchmarkRun {
+            completed_job_id,
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 2,
+            artifact_prefix: "startup-group".into(),
+        }]);
         let deps = JobDeps {
             config,
             jobs: source,
@@ -1709,6 +2045,12 @@ mod tests {
             .await;
 
         assert_eq!(planner.resume_calls(), 1);
+        assert_eq!(planner.appended(), vec![completed_job_id]);
+        let group_sqlite = tmp
+            .path()
+            .join("archive")
+            .join(group_sqlite_key("startup-group"));
+        assert_eq!(std::fs::read(group_sqlite).unwrap(), b"startup sqlite");
     }
 
     /// A `tag_created` job is enqueued with no commit; the runner
@@ -1722,6 +2064,11 @@ mod tests {
 
         let job = RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 1,
+            group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
             commit: String::new(), // unresolved — a tag job
             git_ref_display: "release/1.2".into(),
@@ -1786,6 +2133,11 @@ mod tests {
 
         let job = RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 1,
+            group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
             commit: String::new(), // unresolved — a Slack ad-hoc job
             git_ref_display: "develop".into(),
@@ -1868,6 +2220,11 @@ mod tests {
     fn pr_job(commit: &str, check_run_id: Option<i64>) -> RunnableJob {
         RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 1,
+            group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "acme/widgets".into(),
             commit: commit.into(),
             git_ref_display: "feature".into(),
@@ -2386,7 +2743,7 @@ mod tests {
         let shell = Arc::new(RecordingShell::new());
         shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
         let driver: Arc<dyn Driver> = Arc::new(LibvirtDriver::new(config, shell));
-        let recipe = BenchRecipe::new(driver, vec![], None);
+        let recipe = BenchRecipe::new(driver, vec![], None, None);
         let job = RunnableJob {
             progress: ProgressTarget::CommitCheck { check_run_id: None },
             ..pr_job("abc123", None)
@@ -2582,6 +2939,11 @@ mod tests {
         // The reconstructed orphan view carries a commit check (id 555) to conclude.
         source.set_orphan_runnable(RunnableJob {
             id: orphan_id,
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 1,
+            group_artifact_prefix: Uuid::new_v4().to_string(),
             progress: ProgressTarget::CommitCheck { check_run_id: Some(555) },
             ..pr_job("abc123", None)
         });

@@ -85,6 +85,18 @@ pub enum ProgressTarget {
 #[derive(Debug, Clone)]
 pub struct RunnableJob {
     pub id: Uuid,
+    /// 0037: user-facing benchmark request this run belongs to.
+    pub benchmark_group_id: Uuid,
+    /// 0037: concrete workload/rev variant within the group.
+    pub benchmark_spec_id: Uuid,
+    /// 0037/0038: isolated execution number for this spec. Singleton jobs are
+    /// 0.
+    pub benchmark_run_index: i32,
+    /// Requested isolated run count for this spec. Singleton jobs store 1.
+    pub requested_run_count: i32,
+    /// Group-scoped artifact prefix. Repeat runs use it for the carried SQLite
+    /// DB.
+    pub group_artifact_prefix: String,
     /// `owner/name`. Drives the git clone URL.
     pub repository: String,
     /// Resolved commit/SHA to benchmark. Empty when unresolved at claim
@@ -561,6 +573,28 @@ impl JobSource {
                     job.github_repo_id
                 )
             })?;
+        let group = self
+            .jobs
+            .lookup_benchmark_group(job.benchmark_group_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "job {} references unknown benchmark_group {}",
+                    job.id,
+                    job.benchmark_group_id
+                )
+            })?;
+        let spec = self
+            .jobs
+            .lookup_benchmark_spec(job.benchmark_spec_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "job {} references unknown benchmark_spec {}",
+                    job.id,
+                    job.benchmark_spec_id
+                )
+            })?;
 
         // bench_args live in the queued event's provenance detail.
         let queued = self
@@ -657,6 +691,11 @@ impl JobSource {
 
         Ok(RunnableJob {
             id: job.id,
+            benchmark_group_id: job.benchmark_group_id,
+            benchmark_spec_id: job.benchmark_spec_id,
+            benchmark_run_index: job.benchmark_run_index,
+            requested_run_count: spec.requested_run_count,
+            group_artifact_prefix: group.artifact_prefix,
             repository: format!("{}/{}", repo.owner, repo.name),
             commit: job
                 .git_commit_hash

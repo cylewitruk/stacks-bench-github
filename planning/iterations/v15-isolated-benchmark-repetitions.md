@@ -11,10 +11,11 @@ daemon-orchestrated VM executions under one benchmark group, not
 > every VM invocation to `stacks-bench --repetitions 1`. Phase 2 is implemented
 > and reviewed: requested clean-run counts are persisted on `benchmark_spec`,
 > and both stores expose tested append/resume primitives for the lazy run chain.
-> Phase 3 runtime chaining is in progress: startup resume and after-completion
-> append hooks now drive the internal chain, but multi-run Slack requests remain
-> gated until group-level reporting can suppress per-run card/comment/check
-> fan-out. SQLite carry-forward and aggregate reporting remain Phase 4/5.
+> Phase 3 is implemented and reviewed: startup resume and after-completion
+> append hooks drive the internal chain. Phase 4 is implemented pending review:
+> archived SQLite DBs are carried through a group artifact before the next run
+> is appended/started. Multi-run Slack requests remain gated until group-level
+> reporting can suppress per-run card/comment/check fan-out.
 
 ## Items
 
@@ -106,7 +107,7 @@ in-process repetitions.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [ ] Validated
 
 **Acceptance & Validation:**
@@ -184,8 +185,8 @@ in-process repetitions.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
+- [x] Core implementation
+- [x] Unit/integration tests
 - [ ] Reviewed
 - [ ] Validated
 
@@ -221,8 +222,8 @@ in-process repetitions.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
+- [x] Core implementation
+- [x] Unit/integration tests
 - [ ] Reviewed
 - [ ] Validated
 

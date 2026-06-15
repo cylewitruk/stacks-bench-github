@@ -22,6 +22,8 @@ use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 pub struct BenchRecipe {
     driver: Arc<dyn Driver>,
     bench_args: Vec<String>,
+    /// Optional carried group SQLite DB to seed before this run starts.
+    sqlite_seed_key: Option<String>,
     /// The cpuset this job's VM vCPUs are pinned to (its concurrency slot's
     /// `[runner].cpu_sets` entry), or `None` to float (Phase 5).
     vcpu_cpuset: Option<String>,
@@ -32,10 +34,12 @@ impl BenchRecipe {
         driver: Arc<dyn Driver>,
         bench_args: Vec<String>,
         vcpu_cpuset: Option<String>,
+        sqlite_seed_key: Option<String>,
     ) -> Self {
         Self {
             driver,
             bench_args,
+            sqlite_seed_key,
             vcpu_cpuset,
         }
     }
@@ -70,6 +74,7 @@ impl Recipe for BenchRecipe {
         let spec = TaskSpec {
             args: self.bench_args.clone(),
             build_only: false,
+            sqlite_seed_key: self.sqlite_seed_key.clone(),
         };
         let placement = Placement {
             vcpu_cpuset: self.vcpu_cpuset.clone(),

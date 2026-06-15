@@ -12,12 +12,13 @@ use crate::Result;
 use crate::db::Pool;
 use crate::db::jobs::{
     BaselineAnchor, BaselineMatch, BaselineSelection, CreatedJob, JobCompletion,
-    JobCreationOutcome, JobFailure, JobStore,
+    JobCreationOutcome, JobFailure, JobStore, PendingBenchmarkRun,
 };
 use crate::models::{
-    BenchmarkStepKind, GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job,
-    JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus,
-    NewJob, NewJobEvent, QueuedEventDetail, ResolvedCommit, TaskKind, TerminalJobStatus,
+    BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, GithubPullRequestJob, GithubUserJob,
+    GithubWebhookJob, Job, JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric,
+    JobResult, JobStatus, NewJob, NewJobEvent, QueuedEventDetail, ResolvedCommit, TaskKind,
+    TerminalJobStatus,
 };
 
 #[derive(Clone)]
@@ -534,17 +535,39 @@ impl JobStore for PostgresJobStore {
     }
 
     async fn resume_pending_benchmark_runs(&self) -> Result<Vec<Job>> {
-        let candidates: Vec<Uuid> = sqlx::query_scalar(
+        let mut out = Vec::new();
+        for pending in self
+            .pending_completed_benchmark_runs()
+            .await?
+        {
+            if let Some(job) = self
+                .append_next_benchmark_run(pending.completed_job_id)
+                .await?
+            {
+                out.push(job);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn pending_completed_benchmark_runs(&self) -> Result<Vec<PendingBenchmarkRun>> {
+        let rows = sqlx::query_as::<_, PendingBenchmarkRun>(
             r#"
             WITH latest AS (
-                SELECT DISTINCT ON (j.benchmark_spec_id) j.id, j.benchmark_spec_id,
-                       j.benchmark_run_index, j.status
+                SELECT DISTINCT ON (j.benchmark_spec_id) j.id, j.benchmark_group_id,
+                       j.benchmark_spec_id, j.benchmark_run_index, j.status
                   FROM job j
               ORDER BY j.benchmark_spec_id, j.benchmark_run_index DESC
             )
-            SELECT latest.id
+            SELECT latest.id AS completed_job_id,
+                   latest.benchmark_group_id,
+                   latest.benchmark_spec_id,
+                   latest.benchmark_run_index,
+                   s.requested_run_count,
+                   g.artifact_prefix
               FROM latest
               JOIN benchmark_spec s ON s.id = latest.benchmark_spec_id
+              JOIN benchmark_group g ON g.id = latest.benchmark_group_id
              WHERE latest.status = 'completed'
                AND latest.benchmark_run_index + 1 < s.requested_run_count
                AND s.task_kind <> 'build_only'
@@ -559,17 +582,7 @@ impl JobStore for PostgresJobStore {
         )
         .fetch_all(&self.pool)
         .await?;
-
-        let mut out = Vec::new();
-        for id in candidates {
-            if let Some(job) = self
-                .append_next_benchmark_run(id)
-                .await?
-            {
-                out.push(job);
-            }
-        }
-        Ok(out)
+        Ok(rows)
     }
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {
@@ -588,6 +601,56 @@ impl JobStore for PostgresJobStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    async fn lookup_benchmark_group(&self, group_id: Uuid) -> Result<Option<BenchmarkGroup>> {
+        let row = sqlx::query_as::<_, BenchmarkGroup>(
+            r#"
+            SELECT id, github_installation_id, github_repo_id, source, intent,
+                   artifact_prefix, host_key, created_at, updated_at
+              FROM benchmark_group
+             WHERE id = $1
+            "#,
+        )
+        .bind(group_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn lookup_benchmark_spec(&self, spec_id: Uuid) -> Result<Option<BenchmarkSpec>> {
+        let row = sqlx::query_as::<_, BenchmarkSpec>(
+            r#"
+            SELECT id, benchmark_group_id, spec_index, requested_run_count,
+                   github_repo_id, task_kind, build_target, git_ref_kind,
+                   git_ref_display, git_commit_hash, git_committed_at,
+                   workload_key, created_at, updated_at
+              FROM benchmark_spec
+             WHERE id = $1
+            "#,
+        )
+        .bind(spec_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn completed_event_detail(&self, job_id: Uuid) -> Result<Option<serde_json::Value>> {
+        let detail = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            r#"
+            SELECT detail
+              FROM job_event
+             WHERE job_id = $1
+               AND event_kind = 'completed'
+               AND event_status = 'success'
+          ORDER BY occurred_at DESC, id DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(detail.flatten())
     }
 
     async fn claim_next_queued(&self, claim_token: Uuid) -> Result<Option<Job>> {

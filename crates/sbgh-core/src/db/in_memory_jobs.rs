@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::db::jobs::{
     BaselineAnchor, BaselineMatch, BaselineSelection, CreatedJob, JobCompletion,
-    JobCreationOutcome, JobFailure, JobStore,
+    JobCreationOutcome, JobFailure, JobStore, PendingBenchmarkRun,
 };
 use crate::models::{
     BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, BenchmarkWorkflowStep, GithubPullRequestJob,
@@ -540,47 +540,67 @@ impl JobStore for InMemoryJobStore {
     }
 
     async fn resume_pending_benchmark_runs(&self) -> Result<Vec<Job>> {
-        let candidates: Vec<Uuid> = {
-            let s = self.state.lock().unwrap();
-            let mut ids = Vec::new();
-            for spec in s.specs.values() {
-                if spec.task_kind == TaskKind::BuildOnly {
-                    continue;
-                }
-                if s.jobs.values().any(|j| {
-                    j.benchmark_spec_id == spec.id
-                        && matches!(
-                            j.status,
-                            JobStatus::Queued | JobStatus::Claimed | JobStatus::Running
-                        )
-                }) {
-                    continue;
-                }
-                let latest = s
-                    .jobs
-                    .values()
-                    .filter(|j| j.benchmark_spec_id == spec.id)
-                    .max_by_key(|j| j.benchmark_run_index);
-                if let Some(job) = latest
-                    && job.status == JobStatus::Completed
-                    && job.benchmark_run_index + 1 < spec.requested_run_count
-                {
-                    ids.push(job.id);
-                }
-            }
-            ids
-        };
-
         let mut out = Vec::new();
-        for id in candidates {
+        for pending in self
+            .pending_completed_benchmark_runs()
+            .await?
+        {
             if let Some(job) = self
-                .append_next_benchmark_run(id)
+                .append_next_benchmark_run(pending.completed_job_id)
                 .await?
             {
                 out.push(job);
             }
         }
         Ok(out)
+    }
+
+    async fn pending_completed_benchmark_runs(&self) -> Result<Vec<PendingBenchmarkRun>> {
+        let s = self.state.lock().unwrap();
+        let mut pending = Vec::new();
+        for spec in s.specs.values() {
+            if spec.task_kind == TaskKind::BuildOnly {
+                continue;
+            }
+            if s.jobs.values().any(|j| {
+                j.benchmark_spec_id == spec.id
+                    && matches!(
+                        j.status,
+                        JobStatus::Queued | JobStatus::Claimed | JobStatus::Running
+                    )
+            }) {
+                continue;
+            }
+            let latest = s
+                .jobs
+                .values()
+                .filter(|j| j.benchmark_spec_id == spec.id)
+                .max_by_key(|j| j.benchmark_run_index);
+            let Some(job) = latest else {
+                continue;
+            };
+            if job.status != JobStatus::Completed
+                || job.benchmark_run_index + 1 >= spec.requested_run_count
+            {
+                continue;
+            }
+            let Some(group) = s
+                .groups
+                .get(&job.benchmark_group_id)
+            else {
+                continue;
+            };
+            pending.push(PendingBenchmarkRun {
+                completed_job_id: job.id,
+                benchmark_group_id: job.benchmark_group_id,
+                benchmark_spec_id: job.benchmark_spec_id,
+                benchmark_run_index: job.benchmark_run_index,
+                requested_run_count: spec.requested_run_count,
+                artifact_prefix: group.artifact_prefix.clone(),
+            });
+        }
+        pending.sort_by_key(|p| p.completed_job_id);
+        Ok(pending)
     }
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {
@@ -591,6 +611,46 @@ impl JobStore for InMemoryJobStore {
             .jobs
             .get(&job_id)
             .cloned())
+    }
+
+    async fn lookup_benchmark_group(&self, group_id: Uuid) -> Result<Option<BenchmarkGroup>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .groups
+            .get(&group_id)
+            .cloned())
+    }
+
+    async fn lookup_benchmark_spec(&self, spec_id: Uuid) -> Result<Option<BenchmarkSpec>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .specs
+            .get(&spec_id)
+            .cloned())
+    }
+
+    async fn completed_event_detail(&self, job_id: Uuid) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .rev()
+            .find(|e| {
+                e.job_id == job_id
+                    && e.event_kind == JobEventKind::Completed
+                    && e.event_status == JobEventStatus::Success
+            })
+            .and_then(|e| {
+                e.detail
+                    .as_ref()
+                    .map(|d| d.0.clone())
+            }))
     }
 
     async fn claim_next_queued(&self, claim_token: Uuid) -> Result<Option<Job>> {

@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use async_trait::async_trait;
 use sbgh_core::bench_args::effective_arg_string;
 use sbgh_core::config::DaemonConfig;
@@ -238,6 +239,7 @@ struct RunInputs<'a> {
     repository: &'a str,
     commit: &'a str,
     bench_args: &'a [String],
+    sqlite_seed_key: Option<&'a str>,
     /// v10 (0005): build-only mode — stop after the build VM publishes the
     /// artifact; skip the bench phase entirely.
     build_only: bool,
@@ -265,10 +267,7 @@ impl LibvirtDriver {
     pub async fn run_benchmark(
         &self,
         ctx: &TaskContext<'_>,
-        bench_args: &[String],
-        // v10 (0005): build-only — build + publish the artifact, then stop
-        // before the bench phase.
-        build_only: bool,
+        spec: &TaskSpec,
         listener: &dyn PhaseListener,
         cancel: &CancellationToken,
         // Phase 5 CPU pinning: the libvirt cpuset this job's slot owns, or
@@ -289,8 +288,11 @@ impl LibvirtDriver {
         let inputs = RunInputs {
             repository: ctx.repository,
             commit: ctx.commit,
-            bench_args,
-            build_only,
+            bench_args: &spec.args,
+            sqlite_seed_key: spec
+                .sqlite_seed_key
+                .as_deref(),
+            build_only: spec.build_only,
         };
 
         // Run the inner pipeline. Any error becomes a Failed outcome with
@@ -762,6 +764,9 @@ impl LibvirtDriver {
             )
             .await?,
         );
+        if let (Some(seed_key), Some(tmpfs)) = (inputs.sqlite_seed_key, arts.tmpfs.as_ref()) {
+            seed_sqlite_from_store(self.config.as_ref(), seed_key, tmpfs).await?;
+        }
 
         // Cloud-init: two ISOs, one per phase, distinct instance-ids
         // so cloud-init re-runs user-data on the second boot.
@@ -1326,6 +1331,36 @@ impl PhaseListener for SinkAdapter<'_> {
     }
 }
 
+async fn seed_sqlite_from_store(
+    config: &DaemonConfig,
+    seed_key: &str,
+    tmpfs: &ResultsTmpfs,
+) -> anyhow::Result<()> {
+    let store = build_store_or_local(config);
+    let src = store
+        .get(seed_key)
+        .await
+        .with_context(|| format!("resolve carried SQLite artifact {seed_key}"))?;
+    let dest = tmpfs.sqlite_file();
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create carried SQLite parent {}", parent.display()))?;
+    }
+    std::fs::copy(&src, &dest).with_context(|| {
+        format!(
+            "seed carried SQLite artifact {seed_key} from {} to {}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+    tracing::info!(
+        seed_key,
+        dest = %dest.display(),
+        "seeded carried benchmark SQLite DB",
+    );
+    Ok(())
+}
+
 #[async_trait]
 impl Driver for LibvirtDriver {
     /// Bench's `TaskSpec.args` are this run's benchmark CLI args; `Placement`
@@ -1345,8 +1380,7 @@ impl Driver for LibvirtDriver {
         let outcome = self
             .run_benchmark(
                 ctx,
-                &spec.args,
-                spec.build_only,
+                spec,
                 &adapter,
                 cancel,
                 placement
@@ -1616,6 +1650,7 @@ mod tests {
             repository: "acme/widgets",
             commit: "abc123def456",
             bench_args: &[],
+            sqlite_seed_key: None,
             build_only: false,
         };
         let listener = RecordingListener::default();
@@ -1658,6 +1693,32 @@ mod tests {
                 .any(|c| c.program.ends_with("virsh")),
             "no build VM define/start on a cache hit"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_seed_key_copies_group_db_into_results_tmpfs() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let seed_key =
+            crate::artifact_store::group_artifact_key("group1", "shared/stacks-bench.db");
+        let seed_path = cfg
+            .paths
+            .results_archive_dir
+            .join(&seed_key);
+        std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
+        std::fs::write(&seed_path, b"group sqlite").unwrap();
+
+        let tmpfs = ResultsTmpfs {
+            mount_dir: tmp.path().join("results"),
+            size_mib: 256,
+        };
+        std::fs::create_dir_all(&tmpfs.mount_dir).unwrap();
+
+        seed_sqlite_from_store(&cfg, &seed_key, &tmpfs)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(tmpfs.sqlite_file()).unwrap(), b"group sqlite");
     }
 
     fn test_config(tmp: &TempDir) -> DaemonConfig {
@@ -1729,9 +1790,22 @@ mod tests {
         }
     }
 
+    fn task_spec(args: Vec<String>, build_only: bool) -> TaskSpec {
+        TaskSpec {
+            args,
+            build_only,
+            sqlite_seed_key: None,
+        }
+    }
+
     fn fake_job() -> RunnableJob {
         RunnableJob {
             id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index: 0,
+            requested_run_count: 1,
+            group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "acme/widgets".into(),
             commit: "abc123def456".into(),
             git_ref_display: "PR #42".into(),
@@ -1857,8 +1931,7 @@ mod tests {
         let outcome = driver
             .run_benchmark(
                 &ctx_of(&job),
-                &[],
-                true, // build_only
+                &task_spec(vec![], true), // build_only
                 &NoopPhaseListener,
                 &CancellationToken::new(),
                 None,
@@ -1952,8 +2025,7 @@ mod tests {
         let outcome = driver
             .run_benchmark(
                 &ctx_of(&job),
-                &job.bench_args,
-                false,
+                &task_spec(job.bench_args.clone(), false),
                 &NoopPhaseListener,
                 &CancellationToken::new(),
                 None,
@@ -2096,8 +2168,7 @@ mod tests {
         let outcome = driver
             .run_benchmark(
                 &ctx_of(&job),
-                &job.bench_args,
-                false,
+                &task_spec(job.bench_args.clone(), false),
                 &NoopPhaseListener,
                 &CancellationToken::new(),
                 None,
@@ -2145,8 +2216,7 @@ mod tests {
         let outcome = driver
             .run_benchmark(
                 &ctx_of(&job),
-                &job.bench_args,
-                false,
+                &task_spec(job.bench_args.clone(), false),
                 &NoopPhaseListener,
                 &CancellationToken::new(),
                 None,
@@ -2191,7 +2261,13 @@ mod tests {
         cancel.cancel(); // pre-cancelled → the poll loop's top check fires first
 
         let outcome = driver
-            .run_benchmark(&ctx_of(&job), &job.bench_args, false, &NoopPhaseListener, &cancel, None)
+            .run_benchmark(
+                &ctx_of(&job),
+                &task_spec(job.bench_args.clone(), false),
+                &NoopPhaseListener,
+                &cancel,
+                None,
+            )
             .await
             .expect("driver returns Ok");
 
