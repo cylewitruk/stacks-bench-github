@@ -287,6 +287,7 @@ mod tests {
             rev: "develop",
             commit: None,
             bench_args: &[],
+            repeat: None,
             rows: vec![CardRow {
                 title: "Queued".into(),
                 status: PlanTaskStatus::Pending,

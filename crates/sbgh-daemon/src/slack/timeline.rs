@@ -34,8 +34,10 @@ use crate::slack::stream::{
 /// Slack appears to mark a long-idle stream as no longer actively streaming
 /// after a few minutes, which paints pending tasks as failed in the client
 /// until a later terminal update corrects them. Keep the stream alive with
-/// quiet task-update heartbeats; no markdown text is appended.
-const SLACK_STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// quiet task-update heartbeats; no markdown text is appended. 10s (lowered
+/// from 30s) holds the stream through long, semantically-quiet phases (e.g. a
+/// multi-minute benchmark phase that emits no row updates).
+const SLACK_STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct SlackTimeline {
     client: Arc<dyn SlackClient>,

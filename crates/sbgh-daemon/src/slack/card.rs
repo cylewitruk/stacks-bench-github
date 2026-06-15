@@ -108,6 +108,10 @@ pub struct Card<'a> {
     pub rev: &'a str,
     pub commit: Option<&'a str>,
     pub bench_args: &'a [String],
+    /// Isolated-repeat position for a group-owned card; drives the user-facing
+    /// clean-repeat count in the context header (the in-process `--repetitions`
+    /// is always 1 in v15 and is not surfaced).
+    pub repeat: Option<RepeatContext>,
     pub rows: Vec<CardRow>,
     pub results: Option<Results<'a>>,
 }
@@ -220,6 +224,7 @@ pub fn running_card<'a>(ctx: &'a CardCtx<'a>, stage: usize) -> Card<'a> {
         rev: ctx.rev,
         commit: ctx.commit,
         bench_args: ctx.bench_args,
+        repeat: ctx.repeat,
         rows,
         results: None,
     }
@@ -249,6 +254,7 @@ pub fn queued_card<'a>(ctx: &'a CardCtx<'a>, detail: Option<&str>) -> Card<'a> {
         rev: ctx.rev,
         commit: ctx.commit,
         bench_args: ctx.bench_args,
+        repeat: ctx.repeat,
         rows,
         results: None,
     }
@@ -267,6 +273,7 @@ pub fn repeat_finished_card<'a>(ctx: &'a CardCtx<'a>) -> Card<'a> {
         rev: ctx.rev,
         commit: ctx.commit,
         bench_args: ctx.bench_args,
+        repeat: ctx.repeat,
         rows,
         results: None,
     }
@@ -289,6 +296,7 @@ pub fn completed_card<'a>(ctx: &'a CardCtx<'a>, results: Results<'a>) -> Card<'a
         rev: ctx.rev,
         commit: ctx.commit,
         bench_args: ctx.bench_args,
+        repeat: ctx.repeat,
         rows,
         results: Some(results),
     }
@@ -319,6 +327,7 @@ pub fn failed_card<'a>(ctx: &'a CardCtx<'a>, stage: usize, reason: &str) -> Card
         rev: ctx.rev,
         commit: ctx.commit,
         bench_args: ctx.bench_args,
+        repeat: ctx.repeat,
         rows,
         results: None,
     }
@@ -485,15 +494,20 @@ fn workload_context(card: &Card) -> Vec<String> {
         parts.push(format!("*0* {target_unit} warmup"));
     }
 
-    if let Some(repetitions) = flag_value(card.bench_args, "--repetitions") {
-        parts.push(format!(
-            "*{}* {}",
-            escape_mrkdwn(&format_count(repetitions)),
-            pluralize("repetition", repetitions)
-        ));
-    } else {
-        parts.push("*1* repetition".to_string());
-    }
+    // v15: show the user-facing CLEAN repeat count (the group's requested run
+    // count), not the in-process `--repetitions` — which the daemon forces to 1
+    // on every VM and is not a user-meaningful number. Singletons → one.
+    let clean_reps = card
+        .repeat
+        .map(|r| r.total)
+        .unwrap_or(1)
+        .max(1)
+        .to_string();
+    parts.push(format!(
+        "*{}* {}",
+        escape_mrkdwn(&format_count(&clean_reps)),
+        pluralize("repetition", &clean_reps)
+    ));
     parts
 }
 
@@ -849,6 +863,7 @@ mod tests {
             rev: "feat/stacks-bench",
             commit: Some("56e9fcba1234"),
             bench_args: &[],
+            repeat: None,
             rows: vec![
                 row("Job started", PlanTaskStatus::Complete, None, Some("Started after 17m 23s")),
                 row(
@@ -891,7 +906,9 @@ mod tests {
     }
 
     /// The compact context header summarizes the requested workload and the
-    /// ref/commit above the plan.
+    /// ref/commit above the plan. v15: the repetition count is the user-facing
+    /// CLEAN-run total (`repeat.total`), NOT the in-process `--repetitions`
+    /// (always 1) — so the bench-arg below says `1` while the header says `10`.
     #[test]
     fn context_header_summarizes_workload_and_ref() {
         let args = vec![
@@ -901,7 +918,7 @@ mod tests {
             "8200000".to_string(),
             "--warmup".to_string(),
             "1000".to_string(),
-            "--repetitions=10".to_string(),
+            "--repetitions=1".to_string(),
         ];
         let ctx = CardCtx {
             rev: "sb-integration/3.4.0.0.3",
@@ -909,7 +926,7 @@ mod tests {
             commit_url: Some("https://github.com/o/r/commit/c3b1aad4eeff"),
             job_id: "job-1",
             bench_args: &args,
-            repeat: None,
+            repeat: Some(RepeatContext { index: 0, total: 10 }),
             cached_build: None,
         };
         let v = queued(&ctx, None);
@@ -920,8 +937,31 @@ mod tests {
         let s = v.to_string();
         assert!(s.contains("*Measuring* blocks *8,123,456* to *8,200,000*"), "{s}");
         assert!(s.contains("*1,000* block warmup"), "{s}");
-        assert!(s.contains("*10* repetitions"), "{s}");
+        assert!(
+            s.contains("*10* repetitions"),
+            "header shows the clean-run total, not the bench-arg: {s}"
+        );
         assert!(s.contains("*sb-integration/3.4.0.0.3*  _c3b1aad4_"), "{s}");
+    }
+
+    /// Singleton (no repeat context) → "1 repetition", regardless of any
+    /// in-process `--repetitions` left in the bench args.
+    #[test]
+    fn context_header_singleton_shows_one_repetition() {
+        let args =
+            vec!["--block".to_string(), "8123456".to_string(), "--repetitions=1".to_string()];
+        let ctx = CardCtx {
+            rev: "develop",
+            commit: None,
+            commit_url: None,
+            job_id: "job-1",
+            bench_args: &args,
+            repeat: None,
+            cached_build: None,
+        };
+        let s = queued(&ctx, None).to_string();
+        assert!(s.contains("*1* repetition"), "{s}");
+        assert!(!s.contains("repetitions"), "singular, not plural: {s}");
     }
 
     /// A completed card appends the results: plan → divider → markdown table →
@@ -1005,6 +1045,7 @@ mod tests {
             rev: "develop",
             commit: None,
             bench_args: &[],
+            repeat: None,
             rows: vec![row(
                 "Built benchmark binaries",
                 PlanTaskStatus::Complete,
@@ -1029,6 +1070,7 @@ mod tests {
             rev: "develop",
             commit: None,
             bench_args: &[],
+            repeat: None,
             rows: vec![row(
                 "Run benchmark",
                 PlanTaskStatus::Error,

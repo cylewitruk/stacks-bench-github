@@ -28,7 +28,7 @@ use sbgh_core::models::{
 use uuid::Uuid;
 
 use crate::llm::intent::{IntentOutcome, IntentResolver};
-use crate::slack::card::{self, CardCtx};
+use crate::slack::card::{self, CardCtx, RepeatContext};
 use crate::slack::client::{QUEUED_REACTION, SlackClient};
 use crate::slack::stream::initial_chunks_for_card;
 use crate::slack::target::SlackJobTarget;
@@ -197,8 +197,14 @@ impl SlackConnector {
 
         // 4. Post the queued live-timeline card + persist its ts by job id, so the
         //    claim-time reporter resumes the SAME card (item 0023, Phase 3).
-        self.post_queued_card(&event, &new_job.git_ref_display, &bench_args, job.id)
-            .await;
+        self.post_queued_card(
+            &event,
+            &new_job.git_ref_display,
+            &bench_args,
+            spec.clean_repetitions,
+            job.id,
+        )
+        .await;
 
         // 5. Exactly one ⏳ reaction on the request — the accepted-job signal.
         if let Err(e) = self
@@ -279,6 +285,7 @@ impl SlackConnector {
         event: &MentionEvent,
         rev: &str,
         bench_args: &[String],
+        clean_repetitions: u32,
         job_id: Uuid,
     ) {
         let job_id_str = job_id.to_string();
@@ -288,7 +295,12 @@ impl SlackConnector {
             commit_url: None,
             job_id: &job_id_str,
             bench_args,
-            repeat: None,
+            // Pre-claim, the group has only run 0; show the requested clean-run
+            // total so the queued card reads "N repetitions", not the in-process 1.
+            repeat: (clean_repetitions > 1).then_some(RepeatContext {
+                index: 0,
+                total: clean_repetitions as i32,
+            }),
             cached_build: None,
         };
         let card = card::queued_card(&ctx, None);
