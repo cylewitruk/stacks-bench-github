@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
@@ -67,6 +68,39 @@ const ORPHAN_REMARK: &str = "recovered: orphaned in `running` by a daemon restar
 /// Run (4C-2) — the longer [`ORPHAN_REMARK`] is the DB-side remark.
 const ORPHAN_CHECK_REASON: &str = "the daemon restarted while this run was in progress";
 
+#[async_trait]
+trait RepeatRunPlanner: Send + Sync + 'static {
+    async fn append_next_benchmark_run(
+        &self,
+        completed_job_id: Uuid,
+    ) -> anyhow::Result<Option<sbgh_core::models::Job>>;
+    async fn resume_pending_benchmark_runs(&self) -> anyhow::Result<Vec<sbgh_core::models::Job>>;
+}
+
+struct JobStoreRepeatRunPlanner {
+    jobs: Arc<dyn JobStore>,
+}
+
+#[async_trait]
+impl RepeatRunPlanner for JobStoreRepeatRunPlanner {
+    async fn append_next_benchmark_run(
+        &self,
+        completed_job_id: Uuid,
+    ) -> anyhow::Result<Option<sbgh_core::models::Job>> {
+        self.jobs
+            .append_next_benchmark_run(completed_job_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn resume_pending_benchmark_runs(&self) -> anyhow::Result<Vec<sbgh_core::models::Job>> {
+        self.jobs
+            .resume_pending_benchmark_runs()
+            .await
+            .map_err(Into::into)
+    }
+}
+
 /// The runner's shared handles, cloned into each job task so it can run on its
 /// own (spawned) without borrowing the coordinator.
 #[derive(Clone)]
@@ -93,6 +127,10 @@ struct JobDeps {
     /// cache is enabled and [`Runner::with_pin_recompute`] wired it. Recomputed
     /// on startup + after each job execution, sharing the driver's cache `Arc`.
     pin_manager: Option<Arc<PinManager>>,
+    /// v15 isolated repetitions: append/resume the lazy run chain from durable
+    /// DB state. Kept separate from [`RunnableJobStore`] so the execution view
+    /// stays focused on claim/run lifecycle.
+    repeat_planner: Option<Arc<dyn RepeatRunPlanner>>,
 }
 
 pub struct Runner {
@@ -125,6 +163,7 @@ impl Runner {
                 app_id: Arc::new(OnceCell::new()),
                 slack: None,
                 pin_manager: None,
+                repeat_planner: None,
             },
             max_concurrent,
         }
@@ -178,6 +217,14 @@ impl Runner {
         self
     }
 
+    /// Enable v15 repeat-run lazy chaining. The planner appends the next run
+    /// only after the prior run has terminally completed and resumes any
+    /// completed-but-not-appended groups at startup from persisted DB state.
+    pub fn with_repeat_planning(mut self, jobs: Arc<dyn JobStore>) -> Self {
+        self.deps.repeat_planner = Some(Arc::new(JobStoreRepeatRunPlanner { jobs }));
+        self
+    }
+
     /// The coordinator loop: sweep stranded claims, fill every free slot from
     /// the queue (until a drain/abort is requested), then wait for a task to
     /// free a slot or the poll tick. Returns when drained/aborted **and** idle,
@@ -207,6 +254,9 @@ impl Runner {
         coord
             .recover_orphans()
             .await?;
+        coord
+            .resume_pending_repeats()
+            .await;
         loop {
             coord.sweep(lease).await;
             // Once a drain/abort is requested, stop pulling new work; queued
@@ -391,6 +441,34 @@ impl Coordinator {
             }
         }
         Ok(())
+    }
+
+    /// v15 repeat groups: if a daemon stopped after run K completed but before
+    /// run K+1 was appended, derive and enqueue the next run from durable DB
+    /// state. Best-effort; a failed sweep is retried on the next coordinator
+    /// start instead of blocking unrelated jobs.
+    async fn resume_pending_repeats(&self) {
+        let Some(planner) = &self.deps.repeat_planner else {
+            return;
+        };
+        match planner
+            .resume_pending_benchmark_runs()
+            .await
+        {
+            Ok(jobs) if jobs.is_empty() => {}
+            Ok(jobs) => {
+                tracing::info!(
+                    enqueued = jobs.len(),
+                    "repeat planner: resumed pending benchmark runs"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "repeat planner: startup resume failed; will retry on next daemon start",
+                );
+            }
+        }
     }
 
     /// Conclude a recovered orphan's stuck Check Run (and update its stale
@@ -914,9 +992,46 @@ impl JobDeps {
 
         // Surface the reporter's result (setup-level failures back off the loop;
         // a panic in the reporter task becomes an iteration error).
-        match handle.await {
+        let reporter_result = match handle.await {
             Ok(result) => result,
             Err(join_err) => Err(anyhow::anyhow!("reporter task panicked: {join_err}")),
+        };
+
+        if reporter_result.is_ok() {
+            self.append_next_repeat_after_terminal(job.id)
+                .await;
+        }
+
+        reporter_result
+    }
+
+    /// v15 repeat groups: after the reporter has persisted the terminal state,
+    /// ask the planner to append the next run. This is deliberately non-fatal
+    /// to the just-finished run: a DB hiccup is retryable via startup resume.
+    async fn append_next_repeat_after_terminal(&self, completed_job_id: Uuid) {
+        let Some(planner) = &self.repeat_planner else {
+            return;
+        };
+        match planner
+            .append_next_benchmark_run(completed_job_id)
+            .await
+        {
+            Ok(Some(job)) => {
+                tracing::info!(
+                    completed_job_id = %completed_job_id,
+                    next_job_id = %job.id,
+                    benchmark_run_index = job.benchmark_run_index,
+                    "repeat planner: enqueued next benchmark run",
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    completed_job_id = %completed_job_id,
+                    error = ?e,
+                    "repeat planner: append failed after terminal completion; startup resume can retry",
+                );
+            }
         }
     }
 }
@@ -1032,6 +1147,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::driver::{DriverOutcome, DriverStatus, Placement, TaskSpec};
+    use crate::events::EventSink;
     use crate::job_source::ProgressTarget;
     use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
     use crate::reporter::CHECK_NAME;
@@ -1118,6 +1235,83 @@ mod tests {
                 .lock()
                 .unwrap()
                 .clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRepeatPlanner {
+        appended: StdMutex<Vec<Uuid>>,
+        resume_calls: std::sync::atomic::AtomicUsize,
+        fail_append: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeRepeatPlanner {
+        fn appended(&self) -> Vec<Uuid> {
+            self.appended
+                .lock()
+                .unwrap()
+                .clone()
+        }
+
+        fn resume_calls(&self) -> usize {
+            self.resume_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn fail_append(&self) {
+            self.fail_append
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl RepeatRunPlanner for FakeRepeatPlanner {
+        async fn append_next_benchmark_run(
+            &self,
+            completed_job_id: Uuid,
+        ) -> anyhow::Result<Option<sbgh_core::models::Job>> {
+            self.appended
+                .lock()
+                .unwrap()
+                .push(completed_job_id);
+            if self
+                .fail_append
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("forced append failure");
+            }
+            Ok(None)
+        }
+
+        async fn resume_pending_benchmark_runs(
+            &self,
+        ) -> anyhow::Result<Vec<sbgh_core::models::Job>> {
+            self.resume_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    struct CompletedDriver;
+
+    #[async_trait]
+    impl Driver for CompletedDriver {
+        async fn run_task(
+            &self,
+            _ctx: &TaskContext<'_>,
+            _spec: &TaskSpec,
+            _sink: &dyn EventSink,
+            _cancel: &CancellationToken,
+            _placement: &Placement,
+        ) -> anyhow::Result<DriverOutcome> {
+            Ok(DriverOutcome {
+                status: DriverStatus::Completed,
+                summary: serde_json::json!({ "finish_reason": "test" }),
+            })
+        }
+
+        async fn cleanup_by_job_id(&self, _job_id: &str) -> bool {
+            true
         }
     }
 
@@ -1410,6 +1604,111 @@ mod tests {
         // posted nothing.
         assert_eq!(source.calls(), vec!["start_running", "fail"]);
         assert!(gh.calls().is_empty(), "a build-only (silent) job must make no GitHub calls",);
+    }
+
+    #[tokio::test]
+    async fn completed_run_appends_next_repeat_after_terminal_persist() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(test_config(&tmp));
+        let job = RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(),
+            git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+            workload_key: None,
+            bench_args: vec![],
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            claim_token: Some(Uuid::new_v4()),
+        };
+        let source = Arc::new(FakeSource::new(job.clone()));
+        let planner = Arc::new(FakeRepeatPlanner::default());
+        let deps = JobDeps {
+            config,
+            jobs: source.clone(),
+            gh: Arc::new(FakeGitHub::new()),
+            driver: Arc::new(CompletedDriver),
+            app_id: Arc::new(OnceCell::new()),
+            slack: None,
+            pin_manager: None,
+            repeat_planner: Some(planner.clone()),
+        };
+
+        deps.run(job.clone(), None, CancellationToken::new())
+            .await
+            .expect("completed run should not fail");
+
+        assert_eq!(source.calls(), vec!["start_running", "complete"]);
+        assert_eq!(planner.appended(), vec![job.id]);
+    }
+
+    #[tokio::test]
+    async fn repeat_append_failure_is_nonfatal_to_completed_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(test_config(&tmp));
+        let job = RunnableJob {
+            id: Uuid::new_v4(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(),
+            git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+            workload_key: None,
+            bench_args: vec![],
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            claim_token: Some(Uuid::new_v4()),
+        };
+        let source = Arc::new(FakeSource::new(job.clone()));
+        let planner = Arc::new(FakeRepeatPlanner::default());
+        planner.fail_append();
+        let deps = JobDeps {
+            config,
+            jobs: source.clone(),
+            gh: Arc::new(FakeGitHub::new()),
+            driver: Arc::new(CompletedDriver),
+            app_id: Arc::new(OnceCell::new()),
+            slack: None,
+            pin_manager: None,
+            repeat_planner: Some(planner.clone()),
+        };
+
+        deps.run(job.clone(), None, CancellationToken::new())
+            .await
+            .expect("append failure is retryable and must not fail the completed run");
+
+        assert_eq!(source.calls(), vec!["start_running", "complete"]);
+        assert_eq!(planner.appended(), vec![job.id]);
+    }
+
+    #[tokio::test]
+    async fn coordinator_resumes_pending_repeats_on_startup() {
+        let tmp = TempDir::new().unwrap();
+        let config = Arc::new(test_config(&tmp));
+        let job = pr_job("abc123", None);
+        let source = Arc::new(FakeSource::new(job));
+        let planner = Arc::new(FakeRepeatPlanner::default());
+        let deps = JobDeps {
+            config,
+            jobs: source,
+            gh: Arc::new(FakeGitHub::new()),
+            driver: Arc::new(CompletedDriver),
+            app_id: Arc::new(OnceCell::new()),
+            slack: None,
+            pin_manager: None,
+            repeat_planner: Some(planner.clone()),
+        };
+        let coord = Coordinator::new(deps, 1, CancellationToken::new());
+
+        coord
+            .resume_pending_repeats()
+            .await;
+
+        assert_eq!(planner.resume_calls(), 1);
     }
 
     /// A `tag_created` job is enqueued with no commit; the runner
@@ -1856,6 +2155,7 @@ mod tests {
                 app_id: app_id.clone(),
                 slack: None,
                 pin_manager: None,
+                repeat_planner: None,
             };
             handles.push(tokio::spawn(deps.run(job, None, CancellationToken::new())));
             sources.push(source);
@@ -2031,6 +2331,7 @@ mod tests {
             app_id: Arc::new(OnceCell::new()),
             slack: None,
             pin_manager: None,
+            repeat_planner: None,
         };
         let mut coord = Coordinator::new(deps, 2, CancellationToken::new()); // max_concurrent = 2
         let never_draining = CancellationToken::new();
@@ -2349,6 +2650,7 @@ mod tests {
             app_id: Arc::new(OnceCell::new()),
             slack: None,
             pin_manager: None,
+            repeat_planner: None,
         };
         Coordinator::new(deps, 1, CancellationToken::new())
     }
@@ -2584,6 +2886,7 @@ mod tests {
             app_id: Arc::new(OnceCell::new()),
             slack: Some(slack),
             pin_manager: None,
+            repeat_planner: None,
         };
         Coordinator::new(deps, 1, CancellationToken::new())
     }

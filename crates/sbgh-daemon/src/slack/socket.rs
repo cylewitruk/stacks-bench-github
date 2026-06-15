@@ -26,6 +26,7 @@ use crate::slack::target::SlackJobTarget;
 pub struct SocketRunOptions {
     pub intent_rate_limit_per_minute: u32,
     pub max_clean_repetitions: u32,
+    pub binary_cache_enabled: bool,
 }
 
 /// Map a Slack push event to our [`MentionEvent`], or `None` for any push that
@@ -158,7 +159,8 @@ pub async fn run(
     // The connector (authz/resolve/enqueue/react) shares the Web API client and
     // rides into the listener via user state.
     let mut connector = SlackConnector::new(cfg, target, jobs, web_client)
-        .with_max_clean_repetitions(options.max_clean_repetitions);
+        .with_max_clean_repetitions(options.max_clean_repetitions)
+        .with_binary_cache_enabled(options.binary_cache_enabled);
     if let Some(resolver) = intent_resolver {
         connector = connector.with_intent_resolver(resolver, options.intent_rate_limit_per_minute);
     }

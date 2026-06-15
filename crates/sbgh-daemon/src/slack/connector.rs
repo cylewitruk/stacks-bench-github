@@ -59,6 +59,7 @@ pub struct SlackConnector {
     intent_resolver: Option<Arc<dyn IntentResolver>>,
     intent_rate_limit_per_minute: u32,
     max_clean_repetitions: u32,
+    binary_cache_enabled: bool,
     intent_calls: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
@@ -77,12 +78,18 @@ impl SlackConnector {
             intent_resolver: None,
             intent_rate_limit_per_minute: 0,
             max_clean_repetitions: 5,
+            binary_cache_enabled: false,
             intent_calls: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_max_clean_repetitions(mut self, max_clean_repetitions: u32) -> Self {
         self.max_clean_repetitions = max_clean_repetitions.max(1);
+        self
+    }
+
+    pub fn with_binary_cache_enabled(mut self, enabled: bool) -> Self {
+        self.binary_cache_enabled = enabled;
         self
     }
 
@@ -133,16 +140,22 @@ impl SlackConnector {
             .await;
             return;
         }
-        // TEMPORARY(v15 Phase 3): remove once repeat chaining is wired into the runner.
+        if spec.clean_repetitions > 1 && !self.binary_cache_enabled {
+            self.reject(&event, "clean repetitions require the binary cache to be enabled")
+                .await;
+            return;
+        }
+        // TEMPORARY(v15 Phase 3/5): runtime chaining is wired, but group-level
+        // reporting still needs to suppress per-run card/comment/check fan-out.
         if spec.clean_repetitions > 1 {
             self.reject(
                 &event,
-                "clean repetitions are not enabled yet — please request one repetition for now",
+                "clean repetitions are not fully enabled yet — please request one repetition for \
+                 now",
             )
             .await;
             return;
         }
-
         // 3. Enqueue an ad-hoc job. Default repo (target ids) + rev (`--rev` override,
         //    else the configured default); the parsed workload becomes `bench_args`;
         //    channel/message_ts ride along as reporting provenance.
@@ -551,7 +564,8 @@ mod tests {
     fn harness() -> (SlackConnector, Arc<InMemoryJobStore>, Arc<FakeSlackClient>) {
         let store = Arc::new(InMemoryJobStore::new());
         let client = Arc::new(FakeSlackClient::default());
-        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone());
+        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
+            .with_binary_cache_enabled(true);
         (connector, store, client)
     }
 
@@ -570,6 +584,7 @@ mod tests {
         let store = Arc::new(InMemoryJobStore::new());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
+            .with_binary_cache_enabled(true)
             .with_intent_resolver(resolver.clone(), rate_limit_per_minute);
         (connector, store, client, resolver)
     }
@@ -577,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_request_enqueues_and_reacts_once() {
         let (c, store, slack) = harness();
-        c.handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 5"))
+        c.handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 1"))
             .await;
 
         // Exactly one ad-hoc job, with the resolved workload + default rev.
@@ -605,7 +620,7 @@ mod tests {
                 assert_eq!(channel, "C1");
                 assert_eq!(message_ts, "1700000000.000100");
                 assert_eq!(bench_args, vec!["--block", "184231", "--repetitions", "1"]);
-                assert_eq!(clean_repetitions, 5);
+                assert_eq!(clean_repetitions, 1);
             }
             other => panic!("expected SlackAdhoc detail, got {other:?}"),
         }
@@ -805,11 +820,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_repetitions_above_one_are_rejected_until_runtime_chaining_lands() {
+    async fn clean_repetitions_above_one_require_binary_cache() {
         let store = Arc::new(InMemoryJobStore::new());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
-            .with_max_clean_repetitions(5);
+            .with_max_clean_repetitions(5)
+            .with_binary_cache_enabled(false);
+
+        connector
+            .handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 2"))
+            .await;
+
+        assert!(store.all_jobs().is_empty(), "cache-off multi-run request must not enqueue");
+        assert!(
+            client
+                .reactions
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "rejected request must not get accepted reaction",
+        );
+        let eph = client
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("binary cache"),
+            "{}",
+            eph[0].2
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_repetitions_above_one_are_gated_until_group_reporting_lands() {
+        let store = Arc::new(InMemoryJobStore::new());
+        let client = Arc::new(FakeSlackClient::default());
+        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
+            .with_max_clean_repetitions(5)
+            .with_binary_cache_enabled(true);
 
         connector
             .handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 2"))
@@ -822,7 +873,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .is_empty(),
-            "multi-run request must not get accepted reaction yet",
+            "gated request must not get accepted reaction",
         );
         let eph = client
             .ephemerals
@@ -832,7 +883,7 @@ mod tests {
         assert!(
             eph[0]
                 .2
-                .contains("not enabled yet"),
+                .contains("not fully enabled yet"),
             "{}",
             eph[0].2
         );

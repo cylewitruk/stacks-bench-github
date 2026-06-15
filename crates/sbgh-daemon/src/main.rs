@@ -216,6 +216,10 @@ async fn main() -> anyhow::Result<()> {
             config
                 .runner
                 .max_clean_repetitions,
+            config
+                .artifacts
+                .binary_cache
+                .enabled,
         ))
     } else {
         None
@@ -270,7 +274,8 @@ async fn main() -> anyhow::Result<()> {
 
     // The reporter posts Slack ad-hoc results through the same Web API client
     // the socket connector uses (one bot token, one client).
-    let mut runner = Runner::new(config, runnable_jobs, gh, shell.clone());
+    let mut runner = Runner::new(config, runnable_jobs, gh, shell.clone())
+        .with_repeat_planning(jobs_store.clone());
     if let Some((_, _, _, web_client, ..)) = &slack_runtime {
         runner = runner.with_slack(web_client.clone());
     }
@@ -314,6 +319,7 @@ async fn main() -> anyhow::Result<()> {
                 intent_resolver,
                 intent_rate_limit,
                 max_clean_repetitions,
+                binary_cache_enabled,
             )) = slack_runtime
             {
                 if let Err(e) = slack::socket::run(
@@ -325,6 +331,7 @@ async fn main() -> anyhow::Result<()> {
                     slack::socket::SocketRunOptions {
                         intent_rate_limit_per_minute: intent_rate_limit,
                         max_clean_repetitions,
+                        binary_cache_enabled,
                     },
                     shutdown.draining.clone(),
                 )

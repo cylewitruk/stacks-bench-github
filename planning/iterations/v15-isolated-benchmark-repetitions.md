@@ -6,15 +6,15 @@ daemon-orchestrated VM executions under one benchmark group, not
 
 > **Status:** in_progress
 >
-> Phase 1 is implemented and ready for review. Requests now carry a
-> daemon-owned clean-repeat count, enforce a conservative cap before enqueue,
-> and normalize every single VM invocation to `stacks-bench --repetitions 1`.
-> Phase 2's deploy-safe planning foundation is implemented: requested clean-run
-> counts are persisted on `benchmark_spec`, and both stores expose tested
-> append/resume primitives for the lazy run chain. Automatic runtime chaining
-> remains deferred until the Phase 3/4 carry-forward + single-surface execution
-> pieces land, so the Slack surface temporarily rejects requests above one
-> clean repetition instead of silently under-delivering.
+> Phase 1 is implemented and reviewed: requests carry a daemon-owned
+> clean-repeat count, enforce a conservative cap before enqueue, and normalize
+> every VM invocation to `stacks-bench --repetitions 1`. Phase 2 is implemented
+> and reviewed: requested clean-run counts are persisted on `benchmark_spec`,
+> and both stores expose tested append/resume primitives for the lazy run chain.
+> Phase 3 runtime chaining is in progress: startup resume and after-completion
+> append hooks now drive the internal chain, but multi-run Slack requests remain
+> gated until group-level reporting can suppress per-run card/comment/check
+> fan-out. SQLite carry-forward and aggregate reporting remain Phase 4/5.
 
 ## Items
 
@@ -159,11 +159,9 @@ in-process repetitions.
 - [x] The `job_benchmark_spec_run_unique` constraint catches duplicate indexes.
 - [x] Existing `claim_next_queued` still claims ordinary job rows.
 - [x] Build-only/cache-warm jobs remain single-run.
-- [x] User-facing Slack requests for `clean_repetitions > 1` reject loudly until
-  the runtime chain is activated.
-- [ ] Runtime completion/startup hooks call the append/resume primitives after
-  Phase 3/4 can carry the DB and update one group surface without per-run
-  fan-out.
+- [x] User-facing Slack requests for `clean_repetitions > 1` rejected loudly
+  until the runtime chain was activated.
+- [x] Runtime completion/startup hooks call the append/resume primitives.
 
 ### Phase 3: Build Reuse + Sequential Execution
 
@@ -173,6 +171,8 @@ in-process repetitions.
 
 - Factor the execution path so the group build/artifact step happens once per
   build target (or cache hit) and each measured run consumes that artifact.
+  In this iteration, multi-run requests require the binary cache because it is
+  the current artifact-reuse mechanism.
 - Ensure every repeat gets a fresh source snapshot, VM, and bench process.
 - Keep the group host-pinned for all repeats.
 - Trigger the lazy enqueue of the next run only from the prior run's successful
@@ -191,13 +191,21 @@ in-process repetitions.
 
 **Acceptance & Validation:**
 
-- [ ] N clean repeats do not run build->bench N times.
+- [ ] N clean repeats do not run build->bench N times when the binary cache is
+  enabled.
 - [ ] Every measured repeat still runs in a fresh VM/snapshot.
 - [ ] Cache hits and build misses both preserve the same repeat semantics.
 - [ ] A failed run stops the lazy-enqueue chain and leaves visible partial
   group state.
 - [ ] A repeat group produces one user-facing Slack/GitHub surface, not one
   card/comment/check per run.
+- [x] Multi-run Slack requests are rejected when the binary cache is disabled,
+  avoiding an N-build fallback path.
+- [x] Multi-run Slack requests are still rejected when the binary cache is
+  enabled, until the single group reporting surface lands.
+- [x] The runner resumes missing next-repeat jobs at startup.
+- [x] The runner appends the next repeat after terminal completion persistence;
+  append errors are logged as retryable and do not fail the completed run.
 
 ### Phase 4: SQLite Carry-Forward
 
