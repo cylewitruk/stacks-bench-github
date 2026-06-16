@@ -138,10 +138,13 @@ pub struct CardCtx<'a> {
     pub repeat: Option<RepeatContext>,
     /// Set when the Build phase was served from the binary cache (item 0025,
     /// v9) — the short fingerprint digest, surfaced as the Build row's
-    /// subtext ("Reused cached build · …") instead of the plain "Built
+    /// title ("Reused cached build · …") instead of the plain "Built
     /// benchmark binaries". `None` for a normal build (and the pre-claim /
     /// queue cards).
     pub cached_build: Option<&'a str>,
+    /// Set while a cache-hit binary is being staged onto the source disk. This
+    /// keeps a cache hit from presenting as a build VM.
+    pub cached_build_staging: bool,
 }
 
 /// Per-row display strings — the tense-progressing titles + italic detail
@@ -347,21 +350,26 @@ fn card_row(ctx: &CardCtx, i: usize, state: RowState) -> CardRow {
         RowState::Done => (text.done_title, PlanTaskStatus::Complete, None, None),
         RowState::Errored(reason) => (text.active_title, PlanTaskStatus::Error, None, Some(reason)),
     };
-    // Build row (item 0025, v9): when this run reused a cached binary, its
-    // terminal subtext notes the reused build instead of an empty "Built
-    // benchmark binaries".
-    let output: Option<String> = if i == 1
-        && matches!(status, PlanTaskStatus::Complete)
-        && let Some(id) = ctx.cached_build
-    {
-        Some(format!("Reused cached build · {id}"))
-    } else {
-        output.map(str::to_string)
-    };
+    let mut title = title.to_string();
+    let mut details = details.map(str::to_string);
+    let mut output = output.map(str::to_string);
+    // Build row (item 0025/v16): a cache hit has a host-side staging step and
+    // then a reused-build terminal title, never the build-VM wording.
+    if i == 1 {
+        if matches!(status, PlanTaskStatus::InProgress) && ctx.cached_build_staging {
+            title = "Staging cached binary".to_string();
+            details = Some("Preparing the cached stacks-bench binary".to_string());
+        } else if matches!(status, PlanTaskStatus::Complete)
+            && let Some(id) = ctx.cached_build
+        {
+            title = format!("Reused cached build · {id}");
+            output = None;
+        }
+    }
     CardRow {
-        title: title.to_string(),
+        title,
         status,
-        details: details.map(str::to_string),
+        details,
         output,
         source: row_source(ctx, i),
     }
@@ -928,6 +936,7 @@ mod tests {
             bench_args: &args,
             repeat: Some(RepeatContext { index: 0, total: 10 }),
             cached_build: None,
+            cached_build_staging: false,
         };
         let v = queued(&ctx, None);
         let blocks = v.as_array().unwrap();
@@ -958,6 +967,7 @@ mod tests {
             bench_args: &args,
             repeat: None,
             cached_build: None,
+            cached_build_staging: false,
         };
         let s = queued(&ctx, None).to_string();
         assert!(s.contains("*1* repetition"), "{s}");
@@ -1107,6 +1117,7 @@ mod tests {
             bench_args: &[],
             repeat: None,
             cached_build: None,
+            cached_build_staging: false,
         }
     }
 
@@ -1122,11 +1133,15 @@ mod tests {
             bench_args: &[],
             repeat: None,
             cached_build: Some("abc123def456"),
+            cached_build_staging: false,
         };
         // Stage 2 (Run active) → the Build row is done.
         let s = running(&cached, 2).to_string();
-        assert!(s.contains("Reused cached build · abc123def456"), "cached subtext: {s}");
-        assert!(s.contains("Built benchmark binaries"), "Build row keeps its done title: {s}");
+        assert!(s.contains("Reused cached build · abc123def456"), "cached build title: {s}");
+        assert!(
+            !s.contains("Built benchmark binaries"),
+            "cache hit should not use the normal build-complete title: {s}"
+        );
         // A normal build (the default ctx, no cache) has no such subtext.
         assert!(
             !running(&ctx(), 2)
@@ -1200,6 +1215,7 @@ mod tests {
             bench_args: &[],
             repeat: Some(RepeatContext { index: 1, total: 3 }),
             cached_build: None,
+            cached_build_staging: false,
         };
 
         let s = running(&repeat_ctx, 2).to_string();
@@ -1291,6 +1307,7 @@ mod tests {
             bench_args: &[],
             repeat: None,
             cached_build: None,
+            cached_build_staging: false,
         };
         let s = running(&pre, 0).to_string();
         assert!(s.contains("Benchmarking feat/x"), "rev-only title: {s}");
@@ -1310,6 +1327,7 @@ mod tests {
             bench_args: &[],
             repeat: None,
             cached_build: None,
+            cached_build_staging: false,
         };
         let v = queued(&pre, Some("position 3/5, waiting 15m"));
         let tasks = v.as_array().unwrap()[2]["tasks"]
@@ -1338,6 +1356,7 @@ mod tests {
             bench_args: &[],
             repeat: None,
             cached_build: None,
+            cached_build_staging: false,
         };
         let s = queued(&pre, None).to_string();
         assert!(s.contains("Waiting for an available slot"), "{s}");

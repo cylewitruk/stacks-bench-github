@@ -43,8 +43,8 @@ mount -t virtiofs "$SHARE_TAG" "$RESULTS" || die "failed to mount virtio-fs $SHA
 phase "starting"
 
 # --- mount source disk (vdc) --------------------------------------------------------
-# Already chown'd to root by the build phase + has target/release/
-# populated; we just mount it as-is.
+# Already chown'd to root by the build phase or host-side cache seed + has
+# target/release populated; we just mount it as-is.
 mkdir -p "$SRC"
 mount /dev/disk/by-label/sbgh-src "$SRC" || die "failed to mount source disk"
 

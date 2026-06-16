@@ -3,8 +3,9 @@
 //! For each job:
 //!   1. Prepare a fresh artifact directory.
 //!   2. Refresh the bare git mirror, fetch the PR head SHA.
-//!   3. Provision: boot qcow2 overlay, source raw+ext4 (cloned + checked out),
-//!      LVM-thin chainstate snapshot, host tmpfs for results, cloud-init ISO.
+//!   3. Provision: boot qcow2 overlay, source raw+ext4 (either a full checkout
+//!      or a minimal cached-binary disk), LVM-thin chainstate snapshot, host
+//!      tmpfs for results, cloud-init ISO.
 //!   4. Render the domain XML, `virsh define`, `virsh start`.
 //!   5. Poll loop (1s cadence): emit phase changes via the `PhaseListener`;
 //!      finish when phase=done OR domain transitions to shut-off OR timeout.
@@ -16,7 +17,7 @@
 //! provisioning has begun comes back as `Ok(BenchmarkOutcome { status: Failed,
 //! .. })` so the runner can still record forensics on the job row.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -229,6 +230,12 @@ struct JobArtifacts {
     tmpfs: Option<ResultsTmpfs>,
     domain_defined: bool,
     domain_started: bool,
+}
+
+#[derive(Clone, Debug)]
+enum BuildPlan {
+    CacheHit { binary: PathBuf, digest: String },
+    Miss,
 }
 
 /// The driver's per-run inputs threaded through provisioning: the target
@@ -490,16 +497,26 @@ impl LibvirtDriver {
         vcpu_cpuset: Option<&str>,
     ) -> anyhow::Result<FinishReason> {
         // ── one-time provisioning shared by both phases ────────────────
-        let cidata = self
-            .provision_artifacts(inputs, job_id, job_dir, arts)
+        // v16: fetch the commit into the bare mirror first (fingerprinting
+        // reads toolchain files from it), then resolve the binary-cache plan
+        // before any source-disk write. A hit can therefore provision a minimal
+        // source disk instead of doing a full checkout and chown.
+        self.prepare_git_mirror(inputs, job_id)
+            .await?;
+        let plan = self
+            .resolve_build_plan(inputs)
+            .await;
+        let (cidata, plan) = self
+            .provision_artifacts(inputs, job_id, job_dir, arts, plan, listener)
             .await?;
 
         // ── phase 1: build VM (skipped on a binary-cache hit) ─────────
-        // item 0025 (v9): if a fingerprint-matched binary is cached, stage it
-        // onto the source disk and skip the build VM entirely. Gated by
+        // item 0025 (v9) + v16: if a fingerprint-matched binary is cached, the
+        // source disk has already been provisioned with just that binary, so
+        // skip the build VM entirely. Gated by
         // `[artifacts.binary_cache].enabled` — disabled (default) always builds.
         let reused = self
-            .try_reuse_cached_binary(inputs, arts, job_dir, listener)
+            .mark_cached_binary_reused(inputs, &plan, listener)
             .await;
         let mut published = false;
         if !reused {
@@ -577,26 +594,18 @@ impl LibvirtDriver {
         Ok(bench_reason)
     }
 
-    /// Binary-cache hit path (item 0025, v9): if a fingerprint-matched binary
-    /// is cached, seed it into the **source disk** (where the bench VM
-    /// execs it) and report the build phase done, returning `true` to skip
-    /// the build VM. Best-effort — any miss (cache miss, missing/unreadable
-    /// `rust-toolchain(.toml)`, seed error) returns `false` and the caller
-    /// builds normally. No-op (returns `false`) when the cache is disabled.
-    ///
-    /// NOTE: the VM-skip orchestration is **not** integration-tested (needs a
-    /// libvirt host); gated behind `[artifacts.binary_cache].enabled`. The
-    /// fingerprint is read from the bare git mirror (no source-disk mount);
-    /// only the seed re-mounts the raw disk.
-    async fn try_reuse_cached_binary(
-        &self,
-        inputs: &RunInputs<'_>,
-        arts: &JobArtifacts,
-        job_dir: &Path,
-        listener: &dyn PhaseListener,
-    ) -> bool {
+    async fn prepare_git_mirror(&self, inputs: &RunInputs<'_>, job_id: &str) -> anyhow::Result<()> {
+        let repo_url = format!("https://github.com/{}.git", inputs.repository);
+        git_mirror::ensure(self.shell.as_ref(), &self.config.paths, &repo_url).await?;
+        git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, inputs.commit).await
+    }
+
+    /// Resolve the binary-cache plan before source-disk provisioning (v16).
+    /// The caller has already fetched `inputs.commit` into the bare mirror, so
+    /// fingerprinting can read `rust-toolchain(.toml)` without a source mount.
+    async fn resolve_build_plan(&self, inputs: &RunInputs<'_>) -> BuildPlan {
         let Some(cache) = self.binary_cache.as_deref() else {
-            return false;
+            return BuildPlan::Miss;
         };
         let Some(fp) = self
             .fingerprint_for(inputs.commit)
@@ -607,42 +616,39 @@ impl LibvirtDriver {
                 "binary cache: no fingerprint (missing/unreadable rust-toolchain(.toml) or golden \
                  image); building"
             );
-            return false;
+            return BuildPlan::Miss;
         };
         let Some(hit) = cache.get(&fp, unix_now()) else {
+            return BuildPlan::Miss;
+        };
+        BuildPlan::CacheHit {
+            binary: hit.path,
+            digest: hit.meta.digest,
+        }
+    }
+
+    /// Report a planned binary-cache hit after provisioning has already seeded
+    /// the minimal source disk. Returns `true` to skip the build VM.
+    async fn mark_cached_binary_reused(
+        &self,
+        inputs: &RunInputs<'_>,
+        plan: &BuildPlan,
+        listener: &dyn PhaseListener,
+    ) -> bool {
+        let BuildPlan::CacheHit { digest, .. } = plan else {
             return false;
         };
-        let Some(source) = arts.source.as_ref() else {
-            return false;
-        };
-        // Seed the binary into the (unmounted) source RAW disk — the bench VM
-        // execs `$SRC/target/release/stacks-bench`, NOT the results share, so a
-        // host-dir copy would be invisible to the VM.
-        let mount_dir = job_dir.join("source.mnt");
-        if let Err(e) = source
-            .seed_binary(self.shell.as_ref(), &mount_dir, &hit.path)
-            .await
-        {
-            tracing::warn!(error = %e, "binary cache: seeding the cached binary into the source disk failed; building");
-            return false;
-        }
-        // Archival parity: mirror into the results share (→ the per-job archive +
-        // `binary_archived_path`).
-        if let Some(t) = arts.tmpfs.as_ref() {
-            let _ = std::fs::copy(&hit.path, t.stacks_bench_binary());
-        }
+        let short = &digest[..digest.len().min(12)];
         tracing::info!(
             commit = inputs.commit,
-            digest = %fp.digest(),
+            digest = %digest,
             "binary cache: reusing cached stacks-bench binary; skipping the build VM"
         );
         // Drive the reporter with a single opaque `build_cached:<digest>` phase
         // (item 0025, v9): each surface interprets it — the Slack card marks the
-        // Build row done with a "Reused cached build · <digest>" subtext; the
+        // Build row done with a "Reused cached build · <digest>" title; the
         // GitHub surface shows "build (cached)". The build VM that normally emits
         // `building`/`build_done` never runs.
-        let digest = fp.digest();
-        let short = &digest[..digest.len().min(12)];
         listener
             .on_phase(&Phase::Other(format!("build_cached:{short}")))
             .await;
@@ -707,13 +713,9 @@ impl LibvirtDriver {
         job_id: &str,
         job_dir: &Path,
         arts: &mut JobArtifacts,
-    ) -> anyhow::Result<CloudInitArtifacts> {
-        // Git mirror.
-        let repo_url = format!("https://github.com/{}.git", inputs.repository);
-        git_mirror::ensure(self.shell.as_ref(), &self.config.paths, &repo_url).await?;
-        git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, inputs.commit)
-            .await?;
-
+        plan: BuildPlan,
+        listener: &dyn PhaseListener,
+    ) -> anyhow::Result<(CloudInitArtifacts, BuildPlan)> {
         // Boot disk — single qcow2 overlay reused across both phases.
         // The bench VM boots from the same disk the build VM left
         // behind; cloud-init's per-instance-id re-run is the mechanism
@@ -723,24 +725,73 @@ impl LibvirtDriver {
                 .await?,
         );
 
-        // Source disk — persists across both phases. Build phase puts
-        // `target/release/stacks-bench` on it; bench phase finds it
-        // already there.
+        // Source disk — persists across both phases. A miss provisions the full
+        // checkout for the build VM. A cache hit provisions only the binary the
+        // bench VM execs, avoiding checkout + full-tree chown.
         let source_mount = job_dir.join("source.mnt");
-        arts.source = Some(
-            SourceDisk::provision(
-                self.shell.as_ref(),
-                &self.config.paths,
-                job_dir,
-                &source_mount,
-                inputs.commit,
-                &self
-                    .config
-                    .server
-                    .service_user,
-            )
-            .await?,
-        );
+        let plan = match plan {
+            BuildPlan::CacheHit { binary, digest } => {
+                let short = &digest[..digest.len().min(12)];
+                listener
+                    .on_phase(&Phase::Other(format!("build_cache_staging:{short}")))
+                    .await;
+                match SourceDisk::provision_minimal(
+                    self.shell.as_ref(),
+                    job_dir,
+                    &source_mount,
+                    &binary,
+                    &self
+                        .config
+                        .server
+                        .service_user,
+                )
+                .await
+                {
+                    Ok(source) => {
+                        arts.source = Some(source);
+                        BuildPlan::CacheHit { binary, digest }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "binary cache: minimal source-disk seed failed; falling back to full checkout + build"
+                        );
+                        arts.source = Some(
+                            SourceDisk::provision(
+                                self.shell.as_ref(),
+                                &self.config.paths,
+                                job_dir,
+                                &source_mount,
+                                inputs.commit,
+                                &self
+                                    .config
+                                    .server
+                                    .service_user,
+                            )
+                            .await?,
+                        );
+                        BuildPlan::Miss
+                    }
+                }
+            }
+            BuildPlan::Miss => {
+                arts.source = Some(
+                    SourceDisk::provision(
+                        self.shell.as_ref(),
+                        &self.config.paths,
+                        job_dir,
+                        &source_mount,
+                        inputs.commit,
+                        &self
+                            .config
+                            .server
+                            .service_user,
+                    )
+                    .await?,
+                );
+                BuildPlan::Miss
+            }
+        };
 
         // Chainstate snapshot — only the bench phase mounts it, but
         // the device is attached to the domain in both phases (build
@@ -766,6 +817,9 @@ impl LibvirtDriver {
         );
         if let (Some(seed_key), Some(tmpfs)) = (inputs.sqlite_seed_key, arts.tmpfs.as_ref()) {
             seed_sqlite_from_store(self.config.as_ref(), seed_key, tmpfs).await?;
+        }
+        if let (BuildPlan::CacheHit { binary, .. }, Some(tmpfs)) = (&plan, arts.tmpfs.as_ref()) {
+            let _ = std::fs::copy(binary, tmpfs.stacks_bench_binary());
         }
 
         // Cloud-init: two ISOs, one per phase, distinct instance-ids
@@ -797,7 +851,7 @@ impl LibvirtDriver {
             },
         )
         .await?;
-        Ok(cidata)
+        Ok((cidata, plan))
     }
 
     /// Render the domain XML at this phase's memory/vcpu/cidata,
@@ -1583,12 +1637,11 @@ mod tests {
         }
     }
 
-    /// Enabled cache + a fingerprint-matched entry: the hit seeds the binary
-    /// into the source disk (executable), reports the build phase done, and
-    /// skips the build VM (no `virsh`). Driver-level regression for the
-    /// build-skip path.
+    /// Enabled cache + a fingerprint-matched entry: the driver resolves the hit
+    /// before source provisioning, creates a minimal binary-only source disk,
+    /// reports the cached build, and skips the build VM.
     #[tokio::test]
-    async fn enabled_cache_hit_seeds_source_disk_and_skips_build_vm() {
+    async fn enabled_cache_hit_uses_minimal_source_disk_and_skips_build_vm() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = test_config(&tmp);
         // `image_proxy_id` needs a real golden-image file; enable the cache.
@@ -1619,69 +1672,91 @@ mod tests {
             .publish(&fp, &cached_bin, 1, false)
             .unwrap();
 
-        // Shell: `git show` (toolchain) then the seed sequence.
+        let cfg = Arc::new(cfg);
+        let job = fake_job();
+        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+        let tmpfs_dir = cfg
+            .paths
+            .results_tmpfs_root
+            .join(job.id.to_string());
+        std::fs::create_dir_all(&tmpfs_dir).unwrap();
+        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 done\n").unwrap();
+
+        // Shell: fetch, `git show` for the fingerprint, minimal source seed,
+        // shared artifacts, bench VM only, teardown.
         let shell = RecordingShell::new();
         shell
+            .expect_ok(1) // git fetch_sha
             .reply(PreparedReply::with_stdout(toolchain)) // git show <sha>:rust-toolchain.toml
+            .expect_ok(1) // qemu-img create
+            .expect_ok(1) // truncate (minimal source)
+            .expect_ok(1) // mkfs.ext4
             .reply(PreparedReply::with_stdout("/dev/loop9\n")) // losetup --show
             .expect_ok(1) // mount
-            .expect_ok(1) // chown
+            .expect_ok(1) // chown empty fs to service user
+            .expect_ok(1) // chown seeded binary tree to root
             .expect_ok(1) // umount
-            .expect_ok(1); // losetup -d
+            .expect_ok(1) // losetup -d
+            .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+            .expect_ok(1) // lvcreate snapshot
+            .expect_ok(1) // mount tmpfs
+            .expect_ok(1) // cloud-localds (build ISO, optional but still rendered)
+            .expect_ok(1) // cloud-localds (bench ISO)
+            // ── NO build VM lifecycle on a cache hit ──
+            .expect_ok(1) // virsh define (bench)
+            .expect_ok(1) // virsh start (bench)
+            .reply(PreparedReply::with_stdout("shut off\n")) // domstate bench
+            .expect_ok(1) // virsh destroy
+            .expect_ok(1) // virsh undefine
+            .expect_ok(1) // umount tmpfs
+            .expect_ok(1) // lvremove
+            .expect_ok(1); // git update-ref -d
         let shell = Arc::new(shell);
 
-        let job_dir = tmp.path().join("jobs/job1");
-        std::fs::create_dir_all(&job_dir).unwrap();
-        let raw = job_dir.join("source.raw");
-        std::fs::write(&raw, b"").unwrap();
-        let results_mnt = tmp.path().join("results-mnt");
-        std::fs::create_dir_all(&results_mnt).unwrap();
-        let arts = JobArtifacts {
-            source: Some(SourceDisk { path: raw }),
-            tmpfs: Some(ResultsTmpfs {
-                mount_dir: results_mnt,
-                size_mib: 256,
-            }),
-            ..Default::default()
-        };
-
-        let driver = LibvirtDriver::new(Arc::new(cfg), shell.clone());
-        let inputs = RunInputs {
-            repository: "acme/widgets",
-            commit: "abc123def456",
-            bench_args: &[],
-            sqlite_seed_key: None,
-            build_only: false,
-        };
+        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
         let listener = RecordingListener::default();
-
-        let reused = driver
-            .try_reuse_cached_binary(&inputs, &arts, &job_dir, &listener)
+        let outcome = driver
+            .run_benchmark(
+                &ctx_of(&job),
+                &task_spec(vec![], false),
+                &listener,
+                &CancellationToken::new(),
+                None,
+            )
             .await;
-        assert!(reused, "fingerprint-matched entry → reuse + skip build");
+        let outcome = outcome.expect("cache-hit benchmark should run");
+        assert_eq!(outcome.status, OutcomeStatus::Ok);
 
-        // The cached binary was seeded where the bench VM execs it.
-        assert_eq!(
-            std::fs::read(job_dir.join("source.mnt/target/release/stacks-bench")).unwrap(),
-            b"CACHED"
-        );
-        // The reporter gets a single opaque `build_cached:<short-digest>` phase
-        // (Build done + the reused-build subtext on the card).
+        // The reporter sees staging, then a cached-build completion.
         assert_eq!(
             *listener
                 .phases
                 .lock()
                 .unwrap(),
-            vec![Phase::Other(format!("build_cached:{}", &fp.digest()[..12]))]
+            vec![
+                Phase::Other(format!("build_cache_staging:{}", &fp.digest()[..12])),
+                Phase::Other(format!("build_cached:{}", &fp.digest()[..12])),
+                Phase::Done,
+            ]
         );
-        // It read the toolchain from the mirror + ran the seed sequence, and
-        // never touched a build VM.
+        // It fetched the commit, read the toolchain, ran the minimal seed
+        // sequence, skipped the checkout/chown-heavy path, and never touched a
+        // build VM.
         let calls = shell.calls();
         assert!(calls.iter().any(|c| {
             c.args
                 .iter()
                 .any(|a| a == "abc123def456:rust-toolchain.toml")
         }));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.program.ends_with("git")
+                    && c.args
+                        .iter()
+                        .any(|a| a == "clone" || a == "checkout")),
+            "cache hit must not checkout a source tree"
+        );
         assert!(calls.iter().any(|c| {
             c.program.ends_with("losetup")
                 && c.args
@@ -1690,7 +1765,10 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| c.program.ends_with("virsh")),
+                .any(|c| c.program.ends_with("virsh")
+                    && c.args
+                        .iter()
+                        .any(|a| a.contains("domain.build.xml"))),
             "no build VM define/start on a cache hit"
         );
     }

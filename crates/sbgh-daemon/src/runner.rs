@@ -694,6 +694,7 @@ impl Coordinator {
             bench_args: &job.bench_args,
             repeat: None,
             cached_build: None,
+            cached_build_staging: false,
         };
         let detail = format!("position {}/{}", ahead + 1, total);
         let card = card::queued_card(&ctx, Some(&detail));

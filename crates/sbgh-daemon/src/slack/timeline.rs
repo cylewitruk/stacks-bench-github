@@ -56,6 +56,8 @@ pub struct SlackTimeline {
     /// as "Reused cached build · …". A `OnceLock` so `ctx()` can borrow it
     /// without the state lock.
     cached_build: std::sync::OnceLock<String>,
+    /// Set when a cache hit is being staged onto the source disk on the host.
+    cached_build_staging: std::sync::OnceLock<String>,
     state: Mutex<State>,
 }
 
@@ -105,6 +107,7 @@ impl SlackTimeline {
             commit,
             commit_url,
             cached_build: std::sync::OnceLock::new(),
+            cached_build_staging: std::sync::OnceLock::new(),
             state: Mutex::new(State {
                 streaming: plan_message_ts.is_some(),
                 plan_ts: plan_message_ts,
@@ -128,7 +131,12 @@ impl SlackTimeline {
             }
             st.last_stream_update_at = Instant::now();
             let (stage, blocks, mut chunks, fallback) = self.render_running_locked(&st, st.stage);
-            chunks.extend(stage_started_event_chunks(stage));
+            chunks.extend(stage_started_event_chunks(
+                stage,
+                self.cached_build_staging
+                    .get()
+                    .is_some(),
+            ));
             (stage, blocks, chunks, fallback)
         };
         self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
@@ -180,11 +188,26 @@ impl SlackTimeline {
                     .get()
                     .map(String::as_str),
             ));
-            chunks.extend(stage_started_event_chunks(stage));
+            chunks.extend(stage_started_event_chunks(
+                stage,
+                self.cached_build_staging
+                    .get()
+                    .is_some(),
+            ));
             (blocks, chunks, fallback)
         };
         self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
             .await;
+    }
+
+    /// The Build phase is being served from a cached binary and the daemon is
+    /// staging that binary onto the source disk. Show this as cached staging,
+    /// not as a build VM.
+    pub async fn mark_build_cache_staging(&self, digest: &str) {
+        let _ = self
+            .cached_build_staging
+            .set(digest.to_string());
+        self.advance(1).await;
     }
 
     /// The Build phase was served from the binary cache (item 0025, v9): record
@@ -364,6 +387,10 @@ impl SlackTimeline {
                 .cached_build
                 .get()
                 .map(String::as_str),
+            cached_build_staging: self
+                .cached_build_staging
+                .get()
+                .is_some(),
         }
     }
 
@@ -566,8 +593,13 @@ impl SlackTimeline {
     }
 }
 
-fn stage_started_event_chunks(stage: usize) -> Vec<StreamChunk> {
+fn stage_started_event_chunks(stage: usize, cached_build_staging: bool) -> Vec<StreamChunk> {
     match stage {
+        1 if cached_build_staging => vec![task_detail_event(
+            1,
+            "Staging cached binary",
+            "Preparing cached stacks-bench binary.",
+        )],
         1 => vec![task_detail_event(1, "Building benchmark binaries", "Starting build VM.")],
         2 => vec![task_detail_event(2, "Running benchmark", "Benchmark started.")],
         3 => vec![task_detail_event(3, "Publishing results", "Publishing results.")],
@@ -581,14 +613,19 @@ fn stage_completed_event_chunks(
     cached_build: Option<&str>,
 ) -> Vec<StreamChunk> {
     match stage {
-        1 => vec![task_output_event(
-            1,
-            "Built benchmark binaries",
-            cached_build
-                .map(|digest| format!("Reused cached build · {digest}"))
-                .or_else(|| outputs[1].clone())
-                .unwrap_or_else(|| "Build completed.".to_string()),
-        )],
+        1 => {
+            let (title, output) = if let Some(digest) = cached_build {
+                (format!("Reused cached build · {digest}"), "Cached binary staged.".to_string())
+            } else {
+                (
+                    "Built benchmark binaries".to_string(),
+                    outputs[1]
+                        .clone()
+                        .unwrap_or_else(|| "Build completed.".to_string()),
+                )
+            };
+            vec![task_output_event(1, &title, output)]
+        }
         2 => vec![task_output_event(
             2,
             "Benchmark run completed",

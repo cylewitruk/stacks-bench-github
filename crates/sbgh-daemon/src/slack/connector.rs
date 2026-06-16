@@ -302,6 +302,7 @@ impl SlackConnector {
                 total: clean_repetitions as i32,
             }),
             cached_build: None,
+            cached_build_staging: false,
         };
         let card = card::queued_card(&ctx, None);
         let fallback = format!("Benchmarking {rev}");

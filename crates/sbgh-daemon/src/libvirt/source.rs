@@ -1,5 +1,7 @@
-//! Per-job source disk: a sparse raw file, ext4-formatted on the host, with
-//! `stacks-core` checked out at the PR's head SHA. Attached to the VM as `vdc`.
+//! Per-job source disk: a sparse raw file, ext4-formatted on the host. The
+//! normal path checks out `stacks-core` at the job SHA; the cache-hit path
+//! creates a minimal disk containing only `target/release/stacks-bench`.
+//! Attached to the VM as `vdc`.
 //!
 //! Steps:
 //!   1. `truncate -s 8G <source.raw>` (host-writable)
@@ -99,39 +101,34 @@ impl SourceDisk {
         }
     }
 
-    pub fn teardown(self) -> std::io::Result<()> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Re-attach + mount this (already-provisioned, unmounted) raw disk, seed
-    /// `binary` at `target/release/stacks-bench` — where `sbgh-bench.sh.tmpl`
-    /// execs it — chown the tree to root to match the build VM's hand-off, then
-    /// unmount + detach (guaranteed, even on error). The v9 binary-cache
-    /// build-skip uses this to hand the bench VM a source disk carrying a
-    /// prebuilt binary, with no build VM. Same cleanup invariant as
-    /// [`provision`](Self::provision): once `losetup`/`mount` succeed, they
-    /// MUST be torn down before returning.
-    pub async fn seed_binary(
-        &self,
+    /// Build a minimal source disk for a binary-cache hit: format the raw disk
+    /// and seed only `target/release/stacks-bench`. No git checkout is needed
+    /// because the bench VM only execs the binary from `$SRC`.
+    pub async fn provision_minimal(
         shell: &dyn Shell,
+        job_dir: &Path,
         mount_dir: &Path,
         binary: &Path,
-    ) -> anyhow::Result<()> {
+        service_user: &str,
+    ) -> anyhow::Result<Self> {
+        let raw = job_dir.join("source.raw");
+        let raw_s = raw.display().to_string();
         std::fs::create_dir_all(mount_dir)?;
-        let raw_s = self
-            .path
-            .display()
-            .to_string();
 
-        // losetup — MUST detach before returning, regardless of outcome.
+        let out = shell
+            .run(spec(Path::new("/usr/bin/truncate"), &["-s", SOURCE_SIZE, &raw_s]))
+            .await?;
+        check(&out, &format!("truncate {raw_s}"))?;
+
+        let out = shell
+            .run(spec_priv(Path::new("/usr/sbin/mkfs.ext4"), &["-F", "-L", "sbgh-src", &raw_s]))
+            .await?;
+        check(&out, &format!("mkfs.ext4 {raw_s}"))?;
+
         let out = shell
             .run(spec_priv(Path::new("/usr/sbin/losetup"), &["-fP", "--show", &raw_s]))
             .await?;
-        check(&out, "losetup attach (seed)")?;
+        check(&out, "losetup attach (minimal seed)")?;
         let loop_dev = String::from_utf8(out.stdout)?
             .trim()
             .to_string();
@@ -139,19 +136,28 @@ impl SourceDisk {
             anyhow::bail!("losetup returned empty loop device");
         }
 
-        let seed_result = mount_and_seed(shell, &loop_dev, mount_dir, binary).await;
+        let seed_result =
+            mount_and_seed_minimal(shell, &loop_dev, mount_dir, binary, service_user).await;
         let detach_result = detach_loop(shell, &loop_dev).await;
 
         match (seed_result, detach_result) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => Ok(Self { path: raw }),
             (Ok(()), Err(detach_err)) => Err(detach_err.context(format!(
-                "loop device {loop_dev} still attached after seed; refusing to hand off"
+                "loop device {loop_dev} still attached after minimal seed; refusing to hand off"
             ))),
             (Err(seed_err), Ok(())) => Err(seed_err),
             (Err(seed_err), Err(detach_err)) => {
-                tracing::warn!(error = %detach_err, "losetup -d also failed during seed cleanup");
+                tracing::warn!(error = %detach_err, "losetup -d also failed during minimal seed cleanup");
                 Err(seed_err)
             }
+        }
+    }
+
+    pub fn teardown(self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
     }
 }
@@ -255,13 +261,12 @@ async fn populate_checkout(
     Ok(())
 }
 
-/// Mount the loop device, seed the binary, then unmount — same
-/// guaranteed-unmount structure as [`mount_and_populate`].
-async fn mount_and_seed(
+async fn mount_and_seed_minimal(
     shell: &dyn Shell,
     loop_dev: &str,
     mount_dir: &Path,
     binary: &Path,
+    service_user: &str,
 ) -> anyhow::Result<()> {
     let mount_s = mount_dir
         .display()
@@ -270,18 +275,25 @@ async fn mount_and_seed(
     let out = shell
         .run(spec_priv(Path::new("/usr/bin/mount"), &[loop_dev, &mount_s]))
         .await?;
-    check(&out, &format!("mount {loop_dev} -> {mount_s} (seed)"))?;
+    check(&out, &format!("mount {loop_dev} -> {mount_s} (minimal seed)"))?;
 
-    let inner = seed_into_mount(shell, mount_dir, binary).await;
+    // Fresh ext4 roots are owned by root; make the empty mount writable by the
+    // daemon before the host-side copy. This is cheap because there is no
+    // checkout tree yet.
+    let chown_result = chown_mount(shell, &mount_s, service_user).await;
+    let inner = match chown_result {
+        Ok(()) => seed_into_mount(shell, mount_dir, binary).await,
+        Err(e) => Err(e),
+    };
     let unmount_result = unmount(shell, &mount_s).await;
 
     match (inner, unmount_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(unmount_err)) => Err(unmount_err
-            .context(format!("{mount_s} still mounted after seed; refusing to hand off"))),
+            .context(format!("{mount_s} still mounted after minimal seed; refusing to hand off"))),
         (Err(seed_err), Ok(())) => Err(seed_err),
         (Err(seed_err), Err(unmount_err)) => {
-            tracing::warn!(error = %unmount_err, "umount also failed during seed cleanup");
+            tracing::warn!(error = %unmount_err, "umount also failed during minimal seed cleanup");
             Err(seed_err)
         }
     }
@@ -309,6 +321,16 @@ async fn seed_into_mount(shell: &dyn Shell, mount_dir: &Path, binary: &Path) -> 
         .run(spec_priv(Path::new("/usr/bin/chown"), &["-R", "root:root", &mount_s]))
         .await?;
     check(&out, &format!("chown -R root:root {mount_s} (seed)"))
+}
+
+async fn chown_mount(shell: &dyn Shell, mount_s: &str, service_user: &str) -> anyhow::Result<()> {
+    let out = shell
+        .run(spec_priv(
+            Path::new("/usr/bin/chown"),
+            &["-R", &format!("{service_user}:{service_user}"), mount_s],
+        ))
+        .await?;
+    check(&out, &format!("chown -R {service_user} {mount_s}"))
 }
 
 async fn unmount(shell: &dyn Shell, mount_s: &str) -> anyhow::Result<()> {
@@ -445,6 +467,54 @@ mod tests {
             calls[9]
                 .args
                 .contains(&"-d".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn minimal_provision_seeds_binary_without_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let job_dir = tmp.path().join("jobs/job1");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        let mount_dir = tmp.path().join("mnt");
+        let binary = tmp
+            .path()
+            .join("cached-stacks-bench");
+        std::fs::write(&binary, b"CACHED").unwrap();
+
+        let shell = RecordingShell::new();
+        shell
+            .expect_ok(1) // truncate
+            .expect_ok(1) // mkfs.ext4
+            .reply(PreparedReply::with_stdout("/dev/loop9\n")) // losetup -fP
+            .expect_ok(1) // mount
+            .expect_ok(1) // chown empty fs to service user
+            .expect_ok(1) // chown seeded tree to root
+            .expect_ok(1) // umount
+            .expect_ok(1); // losetup -d
+
+        let disk = SourceDisk::provision_minimal(&shell, &job_dir, &mount_dir, &binary, "sbgh")
+            .await
+            .unwrap();
+
+        assert_eq!(disk.path, job_dir.join("source.raw"));
+        assert_eq!(
+            std::fs::read(mount_dir.join("target/release/stacks-bench")).unwrap(),
+            b"CACHED"
+        );
+
+        let calls = shell.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.program.ends_with("git")),
+            "minimal cache-hit source disk must not checkout a tree"
+        );
+        assert!(
+            !calls.iter().any(|c| c
+                .args
+                .iter()
+                .any(|a| a == "lost+found")),
+            "minimal path does not prepare a git clone destination"
         );
     }
 
@@ -600,88 +670,5 @@ mod tests {
                     .contains(&"-d".to_string())
         });
         assert!(detach_ran, "losetup -d must run after mount failure");
-    }
-
-    /// v9 binary cache: `seed_binary` re-attaches + mounts the raw disk, copies
-    /// the binary to `target/release/stacks-bench` (where the bench VM execs
-    /// it), chowns to root, then unmounts + detaches.
-    #[tokio::test]
-    async fn seed_binary_mounts_seeds_chowns_and_detaches() {
-        let tmp = TempDir::new().unwrap();
-        let job_dir = tmp.path().join("jobs/job1");
-        std::fs::create_dir_all(&job_dir).unwrap();
-        let mount_dir = tmp.path().join("mnt");
-        let binary = tmp
-            .path()
-            .join("cached-stacks-bench");
-        std::fs::write(&binary, b"BINARY").unwrap();
-
-        let shell = RecordingShell::new();
-        shell
-            .reply(PreparedReply::with_stdout("/dev/loop7\n")) // losetup -fP
-            .expect_ok(1) // mount
-            .expect_ok(1) // chown
-            .expect_ok(1) // umount
-            .expect_ok(1); // losetup -d
-
-        let disk = SourceDisk {
-            path: job_dir.join("source.raw"),
-        };
-        disk.seed_binary(&shell, &mount_dir, &binary)
-            .await
-            .unwrap();
-
-        // The binary landed where the bench VM execs it, with an executable mode.
-        let seeded = mount_dir.join("target/release/stacks-bench");
-        assert_eq!(std::fs::read(&seeded).unwrap(), b"BINARY");
-        assert_eq!(
-            std::fs::metadata(&seeded)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755,
-            "seeded binary is executable"
-        );
-
-        let calls = shell.calls();
-        assert!(
-            calls[0]
-                .program
-                .ends_with("losetup")
-                && calls[0]
-                    .args
-                    .contains(&"--show".to_string())
-        );
-        assert!(
-            calls[1]
-                .program
-                .ends_with("mount")
-                && calls[1]
-                    .args
-                    .contains(&"/dev/loop7".to_string())
-        );
-        assert!(
-            calls[2]
-                .program
-                .ends_with("chown")
-                && calls[2]
-                    .args
-                    .iter()
-                    .any(|a| a == "root:root")
-        );
-        assert!(
-            calls[3]
-                .program
-                .ends_with("umount")
-        );
-        assert!(
-            calls[4]
-                .program
-                .ends_with("losetup")
-                && calls[4]
-                    .args
-                    .contains(&"-d".to_string())
-        );
     }
 }

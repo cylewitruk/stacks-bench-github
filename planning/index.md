@@ -59,6 +59,7 @@ need editing when an item's status or location changes.
 | `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `backlog` | [backlog.md](backlog.md) |
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
 | `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `backlog` | [backlog.md](backlog.md) |
+| `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `in_progress` | [iterations/v16-cache-hit-minimal-source-disk.md](iterations/v16-cache-hit-minimal-source-disk.md) |
 
 ## Iterations
 
@@ -76,6 +77,7 @@ need editing when an item's status or location changes.
 | `v13-llm-intent-resolution` | LLM intent resolution | `shipped` | [archive/completed/0020-llm-intent-resolution.md](archive/completed/0020-llm-intent-resolution.md) |
 | `v14-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 | `v15-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `in_progress` | [iterations/v15-isolated-benchmark-repetitions.md](iterations/v15-isolated-benchmark-repetitions.md) |
+| `v16-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `in_progress` | [iterations/v16-cache-hit-minimal-source-disk.md](iterations/v16-cache-hit-minimal-source-disk.md) |
 
 ## Decisions
 
