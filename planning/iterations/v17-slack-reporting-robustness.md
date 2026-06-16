@@ -7,16 +7,16 @@ currently doesn't exist (`0045`).
 
 > **Status:** in_progress
 >
-> Phase 0 design ready for review. Phase 1 is a correctness fix (the double-card
-> race); Phases 2-3 are UX + observability and are independent of it.
+> All three phases implemented + unit/integration-tested (full suite green:
+> `just build`/`just lint`/`just test`). Pending Codex review + host smoke.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0043-slack-plan-ts-race` | primary | in_progress |
-| `0044-slack-reaction-lifecycle` | primary | in_progress |
-| `0045-slack-llm-observability` | primary | in_progress |
+| `0043-slack-plan-ts-race` | primary | implemented |
+| `0044-slack-reaction-lifecycle` | primary | implemented |
+| `0045-slack-llm-observability` | primary | implemented |
 
 ## Why
 
@@ -42,7 +42,7 @@ currently doesn't exist (`0045`).
 
 - `0043`: make run 0's queued-card `ts` atomic with job creation, and repost
   (rather than go dark) if an inherited message is genuinely gone.
-- `0044`: reaction lifecycle 💬 (ack) → ⏳ (queued) → 🚀 (running) → ✅/❌
+- `0044`: reaction lifecycle 👀 (ack) → ⏳ (queued) → 🚀 (running) → ✅/❌
   (terminal), group-aware for repeats.
 - `0045`: info-level LLM + connector lifecycle logging; payloads at debug; no
   secrets.
@@ -113,8 +113,8 @@ inherited-but-missing message reposts instead of reporting nowhere.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
+- [x] Core implementation
+- [x] Unit/integration tests
 - [ ] Reviewed
 - [ ] Validated
 
@@ -138,9 +138,9 @@ inherited-but-missing message reposts instead of reporting nowhere.
 
 **Scope:**
 
-- Add `ACK_REACTION` (`speech_balloon` 💬) and `RUNNING_REACTION` (`rocket` 🚀).
-- Connector: add 💬 immediately after authz, **before** resolution (covers the
-  LLM round-trip). On accept → swap 💬→⏳. On reject/unauthorized → remove 💬 (the
+- Add `ACK_REACTION` (`eyes` 👀) and `RUNNING_REACTION` (`rocket` 🚀).
+- Connector: add 👀 immediately after authz, **before** resolution (covers the
+  LLM round-trip). On accept → swap 👀→⏳. On reject/unauthorized → remove 👀 (the
   ephemeral reply stays).
 - Timeline: at started/running, swap ⏳→🚀 for run 0 only; later repeats are
   no-ops (group already running). At terminal, swap the current reaction (🚀) →
@@ -150,19 +150,19 @@ inherited-but-missing message reposts instead of reporting nowhere.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
+- [x] Core implementation
+- [x] Unit/integration tests
 - [ ] Reviewed
 - [ ] Validated
 
 **Acceptance & Validation:**
 
-- [ ] A mention gets 💬 before the LLM resolves.
+- [ ] A mention gets 👀 before the LLM resolves.
 - [ ] Accepted → ⏳ → 🚀 → ✅/❌, each transition removing the prior reaction (no
   accumulation).
 - [ ] A repeat group transitions once per group: 🚀 persists across intermediate
   repeats, the final run swaps to ✅, a failed/cancelled run swaps to ❌.
-- [ ] Every post-ack rejection path removes the 💬 (tested): parser failure, LLM
+- [ ] Every post-ack rejection path removes the 👀 (tested): parser failure, LLM
   invalid/failure, over-cap, and cache-gate rejection all leave no stray ack.
 
 ### Phase 3: Slack & LLM observability (`0045`)
@@ -184,8 +184,8 @@ log level.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
+- [x] Core implementation
+- [x] Unit/integration tests
 - [ ] Reviewed
 - [ ] Validated
 
@@ -198,11 +198,11 @@ log level.
 
 ## Final Validation
 
-- [ ] `just build`
-- [ ] `just lint`
-- [ ] `just test`
+- [x] `just build`
+- [x] `just lint`
+- [x] `just test` (905 passed, 1 skipped — the ignored real-OpenAI eval)
 - [ ] Host smoke: a Slack 2-3 repeat request posts exactly one plan card (no
-  double), reactions advance 💬→⏳→🚀→✅, run 1+ resume the same card with no
+  double), reactions advance 👀→⏳→🚀→✅, run 1+ resume the same card with no
   `message_not_found`/dead-message fallback, and the journal shows the LLM
   request/response + lifecycle at info.
 

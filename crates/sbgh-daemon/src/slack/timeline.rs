@@ -25,7 +25,9 @@ use crate::bench_summary::RunResult;
 use crate::job_source::{RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
 use crate::slack::card::{self, CardCtx, RepeatContext, RepeatSummary, Results, STAGES, TASK_IDS};
-use crate::slack::client::{COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, SlackClient};
+use crate::slack::client::{
+    COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, RUNNING_REACTION, SlackClient,
+};
 use crate::slack::stream::{
     StreamChunk, StreamFailure, StreamTaskStatus, TaskUpdate, chunks_for_card,
     classify_stream_error, terminal_chunks_for_card,
@@ -141,6 +143,12 @@ impl SlackTimeline {
         };
         self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
             .await;
+        // Only the first run swaps ⏳ → 🚀; later repeats inherit the
+        // already-running group reaction (no flicker).
+        if self.job.benchmark_run_index == 0 {
+            self.swap_reaction(RUNNING_REACTION)
+                .await;
+        }
     }
 
     pub async fn heartbeat(&self) {
@@ -241,8 +249,9 @@ impl SlackTimeline {
     }
 
     /// One repeat finished successfully, but the group still has more runs.
-    /// Keep the shared plan alive and leave the request reaction as ⏳; the
-    /// final repeat owns `chat.stopStream`, result blocks, and ✅.
+    /// Keep the shared plan alive and leave the request reaction as 🚀 (the
+    /// group is still running); the final repeat owns `chat.stopStream`, result
+    /// blocks, and the ✅ swap.
     pub async fn repeat_completed(&self) {
         let (blocks, chunks, fallback) = {
             let mut st = self.state.lock().await;
@@ -261,7 +270,7 @@ impl SlackTimeline {
     }
 
     /// Terminal success: all rows complete, the results table + download button
-    /// beneath the plan; swap ⏳ → ✅.
+    /// beneath the plan; swap the lifecycle reaction (⏳/🚀) → ✅.
     pub async fn completed(
         &self,
         result: Option<RunResult>,
@@ -297,7 +306,8 @@ impl SlackTimeline {
     }
 
     /// Terminal failure: the current row → error (carrying the message),
-    /// earlier rows complete, later rows pending; swap ⏳ → ❌.
+    /// earlier rows complete, later rows pending; swap the lifecycle reaction
+    /// (⏳/🚀) → ❌.
     pub async fn failed(&self, error: &str) {
         self.failed_with_results(error, None, None)
             .await;
@@ -460,13 +470,16 @@ impl SlackTimeline {
                             .lock()
                             .await
                             .streaming = false;
-                        if matches!(
-                            classify_stream_error(&e.to_string()),
-                            StreamFailure::NotStreaming
-                        ) {
-                            tracing::info!(job_id = %self.job_id, error = ?e, "slack: stream inactive; switching to block updates");
-                        } else {
-                            tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream append failed; switching to block updates");
+                        match classify_stream_error(&e.to_string()) {
+                            StreamFailure::NotStreaming => {
+                                tracing::info!(job_id = %self.job_id, error = ?e, "slack: stream inactive; switching to block updates");
+                            }
+                            StreamFailure::MissingMessage => {
+                                tracing::info!(job_id = %self.job_id, error = ?e, "slack: stream message missing; reposting a fresh card");
+                            }
+                            StreamFailure::Other => {
+                                tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream append failed; switching to block updates");
+                            }
                         }
                     }
                 }
@@ -498,20 +511,25 @@ impl SlackTimeline {
                     .await
                 {
                     Ok(()) => return,
-                    Err(e) => {
-                        if matches!(
-                            classify_stream_error(&e.to_string()),
-                            StreamFailure::NotStreaming
-                        ) {
+                    Err(e) => match classify_stream_error(&e.to_string()) {
+                        StreamFailure::NotStreaming => {
                             self.state
                                 .lock()
                                 .await
                                 .streaming = false;
                             tracing::info!(job_id = %self.job_id, error = ?e, "slack: stream inactive at terminal; falling back to block update");
-                        } else {
+                        }
+                        StreamFailure::MissingMessage => {
+                            self.state
+                                .lock()
+                                .await
+                                .streaming = false;
+                            tracing::info!(job_id = %self.job_id, error = ?e, "slack: terminal stream message missing; reposting a fresh card");
+                        }
+                        StreamFailure::Other => {
                             tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream stop failed; falling back to block update");
                         }
-                    }
+                    },
                 }
             }
             self.update_blocks(&ts, blocks, markdown_text.unwrap_or("Benchmark finished"))
@@ -528,8 +546,29 @@ impl SlackTimeline {
             .update_blocks(&self.channel, ts, blocks, fallback)
             .await
         {
-            tracing::warn!(job_id = %self.job_id, error = ?e, "slack: plan update failed (non-fatal)");
+            // A gone/unowned message can't be updated — repost instead of
+            // reporting nowhere.
+            if matches!(classify_stream_error(&e.to_string()), StreamFailure::MissingMessage) {
+                tracing::info!(job_id = %self.job_id, error = ?e, "slack: card message gone; reposting a fresh card");
+                self.repost_card(blocks, fallback)
+                    .await;
+            } else {
+                tracing::warn!(job_id = %self.job_id, error = ?e, "slack: plan update failed (non-fatal)");
+            }
         }
+    }
+
+    /// The card message is gone/unowned — drop our `ts` and post a fresh card
+    /// (persisting its new `ts`) so later updates and the repeat chain follow
+    /// the live message, not the dead one.
+    async fn repost_card(&self, blocks: &serde_json::Value, fallback: &str) {
+        {
+            let mut st = self.state.lock().await;
+            st.plan_ts = None;
+            st.streaming = false;
+        }
+        self.post_fresh_card(blocks, fallback)
+            .await;
     }
 
     /// Post the block fallback if we don't yet have a stream/card (persisting
@@ -546,6 +585,14 @@ impl SlackTimeline {
                 .await;
             return;
         }
+        self.post_fresh_card(blocks, fallback)
+            .await;
+    }
+
+    /// Post a brand-new plan card and persist its `ts`. Does not route through
+    /// `update_blocks`, so the repost path (`update_blocks` → `repost_card` →
+    /// here) can't form an async recursion cycle. Non-fatal.
+    async fn post_fresh_card(&self, blocks: &serde_json::Value, fallback: &str) {
         match self
             .client
             .post_blocks_in_thread(&self.channel, &self.request_ts, blocks, fallback)
@@ -573,22 +620,26 @@ impl SlackTimeline {
         }
     }
 
-    /// Retire the queued ⏳ and add the terminal `to` reaction on the request
-    /// message. Each step is non-fatal + independent.
+    /// Retire whichever non-terminal reaction is present (⏳ or 🚀) and add
+    /// `to`, driving the ⏳ → 🚀 → ✅/❌ chain. Each step is non-fatal;
+    /// removing an absent reaction is a harmless no-op.
     async fn swap_reaction(&self, to: &str) {
-        if let Err(e) = self
-            .client
-            .remove_reaction(&self.channel, &self.request_ts, QUEUED_REACTION)
-            .await
-        {
-            tracing::warn!(job_id = %self.job_id, error = ?e, "slack: removing ⏳ reaction failed (non-fatal)");
+        for from in [QUEUED_REACTION, RUNNING_REACTION] {
+            if from != to
+                && let Err(e) = self
+                    .client
+                    .remove_reaction(&self.channel, &self.request_ts, from)
+                    .await
+            {
+                tracing::debug!(job_id = %self.job_id, reaction = from, error = ?e, "slack: removing prior reaction (non-fatal; likely absent)");
+            }
         }
         if let Err(e) = self
             .client
             .add_reaction(&self.channel, &self.request_ts, to)
             .await
         {
-            tracing::warn!(job_id = %self.job_id, error = ?e, "slack: adding terminal reaction failed (non-fatal)");
+            tracing::warn!(job_id = %self.job_id, reaction = to, error = ?e, "slack: adding reaction failed (non-fatal)");
         }
     }
 }
@@ -696,9 +747,41 @@ mod tests {
         appends: StdMutex<Vec<String>>, // "{ts}:{chunks}" of each append_stream
         append_attempts: StdMutex<usize>,
         append_failures: StdMutex<Vec<String>>,
-        stops: StdMutex<Vec<String>>, // "{ts}:{chunks}:{blocks?}" of each stop_stream
+        update_failures: StdMutex<Vec<String>>, // errors injected into update_blocks
+        stops: StdMutex<Vec<String>>,           // "{ts}:{chunks}:{blocks?}" of each stop_stream
         added: StdMutex<Vec<String>>,
         removed: StdMutex<Vec<String>>,
+    }
+
+    impl FakeSlack {
+        /// Adds not cancelled by a matching remove — the reactions a user would
+        /// still see. The ⏳ → 🚀 → ✅/❌ lifecycle leaves one at any settled
+        /// point.
+        fn live_reactions(&self) -> Vec<String> {
+            let mut removed = self
+                .removed
+                .lock()
+                .unwrap()
+                .clone();
+            self.added
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|add| {
+                    match removed
+                        .iter()
+                        .position(|r| r == *add)
+                    {
+                        Some(pos) => {
+                            removed.remove(pos);
+                            false
+                        }
+                        None => true,
+                    }
+                })
+                .cloned()
+                .collect()
+        }
     }
 
     #[async_trait]
@@ -726,6 +809,14 @@ mod tests {
             blocks: &serde_json::Value,
             _f: &str,
         ) -> anyhow::Result<()> {
+            if let Some(error) = self
+                .update_failures
+                .lock()
+                .unwrap()
+                .pop()
+            {
+                anyhow::bail!("slack chat.update failed: {error}");
+            }
             self.updates
                 .lock()
                 .unwrap()
@@ -989,9 +1080,16 @@ mod tests {
             stops[0]
         );
         assert!(stops[0].contains("Benchmark develop @ abcdef12"), "terminal title: {}", stops[0]);
-        // ⏳ → ✅ swap.
-        assert_eq!(*slack.removed.lock().unwrap(), vec![QUEUED_REACTION.to_string()]);
-        assert_eq!(*slack.added.lock().unwrap(), vec![COMPLETED_REACTION.to_string()]);
+        // ⏳ → 🚀 (run 0 started) → ✅ (completed): only ✅ survives.
+        assert!(
+            slack
+                .added
+                .lock()
+                .unwrap()
+                .contains(&RUNNING_REACTION.to_string()),
+            "run 0 going running swaps in 🚀",
+        );
+        assert_eq!(slack.live_reactions(), vec![COMPLETED_REACTION.to_string()]);
     }
 
     #[tokio::test]
@@ -1065,8 +1163,8 @@ mod tests {
             stops[0]
         );
         assert!(stops[0].contains("Download Profiler Data"), "{}", stops[0]);
-        assert_eq!(*slack.removed.lock().unwrap(), vec![QUEUED_REACTION.to_string()]);
-        assert_eq!(*slack.added.lock().unwrap(), vec![COMPLETED_REACTION.to_string()]);
+        // ⏳ → 🚀 → ✅: only the terminal ✅ is still live.
+        assert_eq!(slack.live_reactions(), vec![COMPLETED_REACTION.to_string()]);
     }
 
     #[tokio::test]
@@ -1086,13 +1184,12 @@ mod tests {
                 .is_empty(),
             "intermediate repeat must not stop the shared stream",
         );
-        assert!(
-            slack
-                .added
-                .lock()
-                .unwrap()
-                .is_empty(),
-            "intermediate repeat must not add the terminal reaction",
+        // Run 0 starting swapped ⏳ → 🚀; an intermediate repeat adds no
+        // terminal, so 🚀 stays the live reaction across the group boundary.
+        assert_eq!(
+            slack.live_reactions(),
+            vec![RUNNING_REACTION.to_string()],
+            "mid-group shows running, not a terminal reaction",
         );
         let appends = slack.appends.lock().unwrap();
         assert_eq!(appends.len(), 2, "started + repeat-complete updates");
@@ -1208,6 +1305,54 @@ mod tests {
         );
     }
 
+    /// When the inherited message is gone — append AND the block fallback both
+    /// report `message_not_found` — repost a fresh card and persist its new
+    /// `ts` instead of reporting onto a dead message.
+    #[tokio::test]
+    async fn missing_message_reposts_a_fresh_card_and_persists_its_ts() {
+        let slack = Arc::new(FakeSlack::default());
+        slack
+            .append_failures
+            .lock()
+            .unwrap()
+            .push("message_not_found".into());
+        slack
+            .update_failures
+            .lock()
+            .unwrap()
+            .push("message_not_found".into());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
+
+        tl.started().await;
+
+        assert_eq!(
+            slack
+                .posts
+                .lock()
+                .unwrap()
+                .len(),
+            1,
+            "a gone message reposts a fresh card",
+        );
+        assert!(
+            slack
+                .updates
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the block update failed (message gone) before recording",
+        );
+        assert_eq!(
+            *store
+                .persisted
+                .lock()
+                .unwrap(),
+            vec!["PLAN_TS".to_string()],
+            "the reposted card's new ts is persisted for resume + the repeat chain",
+        );
+    }
+
     #[tokio::test]
     async fn failed_marks_the_current_row_error_and_swaps_to_x() {
         let slack = Arc::new(FakeSlack::default());
@@ -1227,7 +1372,60 @@ mod tests {
         // pinned in `card`'s `error_row_shows_output_not_details`; here the
         // still-pending Finalize row legitimately keeps its italic detail.
         assert!(last.contains("Running benchmark"), "errored at the Run row: {last}");
-        assert_eq!(*slack.added.lock().unwrap(), vec![FAILED_REACTION.to_string()]);
+        // ⏳ → 🚀 (run 0 started) → ❌ (failed): only ❌ survives.
+        assert_eq!(slack.live_reactions(), vec![FAILED_REACTION.to_string()]);
+    }
+
+    /// The first run going live swaps ⏳ → 🚀 on the request.
+    #[tokio::test]
+    async fn run_zero_started_swaps_queued_for_running() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store.clone(), Some("PLAN_TS".into()));
+
+        tl.started().await;
+
+        assert_eq!(*slack.removed.lock().unwrap(), vec![QUEUED_REACTION.to_string()]);
+        assert_eq!(*slack.added.lock().unwrap(), vec![RUNNING_REACTION.to_string()]);
+        assert_eq!(slack.live_reactions(), vec![RUNNING_REACTION.to_string()]);
+    }
+
+    /// The reaction is group-scoped — a later run starting must not re-swap
+    /// (run 0 already moved the request to 🚀), so there's no churn per repeat.
+    #[tokio::test]
+    async fn later_run_started_leaves_the_running_reaction_untouched() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let mut job = job();
+        job.benchmark_run_index = 1;
+        job.requested_run_count = 2;
+        let tl = SlackTimeline::new(
+            slack.clone(),
+            store.clone(),
+            job,
+            "C1".into(),
+            "REQ_TS".into(),
+            Some("PLAN_TS".into()),
+        );
+
+        tl.started().await;
+
+        assert!(
+            slack
+                .added
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "no reaction add when a follow-up run starts",
+        );
+        assert!(
+            slack
+                .removed
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "no reaction remove when a follow-up run starts",
+        );
     }
 
     #[test]

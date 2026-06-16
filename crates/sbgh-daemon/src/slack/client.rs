@@ -7,15 +7,21 @@ use async_trait::async_trait;
 
 use crate::slack::stream::StreamChunk;
 
-/// The lifecycle-status reaction added to a request message while its job is
-/// queued (the connector adds it; the reporter swaps it for one of the two
-/// terminals below).
+/// Acknowledgment reaction, added once a mention is authorized — before the
+/// (possibly slow) workload resolution. Swapped for ⏳ on accept, removed on
+/// rejection.
+pub const ACK_REACTION: &str = "eyes";
+
+/// Queued reaction, added on accept and swapped for 🚀 once running.
 pub const QUEUED_REACTION: &str = "hourglass_flowing_sand";
 
-/// Terminal reaction for a job that ran to completion (swaps ⏳).
+/// Running reaction; the first run starting swaps ⏳ → 🚀.
+pub const RUNNING_REACTION: &str = "rocket";
+
+/// Terminal reaction for a completed job.
 pub const COMPLETED_REACTION: &str = "white_check_mark";
 
-/// Terminal reaction for a job that failed or was cancelled (swaps ⏳).
+/// Terminal reaction for a failed or cancelled job.
 pub const FAILED_REACTION: &str = "x";
 
 /// Slack Web API calls the connector + reporter make. Errors are surfaced so

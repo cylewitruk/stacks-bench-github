@@ -230,6 +230,35 @@ does not recreate the same expiry window.
 buttons, and no attempt to keep a pre-claim plan stream alive with heartbeats.
 This is a surface/lifecycle split, not a scheduler change.
 
+### 0046 — Reaction state from `reactions.list` (drop brute-force removal)
+
+- **id:** `0046-slack-reaction-state-from-api`
+- **status:** `backlog`
+- **priority:** `low`
+- **relates_to:** `0044-slack-reaction-lifecycle`
+- **source:** v17 `swap_reaction` review (2026-06)
+
+**Problem:** The reaction lifecycle clears prior reactions by *guessing*: the
+timeline's `swap_reaction` speculatively calls `reactions.remove` for each
+candidate emoji (⏳/🚀), most of which are no-ops, and the connector add/removes
+👀 separately. This brute-force sweep scales poorly as the emoji set grows and
+can't clear a reaction it doesn't know is there (e.g. a leaked 👀 when the
+connector's best-effort ack-removal failed).
+
+**Scope:** Add `reactions.list` to the Slack Web API client and use it to read
+the bot's current reactions on the target message, removing exactly those that
+aren't the target before adding the target — replacing the candidate-set
+guesswork with the actual state. Drops the speculative no-op removes and
+self-heals any leaked/unexpected reaction.
+
+**Acceptance:** A reaction transition removes exactly the reactions actually
+present (per `reactions.list`) and adds the target, with no speculative removes;
+a leaked prior reaction is cleared on the next transition.
+
+**Deferred / non-goals:** Trades the speculative removes for one `reactions.list`
+read per transition — only worth it as the reaction set grows; no change to the
+lifecycle/emoji set itself.
+
 *`0037-benchmark-group-run-model` shipped (iteration v14, 2026-06) →
 [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md).*
 

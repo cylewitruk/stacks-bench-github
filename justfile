@@ -8,17 +8,24 @@ build *args:
     set -euo pipefail
     set -- {{args}}
 
+    profile_args=()
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --release)
+                profile_args=(--release)
+                shift
+                ;;
             --no-sccache)
                 export RUSTC_WRAPPER=
                 shift
                 ;;
             -h|--help)
                 printf '%s\n' \
-                    'Usage: just build [--no-sccache]' \
+                    'Usage: just build [--release] [--no-sccache]' \
                     '' \
                     'Options:' \
+                    '  --release     Build with Cargo'\''s release profile. Defaults to dev.' \
                     '  --no-sccache  Clear RUSTC_WRAPPER for sandboxed agent runs.'
                 exit 0
                 ;;
@@ -29,7 +36,7 @@ build *args:
         esac
     done
 
-    cargo --locked build --all-targets --release
+    cargo --locked build --all-targets "${profile_args[@]}"
 
 install *args:
     #!/usr/bin/env bash
@@ -57,7 +64,7 @@ install *args:
         esac
     done
 
-    cargo --locked install --path crates/stacks-bench-agent
+    cargo --locked install --release --path crates/stacks-bench-agent
 
 fmt:
     cargo +nightly --locked fmt --all
@@ -89,7 +96,6 @@ lint *args:
     done
 
     RUST_LOG=warn cargo --locked clippy --all-targets -- -D warnings
-    cargo check --locked --all-targets
     cargo +nightly --locked fmt --all -- --check
 
 fix *args:

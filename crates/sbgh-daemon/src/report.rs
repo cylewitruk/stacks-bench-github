@@ -725,7 +725,7 @@ mod tests {
     use super::*;
     use crate::artifact_store::LocalFsStore;
     use crate::job_source::BaselineRef;
-    use crate::slack::client::COMPLETED_REACTION;
+    use crate::slack::client::{COMPLETED_REACTION, RUNNING_REACTION};
 
     fn store() -> Arc<dyn ArtifactStore> {
         Arc::new(LocalFsStore::new(std::env::temp_dir()))
@@ -1144,8 +1144,8 @@ mod tests {
                 .added
                 .lock()
                 .unwrap(),
-            vec![COMPLETED_REACTION.to_string()],
-            "⏳ swapped to ✅",
+            vec![RUNNING_REACTION.to_string(), COMPLETED_REACTION.to_string()],
+            "⏳ → 🚀 (run 0 started) → ✅ (completed)",
         );
     }
 

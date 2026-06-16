@@ -439,27 +439,30 @@ impl JobStore for PostgresJobStore {
 
     async fn create_unlinked_job(
         &self,
+        job_id: Uuid,
         new_job: &NewJob,
         queued_event_detail: &serde_json::Value,
+        plan_message_ts: Option<&str>,
     ) -> Result<Job> {
-        // One transaction: job insert → queued event. No webhook/user/PR links
-        // (a non-webhook trigger — Slack ad-hoc or daemon warming — has no GitHub
-        // subject) and no idempotency guard (see the trait docs). A failure on
-        // either insert rolls back.
+        // One transaction: job insert → queued event → the `plan_message_sent`
+        // event when the connector pre-posted its card. No webhook/user/PR links
+        // and no idempotency guard (see the trait docs); a failure rolls back.
         let mut tx = self.pool.begin().await?;
         let requested_run_count = Self::requested_run_count_from_detail(queued_event_detail);
         let (group_id, spec_id) =
             Self::create_singleton_group_spec(&mut tx, new_job, requested_run_count).await?;
 
-        // v10 (0005): jobs carry the axes natively — set by the caller.
+        // v10 (0005): jobs carry the axes natively — set by the caller. The id
+        // is caller-provided so the Slack card can be posted before the job
+        // exists.
         let job: Job = sqlx::query_as(
             r#"
             INSERT INTO job
-                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
-            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
@@ -467,6 +470,7 @@ impl JobStore for PostgresJobStore {
                       claim_token, claimed_at, created_at, updated_at
             "#,
         )
+        .bind(job_id)
         .bind(group_id)
         .bind(spec_id)
         .bind(new_job.github_installation_id)
@@ -497,6 +501,25 @@ impl JobStore for PostgresJobStore {
         .bind(queued_event_detail)
         .execute(&mut *tx)
         .await?;
+
+        // Record the pre-posted plan card's `ts` in the same transaction, so the
+        // job is never claimable without its plan-message identity.
+        if let Some(ts) = plan_message_ts {
+            sqlx::query(
+                r#"
+                INSERT INTO job_event
+                    (job_id, event_kind, event_status, github_comment_id,
+                     github_check_run_id, github_check_run_url, remark, detail)
+                VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4)
+                "#,
+            )
+            .bind(job.id)
+            .bind(JobEventKind::PlanMessageSent)
+            .bind(JobEventStatus::Success)
+            .bind(serde_json::json!({ "plan_message_ts": ts }))
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(job)

@@ -720,7 +720,7 @@ mod tests {
 
     use super::*;
     use crate::job_source::BaselineRef;
-    use crate::slack::client::COMPLETED_REACTION;
+    use crate::slack::client::{COMPLETED_REACTION, RUNNING_REACTION};
 
     fn job_with(progress: ProgressTarget) -> RunnableJob {
         RunnableJob {
@@ -1108,8 +1108,8 @@ mod tests {
         assert!(*slack.updates.lock().unwrap() >= 2, "advanced + finalized via fallback update");
         assert_eq!(
             *slack.added.lock().unwrap(),
-            vec![COMPLETED_REACTION.to_string()],
-            "⏳ swapped to ✅",
+            vec![RUNNING_REACTION.to_string(), COMPLETED_REACTION.to_string()],
+            "⏳ → 🚀 (run 0 started) → ✅ (completed)",
         );
         // The posted ts was persisted for resume-on-reclaim.
         assert!(

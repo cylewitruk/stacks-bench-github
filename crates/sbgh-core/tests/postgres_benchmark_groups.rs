@@ -155,7 +155,7 @@ async fn slack_unlinked_job_persists_requested_clean_repetitions_on_spec() {
     let new = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
 
     let job = store
-        .create_unlinked_job(&new, &detail)
+        .create_unlinked_job(uuid::Uuid::new_v4(), &new, &detail, None)
         .await
         .unwrap();
 
@@ -181,7 +181,12 @@ async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
     })
     .unwrap();
     let first = store
-        .create_unlinked_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)
+        .create_unlinked_job(
+            uuid::Uuid::new_v4(),
+            &new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc),
+            &detail,
+            None,
+        )
         .await
         .unwrap();
     store
@@ -261,7 +266,12 @@ async fn resume_pending_benchmark_runs_derives_next_run_from_db_state() {
     })
     .unwrap();
     let first = store
-        .create_unlinked_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)
+        .create_unlinked_job(
+            uuid::Uuid::new_v4(),
+            &new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc),
+            &detail,
+            None,
+        )
         .await
         .unwrap();
     sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
@@ -371,7 +381,7 @@ async fn create_unlinked_build_only_job_creates_build_only_singleton_group() {
     };
 
     let job = store
-        .create_unlinked_job(&new, &detail)
+        .create_unlinked_job(uuid::Uuid::new_v4(), &new, &detail, None)
         .await
         .unwrap();
 

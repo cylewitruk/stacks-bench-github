@@ -31,7 +31,11 @@ futures = "0.3"
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "limit"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
 # S3-compatible object storage for run artifacts (item 0001). Sans-IO (pure
 # SigV4 signing + request building); driven by reqwest.
 rusty-s3 = "0.9"
@@ -44,7 +48,9 @@ jsonwebtoken = "10"
 # `hyper` feature pulls the WS listener (tokio-tungstenite) + Web API client,
 # all rustls/ring-aligned with our stack; the `axum` feature (Events-API HTTP
 # push) is deliberately NOT enabled — Socket Mode is an outbound WebSocket.
-slack-morphism = { version = "2", default-features = false, features = ["hyper"] }
+slack-morphism = { version = "2", default-features = false, features = [
+    "hyper",
+] }
 # Typed Block Kit builders (item 0002): the terminal result card (`task_card`).
 # Serde-only at runtime — no async/HTTP stack of its own.
 slack-messaging = "0.7"
@@ -87,7 +93,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+chrono = { version = "0.4", default-features = false, features = [
+    "serde",
+    "clock",
+] }
 dotenvy = "0.15"
 url = "2"
 percent-encoding = "2"
@@ -96,8 +105,15 @@ quick-xml = "0.40"
 
 reqwest-eventsource = "0.6"
 clap = { version = "4", features = ["derive"] }
-regex = "1"
+regex = "1.12.4"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+codegen-units = 8
+opt-level = 2

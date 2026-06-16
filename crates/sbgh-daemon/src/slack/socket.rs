@@ -271,7 +271,16 @@ mod tests {
                 .push(reaction.into());
             Ok(())
         }
-        async fn remove_reaction(&self, _c: &str, _ts: &str, _r: &str) -> anyhow::Result<()> {
+        async fn remove_reaction(&self, _c: &str, _ts: &str, reaction: &str) -> anyhow::Result<()> {
+            // Keep `reactions` the live set: the 👀 ack is added then removed,
+            // leaving just ⏳.
+            let mut reactions = self.reactions.lock().unwrap();
+            if let Some(pos) = reactions
+                .iter()
+                .position(|r| r == reaction)
+            {
+                reactions.remove(pos);
+            }
             Ok(())
         }
     }

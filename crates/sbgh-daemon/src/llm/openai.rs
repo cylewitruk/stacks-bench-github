@@ -57,11 +57,15 @@ impl OpenAiIntentResolver {
     }
 
     async fn send(&self, text: &str) -> Result<Value, IntentProviderError> {
+        // Safe to log: the API key rides the bearer header, not the body. Prompt
+        // is debug-only.
+        let request_body = self.request_body(text);
+        tracing::debug!(request_body = %request_body, "llm: openai request body");
         let response = self
             .client
             .post(&self.endpoint)
             .bearer_auth(&self.api_key)
-            .json(&self.request_body(text))
+            .json(&request_body)
             .send()
             .await
             .map_err(|e| IntentProviderError::Message(format!("OpenAI request failed: {e}")))?;
@@ -72,6 +76,7 @@ impl OpenAiIntentResolver {
             .map_err(|e| {
                 IntentProviderError::Message(format!("OpenAI response was not JSON: {e}"))
             })?;
+        tracing::debug!(status = %status, response_body = %body, "llm: openai response body");
         if !status.is_success() {
             let msg = body
                 .pointer("/error/message")
@@ -81,17 +86,10 @@ impl OpenAiIntentResolver {
         }
         Ok(body)
     }
-}
 
-#[async_trait]
-impl IntentResolver for OpenAiIntentResolver {
-    async fn resolve(&self, text: &str) -> Result<IntentOutcome, IntentProviderError> {
-        if text.chars().count() > self.input_max_chars {
-            return Ok(IntentOutcome::Invalid(
-                format!("request is too long; keep it under {} characters", self.input_max_chars)
-                    .into(),
-            ));
-        }
+    /// The network + parse + validate path, split out so
+    /// [`IntentResolver::resolve`] can time it and log the outcome.
+    async fn resolve_request(&self, text: &str) -> Result<IntentOutcome, IntentProviderError> {
         let body = self.send(text).await?;
         let output = extract_openai_output_text(&body)?;
         let intent: IntentResolutionJson = serde_json::from_str(output).map_err(|e| {
@@ -101,6 +99,44 @@ impl IntentResolver for OpenAiIntentResolver {
             Ok(outcome) => Ok(outcome),
             Err(e) => Ok(IntentOutcome::Invalid(e.to_string().into())),
         }
+    }
+}
+
+#[async_trait]
+impl IntentResolver for OpenAiIntentResolver {
+    async fn resolve(&self, text: &str) -> Result<IntentOutcome, IntentProviderError> {
+        let input_chars = text.chars().count();
+        if input_chars > self.input_max_chars {
+            tracing::info!(
+                input_chars,
+                max = self.input_max_chars,
+                "llm: rejecting over-long request before any openai call"
+            );
+            return Ok(IntentOutcome::Invalid(
+                format!("request is too long; keep it under {} characters", self.input_max_chars)
+                    .into(),
+            ));
+        }
+        tracing::info!(model = %self.model, input_chars, "llm: resolving benchmark intent via openai");
+
+        let started = std::time::Instant::now();
+        let outcome = self
+            .resolve_request(text)
+            .await;
+        let latency_ms = started.elapsed().as_millis();
+
+        match &outcome {
+            Ok(IntentOutcome::Resolved(_)) => {
+                tracing::info!(latency_ms, outcome = "resolved", "llm: intent resolution complete")
+            }
+            Ok(IntentOutcome::Invalid(_)) => {
+                tracing::info!(latency_ms, outcome = "invalid", "llm: intent resolution complete")
+            }
+            Err(e) => {
+                tracing::warn!(latency_ms, outcome = "error", error = %e, "llm: intent resolution failed")
+            }
+        }
+        outcome
     }
 }
 
@@ -203,6 +239,20 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    /// The request body is debug-logged, so it must never carry the API key
+    /// (that travels only in the bearer header).
+    #[test]
+    fn request_body_never_carries_the_api_key() {
+        let resolver = OpenAiIntentResolver::for_test("http://127.0.0.1:9");
+        let body = resolver
+            .request_body("bench block 1")
+            .to_string();
+        assert!(
+            !body.contains("sk-test"),
+            "the API key must never appear in the request body we debug-log: {body}"
         );
     }
 

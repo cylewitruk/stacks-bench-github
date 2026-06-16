@@ -63,6 +63,7 @@ need editing when an item's status or location changes.
 | `0043-slack-plan-ts-race` | Slack plan-ts race fix (double card) | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
 | `0044-slack-reaction-lifecycle` | Slack reaction lifecycle (ack/queued/running) | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
 | `0045-slack-llm-observability` | Slack/LLM observability logging | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
+| `0046-slack-reaction-state-from-api` | Read reaction state via `reactions.list` instead of brute-force removal | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 

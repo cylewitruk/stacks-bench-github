@@ -150,7 +150,12 @@ async fn v10_create_unlinked_job_writes_derived_axes() {
         "clean_repetitions": 1
     });
     let job = store
-        .create_unlinked_job(&new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc), &detail)
+        .create_unlinked_job(
+            uuid::Uuid::new_v4(),
+            &new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc),
+            &detail,
+            None,
+        )
         .await
         .unwrap();
 

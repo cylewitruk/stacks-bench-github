@@ -65,7 +65,7 @@ async fn create_unlinked_job_is_webhook_less_and_preserves_detail() {
     };
 
     let job = store
-        .create_unlinked_job(&new_job, &detail)
+        .create_unlinked_job(uuid::Uuid::new_v4(), &new_job, &detail, None)
         .await
         .unwrap();
     assert_eq!(job.status, JobStatus::Queued);
@@ -102,6 +102,7 @@ async fn in_memory_repeat_planner_appends_and_resumes_next_run() {
     .unwrap();
     let first = store
         .create_unlinked_job(
+            uuid::Uuid::new_v4(),
             &NewJob {
                 github_installation_id: 100,
                 github_repo_id: 10,
@@ -113,6 +114,7 @@ async fn in_memory_repeat_planner_appends_and_resumes_next_run() {
                 workload_key: Some("wk".into()),
             },
             &detail,
+            None,
         )
         .await
         .unwrap();

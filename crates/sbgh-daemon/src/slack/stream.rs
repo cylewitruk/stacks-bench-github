@@ -204,19 +204,26 @@ fn stream_text(s: &str) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamFailure {
+    /// Ours but no longer streaming (TTL lapse, stopped). `chat.update` still
+    /// works — switch to block updates and keep the card.
     NotStreaming,
+    /// Not editable at all — gone (`message_not_found`) or not ours
+    /// (`message_not_owned_by_app`). `chat.update` would fail too, so the
+    /// caller must repost a fresh card and persist its new `ts`.
+    MissingMessage,
+    /// Any other stream/append error.
     Other,
 }
 
 pub fn classify_stream_error(error: &str) -> StreamFailure {
-    if [
-        "message_not_in_streaming_state",
-        "stopped_by_user",
-        "message_not_owned_by_app",
-        "message_not_found",
-    ]
-    .iter()
-    .any(|code| error.contains(code))
+    if ["message_not_found", "message_not_owned_by_app"]
+        .iter()
+        .any(|code| error.contains(code))
+    {
+        StreamFailure::MissingMessage
+    } else if ["message_not_in_streaming_state", "stopped_by_user"]
+        .iter()
+        .any(|code| error.contains(code))
     {
         StreamFailure::NotStreaming
     } else {
@@ -314,8 +321,17 @@ mod tests {
             StreamFailure::NotStreaming
         );
         assert_eq!(
-            classify_stream_error("slack chat.appendStream failed: message_not_found"),
+            classify_stream_error("slack chat.appendStream failed: stopped_by_user"),
             StreamFailure::NotStreaming
+        );
+        // Gone / not-ours can't be chat.update'd either → repost.
+        assert_eq!(
+            classify_stream_error("slack chat.appendStream failed: message_not_found"),
+            StreamFailure::MissingMessage
+        );
+        assert_eq!(
+            classify_stream_error("slack chat.update failed: message_not_owned_by_app"),
+            StreamFailure::MissingMessage
         );
         assert_eq!(classify_stream_error("invalid_chunks"), StreamFailure::Other);
     }

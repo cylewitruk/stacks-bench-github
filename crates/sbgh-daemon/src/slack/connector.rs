@@ -4,11 +4,14 @@
 //!   1. **authz** (team + user allowlist) — *before* anything else;
 //!   2. **resolve** the workload (deterministic parser fast-path, then optional
 //!      LLM intent resolver);
-//!   3. **enqueue** an ad-hoc job (default repo/rev, no webhook) carrying the
-//!      Slack reporting provenance;
-//!   4. **post** the queued live-timeline card in-thread (persisting its `ts`
-//!      by job id, so the claim-time reporter resumes the same card) and
-//!      **react** ⏳ on the request.
+//!   3. **post** the queued live-timeline card in-thread, then **create** the
+//!      job (default repo/rev, no webhook), recording the card's `ts` in the
+//!      same transaction — so the job is never claimable without its
+//!      plan-message identity and the reporter resumes the same card on claim;
+//!   4. **react** ⏳ on the request.
+//!
+//! The card is posted before the job exists because its `ts` needs the job id;
+//! if creation then fails, the posted card is turned into a visible failure.
 //!
 //! A rejection at step 1 or 2 is an **ephemeral** reply (invoker-only) with
 //! **no enqueue and no reaction**, so a denied/garbled request leaves the
@@ -29,7 +32,7 @@ use uuid::Uuid;
 
 use crate::llm::intent::{IntentOutcome, IntentResolver};
 use crate::slack::card::{self, CardCtx, RepeatContext};
-use crate::slack::client::{QUEUED_REACTION, SlackClient};
+use crate::slack::client::{ACK_REACTION, QUEUED_REACTION, SlackClient};
 use crate::slack::stream::initial_chunks_for_card;
 use crate::slack::target::SlackJobTarget;
 use crate::workload::{WorkloadSpec, resolve_workload};
@@ -49,6 +52,15 @@ pub struct MentionEvent {
     pub message_ts: String,
     /// Raw message text, including the leading `<@bot>` mention.
     pub text: String,
+}
+
+/// A posted queued plan card: its message `ts` and whether it's a live stream
+/// (`start_plan_stream`) or a block-message fallback. The cleanup path needs
+/// the distinction — a live stream is terminated via `stop_stream`, a block
+/// card via `chat.update`.
+struct PostedCard {
+    ts: String,
+    streamed: bool,
 }
 
 pub struct SlackConnector {
@@ -106,14 +118,35 @@ impl SlackConnector {
     /// Handle one mention end to end. Never returns an error — every failure is
     /// either an ephemeral reply (rejection) or a logged best-effort miss; the
     /// caller (receive loop) has already acked the envelope.
+    ///
+    /// The span carries the correlation fields (`ts`, then `job_id` once the
+    /// job exists) so the whole request — including the nested LLM resolver
+    /// — is traceable on one set of fields.
+    #[tracing::instrument(
+        level = "info",
+        name = "slack_mention",
+        skip_all,
+        fields(
+            channel = %event.channel,
+            user = %event.user,
+            ts = %event.message_ts,
+            job_id = tracing::field::Empty,
+        )
+    )]
     pub async fn handle_mention(&self, event: MentionEvent) {
+        tracing::info!("slack: mention received");
         // 1. Authz FIRST — an off-allowlist sender is rejected without parsing (or,
         //    later, spending an LLM call) on their input.
         if !self.is_authorized(&event.team_id, &event.user) {
+            tracing::info!("slack: mention rejected — sender/workspace not on the allowlist");
             self.reject(&event, "not authorized to run benchmarks here")
                 .await;
             return;
         }
+
+        // 1b. Acknowledge immediately — resolution below may be a slow LLM
+        //     round-trip. Removed on any rejection below.
+        self.add_ack(&event).await;
 
         // 2. Resolve the workload (mention stripped → parser fast-path, then optional
         //    LLM resolver).
@@ -124,13 +157,13 @@ impl SlackConnector {
         {
             Ok(spec) => spec,
             Err(reason) => {
-                self.reject(&event, &reason)
+                self.reject_after_ack(&event, &reason)
                     .await;
                 return;
             }
         };
         if spec.clean_repetitions > self.max_clean_repetitions {
-            self.reject(
+            self.reject_after_ack(
                 &event,
                 &format!(
                     "too many clean repetitions — requested {}, max is {}",
@@ -141,8 +174,11 @@ impl SlackConnector {
             return;
         }
         if spec.clean_repetitions > 1 && !self.binary_cache_enabled {
-            self.reject(&event, "clean repetitions require the binary cache to be enabled")
-                .await;
+            self.reject_after_ack(
+                &event,
+                "clean repetitions require the binary cache to be enabled",
+            )
+            .await;
             return;
         }
         // 3. Enqueue an ad-hoc job. Default repo (target ids) + rev (`--rev` override,
@@ -153,6 +189,12 @@ impl SlackConnector {
             .clone()
             .unwrap_or_else(|| self.cfg.default_rev.clone());
         let bench_args = spec.to_bench_args();
+        tracing::info!(
+            rev = %rev,
+            clean_repetitions = spec.clean_repetitions,
+            "slack: workload resolved — enqueuing"
+        );
+        tracing::debug!(bench_args = ?bench_args, "slack: resolved bench args");
         let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
             channel: event.channel.clone(),
             message_ts: event.message_ts.clone(),
@@ -181,32 +223,53 @@ impl SlackConnector {
             workload_key: None,
         };
 
-        let job = match self
+        // 3a. Post the card before creating the job: its `ts` needs the job id,
+        //     and recording it atomically with creation (3b) closes the
+        //     claim-before-recorded race that otherwise double-posts. `None` if
+        //     Slack rejected the post (the reporter then posts at claim).
+        let job_id = Uuid::new_v4();
+        let posted = self
+            .post_queued_card(
+                &event,
+                &new_job.git_ref_display,
+                &bench_args,
+                spec.clean_repetitions,
+                job_id,
+            )
+            .await;
+
+        // 3b. Create the job, its queued event, and (when posted) the
+        //     plan-message event in one transaction — so the job is never
+        //     claimable without its plan `ts`.
+        if let Err(e) = self
             .jobs
-            .create_unlinked_job(&new_job, &detail)
+            .create_unlinked_job(
+                job_id,
+                &new_job,
+                &detail,
+                posted
+                    .as_ref()
+                    .map(|c| c.ts.as_str()),
+            )
             .await
         {
-            Ok(job) => job,
-            Err(e) => {
-                tracing::error!(error = %e, "slack: enqueue failed");
-                self.reject(&event, "couldn't enqueue the benchmark — please retry")
+            tracing::error!(error = %e, "slack: enqueue failed");
+            // Turn the orphaned queued card into a visible failure.
+            if let Some(card) = &posted {
+                self.fail_posted_card(&event.channel, card)
                     .await;
-                return;
             }
-        };
+            self.reject_after_ack(&event, "couldn't enqueue the benchmark — please retry")
+                .await;
+            return;
+        }
+        // The job now exists — pivot the span's correlation field to `job_id` so
+        // the runner/reporter lines line up.
+        tracing::Span::current().record("job_id", tracing::field::display(job_id));
+        tracing::info!(plan_card_posted = posted.is_some(), "slack: ad-hoc benchmark enqueued");
 
-        // 4. Post the queued live-timeline card + persist its ts by job id, so the
-        //    claim-time reporter resumes the SAME card (item 0023, Phase 3).
-        self.post_queued_card(
-            &event,
-            &new_job.git_ref_display,
-            &bench_args,
-            spec.clean_repetitions,
-            job.id,
-        )
-        .await;
-
-        // 5. Exactly one ⏳ reaction on the request — the accepted-job signal.
+        // 4. Accepted: swap 👀 → ⏳; the reporter drives ⏳ → 🚀 → ✅/❌ from here.
+        self.remove_ack(&event).await;
         if let Err(e) = self
             .client
             .add_reaction(&event.channel, &event.message_ts, QUEUED_REACTION)
@@ -216,13 +279,78 @@ impl SlackConnector {
         }
     }
 
+    /// Add the 👀 acknowledgment reaction. Best-effort.
+    async fn add_ack(&self, event: &MentionEvent) {
+        if let Err(e) = self
+            .client
+            .add_reaction(&event.channel, &event.message_ts, ACK_REACTION)
+            .await
+        {
+            tracing::warn!(error = %e, "slack: add ack reaction failed (non-fatal)");
+        } else {
+            tracing::debug!(reaction = ACK_REACTION, "slack: acked mention (👀)");
+        }
+    }
+
+    /// Remove the 👀 ack (replaced by ⏳ on accept, retired on rejection).
+    /// Best-effort; absent is fine.
+    async fn remove_ack(&self, event: &MentionEvent) {
+        if let Err(e) = self
+            .client
+            .remove_reaction(&event.channel, &event.message_ts, ACK_REACTION)
+            .await
+        {
+            tracing::debug!(error = %e, "slack: removing ack reaction (non-fatal; likely absent)");
+        }
+    }
+
+    /// Retire the 👀 ack, then post the ephemeral rejection — for failures past
+    /// the ack (resolution/cap/gate/enqueue).
+    async fn reject_after_ack(&self, event: &MentionEvent, reason: &str) {
+        self.remove_ack(event).await;
+        self.reject(event, reason)
+            .await;
+    }
+
+    /// Turn an already-posted queued card into a visible failure when the job
+    /// insert fails after the post, so the post-before-create window can't
+    /// leave a "queued" card for a job that never existed. A live stream can't
+    /// be edited via `chat.update`, so it's terminated with `stop_stream`
+    /// rendering the failure as terminal blocks; a block card is updated in
+    /// place. Best-effort.
+    async fn fail_posted_card(&self, channel: &str, card: &PostedCard) {
+        let blocks = serde_json::json!([{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": ":warning: Couldn't enqueue the benchmark — please retry."
+            }
+        }]);
+        let fallback = "Couldn't enqueue the benchmark";
+        let result = if card.streamed {
+            self.client
+                .stop_stream(channel, &card.ts, None, &[], Some(&blocks))
+                .await
+        } else {
+            self.client
+                .update_blocks(channel, &card.ts, &blocks, fallback)
+                .await
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "slack: failing the orphaned queued card failed (non-fatal)");
+        }
+    }
+
     async fn resolve_workload_for_event(
         &self,
         event: &MentionEvent,
         text: &str,
     ) -> Result<WorkloadSpec, String> {
         match resolve_workload(text) {
-            Ok(spec) => return Ok(spec),
+            Ok(spec) => {
+                tracing::info!("slack: workload resolved via deterministic parser fast-path");
+                return Ok(spec);
+            }
             Err(e) if self.intent_resolver.is_none() => return Err(e.to_string()),
             Err(_) => {}
         }
@@ -232,10 +360,12 @@ impl SlackConnector {
             .as_ref()
             .expect("checked above");
         if !self.allow_intent_call(&event.user) {
+            tracing::info!("slack: natural-language request rate-limited before the llm call");
             return Err("too many benchmark requests using natural language — please try again \
                         shortly"
                 .into());
         }
+        tracing::info!("slack: parser did not match — resolving via the llm intent resolver");
         match resolver.resolve(text).await {
             Ok(IntentOutcome::Resolved(spec)) => Ok(spec),
             Ok(IntentOutcome::Invalid(invalid)) => Err(invalid.user_message()),
@@ -287,7 +417,7 @@ impl SlackConnector {
         bench_args: &[String],
         clean_repetitions: u32,
         job_id: Uuid,
-    ) {
+    ) -> Option<PostedCard> {
         let job_id_str = job_id.to_string();
         let ctx = CardCtx {
             rev,
@@ -317,8 +447,8 @@ impl SlackConnector {
                 &initial_chunks_for_card(&card),
             )
             .await;
-        let ts = match stream_result {
-            Ok(ts) => ts,
+        let (ts, streamed) = match stream_result {
+            Ok(ts) => (ts, true),
             Err(e) => {
                 tracing::warn!(error = ?e, "slack: start stream failed; falling back to block card");
                 let blocks = card::render(&card);
@@ -327,21 +457,18 @@ impl SlackConnector {
                     .post_blocks_in_thread(&event.channel, &event.message_ts, &blocks, &fallback)
                     .await
                 {
-                    Ok(ts) => ts,
+                    Ok(ts) => (ts, false),
                     Err(e) => {
                         tracing::warn!(error = %e, "slack: posting queued plan card failed (non-fatal)");
-                        return;
+                        return None;
                     }
                 }
             }
         };
-        if let Err(e) = self
-            .jobs
-            .record_plan_message_ts(job_id, &ts)
-            .await
-        {
-            tracing::warn!(error = %e, "slack: persisting queued plan ts failed (non-fatal)");
-        }
+        tracing::info!(plan_ts = %ts, streamed, "slack: queued live-timeline card posted");
+        // The caller records this `ts` atomically with job creation
+        // (`create_unlinked_job`); a separate write here would race the claim.
+        Some(PostedCard { ts, streamed })
     }
 
     /// A mention is authorized iff BOTH its workspace AND its sender are
@@ -388,7 +515,7 @@ fn strip_leading_mention(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use sbgh_core::db::InMemoryJobStore;
@@ -408,8 +535,49 @@ mod tests {
         ephemerals: Mutex<Vec<(String, String, String)>>, // (channel, user, text)
         streams: Mutex<Vec<(String, String, String)>>,    // (channel, thread_ts, chunks-json)
         posts: Mutex<Vec<(String, String, String)>>,      // (channel, thread_ts, blocks-json)
+        updates: Mutex<Vec<(String, String, String)>>,    // (channel, ts, blocks-json)
+        stops: Mutex<Vec<(String, String, String)>>,      // (channel, ts, blocks-json)
         reactions: Mutex<Vec<(String, String, String)>>,  // (channel, ts, reaction)
         removed: Mutex<Vec<(String, String, String)>>,    // (channel, ts, reaction)
+        fail_stream: AtomicBool,                          // force the block-card fallback
+    }
+
+    impl FakeSlackClient {
+        /// Force `start_plan_stream` to fail so the queued card falls back to a
+        /// block message (the non-streamed cleanup branch).
+        fn fail_stream(&self) {
+            self.fail_stream
+                .store(true, Ordering::SeqCst);
+        }
+
+        /// Adds that weren't later removed — the reactions a user would still
+        /// see. The 👀 ack is always removed (swapped for ⏳ or retired), so
+        /// the net is ⏳ when accepted, nothing when rejected.
+        fn net_reactions(&self) -> Vec<(String, String, String)> {
+            let mut remaining = self
+                .removed
+                .lock()
+                .unwrap()
+                .clone();
+            self.reactions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|add| {
+                    match remaining
+                        .iter()
+                        .position(|r| r == *add)
+                    {
+                        Some(pos) => {
+                            remaining.remove(pos);
+                            false
+                        }
+                        None => true,
+                    }
+                })
+                .cloned()
+                .collect()
+        }
     }
 
     struct FakeIntentResolver {
@@ -497,6 +665,12 @@ mod tests {
             _markdown_text: &str,
             chunks: &[crate::slack::stream::StreamChunk],
         ) -> anyhow::Result<String> {
+            if self
+                .fail_stream
+                .load(Ordering::SeqCst)
+            {
+                anyhow::bail!("start stream failed (injected)");
+            }
             self.streams
                 .lock()
                 .unwrap()
@@ -506,11 +680,36 @@ mod tests {
 
         async fn update_blocks(
             &self,
-            _channel: &str,
-            _ts: &str,
-            _blocks: &serde_json::Value,
+            channel: &str,
+            ts: &str,
+            blocks: &serde_json::Value,
             _fallback: &str,
         ) -> anyhow::Result<()> {
+            self.updates
+                .lock()
+                .unwrap()
+                .push((channel.into(), ts.into(), blocks.to_string()));
+            Ok(())
+        }
+
+        async fn stop_stream(
+            &self,
+            channel: &str,
+            ts: &str,
+            _markdown_text: Option<&str>,
+            _chunks: &[crate::slack::stream::StreamChunk],
+            blocks: Option<&serde_json::Value>,
+        ) -> anyhow::Result<()> {
+            self.stops
+                .lock()
+                .unwrap()
+                .push((
+                    channel.into(),
+                    ts.into(),
+                    blocks
+                        .map(|b| b.to_string())
+                        .unwrap_or_default(),
+                ));
             Ok(())
         }
 
@@ -628,16 +827,101 @@ mod tests {
             other => panic!("expected SlackAdhoc detail, got {other:?}"),
         }
 
-        // Exactly one ⏳ reaction on the request; no ephemeral.
-        let reactions = slack
-            .reactions
-            .lock()
-            .unwrap();
+        // Net state is one ⏳ (the 👀 ack was swapped out); no ephemeral.
+        let reactions = slack.net_reactions();
         assert_eq!(reactions.len(), 1);
         assert_eq!(reactions[0], ("C1".into(), "1700000000.000100".into(), QUEUED_REACTION.into()));
         assert!(
             slack
                 .ephemerals
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// An authorized mention gets 👀 the instant authz passes (before
+    /// resolution), then it's swapped for ⏳ on accept.
+    #[tokio::test]
+    async fn ack_reaction_precedes_queued_on_accept() {
+        let (c, _store, slack) = harness();
+        c.handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 1"))
+            .await;
+
+        let added: Vec<String> = slack
+            .reactions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, r)| r.clone())
+            .collect();
+        assert_eq!(added, vec![ACK_REACTION.to_string(), QUEUED_REACTION.to_string()]);
+        let removed: Vec<String> = slack
+            .removed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, r)| r.clone())
+            .collect();
+        assert_eq!(removed, vec![ACK_REACTION.to_string()], "ack retired in favor of ⏳");
+    }
+
+    /// A rejection after the ack (resolution failure) retires 👀 and never adds
+    /// ⏳ — net state is no reaction.
+    #[tokio::test]
+    async fn post_ack_rejection_retires_the_ack() {
+        let (c, store, slack) = harness();
+        // txid + block are mutually exclusive → resolution fails after the ack.
+        let txid = "0x".to_string() + &"1".repeat(64);
+        c.handle_mention(event(&format!("<@U07BOT> bench --block 1 --txid {txid}")))
+            .await;
+
+        assert!(store.all_jobs().is_empty());
+        let added: Vec<String> = slack
+            .reactions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, r)| r.clone())
+            .collect();
+        assert_eq!(added, vec![ACK_REACTION.to_string()], "only the ack was added");
+        assert_eq!(
+            slack
+                .removed
+                .lock()
+                .unwrap()
+                .len(),
+            1,
+            "and it was removed"
+        );
+        assert!(
+            slack
+                .net_reactions()
+                .is_empty(),
+            "no lifecycle reaction survives"
+        );
+    }
+
+    /// An unauthorized mention is rejected before the ack stage, so no reaction
+    /// (not even 👀) is ever added.
+    #[tokio::test]
+    async fn unauthorized_request_never_acks() {
+        let (c, _store, slack) = harness();
+        let mut ev = event("<@U07BOT> bench --block 1");
+        ev.user = "U_EVIL".into();
+        c.handle_mention(ev).await;
+
+        assert!(
+            slack
+                .reactions
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "authz fails before the ack is added"
+        );
+        assert!(
+            slack
+                .removed
                 .lock()
                 .unwrap()
                 .is_empty()
@@ -695,6 +979,98 @@ mod tests {
                 .as_deref(),
             Some("stream_ts"),
             "queued stream ts persisted by job_id",
+        );
+    }
+
+    /// A `create_unlinked_job` failure *after* a streamed card was posted
+    /// terminates the stream with a failure (via `stop_stream`, not
+    /// `chat.update`, which a live stream rejects), enqueues nothing, and
+    /// rejects — so the window can't leave a fake "queued" stream card.
+    #[tokio::test]
+    async fn create_failure_after_streamed_card_stops_the_stream() {
+        let (c, store, slack) = harness();
+        store.fail_create_unlinked_job();
+        c.handle_mention(event("<@U07BOT> bench --block 184231"))
+            .await;
+
+        assert!(store.all_jobs().is_empty(), "create failed → no job");
+        let stops = slack.stops.lock().unwrap();
+        assert_eq!(stops.len(), 1, "the streamed card is stopped, not left queued");
+        assert_eq!(stops[0].0, "C1");
+        assert_eq!(stops[0].1, "stream_ts");
+        assert!(
+            stops[0]
+                .2
+                .contains("Couldn't enqueue"),
+            "failure blocks rendered: {}",
+            stops[0].2
+        );
+        assert!(
+            slack
+                .updates
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a live stream is not chat.update'd",
+        );
+        assert!(
+            slack
+                .net_reactions()
+                .is_empty(),
+            "👀 ack retired, no ⏳"
+        );
+        assert_eq!(
+            slack
+                .ephemerals
+                .lock()
+                .unwrap()
+                .len(),
+            1,
+            "user told to retry",
+        );
+    }
+
+    /// The block-fallback variant: when the card was a block message (stream
+    /// start failed), the same create failure updates it in place.
+    #[tokio::test]
+    async fn create_failure_after_block_card_updates_it() {
+        let store = Arc::new(InMemoryJobStore::new());
+        let slack = Arc::new(FakeSlackClient::default());
+        slack.fail_stream(); // force the block-card fallback
+        store.fail_create_unlinked_job();
+        let c = SlackConnector::new(cfg(), TARGET, store.clone(), slack.clone())
+            .with_binary_cache_enabled(true);
+
+        c.handle_mention(event("<@U07BOT> bench --block 184231"))
+            .await;
+
+        assert!(store.all_jobs().is_empty());
+        assert_eq!(
+            slack
+                .posts
+                .lock()
+                .unwrap()
+                .len(),
+            1,
+            "block fallback posted the card",
+        );
+        let updates = slack.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1, "the block card is updated in place");
+        assert_eq!(updates[0].1, "ts");
+        assert!(
+            updates[0]
+                .2
+                .contains("Couldn't enqueue"),
+            "{}",
+            updates[0].2
+        );
+        assert!(
+            slack
+                .stops
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a block card is not stopped",
         );
     }
 
@@ -769,10 +1145,9 @@ mod tests {
         assert!(store.all_jobs().is_empty(), "no job for an unresolvable request");
         assert!(
             slack
-                .reactions
-                .lock()
-                .unwrap()
-                .is_empty()
+                .net_reactions()
+                .is_empty(),
+            "rejected: ack retired, no ⏳"
         );
         let eph = slack
             .ephemerals
@@ -802,9 +1177,7 @@ mod tests {
         assert!(store.all_jobs().is_empty(), "over-cap request must not enqueue");
         assert!(
             client
-                .reactions
-                .lock()
-                .unwrap()
+                .net_reactions()
                 .is_empty(),
             "over-cap request must not get accepted reaction",
         );
@@ -837,9 +1210,7 @@ mod tests {
         assert!(store.all_jobs().is_empty(), "cache-off multi-run request must not enqueue");
         assert!(
             client
-                .reactions
-                .lock()
-                .unwrap()
+                .net_reactions()
                 .is_empty(),
             "rejected request must not get accepted reaction",
         );
@@ -882,13 +1253,14 @@ mod tests {
             panic!("expected SlackAdhoc detail");
         };
         assert_eq!(clean_repetitions, 2);
-        assert!(
-            !client
-                .reactions
-                .lock()
-                .unwrap()
-                .is_empty(),
-            "accepted request gets a reaction",
+        assert_eq!(
+            client
+                .net_reactions()
+                .iter()
+                .map(|(_, _, r)| r.as_str())
+                .collect::<Vec<_>>(),
+            vec![QUEUED_REACTION],
+            "accepted request settles on the ⏳ reaction",
         );
     }
 
@@ -964,9 +1336,7 @@ mod tests {
         assert!(store.all_jobs().is_empty());
         assert!(
             slack
-                .reactions
-                .lock()
-                .unwrap()
+                .net_reactions()
                 .is_empty()
         );
         assert!(
@@ -990,9 +1360,7 @@ mod tests {
         assert!(store.all_jobs().is_empty());
         assert!(
             slack
-                .reactions
-                .lock()
-                .unwrap()
+                .net_reactions()
                 .is_empty()
         );
         let eph = slack
@@ -1014,9 +1382,7 @@ mod tests {
         assert!(store.all_jobs().is_empty());
         assert!(
             slack
-                .reactions
-                .lock()
-                .unwrap()
+                .net_reactions()
                 .is_empty()
         );
         let eph = slack
@@ -1053,14 +1419,8 @@ mod tests {
 
         assert_eq!(resolver.calls(), 1, "second NL request is rejected before provider call");
         assert_eq!(store.all_jobs().len(), 1);
-        assert_eq!(
-            slack
-                .reactions
-                .lock()
-                .unwrap()
-                .len(),
-            1
-        );
+        // First request accepted (net ⏳), second rate-limited (ack retired) — net one.
+        assert_eq!(slack.net_reactions().len(), 1);
         let eph = slack
             .ephemerals
             .lock()

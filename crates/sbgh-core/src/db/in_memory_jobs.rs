@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -27,6 +27,9 @@ use crate::models::{
 pub struct InMemoryJobStore {
     state: Mutex<State>,
     next_event_id: AtomicI64,
+    /// Test knob: when set, `create_unlinked_job` returns an error so callers
+    /// can exercise their post-create failure handling.
+    fail_create_unlinked: AtomicBool,
 }
 
 #[derive(Default)]
@@ -51,7 +54,15 @@ impl InMemoryJobStore {
         Self {
             state: Mutex::new(State::default()),
             next_event_id: AtomicI64::new(1),
+            fail_create_unlinked: AtomicBool::new(false),
         }
+    }
+
+    /// Test knob: make the next (and subsequent) `create_unlinked_job` calls
+    /// fail, so a caller's post-create cleanup path can be exercised.
+    pub fn fail_create_unlinked_job(&self) {
+        self.fail_create_unlinked
+            .store(true, Ordering::SeqCst);
     }
 
     /// Test-only accessor: returns true iff a `github_webhook_job`
@@ -410,11 +421,20 @@ impl JobStore for InMemoryJobStore {
 
     async fn create_unlinked_job(
         &self,
+        job_id: Uuid,
         new_job: &NewJob,
         queued_event_detail: &serde_json::Value,
+        plan_message_ts: Option<&str>,
     ) -> Result<Job> {
+        if self
+            .fail_create_unlinked
+            .load(Ordering::SeqCst)
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "injected create_unlinked_job failure"
+            )));
+        }
         let now = Utc::now();
-        let job_id = Uuid::new_v4();
         let requested_run_count = requested_run_count_from_detail(queued_event_detail);
         let (group, spec, steps) = singleton_group_spec(new_job, now, requested_run_count);
         // v10 (0005): jobs carry the axes natively — set by the caller.
@@ -467,6 +487,23 @@ impl JobStore for InMemoryJobStore {
         s.steps.extend(steps);
         s.insertion_order.push(job_id);
         s.events.push(queued_event);
+        // Record the pre-posted plan card's `ts` alongside the queued event.
+        if let Some(ts) = plan_message_ts {
+            s.events.push(JobEvent {
+                id: self
+                    .next_event_id
+                    .fetch_add(1, Ordering::SeqCst),
+                job_id,
+                event_kind: JobEventKind::PlanMessageSent,
+                event_status: JobEventStatus::Success,
+                occurred_at: now,
+                github_comment_id: None,
+                github_check_run_id: None,
+                github_check_run_url: None,
+                remark: None,
+                detail: Some(sqlx::types::Json(serde_json::json!({ "plan_message_ts": ts }))),
+            });
+        }
         Ok(job)
     }
 

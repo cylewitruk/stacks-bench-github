@@ -190,9 +190,16 @@ pub trait JobStore: Send + Sync + 'static {
     ) -> Result<JobCreationOutcome>;
 
     /// Create a job with **no GitHub webhook/PR/owner links** — a non-webhook
-    /// trigger (v5 Slack ad-hoc, or v11 daemon `cache_warm` warming). Inserts
-    /// the `job` row + its queued `job_event` (carrying the provenance
-    /// detail) in one transaction, returning the inserted job.
+    /// trigger (Slack ad-hoc, or daemon `cache_warm` warming). Inserts the
+    /// `job` row (under the caller-provided `job_id`) + its queued `job_event`
+    /// — and, when `plan_message_ts` is `Some`, the `plan_message_sent` event —
+    /// all in one transaction, returning the inserted job.
+    ///
+    /// The Slack connector posts its plan card before creating the job (the
+    /// card `ts` needs the id), so it passes that id + the card's `ts` here;
+    /// writing `plan_message_sent` in the same transaction means the job is
+    /// never claimable without its plan `ts`. Warming passes a generated id +
+    /// `None`.
     ///
     /// Deliberately **separate** from
     /// [`create_job_with_links`](Self::create_job_with_links) so the GitHub
@@ -202,8 +209,10 @@ pub trait JobStore: Send + Sync + 'static {
     /// dedups itself against in-flight builds — making this a plain create.
     async fn create_unlinked_job(
         &self,
+        job_id: Uuid,
         new_job: &NewJob,
         queued_event_detail: &serde_json::Value,
+        plan_message_ts: Option<&str>,
     ) -> Result<Job>;
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>>;

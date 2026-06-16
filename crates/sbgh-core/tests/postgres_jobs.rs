@@ -138,7 +138,7 @@ async fn create_unlinked_job_inserts_queued_job_and_event_without_webhook() {
     };
 
     let job = store
-        .create_unlinked_job(&new_job, &detail)
+        .create_unlinked_job(uuid::Uuid::new_v4(), &new_job, &detail, None)
         .await
         .unwrap();
     assert_eq!(job.status, JobStatus::Queued);
@@ -210,7 +210,7 @@ async fn create_unlinked_job_writes_build_only_cache_warm() {
     };
 
     let job = store
-        .create_unlinked_job(&new_job, &detail)
+        .create_unlinked_job(uuid::Uuid::new_v4(), &new_job, &detail, None)
         .await
         .unwrap();
 

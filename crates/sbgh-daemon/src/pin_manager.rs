@@ -285,8 +285,9 @@ async fn warm_missing(
         })
         .expect("QueuedEventDetail::CacheWarm serializes");
 
+        // Warming has no Slack surface: a fresh id and no plan card.
         match jobs
-            .create_unlinked_job(&new_job, &detail)
+            .create_unlinked_job(uuid::Uuid::new_v4(), &new_job, &detail, None)
             .await
         {
             Ok(job) => {
