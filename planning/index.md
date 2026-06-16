@@ -60,6 +60,9 @@ need editing when an item's status or location changes.
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
 | `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `backlog` | [backlog.md](backlog.md) |
 | `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `in_progress` | [iterations/v16-cache-hit-minimal-source-disk.md](iterations/v16-cache-hit-minimal-source-disk.md) |
+| `0043-slack-plan-ts-race` | Slack plan-ts race fix (double card) | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
+| `0044-slack-reaction-lifecycle` | Slack reaction lifecycle (ack/queued/running) | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
+| `0045-slack-llm-observability` | Slack/LLM observability logging | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
 
 ## Iterations
 
@@ -78,6 +81,7 @@ need editing when an item's status or location changes.
 | `v14-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 | `v15-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `in_progress` | [iterations/v15-isolated-benchmark-repetitions.md](iterations/v15-isolated-benchmark-repetitions.md) |
 | `v16-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `in_progress` | [iterations/v16-cache-hit-minimal-source-disk.md](iterations/v16-cache-hit-minimal-source-disk.md) |
+| `v17-slack-reporting-robustness` | Slack reporting robustness, reactions & observability | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
 
 ## Decisions
 
