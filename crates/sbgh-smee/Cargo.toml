@@ -16,6 +16,7 @@ futures.workspace = true
 
 reqwest.workspace = true
 reqwest-eventsource.workspace = true
+rustls.workspace = true
 
 clap.workspace = true
 serde.workspace = true

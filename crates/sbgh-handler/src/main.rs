@@ -29,6 +29,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    sbgh_core::install_default_crypto_provider();
     let args = Args::parse();
     load_env(args.env_file.as_deref())?;
     init_tracing();

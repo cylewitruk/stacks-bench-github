@@ -35,6 +35,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Pin the rustls provider before any TLS (the workspace tree carries both
+    // `ring` and `aws-lc-rs`, so the default is otherwise ambiguous).
+    let _ = rustls::crypto::ring::default_provider().install_default();
     init_tracing();
     let args = Args::parse();
     let client = reqwest::Client::builder()

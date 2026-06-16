@@ -107,6 +107,11 @@ quick-xml = "0.40"
 reqwest-eventsource = "0.6.0"
 clap = { version = "4.6.1", features = ["derive"] }
 regex = "1.12.4"
+# TLS: the dep tree unifies both rustls providers (`aws-lc-rs` via reqwest,
+# `ring` via slack-morphism/sqlx), so the process-level default is ambiguous and
+# rustls panics on the first handshake. Each binary installs `ring` explicitly at
+# startup (see `sbgh_core::install_default_crypto_provider`).
+rustls = { version = "0.23", features = ["ring"] }
 
 [profile.dev]
 debug = "line-tables-only"

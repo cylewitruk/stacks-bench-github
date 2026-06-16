@@ -389,6 +389,7 @@ enum JobsAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    sbgh_core::install_default_crypto_provider();
     let cli = Cli::parse();
     load_env(cli.env_file.as_deref())?;
     init_tracing();
