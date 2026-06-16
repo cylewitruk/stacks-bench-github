@@ -21,49 +21,51 @@ sbgh-core = { path = "crates/sbgh-core" }
 sbgh-api = { path = "crates/sbgh-api" }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 # `io` for ReaderStream (streaming artifact uploads, item 0001).
-tokio-util = { version = "0.7", features = ["io"] }
-async-trait = "0.1"
-futures = "0.3"
+tokio-util = { version = "0.7.18", features = ["io"] }
+async-trait = "0.1.89"
+futures = "0.3.32"
 
 # HTTP / web
-axum = { version = "0.8", features = ["macros"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "limit"] }
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
+axum = { version = "0.8.9", features = ["macros"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.0", features = ["trace", "limit"] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "rustls",
     "json",
+    "query",
     "stream",
 ] }
 # S3-compatible object storage for run artifacts (item 0001). Sans-IO (pure
 # SigV4 signing + request building); driven by reqwest.
-rusty-s3 = "0.9"
+rusty-s3 = "0.9.1"
 
 # GitHub
-octocrab = "0.51"
-jsonwebtoken = "10"
+octocrab = "0.53.1"
+jsonwebtoken = "10.4.0"
 
 # Slack (item 0002): Socket Mode client for the ad-hoc profiling connector. The
 # `hyper` feature pulls the WS listener (tokio-tungstenite) + Web API client,
 # all rustls/ring-aligned with our stack; the `axum` feature (Events-API HTTP
 # push) is deliberately NOT enabled — Socket Mode is an outbound WebSocket.
-slack-morphism = { version = "2", default-features = false, features = [
+slack-morphism = { version = "2.22.0", default-features = false, features = [
     "hyper",
 ] }
 # Typed Block Kit builders (item 0002): the terminal result card (`task_card`).
 # Serde-only at runtime — no async/HTTP stack of its own.
-slack-messaging = "0.7"
+slack-messaging = "0.7.5"
 
 # Crypto / hashing for webhook signature verification
-hmac = "0.12"
-sha2 = "0.10"
-subtle = "2"
-hex = "0.4"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+hex = "0.4.3"
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio-rustls",
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
     "postgres",
     "macros",
     "chrono",
@@ -73,38 +75,37 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
 # `preserve_order` is critical for sbgh-smee: it forwards GitHub webhook
 # payloads, and the receiver verifies HMAC against the body bytes. If we
 # re-serialize JSON with keys in alphabetical order, the byte stream differs
 # from what GitHub originally sent and HMAC fails. preserve_order keeps the
 # insertion order through the round-trip, matching V8's behaviour that
 # upstream smee-client relies on.
-serde_json = { version = "1", features = ["preserve_order"] }
-schemars = "1"
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+schemars = "1.2.1"
 
 # Errors
-thiserror = "2"
-anyhow = "1"
+thiserror = "2.0.18"
+anyhow = "1.0.102"
 
 # Logging / tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # Utilities
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", default-features = false, features = [
+uuid = { version = "1.23.3", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", default-features = false, features = [
     "serde",
     "clock",
 ] }
 dotenvy = "0.15"
-url = "2"
-percent-encoding = "2"
-toml = "1"
+url = "2.5.8"
+percent-encoding = "2.3.2"
+toml = "1.1.2"
 quick-xml = "0.40"
-
-reqwest-eventsource = "0.6"
-clap = { version = "4", features = ["derive"] }
+reqwest-eventsource = "0.6.0"
+clap = { version = "4.6.1", features = ["derive"] }
 regex = "1.12.4"
 
 [profile.dev]

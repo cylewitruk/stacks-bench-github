@@ -5,6 +5,7 @@
 
 use sbgh_core::db::{InstallationStore, NewInstallation, PostgresInstallationStore, setup_pg_db};
 use sbgh_core::models::GithubAccountType;
+use sqlx::AssertSqlSafe;
 
 async fn seed_allowed(pool: &sbgh_core::db::Pool, account_id: i64, login: &str, is_enabled: bool) {
     sqlx::query(
@@ -354,7 +355,7 @@ async fn delete_installation_disables_all_policy_rows_in_same_transaction() {
         let q = format!(
             "SELECT COUNT(*) FROM {table} WHERE github_installation_id = 100 AND is_enabled = TRUE"
         );
-        let count: i64 = sqlx::query_scalar(&q)
+        let count: i64 = sqlx::query_scalar(AssertSqlSafe(q))
             .fetch_one(&pool)
             .await
             .unwrap();

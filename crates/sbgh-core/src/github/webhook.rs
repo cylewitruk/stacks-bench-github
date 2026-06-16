@@ -5,7 +5,7 @@
 //! `X-Hub-Signature-256: sha256=<hex>`. The comparison MUST be constant-time
 //! to prevent timing attacks.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;

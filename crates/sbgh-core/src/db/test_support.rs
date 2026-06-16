@@ -11,6 +11,7 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+use sqlx::AssertSqlSafe;
 use tokio::time::sleep;
 
 use crate::db::{self, Pool};
@@ -63,9 +64,9 @@ impl Drop for TestDb {
             };
             rt.block_on(async move {
                 if let Ok(admin) = db::connect(COMPOSE_ADMIN_DSN).await {
-                    let _ = sqlx::query(&format!(
+                    let _ = sqlx::query(AssertSqlSafe(format!(
                         r#"DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)"#
-                    ))
+                    )))
                     .execute(&admin)
                     .await;
                     admin.close().await;
@@ -131,7 +132,7 @@ pub async fn setup_pg_db() -> TestPgDb {
     // *different* database — hence the admin pool on `postgres`. The id is a
     // server-generated integer, so interpolating it (DDL takes no bind
     // params) is injection-safe.
-    sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
+    sqlx::query(AssertSqlSafe(format!(r#"CREATE DATABASE "{db_name}""#)))
         .execute(&admin)
         .await
         .unwrap_or_else(|e| panic!("creating test database {db_name}: {e}"));

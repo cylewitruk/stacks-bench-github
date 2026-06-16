@@ -13,7 +13,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::post;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::BodyExt;
 use sbgh_api::Client;
 use sbgh_core::config::{HandlerApiConfig, HandlerConfig, ServerConfig, WebhookConfig};
@@ -158,7 +158,7 @@ async fn setup_ok() -> Harness {
 }
 
 fn sign(body: &[u8]) -> String {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(SECRET.as_bytes()).unwrap();
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(SECRET.as_bytes()).unwrap();
     mac.update(body);
     let bytes = mac.finalize().into_bytes();
     format!("sha256={}", hex::encode::<&[u8]>(bytes.as_ref()))

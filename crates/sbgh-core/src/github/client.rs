@@ -386,7 +386,11 @@ impl GitHubApi for OctocrabClient {
             .pulls(owner, repo)
             .get(pr_number)
             .await?;
-        Ok(pr.head.sha)
+        let head = pr
+            .head
+            .as_ref()
+            .ok_or_else(|| Error::Config(format!("PR #{pr_number} missing head")))?;
+        Ok(head.sha.clone())
     }
 
     async fn get_repository(
@@ -423,17 +427,26 @@ impl GitHubApi for OctocrabClient {
         // types (Head vs Base) even though they share fields. Extract
         // the bits we care about manually rather than fight the
         // generics.
-        let head_repo = pr
+        let head = pr
             .head
+            .as_ref()
+            .ok_or_else(|| Error::Config(format!("PR #{pr_number} missing head")))?;
+        let base = pr
+            .base
+            .as_ref()
+            .ok_or_else(|| Error::Config(format!("PR #{pr_number} missing base")))?;
+        let head_repo = head
             .repo
             .as_ref()
             .ok_or_else(|| Error::Config("PR head missing repo (orphaned ref?)".into()))?;
-        let base_repo = pr
-            .base
+        let base_repo = base
             .repo
             .as_ref()
             .ok_or_else(|| Error::Config("PR base missing repo".into()))?;
-        let author = pr.user.as_ref();
+        let author = pr
+            .user
+            .as_ref()
+            .ok_or_else(|| Error::Config(format!("PR #{pr_number} missing author")))?;
         // GH's REST response uses `User`/`Organization`/`Bot`; map to
         // our typed enum at the boundary (same rationale as elsewhere
         // — bogus type → Error rather than silent default).
@@ -449,15 +462,18 @@ impl GitHubApi for OctocrabClient {
             number: pr_number,
             head: PullRequestSide {
                 repo: repo_ref_from_octocrab(head_repo),
-                sha: pr.head.sha.clone(),
-                branch: pr.head.ref_field.clone(),
+                sha: head.sha.clone(),
+                branch: head.ref_field.clone(),
             },
             base: PullRequestSide {
                 repo: repo_ref_from_octocrab(base_repo),
-                sha: pr.base.sha.clone(),
-                branch: pr.base.ref_field.clone(),
+                sha: base.sha.clone(),
+                branch: base.ref_field.clone(),
             },
-            title: pr.title.clone(),
+            title: pr
+                .title
+                .clone()
+                .ok_or_else(|| Error::Config(format!("PR #{pr_number} missing title")))?,
             author: crate::github::PullRequestAuthor {
                 id: author.id.0 as i64,
                 login: author.login.clone(),
