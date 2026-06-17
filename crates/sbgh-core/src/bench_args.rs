@@ -16,8 +16,9 @@
 //! Order- and whitespace-sensitive by current contract: it mirrors the bench
 //! template's `read -r -a` word-splitting, so quoted/escaped values are not
 //! supported (no current bench arg needs them). v15 normalizes any raw
-//! `--repetitions` arg to one in-process repetition; daemon-level clean
-//! repetitions are modeled above this layer.
+//! `--repetitions` arg to one in-process repetition for target-selector modes
+//! that support it; daemon-level clean repetitions are modeled above this
+//! layer.
 
 use sha2::{Digest, Sha256};
 
@@ -118,8 +119,10 @@ fn effective_arg_tokens(stored: &[String], default: &str) -> Vec<String> {
     normalize_in_process_repetitions(raw)
 }
 
-/// Force sbgh-managed executions to one in-process measured repetition. The
-/// user-facing repetition count is now a daemon/group-level clean-run count.
+/// Force sbgh-managed executions to one in-process measured repetition when the
+/// `stacks-bench` mode supports it. Range mode uses `--start-at` + `--count` or
+/// `--end-at` and rejects `--repetitions`, so raw range-shaped args have the
+/// user-facing repetition flag stripped without re-adding an in-process one.
 fn normalize_in_process_repetitions(args: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     let mut iter = args.into_iter().peekable();
@@ -142,11 +145,24 @@ fn normalize_in_process_repetitions(args: Vec<String>) -> Vec<String> {
             out.push(arg);
         }
     }
-    if saw_repetitions {
+    if saw_repetitions && !is_range_mode(&out) {
         out.push("--repetitions".into());
         out.push("1".into());
     }
     out
+}
+
+fn is_range_mode(args: &[String]) -> bool {
+    let has_start = has_flag(args, "--start-at");
+    let has_range_end = has_flag(args, "--count") || has_flag(args, "--end-at");
+    let has_target_selector = has_flag(args, "--block") || has_flag(args, "--txid");
+    has_start && has_range_end && !has_target_selector
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    let eq_prefix = format!("{flag}=");
+    args.iter()
+        .any(|arg| arg == flag || arg.starts_with(&eq_prefix))
 }
 
 #[cfg(test)]
@@ -242,6 +258,27 @@ mod tests {
             resolve_bench_args(&[], "--block 1 --repetitions 9").effective_args,
             vec!["--block", "1", "--repetitions", "1"],
             "configured defaults are normalized too",
+        );
+    }
+
+    #[test]
+    fn normalize_range_args_strips_repetition_without_readding_it() {
+        assert_eq!(
+            normalize_stored(&slack(&[
+                "--start-at",
+                "8000000",
+                "--count",
+                "5000",
+                "--warmup",
+                "1000",
+                "--repetitions",
+                "2",
+            ])),
+            vec!["--start-at", "8000000", "--count", "5000", "--warmup", "1000"]
+        );
+        assert_eq!(
+            effective_arg_string(&[], "--start-at 8000000 --end-at 8005000 --repetitions=2"),
+            "--start-at 8000000 --end-at 8005000"
         );
     }
 
