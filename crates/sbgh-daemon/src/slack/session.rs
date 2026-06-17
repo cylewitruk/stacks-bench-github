@@ -13,8 +13,9 @@
 //!
 //! [`SlackReportSurface`]: crate::report::SlackReportSurface
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -40,6 +41,11 @@ pub struct SlackTarget {
 pub struct SlackSession {
     timeline: std::sync::Arc<SlackTimeline>,
     keepalive: Mutex<Option<JoinHandle<()>>>,
+    /// Last time a run actively used this session (built / completed). The
+    /// abandonment sweep only reaps a session idle past a grace TTL, so this is
+    /// refreshed at each run's bookends — never by the (always-looping)
+    /// keepalive.
+    last_touched: Mutex<Instant>,
 }
 
 impl SlackSession {
@@ -47,6 +53,7 @@ impl SlackSession {
         Self {
             timeline,
             keepalive: Mutex::new(None),
+            last_touched: Mutex::new(Instant::now()),
         }
     }
 
@@ -54,6 +61,23 @@ impl SlackSession {
     /// API (`begin_run`/`started`/`advance`/terminal).
     pub fn timeline(&self) -> &std::sync::Arc<SlackTimeline> {
         &self.timeline
+    }
+
+    /// Mark the session as actively used by a run (resets the abandonment
+    /// clock). Called on get-or-create and on successful run completion;
+    /// failure/cancel reap the session immediately instead.
+    pub fn touch(&self) {
+        *self
+            .last_touched
+            .lock()
+            .unwrap() = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_touched
+            .lock()
+            .unwrap()
+            .elapsed()
     }
 
     /// Spawn the stream keepalive once, idempotently. Called after the first
@@ -119,19 +143,45 @@ impl SlackSessionRegistry {
     }
 
     /// The session for `(group_id, target)`, creating it from `make_timeline`
-    /// (invoked only on first use) if absent.
+    /// (invoked only on first use) if absent. Touches it either way — building
+    /// a run's surface is run activity, which resets the abandonment clock.
     pub fn get_or_create(
         &self,
         group_id: Uuid,
         target: SlackTarget,
         make_timeline: impl FnOnce() -> std::sync::Arc<SlackTimeline>,
     ) -> std::sync::Arc<SlackSession> {
-        self.sessions
+        let session = self
+            .sessions
             .lock()
             .unwrap()
             .entry((group_id, target))
             .or_insert_with(|| std::sync::Arc::new(SlackSession::new(make_timeline())))
-            .clone()
+            .clone();
+        session.touch();
+        session
+    }
+
+    /// Reap sessions abandoned mid-group: idle past `grace` **and** whose group
+    /// has no active (queued/running) run — `active_groups`. Both conditions
+    /// are required: "no active run right now" alone is briefly true during
+    /// a repeat group's inter-run carry-forward gap, which `grace` bridges.
+    /// Returns the number reaped. (Phase 3, 0047.)
+    pub fn sweep_abandoned(&self, grace: Duration, active_groups: &HashSet<Uuid>) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let stale: Vec<(Uuid, SlackTarget)> = sessions
+            .iter()
+            .filter(|((group, _), session)| {
+                !active_groups.contains(group) && session.idle_for() > grace
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &stale {
+            if let Some(session) = sessions.remove(key) {
+                session.stop_keepalive();
+            }
+        }
+        stale.len()
     }
 
     /// Reap the session for `(group_id, target)`: abort its keepalive and drop
@@ -163,9 +213,7 @@ impl SlackSessionRegistry {
             .cloned()
     }
 
-    /// Number of live sessions (tests; Phase 3's abandonment sweep promotes
-    /// this to production).
-    #[cfg(test)]
+    /// Number of live sessions.
     pub fn len(&self) -> usize {
         self.sessions
             .lock()
@@ -173,7 +221,6 @@ impl SlackSessionRegistry {
             .len()
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

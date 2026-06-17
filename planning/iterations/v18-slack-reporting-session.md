@@ -4,20 +4,21 @@ Move Slack stream/card liveness from the **per-run** reporting surface to a
 **group-scoped session**, so the card's lifetime matches the trigger/request
 lifetime instead of a single run's (`0047`).
 
-> **Status:** planning (Codex signed off; adjustments folded in)
+> **Status:** in_progress — all three phases implemented, tested (919 green,
+> lint clean), and Codex-reviewed. Pending only the host smoke (the real
+> validation gate), batched with the dep upgrade + v15/v16/v17.
 >
 > Corrects the ownership model exposed by v17's per-run keepalive (the
-> repeat-group inter-run gap). The v17 per-run keepalive stays in place as the
-> working single-run fix until this lands. Codex review folded in: keepalive
-> started after `started()`, `begin_run` resets **all** run state, an explicit
-> group-terminal reap predicate, a conservative sweep, and composability
-> guardrails (see Design Decisions).
+> repeat-group inter-run gap): the per-run `SlackReportSurface` is now a delegate
+> into a group-scoped `SlackSession` that owns the card, stream keepalive, and
+> reactions for the group's lifetime, reaped on a group-terminal event (with a
+> conservative abandonment sweep). The v17 per-run keepalive is superseded.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0047-slack-reporting-session` | primary | planning |
+| `0047-slack-reporting-session` | primary | in_progress |
 
 ## Why
 
@@ -233,21 +234,33 @@ group mid carry-forward.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed
 - [ ] Validated
+
+> Landed (919 green, lint clean). `SlackSession` gained `last_touched` (bumped on
+> get-or-create and successful run completion — failure/cancel reap immediately,
+> so they don't touch); `SlackSessionRegistry::
+> sweep_abandoned(grace, active_groups)` reaps idle-past-`SESSION_ABANDON_GRACE`
+> (10 min) sessions whose group isn't active. The coordinator computes
+> `active_groups` from the DB (`list_queued` ∪ running-via-`load_runnable`) each
+> tick and skips the sweep on any read error (never reaps on uncertainty); a long
+> *running* job stays protected (its group is in `running`), so the grace only
+> bridges the brief carry-forward gap. `len`/`is_empty` promoted from test-only.
 
 **Acceptance:**
 
-- [ ] A group abandoned mid-flight has its session reaped after the grace TTL; a
-  healthy group in its inter-run carry-forward gap is **never** reaped early.
+- [x] A group abandoned mid-flight has its session reaped after the grace TTL; a
+  healthy group in its inter-run carry-forward gap is **never** reaped early —
+  `sweep_reaps_only_idle_and_inactive_sessions` covers the grace gate, the
+  active-group (DB-progress) gate, and the abandoned-reap (+ keepalive abort).
 
 ## Final Validation
 
-- [ ] `just build`
-- [ ] `just lint`
-- [ ] `just test`
+- [x] `just build`
+- [x] `just lint`
+- [x] `just test` (919 passed, 1 skipped)
 - [ ] Host smoke: a Slack 2–3 repeat request streams continuously across run
   boundaries — `slack: stream keepalive` lines every ~10s through the
   carry-forward / provisioning gaps, and **no** `message_not_in_streaming_state`

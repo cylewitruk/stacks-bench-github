@@ -53,6 +53,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// without leaving a crashed claim stuck for long.
 const CLAIM_LEASE_MINUTES: i64 = 5;
 
+/// Grace before a Slack reporting session whose group has no active (queued /
+/// running) run is reaped as abandoned (v18, 0047). Comfortably exceeds a
+/// repeat group's inter-run carry-forward + provisioning gap, so the sweep
+/// never reaps a healthy group mid-handoff; with the daemon's reaping otherwise
+/// comprehensive, this is a backstop for the rare stranded session.
+const SESSION_ABANDON_GRACE: Duration = Duration::from_secs(10 * 60);
+
 /// Bounded capacity of the per-job worker→reporter event channel. Phase
 /// transitions are few and heartbeats are droppable, so a small buffer
 /// absorbs bursts without ever stalling the worker for long.
@@ -282,6 +289,9 @@ impl Runner {
             .await;
         loop {
             coord.sweep(lease).await;
+            coord
+                .sweep_abandoned_sessions()
+                .await;
             // Once a drain/abort is requested, stop pulling new work; queued
             // jobs wait for the next boot.
             if !shutdown
@@ -876,6 +886,73 @@ impl Coordinator {
             Ok(n) if n > 0 => tracing::warn!(recovered = n, "recovered stuck `claimed` jobs"),
             Ok(_) => {}
             Err(e) => tracing::error!(error = ?e, "stuck-claim sweep failed"),
+        }
+    }
+
+    /// Reap Slack reporting sessions abandoned mid-group (v18, 0047): idle past
+    /// [`SESSION_ABANDON_GRACE`] **and** whose group has no active (queued /
+    /// running) run. DB-progress-aware so a healthy group in its inter-run
+    /// carry-forward gap is never reaped early. Best-effort — a DB read error
+    /// skips this sweep (we never reap on uncertainty).
+    async fn sweep_abandoned_sessions(&self) {
+        if self
+            .deps
+            .slack_sessions
+            .is_empty()
+        {
+            return; // no sessions → no DB work
+        }
+        let mut active: HashSet<Uuid> = HashSet::new();
+        match self
+            .deps
+            .jobs
+            .list_queued()
+            .await
+        {
+            Ok(jobs) => active.extend(
+                jobs.iter()
+                    .map(|j| j.benchmark_group_id),
+            ),
+            Err(e) => {
+                tracing::warn!(error = ?e, "slack: session sweep skipped (queued read failed)");
+                return;
+            }
+        }
+        let running = match self
+            .deps
+            .jobs
+            .running_job_ids()
+            .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = ?e, "slack: session sweep skipped (running read failed)");
+                return;
+            }
+        };
+        for id in running {
+            match self
+                .deps
+                .jobs
+                .load_runnable(id)
+                .await
+            {
+                Ok(Some(job)) => {
+                    active.insert(job.benchmark_group_id);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = ?e, "slack: session sweep skipped (running job read failed)");
+                    return;
+                }
+            }
+        }
+        let reaped = self
+            .deps
+            .slack_sessions
+            .sweep_abandoned(SESSION_ABANDON_GRACE, &active);
+        if reaped > 0 {
+            tracing::info!(reaped, "slack: reaped abandoned reporting sessions");
         }
     }
 

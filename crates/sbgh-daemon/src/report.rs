@@ -557,6 +557,9 @@ impl ReportSurface for SlackReportSurface {
         summary: &serde_json::Value,
         _comparison: Option<&BaselineComparison>,
     ) {
+        // Run-end is activity: refresh the abandonment clock so the next run's
+        // inter-run carry-forward gap is bridged by the sweep's grace TTL.
+        self.session.touch();
         // Ad-hoc Slack runs aren't PRs → no vs-baseline. Metrics + the presigned
         // DB link (S3 + in-bucket only) are resolved here, then handed to the card.
         if self

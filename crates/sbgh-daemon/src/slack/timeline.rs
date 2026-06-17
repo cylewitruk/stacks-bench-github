@@ -1567,6 +1567,53 @@ mod tests {
         assert!(!session.keepalive_running(), "reap aborts the keepalive");
     }
 
+    /// The abandonment sweep reaps a session only when it's **both** idle past
+    /// the grace TTL **and** its group has no active (queued/running) run — the
+    /// Phase 3 gating that protects a healthy group's inter-run gap.
+    #[tokio::test]
+    async fn sweep_reaps_only_idle_and_inactive_sessions() {
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        use crate::slack::session::{SlackSessionRegistry, SlackTarget};
+
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let registry = SlackSessionRegistry::new();
+        let group = Uuid::from_u128(5);
+        let target = SlackTarget {
+            channel: "C1".into(),
+            thread_ts: "REQ_TS".into(),
+        };
+        let _ = registry.get_or_create(group, target.clone(), || {
+            Arc::new(timeline(slack.clone(), store.clone(), Some("STREAM_TS".into())))
+        });
+
+        // Recently touched (idle < grace) → never reaped, even with no active runs.
+        assert_eq!(registry.sweep_abandoned(Duration::from_secs(3600), &HashSet::new()), 0);
+        assert_eq!(registry.len(), 1, "a freshly-touched session is not reaped");
+
+        // Idle past grace BUT the group still has an active run → kept (the
+        // inter-run carry-forward gap protection).
+        let active: HashSet<Uuid> = [group].into_iter().collect();
+        assert_eq!(registry.sweep_abandoned(Duration::ZERO, &active), 0);
+        assert_eq!(registry.len(), 1, "an active group is never reaped, even when idle");
+
+        // Idle past grace AND no active run → reaped, keepalive aborted.
+        let session = registry
+            .get(group, &target)
+            .unwrap();
+        session
+            .timeline()
+            .started()
+            .await;
+        session.ensure_keepalive();
+        assert!(session.keepalive_running());
+        assert_eq!(registry.sweep_abandoned(Duration::ZERO, &HashSet::new()), 1);
+        assert!(registry.is_empty(), "abandoned session reaped");
+        assert!(!session.keepalive_running(), "and its keepalive aborted");
+    }
+
     #[tokio::test]
     async fn inactive_stream_switches_to_block_updates_without_retrying_appends() {
         let slack = Arc::new(FakeSlack::default());
