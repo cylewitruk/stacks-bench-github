@@ -241,6 +241,11 @@ impl SlackTimeline {
     pub fn spawn_keepalive(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let tl = Arc::clone(self);
         tokio::spawn(async move {
+            tracing::info!(
+                group_id = %tl.group_id,
+                interval_secs = SLACK_STREAM_KEEPALIVE_INTERVAL.as_secs(),
+                "slack: stream keepalive task started",
+            );
             let mut tick = tokio::time::interval(SLACK_STREAM_KEEPALIVE_INTERVAL);
             tick.tick().await; // the first tick is immediate — started() just appended.
             loop {
@@ -249,6 +254,7 @@ impl SlackTimeline {
                     break;
                 }
             }
+            tracing::info!(group_id = %tl.group_id, "slack: stream keepalive task stopped");
         })
     }
 
@@ -263,12 +269,14 @@ impl SlackTimeline {
             let st = self.state.lock().await;
             if !st.streaming {
                 // Fell back to `chat.update` — no stream to keep warm.
+                tracing::info!(group_id = %self.group_id, "slack: keepalive: not streaming (block-update mode) — stopping");
                 return Keepalive::Dead;
             }
             // Idle: pre-stream, or between phases / runs (stage reset by
             // `begin_run`). Keep looping — a later `started`/`advance` re-arms
             // the row to warm.
             if st.plan_ts.is_none() || st.stage == 0 || st.stage >= STAGES {
+                tracing::info!(group_id = %self.group_id, stage = st.stage, has_plan_ts = st.plan_ts.is_some(), "slack: keepalive: idle (nothing to warm)");
                 return Keepalive::Alive;
             }
             let ts = st
@@ -288,7 +296,7 @@ impl SlackTimeline {
             .await
         {
             Ok(()) => {
-                tracing::debug!(group_id = %self.group_id, ts = %ts, "slack: stream keepalive");
+                tracing::info!(group_id = %self.group_id, ts = %ts, "slack: keepalive appended");
                 Keepalive::Alive
             }
             Err(e) => {
