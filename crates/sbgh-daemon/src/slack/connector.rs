@@ -1304,10 +1304,7 @@ mod tests {
         else {
             panic!("expected SlackAdhoc");
         };
-        assert_eq!(
-            bench_args,
-            vec!["--start-at", "10", "--count", "3", "--repetitions", "1", "--warmup", "1"]
-        );
+        assert_eq!(bench_args, vec!["--start-at", "10", "--count", "3", "--warmup", "1"]);
         assert_eq!(clean_repetitions, 1);
     }
 

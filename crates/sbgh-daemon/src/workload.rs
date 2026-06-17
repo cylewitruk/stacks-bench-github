@@ -80,21 +80,27 @@ pub struct WorkloadSpec {
 
 impl WorkloadSpec {
     /// The `stacks-bench` CLI args for one isolated VM execution — the
-    /// **workload** flags only (`--txid`/`--block`/`--repetitions`/`--warmup`).
-    /// `rev` is the code-under-test, applied by the connector, not a bench arg.
+    /// **workload** flags only (`--txid`/`--block` or block range, plus
+    /// `--warmup` where present). `rev` is the code-under-test, applied by the
+    /// connector, not a bench arg.
     ///
-    /// v15 repurposes user-facing repetitions as daemon-level clean runs, so
-    /// every single VM invocation receives `--repetitions 1`.
+    /// v15 repurposes user-facing repetitions as daemon-level clean runs.
+    /// Targeted `--txid`/`--block` invocations still receive one in-process
+    /// repetition for compatibility with that CLI shape; block-range mode does
+    /// not support `--repetitions`.
     pub fn to_bench_args(&self) -> Vec<String> {
         let mut args = Vec::new();
+        let mut include_in_process_repetition = false;
         match &self.target {
             WorkloadTarget::Txids(txids) => {
+                include_in_process_repetition = true;
                 for t in txids {
                     args.push("--txid".to_string());
                     args.push(t.clone());
                 }
             }
             WorkloadTarget::Blocks(blocks) => {
+                include_in_process_repetition = true;
                 for b in blocks {
                     args.push("--block".to_string());
                     args.push(b.as_bench_arg());
@@ -107,8 +113,10 @@ impl WorkloadSpec {
                 args.push((end - start + 1).to_string());
             }
         }
-        args.push("--repetitions".to_string());
-        args.push("1".to_string());
+        if include_in_process_repetition {
+            args.push("--repetitions".to_string());
+            args.push("1".to_string());
+        }
         if let Some(w) = self.warmup {
             args.push("--warmup".to_string());
             args.push(w.to_string());
