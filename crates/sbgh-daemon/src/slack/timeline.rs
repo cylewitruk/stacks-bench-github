@@ -17,9 +17,11 @@
 //! resumes the **same** card. Every Slack call is non-fatal.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::bench_summary::RunResult;
 use crate::job_source::{RunnableJob, RunnableJobStore};
@@ -33,39 +35,62 @@ use crate::slack::stream::{
     classify_stream_error, terminal_chunks_for_card,
 };
 
-/// Slack appears to mark a long-idle stream as no longer actively streaming
-/// after a few minutes, which paints pending tasks as failed in the client
-/// until a later terminal update corrects them. Keep the stream alive with
-/// quiet task-update heartbeats; no markdown text is appended. 10s (lowered
-/// from 30s) holds the stream through long, semantically-quiet phases (e.g. a
-/// multi-minute benchmark phase that emits no row updates).
+/// Slack marks a long-idle stream as no longer actively streaming after a few
+/// minutes, painting pending rows as failed until a terminal update corrects
+/// them. The dedicated keepalive task ([`SlackTimeline::spawn_keepalive`])
+/// warms the stream every interval with a quiet task-update; 10s holds it
+/// through long semantically-quiet phases and the provisioning gaps the VM
+/// heartbeat doesn't cover. Also the debounce floor for the (VM-driven)
+/// semantic `heartbeat`.
 const SLACK_STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Outcome of one keepalive tick. `Alive` keeps the loop running (including the
+/// idle windows between phases / runs); `Dead` stops it (the stream is gone and
+/// the card has fallen back to `chat.update`, which doesn't expire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keepalive {
+    Alive,
+    Dead,
+}
 
 pub struct SlackTimeline {
     client: Arc<dyn SlackClient>,
     jobs: Arc<dyn RunnableJobStore>,
-    job: RunnableJob,
     /// The user's mention message — the thread anchor + the reaction target.
     channel: String,
     request_ts: String,
-    // Pre-extracted render metadata (the job's fields don't change post-claim).
-    job_id: String,
-    rev: String,
-    commit: String,
-    commit_url: String,
-    /// Set once when this run's Build phase is served from the binary cache
-    /// (item 0025, v9): the short fingerprint digest, surfaced on the Build row
-    /// as "Reused cached build · …". A `OnceLock` so `ctx()` can borrow it
-    /// without the state lock.
-    cached_build: std::sync::OnceLock<String>,
-    /// Set when a cache hit is being staged onto the source disk on the host.
-    cached_build_staging: std::sync::OnceLock<String>,
+    // ── Group-constant: set once, shared by every run in the group (v18). ──
+    /// The benchmark group — the stable correlation id for the whole card's
+    /// lifecycle (logs), since the timeline now spans all of a group's runs.
+    group_id: Uuid,
+    benchmark_spec_id: Uuid,
+    requested_run_count: i32,
+    group_artifact_prefix: String,
+    bench_args: Vec<String>,
+    /// The current run's index — sync-readable so the (lock-free) terminal /
+    /// reaction predicates don't need the state lock. Updated by `begin_run`.
+    run_index: AtomicI32,
     state: Mutex<State>,
 }
 
 struct State {
+    // ── Run-specific render metadata, reset per run by `begin_run` (v18). ──
+    /// The current run's job — for `set_plan_message_ts` (resume identity).
+    job: RunnableJob,
+    /// `job.id` as a string, for `ctx()` to borrow.
+    job_id: String,
+    rev: String,
+    commit: String,
+    commit_url: String,
+    /// This run's Build phase served from the binary cache (item 0025, v9): the
+    /// short fingerprint digest, surfaced on the Build row as "Reused cached
+    /// build · …". Per-run (each run may hit/miss independently).
+    cached_build: Option<String>,
+    /// Set when this run's cache hit is being staged onto the source disk.
+    cached_build_staging: Option<String>,
     /// The plan card's own message `ts` (`None` until posted; pre-seeded from
     /// the persisted value on re-claim so we resume the existing card).
+    /// **Group-shared** — survives `begin_run` across runs.
     plan_ts: Option<String>,
     /// Whether `plan_ts` is still believed to be a Slack streaming message.
     /// Reclaimed/fallback cards may not be streamable; the first
@@ -94,23 +119,27 @@ impl SlackTimeline {
         request_ts: String,
         plan_message_ts: Option<String>,
     ) -> Self {
-        let job_id = job.id.to_string();
-        let rev = job.git_ref_display.clone();
-        let commit = job.commit.clone();
-        let commit_url = format!("https://github.com/{}/commit/{}", job.repository, commit);
         Self {
             client,
             jobs,
-            job,
             channel,
             request_ts,
-            job_id,
-            rev,
-            commit,
-            commit_url,
-            cached_build: std::sync::OnceLock::new(),
-            cached_build_staging: std::sync::OnceLock::new(),
+            group_id: job.benchmark_group_id,
+            benchmark_spec_id: job.benchmark_spec_id,
+            requested_run_count: job.requested_run_count,
+            group_artifact_prefix: job
+                .group_artifact_prefix
+                .clone(),
+            bench_args: job.bench_args.clone(),
+            run_index: AtomicI32::new(job.benchmark_run_index),
             state: Mutex::new(State {
+                job_id: job.id.to_string(),
+                rev: job.git_ref_display.clone(),
+                commit: job.commit.clone(),
+                commit_url: format!("https://github.com/{}/commit/{}", job.repository, job.commit),
+                cached_build: None,
+                cached_build_staging: None,
+                job,
                 streaming: plan_message_ts.is_some(),
                 plan_ts: plan_message_ts,
                 stage: 0,
@@ -119,6 +148,28 @@ impl SlackTimeline {
                 last_stream_update_at: Instant::now(),
             }),
         }
+    }
+
+    /// Re-point the group-scoped timeline at a new run of the same group (v18,
+    /// `0047`): refresh **all** run-specific render state from `job` and reset
+    /// the stage/cache labels, so run *N+1* inherits nothing from run *N*.
+    /// The shared card identity (`plan_ts`/`streaming`/reactions) is
+    /// deliberately left intact — it's the same Slack message across the
+    /// group.
+    pub async fn begin_run(&self, job: &RunnableJob) {
+        self.run_index
+            .store(job.benchmark_run_index, Ordering::SeqCst);
+        let mut st = self.state.lock().await;
+        st.job_id = job.id.to_string();
+        st.rev = job.git_ref_display.clone();
+        st.commit = job.commit.clone();
+        st.commit_url = format!("https://github.com/{}/commit/{}", job.repository, job.commit);
+        st.cached_build = None;
+        st.cached_build_staging = None;
+        st.stage = 0;
+        st.stage_started_at = Instant::now();
+        st.stage_outputs = std::array::from_fn(|_| None);
+        st.job = job.clone();
     }
 
     /// Post (or, on re-claim, resume) the card with the job started — Job
@@ -135,8 +186,7 @@ impl SlackTimeline {
             let (stage, blocks, mut chunks, fallback) = self.render_running_locked(&st, st.stage);
             chunks.extend(stage_started_event_chunks(
                 stage,
-                self.cached_build_staging
-                    .get()
+                st.cached_build_staging
                     .is_some(),
             ));
             (stage, blocks, chunks, fallback)
@@ -145,7 +195,11 @@ impl SlackTimeline {
             .await;
         // Only the first run swaps ⏳ → 🚀; later repeats inherit the
         // already-running group reaction (no flicker).
-        if self.job.benchmark_run_index == 0 {
+        if self
+            .run_index
+            .load(Ordering::SeqCst)
+            == 0
+        {
             self.swap_reaction(RUNNING_REACTION)
                 .await;
         }
@@ -172,6 +226,82 @@ impl SlackTimeline {
             .await;
     }
 
+    /// Spawn a background task that warms the Slack stream on a fixed cadence
+    /// (independent of VM/phase activity), for the whole group's lifetime. The
+    /// caller owns the handle and aborts it on a group-terminal reap. Slack
+    /// expires a quiet stream's server-side state within minutes, and our phase
+    /// events are far sparser than that during provisioning / long quiet phases
+    /// / the inter-run gaps of a repeat group — so the card's liveness must be
+    /// driven here, not as a side effect of the VM heartbeat.
+    ///
+    /// The task keeps looping while the stream is alive but idle (pre-stream,
+    /// between phases, or between a group's runs where `begin_run` has reset
+    /// the stage); it stops only when the stream is permanently gone (fell
+    /// back to block updates), since `chat.update` doesn't expire.
+    pub fn spawn_keepalive(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let tl = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SLACK_STREAM_KEEPALIVE_INTERVAL);
+            tick.tick().await; // the first tick is immediate — started() just appended.
+            loop {
+                tick.tick().await;
+                if matches!(tl.touch_stream().await, Keepalive::Dead) {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// One keepalive tick. Appends the smallest valid chunk — the current
+    /// in-progress row, no new content — to reset the stream's TTL when there's
+    /// a live row; otherwise a no-op. [`Keepalive::Dead`] means the stream is
+    /// permanently gone (block-update mode), so the loop should stop;
+    /// everything else returns [`Keepalive::Alive`] and keeps the loop
+    /// running across the idle windows between phases and between runs.
+    async fn touch_stream(&self) -> Keepalive {
+        let (ts, chunk) = {
+            let st = self.state.lock().await;
+            if !st.streaming {
+                // Fell back to `chat.update` — no stream to keep warm.
+                return Keepalive::Dead;
+            }
+            // Idle: pre-stream, or between phases / runs (stage reset by
+            // `begin_run`). Keep looping — a later `started`/`advance` re-arms
+            // the row to warm.
+            if st.plan_ts.is_none() || st.stage == 0 || st.stage >= STAGES {
+                return Keepalive::Alive;
+            }
+            let ts = st
+                .plan_ts
+                .clone()
+                .expect("checked is_none above");
+            let ctx = self.ctx(&st);
+            let chunk = StreamChunk::TaskUpdate(TaskUpdate::from_row(
+                TASK_IDS[st.stage],
+                &card::running_card(&ctx, st.stage).rows[st.stage],
+            ));
+            (ts, chunk)
+        };
+        match self
+            .client
+            .append_stream(&self.channel, &ts, std::slice::from_ref(&chunk))
+            .await
+        {
+            Ok(()) => {
+                tracing::debug!(group_id = %self.group_id, ts = %ts, "slack: stream keepalive");
+                Keepalive::Alive
+            }
+            Err(e) => {
+                self.state
+                    .lock()
+                    .await
+                    .streaming = false;
+                tracing::info!(group_id = %self.group_id, error = ?e, "slack: keepalive found the stream inactive; switching to block updates");
+                Keepalive::Dead
+            }
+        }
+    }
+
     /// Advance to `stage` — append stream `task_update`s so the prior rows show
     /// complete and `stage` shows in-progress (`chat.update` fallback if the
     /// stream is inactive). Monotonic: a same/earlier stage (e.g. a repeat or
@@ -192,14 +322,11 @@ impl SlackTimeline {
             chunks.extend(stage_completed_event_chunks(
                 completed_stage,
                 &st.stage_outputs,
-                self.cached_build
-                    .get()
-                    .map(String::as_str),
+                st.cached_build.as_deref(),
             ));
             chunks.extend(stage_started_event_chunks(
                 stage,
-                self.cached_build_staging
-                    .get()
+                st.cached_build_staging
                     .is_some(),
             ));
             (blocks, chunks, fallback)
@@ -212,9 +339,10 @@ impl SlackTimeline {
     /// staging that binary onto the source disk. Show this as cached staging,
     /// not as a build VM.
     pub async fn mark_build_cache_staging(&self, digest: &str) {
-        let _ = self
-            .cached_build_staging
-            .set(digest.to_string());
+        self.state
+            .lock()
+            .await
+            .cached_build_staging = Some(digest.to_string());
         self.advance(1).await;
     }
 
@@ -222,30 +350,34 @@ impl SlackTimeline {
     /// the short fingerprint `digest` (surfaced on the Build row as "Reused
     /// cached build · …") and advance to Run. The digest is set once.
     pub async fn mark_build_cached(&self, digest: &str) {
-        let _ = self
-            .cached_build
-            .set(digest.to_string());
+        self.state
+            .lock()
+            .await
+            .cached_build = Some(digest.to_string());
         self.advance(2).await;
     }
 
     pub fn is_repeat_group(&self) -> bool {
-        self.job.requested_run_count > 1
+        self.requested_run_count > 1
     }
 
     pub fn is_final_repeat(&self) -> bool {
-        self.job.benchmark_run_index + 1 >= self.job.requested_run_count
+        self.run_index
+            .load(Ordering::SeqCst)
+            + 1
+            >= self.requested_run_count
     }
 
-    pub fn benchmark_spec_id(&self) -> uuid::Uuid {
-        self.job.benchmark_spec_id
+    pub fn benchmark_spec_id(&self) -> Uuid {
+        self.benchmark_spec_id
     }
 
     pub fn requested_run_count(&self) -> i32 {
-        self.job.requested_run_count
+        self.requested_run_count
     }
 
     pub fn group_artifact_prefix(&self) -> &str {
-        &self.job.group_artifact_prefix
+        &self.group_artifact_prefix
     }
 
     /// One repeat finished successfully, but the group still has more runs.
@@ -258,7 +390,7 @@ impl SlackTimeline {
             self.finish_stage_locked(&mut st);
             st.stage = STAGES;
             st.last_stream_update_at = Instant::now();
-            let ctx = self.ctx();
+            let ctx = self.ctx(&st);
             let mut card = card::repeat_finished_card(&ctx);
             self.apply_timing(&mut card, &st);
             let blocks = card::render(&card);
@@ -287,7 +419,7 @@ impl SlackTimeline {
             self.finish_stage_locked(&mut st);
             st.stage = STAGES;
             st.last_stream_update_at = Instant::now();
-            let ctx = self.ctx();
+            let ctx = self.ctx(&st);
             let mut card = card::completed_card(&ctx, results);
             self.apply_timing(&mut card, &st);
             let blocks = card::render(&card);
@@ -360,7 +492,7 @@ impl SlackTimeline {
         let (blocks, chunks, result_blocks, fallback) = {
             let st = self.state.lock().await;
             let stage = st.stage.min(STAGES - 1);
-            let ctx = self.ctx();
+            let ctx = self.ctx(&st);
             let mut card = card::failed_card(&ctx, stage, message);
             card.results = results;
             self.apply_timing(&mut card, &st);
@@ -382,24 +514,20 @@ impl SlackTimeline {
     /// The render context for this job — claimed, so the commit is resolved
     /// (the title carries the short SHA and the Build row links the
     /// commit).
-    fn ctx(&self) -> CardCtx<'_> {
+    fn ctx<'a>(&'a self, st: &'a State) -> CardCtx<'a> {
         CardCtx {
-            rev: &self.rev,
-            commit: Some(&self.commit),
-            commit_url: Some(&self.commit_url),
-            job_id: &self.job_id,
-            bench_args: &self.job.bench_args,
-            repeat: (self.job.requested_run_count > 1).then_some(RepeatContext {
-                index: self.job.benchmark_run_index,
-                total: self.job.requested_run_count,
+            rev: &st.rev,
+            commit: Some(&st.commit),
+            commit_url: Some(&st.commit_url),
+            job_id: &st.job_id,
+            bench_args: &self.bench_args,
+            repeat: (self.requested_run_count > 1).then_some(RepeatContext {
+                index: st.job.benchmark_run_index,
+                total: self.requested_run_count,
             }),
-            cached_build: self
-                .cached_build
-                .get()
-                .map(String::as_str),
-            cached_build_staging: self
+            cached_build: st.cached_build.as_deref(),
+            cached_build_staging: st
                 .cached_build_staging
-                .get()
                 .is_some(),
         }
     }
@@ -409,7 +537,7 @@ impl SlackTimeline {
         st: &State,
         stage: usize,
     ) -> (usize, serde_json::Value, Vec<StreamChunk>, String) {
-        let ctx = self.ctx();
+        let ctx = self.ctx(st);
         let mut card = card::running_card(&ctx, stage);
         self.apply_timing(&mut card, st);
         let blocks = card::render(&card);
@@ -472,13 +600,13 @@ impl SlackTimeline {
                             .streaming = false;
                         match classify_stream_error(&e.to_string()) {
                             StreamFailure::NotStreaming => {
-                                tracing::info!(job_id = %self.job_id, error = ?e, "slack: stream inactive; switching to block updates");
+                                tracing::info!(group_id = %self.group_id, error = ?e, "slack: stream inactive; switching to block updates");
                             }
                             StreamFailure::MissingMessage => {
-                                tracing::info!(job_id = %self.job_id, error = ?e, "slack: stream message missing; reposting a fresh card");
+                                tracing::info!(group_id = %self.group_id, error = ?e, "slack: stream message missing; reposting a fresh card");
                             }
                             StreamFailure::Other => {
-                                tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream append failed; switching to block updates");
+                                tracing::warn!(group_id = %self.group_id, error = ?e, "slack: stream append failed; switching to block updates");
                             }
                         }
                     }
@@ -517,17 +645,17 @@ impl SlackTimeline {
                                 .lock()
                                 .await
                                 .streaming = false;
-                            tracing::info!(job_id = %self.job_id, error = ?e, "slack: stream inactive at terminal; falling back to block update");
+                            tracing::info!(group_id = %self.group_id, error = ?e, "slack: stream inactive at terminal; falling back to block update");
                         }
                         StreamFailure::MissingMessage => {
                             self.state
                                 .lock()
                                 .await
                                 .streaming = false;
-                            tracing::info!(job_id = %self.job_id, error = ?e, "slack: terminal stream message missing; reposting a fresh card");
+                            tracing::info!(group_id = %self.group_id, error = ?e, "slack: terminal stream message missing; reposting a fresh card");
                         }
                         StreamFailure::Other => {
-                            tracing::warn!(job_id = %self.job_id, error = ?e, "slack: stream stop failed; falling back to block update");
+                            tracing::warn!(group_id = %self.group_id, error = ?e, "slack: stream stop failed; falling back to block update");
                         }
                     },
                 }
@@ -549,11 +677,11 @@ impl SlackTimeline {
             // A gone/unowned message can't be updated — repost instead of
             // reporting nowhere.
             if matches!(classify_stream_error(&e.to_string()), StreamFailure::MissingMessage) {
-                tracing::info!(job_id = %self.job_id, error = ?e, "slack: card message gone; reposting a fresh card");
+                tracing::info!(group_id = %self.group_id, error = ?e, "slack: card message gone; reposting a fresh card");
                 self.repost_card(blocks, fallback)
                     .await;
             } else {
-                tracing::warn!(job_id = %self.job_id, error = ?e, "slack: plan update failed (non-fatal)");
+                tracing::warn!(group_id = %self.group_id, error = ?e, "slack: plan update failed (non-fatal)");
             }
         }
     }
@@ -599,23 +727,24 @@ impl SlackTimeline {
             .await
         {
             Ok(ts) => {
-                {
+                let job = {
                     let mut st = self.state.lock().await;
                     st.plan_ts = Some(ts.clone());
                     st.streaming = false;
-                }
+                    st.job.clone()
+                };
                 // Persist so a reclaimed job resumes this card. A failure
                 // is non-fatal: a restart would post a fresh card.
                 if let Err(e) = self
                     .jobs
-                    .set_plan_message_ts(&self.job, &ts)
+                    .set_plan_message_ts(&job, &ts)
                     .await
                 {
-                    tracing::warn!(job_id = %self.job_id, error = ?e, "slack: persisting plan ts failed (non-fatal)");
+                    tracing::warn!(group_id = %self.group_id, error = ?e, "slack: persisting plan ts failed (non-fatal)");
                 }
             }
             Err(e) => {
-                tracing::warn!(job_id = %self.job_id, error = ?e, "slack: plan post failed (non-fatal)")
+                tracing::warn!(group_id = %self.group_id, error = ?e, "slack: plan post failed (non-fatal)")
             }
         }
     }
@@ -631,7 +760,7 @@ impl SlackTimeline {
                     .remove_reaction(&self.channel, &self.request_ts, from)
                     .await
             {
-                tracing::debug!(job_id = %self.job_id, reaction = from, error = ?e, "slack: removing prior reaction (non-fatal; likely absent)");
+                tracing::debug!(group_id = %self.group_id, reaction = from, error = ?e, "slack: removing prior reaction (non-fatal; likely absent)");
             }
         }
         if let Err(e) = self
@@ -639,7 +768,7 @@ impl SlackTimeline {
             .add_reaction(&self.channel, &self.request_ts, to)
             .await
         {
-            tracing::warn!(job_id = %self.job_id, reaction = to, error = ?e, "slack: adding reaction failed (non-fatal)");
+            tracing::warn!(group_id = %self.group_id, reaction = to, error = ?e, "slack: adding reaction failed (non-fatal)");
         }
     }
 }
@@ -1229,6 +1358,213 @@ mod tests {
             "keepalive is a quiet semantic task refresh: {}",
             appends[1]
         );
+    }
+
+    #[tokio::test]
+    async fn touch_stream_warms_an_active_stream_with_a_quiet_task_update() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
+
+        tl.started().await; // stage 1, streaming
+        let before = slack
+            .appends
+            .lock()
+            .unwrap()
+            .len();
+        assert_eq!(
+            tl.touch_stream().await,
+            Keepalive::Alive,
+            "keepalive runs while the stream is active",
+        );
+
+        let appends = slack.appends.lock().unwrap();
+        assert_eq!(appends.len(), before + 1, "one keepalive append");
+        let last = appends.last().unwrap();
+        assert!(last.starts_with("STREAM_TS:"), "{last}");
+        assert!(last.contains("\"type\":\"task_update\""), "quiet task refresh: {last}");
+        assert!(!last.contains("\"type\":\"markdown_text\""), "no visible text appended: {last}");
+    }
+
+    /// Idle (between phases / runs, e.g. `stage >= STAGES` after a non-final
+    /// repeat) keeps the loop alive — it must not exit and abandon the next
+    /// run.
+    #[tokio::test]
+    async fn touch_stream_stays_alive_but_quiet_when_idle() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
+
+        tl.started().await;
+        // Simulate an intermediate repeat finishing (stage past the last row).
+        tl.state.lock().await.stage = STAGES;
+        let before = slack
+            .appends
+            .lock()
+            .unwrap()
+            .len();
+
+        assert_eq!(tl.touch_stream().await, Keepalive::Alive, "idle, but the loop stays alive");
+        assert_eq!(
+            slack
+                .appends
+                .lock()
+                .unwrap()
+                .len(),
+            before,
+            "nothing appended while idle",
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_stream_stops_when_the_stream_is_gone() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        // No resume ts → not streaming (block mode): nothing to keep warm.
+        let tl = timeline(slack.clone(), store.clone(), None);
+
+        assert_eq!(tl.touch_stream().await, Keepalive::Dead, "block mode → stop the loop");
+        assert!(
+            slack
+                .appends
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "nothing appended",
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_stream_stops_after_the_stream_goes_inactive() {
+        let slack = Arc::new(FakeSlack::default());
+        slack
+            .append_failures
+            .lock()
+            .unwrap()
+            .push("message_not_in_streaming_state".into());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
+
+        tl.started().await;
+        assert_eq!(tl.touch_stream().await, Keepalive::Dead, "a dead stream stops the loop");
+        assert!(
+            !tl.state
+                .lock()
+                .await
+                .streaming,
+            "and flips to block-update mode",
+        );
+    }
+
+    // ── v18 (0047): group-scoped run handoff + session/registry ──
+
+    /// `begin_run` refreshes all run-specific state from the new job and resets
+    /// the stage/cache labels, while the shared card identity survives.
+    #[tokio::test]
+    async fn begin_run_resets_run_state_but_keeps_the_card() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
+
+        // Run 0: advance + stamp a cache label, so there's stale state to clear.
+        tl.started().await;
+        tl.mark_build_cached("run0digest")
+            .await; // sets cached_build, stage → 2
+
+        let mut run1 = job();
+        run1.id = Uuid::from_u128(0xB0B);
+        run1.benchmark_run_index = 1;
+        run1.requested_run_count = 2;
+        run1.commit = "ffffffffffffffff".into();
+        tl.begin_run(&run1).await;
+
+        let st = tl.state.lock().await;
+        assert_eq!(st.stage, 0, "stage reset for the new run");
+        assert!(st.cached_build.is_none(), "run-0 cache label cleared");
+        assert!(
+            st.cached_build_staging
+                .is_none()
+        );
+        assert_eq!(st.commit, "ffffffffffffffff", "run metadata refreshed");
+        assert_eq!(st.job_id, Uuid::from_u128(0xB0B).to_string());
+        assert_eq!(st.job.benchmark_run_index, 1);
+        // Group-shared card identity is untouched.
+        assert_eq!(st.plan_ts.as_deref(), Some("STREAM_TS"), "same card across runs");
+        assert!(st.streaming, "stream stays live across the run boundary");
+        drop(st);
+        assert_eq!(
+            tl.run_index
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert!(tl.is_final_repeat(), "run 1 of 2 is the final repeat");
+    }
+
+    /// The registry returns one session per `(group, target)` across runs and
+    /// builds the timeline only once; `reap` aborts the keepalive + removes it.
+    #[tokio::test]
+    async fn registry_shares_one_session_per_group_and_reaps() {
+        use crate::slack::session::{SlackSessionRegistry, SlackTarget};
+
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let registry = SlackSessionRegistry::new();
+        let group = Uuid::from_u128(7);
+        let target = SlackTarget {
+            channel: "C1".into(),
+            thread_ts: "REQ_TS".into(),
+        };
+        let built = std::cell::Cell::new(0);
+
+        let s1 = registry.get_or_create(group, target.clone(), || {
+            built.set(built.get() + 1);
+            Arc::new(timeline(slack.clone(), store.clone(), Some("STREAM_TS".into())))
+        });
+        let s2 = registry.get_or_create(group, target.clone(), || {
+            built.set(built.get() + 1);
+            Arc::new(timeline(slack.clone(), store.clone(), None))
+        });
+
+        assert_eq!(built.get(), 1, "timeline built once for the group");
+        assert!(Arc::ptr_eq(&s1, &s2), "same session across runs");
+        assert_eq!(registry.len(), 1);
+
+        registry.reap(group, &target);
+        assert!(registry.is_empty(), "reaped from the registry");
+        registry.reap(group, &target); // idempotent
+    }
+
+    /// `ensure_keepalive` is idempotent — N calls leave exactly one running
+    /// task.
+    #[tokio::test]
+    async fn ensure_keepalive_is_idempotent() {
+        use crate::slack::session::{SlackSessionRegistry, SlackTarget};
+
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let registry = SlackSessionRegistry::new();
+        let group = Uuid::from_u128(1);
+        let target = SlackTarget {
+            channel: "C1".into(),
+            thread_ts: "REQ_TS".into(),
+        };
+        let session = registry.get_or_create(group, target.clone(), || {
+            Arc::new(timeline(slack.clone(), store.clone(), Some("STREAM_TS".into())))
+        });
+        session
+            .timeline()
+            .started()
+            .await;
+
+        assert!(!session.keepalive_running(), "no keepalive before ensure");
+        session.ensure_keepalive();
+        assert!(session.keepalive_running(), "spawned");
+        session.ensure_keepalive();
+        session.ensure_keepalive();
+        assert!(session.keepalive_running(), "still exactly one (no replace)");
+
+        registry.reap(group, &target);
+        assert!(!session.keepalive_running(), "reap aborts the keepalive");
     }
 
     #[tokio::test]

@@ -1,19 +1,29 @@
 //! The job reporting **surface** seam (iteration v7, item 0022).
 //!
-//! One [`ReportSurface`] per job owns the *whole* lifecycle on one target
-//! family — the GitHub PR comment + Check Run together
-//! ([`GitHubReportSurface`]), the Slack live card ([`SlackReportSurface`]), or
-//! nothing ([`NoopReportSurface`]). [`build_report_surface`] picks the right
-//! one from `(ProgressTarget, slack)`. This collapses the old split between
+//! One [`ReportSurface`] per job drives the lifecycle on one target family —
+//! the GitHub PR comment + Check Run together ([`GitHubReportSurface`]), the
+//! Slack live card ([`SlackReportSurface`]), or nothing
+//! ([`NoopReportSurface`]). [`build_report_surface`] picks the right one from
+//! `(ProgressTarget, slack)`. This collapses the old split between
 //! `ProgressReporter` (lifecycle) and `ProgressSink` (worker-event drain),
 //! which each re-interpreted the `ProgressTarget` separately.
+//!
+//! **Surface lifetime vs. card lifetime (v18, 0047).** For GitHub the surface
+//! owns the whole lifecycle. For Slack a benchmark *group* shares **one** live
+//! card/stream across all its runs, so the per-run [`SlackReportSurface`] is a
+//! thin **delegate** into a group-scoped session (`slack::session`) that owns
+//! the card, stream keepalive, and reactions for the group's lifetime; the
+//! per-run surface re-points it (`begin_run`) and reaps it only on a
+//! group-terminal event. The model is `trigger → session(s) → per-run
+//! delegate(s)`, kept fan-out friendly so a future job can report to several
+//! destinations.
 //!
 //! Every method is **non-fatal**: an impl logs and swallows its own transport
 //! errors (a reporting failure never fails the benchmark) — hence `()` returns.
 //!
 //! Wired from [`Reporter::run`](crate::reporter) (the lifecycle + the drain
-//! loop) and the runner's orphan recovery — both build their one surface via
-//! [`build_report_surface`].
+//! loop) and the runner's orphan recovery — both build their surface via
+//! [`build_report_surface`], threading the shared `SlackSessionRegistry`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,6 +43,7 @@ use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
 use crate::slack::card::RepeatSummary;
 use crate::slack::client::SlackClient;
+use crate::slack::session::{SlackSession, SlackSessionRegistry, SlackTarget};
 use crate::slack::timeline::{SlackTimeline, stage_for_phase};
 
 /// Lifetime of the presigned `stacks-bench.db` download link in a Slack card.
@@ -80,6 +91,7 @@ pub fn build_report_surface(
     jobs: Arc<dyn RunnableJobStore>,
     store: Arc<dyn ArtifactStore>,
     slack: Option<&Arc<dyn SlackClient>>,
+    slack_sessions: &Arc<SlackSessionRegistry>,
     job: &RunnableJob,
 ) -> Box<dyn ReportSurface> {
     match (&job.progress, slack) {
@@ -90,18 +102,35 @@ pub fn build_report_surface(
                 plan_message_ts,
             },
             Some(client),
-        ) => Box::new(SlackReportSurface::new(
-            SlackTimeline::new(
-                client.clone(),
-                jobs.clone(),
+        ) => {
+            // v18 (0047): one group-scoped session owns the card + keepalive
+            // across every run of the group; this run's surface borrows it. The
+            // timeline is built only on the group's first run (get-or-create);
+            // later runs re-point it via `begin_run` in `started`.
+            let target = SlackTarget {
+                channel: channel.clone(),
+                thread_ts: message_ts.clone(),
+            };
+            let session =
+                slack_sessions.get_or_create(job.benchmark_group_id, target.clone(), || {
+                    Arc::new(SlackTimeline::new(
+                        client.clone(),
+                        jobs.clone(),
+                        job.clone(),
+                        channel.clone(),
+                        message_ts.clone(),
+                        plan_message_ts.clone(),
+                    ))
+                });
+            Box::new(SlackReportSurface::new(
+                slack_sessions.clone(),
+                session,
+                target,
                 job.clone(),
-                channel.clone(),
-                message_ts.clone(),
-                plan_message_ts.clone(),
-            ),
-            jobs,
-            store,
-        )),
+                jobs,
+                store,
+            ))
+        }
         (ProgressTarget::Slack { .. }, None) => Box::new(NoopReportSurface),
         // Build-only/silent jobs (v10 0005) report nothing — the empty surface
         // set, explicit rather than a GitHub surface coincidentally no-opping.
@@ -398,30 +427,94 @@ impl ReportSurface for GitHubReportSurface {
 
 // ─────────────────────────── Slack ───────────────────────────
 
-/// Slack reporting surface: a thin `ReportSurface` adapter over the live
-/// [`SlackTimeline`]. Always holds a **real** timeline (the no-client case is
-/// [`NoopReportSurface`], not an `Option` here). The artifact store resolves
-/// the metrics + DB link in `completed`.
+/// The kind of terminal a run reached, for the group-reap decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalOutcome {
+    Success,
+    Failure,
+    Cancel,
+}
+
+/// Whether a run is **group-terminal** — and so reaps the shared Slack session.
+/// A final-repeat success ends the group; any failure or cancel stops it. A
+/// non-final repeat success is *not* group-terminal — the session (card +
+/// keepalive) lives on for the next run.
+fn is_group_terminal(is_final_repeat: bool, outcome: TerminalOutcome) -> bool {
+    match outcome {
+        TerminalOutcome::Success => is_final_repeat,
+        TerminalOutcome::Failure | TerminalOutcome::Cancel => true,
+    }
+}
+
+/// Slack reporting surface: a per-run **delegate** into the group-scoped
+/// [`SlackSession`] that owns the live card + keepalive (v18, 0047). `started`
+/// re-points the card at this run; the terminal methods reap the session only
+/// on a group-terminal event ([`is_group_terminal`]). The artifact store
+/// resolves the metrics + DB link in `completed`.
 pub struct SlackReportSurface {
-    timeline: SlackTimeline,
+    /// The registry the session is reaped from on a group-terminal event.
+    sessions: Arc<SlackSessionRegistry>,
+    /// This group's shared session — owns the live card + keepalive (v18 0047).
+    session: Arc<SlackSession>,
+    /// The session key's target half, for reaping.
+    target: SlackTarget,
+    job: RunnableJob,
     jobs: Arc<dyn RunnableJobStore>,
     store: Arc<dyn ArtifactStore>,
 }
 
 impl SlackReportSurface {
     pub fn new(
-        timeline: SlackTimeline,
+        sessions: Arc<SlackSessionRegistry>,
+        session: Arc<SlackSession>,
+        target: SlackTarget,
+        job: RunnableJob,
         jobs: Arc<dyn RunnableJobStore>,
         store: Arc<dyn ArtifactStore>,
     ) -> Self {
-        Self { timeline, jobs, store }
+        Self {
+            sessions,
+            session,
+            target,
+            job,
+            jobs,
+            store,
+        }
+    }
+
+    /// The group-scoped live card this run reports into.
+    fn timeline(&self) -> &SlackTimeline {
+        self.session.timeline()
+    }
+
+    /// Reap the session on a group-terminal event (abort keepalive + drop from
+    /// the registry); a non-final repeat success leaves it alive.
+    fn reap_if_group_terminal(&self, outcome: TerminalOutcome) {
+        if is_group_terminal(
+            self.timeline()
+                .is_final_repeat(),
+            outcome,
+        ) {
+            self.sessions
+                .reap(self.job.benchmark_group_id, &self.target);
+        }
     }
 }
 
 #[async_trait]
 impl ReportSurface for SlackReportSurface {
     async fn started(&self) {
-        self.timeline.started().await;
+        // Re-point the group card at this run, render it, then (re-)arm the
+        // keepalive — in that order: `begin_run` resets the stage to 0 and the
+        // keepalive idles at stage 0, so it must follow `started` (stage 1).
+        self.timeline()
+            .begin_run(&self.job)
+            .await;
+        self.timeline()
+            .started()
+            .await;
+        self.session
+            .ensure_keepalive();
     }
 
     async fn phase(&self, label: &PhaseLabel, _elapsed: Duration) {
@@ -429,7 +522,7 @@ impl ReportSurface for SlackReportSurface {
         // v16: a cache hit is being staged on the host before the bench VM
         // starts. Surface it as a cached-binary staging row, not as a build VM.
         if let Some(digest) = name.strip_prefix("build_cache_staging:") {
-            self.timeline
+            self.timeline()
                 .mark_build_cache_staging(digest)
                 .await;
             return;
@@ -437,7 +530,7 @@ impl ReportSurface for SlackReportSurface {
         // A binary-cache hit (item 0025, v9) arrives as `build_cached:<digest>`:
         // mark the Build row done with the reused-build subtext + advance to Run.
         if let Some(digest) = name.strip_prefix("build_cached:") {
-            self.timeline
+            self.timeline()
                 .mark_build_cached(digest)
                 .await;
             return;
@@ -445,7 +538,7 @@ impl ReportSurface for SlackReportSurface {
         // Monotonic: a non-stage / terminal phase (mapped to `None`) or a repeat
         // is a no-op; the terminal card is owned by `completed`/`failed`.
         if let Some(stage) = stage_for_phase(&name) {
-            self.timeline
+            self.timeline()
                 .advance(stage)
                 .await;
         }
@@ -453,7 +546,7 @@ impl ReportSurface for SlackReportSurface {
 
     async fn heartbeat(&self, label: &PhaseLabel, _elapsed: Duration) {
         if stage_for_phase(&label.to_string()).is_some() {
-            self.timeline
+            self.timeline()
                 .heartbeat()
                 .await;
         }
@@ -467,20 +560,21 @@ impl ReportSurface for SlackReportSurface {
         // Ad-hoc Slack runs aren't PRs → no vs-baseline. Metrics + the presigned
         // DB link (S3 + in-bucket only) are resolved here, then handed to the card.
         if self
-            .timeline
+            .timeline()
             .is_repeat_group()
             && !self
-                .timeline
+                .timeline()
                 .is_final_repeat()
         {
-            self.timeline
+            // Non-final repeat: keep the shared card + keepalive for the next run.
+            self.timeline()
                 .repeat_completed()
                 .await;
             return;
         }
         let result = parsed_run(self.store.as_ref(), summary).await;
         let repeat_summary = if self
-            .timeline
+            .timeline()
             .is_repeat_group()
         {
             self.repeat_summary().await
@@ -488,20 +582,20 @@ impl ReportSurface for SlackReportSurface {
             None
         };
         let db_url = if self
-            .timeline
+            .timeline()
             .is_repeat_group()
             && !self
-                .timeline
+                .timeline()
                 .is_final_repeat()
         {
             signed_group_db_url(
                 self.store.as_ref(),
-                self.timeline
+                self.timeline()
                     .group_artifact_prefix(),
             )
             .await
         } else if self
-            .timeline
+            .timeline()
             .is_repeat_group()
         {
             // The final run's job-scoped DB has already been seeded from the
@@ -512,7 +606,7 @@ impl ReportSurface for SlackReportSurface {
                 None => {
                     signed_group_db_url(
                         self.store.as_ref(),
-                        self.timeline
+                        self.timeline()
                             .group_artifact_prefix(),
                     )
                     .await
@@ -521,42 +615,45 @@ impl ReportSurface for SlackReportSurface {
         } else {
             signed_db_url(self.store.as_ref(), summary).await
         };
-        self.timeline
+        self.timeline()
             .completed(result, db_url, repeat_summary)
             .await;
+        self.reap_if_group_terminal(TerminalOutcome::Success);
     }
 
     async fn failed(&self, error: &str) {
         let snippet = short_pr_error(error);
         if self
-            .timeline
+            .timeline()
             .is_repeat_group()
         {
             let (repeat_summary, db_url) = self.repeat_payload().await;
-            self.timeline
+            self.timeline()
                 .failed_with_results(&snippet, repeat_summary, db_url)
                 .await;
-            return;
+        } else {
+            self.timeline()
+                .failed(&snippet)
+                .await;
         }
-        self.timeline
-            .failed(&snippet)
-            .await;
+        self.reap_if_group_terminal(TerminalOutcome::Failure);
     }
 
     async fn cancelled(&self, reason: &str) {
         if self
-            .timeline
+            .timeline()
             .is_repeat_group()
         {
             let (repeat_summary, db_url) = self.repeat_payload().await;
-            self.timeline
+            self.timeline()
                 .cancelled_with_results(reason, repeat_summary, db_url)
                 .await;
-            return;
+        } else {
+            self.timeline()
+                .cancelled(reason)
+                .await;
         }
-        self.timeline
-            .cancelled(reason)
-            .await;
+        self.reap_if_group_terminal(TerminalOutcome::Cancel);
     }
 }
 
@@ -565,7 +662,7 @@ impl SlackReportSurface {
         let repeat_summary = self.repeat_summary().await;
         let db_url = signed_group_db_url(
             self.store.as_ref(),
-            self.timeline
+            self.timeline()
                 .group_artifact_prefix(),
         )
         .await;
@@ -576,7 +673,7 @@ impl SlackReportSurface {
         match self
             .jobs
             .benchmark_run_metrics(
-                self.timeline
+                self.timeline()
                     .benchmark_spec_id(),
             )
             .await
@@ -587,7 +684,7 @@ impl SlackReportSurface {
                     .map(|run| run.metric)
                     .collect();
                 Some(RepeatSummary::from_metrics(
-                    self.timeline
+                    self.timeline()
                         .requested_run_count(),
                     &metrics,
                 ))
@@ -1109,6 +1206,7 @@ mod tests {
             jobs,
             store(),
             Some(&slack),
+            &Arc::new(SlackSessionRegistry::new()),
             &slack_job(),
         );
 
@@ -1162,6 +1260,7 @@ mod tests {
             jobs,
             store(),
             Some(&slack),
+            &Arc::new(SlackSessionRegistry::new()),
             &repeat_slack_job(),
         );
 
@@ -1188,6 +1287,114 @@ mod tests {
         );
     }
 
+    // ── v18 (0047): group-scoped session lifecycle ──
+
+    #[test]
+    fn is_group_terminal_matrix() {
+        // Success is group-terminal only on the final repeat.
+        assert!(!is_group_terminal(false, TerminalOutcome::Success), "non-final success");
+        assert!(is_group_terminal(true, TerminalOutcome::Success), "final success");
+        // Any failure/cancel stops the whole group, regardless of index.
+        assert!(is_group_terminal(false, TerminalOutcome::Failure));
+        assert!(is_group_terminal(true, TerminalOutcome::Failure));
+        assert!(is_group_terminal(false, TerminalOutcome::Cancel));
+        assert!(is_group_terminal(true, TerminalOutcome::Cancel));
+    }
+
+    /// A repeat group's runs share **one** session + keepalive, reaped only on
+    /// the final run — the v18 ownership fix (and Codex's non-final re-arm
+    /// note).
+    #[tokio::test]
+    async fn repeat_group_shares_one_session_reaped_only_on_final() {
+        let recording = Arc::new(FakeSlack::default());
+        let slack = recording.clone() as Arc<dyn SlackClient>;
+        let sessions = Arc::new(SlackSessionRegistry::new());
+        let gh = Arc::new(FakeGitHub::new());
+        let group = Uuid::from_u128(0xABC);
+        let target = SlackTarget {
+            channel: "C1".into(),
+            thread_ts: "REQ".into(),
+        };
+        let job_for = |idx: i32| {
+            let mut j = slack_job(); // Slack { C1, REQ, None }
+            j.benchmark_group_id = group;
+            j.benchmark_run_index = idx;
+            j.requested_run_count = 2;
+            j
+        };
+        let jobs = || -> Arc<dyn RunnableJobStore> {
+            Arc::new(RecordingStore::with_metrics(vec![
+                metric(0, 1_000, 100),
+                metric(1, 1_200, 200),
+            ]))
+        };
+
+        // ── Run 0 (non-final) ──
+        let s0 =
+            build_report_surface(gh.clone(), jobs(), store(), Some(&slack), &sessions, &job_for(0));
+        s0.started().await;
+        assert_eq!(sessions.len(), 1, "session created on the first run");
+        assert!(
+            sessions
+                .get(group, &target)
+                .unwrap()
+                .keepalive_running(),
+            "keepalive armed after the first started()",
+        );
+        s0.completed(&serde_json::json!({}), None)
+            .await; // non-final success
+        assert_eq!(sessions.len(), 1, "non-final completion keeps the session");
+        assert!(
+            sessions
+                .get(group, &target)
+                .unwrap()
+                .keepalive_running(),
+            "keepalive persists across the non-final terminal",
+        );
+        drop(s0);
+        assert_eq!(sessions.len(), 1, "dropping the per-run surface does not reap");
+
+        // ── Run 1 (final) — new surface, same registry → same session ──
+        let s1 =
+            build_report_surface(gh.clone(), jobs(), store(), Some(&slack), &sessions, &job_for(1));
+        s1.started().await; // begin_run → started → ensure_keepalive
+        assert!(
+            sessions
+                .get(group, &target)
+                .unwrap()
+                .keepalive_running(),
+            "keepalive still running across the begin_run/started handoff",
+        );
+        s1.completed(&serde_json::json!({}), None)
+            .await; // final success
+        assert!(sessions.is_empty(), "final completion reaps the session");
+    }
+
+    /// A single-run Slack job is a group of size 1 — its session is reaped on
+    /// completion.
+    #[tokio::test]
+    async fn single_run_slack_job_reaps_on_completion() {
+        let recording = Arc::new(FakeSlack::default());
+        let slack = recording.clone() as Arc<dyn SlackClient>;
+        let sessions = Arc::new(SlackSessionRegistry::new());
+        let jobs: Arc<dyn RunnableJobStore> = Arc::new(RecordingStore::default());
+        let surface = build_report_surface(
+            Arc::new(FakeGitHub::new()),
+            jobs,
+            store(),
+            Some(&slack),
+            &sessions,
+            &slack_job(),
+        );
+
+        surface.started().await;
+        assert_eq!(sessions.len(), 1);
+        surface
+            .completed(&serde_json::json!({}), None)
+            .await;
+        assert!(sessions.is_empty(), "single-run job reaps its session on completion");
+    }
+
     // ── Factory routing + the no-client no-op guard ──
 
     /// A Slack target with **no** client wired routes to `NoopReportSurface`:
@@ -1197,7 +1404,14 @@ mod tests {
     async fn factory_slack_without_client_is_a_noop() {
         let gh = Arc::new(FakeGitHub::new());
         let jobs: Arc<dyn RunnableJobStore> = Arc::new(RecordingStore::default());
-        let surface = build_report_surface(gh.clone(), jobs, store(), None, &slack_job());
+        let surface = build_report_surface(
+            gh.clone(),
+            jobs,
+            store(),
+            None,
+            &Arc::new(SlackSessionRegistry::new()),
+            &slack_job(),
+        );
 
         surface.started().await;
         surface
@@ -1222,7 +1436,14 @@ mod tests {
     async fn factory_github_target_concludes_check() {
         let gh = Arc::new(FakeGitHub::new());
         let jobs: Arc<dyn RunnableJobStore> = Arc::new(RecordingStore::default());
-        let surface = build_report_surface(gh.clone(), jobs, store(), None, &check_job(99));
+        let surface = build_report_surface(
+            gh.clone(),
+            jobs,
+            store(),
+            None,
+            &Arc::new(SlackSessionRegistry::new()),
+            &check_job(99),
+        );
         surface
             .completed(&serde_json::json!({}), None)
             .await;

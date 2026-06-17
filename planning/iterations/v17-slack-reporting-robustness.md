@@ -211,3 +211,6 @@ log level.
 - `0040-slack-queue-receipt-before-stream` overlaps the plan-ts lifecycle and may
   be revisited once `0043` lands (a claim-time stream start sidesteps the orphaned
   pre-claim stream entirely).
+- `0047-slack-reporting-session` (v18): the `0044` stream keepalive added here is
+  **per-run**, which leaves a repeat-group inter-run gap. v18 moves stream/card
+  liveness to a group-scoped session and supersedes the per-run keepalive.

@@ -259,6 +259,35 @@ a leaked prior reaction is cleared on the next transition.
 read per transition — only worth it as the reaction set grows; no change to the
 lifecycle/emoji set itself.
 
+### 0048 — Transient vs permanent stream-append errors
+
+- **id:** `0048-slack-stream-error-classification`
+- **status:** `backlog`
+- **priority:** `low`
+- **relates_to:** `0033-slack-streamed-plan-updates`, `0047-slack-reporting-session`
+- **source:** v18 Phase 2 review (2026-06)
+
+**Problem:** `touch_stream`/`upsert_stream_or_blocks` treat **any**
+`append_stream` error as permanent stream death — they flip `streaming = false`
+and the card falls back to `chat.update` for the rest of its life. A *transient*
+Slack/API blip therefore permanently abandons streaming (and stops the keepalive)
+for a card that's otherwise fine. Only `message_not_in_streaming_state` /
+`MissingMessage` are genuinely terminal for the stream.
+
+**Scope:** Extend `classify_stream_error` (or the call sites) to distinguish
+**transient** append failures (network/5xx/rate-limit) from **permanent** ones
+(`not_in_streaming_state`, `message_not_found`, `not_owned`). On transient, keep
+`streaming = true` and let the next tick/append retry, with a bounded
+consecutive-failure budget before giving up; only permanent errors flip to block
+mode.
+
+**Acceptance:** A single transient append error does not permanently disable
+streaming — the next keepalive/append retries on the stream; a genuine
+not-streaming/missing error still falls back to `chat.update` as today.
+
+**Deferred / non-goals:** No change to the keepalive cadence or the block-update
+render path; the failure budget/backoff shape is a design detail.
+
 *`0037-benchmark-group-run-model` shipped (iteration v14, 2026-06) →
 [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md).*
 

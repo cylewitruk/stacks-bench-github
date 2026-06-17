@@ -64,6 +64,8 @@ need editing when an item's status or location changes.
 | `0044-slack-reaction-lifecycle` | Slack reaction lifecycle (ack/queued/running) | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
 | `0045-slack-llm-observability` | Slack/LLM observability logging | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
 | `0046-slack-reaction-state-from-api` | Read reaction state via `reactions.list` instead of brute-force removal | `backlog` | [backlog.md](backlog.md) |
+| `0047-slack-reporting-session` | Group-scoped Slack reporting session (surface lifetime = trigger, not run) | `in_progress` | [iterations/v18-slack-reporting-session.md](iterations/v18-slack-reporting-session.md) |
+| `0048-slack-stream-error-classification` | Transient vs permanent stream-append errors (don't abandon streaming on a blip) | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 
@@ -83,6 +85,7 @@ need editing when an item's status or location changes.
 | `v15-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `in_progress` | [iterations/v15-isolated-benchmark-repetitions.md](iterations/v15-isolated-benchmark-repetitions.md) |
 | `v16-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `in_progress` | [iterations/v16-cache-hit-minimal-source-disk.md](iterations/v16-cache-hit-minimal-source-disk.md) |
 | `v17-slack-reporting-robustness` | Slack reporting robustness, reactions & observability | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
+| `v18-slack-reporting-session` | Group-scoped Slack reporting session | `in_progress` | [iterations/v18-slack-reporting-session.md](iterations/v18-slack-reporting-session.md) |
 
 ## Decisions
 

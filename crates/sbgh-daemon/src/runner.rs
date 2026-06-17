@@ -39,6 +39,7 @@ use crate::reporter::{CHECK_NAME, Prepared, Reporter, resolved_app_id};
 use crate::shutdown::Shutdown;
 use crate::slack::card::{self, CardCtx};
 use crate::slack::client::SlackClient;
+use crate::slack::session::SlackSessionRegistry;
 use crate::slack::stream::chunks_for_card;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
@@ -149,6 +150,9 @@ struct JobDeps {
     /// DB state. Kept separate from [`RunnableJobStore`] so the execution view
     /// stays focused on claim/run lifecycle.
     repeat_planner: Option<Arc<dyn RepeatRunPlanner>>,
+    /// v18 (0047): group-scoped Slack reporting sessions, shared into every
+    /// reporter so a repeat group's runs reuse one live card + keepalive.
+    slack_sessions: Arc<SlackSessionRegistry>,
 }
 
 pub struct Runner {
@@ -182,6 +186,7 @@ impl Runner {
                 slack: None,
                 pin_manager: None,
                 repeat_planner: None,
+                slack_sessions: Arc::new(SlackSessionRegistry::new()),
             },
             max_concurrent,
         }
@@ -582,6 +587,7 @@ impl Coordinator {
             self.deps.jobs.clone(),
             store,
             self.deps.slack.as_ref(),
+            &self.deps.slack_sessions,
             &job,
         );
         surface
@@ -1036,6 +1042,7 @@ impl JobDeps {
             self.gh.clone(),
             self.app_id.clone(),
             self.slack.clone(),
+            self.slack_sessions.clone(),
             job.clone(),
         );
         let handle = tokio::spawn(reporter.run(events_rx, prepared_tx));
@@ -1223,6 +1230,7 @@ impl JobDeps {
             self.jobs.clone(),
             store,
             self.slack.as_ref(),
+            &self.slack_sessions,
             job,
         );
         surface.failed(reason).await;
@@ -1946,6 +1954,7 @@ mod tests {
             slack: None,
             pin_manager: None,
             repeat_planner: Some(planner.clone()),
+            slack_sessions: Default::default(),
         };
 
         deps.run(job.clone(), None, CancellationToken::new())
@@ -2010,6 +2019,7 @@ mod tests {
             slack: None,
             pin_manager: None,
             repeat_planner: Some(planner.clone()),
+            slack_sessions: Default::default(),
         };
 
         deps.run(job.clone(), None, CancellationToken::new())
@@ -2054,6 +2064,7 @@ mod tests {
             slack: None,
             pin_manager: None,
             repeat_planner: Some(planner.clone()),
+            slack_sessions: Default::default(),
         };
 
         deps.run(job, None, CancellationToken::new())
@@ -2114,6 +2125,7 @@ mod tests {
             slack: Some(slack.clone()),
             pin_manager: None,
             repeat_planner: Some(planner.clone()),
+            slack_sessions: Default::default(),
         };
 
         deps.run(job.clone(), None, CancellationToken::new())
@@ -2192,6 +2204,7 @@ mod tests {
             slack: None,
             pin_manager: None,
             repeat_planner: Some(planner.clone()),
+            slack_sessions: Default::default(),
         };
         let coord = Coordinator::new(deps, 1, CancellationToken::new());
 
@@ -2668,6 +2681,7 @@ mod tests {
                 slack: None,
                 pin_manager: None,
                 repeat_planner: None,
+                slack_sessions: Default::default(),
             };
             handles.push(tokio::spawn(deps.run(job, None, CancellationToken::new())));
             sources.push(source);
@@ -2844,6 +2858,7 @@ mod tests {
             slack: None,
             pin_manager: None,
             repeat_planner: None,
+            slack_sessions: Default::default(),
         };
         let mut coord = Coordinator::new(deps, 2, CancellationToken::new()); // max_concurrent = 2
         let never_draining = CancellationToken::new();
@@ -3168,6 +3183,7 @@ mod tests {
             slack: None,
             pin_manager: None,
             repeat_planner: None,
+            slack_sessions: Default::default(),
         };
         Coordinator::new(deps, 1, CancellationToken::new())
     }
@@ -3426,6 +3442,7 @@ mod tests {
             slack: Some(slack),
             pin_manager: None,
             repeat_planner: None,
+            slack_sessions: Default::default(),
         };
         Coordinator::new(deps, 1, CancellationToken::new())
     }

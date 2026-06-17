@@ -31,6 +31,7 @@ use crate::events::{Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::{ReportSurface, build_report_surface};
 use crate::slack::client::SlackClient;
+use crate::slack::session::SlackSessionRegistry;
 
 /// Resolve the App's numeric id via `GET /app`, cached on **success** in `cell`
 /// (a `get_or_try_init` that leaves the cell empty on error, so a transient
@@ -80,6 +81,10 @@ pub struct Reporter {
     /// from the runner. `None` for a GitHub-only deployment, or until the
     /// wiring slice injects a real client.
     slack: Option<Arc<dyn SlackClient>>,
+    /// Group-scoped Slack reporting sessions (v18, 0047), shared from the
+    /// runner so a repeat group's per-run surfaces reuse one live card +
+    /// keepalive.
+    slack_sessions: Arc<SlackSessionRegistry>,
     job: RunnableJob,
 }
 
@@ -90,6 +95,7 @@ impl Reporter {
         gh: Arc<dyn GitHubApi>,
         app_id: Arc<OnceCell<i64>>,
         slack: Option<Arc<dyn SlackClient>>,
+        slack_sessions: Arc<SlackSessionRegistry>,
         job: RunnableJob,
     ) -> Self {
         Self {
@@ -98,6 +104,7 @@ impl Reporter {
             gh,
             app_id,
             slack,
+            slack_sessions,
             job,
         }
     }
@@ -159,6 +166,7 @@ impl Reporter {
             self.jobs.clone(),
             store,
             self.slack.as_ref(),
+            &self.slack_sessions,
             &self.job,
         );
 
@@ -928,6 +936,7 @@ mod tests {
             Arc::new(FakeGitHub::new()),
             Arc::new(OnceCell::new()),
             None,
+            Default::default(),
             // Pre-resolved commit → prepare's resolve is a no-op; `CommitCheck`
             // + `baseline_report = none` → prepare creates no surfaces.
             job_with(ProgressTarget::CommitCheck { check_run_id: None }),
@@ -968,6 +977,7 @@ mod tests {
             gh.clone(),
             Arc::new(OnceCell::new()),
             None,
+            Default::default(),
             // Pre-resolved commit; a check id already on the job (as if read
             // back on re-claim) so the cancelled conclusion has a target.
             job_with(ProgressTarget::CommitCheck { check_run_id: Some(900) }),
@@ -1071,6 +1081,7 @@ mod tests {
             Arc::new(FakeGitHub::new()),
             Arc::new(OnceCell::new()),
             Some(slack.clone()),
+            Default::default(),
             job_with(ProgressTarget::Slack {
                 channel: "C1".into(),
                 message_ts: "REQ".into(),
@@ -1224,8 +1235,15 @@ mod tests {
         job.repository = "cylewitruk/stacks-core".into();
         job.workload_key = Some("wk1".into());
 
-        let reporter =
-            Reporter::new(Arc::new(config), store, gh, Arc::new(OnceCell::new()), None, job);
+        let reporter = Reporter::new(
+            Arc::new(config),
+            store,
+            gh,
+            Arc::new(OnceCell::new()),
+            None,
+            Default::default(),
+            job,
+        );
 
         let summary = serde_json::json!({ "run_json_archived_path": run_json_key });
         let c = reporter
@@ -1255,6 +1273,7 @@ mod tests {
             Arc::new(FakeGitHub::new()),
             Arc::new(OnceCell::new()),
             None,
+            Default::default(),
             job_with(ProgressTarget::CommitCheck { check_run_id: Some(1) }),
         );
         assert!(
@@ -1296,6 +1315,7 @@ mod tests {
             gh,
             Arc::new(OnceCell::new()),
             None,
+            Default::default(),
             job,
         );
         assert!(

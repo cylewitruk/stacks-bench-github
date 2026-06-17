@@ -9,13 +9,15 @@
 //! This module owns Slack-specific adaptation: [`connector`] is the
 //! mention→job orchestration, [`target`] the startup repo resolution,
 //! [`api_client`] the Web API client, [`socket`] the Socket Mode receive loop,
-//! and [`timeline`] the live `plan`-card reporting surface — all wired into
-//! `main` behind `[slack].enabled`.
+//! [`timeline`] the live `plan`-card reporting surface, and [`session`] the
+//! group-scoped session that owns the card/stream across a group's runs — all
+//! wired into `main` behind `[slack].enabled`.
 
 pub mod api_client;
 pub mod card;
 pub mod client;
 pub mod connector;
+pub mod session;
 pub mod socket;
 pub mod stream;
 pub mod target;
