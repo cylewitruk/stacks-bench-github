@@ -606,37 +606,60 @@ before an iteration.
 - **id:** `0027-fine-grained-progress`
 - **status:** `backlog`
 - **priority:** `medium`
-- **depends_on:** a profiler-protocol change in the `stacks-bench` integration
-  branches; feeds `0024-slack-card-stage-timings` + the `ReportSurface`
-  heartbeat
+- **depends_on:** upstream `stacks-bench` progress JSONL support landing on the
+  pinned integration branch; feeds `0024-slack-card-stage-timings` + the
+  `ReportSurface` heartbeat
 - **relates_to:** `0017-generic-phase-events`,
   `0037-benchmark-group-run-model`, `0041-shared-benchmark-calibration`
 - **source:** high-value list (2026-06)
 
-**Problem:** `--json` emits only the final result on stdout, so the daemon can't
-surface sub-phase progress ("indexing 2345/5000", "warming up 111/2000",
-"measuring 4876/10000") — the card's in-progress rows show only a static detail.
+**Problem:** `--json` historically emitted only the final result on stdout, so
+the daemon could not surface sub-phase progress ("indexing 2345/5000", "warming
+up 111/2000", "measuring 4876/10000") — the card's in-progress rows showed only
+a static detail.
 
-**Scope:** `stacks-bench` emits **structured progress** as JSONL on a
-**dedicated channel**, with a small stable schema (`{phase, current, total}`
-plus phase-change events), **versioned** with the profiler protocol since it
-lands across all 7 integration branches. **Invariant:** stdout stays reserved
-for the final `--json` result and raw stderr is excluded (it carries log/rustc
-noise); the leading options are a dedicated `--progress-json-fd N` or a
-sentinel-prefixed line, and if the sentinel wins it must name the exact
-stream/file it rides and guarantee it can't corrupt an existing parser.
-Daemon-side, the runner parses the stream, **debounces** (the PR-comment /
-queue-position throttle discipline), and feeds `ReportSurface` heartbeats → the
-v8 card's active-row detail. After `0037`, progress events should be attributed
-to a workflow step / run so calibration, build, measured run, and future
-block-validation work do not collapse into one ambiguous stream.
+**Upstream shape:** New `stacks-bench --json` builds reserve **stdout** for the
+final versioned `CommandResult` envelope and emit progress events as **newline
+delimited JSON on stderr**. Consumers must parse stdout as the final result and
+parse stderr line-by-line, ignoring non-JSON lines for older/mixed builds.
+Progress events dispatch by `(schema_version, event_type, event_version)`;
+currently `(1, "progress", 1)` with payload:
 
-**Acceptance:** A running bench drives a live sub-phase counter on its surface
-(Slack card / PR comment) without spamming `chat.update`.
+```json
+{
+  "phase": "replay",
+  "progress": 42,
+  "total": 100,
+  "message": "Replaying measured entries"
+}
+```
 
-**Deferred / non-goals:** Progress schema fields, channel choice (fd vs
-sentinel), and throttle interval are design questions. Dovetails with `0024`
-(durations) — candidates to co-schedule.
+`total` and `message` are optional; phases include stable labels such as
+`indexing`, `index_merge`, `index_checkpoint`, `index_vacuum`, `txid_scan`,
+`setup`, `planning`, `baseline`, `warmup`, `replay`, `metrics`, and `cleanup`.
+
+**Scope:** Capture the VM's `stacks-bench` stderr stream separately from the
+console log: the guest script should redirect benchmark stderr to a dedicated
+progress JSONL file (for example `2> "$RESULTS/progress.jsonl"`), not try to
+demux the serial console. The daemon tails that file live during the run, parses
+JSONL progress events without merging stdout/stderr, and forwards recognized
+progress as recipe-neutral worker events tagged to the current benchmark
+run/workflow step. The parser should be defensive: line-by-line JSON parse,
+unknown envelope/payload fields ignored, unsupported `event_type`/`event_version`
+ignored, and malformed lines treated as ordinary stderr noise. Daemon-side
+reporting should debounce user-visible updates and feed the active
+`ReportSurface` detail/output rows rather than spamming `chat.update` or GitHub
+comments. Archive the raw progress stream alongside `run.json` for forensics.
+
+**Acceptance:** A running bench drives live sub-phase progress on its surface
+(Slack card / PR/check surface) from stderr JSONL, while stdout remains the final
+`run.json` source. Older builds or malformed stderr lines fall back to today's
+coarse phase reporting without failing the job.
+
+**Deferred / non-goals:** No new `stacks-bench` protocol shape is needed here;
+the upstream stderr JSONL contract is the integration target. Dovetails with
+`0024` (durations) and future calibration/block-validation progress, but this
+slice should only surface the emitted benchmark events.
 
 ### 0028 — Results-summary restructure
 
