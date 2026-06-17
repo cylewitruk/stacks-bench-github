@@ -7,10 +7,10 @@
 //! every field round-trips as `None`, the caller falls back to a
 //! generic "completed" comment.
 //!
-//! Mirrors the upstream Rust shape from `stacks-bench/src/runner.rs`
-//! (RunResult / RunSummaryJson / TargetSummary) verbatim except for
-//! the optional-everywhere relaxation. Extra fields from the JSON are
-//! ignored silently by serde's default behaviour.
+//! Mirrors the upstream Rust shape closely, except for the optional-everywhere
+//! relaxation and a compatibility layer across the legacy `data` envelope and
+//! the schema-v1 `result` envelope. Extra fields from the JSON are ignored
+//! silently by serde's default behaviour.
 
 use sbgh_core::db::BaselineSelection;
 use sbgh_core::github::encode_ref_path;
@@ -19,26 +19,40 @@ use serde::Deserialize;
 use crate::comparison::{BaselineComparison, Verdict};
 
 /// Top-level envelope written by `stacks-bench bench run --json`. The
-/// envelope's `duration_secs` is the full wall-clock time (setup +
-/// chainstate copy avoidance + replay); the detail block under `data`
-/// carries the bench-only metrics. We surface envelope duration as the
-/// headline "Run duration" because it matches what an operator sees
-/// from the daemon's perspective.
+/// envelope's `duration_secs` is the full wall-clock time (setup + chainstate
+/// copy avoidance + replay). Legacy binaries put bench-only metrics under
+/// `data`; schema-v1 binaries put them under `result` and identify the payload
+/// with `result_type = "run", result_version = 1`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct RunResult {
+    pub schema_version: Option<u32>,
     pub success: Option<bool>,
+    pub result_type: Option<String>,
+    pub result_version: Option<u32>,
     pub duration_secs: Option<f64>,
+    /// Legacy pre-schema payload.
     pub data: Option<RunData>,
+    /// Schema-v1 payload. Only interpreted when `(result_type, result_version)`
+    /// identifies a stable `bench run` payload.
+    pub result: Option<RunData>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct RunData {
     pub run_id: Option<i64>,
+    #[serde(alias = "entries")]
     pub blocks: Option<u64>,
+    #[serde(alias = "warmup_entries")]
     pub warmup_blocks: Option<u64>,
+    #[serde(alias = "measured_entries")]
     pub measured_blocks: Option<u64>,
+    pub sampled_metric_rows: Option<u64>,
+    /// Schema-v1 mode details. Kept raw for now; a follow-up will use it to
+    /// render neutral entry/block/tx labels once the upstream schema lands.
+    pub mode_summary: Option<serde_json::Value>,
     /// Replay-only duration (excludes setup). Distinct from envelope
     /// `duration_secs`.
     pub duration_secs: Option<f64>,
@@ -82,6 +96,18 @@ impl RunResult {
                 tracing::warn!(error = %e, "failed to parse run.json; PR comment will fall back");
                 None
             }
+        }
+    }
+
+    /// The stable `bench run` payload, regardless of envelope generation.
+    pub fn run_data(&self) -> Option<&RunData> {
+        if self.schema_version.is_some() {
+            match (self.result_type.as_deref(), self.result_version) {
+                (Some("run"), Some(1)) => self.result.as_ref(),
+                _ => None,
+            }
+        } else {
+            self.data.as_ref()
         }
     }
 }
@@ -135,7 +161,7 @@ pub fn render_pr_comment(
     out.push('\n');
     out.push_str("./stacks-bench --db . bench list\n");
     if let Some(rid) = result
-        .and_then(|r| r.data.as_ref())
+        .and_then(|r| r.run_data())
         .and_then(|d| d.run_id)
     {
         out.push_str(&format!("./stacks-bench --db . bench summary {rid}\n"));
@@ -246,7 +272,10 @@ pub fn metric_table(r: &RunResult) -> String {
 fn metric_rows(r: &RunResult) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = Vec::new();
 
-    let data = r.data.as_ref();
+    let data = r.run_data();
+    if r.schema_version.is_some() && data.is_none() {
+        return rows;
+    }
 
     if let Some(m) = data.and_then(|d| d.measured_blocks) {
         let warmup = data
@@ -394,7 +423,7 @@ mod tests {
         let r = RunResult::from_bytes(json).unwrap();
         assert_eq!(r.success, Some(true));
         assert_eq!(r.duration_secs, Some(2203.8));
-        let d = r.data.as_ref().unwrap();
+        let d = r.run_data().unwrap();
         assert_eq!(d.run_id, Some(42));
         assert_eq!(d.measured_blocks, Some(4000));
         let s = d.summary.as_ref().unwrap();
@@ -402,10 +431,87 @@ mod tests {
     }
 
     #[test]
+    fn parse_schema_v1_run_payload() {
+        let json = br#"{
+            "schema_version": 1,
+            "success": true,
+            "result_type": "run",
+            "result_version": 1,
+            "duration_secs": 2203.8,
+            "result": {
+                "run_id": 42,
+                "entries": 5000,
+                "warmup_entries": 1000,
+                "measured_entries": 4000,
+                "sampled_metric_rows": 4000,
+                "mode_summary": {
+                    "mode": "range",
+                    "sample_unit": "entry"
+                },
+                "duration_secs": 1964.9,
+                "interrupted": false,
+                "summary": {
+                    "total_duration_us": 100000000,
+                    "setup_duration_us": 9380000,
+                    "execution_duration_us": 72940000,
+                    "commit_duration_us": 18280000,
+                    "transactions": 12345,
+                    "clarity_runtime": 9876543210,
+                    "write_length": 89000000,
+                    "read_length": 245000000
+                }
+            }
+        }"#;
+        let r = RunResult::from_bytes(json).unwrap();
+        assert_eq!(r.schema_version, Some(1));
+        assert_eq!(r.result_type.as_deref(), Some("run"));
+        assert_eq!(r.result_version, Some(1));
+        let d = r.run_data().unwrap();
+        assert_eq!(d.run_id, Some(42));
+        assert_eq!(d.blocks, Some(5000));
+        assert_eq!(d.measured_blocks, Some(4000));
+        assert_eq!(d.warmup_blocks, Some(1000));
+        assert_eq!(d.sampled_metric_rows, Some(4000));
+        assert!(d.mode_summary.is_some());
+    }
+
+    #[test]
+    fn parse_schema_v1_error_envelope_without_run_payload() {
+        let json = br#"{
+            "schema_version": 1,
+            "success": false,
+            "result_type": "error",
+            "result_version": 0,
+            "duration_secs": 1.23,
+            "error": "bad args"
+        }"#;
+        let r = RunResult::from_bytes(json).unwrap();
+        assert_eq!(r.success, Some(false));
+        assert_eq!(r.error.as_deref(), Some("bad args"));
+        assert!(r.run_data().is_none());
+        assert!(metric_table(&r).is_empty());
+    }
+
+    #[test]
+    fn unsupported_schema_v1_result_type_has_no_rich_metrics() {
+        let json = br#"{
+            "schema_version": 1,
+            "success": true,
+            "result_type": "run_show",
+            "result_version": 1,
+            "duration_secs": 1.23,
+            "result": { "run_id": 1, "measured_entries": 10 }
+        }"#;
+        let r = RunResult::from_bytes(json).unwrap();
+        assert!(r.run_data().is_none());
+        assert!(metric_table(&r).is_empty());
+    }
+
+    #[test]
     fn parse_minimal_payload_keeps_unknown_fields_none() {
         let json = br#"{ "data": { "run_id": 1 } }"#;
         let r = RunResult::from_bytes(json).unwrap();
-        let d = r.data.as_ref().unwrap();
+        let d = r.run_data().unwrap();
         assert_eq!(d.run_id, Some(1));
         assert!(d.summary.is_none());
         assert!(d.measured_blocks.is_none());
@@ -418,7 +524,7 @@ mod tests {
             "data": { "run_id": 7, "future_field": "we_dont_know_yet", "summary": { "transactions": 9 } }
         }"#;
         let r = RunResult::from_bytes(json).unwrap();
-        let d = r.data.as_ref().unwrap();
+        let d = r.run_data().unwrap();
         assert_eq!(d.run_id, Some(7));
         assert_eq!(
             d.summary
@@ -456,6 +562,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let md =
             render_pr_comment("job-1", "abc123", "/var/lib/sbgh/results/job-1", Some(&r), None);

@@ -335,6 +335,45 @@ privilege change by accident.
 of the full provisioning flow, no fleet scheduling changes, and no attempt to
 replace non-libvirt host setup commands in the same slice.
 
+### 0050 — Adopt `stacks-bench` schema-v1 JSON natively
+
+- **id:** `0050-stacks-bench-schema-v1-native`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** upstream `stacks-bench` schema-v1 JSON landing on the pinned
+  integration branch
+- **relates_to:** `0038-isolated-benchmark-repetitions`,
+  `0039-multi-variant-benchmark-comparisons`, `0028-results-summary-card`
+- **source:** upcoming `stacks-bench --json` schema-v1 compatibility shim
+  (2026-06)
+
+**Problem:** The daemon currently carries a compatibility layer that accepts both
+the legacy `data` envelope and the new schema-v1 `result` envelope from
+`stacks-bench bench run --json`. That keeps deploys unblocked while upstream
+transitions, but the daemon still names promoted metrics and rendered labels in
+block-centric terms (`blocks`, `warmup_blocks`, `measured_blocks`) even though
+schema-v1 intentionally uses neutral `entries` terminology across range, txid,
+and block modes.
+
+**Scope:** Once schema-v1 is the deployed upstream contract, clean up the daemon
+side to treat it as native: dispatch explicitly on `(result_type,
+result_version)`, prefer `entries`/`warmup_entries`/`measured_entries` naming in
+new code and UI text, and use `mode_summary` plus `sampled_metric_rows` where
+they improve Slack/GitHub result summaries. Decide whether existing
+`job_metric` column names stay as storage legacy or need a migration. Add a
+checked fixture or schema-contract test using upstream
+`contrib/stacks-bench/schema/v1.json` when it is available in the pinned source.
+
+**Acceptance:**
+
+- The compatibility shim is either removed or reduced to an explicit legacy
+  fallback with tests, and the main parser path treats schema-v1 as canonical.
+- Slack/GitHub summaries use neutral "entries" wording where the workload is not
+  literally block-height range replay, while preserving useful block labels for
+  range-mode runs.
+- Promoted metrics and aggregate summaries continue to populate for schema-v1
+  `run` payloads, including txid/block selector modes.
+
 *`0037-benchmark-group-run-model` shipped (iteration v14, 2026-06) →
 [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md).*
 

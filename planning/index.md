@@ -67,6 +67,7 @@ need editing when an item's status or location changes.
 | `0047-slack-reporting-session` | Group-scoped Slack reporting session (surface lifetime = trigger, not run) | `in_progress` | [iterations/v18-slack-reporting-session.md](iterations/v18-slack-reporting-session.md) |
 | `0048-slack-stream-error-classification` | Transient vs permanent stream-append errors (don't abandon streaming on a blip) | `backlog` | [backlog.md](backlog.md) |
 | `0049-libvirt-pure-driver-spike` | Direct libvirt RPC driver spike (`libvirt-pure`) | `backlog` | [backlog.md](backlog.md) |
+| `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 

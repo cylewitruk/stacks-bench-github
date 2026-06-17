@@ -788,7 +788,7 @@ fn archive_dir(summary: &serde_json::Value) -> Option<String> {
 /// Also reused (roadmap-v7) to build the PR run's metric for the vs-baseline
 /// comparison, so the comment's delta is on the same numbers we persist.
 pub fn metric_from_run(job_id: Uuid, run: &RunResult) -> Option<JobMetric> {
-    let data = run.data.as_ref()?;
+    let data = run.run_data()?;
     let summary = data.summary.as_ref()?;
     Some(JobMetric {
         job_id,
@@ -812,4 +812,69 @@ pub fn metric_from_run(job_id: Uuid, run: &RunResult) -> Option<JobMetric> {
 /// `CHECK >= 0`; a negative/NaN duration is nonsensical anyway).
 fn secs_to_us(secs: f64) -> i64 {
     if secs.is_finite() && secs > 0.0 { (secs * 1_000_000.0) as i64 } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_from_run_accepts_schema_v1_run_envelope() {
+        let run = RunResult::from_bytes(
+            br#"{
+                "schema_version": 1,
+                "success": true,
+                "result_type": "run",
+                "result_version": 1,
+                "duration_secs": 2200.0,
+                "result": {
+                    "measured_entries": 4000,
+                    "warmup_entries": 1000,
+                    "duration_secs": 1900.0,
+                    "sampled_metric_rows": 4000,
+                    "mode_summary": { "mode": "range" },
+                    "summary": {
+                        "total_duration_us": 100000000,
+                        "setup_duration_us": 9000000,
+                        "execution_duration_us": 72000000,
+                        "commit_duration_us": 18000000,
+                        "transactions": 12345,
+                        "clarity_runtime": 9876543,
+                        "write_length": 89000000,
+                        "read_length": 245000000
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let job_id = Uuid::new_v4();
+
+        let metric = metric_from_run(job_id, &run).unwrap();
+
+        assert_eq!(metric.job_id, job_id);
+        assert_eq!(metric.envelope_duration_us, 2_200_000_000);
+        assert_eq!(metric.replay_duration_us, 1_900_000_000);
+        assert_eq!(metric.measured_blocks, 4000);
+        assert_eq!(metric.warmup_blocks, 1000);
+        assert_eq!(metric.transactions, 12345);
+        assert_eq!(metric.execution_duration_us, 72_000_000);
+        assert_eq!(metric.commit_duration_us, 18_000_000);
+    }
+
+    #[test]
+    fn metric_from_run_ignores_non_run_schema_v1_envelopes() {
+        let run = RunResult::from_bytes(
+            br#"{
+                "schema_version": 1,
+                "success": false,
+                "result_type": "error",
+                "result_version": 0,
+                "duration_secs": 1.0,
+                "error": "bad args"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(metric_from_run(Uuid::new_v4(), &run).is_none());
+    }
 }
