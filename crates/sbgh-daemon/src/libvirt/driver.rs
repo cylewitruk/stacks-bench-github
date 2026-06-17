@@ -74,7 +74,7 @@ const SCCACHE_MAX_SIZE: &str = "20G";
 const BUILD_PROFILE: &str = "release";
 const BUILD_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 /// Bump on any binary-affecting change to `sbgh-build.sh.tmpl`.
-const BUILD_RECIPE_VERSION: u32 = 1;
+const BUILD_RECIPE_VERSION: u32 = 2;
 /// Until `0027`'s profiler-protocol versioning lands.
 const BUILD_PROTOCOL_VERSION: &str = "v1";
 

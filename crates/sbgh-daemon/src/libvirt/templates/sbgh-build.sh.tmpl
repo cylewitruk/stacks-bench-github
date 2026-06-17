@@ -66,6 +66,7 @@ phase "building"
 cd "$SRC"
 git rev-parse HEAD | grep -q "$HEAD_SHA" || die "checkout sha mismatch"
 cargo build --release -p stacks-bench || die "cargo build failed"
+strip --strip-debug ./target/release/stacks-bench || die "strip stacks-bench debug info failed"
 sccache --show-stats || true
 
 # --- snapshot the binary -------------------------------------------------------------
