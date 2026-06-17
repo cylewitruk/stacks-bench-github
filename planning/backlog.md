@@ -288,6 +288,53 @@ not-streaming/missing error still falls back to `chat.update` as today.
 **Deferred / non-goals:** No change to the keepalive cadence or the block-update
 render path; the failure budget/backoff shape is a design detail.
 
+### 0049 — Direct libvirt RPC driver spike (`libvirt-pure`)
+
+- **id:** `0049-libvirt-pure-driver-spike`
+- **status:** `backlog`
+- **priority:** `low`
+- **depends_on:** `0010-driver-seam` (shipped)
+- **relates_to:** `0004-worker-fleet`, `0019-block-validation-recipe`
+- **source:** host log / integration cleanup follow-up (2026-06)
+
+**Problem:** The current libvirt integration shells out to `virsh` and other
+privileged host tools through `sudo`. It works, but it creates noisy system logs,
+depends on CLI output/semantics, and makes libvirt errors harder to classify
+than a typed API would. Future libvirt CLI drift would be an avoidable source of
+host breakage.
+
+**Scope:** Spike replacing the `virsh` subset of the libvirt driver with direct
+libvirt RPC over the local Unix socket, using `libvirt-pure` if it proves mature
+enough. Prove the lifecycle operations the daemon actually needs: connect to the
+system libvirt socket, define a domain from the existing XML, start it, poll
+state, destroy it, and undefine it, with typed error handling and no shelling out
+to `virsh`. Keep the work behind the existing driver seam and preserve the
+current shell implementation as a fallback until the host proof is boring.
+
+The spike should also document the boundary: non-libvirt privileged filesystem
+operations (`mkfs`, mount/umount, ownership fixes, LVM/thin snapshot work) are
+not automatically solved by libvirt RPC and should stay separate unless a safe
+replacement is identified. Evaluate host permissions explicitly (libvirt group,
+Polkit, socket ownership) so removing `sudo virsh` does not turn into a broader
+privilege change by accident.
+
+**Acceptance:**
+
+- On a host-compatible environment, a disposable domain can be
+  define/start/poll/destroy/undefine'd through direct libvirt RPC using the
+  existing generated XML.
+- The spike records which current `virsh` calls can be replaced directly, which
+  shell/sudo calls remain outside libvirt, and any `libvirt-pure` gaps or
+  maturity risks. As of the initial backlog entry, `libvirt-pure` is attractive
+  because it is pure Rust / Tokio and avoids C libvirt bindings, but it is young
+  and low-adoption, so this must be proven before committing to migration.
+- If viable, a follow-up migration plan keeps the shell driver as a fallback
+  until direct RPC has passed host validation.
+
+**Deferred / non-goals:** No immediate removal of the shell driver, no rewrite
+of the full provisioning flow, no fleet scheduling changes, and no attempt to
+replace non-libvirt host setup commands in the same slice.
+
 *`0037-benchmark-group-run-model` shipped (iteration v14, 2026-06) →
 [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md).*
 
