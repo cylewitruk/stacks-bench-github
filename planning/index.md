@@ -55,14 +55,14 @@ need editing when an item's status or location changes.
 | `0035-slack-app-home-status` | Slack App Home status dashboard | `backlog` | [backlog.md](backlog.md) |
 | `0036-pr-comment-llm-intent` | PR-comment LLM intent resolution | `backlog` | [backlog.md](backlog.md) |
 | `0037-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
-| `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `in_progress` | [iterations/v15-isolated-benchmark-repetitions.md](iterations/v15-isolated-benchmark-repetitions.md) |
+| `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
 | `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `backlog` | [backlog.md](backlog.md) |
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
 | `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `backlog` | [backlog.md](backlog.md) |
-| `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `in_progress` | [iterations/v16-cache-hit-minimal-source-disk.md](iterations/v16-cache-hit-minimal-source-disk.md) |
-| `0043-slack-plan-ts-race` | Slack plan-ts race fix (double card) | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
-| `0044-slack-reaction-lifecycle` | Slack reaction lifecycle (ack/queued/running) | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
-| `0045-slack-llm-observability` | Slack/LLM observability logging | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
+| `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
+| `0043-slack-plan-ts-race` | Slack plan-ts race fix (double card) | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
+| `0044-slack-reaction-lifecycle` | Slack reaction lifecycle (ack/queued/running) | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
+| `0045-slack-llm-observability` | Slack/LLM observability logging | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `0046-slack-reaction-state-from-api` | Read reaction state via `reactions.list` instead of brute-force removal | `backlog` | [backlog.md](backlog.md) |
 | `0047-slack-reporting-session` | Group-scoped Slack reporting session (surface lifetime = trigger, not run) | `in_progress` | [iterations/v18-slack-reporting-session.md](iterations/v18-slack-reporting-session.md) |
 | `0048-slack-stream-error-classification` | Transient vs permanent stream-append errors (don't abandon streaming on a blip) | `backlog` | [backlog.md](backlog.md) |
@@ -84,9 +84,9 @@ need editing when an item's status or location changes.
 | `v12-slack-streamed-plan` | Slack streamed plan updates | `shipped` | [archive/completed/0033-slack-streamed-plan-updates.md](archive/completed/0033-slack-streamed-plan-updates.md) |
 | `v13-llm-intent-resolution` | LLM intent resolution | `shipped` | [archive/completed/0020-llm-intent-resolution.md](archive/completed/0020-llm-intent-resolution.md) |
 | `v14-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
-| `v15-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `in_progress` | [iterations/v15-isolated-benchmark-repetitions.md](iterations/v15-isolated-benchmark-repetitions.md) |
-| `v16-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `in_progress` | [iterations/v16-cache-hit-minimal-source-disk.md](iterations/v16-cache-hit-minimal-source-disk.md) |
-| `v17-slack-reporting-robustness` | Slack reporting robustness, reactions & observability | `in_progress` | [iterations/v17-slack-reporting-robustness.md](iterations/v17-slack-reporting-robustness.md) |
+| `v15-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
+| `v16-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
+| `v17-slack-reporting-robustness` | Slack reporting robustness, reactions & observability | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `v18-slack-reporting-session` | Group-scoped Slack reporting session | `in_progress` | [iterations/v18-slack-reporting-session.md](iterations/v18-slack-reporting-session.md) |
 
 ## Decisions

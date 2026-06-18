@@ -5,18 +5,18 @@ already cached, provision a **minimal** source disk (the binary only) instead of
 a full `git checkout` of stacks-core, so a cache-hit run goes claim → bench in a
 few seconds instead of ~15-20s of source-disk churn the bench never reads.
 
-> **Status:** in_progress
+> **Status:** shipped
 >
-> Phases 1-3 are implemented and ready for review. The load-bearing move is to
-> split mirror prep from source-disk population: fetch the commit into the bare
-> mirror, resolve the binary cache **before** the source disk is populated, then
-> choose a full checkout or minimal binary-only disk from that plan.
+> Shipped as v16 and validated on-host. Cache-hit runs now split mirror prep
+> from source-disk population, resolve the binary cache before populating the
+> disk, and provision a minimal binary-only source disk instead of a full
+> checkout/chown path.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0042-cache-hit-minimal-source-disk` | primary | in_progress |
+| `0042-cache-hit-minimal-source-disk` | primary | shipped |
 
 ## Why
 
@@ -100,7 +100,7 @@ no behavior change yet.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [x] Validated
 
 **Acceptance & Validation:**
@@ -131,13 +131,13 @@ no behavior change yet.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [x] Validated
 
 **Acceptance & Validation:**
 
 - [x] A cache-hit run performs no `git checkout` and no full-tree `chown`.
-- [ ] The bench still execs the cached binary and produces identical results.
+- [x] The bench still execs the cached binary and produces identical results.
 - [x] A cache miss is unchanged (full checkout → build → publish → bench).
 - [x] A stale hit (binary evicted between plan and seed) falls back, not fails.
 
@@ -156,7 +156,7 @@ no behavior change yet.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
+- [x] Reviewed
 - [x] Validated
 
 **Acceptance & Validation:**
@@ -169,7 +169,7 @@ no behavior change yet.
 - [x] `just build`
 - [x] `just lint`
 - [x] `just test`
-- [ ] Host smoke: a cache-hit bench logs no `git checkout`, goes claim → bench in
+- [x] Host smoke: a cache-hit bench logs no `git checkout`, goes claim → bench in
   a few seconds, the build VM stays skipped, and results match a full-checkout
   run; the Build row never shows "Building…". A 2-3 repeat group confirms each
   cache-hit repeat avoids the checkout/chown path.

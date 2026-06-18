@@ -4,26 +4,19 @@ Item `0038-isolated-benchmark-repetitions`: make "repetitions" mean clean,
 daemon-orchestrated VM executions under one benchmark group, not
 `stacks-bench` in-process loops.
 
-> **Status:** in_progress
+> **Status:** shipped
 >
-> Phase 1 is implemented and reviewed: requests carry a daemon-owned
-> clean-repeat count, enforce a conservative cap before enqueue, and normalize
-> every VM invocation to `stacks-bench --repetitions 1`. Phase 2 is implemented
-> and reviewed: requested clean-run counts are persisted on `benchmark_spec`,
-> and both stores expose tested append/resume primitives for the lazy run chain.
-> Phase 3 is implemented and reviewed: startup resume and after-completion
-> append hooks drive the internal chain. Phase 4 is implemented and reviewed:
-> archived SQLite DBs are carried through a group artifact before the next run
-> is appended/started. Phase 5 is implemented pending review: the group owns one
-> Slack surface with live repeat progress, aggregate variance from promoted
-> metrics, shared-DB download links, and partial summaries on failed/stalled
-> groups. Multi-run Slack requests now open when the binary cache is enabled.
+> Shipped as v15 and validated on-host. Requests now carry a daemon-owned
+> clean-repeat count, runs are appended lazily and resumably, archived SQLite
+> DBs are carried forward through the group artifact, and the group owns one
+> reporting surface with live repeat progress, aggregate variance, shared-DB
+> download links, and partial summaries for failed/stalled groups.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0038-isolated-benchmark-repetitions` | primary | in_progress |
+| `0038-isolated-benchmark-repetitions` | primary | shipped |
 
 ## Why
 
@@ -110,7 +103,7 @@ in-process repetitions.
 - [x] Core implementation
 - [x] Unit/integration tests
 - [x] Reviewed
-- [ ] Validated
+- [x] Validated
 
 **Acceptance & Validation:**
 
@@ -148,7 +141,7 @@ in-process repetitions.
 - [x] Core implementation
 - [x] Unit/integration tests
 - [x] Reviewed
-- [ ] Validated
+- [x] Validated
 
 **Acceptance & Validation:**
 
@@ -190,14 +183,14 @@ in-process repetitions.
 - [x] Core implementation
 - [x] Unit/integration tests
 - [x] Reviewed
-- [ ] Validated
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] N clean repeats do not run build->bench N times when the binary cache is
+- [x] N clean repeats do not run build->bench N times when the binary cache is
   enabled.
-- [ ] Every measured repeat still runs in a fresh VM/snapshot.
-- [ ] Cache hits and build misses both preserve the same repeat semantics.
+- [x] Every measured repeat still runs in a fresh VM/snapshot.
+- [x] Cache hits and build misses both preserve the same repeat semantics.
 - [x] A failed run stops the lazy-enqueue chain and leaves visible partial
   group state.
 - [x] A repeat group produces one user-facing Slack/GitHub surface, not one
@@ -226,11 +219,11 @@ in-process repetitions.
 - [x] Core implementation
 - [x] Unit/integration tests
 - [x] Reviewed
-- [ ] Validated
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] A multi-repeat group produces one shared DB containing rows for all clean
+- [x] A multi-repeat group produces one shared DB containing rows for all clean
   runs.
 - [x] The final result card/download links the shared DB.
 - [x] A carry-forward failure is visible and terminal/partial according to the
@@ -256,8 +249,8 @@ in-process repetitions.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
@@ -272,7 +265,7 @@ in-process repetitions.
 - [x] `just build`
 - [x] `just lint`
 - [x] `just test`
-- [ ] Host smoke: request 2 clean repeats, confirm two fresh VMs/snapshots, one
+- [x] Host smoke: request 2 clean repeats, confirm two fresh VMs/snapshots, one
   build/cache artifact, one shared DB, and a variance summary.
 
 ## Follow-Ups

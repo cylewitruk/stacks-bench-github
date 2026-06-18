@@ -5,18 +5,21 @@ poisons the repeat plan-ts chain (`0043`), add an immediate-ack + queued/running
 reaction lifecycle (`0044`), and add the LLM/Slack lifecycle logging that
 currently doesn't exist (`0045`).
 
-> **Status:** in_progress
+> **Status:** shipped
 >
-> All three phases implemented + unit/integration-tested (full suite green:
-> `just build`/`just lint`/`just test`). Pending Codex review + host smoke.
+> Shipped as v17 and validated on-host. The Slack surface now persists run 0's
+> plan-card `ts` atomically with job creation, handles request reactions through
+> ack/queued/running/terminal states, and logs the Slack/LLM request lifecycle.
+> v18 supersedes the per-run keepalive/session lifetime shape while preserving
+> these shipped race/reaction/logging fixes.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0043-slack-plan-ts-race` | primary | implemented |
-| `0044-slack-reaction-lifecycle` | primary | implemented |
-| `0045-slack-llm-observability` | primary | implemented |
+| `0043-slack-plan-ts-race` | primary | shipped |
+| `0044-slack-reaction-lifecycle` | primary | shipped |
+| `0045-slack-llm-observability` | primary | shipped |
 
 ## Why
 
@@ -115,21 +118,21 @@ inherited-but-missing message reposts instead of reporting nowhere.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] A Slack run never posts two plan cards, even when claimed immediately on an
+- [x] A Slack run never posts two plan cards, even when claimed immediately on an
   idle daemon.
-- [ ] Run 0 has exactly one `plan_message_sent` event; run 1+ inherit the live
+- [x] Run 0 has exactly one `plan_message_sent` event; run 1+ inherit the live
   card and resume via `appendStream` with no `message_not_found`.
-- [ ] A genuinely-deleted inherited message reposts a fresh card **and persists
+- [x] A genuinely-deleted inherited message reposts a fresh card **and persists
   the new `ts`**, so subsequent updates land on it (covered for both append and
   block-update).
-- [ ] A failed queued-card post still leaves the job runnable (reporter posts at
+- [x] A failed queued-card post still leaves the job runnable (reporter posts at
   claim) — no regression.
-- [ ] A `create_unlinked_job` failure after a successful post leaves a visible
+- [x] A `create_unlinked_job` failure after a successful post leaves a visible
   failure message, not a fake queued card.
 
 ### Phase 2: Reaction lifecycle (`0044`)
@@ -152,17 +155,17 @@ inherited-but-missing message reposts instead of reporting nowhere.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] A mention gets 👀 before the LLM resolves.
-- [ ] Accepted → ⏳ → 🚀 → ✅/❌, each transition removing the prior reaction (no
+- [x] A mention gets 👀 before the LLM resolves.
+- [x] Accepted → ⏳ → 🚀 → ✅/❌, each transition removing the prior reaction (no
   accumulation).
-- [ ] A repeat group transitions once per group: 🚀 persists across intermediate
+- [x] A repeat group transitions once per group: 🚀 persists across intermediate
   repeats, the final run swaps to ✅, a failed/cancelled run swaps to ❌.
-- [ ] Every post-ack rejection path removes the 👀 (tested): parser failure, LLM
+- [x] Every post-ack rejection path removes the 👀 (tested): parser failure, LLM
   invalid/failure, over-cap, and cache-gate rejection all leave no stray ack.
 
 ### Phase 3: Slack & LLM observability (`0045`)
@@ -186,22 +189,22 @@ log level.
 
 - [x] Core implementation
 - [x] Unit/integration tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] At default `RUST_LOG` (info), a mention shows received → resolving
+- [x] At default `RUST_LOG` (info), a mention shows received → resolving
   (parser/LLM) → [LLM request/response + latency] → accepted/rejected → reaction →
   card posted.
-- [ ] No secrets (API key) appear in any log line; the prompt is debug-only.
+- [x] No secrets (API key) appear in any log line; the prompt is debug-only.
 
 ## Final Validation
 
 - [x] `just build`
 - [x] `just lint`
 - [x] `just test` (905 passed, 1 skipped — the ignored real-OpenAI eval)
-- [ ] Host smoke: a Slack 2-3 repeat request posts exactly one plan card (no
+- [x] Host smoke: a Slack 2-3 repeat request posts exactly one plan card (no
   double), reactions advance 👀→⏳→🚀→✅, run 1+ resume the same card with no
   `message_not_found`/dead-message fallback, and the journal shows the LLM
   request/response + lifecycle at info.

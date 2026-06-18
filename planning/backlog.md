@@ -377,8 +377,8 @@ checked fixture or schema-contract test using upstream
 *`0037-benchmark-group-run-model` shipped (iteration v14, 2026-06) →
 [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md).*
 
-*`0038-isolated-benchmark-repetitions` is in progress as iteration **v15** →
-[iterations/v15-isolated-benchmark-repetitions.md](iterations/v15-isolated-benchmark-repetitions.md).*
+*`0038-isolated-benchmark-repetitions` shipped (iteration v15, 2026-06) →
+[archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md).*
 
 ### 0039 — Multi-variant benchmark comparisons
 
@@ -441,16 +441,31 @@ own baseline overhead calibration. In a clean-repeat or multi-variant group,
 that means each fresh VM repeats calibration work and may add noise that is not
 the workload under test.
 
-**Scope:** Add an explicit calibration primitive to `stacks-bench` and the
-daemon. The intended shape is a separate `stacks-bench bench calibrate` command
-that records calibration output into the group DB, plus a `bench run` option to
-reuse an existing calibration and skip recalibrating inside each repeat/variant
-VM. The daemon can execute one calibration run at the start of a
-`BenchmarkGroup` (potentially in its own VM for the same isolation discipline),
-carry the calibrated DB forward, and then run each measured VM with calibration
-disabled. This should land as a new workflow step in the model established by
-`0037`, not as a retrofit to BenchmarkSpec/BenchmarkRun semantics: calibration
-is group-scoped setup for measured runs, not another variant being compared.
+**Scope:** Use the upstream tip-anchored calibration primitive:
+`stacks-bench bench baseline calibrate --source … --network …` writes a
+calibration row into the group's shared `stacks-bench.db` and returns
+`result.calibration_id` in the final JSON envelope. The daemon executes one
+calibration run at the start of a `BenchmarkGroup` (potentially in its own VM
+for the same isolation discipline), carries the calibrated DB forward, and then
+injects `--baseline-id <calibration_id>` into each measured repeat/variant VM.
+This should land as a new workflow step in the model established by `0037`, not
+as a retrofit to BenchmarkSpec/BenchmarkRun semantics: calibration is
+group-scoped setup for measured runs, not another variant being compared.
+
+The correctness invariant is **same carried-forward app DB + same chainstate
+snapshot/tip**, not "same run end block." The daemon does not need to resolve a
+range's end block just to calibrate. If calibration fails, measured runs are not
+enqueued; if any measured run rejects `--baseline-id`, the group fails loudly as
+a correctness error rather than silently falling back to inline calibration.
+
+Upstream references for the implementation pass:
+
+- `contrib/stacks-bench/schema/` on `cylewitruk/feat/stacks-bench` is the
+  versioned JSON contract for the calibration result envelope.
+- `contrib/stacks-bench/src/cli/bench/run.rs` on the same branch is the
+  `bench run` clap source of truth for `--baseline-id` and related workload
+  flags.
+
 The methodological assumption is explicit: `stacks-bench` calibration is a
 host-stable block-commit baseline, measured by committing empty blocks in a fork
 until tail timings converge. For a host-pinned group, sharing one calibration
@@ -458,9 +473,10 @@ removes per-run calibration noise from `0038` variance and cancels the baseline
 from `0039` variant deltas.
 
 **Acceptance:** A group can perform one calibration pass, then run multiple
-measured executions that reuse that calibration data. The final summary clearly
-distinguishes calibration time from measured workload time, and falling back to
-per-run calibration remains possible when no reusable calibration exists.
+measured executions that reuse that calibration data via `--baseline-id`. The
+final summary clearly distinguishes calibration time from measured workload
+time and notes that the calibration was shared. Fallback to per-run calibration
+is explicit policy/configuration, not an automatic recovery path.
 
 **Deferred / non-goals:** Do not change `stacks-bench` calibration semantics
 implicitly for standalone CLI users. Do not optimize calibration distribution
