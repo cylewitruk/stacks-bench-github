@@ -338,41 +338,11 @@ replace non-libvirt host setup commands in the same slice.
 ### 0050 — Adopt `stacks-bench` schema-v1 JSON natively
 
 - **id:** `0050-stacks-bench-schema-v1-native`
-- **status:** `backlog`
+- **status:** `planned`
 - **priority:** `medium`
-- **depends_on:** upstream `stacks-bench` schema-v1 JSON landing on the pinned
-  integration branch
-- **relates_to:** `0038-isolated-benchmark-repetitions`,
-  `0039-multi-variant-benchmark-comparisons`, `0028-results-summary-card`
-- **source:** upcoming `stacks-bench --json` schema-v1 compatibility shim
-  (2026-06)
 
-**Problem:** The daemon currently carries a compatibility layer that accepts both
-the legacy `data` envelope and the new schema-v1 `result` envelope from
-`stacks-bench bench run --json`. That keeps deploys unblocked while upstream
-transitions, but the daemon still names promoted metrics and rendered labels in
-block-centric terms (`blocks`, `warmup_blocks`, `measured_blocks`) even though
-schema-v1 intentionally uses neutral `entries` terminology across range, txid,
-and block modes.
-
-**Scope:** Once schema-v1 is the deployed upstream contract, clean up the daemon
-side to treat it as native: dispatch explicitly on `(result_type,
-result_version)`, prefer `entries`/`warmup_entries`/`measured_entries` naming in
-new code and UI text, and use `mode_summary` plus `sampled_metric_rows` where
-they improve Slack/GitHub result summaries. Decide whether existing
-`job_metric` column names stay as storage legacy or need a migration. Add a
-checked fixture or schema-contract test using upstream
-`contrib/stacks-bench/schema/v1.json` when it is available in the pinned source.
-
-**Acceptance:**
-
-- The compatibility shim is either removed or reduced to an explicit legacy
-  fallback with tests, and the main parser path treats schema-v1 as canonical.
-- Slack/GitHub summaries use neutral "entries" wording where the workload is not
-  literally block-height range replay, while preserving useful block labels for
-  range-mode runs.
-- Promoted metrics and aggregate summaries continue to populate for schema-v1
-  `run` payloads, including txid/block selector modes.
+Promoted to `v21-stacks-bench-schema-v1-native` →
+[iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md).
 
 *`0037-benchmark-group-run-model` shipped (iteration v14, 2026-06) →
 [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md).*
@@ -429,58 +399,11 @@ scheduling until resource-aware admission/worker-fleet policy exists.
 ### 0041 — Shared benchmark calibration pass
 
 - **id:** `0041-shared-benchmark-calibration`
-- **status:** `backlog`
+- **status:** `in_progress`
 - **priority:** `medium`
-- **depends_on:** `0037-benchmark-group-run-model`
-- **relates_to:** `0038-isolated-benchmark-repetitions`,
-  `0039-multi-variant-benchmark-comparisons`, `0027-fine-grained-progress`
-- **source:** experiment-group modeling follow-up (2026-06)
 
-**Problem:** Every `stacks-bench bench run` invocation currently performs its
-own baseline overhead calibration. In a clean-repeat or multi-variant group,
-that means each fresh VM repeats calibration work and may add noise that is not
-the workload under test.
-
-**Scope:** Use the upstream tip-anchored calibration primitive:
-`stacks-bench bench baseline calibrate --source … --network …` writes a
-calibration row into the group's shared `stacks-bench.db` and returns
-`result.calibration_id` in the final JSON envelope. The daemon executes one
-calibration run at the start of a `BenchmarkGroup` (potentially in its own VM
-for the same isolation discipline), carries the calibrated DB forward, and then
-injects `--baseline-id <calibration_id>` into each measured repeat/variant VM.
-This should land as a new workflow step in the model established by `0037`, not
-as a retrofit to BenchmarkSpec/BenchmarkRun semantics: calibration is
-group-scoped setup for measured runs, not another variant being compared.
-
-The correctness invariant is **same carried-forward app DB + same chainstate
-snapshot/tip**, not "same run end block." The daemon does not need to resolve a
-range's end block just to calibrate. If calibration fails, measured runs are not
-enqueued; if any measured run rejects `--baseline-id`, the group fails loudly as
-a correctness error rather than silently falling back to inline calibration.
-
-Upstream references for the implementation pass:
-
-- `contrib/stacks-bench/schema/` on `cylewitruk/feat/stacks-bench` is the
-  versioned JSON contract for the calibration result envelope.
-- `contrib/stacks-bench/src/cli/bench/run.rs` on the same branch is the
-  `bench run` clap source of truth for `--baseline-id` and related workload
-  flags.
-
-The methodological assumption is explicit: `stacks-bench` calibration is a
-host-stable block-commit baseline, measured by committing empty blocks in a fork
-until tail timings converge. For a host-pinned group, sharing one calibration
-removes per-run calibration noise from `0038` variance and cancels the baseline
-from `0039` variant deltas.
-
-**Acceptance:** A group can perform one calibration pass, then run multiple
-measured executions that reuse that calibration data via `--baseline-id`. The
-final summary clearly distinguishes calibration time from measured workload
-time and notes that the calibration was shared. Fallback to per-run calibration
-is explicit policy/configuration, not an automatic recovery path.
-
-**Deferred / non-goals:** Do not change `stacks-bench` calibration semantics
-implicitly for standalone CLI users. Do not optimize calibration distribution
-across remote workers until worker-fleet/resource policy exists.
+Promoted to `v19-shared-benchmark-calibration` →
+[iterations/v19-shared-benchmark-calibration.md](iterations/v19-shared-benchmark-calibration.md).
 
 ### 0015 — Resource-aware admission / budgets
 
@@ -620,62 +543,11 @@ before an iteration.
 ### 0027 — Fine-grained bench progress (JSONL)
 
 - **id:** `0027-fine-grained-progress`
-- **status:** `backlog`
+- **status:** `planned`
 - **priority:** `medium`
-- **depends_on:** upstream `stacks-bench` progress JSONL support landing on the
-  pinned integration branch; feeds `0024-slack-card-stage-timings` + the
-  `ReportSurface` heartbeat
-- **relates_to:** `0017-generic-phase-events`,
-  `0037-benchmark-group-run-model`, `0041-shared-benchmark-calibration`
-- **source:** high-value list (2026-06)
 
-**Problem:** `--json` historically emitted only the final result on stdout, so
-the daemon could not surface sub-phase progress ("indexing 2345/5000", "warming
-up 111/2000", "measuring 4876/10000") — the card's in-progress rows showed only
-a static detail.
-
-**Upstream shape:** New `stacks-bench --json` builds reserve **stdout** for the
-final versioned `CommandResult` envelope and emit progress events as **newline
-delimited JSON on stderr**. Consumers must parse stdout as the final result and
-parse stderr line-by-line, ignoring non-JSON lines for older/mixed builds.
-Progress events dispatch by `(schema_version, event_type, event_version)`;
-currently `(1, "progress", 1)` with payload:
-
-```json
-{
-  "phase": "replay",
-  "progress": 42,
-  "total": 100,
-  "message": "Replaying measured entries"
-}
-```
-
-`total` and `message` are optional; phases include stable labels such as
-`indexing`, `index_merge`, `index_checkpoint`, `index_vacuum`, `txid_scan`,
-`setup`, `planning`, `baseline`, `warmup`, `replay`, `metrics`, and `cleanup`.
-
-**Scope:** Capture the VM's `stacks-bench` stderr stream separately from the
-console log: the guest script should redirect benchmark stderr to a dedicated
-progress JSONL file (for example `2> "$RESULTS/progress.jsonl"`), not try to
-demux the serial console. The daemon tails that file live during the run, parses
-JSONL progress events without merging stdout/stderr, and forwards recognized
-progress as recipe-neutral worker events tagged to the current benchmark
-run/workflow step. The parser should be defensive: line-by-line JSON parse,
-unknown envelope/payload fields ignored, unsupported `event_type`/`event_version`
-ignored, and malformed lines treated as ordinary stderr noise. Daemon-side
-reporting should debounce user-visible updates and feed the active
-`ReportSurface` detail/output rows rather than spamming `chat.update` or GitHub
-comments. Archive the raw progress stream alongside `run.json` for forensics.
-
-**Acceptance:** A running bench drives live sub-phase progress on its surface
-(Slack card / PR/check surface) from stderr JSONL, while stdout remains the final
-`run.json` source. Older builds or malformed stderr lines fall back to today's
-coarse phase reporting without failing the job.
-
-**Deferred / non-goals:** No new `stacks-bench` protocol shape is needed here;
-the upstream stderr JSONL contract is the integration target. Dovetails with
-`0024` (durations) and future calibration/block-validation progress, but this
-slice should only surface the emitted benchmark events.
+Promoted to `v20-fine-grained-bench-progress` →
+[iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md).
 
 ### 0028 — Results-summary restructure
 

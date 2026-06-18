@@ -1,0 +1,204 @@
+# v19: Shared Benchmark Calibration
+
+Add a group-scoped `stacks-bench` calibration step before measured benchmark
+runs, so clean repeats and future multi-variant groups reuse one baseline
+calibration instead of recalibrating inside every VM (`0041`).
+
+> **Status:** in_progress - planning complete, implementation not started.
+>
+> This iteration deliberately comes before JSONL progress (`0027`): calibration
+> changes the benchmark workflow shape, while progress reporting can observe the
+> new workflow once it exists.
+
+## Items
+
+| Item | Role | Status |
+| ---- | ---- | ------ |
+| `0041-shared-benchmark-calibration` | primary | in_progress |
+
+## Why
+
+`stacks-bench bench run` historically performed its own empty-block baseline
+calibration. In a clean-repeat group, that means every isolated run pays the
+calibration cost and can introduce per-run baseline noise that is not part of
+the workload being measured.
+
+Upstream now exposes an explicit calibration command:
+
+```bash
+stacks-bench --db /path/to/stacks-bench.db --json \
+  bench baseline calibrate \
+  --source /path/to/node-data \
+  --network mainnet
+```
+
+The final stdout envelope returns `result.calibration_id`. Measured runs can then
+reuse that calibration:
+
+```bash
+stacks-bench --db /path/to/stacks-bench.db --json \
+  bench run \
+  --source /path/to/node-data \
+  --network mainnet \
+  --start-at A \
+  --count N \
+  --baseline-id 12
+```
+
+The upstream invariant is now tip-anchored: calibration belongs to the same
+indexed chainstate and resolved chain-tip anchor, not to a benchmark range end
+block. That is exactly the shape a host-pinned benchmark group wants: one
+calibrated group DB, carried forward into every measured run VM.
+
+## Sources
+
+Implementation should verify the upstream contract against the pinned
+`cylewitruk/feat-stacks-bench` sources:
+
+- `contrib/stacks-bench/schema/` — versioned JSON schema for the
+  `baseline_calibration` result envelope.
+- `contrib/stacks-bench/src/cli/bench/run.rs` — `clap` source of truth for
+  `bench run`, including `--baseline-id`.
+
+The name mapping is intentional: the calibration command returns
+`result.calibration_id`, and measured runs consume that value via
+`--baseline-id`.
+
+## Scope
+
+- Add a `calibrate` workflow step before measured benchmark runs for group
+  workloads that opt into shared calibration.
+- Run calibration against the same group `stacks-bench.db` artifact that is
+  carried forward between runs.
+- Parse `baseline_calibration` result envelopes and persist the
+  `calibration_id` needed by later measured runs.
+- Inject `--baseline-id <id>` into every measured benchmark run in the group.
+- Fail the group loudly if calibration fails, the calibration result cannot be
+  parsed, or a measured run rejects the baseline id.
+- Report calibration as group setup, distinct from measured workload time.
+
+**Non-goals:** no JSONL progress integration in this slice, no cross-host
+calibration sharing, no silent fallback to inline per-run calibration, and no
+change to standalone `stacks-bench` semantics.
+
+## Design Decisions
+
+- **Calibration is a workflow step, not a benchmark variant.** It prepares the
+  group DB for measured runs. It should not appear as a `BenchmarkSpec` variant
+  and should not be included in variance or comparison math.
+- **The shared DB is load-bearing.** `baseline_id` and `chainstate_id` are
+  DB-local. The calibrated DB must be the one carried into measured run VMs.
+- **Tip-anchored by default.** The daemon does not compute a range end block just
+  to calibrate. It relies on upstream's same-chainstate/same-tip validation.
+- **Fail closed.** Rejecting or losing the calibration is a correctness failure,
+  not an opportunity to silently run inline calibration.
+- **Host pinning remains the group boundary.** Calibration, measured runs, and
+  carried artifacts must stay on the same host until worker-fleet policy exists.
+
+## Phase 1 - Result Model and Workflow Metadata
+
+**Status:** planned
+
+Add the daemon-side model for calibration outputs and the persisted metadata that
+later measured runs need.
+
+**Scope:**
+
+- Add a typed parser for schema-v1 `baseline_calibration` result envelopes.
+- Persist the selected calibration id on group/workflow metadata.
+- Represent `calibrate` as a first-class workflow step state, reusing the 0037
+  workflow-step model rather than hard-coding it into repeat logic.
+- Add tests for successful parse, wrong result type/version, missing id, and
+  legacy/invalid envelopes.
+
+**Acceptance:**
+
+- The daemon can parse and persist a calibration id without running a measured
+  benchmark.
+- Bad calibration envelopes fail loudly with useful diagnostics.
+
+## Phase 2 - Execute Calibration Before Measured Runs
+
+**Status:** planned
+
+Run the calibration command once per benchmark group before run 0.
+
+**Scope:**
+
+- Add a calibration execution path that uses the same built/cached
+  `stacks-bench` binary path as benchmark runs.
+- Seed the calibration VM with the group DB and archive the calibrated DB as the
+  next group DB artifact.
+- Block measured run enqueueing until calibration succeeds.
+- Make startup/resume DB-derivable: a group that calibrated successfully but has
+  not started measured runs resumes from the persisted calibration state.
+
+**Acceptance:**
+
+- A two-repeat group runs exactly one calibration step before the measured
+  sequence.
+- A calibration failure marks the group failed and enqueues no measured runs.
+- Restarting after calibration but before run 0 resumes the measured sequence.
+
+## Phase 3 - Inject Baseline ID into Measured Runs
+
+**Status:** planned
+
+Thread the saved calibration into every measured benchmark invocation.
+
+**Scope:**
+
+- Add `--baseline-id <id>` to effective measured-run arguments for calibrated
+  groups.
+- Keep workload-key semantics explicit: calibration changes execution mechanics
+  but not the user-requested workload identity.
+- Treat a measured-run rejection of `--baseline-id` as a group correctness
+  failure.
+- Ensure clean repeats still run one VM per repeat and still carry the DB forward.
+
+**Acceptance:**
+
+- Every measured run in a calibrated group receives the same `--baseline-id`.
+- No measured run performs inline baseline calibration unless an explicit future
+  policy opts out of shared calibration.
+
+## Phase 4 - Reporting and Host Validation
+
+**Status:** planned
+
+Make the shared calibration visible without overloading measured-run summaries.
+
+**Scope:**
+
+- Add a group/reporting row for calibration setup and duration.
+- Final summaries distinguish "shared group baseline" from measured workload
+  timing.
+- Preserve partial-group reporting: if calibration succeeds and a later run
+  fails, the surface still reports calibration provenance and any completed run
+  data.
+- Host-smoke with a two-repeat group.
+
+**Acceptance:**
+
+- Slack/GitHub surfaces show one shared calibration and two measured runs.
+- The group artifact DB contains the calibration row and measured runs linked to
+  that baseline.
+- A host smoke confirms no per-run inline calibration occurs.
+
+## Validation
+
+- `just build`
+- `just lint`
+- `just test`
+- Host smoke: two clean repeats over a known workload produce one calibration,
+  two measured VM runs, one carried group DB, and a final summary that separates
+  calibration from measured workload time.
+
+## Follow-Ups
+
+- `0027-fine-grained-progress` should surface calibration progress once stderr
+  JSONL events are wired through.
+- `0039-multi-variant-benchmark-comparisons` can reuse one calibration across
+  variants that share the same group DB and chainstate/tip.
+- `0028-results-summary-restructure` should include calibration provenance in
+  the overview.

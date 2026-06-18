@@ -44,7 +44,7 @@ need editing when an item's status or location changes.
 | `0024-slack-card-stage-timings` | Slack card stage timings | `shipped` | [archive/completed/0024-slack-card-stage-timings.md](archive/completed/0024-slack-card-stage-timings.md) |
 | `0025-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
 | `0026-central-block-index-cache` | Central block/tx index cache | `backlog` | [backlog.md](backlog.md) |
-| `0027-fine-grained-progress` | Fine-grained bench progress | `backlog` | [backlog.md](backlog.md) |
+| `0027-fine-grained-progress` | Fine-grained bench progress | `planned` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
@@ -58,7 +58,7 @@ need editing when an item's status or location changes.
 | `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
 | `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `backlog` | [backlog.md](backlog.md) |
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
-| `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `backlog` | [backlog.md](backlog.md) |
+| `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `in_progress` | [iterations/v19-shared-benchmark-calibration.md](iterations/v19-shared-benchmark-calibration.md) |
 | `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
 | `0043-slack-plan-ts-race` | Slack plan-ts race fix (double card) | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `0044-slack-reaction-lifecycle` | Slack reaction lifecycle (ack/queued/running) | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
@@ -67,7 +67,7 @@ need editing when an item's status or location changes.
 | `0047-slack-reporting-session` | Group-scoped Slack reporting session (surface lifetime = trigger, not run) | `in_progress` | [iterations/v18-slack-reporting-session.md](iterations/v18-slack-reporting-session.md) |
 | `0048-slack-stream-error-classification` | Transient vs permanent stream-append errors (don't abandon streaming on a blip) | `backlog` | [backlog.md](backlog.md) |
 | `0049-libvirt-pure-driver-spike` | Direct libvirt RPC driver spike (`libvirt-pure`) | `backlog` | [backlog.md](backlog.md) |
-| `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `backlog` | [backlog.md](backlog.md) |
+| `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 
 ## Iterations
 
@@ -88,6 +88,9 @@ need editing when an item's status or location changes.
 | `v16-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
 | `v17-slack-reporting-robustness` | Slack reporting robustness, reactions & observability | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `v18-slack-reporting-session` | Group-scoped Slack reporting session | `in_progress` | [iterations/v18-slack-reporting-session.md](iterations/v18-slack-reporting-session.md) |
+| `v19-shared-benchmark-calibration` | Shared benchmark calibration | `in_progress` | [iterations/v19-shared-benchmark-calibration.md](iterations/v19-shared-benchmark-calibration.md) |
+| `v20-fine-grained-bench-progress` | Fine-grained bench progress | `planned` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
+| `v21-stacks-bench-schema-v1-native` | Native `stacks-bench` schema-v1 JSON | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 
 ## Decisions
 
