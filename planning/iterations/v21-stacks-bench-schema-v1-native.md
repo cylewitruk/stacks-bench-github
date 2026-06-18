@@ -59,11 +59,11 @@ no new upstream schema design, and no portal work.
   unknown final-result schema/type/version combinations are correctness errors
   because the daemon must parse results before persisting/reporting them.
 
-## Phase 1 - Versioned Result Envelope
+## Phases
 
-**Status:** planned
+### Phase 1: Versioned Result Envelope
 
-Create the schema-v1 result parsing spine.
+**Goal:** Create the schema-v1 result parsing spine.
 
 **Scope:**
 
@@ -72,17 +72,27 @@ Create the schema-v1 result parsing spine.
 - Preserve explicit error-envelope handling.
 - Add fixtures for `run`, `baseline_calibration`, and `error`.
 
-**Acceptance:**
+**Status:**
 
-- Unknown schema/result versions fail with clear diagnostics.
-- Error envelopes surface the upstream error without being mistaken for a
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
+
+**Acceptance & Validation:**
+
+- [ ] Unknown schema/result versions fail with clear diagnostics.
+- [ ] Error envelopes surface the upstream error without being mistaken for a
   successful result.
 
-## Phase 2 - Native Run Payload and Metrics
+**Tests:**
 
-**Status:** planned
+- Envelope parser fixtures for `run`, `baseline_calibration`, and `error`.
+- Unknown-version/error-path unit tests.
 
-Move benchmark result parsing to schema-v1 run payloads.
+### Phase 2: Native Run Payload and Metrics
+
+**Goal:** Move benchmark result parsing to schema-v1 run payloads.
 
 **Scope:**
 
@@ -92,17 +102,28 @@ Move benchmark result parsing to schema-v1 run payloads.
 - Decide whether persisted metric/summary names stay legacy or get migrated.
 - Keep historical legacy-run fixtures if old artifacts must still render.
 
-**Acceptance:**
+**Status:**
 
-- Schema-v1 run payloads populate promoted metrics and clean-repeat aggregates.
-- Legacy archived run JSON either still renders through an explicit fallback or
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
+
+**Acceptance & Validation:**
+
+- [ ] Schema-v1 run payloads populate promoted metrics and clean-repeat
+  aggregates.
+- [ ] Legacy archived run JSON either still renders through an explicit fallback or
   has a documented migration/retention decision.
 
-## Phase 3 - Reporting Language and Mode Summary
+**Tests:**
 
-**Status:** planned
+- Run-payload parser fixtures covering range, txid, and block selector modes.
+- Metric-promotion and clean-repeat aggregate tests.
 
-Align user-facing summaries with the neutral schema-v1 vocabulary.
+### Phase 3: Reporting Language and Mode Summary
+
+**Goal:** Align user-facing summaries with the neutral schema-v1 vocabulary.
 
 **Scope:**
 
@@ -112,16 +133,25 @@ Align user-facing summaries with the neutral schema-v1 vocabulary.
   isolation, ordering, and sample unit.
 - Ensure Slack/GitHub summaries stay concise.
 
-**Acceptance:**
+**Status:**
 
-- Slack and GitHub summaries no longer imply every workload is a block range.
-- Range-mode summaries still read naturally as block ranges.
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
 
-## Phase 4 - Compatibility Retirement and Contract Guard
+**Acceptance & Validation:**
 
-**Status:** planned
+- [ ] Slack and GitHub summaries no longer imply every workload is a block range.
+- [ ] Range-mode summaries still read naturally as block ranges.
 
-Make the compatibility boundary small and tested.
+**Tests:**
+
+- Slack/GitHub rendering tests for range and selector-mode wording.
+
+### Phase 4: Compatibility Retirement and Contract Guard
+
+**Goal:** Make the compatibility boundary small and tested.
 
 **Scope:**
 
@@ -131,16 +161,33 @@ Make the compatibility boundary small and tested.
   `contrib/stacks-bench/schema/v1.json`.
 - Document the expected upstream schema version in the daemon.
 
-**Acceptance:**
+**Status:**
 
-- Runtime parsing is schema-v1-first.
-- Adding or renaming consumed schema-v1 fields requires updating tests.
-- Compatibility behavior is explicit, not accidental.
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
 
-## Validation
+**Acceptance & Validation:**
 
-- `just build`
-- `just lint`
-- `just test`
-- Host smoke with a schema-v1 `stacks-bench` binary producing range and txid
+- [ ] Runtime parsing is schema-v1-first.
+- [ ] Adding or renaming consumed schema-v1 fields requires updating tests.
+- [ ] Compatibility behavior is explicit, not accidental.
+
+**Tests:**
+
+- Schema/fixture drift guard against upstream `v1.json`.
+- Legacy fallback tests, if retained.
+
+## Final Validation
+
+- [ ] `just build`
+- [ ] `just lint`
+- [ ] `just test`
+- [ ] Host smoke with a schema-v1 `stacks-bench` binary producing range and txid
   runs, plus a calibrated group from v19.
+
+## Follow-Ups
+
+- If storage naming remains legacy, record that as an explicit decision before
+  new schema-v2 work starts.

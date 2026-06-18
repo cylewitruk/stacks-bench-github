@@ -71,12 +71,12 @@ no portal UI, and no attempt to reconstruct progress from human console logs.
 - **Other surfaces degrade simply.** GitHub/check surfaces can show throttled
   latest-progress text without trying to mirror Slack's append transcript.
 
-## Phase 1 - Capture, Tail, and Archive Progress JSONL
+## Phases
 
-**Status:** planned
+### Phase 1: Capture, Tail, and Archive Progress JSONL
 
-Separate machine progress from the serial console and make it available while
-the VM is running.
+**Goal:** Separate machine progress from the serial console and make it
+available while the VM is running.
 
 **Scope:**
 
@@ -86,16 +86,26 @@ the VM is running.
   created startup gaps.
 - Archive raw progress JSONL for forensics.
 
-**Acceptance:**
+**Status:**
 
-- Updated builds produce a live progress file during a run.
-- Older builds with no JSONL behave like today's coarse phase reporting.
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
 
-## Phase 2 - Parser and Worker Events
+**Acceptance & Validation:**
 
-**Status:** planned
+- [ ] Updated builds produce a live progress file during a run.
+- [ ] Older builds with no JSONL behave like today's coarse phase reporting.
 
-Turn raw JSONL lines into typed daemon progress events.
+**Tests:**
+
+- Guest-template tests for stdout/stderr separation.
+- Driver/tailer tests for file-created-late and no-progress-file cases.
+
+### Phase 2: Parser and Worker Events
+
+**Goal:** Turn raw JSONL lines into typed daemon progress events.
 
 **Scope:**
 
@@ -105,18 +115,29 @@ Turn raw JSONL lines into typed daemon progress events.
 - Add a recipe-neutral worker/reporting event carrying phase, progress, optional
   total, optional message, run index, and workflow step.
 
-**Acceptance:**
+**Status:**
 
-- Parser tests cover valid progress, unknown event/version, additive fields,
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
+
+**Acceptance & Validation:**
+
+- [ ] Parser tests cover valid progress, unknown event/version, additive fields,
   missing optional fields, and malformed lines.
-- Driver tests prove progress events are emitted without affecting terminal
+- [ ] Driver tests prove progress events are emitted without affecting terminal
   success/failure handling.
 
-## Phase 3 - Report Surface Rendering
+**Tests:**
 
-**Status:** planned
+- Parser fixtures for schema-v1 progress events.
+- Driver/worker-event tests for recognized and ignored progress lines.
 
-Render progress in Slack and other surfaces without excessive API churn.
+### Phase 3: Report Surface Rendering
+
+**Goal:** Render progress in Slack and other surfaces without excessive API
+churn.
 
 **Scope:**
 
@@ -126,17 +147,27 @@ Render progress in Slack and other surfaces without excessive API churn.
   milestone counts, and human messages where useful.
 - For GitHub/checks, update a throttled latest-progress summary.
 
-**Acceptance:**
+**Status:**
 
-- A long block-range run shows live indexing/warmup/replay progress in Slack.
-- Slack updates remain bounded and readable; no event-per-line spam.
-- A run with no JSONL still shows the existing coarse phase card.
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
 
-## Phase 4 - Calibration and Repeat Validation
+**Acceptance & Validation:**
 
-**Status:** planned
+- [ ] A long block-range run shows live indexing/warmup/replay progress in Slack.
+- [ ] Slack updates remain bounded and readable; no event-per-line spam.
+- [ ] A run with no JSONL still shows the existing coarse phase card.
 
-Validate progress across the v19/v15 workflow shape.
+**Tests:**
+
+- Slack card/timeline tests for coalesced progress details.
+- GitHub/check-surface tests for throttled latest-progress updates.
+
+### Phase 4: Calibration and Repeat Validation
+
+**Goal:** Validate progress across the v19/v15 workflow shape.
 
 **Scope:**
 
@@ -145,14 +176,31 @@ Validate progress across the v19/v15 workflow shape.
   group surface.
 - Confirm progress tailing stops at terminal and archived JSONL is retained.
 
-**Acceptance:**
+**Status:**
 
-- Host smoke: a calibrated two-repeat group displays calibration progress, then
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
+
+**Acceptance & Validation:**
+
+- [ ] Host smoke: a calibrated two-repeat group displays calibration progress, then
   measured-run progress, without duplicate cards or per-repeat fan-out.
 
-## Validation
+**Tests:**
 
-- `just build`
-- `just lint`
-- `just test`
-- Host smoke with an updated `stacks-bench` binary emitting JSONL.
+- End-to-end host smoke with updated `stacks-bench` emitting JSONL.
+
+## Final Validation
+
+- [ ] `just build`
+- [ ] `just lint`
+- [ ] `just test`
+- [ ] Host smoke with an updated `stacks-bench` binary emitting JSONL.
+
+## Follow-Ups
+
+- `0050-stacks-bench-schema-v1-native` should consolidate schema-v1 DTOs once
+  progress and result shapes are both exercised.
+- Portal-style progress history remains out of scope for this iteration.

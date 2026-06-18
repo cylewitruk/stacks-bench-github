@@ -53,7 +53,7 @@ calibrated group DB, carried forward into every measured run VM.
 ## Sources
 
 Implementation should verify the upstream contract against the pinned
-`cylewitruk/feat-stacks-bench` sources:
+`cylewitruk/stacks-core` branch `feat/stacks-bench`:
 
 - `contrib/stacks-bench/schema/` — versioned JSON schema for the
   `baseline_calibration` result envelope.
@@ -95,12 +95,12 @@ change to standalone `stacks-bench` semantics.
 - **Host pinning remains the group boundary.** Calibration, measured runs, and
   carried artifacts must stay on the same host until worker-fleet policy exists.
 
-## Phase 1 - Result Model and Workflow Metadata
+## Phases
 
-**Status:** planned
+### Phase 1: Result Model and Workflow Metadata
 
-Add the daemon-side model for calibration outputs and the persisted metadata that
-later measured runs need.
+**Goal:** Add the daemon-side model for calibration outputs and the persisted
+metadata later measured runs need.
 
 **Scope:**
 
@@ -111,17 +111,27 @@ later measured runs need.
 - Add tests for successful parse, wrong result type/version, missing id, and
   legacy/invalid envelopes.
 
-**Acceptance:**
+**Status:**
 
-- The daemon can parse and persist a calibration id without running a measured
-  benchmark.
-- Bad calibration envelopes fail loudly with useful diagnostics.
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
 
-## Phase 2 - Execute Calibration Before Measured Runs
+**Acceptance & Validation:**
 
-**Status:** planned
+- [ ] The daemon can parse and persist a calibration id without running a
+  measured benchmark.
+- [ ] Bad calibration envelopes fail loudly with useful diagnostics.
 
-Run the calibration command once per benchmark group before run 0.
+**Tests:**
+
+- Parser/unit tests for `baseline_calibration` success and failure envelopes.
+- Store tests for persisted calibration metadata.
+
+### Phase 2: Execute Calibration Before Measured Runs
+
+**Goal:** Run the calibration command once per benchmark group before run 0.
 
 **Scope:**
 
@@ -133,18 +143,29 @@ Run the calibration command once per benchmark group before run 0.
 - Make startup/resume DB-derivable: a group that calibrated successfully but has
   not started measured runs resumes from the persisted calibration state.
 
-**Acceptance:**
+**Status:**
 
-- A two-repeat group runs exactly one calibration step before the measured
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
+
+**Acceptance & Validation:**
+
+- [ ] A two-repeat group runs exactly one calibration step before the measured
   sequence.
-- A calibration failure marks the group failed and enqueues no measured runs.
-- Restarting after calibration but before run 0 resumes the measured sequence.
+- [ ] A calibration failure marks the group failed and enqueues no measured runs.
+- [ ] Restarting after calibration but before run 0 resumes the measured
+  sequence.
 
-## Phase 3 - Inject Baseline ID into Measured Runs
+**Tests:**
 
-**Status:** planned
+- Driver/runner tests for calibration-before-run ordering.
+- Resume tests for calibrated-but-not-started groups.
 
-Thread the saved calibration into every measured benchmark invocation.
+### Phase 3: Inject Baseline ID into Measured Runs
+
+**Goal:** Thread the saved calibration into every measured benchmark invocation.
 
 **Scope:**
 
@@ -154,19 +175,32 @@ Thread the saved calibration into every measured benchmark invocation.
   but not the user-requested workload identity.
 - Treat a measured-run rejection of `--baseline-id` as a group correctness
   failure.
-- Ensure clean repeats still run one VM per repeat and still carry the DB forward.
+- Ensure clean repeats still run one VM per repeat and still carry the DB
+  forward.
 
-**Acceptance:**
+**Status:**
 
-- Every measured run in a calibrated group receives the same `--baseline-id`.
-- No measured run performs inline baseline calibration unless an explicit future
-  policy opts out of shared calibration.
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
 
-## Phase 4 - Reporting and Host Validation
+**Acceptance & Validation:**
 
-**Status:** planned
+- [ ] Every measured run in a calibrated group receives the same
+  `--baseline-id`.
+- [ ] No measured run performs inline baseline calibration unless an explicit
+  future policy opts out of shared calibration.
 
-Make the shared calibration visible without overloading measured-run summaries.
+**Tests:**
+
+- Argument-normalization tests for calibrated measured runs.
+- Group execution tests proving all measured runs receive the stored baseline id.
+
+### Phase 4: Reporting and Host Validation
+
+**Goal:** Make the shared calibration visible without overloading measured-run
+summaries.
 
 **Scope:**
 
@@ -178,21 +212,33 @@ Make the shared calibration visible without overloading measured-run summaries.
   data.
 - Host-smoke with a two-repeat group.
 
-**Acceptance:**
+**Status:**
 
-- Slack/GitHub surfaces show one shared calibration and two measured runs.
-- The group artifact DB contains the calibration row and measured runs linked to
-  that baseline.
-- A host smoke confirms no per-run inline calibration occurs.
+- [ ] Core implementation
+- [ ] Unit/integration tests, if applicable
+- [ ] Reviewed (Codex)
+- [ ] Validated — the acceptance checks below were run
 
-## Validation
+**Acceptance & Validation:**
 
-- `just build`
-- `just lint`
-- `just test`
-- Host smoke: two clean repeats over a known workload produce one calibration,
-  two measured VM runs, one carried group DB, and a final summary that separates
-  calibration from measured workload time.
+- [ ] Slack/GitHub surfaces show one shared calibration and two measured runs.
+- [ ] The group artifact DB contains the calibration row and measured runs linked
+  to that baseline.
+- [ ] A host smoke confirms no per-run inline calibration occurs.
+
+**Tests:**
+
+- Reporting tests for calibration provenance and partial groups.
+- Host smoke: calibrated two-repeat group.
+
+## Final Validation
+
+- [ ] `just build`
+- [ ] `just lint`
+- [ ] `just test`
+- [ ] Host smoke: two clean repeats over a known workload produce one
+  calibration, two measured VM runs, one carried group DB, and a final summary
+  that separates calibration from measured workload time.
 
 ## Follow-Ups
 
