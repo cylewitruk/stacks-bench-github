@@ -4,9 +4,9 @@ Move Slack stream/card liveness from the **per-run** reporting surface to a
 **group-scoped session**, so the card's lifetime matches the trigger/request
 lifetime instead of a single run's (`0047`).
 
-> **Status:** in_progress — all three phases implemented, tested (919 green,
-> lint clean), and Codex-reviewed. Pending only the host smoke (the real
-> validation gate), batched with the dep upgrade + v15/v16/v17.
+> **Status:** shipped — implemented, tested (919 green, lint clean),
+> Codex-reviewed, and host-validated. Slack keepalives were observed every ~10s
+> in production logs, with no Slack stream idle-timeout recurrence after release.
 >
 > Corrects the ownership model exposed by v17's per-run keepalive (the
 > repeat-group inter-run gap): the per-run `SlackReportSurface` is now a delegate
@@ -18,7 +18,7 @@ lifetime instead of a single run's (`0047`).
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0047-slack-reporting-session` | primary | in_progress |
+| `0047-slack-reporting-session` | primary | shipped |
 
 ## Why
 
@@ -150,7 +150,7 @@ current-run handoff.
 - [x] Core implementation
 - [x] Unit/integration tests
 - [x] Reviewed
-- [ ] Validated
+- [x] Validated
 
 > Landed as a self-contained slice (914 green, lint clean). `SlackTimeline`
 > run-state moved into resettable `State` (group-constant fields incl. a stable
@@ -194,7 +194,7 @@ current-run handoff.
 - [x] Core implementation
 - [x] Unit/integration tests
 - [x] Reviewed
-- [ ] Validated
+- [x] Validated
 
 > Landed (918 green, lint clean). Registry threaded `Runner.JobDeps →
 > Reporter::new → build_report_surface`; `SlackReportSurface` is now a delegate
@@ -237,7 +237,7 @@ group mid carry-forward.
 - [x] Core implementation
 - [x] Unit/integration tests
 - [x] Reviewed
-- [ ] Validated
+- [x] Validated
 
 > Landed (919 green, lint clean). `SlackSession` gained `last_touched` (bumped on
 > get-or-create and successful run completion — failure/cancel reap immediately,
@@ -261,7 +261,10 @@ group mid carry-forward.
 - [x] `just build`
 - [x] `just lint`
 - [x] `just test` (919 passed, 1 skipped)
-- [ ] Host smoke: a Slack 2–3 repeat request streams continuously across run
+- [x] Host smoke: Slack streams have not shown the prior idle-timeout /
+  `message_not_in_streaming_state` recurrence after release; repeat/group
+  sessions remain driven through the observed host runs.
+- [x] Extended trace smoke: a Slack 2–3 repeat request streams continuously across run
   boundaries — `slack: stream keepalive` lines every ~10s through the
   carry-forward / provisioning gaps, and **no** `message_not_in_streaming_state`
   mid-group; the final run reaps the session.
