@@ -4,8 +4,8 @@ Add a group-scoped `stacks-bench` calibration step before measured benchmark
 runs, so clean repeats and future multi-variant groups reuse one baseline
 calibration instead of recalibrating inside every VM (`0041`).
 
-> **Status:** in_progress - core implementation reviewed; host validation
-> pending.
+> **Status:** in_progress - core implementation reviewed; host smoke partially
+> validated.
 >
 > This iteration deliberately comes before JSONL progress (`0027`): calibration
 > changes the benchmark workflow shape, while progress reporting can observe the
@@ -119,7 +119,7 @@ metadata later measured runs need.
 - [x] Core implementation
 - [x] Unit/integration tests, if applicable
 - [x] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
@@ -150,11 +150,11 @@ metadata later measured runs need.
 - [x] Core implementation
 - [x] Unit/integration tests, if applicable
 - [x] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] A two-repeat group runs exactly one calibration step before the measured
+- [x] A two-repeat group runs exactly one calibration step before the measured
   sequence.
 - [ ] A calibration failure marks the group failed and enqueues no measured runs.
 
@@ -183,13 +183,13 @@ metadata later measured runs need.
 - [x] Core implementation
 - [x] Unit/integration tests, if applicable
 - [x] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
 - [x] Every measured run in a calibrated group receives the same
   `--baseline-id`.
-- [ ] No measured run performs inline baseline calibration unless an explicit
+- [x] No measured run performs inline baseline calibration unless an explicit
   future policy opts out of shared calibration.
 
 **Tests:**
@@ -217,14 +217,14 @@ summaries.
 - [x] Core implementation
 - [x] Unit/integration tests, if applicable
 - [x] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [ ] Validated — host smoke partially run; DB/reporting acceptance remains open
 
 **Acceptance & Validation:**
 
 - [ ] Slack/GitHub surfaces show one shared calibration and two measured runs.
 - [ ] The group artifact DB contains the calibration row and measured runs linked
   to that baseline.
-- [ ] A host smoke confirms no per-run inline calibration occurs.
+- [x] A host smoke confirms no per-run inline calibration occurs.
 
 **Tests:**
 

@@ -38,6 +38,7 @@ phase "calibrating"
     --db "$RESULTS" \
     bench baseline calibrate \
     --source "$SBGH_SOURCE_DIR" \
+    --dangerous-no-chainstate-copy \
     > "$RESULTS/calibration.json" \
     || die "stacks-bench baseline calibration exited non-zero"
 

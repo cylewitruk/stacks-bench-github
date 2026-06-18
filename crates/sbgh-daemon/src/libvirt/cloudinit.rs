@@ -346,6 +346,7 @@ mod tests {
         let run = render_bench_user_data(&common, &bench);
 
         assert!(calibrate.contains("bench baseline calibrate"));
+        assert!(calibrate.contains("--dangerous-no-chainstate-copy"));
         assert!(calibrate.contains("calibration.json"));
         assert!(run.contains("SHARED_BASELINE_CALIBRATION=\"true\""));
         assert!(run.contains("BASELINE_ID=\"12\""));
