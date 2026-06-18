@@ -858,7 +858,7 @@ fn task_output_event(stage: usize, title: &str, output: String) -> StreamChunk {
 pub fn stage_for_phase(label: &str) -> Option<usize> {
     match label {
         "starting" | "building" => Some(1),
-        "build_done" | "running" => Some(2),
+        "build_done" | "calibrating" | "running" => Some(2),
         "collecting" => Some(3),
         _ => None,
     }
@@ -1108,6 +1108,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
             commit: "abcdef1234567890".into(),
@@ -1824,6 +1825,7 @@ mod tests {
         assert_eq!(stage_for_phase("starting"), Some(1));
         assert_eq!(stage_for_phase("building"), Some(1));
         assert_eq!(stage_for_phase("build_done"), Some(2));
+        assert_eq!(stage_for_phase("calibrating"), Some(2));
         assert_eq!(stage_for_phase("running"), Some(2));
         assert_eq!(stage_for_phase("collecting"), Some(3));
         assert_eq!(stage_for_phase("done"), None);

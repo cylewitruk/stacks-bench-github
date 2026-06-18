@@ -97,6 +97,19 @@ impl ResultsTmpfs {
         self.mount_dir
             .join("run.json")
     }
+
+    /// JSON stdout from `stacks-bench bench baseline calibrate --json`.
+    pub fn calibration_json(&self) -> PathBuf {
+        self.mount_dir
+            .join("calibration.json")
+    }
+
+    /// Small handoff file written by the calibration phase and read by the
+    /// measured run phase in the same repeat-group job.
+    pub fn baseline_id_file(&self) -> PathBuf {
+        self.mount_dir
+            .join("baseline-id")
+    }
 }
 
 #[cfg(test)]

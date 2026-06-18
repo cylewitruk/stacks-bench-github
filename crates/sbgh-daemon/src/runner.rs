@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
-use sbgh_core::models::{BuildTarget, TaskKind};
+use sbgh_core::models::{BuildTarget, TaskKind, uses_shared_calibration};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -1140,6 +1140,8 @@ impl JobDeps {
                     job.bench_args.clone(),
                     vcpu_cpuset,
                     sqlite_seed_key_for(&job),
+                    job_should_carry_sqlite(&job),
+                    job.baseline_calibration_id,
                 );
                 run_worker(&recipe, &job, prepared_rx, events_tx, token).await
             }
@@ -1319,9 +1321,7 @@ fn group_sqlite_key(artifact_prefix: &str) -> String {
 }
 
 fn job_should_carry_sqlite(job: &RunnableJob) -> bool {
-    job.task_kind == TaskKind::Benchmark
-        && job.build_target == BuildTarget::StacksBench
-        && job.requested_run_count > 1
+    uses_shared_calibration(job.task_kind, job.build_target, job.requested_run_count)
 }
 
 fn job_is_final_repeat(job: &RunnableJob) -> bool {
@@ -1885,6 +1885,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            baseline_calibration_id: None,
             group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(), // pre-resolved → preflight is a no-op
@@ -1947,6 +1948,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            baseline_calibration_id: None,
             group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(), // pre-resolved → preflight is a no-op
@@ -1993,6 +1995,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            baseline_calibration_id: None,
             group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(),
@@ -2057,6 +2060,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            baseline_calibration_id: None,
             group_artifact_prefix: "group-b".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(),
@@ -2117,6 +2121,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            baseline_calibration_id: None,
             group_artifact_prefix: "group-failed".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(),
@@ -2168,6 +2173,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            baseline_calibration_id: None,
             group_artifact_prefix: "group-missing".into(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(),
@@ -2313,6 +2319,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
             commit: String::new(), // unresolved — a tag job
@@ -2382,6 +2389,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
             commit: String::new(), // unresolved — a Slack ad-hoc job
@@ -2469,6 +2477,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "acme/widgets".into(),
             commit: commit.into(),
@@ -2990,7 +2999,7 @@ mod tests {
         let shell = Arc::new(RecordingShell::new());
         shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
         let driver: Arc<dyn Driver> = Arc::new(LibvirtDriver::new(config, shell));
-        let recipe = BenchRecipe::new(driver, vec![], None, None);
+        let recipe = BenchRecipe::new(driver, vec![], None, None, false, None);
         let job = RunnableJob {
             progress: ProgressTarget::CommitCheck { check_run_id: None },
             ..pr_job("abc123", None)
@@ -3190,6 +3199,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             progress: ProgressTarget::CommitCheck { check_run_id: Some(555) },
             ..pr_job("abc123", None)

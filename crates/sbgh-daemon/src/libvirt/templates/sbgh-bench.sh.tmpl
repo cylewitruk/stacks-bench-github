@@ -32,6 +32,8 @@ RESULTS="{{ results_mount }}"
 SHARE_TAG="{{ results_share_tag }}"
 
 read -r -a EXTRA_ARGS <<<"{{ stacks_bench_args }}"
+BASELINE_ID="{{ baseline_calibration_id }}"
+SHARED_BASELINE_CALIBRATION="{{ shared_baseline_calibration }}"
 
 PHASE_LOG="$RESULTS/.phase-log"
 phase()  { printf '%s %s\n' "$(date +%s)" "$1" >> "$PHASE_LOG"; sync; }
@@ -84,6 +86,16 @@ SBGH_SOURCE_DIR=$(find "$CHAIN" -maxdepth 3 -mindepth 1 -name chainstate -type d
 # bench-spans-only, etc.) from [stacks_bench].default_args or per-PR
 # `/benchmark` overrides.
 cd "$SRC"
+if [[ "$SHARED_BASELINE_CALIBRATION" == "true" ]]; then
+    if [[ -z "$BASELINE_ID" ]]; then
+        [[ -s "$RESULTS/baseline-id" ]] \
+            || die "shared calibration requested but baseline-id handoff is missing"
+        BASELINE_ID=$(<"$RESULTS/baseline-id")
+    fi
+    [[ "$BASELINE_ID" =~ ^[0-9]+$ ]] \
+        || die "shared calibration produced invalid baseline id: $BASELINE_ID"
+    EXTRA_ARGS+=(--baseline-id "$BASELINE_ID")
+fi
 phase "running"
 ./target/release/stacks-bench \
     --json \

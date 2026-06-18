@@ -42,6 +42,8 @@ pub struct CloudInitCommon<'a> {
 /// user-controlled field — it's substituted into the run command verbatim.
 pub struct BenchPhaseParams<'a> {
     pub stacks_bench_args: &'a str,
+    pub shared_baseline_calibration: bool,
+    pub baseline_calibration_id: Option<i64>,
 }
 
 /// Both rendered NoCloud ISOs, paths relative to the per-job dir.
@@ -49,10 +51,12 @@ pub struct BenchPhaseParams<'a> {
 /// build / bench VM lifecycles.
 pub struct CloudInitArtifacts {
     pub build_iso_path: PathBuf,
+    pub calibrate_iso_path: Option<PathBuf>,
     pub bench_iso_path: PathBuf,
 }
 
 const BUILD_SCRIPT: &str = include_str!("templates/sbgh-build.sh.tmpl");
+const CALIBRATE_SCRIPT: &str = include_str!("templates/sbgh-calibrate.sh.tmpl");
 const BENCH_SCRIPT: &str = include_str!("templates/sbgh-bench.sh.tmpl");
 
 impl CloudInitArtifacts {
@@ -72,6 +76,25 @@ impl CloudInitArtifacts {
             &meta_data_for_phase(common.job_id, "build"),
         )
         .await?;
+        let calibrate_iso = if bench.shared_baseline_calibration
+            && bench
+                .baseline_calibration_id
+                .is_none()
+        {
+            Some(
+                pack_iso(
+                    shell,
+                    paths,
+                    job_dir,
+                    "calibrate",
+                    &render_calibrate_user_data(common),
+                    &meta_data_for_phase(common.job_id, "calibrate"),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let bench_iso = pack_iso(
             shell,
             paths,
@@ -83,6 +106,7 @@ impl CloudInitArtifacts {
         .await?;
         Ok(Self {
             build_iso_path: build_iso,
+            calibrate_iso_path: calibrate_iso,
             bench_iso_path: bench_iso,
         })
     }
@@ -153,8 +177,27 @@ fn render_bench_user_data(c: &CloudInitCommon<'_>, b: &BenchPhaseParams<'_>) -> 
         .replace("{{ chainstate_mount }}", c.chainstate_mount)
         .replace("{{ results_share_tag }}", c.results_share_tag)
         .replace("{{ results_mount }}", c.results_mount)
-        .replace("{{ stacks_bench_args }}", b.stacks_bench_args);
+        .replace("{{ stacks_bench_args }}", b.stacks_bench_args)
+        .replace(
+            "{{ shared_baseline_calibration }}",
+            if b.shared_baseline_calibration { "true" } else { "false" },
+        )
+        .replace(
+            "{{ baseline_calibration_id }}",
+            &b.baseline_calibration_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        );
     wrap_in_cloud_config(&script, "sbgh-bench.sh")
+}
+
+fn render_calibrate_user_data(c: &CloudInitCommon<'_>) -> String {
+    let script = CALIBRATE_SCRIPT
+        .replace("{{ source_mount }}", c.source_mount)
+        .replace("{{ chainstate_mount }}", c.chainstate_mount)
+        .replace("{{ results_share_tag }}", c.results_share_tag)
+        .replace("{{ results_mount }}", c.results_mount);
+    wrap_in_cloud_config(&script, "sbgh-calibrate.sh")
 }
 
 /// Wrap a bash script in the cloud-config YAML envelope cloud-init
@@ -217,7 +260,11 @@ mod tests {
     }
 
     fn sample_bench<'a>() -> BenchPhaseParams<'a> {
-        BenchPhaseParams { stacks_bench_args: "--iters 5" }
+        BenchPhaseParams {
+            stacks_bench_args: "--iters 5",
+            shared_baseline_calibration: false,
+            baseline_calibration_id: None,
+        }
     }
 
     #[tokio::test]
@@ -236,6 +283,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(arts.build_iso_path, job_dir.join("cidata.build.iso"));
+        assert_eq!(arts.calibrate_iso_path, None);
         assert_eq!(arts.bench_iso_path, job_dir.join("cidata.bench.iso"));
 
         // Per-phase user-data and meta-data should both land on disk.
@@ -257,6 +305,7 @@ mod tests {
         assert!(bench_user.contains("sbgh-bench.sh"));
         assert!(bench_user.contains("stacks-bench"));
         assert!(bench_user.contains("--iters 5"));
+        assert!(bench_user.contains("SHARED_BASELINE_CALIBRATION=\"false\""));
         assert!(!bench_user.contains("phase \"build_done\""));
 
         // cloud-localds invoked twice.
@@ -284,5 +333,22 @@ mod tests {
         assert!(!s.contains("{{"), "unsubstituted placeholder in bench script: {s}");
         assert!(s.contains("--iters 5"));
         assert!(s.contains("power_state"));
+    }
+
+    #[test]
+    fn repeat_run_renders_calibration_handoff() {
+        let common = sample_common();
+        let mut bench = sample_bench();
+        bench.shared_baseline_calibration = true;
+        bench.baseline_calibration_id = Some(12);
+
+        let calibrate = render_calibrate_user_data(&common);
+        let run = render_bench_user_data(&common, &bench);
+
+        assert!(calibrate.contains("bench baseline calibrate"));
+        assert!(calibrate.contains("calibration.json"));
+        assert!(run.contains("SHARED_BASELINE_CALIBRATION=\"true\""));
+        assert!(run.contains("BASELINE_ID=\"12\""));
+        assert!(run.contains("--baseline-id"));
     }
 }

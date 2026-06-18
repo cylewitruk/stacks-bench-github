@@ -1001,11 +1001,24 @@ async fn complete_job_writes_status_result_metric_and_event_atomically() {
                 created_at: chrono::Utc::now(),
             },
             metric: Some(sample_metric(job_id)),
+            baseline_calibration_id: Some(42),
             event_detail: Some(serde_json::json!({"finish_reason": "phase_done"})),
         })
         .await
         .unwrap();
     assert!(ok);
+
+    let calibration_id: Option<i64> = sqlx::query_scalar(
+        "SELECT s.baseline_calibration_id
+           FROM benchmark_spec s
+           JOIN job j ON j.benchmark_spec_id = s.id
+          WHERE j.id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(calibration_id, Some(42));
 
     let row = store
         .lookup_job(job_id)
@@ -1058,6 +1071,7 @@ async fn complete_job_with_stale_claim_is_noop() {
                 created_at: chrono::Utc::now(),
             },
             metric: None,
+            baseline_calibration_id: None,
             event_detail: None,
         })
         .await

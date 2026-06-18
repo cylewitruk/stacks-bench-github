@@ -18,7 +18,7 @@ use crate::models::{
     BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, GithubPullRequestJob, GithubUserJob,
     GithubWebhookJob, Job, JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric,
     JobResult, JobStatus, NewJob, NewJobEvent, QueuedEventDetail, ResolvedCommit, TaskKind,
-    TerminalJobStatus,
+    TerminalJobStatus, uses_shared_calibration,
 };
 
 #[derive(Clone)]
@@ -91,7 +91,7 @@ impl PostgresJobStore {
         .execute(&mut **tx)
         .await?;
 
-        if new.axes.task_kind != TaskKind::BuildOnly {
+        if uses_shared_calibration(new.axes.task_kind, new.axes.build_target, requested_run_count) {
             sqlx::query(
                 r#"
                 INSERT INTO benchmark_workflow_step
@@ -100,6 +100,32 @@ impl PostgresJobStore {
                 "#,
             )
             .bind(group_id)
+            .bind(BenchmarkStepKind::Calibrate)
+            .bind(spec_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        if new.axes.task_kind != TaskKind::BuildOnly {
+            sqlx::query(
+                r#"
+                INSERT INTO benchmark_workflow_step
+                    (benchmark_group_id, step_index, step_kind, benchmark_spec_id)
+                VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(group_id)
+            .bind(
+                if uses_shared_calibration(
+                    new.axes.task_kind,
+                    new.axes.build_target,
+                    requested_run_count,
+                ) {
+                    2
+                } else {
+                    1
+                },
+            )
             .bind(BenchmarkStepKind::Run)
             .bind(spec_id)
             .execute(&mut **tx)
@@ -706,6 +732,7 @@ impl JobStore for PostgresJobStore {
         let row = sqlx::query_as::<_, BenchmarkSpec>(
             r#"
             SELECT id, benchmark_group_id, spec_index, requested_run_count,
+                   baseline_calibration_id,
                    github_repo_id, task_kind, build_target, git_ref_kind,
                    git_ref_display, git_commit_hash, git_committed_at,
                    workload_key, created_at, updated_at
@@ -916,6 +943,23 @@ impl JobStore for PostgresJobStore {
             .bind(m.write_length)
             .bind(m.measured_blocks)
             .bind(m.warmup_blocks)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if let Some(calibration_id) = completion.baseline_calibration_id {
+            sqlx::query(
+                r#"
+                UPDATE benchmark_spec spec
+                   SET baseline_calibration_id = $2,
+                       updated_at = NOW()
+                  FROM job j
+                 WHERE spec.id = j.benchmark_spec_id
+                   AND j.id = $1
+                "#,
+            )
+            .bind(completion.job_id)
+            .bind(calibration_id)
             .execute(&mut *tx)
             .await?;
         }

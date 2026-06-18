@@ -41,6 +41,10 @@ pub struct TaskSpec {
     /// before the in-VM task starts. Used by v15 clean repetitions; ordinary
     /// singleton runs leave this unset.
     pub sqlite_seed_key: Option<String>,
+    /// v19: repeat groups calibrate once, then measured runs consume the saved
+    /// stacks-bench baseline id with `--baseline-id`.
+    pub shared_baseline_calibration: bool,
+    pub baseline_calibration_id: Option<i64>,
 }
 
 /// A backend-interpreted placement hint. Today the only knob is CPU pinning

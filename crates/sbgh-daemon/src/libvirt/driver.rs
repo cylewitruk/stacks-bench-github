@@ -28,6 +28,7 @@ use sbgh_core::config::DaemonConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::artifact_store::{artifact_key, build_store_or_local};
+use crate::bench_summary::BaselineCalibrationResult;
 use crate::binary_cache::{self, BinaryCache, BuildFingerprint, CacheEnvironment};
 use crate::driver::{Driver, DriverOutcome, DriverStatus, Placement, TaskSpec};
 use crate::events::{EventSink, PhaseLabel};
@@ -247,6 +248,8 @@ struct RunInputs<'a> {
     commit: &'a str,
     bench_args: &'a [String],
     sqlite_seed_key: Option<&'a str>,
+    shared_baseline_calibration: bool,
+    baseline_calibration_id: Option<i64>,
     /// v10 (0005): build-only mode — stop after the build VM publishes the
     /// artifact; skip the bench phase entirely.
     build_only: bool,
@@ -299,6 +302,8 @@ impl LibvirtDriver {
             sqlite_seed_key: spec
                 .sqlite_seed_key
                 .as_deref(),
+            shared_baseline_calibration: spec.shared_baseline_calibration,
+            baseline_calibration_id: spec.baseline_calibration_id,
             build_only: spec.build_only,
         };
 
@@ -387,6 +392,21 @@ impl LibvirtDriver {
         };
         let run_json_archived_path = run_json_size_bytes.map(|_| run_json_key);
 
+        let calibration_json_key = artifact_key(&job_id, forensics::CALIBRATION_JSON_RELATIVE);
+        let calibration_json_size_bytes = match tmpfs {
+            Some(t) => {
+                store
+                    .put(&calibration_json_key, &t.calibration_json())
+                    .await
+            }
+            None => None,
+        };
+        let calibration_json_archived_path =
+            calibration_json_size_bytes.map(|_| calibration_json_key);
+        let baseline_calibration_id = inputs
+            .baseline_calibration_id
+            .or_else(|| tmpfs.and_then(baseline_calibration_id_from_tmpfs));
+
         // Chown the serial console log to sbgh before we try to read it.
         // libvirt-qemu creates this file as itself (typically
         // libvirt-qemu:libvirt-qemu mode 0600), so a plain open from
@@ -450,6 +470,9 @@ impl LibvirtDriver {
             "binary_size_bytes": binary_size_bytes,
             "run_json_archived_path": run_json_archived_path,
             "run_json_size_bytes": run_json_size_bytes,
+            "calibration_json_archived_path": calibration_json_archived_path,
+            "calibration_json_size_bytes": calibration_json_size_bytes,
+            "baseline_calibration_id": baseline_calibration_id,
             "phase_log_archived_path": phase_log_archived_path,
             "phase_log_size_bytes": phase_log_size_bytes,
         });
@@ -458,7 +481,12 @@ impl LibvirtDriver {
         // without the script having written `done` first means the VM died
         // mid-flight — kernel panic, cloud-init failure, manual `virsh
         // destroy`, etc. Treat as failure but keep the forensics blob.
+        let missing_shared_calibration =
+            inputs.shared_baseline_calibration && baseline_calibration_id.is_none();
         let status = match inner_result {
+            _ if missing_shared_calibration => OutcomeStatus::Failed(
+                "shared baseline calibration did not produce a baseline id".into(),
+            ),
             Ok(FinishReason::PhaseDone) => OutcomeStatus::Ok,
             Ok(FinishReason::ShutOff) => OutcomeStatus::Failed(format!(
                 "VM powered off before reporting phase=done (last_phase={})",
@@ -567,6 +595,40 @@ impl LibvirtDriver {
                 "build-only job produced no cached artifact (the binary cache is disabled, the \
                  build produced no binary, or publishing failed)"
             );
+        }
+
+        if let Some(calibrate_iso_path) = cidata
+            .calibrate_iso_path
+            .as_ref()
+        {
+            let calibrate_reason = self
+                .run_phase(
+                    "calibrate",
+                    PollMode::Bench,
+                    self.config.vm.bench_vcpus,
+                    self.config
+                        .vm
+                        .bench_memory
+                        .as_bytes(),
+                    calibrate_iso_path,
+                    job_dir,
+                    domain_name,
+                    arts,
+                    listener,
+                    cancel,
+                    vcpu_cpuset,
+                )
+                .await?;
+            match calibrate_reason {
+                FinishReason::PhaseDone => {}
+                other => return Ok(other),
+            }
+        } else if inputs.shared_baseline_calibration
+            && inputs
+                .baseline_calibration_id
+                .is_none()
+        {
+            anyhow::bail!("shared baseline calibration requested without calibration phase or id");
         }
 
         // ── phase 2: bench VM ─────────────────────────────────────────
@@ -848,6 +910,8 @@ impl LibvirtDriver {
             },
             &BenchPhaseParams {
                 stacks_bench_args: &stacks_bench_args,
+                shared_baseline_calibration: inputs.shared_baseline_calibration,
+                baseline_calibration_id: inputs.baseline_calibration_id,
             },
         )
         .await?;
@@ -1333,6 +1397,18 @@ impl LibvirtDriver {
     }
 }
 
+fn baseline_calibration_id_from_tmpfs(tmpfs: &ResultsTmpfs) -> Option<i64> {
+    let from_json = std::fs::read(tmpfs.calibration_json())
+        .ok()
+        .and_then(|bytes| BaselineCalibrationResult::from_bytes(&bytes))
+        .and_then(|result| result.calibration_id());
+    from_json.or_else(|| {
+        std::fs::read_to_string(tmpfs.baseline_id_file())
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+    })
+}
+
 /// Bridges the libvirt driver's `Phase` callbacks to recipe-neutral
 /// [`EventSink`] calls. The `Phase` → [`PhaseLabel`] mapping lives here so the
 /// driver speaks the neutral event surface — roadmap-v8 Phase 1 moved this
@@ -1799,6 +1875,25 @@ mod tests {
         assert_eq!(std::fs::read(tmpfs.sqlite_file()).unwrap(), b"group sqlite");
     }
 
+    #[test]
+    fn baseline_calibration_id_reads_json_or_handoff_file() {
+        let tmp = TempDir::new().unwrap();
+        let tmpfs = ResultsTmpfs {
+            mount_dir: tmp.path().to_path_buf(),
+            size_mib: 64,
+        };
+        std::fs::write(
+            tmpfs.calibration_json(),
+            br#"{"schema_version":1,"success":true,"result_type":"baseline_calibration","result_version":1,"result":{"calibration_id":12}}"#,
+        )
+        .unwrap();
+        assert_eq!(baseline_calibration_id_from_tmpfs(&tmpfs), Some(12));
+
+        std::fs::remove_file(tmpfs.calibration_json()).unwrap();
+        std::fs::write(tmpfs.baseline_id_file(), "13\n").unwrap();
+        assert_eq!(baseline_calibration_id_from_tmpfs(&tmpfs), Some(13));
+    }
+
     fn test_config(tmp: &TempDir) -> DaemonConfig {
         let p = tmp.path();
         DaemonConfig {
@@ -1873,6 +1968,8 @@ mod tests {
             args,
             build_only,
             sqlite_seed_key: None,
+            shared_baseline_calibration: false,
+            baseline_calibration_id: None,
         }
     }
 
@@ -1883,6 +1980,7 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "acme/widgets".into(),
             commit: "abc123def456".into(),

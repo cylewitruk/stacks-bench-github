@@ -95,6 +95,9 @@ pub struct RunnableJob {
     pub benchmark_run_index: i32,
     /// Requested isolated run count for this spec. Singleton jobs store 1.
     pub requested_run_count: i32,
+    /// Shared stacks-bench baseline calibration id for repeat groups, once run
+    /// 0 has produced it.
+    pub baseline_calibration_id: Option<i64>,
     /// Group-scoped artifact prefix. Repeat runs use it for the carried SQLite
     /// DB.
     pub group_artifact_prefix: String,
@@ -382,6 +385,7 @@ impl RunnableJobStore for JobSource {
                 claim_token,
                 result,
                 metric,
+                baseline_calibration_id: baseline_calibration_id(summary),
                 event_detail: Some(summary.clone()),
             })
             .await?;
@@ -717,6 +721,7 @@ impl JobSource {
             benchmark_spec_id: job.benchmark_spec_id,
             benchmark_run_index: job.benchmark_run_index,
             requested_run_count: spec.requested_run_count,
+            baseline_calibration_id: spec.baseline_calibration_id,
             group_artifact_prefix: group.artifact_prefix,
             repository: format!("{}/{}", repo.owner, repo.name),
             commit: job
@@ -780,6 +785,12 @@ fn archive_dir(summary: &serde_json::Value) -> Option<String> {
         .get("archive_dir")
         .and_then(|v| v.as_str())
         .map(String::from)
+}
+
+fn baseline_calibration_id(summary: &serde_json::Value) -> Option<i64> {
+    summary
+        .get("baseline_calibration_id")
+        .and_then(|v| v.as_i64())
 }
 
 /// Map a parsed `run.json` to the typed `job_metric` row. Returns `None`

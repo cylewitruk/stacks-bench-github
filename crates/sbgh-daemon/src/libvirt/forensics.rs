@@ -24,6 +24,7 @@ const CONSOLE_TAIL_BYTES: usize = 64 * 1024;
 ///   ├── appdata/
 ///   │   └── stacks-bench.db  ← preserves stacks-bench's own --db layout
 ///   ├── run.json             ← raw JSON output from `bench run --json`
+///   ├── calibration.json     ← raw JSON output from shared calibration
 ///   └── phase.log            ← in-VM phase journal (timestamped)
 /// ```
 ///
@@ -35,6 +36,7 @@ const CONSOLE_TAIL_BYTES: usize = 64 * 1024;
 pub const SQLITE_RELATIVE: &str = "appdata/stacks-bench.db";
 pub const BINARY_RELATIVE: &str = "stacks-bench";
 pub const RUN_JSON_RELATIVE: &str = "run.json";
+pub const CALIBRATION_JSON_RELATIVE: &str = "calibration.json";
 pub const PHASE_LOG_RELATIVE: &str = "phase.log";
 
 /// Read the last `max_bytes` of a text file. Returns `None` if the file

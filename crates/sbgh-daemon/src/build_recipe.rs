@@ -64,6 +64,8 @@ impl Recipe for BuildOnlyRecipe {
             args: Vec::new(),
             build_only: true,
             sqlite_seed_key: None,
+            shared_baseline_calibration: false,
+            baseline_calibration_id: None,
         };
         let placement = Placement {
             vcpu_cpuset: self.vcpu_cpuset.clone(),

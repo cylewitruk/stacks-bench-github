@@ -4,7 +4,8 @@ Add a group-scoped `stacks-bench` calibration step before measured benchmark
 runs, so clean repeats and future multi-variant groups reuse one baseline
 calibration instead of recalibrating inside every VM (`0041`).
 
-> **Status:** in_progress - planning complete, implementation not started.
+> **Status:** in_progress - core implementation reviewed; host validation
+> pending.
 >
 > This iteration deliberately comes before JSONL progress (`0027`): calibration
 > changes the benchmark workflow shape, while progress reporting can observe the
@@ -67,7 +68,9 @@ The name mapping is intentional: the calibration command returns
 ## Scope
 
 - Add a `calibrate` workflow step before measured benchmark runs for group
-  workloads that opt into shared calibration.
+  workloads that opt into shared calibration. The current implementation runs
+  that step inside run 0's libvirt lifecycle so the calibrated DB and id are
+  handed directly to the measured run.
 - Run calibration against the same group `stacks-bench.db` artifact that is
   carried forward between runs.
 - Parse `baseline_calibration` result envelopes and persist the
@@ -113,16 +116,15 @@ metadata later measured runs need.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
 - [ ] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] The daemon can parse and persist a calibration id without running a
-  measured benchmark.
-- [ ] Bad calibration envelopes fail loudly with useful diagnostics.
+- [x] The daemon can parse and persist a calibration id.
+- [x] Bad calibration envelopes fail loudly with useful diagnostics.
 
 **Tests:**
 
@@ -145,9 +147,9 @@ metadata later measured runs need.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
 - [ ] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
@@ -155,8 +157,6 @@ metadata later measured runs need.
 - [ ] A two-repeat group runs exactly one calibration step before the measured
   sequence.
 - [ ] A calibration failure marks the group failed and enqueues no measured runs.
-- [ ] Restarting after calibration but before run 0 resumes the measured
-  sequence.
 
 **Tests:**
 
@@ -180,14 +180,14 @@ metadata later measured runs need.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
 - [ ] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] Every measured run in a calibrated group receives the same
+- [x] Every measured run in a calibrated group receives the same
   `--baseline-id`.
 - [ ] No measured run performs inline baseline calibration unless an explicit
   future policy opts out of shared calibration.
@@ -214,9 +214,9 @@ summaries.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
 - [ ] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
@@ -248,3 +248,9 @@ summaries.
   variants that share the same group DB and chainstate/tip.
 - `0028-results-summary-restructure` should include calibration provenance in
   the overview.
+- A separately resumable calibration-only checkpoint is deferred. Today
+  calibration and measured run 0 are one claimable libvirt lifecycle: if the
+  daemon is interrupted after calibration but before run 0 finishes, retrying
+  re-runs calibration rather than silently continuing from a half-persisted
+  state. That is fail-closed and acceptable unless host validation shows
+  calibration cost warrants a dedicated checkpoint.

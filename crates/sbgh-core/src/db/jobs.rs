@@ -57,6 +57,9 @@ pub struct JobCompletion {
     pub claim_token: Uuid,
     pub result: JobResult,
     pub metric: Option<JobMetric>,
+    /// v19: shared stacks-bench baseline calibration id to persist on the
+    /// benchmark spec in the same transaction as run completion.
+    pub baseline_calibration_id: Option<i64>,
     /// `completed` event provenance (forensics summary blob).
     pub event_detail: Option<serde_json::Value>,
 }

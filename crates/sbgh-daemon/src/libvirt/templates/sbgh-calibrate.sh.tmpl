@@ -1,0 +1,61 @@
+#!/bin/bash
+# In-VM cloud-init script for a shared benchmark-group baseline calibration.
+# Runs after the build/cache phase and before the measured benchmark run.
+
+set -euo pipefail
+
+SRC="{{ source_mount }}"
+CHAIN="{{ chainstate_mount }}"
+RESULTS="{{ results_mount }}"
+SHARE_TAG="{{ results_share_tag }}"
+
+PHASE_LOG="$RESULTS/.phase-log"
+phase()  { printf '%s %s\n' "$(date +%s)" "$1" >> "$PHASE_LOG"; sync; }
+die()    { phase "error"; echo "ERROR: $*" >&2; exit 1; }
+
+mkdir -p "$RESULTS"
+mount -t virtiofs "$SHARE_TAG" "$RESULTS" || die "failed to mount virtio-fs $SHARE_TAG"
+phase "starting"
+
+mkdir -p "$SRC"
+mount /dev/disk/by-label/sbgh-src "$SRC" || die "failed to mount source disk"
+
+mkdir -p "$CHAIN"
+mount -t xfs /dev/vdb "$CHAIN" || die "failed to mount chainstate xfs"
+
+PROBE="$CHAIN/.sbgh-write-probe"
+touch "$PROBE" 2>/dev/null \
+    || die "chainstate mount at $CHAIN is read-only — check LVM snapshot, domain XML, and mount opts"
+rm -f "$PROBE"
+
+SBGH_SOURCE_DIR=$(find "$CHAIN" -maxdepth 3 -mindepth 1 -name chainstate -type d -printf '%h\n' 2>/dev/null | head -1)
+[[ -n "$SBGH_SOURCE_DIR" ]] || die "couldn't locate chainstate/ under $CHAIN"
+
+cd "$SRC"
+phase "calibrating"
+./target/release/stacks-bench \
+    --json \
+    --db "$RESULTS" \
+    bench baseline calibrate \
+    --source "$SBGH_SOURCE_DIR" \
+    > "$RESULTS/calibration.json" \
+    || die "stacks-bench baseline calibration exited non-zero"
+
+if ! python3 - "$RESULTS/calibration.json" "$RESULTS/baseline-id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    envelope = json.load(fh)
+result = envelope.get("result") or {}
+calibration_id = result.get("calibration_id")
+if not isinstance(calibration_id, int):
+    raise SystemExit("missing integer result.calibration_id")
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    fh.write(f"{calibration_id}\n")
+PY
+then
+    die "failed to extract calibration_id from calibration.json"
+fi
+
+phase "done"

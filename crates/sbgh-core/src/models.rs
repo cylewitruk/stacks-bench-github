@@ -487,6 +487,9 @@ pub struct BenchmarkSpec {
     /// Singleton jobs store `1`; repeat groups store the requested count and
     /// lazily enqueue run rows in `benchmark_run_index` order.
     pub requested_run_count: i32,
+    /// v19: baseline calibration id produced by `stacks-bench bench baseline
+    /// calibrate` and reused by all measured repeat runs in this spec.
+    pub baseline_calibration_id: Option<i64>,
     pub github_repo_id: i64,
     pub task_kind: TaskKind,
     pub build_target: BuildTarget,
@@ -497,6 +500,22 @@ pub struct BenchmarkSpec {
     pub workload_key: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl BenchmarkSpec {
+    pub fn uses_shared_calibration(&self) -> bool {
+        uses_shared_calibration(self.task_kind, self.build_target, self.requested_run_count)
+    }
+}
+
+pub fn uses_shared_calibration(
+    task_kind: TaskKind,
+    build_target: BuildTarget,
+    requested_run_count: i32,
+) -> bool {
+    task_kind == TaskKind::Benchmark
+        && build_target == BuildTarget::StacksBench
+        && requested_run_count > 1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]

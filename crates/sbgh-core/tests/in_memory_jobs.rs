@@ -151,6 +151,7 @@ async fn in_memory_repeat_planner_appends_and_resumes_next_run() {
                 created_at: chrono::Utc::now(),
             },
             metric: None,
+            baseline_calibration_id: None,
             event_detail: None,
         })
         .await
@@ -339,20 +340,25 @@ async fn complete_job_and_fail_job_mirror_postgres_guard() {
                 created_at: chrono::Utc::now(),
             },
             metric: None,
+            baseline_calibration_id: Some(42),
             event_detail: None,
         })
         .await
         .unwrap();
     assert!(ok);
+    let completed = store
+        .lookup_job(job_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store
-            .lookup_job(job_id)
-            .await
+            .spec(completed.benchmark_spec_id)
             .unwrap()
-            .unwrap()
-            .status,
-        JobStatus::Completed
+            .baseline_calibration_id,
+        Some(42)
     );
+    assert_eq!(completed.status, JobStatus::Completed);
 
     // Stale-claim guard: fail_job on a now-completed (not running) job is
     // a no-op, mirroring the Postgres status guard.
@@ -458,6 +464,7 @@ async fn seed_completed_baseline(
                 warmup_blocks: 1000,
                 created_at: chrono::Utc::now(),
             }),
+            baseline_calibration_id: None,
             event_detail: None,
         })
         .await

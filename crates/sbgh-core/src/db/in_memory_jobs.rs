@@ -20,7 +20,7 @@ use crate::models::{
     BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, BenchmarkWorkflowStep, GithubPullRequestJob,
     GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent, JobEventKind,
     JobEventStatus, JobMetric, JobResult, JobStatus, NewJob, NewJobEvent, QueuedEventDetail,
-    ResolvedCommit, TaskKind, TerminalJobStatus,
+    ResolvedCommit, TaskKind, TerminalJobStatus, uses_shared_calibration,
 };
 
 #[derive(Default)]
@@ -174,6 +174,7 @@ fn singleton_group_spec(
         benchmark_group_id: group_id,
         spec_index: 0,
         requested_run_count: requested_run_count.max(1),
+        baseline_calibration_id: None,
         github_repo_id: new.github_repo_id,
         task_kind: new.axes.task_kind,
         build_target: new.axes.build_target,
@@ -193,11 +194,23 @@ fn singleton_group_spec(
         benchmark_spec_id: Some(spec_id),
         created_at: now,
     }];
-    if new.axes.task_kind != TaskKind::BuildOnly {
+    let calibrates =
+        uses_shared_calibration(new.axes.task_kind, new.axes.build_target, requested_run_count);
+    if calibrates {
         steps.push(BenchmarkWorkflowStep {
             id: Uuid::new_v4(),
             benchmark_group_id: group_id,
             step_index: 1,
+            step_kind: BenchmarkStepKind::Calibrate,
+            benchmark_spec_id: Some(spec_id),
+            created_at: now,
+        });
+    }
+    if new.axes.task_kind != TaskKind::BuildOnly {
+        steps.push(BenchmarkWorkflowStep {
+            id: Uuid::new_v4(),
+            benchmark_group_id: group_id,
+            step_index: if calibrates { 2 } else { 1 },
             step_kind: BenchmarkStepKind::Run,
             benchmark_spec_id: Some(spec_id),
             created_at: now,
@@ -865,6 +878,16 @@ impl JobStore for InMemoryJobStore {
         if let Some(m) = completion.metric.as_ref() {
             s.metrics
                 .insert(m.job_id, m.clone());
+        }
+        if let Some(calibration_id) = completion.baseline_calibration_id
+            && let Some(spec_id) = s
+                .jobs
+                .get(&completion.job_id)
+                .map(|job| job.benchmark_spec_id)
+            && let Some(spec) = s.specs.get_mut(&spec_id)
+        {
+            spec.baseline_calibration_id = Some(calibration_id);
+            spec.updated_at = now;
         }
         s.events.push(event);
         Ok(true)

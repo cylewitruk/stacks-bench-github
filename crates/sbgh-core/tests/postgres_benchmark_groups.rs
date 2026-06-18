@@ -166,6 +166,23 @@ async fn slack_unlinked_job_persists_requested_clean_repetitions_on_spec() {
             .await
             .unwrap();
     assert_eq!(requested, 4);
+
+    let steps: Vec<(i32, BenchmarkStepKind)> = sqlx::query_as(
+        "SELECT step_index, step_kind FROM benchmark_workflow_step WHERE benchmark_group_id = $1 \
+         ORDER BY step_index",
+    )
+    .bind(job.benchmark_group_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        steps,
+        vec![
+            (0, BenchmarkStepKind::Build),
+            (1, BenchmarkStepKind::Calibrate),
+            (2, BenchmarkStepKind::Run),
+        ]
+    );
 }
 
 #[tokio::test]
