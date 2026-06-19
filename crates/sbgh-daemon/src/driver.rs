@@ -45,6 +45,23 @@ pub struct TaskSpec {
     /// stacks-bench baseline id with `--baseline-id`.
     pub shared_baseline_calibration: bool,
     pub baseline_calibration_id: Option<i64>,
+    /// Benchmark repeat identity for fine-grained progress events.
+    pub benchmark_run: BenchmarkRunContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchmarkRunContext {
+    pub run_index: i32,
+    pub requested_run_count: i32,
+}
+
+impl Default for BenchmarkRunContext {
+    fn default() -> Self {
+        Self {
+            run_index: 0,
+            requested_run_count: 1,
+        }
+    }
 }
 
 /// A backend-interpreted placement hint. Today the only knob is CPU pinning

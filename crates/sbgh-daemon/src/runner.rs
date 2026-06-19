@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::artifact_store::{GROUP_SQLITE_RELATIVE, build_store_or_local, group_artifact_key};
 use crate::bench_recipe::BenchRecipe;
 use crate::build_recipe::BuildOnlyRecipe;
-use crate::driver::Driver;
+use crate::driver::{BenchmarkRunContext, Driver};
 use crate::events::{ChannelSink, Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::{LibvirtDriver, Shell};
@@ -1142,6 +1142,10 @@ impl JobDeps {
                     sqlite_seed_key_for(&job),
                     job_should_carry_sqlite(&job),
                     job.baseline_calibration_id,
+                    BenchmarkRunContext {
+                        run_index: job.benchmark_run_index,
+                        requested_run_count: job.requested_run_count,
+                    },
                 );
                 run_worker(&recipe, &job, prepared_rx, events_tx, token).await
             }
@@ -2999,7 +3003,15 @@ mod tests {
         let shell = Arc::new(RecordingShell::new());
         shell.reply(PreparedReply::fail(b"boom: provisioning failed"));
         let driver: Arc<dyn Driver> = Arc::new(LibvirtDriver::new(config, shell));
-        let recipe = BenchRecipe::new(driver, vec![], None, None, false, None);
+        let recipe = BenchRecipe::new(
+            driver,
+            vec![],
+            None,
+            None,
+            false,
+            None,
+            BenchmarkRunContext::default(),
+        );
         let job = RunnableJob {
             progress: ProgressTarget::CommitCheck { check_run_id: None },
             ..pr_job("abc123", None)

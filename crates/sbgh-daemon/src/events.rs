@@ -9,10 +9,11 @@
 //!
 //! Delivery is **two-tier** (roadmap-v5 channel discipline): a phase transition
 //! is **reliable** — it must not be silently dropped, so [`EventSink::phase`]
-//! returns a [`SinkResult`] (`Err(SinkClosed)` if the reporter is gone); a
-//! heartbeat is **best-effort** and may be dropped under backpressure, so
-//! [`EventSink::heartbeat`] has no failure signal by design. The terminal
-//! [`Terminal`] outcome rides the same channel as [`WorkerEvent::Finished`].
+//! returns a [`SinkResult`] (`Err(SinkClosed)` if the reporter is gone);
+//! heartbeats and fine-grained progress are **best-effort** and may be dropped
+//! under backpressure, so [`EventSink::heartbeat`] and [`EventSink::progress`]
+//! have no failure signal by design. The terminal [`Terminal`] outcome rides
+//! the same channel as [`WorkerEvent::Finished`].
 
 use std::fmt;
 use std::time::Duration;
@@ -65,6 +66,34 @@ impl std::error::Error for SinkClosed {}
 /// Result of a **reliable** [`EventSink::phase`] send.
 pub type SinkResult = Result<(), SinkClosed>;
 
+/// Which workflow step produced a fine-grained progress event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStep {
+    Calibrate,
+    Run,
+}
+
+impl fmt::Display for WorkflowStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Calibrate => "calibrate",
+            Self::Run => "run",
+        })
+    }
+}
+
+/// Best-effort fine-grained progress parsed from `stacks-bench` JSONL stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressUpdate {
+    pub workflow_step: WorkflowStep,
+    pub run_index: i32,
+    pub requested_run_count: i32,
+    pub phase: String,
+    pub progress: u64,
+    pub total: Option<u64>,
+    pub message: Option<String>,
+}
+
 /// Consumes a recipe's progress events. The reporting surface (PR comment +
 /// Check Run) implements this; a recipe emits to it without knowing what is
 /// downstream.
@@ -79,6 +108,10 @@ pub trait EventSink: Send + Sync {
     /// Deliver a periodic "still alive" tick within the current phase.
     /// **Best-effort:** may be dropped under backpressure; no failure signal.
     async fn heartbeat(&self, label: PhaseLabel, elapsed: Duration);
+
+    /// Deliver fine-grained task progress. **Best-effort:** may be dropped
+    /// under backpressure; no failure signal.
+    async fn progress(&self, _progress: ProgressUpdate) {}
 }
 
 /// The terminal result of a run, carried on [`WorkerEvent::Finished`]. The
@@ -109,6 +142,8 @@ pub enum WorkerEvent {
     Phase { label: PhaseLabel, elapsed: Duration },
     /// A periodic "still alive" tick within the current phase.
     Heartbeat { label: PhaseLabel, elapsed: Duration },
+    /// Fine-grained task progress parsed from the worker's JSONL progress file.
+    Progress(ProgressUpdate),
     /// The run is over — its terminal outcome.
     Finished(Terminal),
 }
@@ -142,5 +177,50 @@ impl EventSink for ChannelSink {
         let _ = self
             .tx
             .try_send(WorkerEvent::Heartbeat { label, elapsed });
+    }
+
+    async fn progress(&self, progress: ProgressUpdate) {
+        // Droppable: progress must never delay or displace reliable phase /
+        // terminal events.
+        let _ = self
+            .tx
+            .try_send(WorkerEvent::Progress(progress));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress(n: u64) -> ProgressUpdate {
+        ProgressUpdate {
+            workflow_step: WorkflowStep::Run,
+            run_index: 0,
+            requested_run_count: 1,
+            phase: "replay".into(),
+            progress: n,
+            total: Some(100),
+            message: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_events_are_dropped_under_backpressure() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = ChannelSink::new(tx);
+
+        sink.progress(progress(1))
+            .await;
+        sink.progress(progress(2))
+            .await;
+
+        match rx.recv().await {
+            Some(WorkerEvent::Progress(update)) => assert_eq!(update.progress, 1),
+            other => panic!("expected first progress event, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "second progress event should be dropped while the channel is full"
+        );
     }
 }

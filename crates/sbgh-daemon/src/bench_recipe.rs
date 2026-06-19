@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::driver::{Driver, DriverStatus, Placement, TaskSpec};
+use crate::driver::{BenchmarkRunContext, Driver, DriverStatus, Placement, TaskSpec};
 use crate::events::EventSink;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 
@@ -26,6 +26,7 @@ pub struct BenchRecipe {
     sqlite_seed_key: Option<String>,
     shared_baseline_calibration: bool,
     baseline_calibration_id: Option<i64>,
+    benchmark_run: BenchmarkRunContext,
     /// The cpuset this job's VM vCPUs are pinned to (its concurrency slot's
     /// `[runner].cpu_sets` entry), or `None` to float (Phase 5).
     vcpu_cpuset: Option<String>,
@@ -39,6 +40,7 @@ impl BenchRecipe {
         sqlite_seed_key: Option<String>,
         shared_baseline_calibration: bool,
         baseline_calibration_id: Option<i64>,
+        benchmark_run: BenchmarkRunContext,
     ) -> Self {
         Self {
             driver,
@@ -46,6 +48,7 @@ impl BenchRecipe {
             sqlite_seed_key,
             shared_baseline_calibration,
             baseline_calibration_id,
+            benchmark_run,
             vcpu_cpuset,
         }
     }
@@ -83,6 +86,7 @@ impl Recipe for BenchRecipe {
             sqlite_seed_key: self.sqlite_seed_key.clone(),
             shared_baseline_calibration: self.shared_baseline_calibration,
             baseline_calibration_id: self.baseline_calibration_id,
+            benchmark_run: self.benchmark_run,
         };
         let placement = Placement {
             vcpu_cpuset: self.vcpu_cpuset.clone(),

@@ -66,6 +66,7 @@ impl Recipe for BuildOnlyRecipe {
             sqlite_seed_key: None,
             shared_baseline_calibration: false,
             baseline_calibration_id: None,
+            benchmark_run: Default::default(),
         };
         let placement = Placement {
             vcpu_cpuset: self.vcpu_cpuset.clone(),

@@ -543,7 +543,7 @@ before an iteration.
 ### 0027 — Fine-grained bench progress (JSONL)
 
 - **id:** `0027-fine-grained-progress`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `medium`
 
 Promoted to `v20-fine-grained-bench-progress` →

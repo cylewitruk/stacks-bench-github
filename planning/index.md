@@ -44,7 +44,7 @@ need editing when an item's status or location changes.
 | `0024-slack-card-stage-timings` | Slack card stage timings | `shipped` | [archive/completed/0024-slack-card-stage-timings.md](archive/completed/0024-slack-card-stage-timings.md) |
 | `0025-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
 | `0026-central-block-index-cache` | Central block/tx index cache | `backlog` | [backlog.md](backlog.md) |
-| `0027-fine-grained-progress` | Fine-grained bench progress | `planned` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
+| `0027-fine-grained-progress` | Fine-grained bench progress | `in_progress` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
@@ -89,7 +89,7 @@ need editing when an item's status or location changes.
 | `v17-slack-reporting-robustness` | Slack reporting robustness, reactions & observability | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `v18-slack-reporting-session` | Group-scoped Slack reporting session | `shipped` | [archive/completed/0047-slack-reporting-session.md](archive/completed/0047-slack-reporting-session.md) |
 | `v19-shared-benchmark-calibration` | Shared benchmark calibration | `in_progress` | [iterations/v19-shared-benchmark-calibration.md](iterations/v19-shared-benchmark-calibration.md) |
-| `v20-fine-grained-bench-progress` | Fine-grained bench progress | `planned` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
+| `v20-fine-grained-bench-progress` | Fine-grained bench progress | `in_progress` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
 | `v21-stacks-bench-schema-v1-native` | Native `stacks-bench` schema-v1 JSON | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 
 ## Decisions

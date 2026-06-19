@@ -9,6 +9,7 @@ pub mod forensics;
 pub mod git_mirror;
 pub mod lvm;
 pub mod phase;
+pub mod progress;
 pub mod shell;
 pub mod source;
 pub mod tmpfs;

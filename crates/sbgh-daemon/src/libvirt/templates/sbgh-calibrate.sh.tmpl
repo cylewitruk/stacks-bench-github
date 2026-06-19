@@ -40,6 +40,7 @@ phase "calibrating"
     --source "$SBGH_SOURCE_DIR" \
     --dangerous-no-chainstate-copy \
     > "$RESULTS/calibration.json" \
+    2> >(tee -a "$RESULTS/calibration.progress.jsonl" >&2) \
     || die "stacks-bench baseline calibration exited non-zero"
 
 if ! python3 - "$RESULTS/calibration.json" "$RESULTS/baseline-id" <<'PY'

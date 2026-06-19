@@ -98,10 +98,23 @@ impl ResultsTmpfs {
             .join("run.json")
     }
 
+    /// JSONL stderr progress from `stacks-bench bench run --json`.
+    pub fn run_progress_jsonl(&self) -> PathBuf {
+        self.mount_dir
+            .join("run.progress.jsonl")
+    }
+
     /// JSON stdout from `stacks-bench bench baseline calibrate --json`.
     pub fn calibration_json(&self) -> PathBuf {
         self.mount_dir
             .join("calibration.json")
+    }
+
+    /// JSONL stderr progress from `stacks-bench bench baseline calibrate
+    /// --json`.
+    pub fn calibration_progress_jsonl(&self) -> PathBuf {
+        self.mount_dir
+            .join("calibration.progress.jsonl")
     }
 
     /// Small handoff file written by the calibration phase and read by the
@@ -151,6 +164,16 @@ mod tests {
                 .join("j1")
         );
         assert_eq!(r.phase_log(), r.mount_dir.join(".phase-log"));
+        assert_eq!(
+            r.run_progress_jsonl(),
+            r.mount_dir
+                .join("run.progress.jsonl")
+        );
+        assert_eq!(
+            r.calibration_progress_jsonl(),
+            r.mount_dir
+                .join("calibration.progress.jsonl")
+        );
 
         let calls = shell.calls();
         assert_eq!(calls.len(), 1);

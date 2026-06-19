@@ -8,12 +8,6 @@ read as a backlog rather than a roadmap.
 
 Workflow: Opus drafts, Codex reviews, Opus fixes. Keep planning docs concise.
 
-> **Migration complete (2026-06).** The old `docs/roadmap-vN.md` set has been
-> migrated into this system — shipped work → `archive/completed/`; active work →
-> `backlog.md` + `design/`; durable rules → `decisions/`. **Every
-> `docs/roadmap-vN.md` is now a tombstone** (slated for deletion); the crosswalk is
-> [archive/superseded/rollup-roadmap-register-2026-06.md](archive/superseded/rollup-roadmap-register-2026-06.md).
-
 ## Where To Look
 
 - [index.md](index.md) — **the registry**: every item's ID, status, and current

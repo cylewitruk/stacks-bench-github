@@ -1,5 +1,6 @@
 mod api;
 mod artifact_store;
+mod bench_progress;
 mod bench_recipe;
 mod bench_summary;
 mod binary_cache;

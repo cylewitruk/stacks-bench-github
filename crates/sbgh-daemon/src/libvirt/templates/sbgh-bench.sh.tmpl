@@ -105,6 +105,7 @@ phase "running"
     --dangerous-no-chainstate-copy \
     "${EXTRA_ARGS[@]}" \
     > "$RESULTS/run.json" \
+    2> >(tee -a "$RESULTS/run.progress.jsonl" >&2) \
     || die "stacks-bench exited non-zero"
 
 # --- finalize -----------------------------------------------------------------------

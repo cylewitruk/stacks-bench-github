@@ -28,15 +28,19 @@ use sbgh_core::config::DaemonConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::artifact_store::{artifact_key, build_store_or_local};
+use crate::bench_progress::parse_progress_line;
 use crate::bench_summary::BaselineCalibrationResult;
 use crate::binary_cache::{self, BinaryCache, BuildFingerprint, CacheEnvironment};
-use crate::driver::{Driver, DriverOutcome, DriverStatus, Placement, TaskSpec};
-use crate::events::{EventSink, PhaseLabel};
+use crate::driver::{
+    BenchmarkRunContext, Driver, DriverOutcome, DriverStatus, Placement, TaskSpec,
+};
+use crate::events::{EventSink, PhaseLabel, ProgressUpdate, WorkflowStep};
 use crate::libvirt::boot::BootDisk;
 use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitCommon};
 use crate::libvirt::domain::{self, DomainSpec};
 use crate::libvirt::lvm::ChainstateSnapshot;
 use crate::libvirt::phase::{self, Phase, PollMode};
+use crate::libvirt::progress::ProgressTailer;
 use crate::libvirt::shell::{Shell, spec, spec_priv};
 use crate::libvirt::source::SourceDisk;
 use crate::libvirt::tmpfs::ResultsTmpfs;
@@ -175,6 +179,11 @@ pub trait PhaseListener: Send + Sync {
     /// listener can refresh "still alive, currently in X for Y" UI
     /// (PR comment, status page, etc.). Default no-op.
     async fn on_heartbeat(&self, _phase: &Phase, _elapsed: Duration) {}
+
+    /// Called for fine-grained `stacks-bench` progress parsed from stderr
+    /// JSONL. Default no-op because older tests and non-benchmark phases
+    /// only care about phase transitions.
+    async fn on_progress(&self, _progress: ProgressUpdate) {}
 }
 
 #[allow(dead_code)] // used by tests; kept on the public surface as a convenience
@@ -221,6 +230,13 @@ impl FinishReason {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProgressContext {
+    workflow_step: WorkflowStep,
+    run_index: i32,
+    requested_run_count: i32,
+}
+
 /// Aggregates the host-side artifacts so cleanup can run unconditionally even
 /// if provisioning aborts mid-way.
 #[derive(Default)]
@@ -250,6 +266,7 @@ struct RunInputs<'a> {
     sqlite_seed_key: Option<&'a str>,
     shared_baseline_calibration: bool,
     baseline_calibration_id: Option<i64>,
+    benchmark_run: BenchmarkRunContext,
     /// v10 (0005): build-only mode — stop after the build VM publishes the
     /// artifact; skip the bench phase entirely.
     build_only: bool,
@@ -304,6 +321,7 @@ impl LibvirtDriver {
                 .as_deref(),
             shared_baseline_calibration: spec.shared_baseline_calibration,
             baseline_calibration_id: spec.baseline_calibration_id,
+            benchmark_run: spec.benchmark_run,
             build_only: spec.build_only,
         };
 
@@ -338,29 +356,19 @@ impl LibvirtDriver {
         let store = build_store_or_local(self.config.as_ref());
         let tmpfs = arts.tmpfs.as_ref();
 
-        let sqlite_key = artifact_key(&job_id, forensics::SQLITE_RELATIVE);
-        let sqlite_size_bytes = match tmpfs {
-            Some(t) => {
-                store
-                    .put(&sqlite_key, &t.sqlite_file())
-                    .await
-            }
-            None => None,
-        };
-        let sqlite_archived_path = sqlite_size_bytes.map(|_| sqlite_key);
+        let (sqlite_archived_path, sqlite_size_bytes) =
+            archive_optional(store.as_ref(), &job_id, forensics::SQLITE_RELATIVE, tmpfs, |t| {
+                t.sqlite_file()
+            })
+            .await;
 
         // The append-only phase journal — cheap, makes per-job "how long was
         // each phase" trivial after the job dir is gone.
-        let phase_log_key = artifact_key(&job_id, forensics::PHASE_LOG_RELATIVE);
-        let phase_log_size_bytes = match tmpfs {
-            Some(t) => {
-                store
-                    .put(&phase_log_key, &t.phase_log())
-                    .await
-            }
-            None => None,
-        };
-        let phase_log_archived_path = phase_log_size_bytes.map(|_| phase_log_key);
+        let (phase_log_archived_path, phase_log_size_bytes) =
+            archive_optional(store.as_ref(), &job_id, forensics::PHASE_LOG_RELATIVE, tmpfs, |t| {
+                t.phase_log()
+            })
+            .await;
 
         // The stacks-bench binary that produced this run — kept as a host-side
         // forensic copy (the exact-version DB reader), but archived **locally
@@ -381,28 +389,39 @@ impl LibvirtDriver {
 
         // Raw JSON stdout from `stacks-bench bench run --json` — the source of
         // the curated PR-comment metrics (read back via `ArtifactStore::get`).
-        let run_json_key = artifact_key(&job_id, forensics::RUN_JSON_RELATIVE);
-        let run_json_size_bytes = match tmpfs {
-            Some(t) => {
-                store
-                    .put(&run_json_key, &t.run_json())
-                    .await
-            }
-            None => None,
-        };
-        let run_json_archived_path = run_json_size_bytes.map(|_| run_json_key);
+        let (run_json_archived_path, run_json_size_bytes) =
+            archive_optional(store.as_ref(), &job_id, forensics::RUN_JSON_RELATIVE, tmpfs, |t| {
+                t.run_json()
+            })
+            .await;
 
-        let calibration_json_key = artifact_key(&job_id, forensics::CALIBRATION_JSON_RELATIVE);
-        let calibration_json_size_bytes = match tmpfs {
-            Some(t) => {
-                store
-                    .put(&calibration_json_key, &t.calibration_json())
-                    .await
-            }
-            None => None,
-        };
-        let calibration_json_archived_path =
-            calibration_json_size_bytes.map(|_| calibration_json_key);
+        let (run_progress_archived_path, run_progress_size_bytes) = archive_optional(
+            store.as_ref(),
+            &job_id,
+            forensics::RUN_PROGRESS_JSONL_RELATIVE,
+            tmpfs,
+            |t| t.run_progress_jsonl(),
+        )
+        .await;
+
+        let (calibration_json_archived_path, calibration_json_size_bytes) = archive_optional(
+            store.as_ref(),
+            &job_id,
+            forensics::CALIBRATION_JSON_RELATIVE,
+            tmpfs,
+            |t| t.calibration_json(),
+        )
+        .await;
+
+        let (calibration_progress_archived_path, calibration_progress_size_bytes) =
+            archive_optional(
+                store.as_ref(),
+                &job_id,
+                forensics::CALIBRATION_PROGRESS_JSONL_RELATIVE,
+                tmpfs,
+                |t| t.calibration_progress_jsonl(),
+            )
+            .await;
         let baseline_calibration_id = inputs
             .baseline_calibration_id
             .or_else(|| tmpfs.and_then(baseline_calibration_id_from_tmpfs));
@@ -470,8 +489,12 @@ impl LibvirtDriver {
             "binary_size_bytes": binary_size_bytes,
             "run_json_archived_path": run_json_archived_path,
             "run_json_size_bytes": run_json_size_bytes,
+            "run_progress_archived_path": run_progress_archived_path,
+            "run_progress_size_bytes": run_progress_size_bytes,
             "calibration_json_archived_path": calibration_json_archived_path,
             "calibration_json_size_bytes": calibration_json_size_bytes,
+            "calibration_progress_archived_path": calibration_progress_archived_path,
+            "calibration_progress_size_bytes": calibration_progress_size_bytes,
             "baseline_calibration_id": baseline_calibration_id,
             "phase_log_archived_path": phase_log_archived_path,
             "phase_log_size_bytes": phase_log_size_bytes,
@@ -567,6 +590,7 @@ impl LibvirtDriver {
                     listener,
                     cancel,
                     vcpu_cpuset,
+                    None,
                 )
                 .await?;
             match build_reason {
@@ -617,6 +641,13 @@ impl LibvirtDriver {
                     listener,
                     cancel,
                     vcpu_cpuset,
+                    Some(ProgressContext {
+                        workflow_step: WorkflowStep::Calibrate,
+                        run_index: inputs.benchmark_run.run_index,
+                        requested_run_count: inputs
+                            .benchmark_run
+                            .requested_run_count,
+                    }),
                 )
                 .await?;
             match calibrate_reason {
@@ -651,6 +682,13 @@ impl LibvirtDriver {
                 listener,
                 cancel,
                 vcpu_cpuset,
+                Some(ProgressContext {
+                    workflow_step: WorkflowStep::Run,
+                    run_index: inputs.benchmark_run.run_index,
+                    requested_run_count: inputs
+                        .benchmark_run
+                        .requested_run_count,
+                }),
             )
             .await?;
         Ok(bench_reason)
@@ -943,6 +981,7 @@ impl LibvirtDriver {
         listener: &dyn PhaseListener,
         cancel: &CancellationToken,
         vcpu_cpuset: Option<&str>,
+        progress_context: Option<ProgressContext>,
     ) -> anyhow::Result<FinishReason> {
         tracing::info!(domain = domain_name, phase_lifecycle = phase_label, "starting phase");
 
@@ -1001,12 +1040,26 @@ impl LibvirtDriver {
 
         virsh::define(self.shell.as_ref(), &self.config.paths, &domain_xml_path).await?;
         arts.domain_defined = true;
+        let mut progress_tailer = progress_context.map(|ctx| {
+            let path = match ctx.workflow_step {
+                WorkflowStep::Calibrate => tmpfs_ref.calibration_progress_jsonl(),
+                WorkflowStep::Run => tmpfs_ref.run_progress_jsonl(),
+            };
+            (ProgressTailer::new(path), ctx)
+        });
         virsh::start(self.shell.as_ref(), &self.config.paths, domain_name).await?;
         arts.domain_started = true;
 
         let phase_log = tmpfs_ref.phase_log();
         let reason = self
-            .poll_to_completion(domain_name, &phase_log, listener, mode, cancel)
+            .poll_to_completion(
+                domain_name,
+                &phase_log,
+                progress_tailer.as_mut(),
+                listener,
+                mode,
+                cancel,
+            )
             .await;
         Ok(reason)
     }
@@ -1015,6 +1068,7 @@ impl LibvirtDriver {
         &self,
         domain_name: &str,
         phase_log: &Path,
+        mut progress_tailer: Option<&mut (ProgressTailer, ProgressContext)>,
         listener: &dyn PhaseListener,
         mode: PollMode,
         cancel: &CancellationToken,
@@ -1067,6 +1121,8 @@ impl LibvirtDriver {
             // the caller's normal teardown (with handles) will tear it down.
             if cancel.is_cancelled() {
                 tracing::warn!(domain = domain_name, "run cancelled; stopping poll");
+                Self::drain_progress_tailer(domain_name, &mut progress_tailer, listener, true)
+                    .await;
                 return FinishReason::Cancelled;
             }
 
@@ -1080,6 +1136,8 @@ impl LibvirtDriver {
                 current_phase = Some(p.clone());
 
                 if p == Phase::Error {
+                    Self::drain_progress_tailer(domain_name, &mut progress_tailer, listener, true)
+                        .await;
                     return FinishReason::PhaseError;
                 }
                 if p.is_success_for(mode) {
@@ -1092,6 +1150,7 @@ impl LibvirtDriver {
                     // `success_phase_seen` is true.
                 }
             }
+            Self::drain_progress_tailer(domain_name, &mut progress_tailer, listener, false).await;
 
             // Heartbeat — periodic liveness signal. INFO log + listener
             // callback so the PR comment (or whatever) can surface the
@@ -1121,6 +1180,8 @@ impl LibvirtDriver {
             //     kernel/cloud-init panicked. Treat as ShutOff failure.
             match virsh::domstate(self.shell.as_ref(), &self.config.paths, domain_name).await {
                 Ok(DomState::ShutOff) | Ok(DomState::Undefined) => {
+                    Self::drain_progress_tailer(domain_name, &mut progress_tailer, listener, true)
+                        .await;
                     return if success_phase_seen {
                         FinishReason::PhaseDone
                     } else {
@@ -1132,6 +1193,8 @@ impl LibvirtDriver {
             }
 
             if started.elapsed() > timeout {
+                Self::drain_progress_tailer(domain_name, &mut progress_tailer, listener, true)
+                    .await;
                 return FinishReason::Timeout;
             }
             // Sleep until the next poll, but wake immediately on cancellation
@@ -1141,6 +1204,50 @@ impl LibvirtDriver {
                 _ = tokio::time::sleep(poll_interval) => {}
                 _ = cancel.cancelled() => {}
             }
+        }
+    }
+
+    async fn drain_progress_tailer(
+        domain_name: &str,
+        progress_tailer: &mut Option<&mut (ProgressTailer, ProgressContext)>,
+        listener: &dyn PhaseListener,
+        final_drain: bool,
+    ) {
+        let Some((tailer, ctx)) = progress_tailer.as_mut() else {
+            return;
+        };
+        match tailer.drain(final_drain) {
+            Ok(lines) => {
+                for line in lines {
+                    tracing::debug!(
+                        domain = domain_name,
+                        progress_log = %tailer.path().display(),
+                        final_drain,
+                        line,
+                        "stacks-bench progress stderr line",
+                    );
+                    let Some(event) = parse_progress_line(&line) else {
+                        continue;
+                    };
+                    listener
+                        .on_progress(ProgressUpdate {
+                            workflow_step: ctx.workflow_step,
+                            run_index: ctx.run_index,
+                            requested_run_count: ctx.requested_run_count,
+                            phase: event.phase,
+                            progress: event.progress,
+                            total: event.total,
+                            message: event.message,
+                        })
+                        .await;
+                }
+            }
+            Err(e) => tracing::warn!(
+                domain = domain_name,
+                progress_log = %tailer.path().display(),
+                error = %e,
+                "failed to tail stacks-bench progress file",
+            ),
         }
     }
 
@@ -1409,6 +1516,25 @@ fn baseline_calibration_id_from_tmpfs(tmpfs: &ResultsTmpfs) -> Option<i64> {
     })
 }
 
+async fn archive_optional(
+    store: &dyn crate::artifact_store::ArtifactStore,
+    job_id: &str,
+    relative: &'static str,
+    tmpfs: Option<&ResultsTmpfs>,
+    path: impl FnOnce(&ResultsTmpfs) -> PathBuf,
+) -> (Option<String>, Option<u64>) {
+    let key = artifact_key(job_id, relative);
+    let size = match tmpfs {
+        Some(tmpfs) => {
+            store
+                .put(&key, &path(tmpfs))
+                .await
+        }
+        None => None,
+    };
+    (size.as_ref().map(|_| key), size)
+}
+
 /// Bridges the libvirt driver's `Phase` callbacks to recipe-neutral
 /// [`EventSink`] calls. The `Phase` → [`PhaseLabel`] mapping lives here so the
 /// driver speaks the neutral event surface — roadmap-v8 Phase 1 moved this
@@ -1457,6 +1583,12 @@ impl PhaseListener for SinkAdapter<'_> {
     async fn on_heartbeat(&self, phase: &Phase, elapsed: Duration) {
         self.sink
             .heartbeat(Self::label(phase), elapsed)
+            .await;
+    }
+
+    async fn on_progress(&self, progress: ProgressUpdate) {
+        self.sink
+            .progress(progress)
             .await;
     }
 }
@@ -1701,6 +1833,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingListener {
         phases: std::sync::Mutex<Vec<Phase>>,
+        progresses: std::sync::Mutex<Vec<ProgressUpdate>>,
     }
 
     #[async_trait::async_trait]
@@ -1710,6 +1843,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(phase.clone());
+        }
+
+        async fn on_progress(&self, progress: ProgressUpdate) {
+            self.progresses
+                .lock()
+                .unwrap()
+                .push(progress);
         }
     }
 
@@ -1970,6 +2110,7 @@ mod tests {
             sqlite_seed_key: None,
             shared_baseline_calibration: false,
             baseline_calibration_id: None,
+            benchmark_run: Default::default(),
         }
     }
 
@@ -2195,14 +2336,20 @@ mod tests {
         // observes its success phase on the first read.
         std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 build_done\n1700000060 done\n")
             .unwrap();
+        std::fs::write(
+            tmpfs_dir.join("run.progress.jsonl"),
+            br#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"replay","progress":42,"total":100,"message":"Replaying measured entries"}}"#,
+        )
+        .unwrap();
 
         let shell = Arc::new(happy_path_shell());
         let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
+        let listener = RecordingListener::default();
         let outcome = driver
             .run_benchmark(
                 &ctx_of(&job),
                 &task_spec(job.bench_args.clone(), false),
-                &NoopPhaseListener,
+                &listener,
                 &CancellationToken::new(),
                 None,
             )
@@ -2215,6 +2362,40 @@ mod tests {
         assert_eq!(outcome.summary["last_phase"], "done");
         assert_eq!(outcome.summary["head_sha"], "abc123def456");
         assert_eq!(outcome.summary["repository"], "acme/widgets");
+        assert_eq!(
+            outcome.summary["run_progress_archived_path"]
+                .as_str()
+                .unwrap(),
+            format!("{}/{}", job.id, forensics::RUN_PROGRESS_JSONL_RELATIVE)
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                cfg.paths
+                    .results_archive_dir
+                    .join(
+                        outcome.summary["run_progress_archived_path"]
+                            .as_str()
+                            .unwrap()
+                    )
+            )
+            .unwrap(),
+            r#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"replay","progress":42,"total":100,"message":"Replaying measured entries"}}"#
+        );
+        assert_eq!(
+            *listener
+                .progresses
+                .lock()
+                .unwrap(),
+            vec![ProgressUpdate {
+                workflow_step: WorkflowStep::Run,
+                run_index: 0,
+                requested_run_count: 1,
+                phase: "replay".into(),
+                progress: 42,
+                total: Some(100),
+                message: Some("Replaying measured entries".into()),
+            }]
+        );
 
         // Command sequence: assert the exact shell program names in order,
         // skipping the `program` -> basename comparison detail.

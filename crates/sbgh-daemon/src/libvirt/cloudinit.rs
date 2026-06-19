@@ -305,6 +305,8 @@ mod tests {
         assert!(bench_user.contains("sbgh-bench.sh"));
         assert!(bench_user.contains("stacks-bench"));
         assert!(bench_user.contains("--iters 5"));
+        assert!(bench_user.contains("> \"$RESULTS/run.json\""));
+        assert!(bench_user.contains("2> >(tee -a \"$RESULTS/run.progress.jsonl\" >&2)"));
         assert!(bench_user.contains("SHARED_BASELINE_CALIBRATION=\"false\""));
         assert!(!bench_user.contains("phase \"build_done\""));
 
@@ -347,7 +349,8 @@ mod tests {
 
         assert!(calibrate.contains("bench baseline calibrate"));
         assert!(calibrate.contains("--dangerous-no-chainstate-copy"));
-        assert!(calibrate.contains("calibration.json"));
+        assert!(calibrate.contains("> \"$RESULTS/calibration.json\""));
+        assert!(calibrate.contains("2> >(tee -a \"$RESULTS/calibration.progress.jsonl\" >&2)"));
         assert!(run.contains("SHARED_BASELINE_CALIBRATION=\"true\""));
         assert!(run.contains("BASELINE_ID=\"12\""));
         assert!(run.contains("--baseline-id"));
