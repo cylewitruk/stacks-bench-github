@@ -8,7 +8,9 @@ use crate::bench_summary::thousands;
 use crate::events::{ProgressUpdate, WorkflowStep};
 
 const PERCENT_MILESTONE: u64 = 10;
-const TOTALLESS_MILESTONE: u64 = 10;
+// Total-less phases are generally status/counter streams. `txid_scan` can
+// reach hundreds of thousands, so keep this coarse enough for Slack streams.
+const TOTALLESS_MILESTONE: u64 = 10_000;
 
 #[derive(Debug, Default, Clone)]
 pub struct SlackProgressTranscript {
@@ -103,11 +105,20 @@ fn milestone(update: &ProgressUpdate) -> Option<u64> {
 }
 
 fn milestone_line(update: &ProgressUpdate, milestone: u64) -> String {
-    match update.total {
+    let line = match update.total {
         Some(total) if total > 0 => {
             format!("{} / {} ({}%)", thousands(update.progress), thousands(total), milestone)
         }
         _ => thousands(update.progress),
+    };
+    match update
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        Some(message) => format!("{line} — {message}"),
+        None => line,
     }
 }
 
@@ -201,25 +212,52 @@ mod tests {
         let mut transcript = SlackProgressTranscript::default();
 
         let first = transcript
-            .push(&update("planning", 1, None))
+            .push(&update("txid_scan", 38_400, None))
             .expect("new phase emits");
         assert!(
             first
                 .details
-                .contains("Planning benchmark")
+                .contains("Scanning transactions")
         );
-        assert!(first.details.contains("1"));
+        assert!(
+            first
+                .details
+                .contains("38,400")
+        );
 
         assert!(
             transcript
-                .push(&update("planning", 5, None))
+                .push(&update("txid_scan", 39_000, None))
                 .is_none(),
-            "same raw-count bucket is quiet"
+            "same 10,000-count bucket is quiet"
         );
 
         let next = transcript
-            .push(&update("planning", 12, None))
+            .push(&update("txid_scan", 40_000, None))
             .expect("new raw-count bucket emits");
-        assert_eq!(next.details, "12");
+        assert_eq!(next.details, "40,000");
+    }
+
+    #[test]
+    fn milestone_lines_keep_messages() {
+        let mut transcript = SlackProgressTranscript::default();
+        let mut done = update("baseline", 1_900, Some(1_900));
+        done.workflow_step = WorkflowStep::Calibrate;
+        done.message = Some("Baseline converged after 38 segments".into());
+
+        let first = transcript
+            .push(&done)
+            .expect("new phase emits");
+
+        assert!(
+            first
+                .details
+                .contains("Calibrating baselines: Baseline converged after 38 segments")
+        );
+        assert!(
+            first
+                .details
+                .contains("1,900 / 1,900 (100%) — Baseline converged after 38 segments")
+        );
     }
 }

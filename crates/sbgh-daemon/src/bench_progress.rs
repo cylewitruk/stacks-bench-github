@@ -5,6 +5,7 @@
 //! versions are ignored rather than failing the run.
 
 use serde::Deserialize;
+use serde_json::Number;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BenchProgressEvent {
@@ -25,8 +26,12 @@ struct Envelope {
 #[derive(Debug, Deserialize)]
 struct ProgressPayload {
     phase: String,
-    progress: u64,
-    total: Option<u64>,
+    /// Schema-v1 upstream currently emits `current`; early drafts used
+    /// `progress`. Accept both so deployed integrations survive either side of
+    /// the rename.
+    current: Option<Number>,
+    progress: Option<Number>,
+    total: Option<Number>,
     message: Option<String>,
 }
 
@@ -39,12 +44,31 @@ pub fn parse_progress_line(line: &str) -> Option<BenchProgressEvent> {
         return None;
     }
     let progress = envelope.progress?;
+    let current = progress
+        .current
+        .as_ref()
+        .or(progress.progress.as_ref())
+        .and_then(number_to_u64)?;
     Some(BenchProgressEvent {
         phase: progress.phase,
-        progress: progress.progress,
-        total: progress.total,
+        progress: current,
+        total: progress
+            .total
+            .as_ref()
+            .and_then(number_to_u64),
         message: progress.message,
     })
+}
+
+fn number_to_u64(n: &Number) -> Option<u64> {
+    if let Some(n) = n.as_u64() {
+        return Some(n);
+    }
+    let n = n.as_f64()?;
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > u64::MAX as f64 {
+        return None;
+    }
+    Some(n as u64)
 }
 
 #[cfg(test)]
@@ -82,6 +106,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_current_field_and_integer_valued_floats() {
+        let event = parse_progress_line(
+            r#"{"schema_version":1,"event_type":"progress","event_version":1,
+                "progress":{"phase":"txid_scan","current":38400.0,
+                    "total":40000.0,"message":"Scanned 38400 blocks"}}"#,
+        )
+        .expect("valid current-style progress event");
+
+        assert_eq!(event.phase, "txid_scan");
+        assert_eq!(event.progress, 38_400);
+        assert_eq!(event.total, Some(40_000));
+        assert_eq!(event.message.as_deref(), Some("Scanned 38400 blocks"));
+    }
+
+    #[test]
     fn parses_status_only_progress_event() {
         let event = parse_progress_line(
             r#"{"schema_version":1,"event_type":"progress","event_version":1,
@@ -93,6 +132,24 @@ mod tests {
         assert_eq!(event.progress, 0);
         assert_eq!(event.total, None);
         assert_eq!(event.message, None);
+    }
+
+    #[test]
+    fn ignores_fractional_or_missing_counters() {
+        assert!(
+            parse_progress_line(
+                r#"{"schema_version":1,"event_type":"progress","event_version":1,
+                    "progress":{"phase":"replay","current":1.5}}"#,
+            )
+            .is_none()
+        );
+        assert!(
+            parse_progress_line(
+                r#"{"schema_version":1,"event_type":"progress","event_version":1,
+                    "progress":{"phase":"replay"}}"#,
+            )
+            .is_none()
+        );
     }
 
     #[test]
