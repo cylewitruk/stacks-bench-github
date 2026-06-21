@@ -21,7 +21,7 @@ use std::cmp::Ordering;
 use sbgh_core::models::JobMetric;
 use serde_json::{Value, json};
 
-use crate::bench_summary::{self, DB_LINK_TTL_HUMAN, PlanTaskStatus, RunResult};
+use crate::bench_summary::{self, DB_LINK_TTL_HUMAN, PlanTaskStatus, RunResult, thousands};
 
 /// An optional per-row link rendered as the task's `source` (e.g. "View
 /// commit").
@@ -570,15 +570,7 @@ fn format_count(s: &str) -> String {
     let Ok(n) = s.parse::<u64>() else {
         return s.to_string();
     };
-    let raw = n.to_string();
-    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
-    for (i, ch) in raw.chars().enumerate() {
-        if i > 0 && (raw.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
+    thousands(n)
 }
 
 fn pluralize<'a>(singular: &'a str, count: &str) -> &'a str {

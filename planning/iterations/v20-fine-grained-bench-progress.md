@@ -55,6 +55,11 @@ assumes calibration progress exists under the `calibrate` step; if calibrate is
 silent, that becomes a no-op fallback rather than a tested live path, and the
 host-smoke acceptance should be reworded accordingly.
 
+Also observe total-less progress phases during the host smoke. The Slack
+coalescer buckets total-less counters by fixed raw-count intervals; if upstream
+emits high-magnitude total-less counters in practice, switch that path to a
+scaling bucket or require totals for long-running phases.
+
 ## Scope
 
 - Capture benchmark stderr separately from the serial console by redirecting it
@@ -208,16 +213,16 @@ churn.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
 - [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
 - [ ] A long block-range run shows live indexing/warmup/replay progress in Slack.
-- [ ] Slack updates remain bounded and readable; no event-per-line spam.
-- [ ] A run with no JSONL still shows the existing coarse phase card.
+- [x] Slack updates remain bounded and readable; no event-per-line spam.
+- [x] A run with no JSONL still shows the existing coarse phase card.
 
 **Tests:**
 
@@ -248,6 +253,8 @@ churn.
 
 - [ ] Host smoke: a calibrated two-repeat group displays calibration progress, then
   measured-run progress, without duplicate cards or per-repeat fan-out.
+- [ ] Host smoke confirms total-less progress phases are low-volume enough for
+  the fixed raw-count bucket, or records a follow-up to scale that path.
 
 **Tests:**
 

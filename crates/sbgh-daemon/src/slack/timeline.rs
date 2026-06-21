@@ -24,12 +24,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::bench_summary::RunResult;
+use crate::events::ProgressUpdate;
 use crate::job_source::{RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
 use crate::slack::card::{self, CardCtx, RepeatContext, RepeatSummary, Results, STAGES, TASK_IDS};
 use crate::slack::client::{
     COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, RUNNING_REACTION, SlackClient,
 };
+use crate::slack::progress::SlackProgressTranscript;
 use crate::slack::stream::{
     StreamChunk, StreamFailure, StreamTaskStatus, TaskUpdate, chunks_for_card,
     classify_stream_error, terminal_chunks_for_card,
@@ -108,6 +110,8 @@ struct State {
     /// Last semantic stream update. Heartbeats are debounced against this so a
     /// long benchmark keeps Slack's stream active without spamming the API.
     last_stream_update_at: Instant,
+    /// Compact progress transcript for the current run, reset by `begin_run`.
+    progress: SlackProgressTranscript,
 }
 
 impl SlackTimeline {
@@ -146,6 +150,7 @@ impl SlackTimeline {
                 stage_started_at: Instant::now(),
                 stage_outputs: std::array::from_fn(|_| None),
                 last_stream_update_at: Instant::now(),
+                progress: SlackProgressTranscript::default(),
             }),
         }
     }
@@ -169,6 +174,7 @@ impl SlackTimeline {
         st.stage = 0;
         st.stage_started_at = Instant::now();
         st.stage_outputs = std::array::from_fn(|_| None);
+        st.progress = SlackProgressTranscript::default();
         st.job = job.clone();
     }
 
@@ -221,6 +227,30 @@ impl SlackTimeline {
             st.last_stream_update_at = Instant::now();
             let (_, blocks, chunks, fallback) = self.render_running_locked(&st, st.stage);
             (blocks, chunks, fallback)
+        };
+        self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
+            .await;
+    }
+
+    /// Best-effort fine-grained progress. Streamed cards receive only newly
+    /// reached milestones; block-update fallback renders the compact snapshot.
+    pub async fn progress(&self, progress: &ProgressUpdate) {
+        let (blocks, chunks, fallback) = {
+            let mut st = self.state.lock().await;
+            if progress.run_index != st.job.benchmark_run_index || st.stage != 2 {
+                return;
+            }
+            let Some(delta) = st.progress.push(progress) else {
+                return;
+            };
+            st.last_stream_update_at = Instant::now();
+            let ctx = self.ctx(&st);
+            let mut card = card::running_card(&ctx, st.stage);
+            self.apply_timing(&mut card, &st);
+            self.apply_progress(&mut card, &st);
+            let chunks = vec![task_detail_event(2, &card.rows[2].title, &delta.details)];
+            let blocks = card::render(&card);
+            (blocks, chunks, card.title)
         };
         self.upsert_stream_or_blocks(&blocks, &chunks, &fallback)
             .await;
@@ -548,6 +578,7 @@ impl SlackTimeline {
         let ctx = self.ctx(st);
         let mut card = card::running_card(&ctx, stage);
         self.apply_timing(&mut card, st);
+        self.apply_progress(&mut card, st);
         let blocks = card::render(&card);
         let chunks = chunks_for_card(&card);
         (stage, blocks, chunks, card.title)
@@ -578,6 +609,17 @@ impl SlackTimeline {
                 row.details =
                     Some(format!("{details} · {}", format_elapsed(st.stage_started_at.elapsed())));
             }
+        }
+    }
+
+    fn apply_progress(&self, card: &mut card::Card, st: &State) {
+        if st.stage != 2 {
+            return;
+        }
+        if let Some(snapshot) = st.progress.snapshot()
+            && let Some(row) = card.rows.get_mut(2)
+        {
+            row.details = Some(snapshot);
         }
     }
 
@@ -1147,6 +1189,18 @@ mod tests {
         SlackTimeline::new(slack, store, job, "C1".into(), "REQ_TS".into(), resume_ts)
     }
 
+    fn progress_update(progress: u64) -> ProgressUpdate {
+        ProgressUpdate {
+            workflow_step: crate::events::WorkflowStep::Run,
+            run_index: 0,
+            requested_run_count: 1,
+            phase: "replay".into(),
+            progress,
+            total: Some(100),
+            message: Some("Replaying measured entries".into()),
+        }
+    }
+
     #[tokio::test]
     async fn started_posts_four_row_plan_and_persists_its_ts() {
         let slack = Arc::new(FakeSlack::default());
@@ -1228,6 +1282,60 @@ mod tests {
             "run 0 going running swaps in 🚀",
         );
         assert_eq!(slack.live_reactions(), vec![COMPLETED_REACTION.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn progress_appends_only_new_milestones_to_the_run_task() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store, Some("PLAN_TS".into()));
+
+        tl.started().await;
+        tl.advance(2).await;
+        tl.progress(&progress_update(1))
+            .await;
+        tl.progress(&progress_update(5))
+            .await;
+        tl.progress(&progress_update(12))
+            .await;
+
+        let appends = slack.appends.lock().unwrap();
+        assert_eq!(
+            appends.len(),
+            4,
+            "started + advance + two progress milestones; 5% stays quiet: {appends:?}",
+        );
+        assert!(appends[2].contains("\"id\":\"run\""), "{}", appends[2]);
+        assert!(appends[2].contains("Replaying measured entries"), "{}", appends[2]);
+        assert!(appends[2].contains("1 / 100 (0%)"), "{}", appends[2]);
+        assert!(appends[3].contains("12 / 100 (10%)"), "{}", appends[3]);
+    }
+
+    #[tokio::test]
+    async fn progress_block_fallback_renders_compact_snapshot() {
+        let slack = Arc::new(FakeSlack::default());
+        slack
+            .append_failures
+            .lock()
+            .unwrap()
+            .push("message_not_in_streaming_state".into());
+        let store = Arc::new(RecordingStore::default());
+        let tl = timeline(slack.clone(), store, Some("PLAN_TS".into()));
+
+        tl.started().await; // injected append failure flips to block updates
+        tl.advance(2).await;
+        tl.progress(&progress_update(1))
+            .await;
+        tl.progress(&progress_update(12))
+            .await;
+
+        let updates = slack.updates.lock().unwrap();
+        let latest = updates
+            .last()
+            .expect("progress updates blocks");
+        assert!(latest.contains("Replaying measured entries"), "{latest}");
+        assert!(latest.contains("1 / 100 (0%)"), "{latest}");
+        assert!(latest.contains("12 / 100 (10%)"), "{latest}");
     }
 
     #[tokio::test]

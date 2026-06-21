@@ -382,11 +382,8 @@ fn avg_us_per(total_us: u64, divisor: Option<u64>) -> String {
     }
 }
 
-/// 1234567 → "1,234,567". Reads better in a results table than the
-/// raw u64. Comma-grouping by reversing the digits, inserting commas
-/// every 3, then reversing back — straightforward, no off-by-one
-/// arithmetic to second-guess.
-fn thousands<N: ToString>(n: N) -> String {
+/// Render a number with comma thousands separators.
+pub fn thousands<N: ToString>(n: N) -> String {
     let s = n.to_string();
     let (sign, digits) = match s.strip_prefix('-') {
         Some(rest) => ("-", rest),
@@ -787,6 +784,7 @@ mod tests {
         assert_eq!(thousands(1_000_u64), "1,000");
         assert_eq!(thousands(1_234_567_u64), "1,234,567");
         assert_eq!(thousands(12_345_678_u64), "12,345,678");
+        assert_eq!(thousands(-12_345_i64), "-12,345");
     }
 
     #[test]

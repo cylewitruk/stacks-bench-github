@@ -36,9 +36,9 @@ use sbgh_core::github::{
 use tokio::sync::Mutex;
 
 use crate::artifact_store::{ArtifactStore, GROUP_SQLITE_RELATIVE, group_artifact_key};
-use crate::bench_summary::{self, RunResult};
+use crate::bench_summary::{self, RunResult, thousands};
 use crate::comparison::BaselineComparison;
-use crate::events::PhaseLabel;
+use crate::events::{PhaseLabel, ProgressUpdate};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
 use crate::slack::card::RepeatSummary;
@@ -72,6 +72,8 @@ pub trait ReportSurface: Send + Sync {
     async fn phase(&self, label: &PhaseLabel, elapsed: Duration);
     /// A periodic "still alive" tick within the current phase (best-effort).
     async fn heartbeat(&self, label: &PhaseLabel, elapsed: Duration);
+    /// Fine-grained task progress (best-effort).
+    async fn progress(&self, progress: &ProgressUpdate);
     /// Terminal success — the run produced results.
     async fn completed(&self, summary: &serde_json::Value, comparison: Option<&BaselineComparison>);
     /// Terminal failure — the run couldn't run / produce results.
@@ -364,6 +366,74 @@ impl ReportSurface for GitHubReportSurface {
             .await;
     }
 
+    async fn progress(&self, progress: &ProgressUpdate) {
+        let comment_id = self.comment_id();
+        let check_run_id = self.check_run_id();
+        if comment_id.is_none() && check_run_id.is_none() {
+            tracing::debug!(job_id = %self.job.id, phase = %progress.phase, "progress (no reporting surface)");
+            return;
+        }
+
+        {
+            let mut state = self.phase_state.lock().await;
+            if let Some(last) = state.last_update_at
+                && last.elapsed() < PR_UPDATE_MIN_INTERVAL
+            {
+                tracing::trace!(
+                    phase = %progress.phase,
+                    since_last = ?last.elapsed(),
+                    "progress update debounced",
+                );
+                return;
+            }
+            state.last_update_at = Some(Instant::now());
+        }
+
+        let summary = format_progress_summary(progress);
+        if let Some(comment_id) = comment_id {
+            let body = format!(
+                ":construction: benchmark `{id}` — {summary} (commit `{sha}`)",
+                id = self.job.id,
+                sha = self.job.commit,
+            );
+            if let Err(e) = self
+                .gh
+                .update_pr_comment(
+                    self.job.installation_id,
+                    &self.job.repository,
+                    comment_id,
+                    &body,
+                )
+                .await
+            {
+                tracing::warn!(error = ?e, "progress comment update failed (non-fatal)");
+            }
+        }
+
+        if let Some(check_run_id) = check_run_id {
+            let output = CheckRunOutput {
+                title: "Benchmark progress".into(),
+                summary: format!("{summary} — commit `{}`", self.job.commit),
+                text: None,
+            };
+            if let Err(e) = self
+                .gh
+                .update_check_run(
+                    self.job.installation_id,
+                    &self.job.repository,
+                    check_run_id,
+                    CheckRunUpdate {
+                        state: CheckRunState::InProgress,
+                        output,
+                    },
+                )
+                .await
+            {
+                tracing::warn!(error = ?e, "progress check update failed (non-fatal)");
+            }
+        }
+    }
+
     async fn completed(
         &self,
         summary: &serde_json::Value,
@@ -552,6 +622,12 @@ impl ReportSurface for SlackReportSurface {
         }
     }
 
+    async fn progress(&self, progress: &ProgressUpdate) {
+        self.timeline()
+            .progress(progress)
+            .await;
+    }
+
     async fn completed(
         &self,
         summary: &serde_json::Value,
@@ -711,6 +787,7 @@ impl ReportSurface for NoopReportSurface {
     async fn started(&self) {}
     async fn phase(&self, _label: &PhaseLabel, _elapsed: Duration) {}
     async fn heartbeat(&self, _label: &PhaseLabel, _elapsed: Duration) {}
+    async fn progress(&self, _progress: &ProgressUpdate) {}
     async fn completed(&self, _s: &serde_json::Value, _c: Option<&BaselineComparison>) {}
     async fn failed(&self, _error: &str) {}
     async fn cancelled(&self, _reason: &str) {}
@@ -777,6 +854,24 @@ fn humanize_phase(label: &PhaseLabel) -> String {
         "build (cached staging)".to_string()
     } else {
         name
+    }
+}
+
+fn format_progress_summary(progress: &ProgressUpdate) -> String {
+    let base = match progress.total {
+        Some(total) if total > 0 => {
+            format!("{}: {} / {}", progress.phase, thousands(progress.progress), thousands(total))
+        }
+        _ => format!("{}: {}", progress.phase, thousands(progress.progress)),
+    };
+    match progress
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|msg| !msg.is_empty())
+    {
+        Some(message) => format!("{base} — {message}"),
+        None => base,
     }
 }
 
@@ -990,6 +1085,42 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
             "check updated"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_progress_updates_both_comment_and_check() {
+        let gh = Arc::new(FakeGitHub::new());
+        let job = job_with(ProgressTarget::PullRequest {
+            pr_number: 7,
+            comment_id: Some(800),
+            check_run_id: Some(900),
+            check_run_url: None,
+        });
+        github(&gh, job)
+            .progress(&ProgressUpdate {
+                workflow_step: crate::events::WorkflowStep::Run,
+                run_index: 0,
+                requested_run_count: 1,
+                phase: "replay".into(),
+                progress: 42,
+                total: Some(100),
+                message: Some("Replaying measured entries".into()),
+            })
+            .await;
+
+        let calls = gh.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateComment { body, .. } if body.contains("replay: 42 / 100"))),
+            "comment updated with latest progress"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, FakeCall::UpdateCheckRun { output, .. } if output.summary.contains("replay: 42 / 100"))),
+            "check updated with latest progress"
         );
     }
 
@@ -1249,6 +1380,47 @@ mod tests {
             vec![RUNNING_REACTION.to_string(), COMPLETED_REACTION.to_string()],
             "⏳ → 🚀 (run 0 started) → ✅ (completed)",
         );
+    }
+
+    #[tokio::test]
+    async fn slack_surface_renders_progress_on_the_shared_card() {
+        let recording = Arc::new(FakeSlack::default());
+        let slack = recording.clone() as Arc<dyn SlackClient>;
+        let jobs: Arc<dyn RunnableJobStore> = Arc::new(RecordingStore::default());
+        let surface = build_report_surface(
+            Arc::new(FakeGitHub::new()),
+            jobs,
+            store(),
+            Some(&slack),
+            &Arc::new(SlackSessionRegistry::new()),
+            &slack_job(),
+        );
+
+        surface.started().await;
+        surface
+            .phase(&PhaseLabel::new("running", false), Duration::ZERO)
+            .await;
+        surface
+            .progress(&ProgressUpdate {
+                workflow_step: crate::events::WorkflowStep::Run,
+                run_index: 0,
+                requested_run_count: 1,
+                phase: "replay".into(),
+                progress: 10,
+                total: Some(100),
+                message: Some("Replaying measured entries".into()),
+            })
+            .await;
+
+        let updates = recording
+            .update_blocks
+            .lock()
+            .unwrap();
+        let rendered = updates
+            .last()
+            .expect("progress updates the Slack card");
+        assert!(rendered.contains("Replaying measured entries"), "{rendered}");
+        assert!(rendered.contains("10 / 100 (10%)"), "{rendered}");
     }
 
     #[tokio::test]

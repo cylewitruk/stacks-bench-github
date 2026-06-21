@@ -17,6 +17,7 @@ pub mod api_client;
 pub mod card;
 pub mod client;
 pub mod connector;
+pub mod progress;
 pub mod session;
 pub mod socket;
 pub mod stream;

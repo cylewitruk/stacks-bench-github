@@ -216,17 +216,9 @@ impl Reporter {
                         .await;
                 }
                 WorkerEvent::Progress(progress) => {
-                    tracing::debug!(
-                        job_id = %self.job.id,
-                        workflow_step = %progress.workflow_step,
-                        run_index = progress.run_index,
-                        requested_run_count = progress.requested_run_count,
-                        phase = %progress.phase,
-                        progress = progress.progress,
-                        total = ?progress.total,
-                        message = ?progress.message,
-                        "received fine-grained benchmark progress",
-                    );
+                    surface
+                        .progress(&progress)
+                        .await;
                 }
                 WorkerEvent::Finished(terminal) => {
                     saw_terminal = true;
