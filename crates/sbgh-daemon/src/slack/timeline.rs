@@ -1306,9 +1306,9 @@ mod tests {
             "started + advance + two progress milestones; 5% stays quiet: {appends:?}",
         );
         assert!(appends[2].contains("\"id\":\"run\""), "{}", appends[2]);
-        assert!(appends[2].contains("Replaying measured entries"), "{}", appends[2]);
-        assert!(appends[2].contains("1 / 100 (0%)"), "{}", appends[2]);
-        assert!(appends[3].contains("12 / 100 (10%)"), "{}", appends[3]);
+        assert!(appends[2].contains("Measuring"), "{}", appends[2]);
+        assert!(appends[2].contains("1 / 100 entries (0%)"), "{}", appends[2]);
+        assert!(appends[3].contains("12 / 100 entries (10%)"), "{}", appends[3]);
     }
 
     #[tokio::test]
@@ -1333,9 +1333,9 @@ mod tests {
         let latest = updates
             .last()
             .expect("progress updates blocks");
-        assert!(latest.contains("Replaying measured entries"), "{latest}");
-        assert!(latest.contains("1 / 100 (0%)"), "{latest}");
-        assert!(latest.contains("12 / 100 (10%)"), "{latest}");
+        assert!(latest.contains("Measuring"), "{latest}");
+        assert!(latest.contains("1 / 100 entries (0%)"), "{latest}");
+        assert!(latest.contains("12 / 100 entries (10%)"), "{latest}");
     }
 
     #[tokio::test]

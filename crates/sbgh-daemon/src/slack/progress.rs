@@ -53,11 +53,12 @@ struct StepTranscript {
 
 impl StepTranscript {
     fn push(&mut self, update: &ProgressUpdate) -> Option<ProgressDelta> {
+        let phase = phase_view(update)?;
         let mut additions = Vec::new();
         if self.current_phase.as_deref() != Some(update.phase.as_str()) {
             self.current_phase = Some(update.phase.clone());
             self.last_percent_milestone = None;
-            additions.push(phase_heading(update));
+            additions.push(phase.heading.to_string());
         }
 
         let milestone = milestone(update)?;
@@ -66,14 +67,21 @@ impl StepTranscript {
         }
 
         self.last_percent_milestone = Some(milestone);
-        additions.push(milestone_line(update, milestone));
+        if let Some(line) = milestone_line(update, milestone, phase) {
+            additions.push(line);
+        }
+        if additions.is_empty() {
+            return None;
+        }
         Some(self.commit(additions))
     }
 
     fn commit(&mut self, additions: Vec<String>) -> ProgressDelta {
         self.lines
             .extend(additions.clone());
-        ProgressDelta { details: additions.join("\n") }
+        ProgressDelta {
+            details: format!("\n{}", additions.join("\n")),
+        }
     }
 
     fn snapshot(&self) -> Option<String> {
@@ -81,12 +89,46 @@ impl StepTranscript {
     }
 }
 
-fn phase_heading(update: &ProgressUpdate) -> String {
-    let label = phase_label(&update.phase);
-    match &update.message {
-        Some(message) if !message.trim().is_empty() => format!("{label}: {}", message.trim()),
-        _ => label.to_string(),
-    }
+#[derive(Debug, Clone, Copy)]
+struct PhaseView {
+    heading: &'static str,
+    unit: Option<&'static str>,
+}
+
+fn phase_view(update: &ProgressUpdate) -> Option<PhaseView> {
+    let view = match update.phase.as_str() {
+        "baseline" => PhaseView {
+            heading: "Baseline calibration",
+            unit: Some("blocks"),
+        },
+        "warmup" => PhaseView {
+            heading: "Warming up",
+            unit: Some("entries"),
+        },
+        "replay" => PhaseView {
+            heading: "Measuring",
+            unit: Some("entries"),
+        },
+        "indexing" | "index_merge" | "index_checkpoint" | "index_vacuum" | "txid_scan" => {
+            PhaseView {
+                heading: "Indexing blocks and transactions",
+                unit: Some("blocks"),
+            }
+        }
+        "metrics" => PhaseView {
+            heading: "Collecting metrics",
+            unit: Some("rows"),
+        },
+        "cleanup" => PhaseView {
+            heading: "Cleaning up",
+            unit: None,
+        },
+        // These upstream messages are operational/debug context. The Slack
+        // card already shows the requested workload and daemon-owned flags.
+        "setup" | "planning" => return None,
+        _ => PhaseView { heading: "Working", unit: None },
+    };
+    Some(view)
 }
 
 fn milestone(update: &ProgressUpdate) -> Option<u64> {
@@ -104,40 +146,20 @@ fn milestone(update: &ProgressUpdate) -> Option<u64> {
     }
 }
 
-fn milestone_line(update: &ProgressUpdate, milestone: u64) -> String {
-    let line = match update.total {
+fn milestone_line(update: &ProgressUpdate, milestone: u64, phase: PhaseView) -> Option<String> {
+    if update.progress == 0 && update.total.is_none() {
+        return None;
+    }
+    Some(match update.total {
         Some(total) if total > 0 => {
-            format!("{} / {} ({}%)", thousands(update.progress), thousands(total), milestone)
+            let unit = phase.unit.unwrap_or("items");
+            format!("{} / {} {unit} ({}%)", thousands(update.progress), thousands(total), milestone)
         }
-        _ => thousands(update.progress),
-    };
-    match update
-        .message
-        .as_deref()
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-    {
-        Some(message) => format!("{line} — {message}"),
-        None => line,
-    }
-}
-
-fn phase_label(phase: &str) -> &'static str {
-    match phase {
-        "baseline" => "Calibrating baselines",
-        "warmup" => "Warming up",
-        "replay" => "Replaying measured entries",
-        "indexing" => "Indexing chainstate",
-        "index_merge" => "Merging index",
-        "index_checkpoint" => "Checkpointing index",
-        "index_vacuum" => "Compacting index",
-        "txid_scan" => "Scanning transactions",
-        "setup" => "Setting up benchmark",
-        "planning" => "Planning benchmark",
-        "metrics" => "Collecting metrics",
-        "cleanup" => "Cleaning up",
-        _ => "Working",
-    }
+        _ => match phase.unit {
+            Some(unit) => format!("{} {unit}", thousands(update.progress)),
+            None => thousands(update.progress),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -166,12 +188,12 @@ mod tests {
         assert!(
             first
                 .details
-                .contains("Replaying measured entries")
+                .contains("Measuring")
         );
         assert!(
             first
                 .details
-                .contains("1 / 100 (0%)")
+                .contains("1 / 100 entries (0%)")
         );
 
         assert!(
@@ -184,12 +206,12 @@ mod tests {
         let next = transcript
             .push(&update("replay", 12, Some(100)))
             .expect("new 10% bucket emits");
-        assert_eq!(next.details, "12 / 100 (10%)");
+        assert_eq!(next.details, "\n12 / 100 entries (10%)");
         assert!(
             transcript
                 .snapshot()
                 .unwrap()
-                .contains("12 / 100 (10%)")
+                .contains("12 / 100 entries (10%)")
         );
     }
 
@@ -202,8 +224,8 @@ mod tests {
         transcript.push(&update("replay", 50, Some(100)));
 
         let snapshot = transcript.snapshot().unwrap();
-        assert!(snapshot.contains("Calibrating baselines"));
-        assert!(snapshot.contains("Replaying measured entries"));
+        assert!(snapshot.contains("Baseline calibration"));
+        assert!(snapshot.contains("Measuring"));
         assert!(snapshot.contains("\n\n"));
     }
 
@@ -217,12 +239,12 @@ mod tests {
         assert!(
             first
                 .details
-                .contains("Scanning transactions")
+                .contains("Indexing blocks and transactions")
         );
         assert!(
             first
                 .details
-                .contains("38,400")
+                .contains("38,400 blocks")
         );
 
         assert!(
@@ -235,11 +257,11 @@ mod tests {
         let next = transcript
             .push(&update("txid_scan", 40_000, None))
             .expect("new raw-count bucket emits");
-        assert_eq!(next.details, "40,000");
+        assert_eq!(next.details, "\n40,000 blocks");
     }
 
     #[test]
-    fn milestone_lines_keep_messages() {
+    fn rendering_ignores_upstream_messages() {
         let mut transcript = SlackProgressTranscript::default();
         let mut done = update("baseline", 1_900, Some(1_900));
         done.workflow_step = WorkflowStep::Calibrate;
@@ -252,12 +274,42 @@ mod tests {
         assert!(
             first
                 .details
-                .contains("Calibrating baselines: Baseline converged after 38 segments")
+                .contains("Baseline calibration")
         );
         assert!(
             first
                 .details
-                .contains("1,900 / 1,900 (100%) — Baseline converged after 38 segments")
+                .contains("1,900 / 1,900 blocks (100%)")
+        );
+        assert!(
+            !first
+                .details
+                .contains("converged after")
+        );
+    }
+
+    #[test]
+    fn skips_noisy_setup_and_planning_messages() {
+        let mut transcript = SlackProgressTranscript::default();
+        let mut setup = update("setup", 0, None);
+        setup.message = Some("DESTRUCTIVE: --dangerous-no-chainstate-copy enabled".into());
+        assert!(
+            transcript
+                .push(&setup)
+                .is_none()
+        );
+
+        let mut planning = update("planning", 0, None);
+        planning.message = Some("Benchmark plan: mode=txid targets=1".into());
+        assert!(
+            transcript
+                .push(&planning)
+                .is_none()
+        );
+        assert!(
+            transcript
+                .snapshot()
+                .is_none()
         );
     }
 }

@@ -858,20 +858,11 @@ fn humanize_phase(label: &PhaseLabel) -> String {
 }
 
 fn format_progress_summary(progress: &ProgressUpdate) -> String {
-    let base = match progress.total {
+    match progress.total {
         Some(total) if total > 0 => {
             format!("{}: {} / {}", progress.phase, thousands(progress.progress), thousands(total))
         }
         _ => format!("{}: {}", progress.phase, thousands(progress.progress)),
-    };
-    match progress
-        .message
-        .as_deref()
-        .map(str::trim)
-        .filter(|msg| !msg.is_empty())
-    {
-        Some(message) => format!("{base} — {message}"),
-        None => base,
     }
 }
 
@@ -1419,8 +1410,8 @@ mod tests {
         let rendered = updates
             .last()
             .expect("progress updates the Slack card");
-        assert!(rendered.contains("Replaying measured entries"), "{rendered}");
-        assert!(rendered.contains("10 / 100 (10%)"), "{rendered}");
+        assert!(rendered.contains("Measuring"), "{rendered}");
+        assert!(rendered.contains("10 / 100 entries (10%)"), "{rendered}");
     }
 
     #[tokio::test]
