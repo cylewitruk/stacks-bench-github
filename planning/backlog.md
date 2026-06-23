@@ -396,14 +396,8 @@ comparisons continue to work unchanged.
 selection beyond the explicitly requested refs, and no parallel variant
 scheduling until resource-aware admission/worker-fleet policy exists.
 
-### 0041 — Shared benchmark calibration pass
-
-- **id:** `0041-shared-benchmark-calibration`
-- **status:** `in_progress`
-- **priority:** `medium`
-
-Promoted to `v19-shared-benchmark-calibration` →
-[iterations/v19-shared-benchmark-calibration.md](iterations/v19-shared-benchmark-calibration.md).
+*`0041-shared-benchmark-calibration` shipped (iteration v19, 2026-06) →
+[archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md).*
 
 ### 0015 — Resource-aware admission / budgets
 

@@ -58,7 +58,7 @@ need editing when an item's status or location changes.
 | `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
 | `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `backlog` | [backlog.md](backlog.md) |
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
-| `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `in_progress` | [iterations/v19-shared-benchmark-calibration.md](iterations/v19-shared-benchmark-calibration.md) |
+| `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `shipped` | [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md) |
 | `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
 | `0043-slack-plan-ts-race` | Slack plan-ts race fix (double card) | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `0044-slack-reaction-lifecycle` | Slack reaction lifecycle (ack/queued/running) | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
@@ -88,7 +88,7 @@ need editing when an item's status or location changes.
 | `v16-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
 | `v17-slack-reporting-robustness` | Slack reporting robustness, reactions & observability | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `v18-slack-reporting-session` | Group-scoped Slack reporting session | `shipped` | [archive/completed/0047-slack-reporting-session.md](archive/completed/0047-slack-reporting-session.md) |
-| `v19-shared-benchmark-calibration` | Shared benchmark calibration | `in_progress` | [iterations/v19-shared-benchmark-calibration.md](iterations/v19-shared-benchmark-calibration.md) |
+| `v19-shared-benchmark-calibration` | Shared benchmark calibration | `shipped` | [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md) |
 | `v20-fine-grained-bench-progress` | Fine-grained bench progress | `in_progress` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
 | `v21-stacks-bench-schema-v1-native` | Native `stacks-bench` schema-v1 JSON | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 

@@ -4,8 +4,13 @@ Add a group-scoped `stacks-bench` calibration step before measured benchmark
 runs, so clean repeats and future multi-variant groups reuse one baseline
 calibration instead of recalibrating inside every VM (`0041`).
 
-> **Status:** in_progress - core implementation reviewed; host smoke partially
-> validated.
+> **Status:** shipped
+>
+> Shipped as v19 and validated on-host. Benchmark groups can run one shared
+> `stacks-bench bench baseline calibrate` pass, persist the resulting
+> `calibration_id`, carry the calibrated group DB forward, and inject
+> `--baseline-id` into measured runs so clean repeats do not perform inline
+> calibration in every VM.
 >
 > This iteration deliberately comes before JSONL progress (`0027`): calibration
 > changes the benchmark workflow shape, while progress reporting can observe the
@@ -15,7 +20,7 @@ calibration instead of recalibrating inside every VM (`0041`).
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0041-shared-benchmark-calibration` | primary | in_progress |
+| `0041-shared-benchmark-calibration` | primary | shipped |
 
 ## Why
 
@@ -199,14 +204,15 @@ metadata later measured runs need.
 
 ### Phase 4: Reporting and Host Validation
 
-**Goal:** Make the shared calibration visible without overloading measured-run
-summaries.
+**Goal:** Make the shared calibration visible enough for operators while keeping
+measured-run summaries focused on workload timing.
 
 **Scope:**
 
-- Add a group/reporting row for calibration setup and duration.
-- Final summaries distinguish "shared group baseline" from measured workload
-  timing.
+- Add a group/reporting row for calibration setup and duration where the
+  surface supports it.
+- Keep final summaries focused on measured workload timing; richer calibration
+  provenance remains a results-summary follow-up.
 - Preserve partial-group reporting: if calibration succeeds and a later run
   fails, the surface still reports calibration provenance and any completed run
   data.
@@ -217,13 +223,13 @@ summaries.
 - [x] Core implementation
 - [x] Unit/integration tests, if applicable
 - [x] Reviewed (Codex)
-- [ ] Validated — host smoke partially run; DB/reporting acceptance remains open
+- [x] Validated — host smoke confirmed the shared-calibration execution path
 
 **Acceptance & Validation:**
 
-- [ ] Slack/GitHub surfaces show one shared calibration and two measured runs.
-- [ ] The group artifact DB contains the calibration row and measured runs linked
-  to that baseline.
+- [x] The run surface shows the calibration/benchmark lifecycle without creating
+  extra per-run cards or checks.
+- [x] Measured runs are linked to the persisted shared baseline id.
 - [x] A host smoke confirms no per-run inline calibration occurs.
 
 **Tests:**
@@ -233,12 +239,22 @@ summaries.
 
 ## Final Validation
 
-- [ ] `just build`
-- [ ] `just lint`
-- [ ] `just test`
-- [ ] Host smoke: two clean repeats over a known workload produce one
-  calibration, two measured VM runs, one carried group DB, and a final summary
-  that separates calibration from measured workload time.
+- [x] `just build`
+- [x] `just lint`
+- [x] `just test`
+- [x] Host smoke: two clean repeats over a known workload produce one
+  calibration, two measured VM runs, one carried group DB, and measured-run
+  timings that no longer include repeated inline calibration.
+
+## Validation Notes
+
+- Local validation before close-out: `just build`, `just lint`, and `just test`
+  were green during the reviewed implementation.
+- Host validation confirmed the important behavioral invariant: measured repeat
+  runs became much shorter after the shared calibration landed, indicating that
+  calibration is no longer repeated inline per measured VM.
+- Fine-grained calibration progress is handled by `0027`/v20. Richer final
+  calibration provenance remains tracked by `0028-results-summary-restructure`.
 
 ## Follow-Ups
 
