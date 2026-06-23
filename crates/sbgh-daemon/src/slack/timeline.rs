@@ -24,10 +24,13 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::bench_summary::RunResult;
+use crate::comparison::GroupComparison;
 use crate::events::ProgressUpdate;
 use crate::job_source::{RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
-use crate::slack::card::{self, CardCtx, RepeatContext, RepeatSummary, Results, STAGES, TASK_IDS};
+use crate::slack::card::{
+    self, CardCtx, GroupRunContext, RepeatContext, RepeatSummary, Results, STAGES, TASK_IDS,
+};
 use crate::slack::client::{
     COMPLETED_REACTION, FAILED_REACTION, QUEUED_REACTION, RUNNING_REACTION, SlackClient,
 };
@@ -67,11 +70,16 @@ pub struct SlackTimeline {
     group_id: Uuid,
     benchmark_spec_id: Uuid,
     requested_run_count: i32,
+    group_requested_run_count: i32,
     group_artifact_prefix: String,
     bench_args: Vec<String>,
     /// The current run's index — sync-readable so the (lock-free) terminal /
     /// reaction predicates don't need the state lock. Updated by `begin_run`.
     run_index: AtomicI32,
+    /// Current run's position across the entire group. For a comparison group,
+    /// this advances across specs; for a single-spec repeat group it matches
+    /// `run_index`.
+    group_run_index: AtomicI32,
     state: Mutex<State>,
 }
 
@@ -131,11 +139,13 @@ impl SlackTimeline {
             group_id: job.benchmark_group_id,
             benchmark_spec_id: job.benchmark_spec_id,
             requested_run_count: job.requested_run_count,
+            group_requested_run_count: job.group_requested_run_count,
             group_artifact_prefix: job
                 .group_artifact_prefix
                 .clone(),
             bench_args: job.bench_args.clone(),
             run_index: AtomicI32::new(job.benchmark_run_index),
+            group_run_index: AtomicI32::new(job.group_run_index),
             state: Mutex::new(State {
                 job_id: job.id.to_string(),
                 rev: job.git_ref_display.clone(),
@@ -164,6 +174,8 @@ impl SlackTimeline {
     pub async fn begin_run(&self, job: &RunnableJob) {
         self.run_index
             .store(job.benchmark_run_index, Ordering::SeqCst);
+        self.group_run_index
+            .store(job.group_run_index, Ordering::SeqCst);
         let mut st = self.state.lock().await;
         st.job_id = job.id.to_string();
         st.rev = job.git_ref_display.clone();
@@ -396,14 +408,18 @@ impl SlackTimeline {
     }
 
     pub fn is_repeat_group(&self) -> bool {
-        self.requested_run_count > 1
+        self.group_requested_run_count > 1
     }
 
     pub fn is_final_repeat(&self) -> bool {
-        self.run_index
+        self.group_run_index
             .load(Ordering::SeqCst)
             + 1
-            >= self.requested_run_count
+            >= self.group_requested_run_count
+    }
+
+    pub fn renders_repeat_summary(&self) -> bool {
+        self.requested_run_count > 1 && self.group_requested_run_count == self.requested_run_count
     }
 
     pub fn benchmark_spec_id(&self) -> Uuid {
@@ -446,10 +462,12 @@ impl SlackTimeline {
         result: Option<RunResult>,
         db_url: Option<String>,
         repeat_summary: Option<RepeatSummary>,
+        comparison: Option<&GroupComparison>,
     ) {
         let results = Results {
             metrics: result.as_ref(),
             repeat_summary: repeat_summary.as_ref(),
+            comparison,
             db_url: db_url.as_deref(),
         };
         let (blocks, chunks, result_blocks, fallback) = {
@@ -525,6 +543,7 @@ impl SlackTimeline {
         let results = (repeat_summary.is_some() || db_url.is_some()).then_some(Results {
             metrics: None,
             repeat_summary: repeat_summary.as_ref(),
+            comparison: None,
             db_url: db_url.as_deref(),
         });
         let (blocks, chunks, result_blocks, fallback) = {
@@ -563,6 +582,12 @@ impl SlackTimeline {
                 index: st.job.benchmark_run_index,
                 total: self.requested_run_count,
             }),
+            group_run: (self.group_requested_run_count > self.requested_run_count).then_some(
+                GroupRunContext {
+                    index: st.job.group_run_index,
+                    total: self.group_requested_run_count,
+                },
+            ),
             cached_build: st.cached_build.as_deref(),
             cached_build_staging: st
                 .cached_build_staging
@@ -1248,7 +1273,7 @@ mod tests {
         tl.started().await; // append (Build in_progress)
         tl.advance(2).await; // update (Run in_progress)
         tl.advance(1).await; // monotonic: no-op (earlier stage)
-        tl.completed(None, Some("https://s3/stacks-bench.db".into()), None)
+        tl.completed(None, Some("https://s3/stacks-bench.db".into()), None, None)
             .await; // update (all complete + results)
 
         assert_eq!(
@@ -1392,7 +1417,7 @@ mod tests {
         let tl = timeline(slack.clone(), store.clone(), Some("STREAM_TS".into()));
 
         tl.started().await;
-        tl.completed(None, Some("https://s3/stacks-bench.db".into()), None)
+        tl.completed(None, Some("https://s3/stacks-bench.db".into()), None, None)
             .await;
 
         assert!(
@@ -1621,6 +1646,40 @@ mod tests {
             1
         );
         assert!(tl.is_final_repeat(), "run 1 of 2 is the final repeat");
+    }
+
+    #[tokio::test]
+    async fn group_run_index_controls_comparison_group_terminal_status() {
+        let slack = Arc::new(FakeSlack::default());
+        let store = Arc::new(RecordingStore::default());
+        let mut first_variant = job();
+        first_variant.requested_run_count = 1;
+        first_variant.group_requested_run_count = 2;
+        first_variant.group_run_index = 0;
+        let tl = SlackTimeline::new(
+            slack,
+            store,
+            first_variant,
+            "C1".into(),
+            "REQ_TS".into(),
+            Some("STREAM_TS".into()),
+        );
+
+        assert!(tl.is_repeat_group(), "comparison groups share a multi-run surface");
+        assert!(
+            !tl.renders_repeat_summary(),
+            "comparison groups should not render clean-repeat aggregates",
+        );
+        assert!(!tl.is_final_repeat(), "spec 0/run 0 is not group-terminal");
+
+        let mut second_variant = job();
+        second_variant.requested_run_count = 1;
+        second_variant.group_requested_run_count = 2;
+        second_variant.group_run_index = 1;
+        tl.begin_run(&second_variant)
+            .await;
+
+        assert!(tl.is_final_repeat(), "spec 1/run 0 is group-terminal");
     }
 
     /// The registry returns one session per `(group, target)` across runs and

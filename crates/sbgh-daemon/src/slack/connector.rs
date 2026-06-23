@@ -489,6 +489,7 @@ impl SlackConnector {
                 index: 0,
                 total: clean_repetitions as i32,
             }),
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         };

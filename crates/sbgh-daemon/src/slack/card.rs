@@ -22,6 +22,7 @@ use sbgh_core::models::JobMetric;
 use serde_json::{Value, json};
 
 use crate::bench_summary::{self, DB_LINK_TTL_HUMAN, PlanTaskStatus, RunResult, thousands};
+use crate::comparison::{ComparisonUnavailable, GroupComparison, Verdict};
 
 /// An optional per-row link rendered as the task's `source` (e.g. "View
 /// commit").
@@ -49,6 +50,7 @@ pub struct CardRow {
 pub struct Results<'a> {
     pub metrics: Option<&'a RunResult>,
     pub repeat_summary: Option<&'a RepeatSummary>,
+    pub comparison: Option<&'a GroupComparison>,
     /// Presigned `stacks-bench.db` URL — S3-only, **presence-gated by the
     /// caller** (a dead link is never offered).
     pub db_url: Option<&'a str>,
@@ -65,6 +67,20 @@ pub struct RepeatContext {
 impl RepeatContext {
     fn label(self) -> Option<String> {
         (self.total > 1).then(|| format!("repeat {}/{}", self.index + 1, self.total))
+    }
+}
+
+/// Current measured execution position across a multi-spec comparison group.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupRunContext {
+    /// Zero-based group run index stored in `RunnableJob::group_run_index`.
+    pub index: i32,
+    pub total: i32,
+}
+
+impl GroupRunContext {
+    fn label(self) -> Option<String> {
+        (self.total > 1).then(|| format!("run {}/{}", self.index + 1, self.total))
     }
 }
 
@@ -136,6 +152,8 @@ pub struct CardCtx<'a> {
     pub bench_args: &'a [String],
     /// Isolated-repeat position when this job belongs to a multi-run group.
     pub repeat: Option<RepeatContext>,
+    /// Whole-group execution position when the group spans multiple specs.
+    pub group_run: Option<GroupRunContext>,
     /// Set when the Build phase was served from the binary cache (item 0025,
     /// v9) — the short fingerprint digest, surfaced as the Build row's
     /// title ("Reused cached build · …") instead of the plain "Built
@@ -396,17 +414,25 @@ fn title(ctx: &CardCtx, terminal: bool) -> String {
     match ctx.commit {
         Some(commit) => {
             let base = format!("{verb} {} @ {}", ctx.rev, short_commit(commit));
-            with_repeat_label(base, ctx.repeat)
+            with_run_labels(base, ctx.repeat, ctx.group_run)
         }
-        None => with_repeat_label(format!("{verb} {}", ctx.rev), ctx.repeat),
+        None => with_run_labels(format!("{verb} {}", ctx.rev), ctx.repeat, ctx.group_run),
     }
 }
 
-fn with_repeat_label(base: String, repeat: Option<RepeatContext>) -> String {
-    match repeat.and_then(RepeatContext::label) {
-        Some(label) => format!("{base} · {label}"),
-        None => base,
+fn with_run_labels(
+    base: String,
+    repeat: Option<RepeatContext>,
+    group_run: Option<GroupRunContext>,
+) -> String {
+    let mut labels = Vec::new();
+    if let Some(label) = repeat.and_then(RepeatContext::label) {
+        labels.push(label);
     }
+    if let Some(label) = group_run.and_then(GroupRunContext::label) {
+        labels.push(label);
+    }
+    if labels.is_empty() { base } else { format!("{base} · {}", labels.join(" · ")) }
 }
 
 fn short_commit(commit: &str) -> &str {
@@ -619,8 +645,10 @@ fn escape_mrkdwn(s: &str) -> String {
 /// `chat.stopStream`, where Slack renders final `blocks` below the streamed
 /// plan instead of replacing the plan itself.
 pub fn result_blocks(results: &Results) -> Vec<Value> {
-    let mut blocks =
-        vec![json!({ "type": "divider" }), markdown_block(results.metrics, results.repeat_summary)];
+    let mut blocks = vec![
+        json!({ "type": "divider" }),
+        markdown_block(results.metrics, results.repeat_summary, results.comparison),
+    ];
     // The primary download button — only when an in-bucket DB link exists.
     if let Some(url) = results.db_url {
         blocks.push(json!({ "type": "divider" }));
@@ -704,14 +732,30 @@ fn to_task_status(s: PlanTaskStatus) -> slack_messaging::blocks::TaskStatus {
 
 /// The `markdown` results block — a heading + the shared GFM metric table (or a
 /// fallback note when no metrics parsed).
-fn markdown_block(metrics: Option<&RunResult>, repeat: Option<&RepeatSummary>) -> Value {
-    json!({ "type": "markdown", "text": results_markdown(metrics, repeat) })
+fn markdown_block(
+    metrics: Option<&RunResult>,
+    repeat: Option<&RepeatSummary>,
+    comparison: Option<&GroupComparison>,
+) -> Value {
+    json!({ "type": "markdown", "text": results_markdown(metrics, repeat, comparison) })
 }
 
-fn results_markdown(metrics: Option<&RunResult>, repeat: Option<&RepeatSummary>) -> String {
+fn results_markdown(
+    metrics: Option<&RunResult>,
+    repeat: Option<&RepeatSummary>,
+    comparison: Option<&GroupComparison>,
+) -> String {
     let table = metrics
         .map(bench_summary::metric_table)
         .unwrap_or_default();
+    if let Some(comparison) = comparison {
+        let mut out = comparison_markdown(comparison);
+        if !table.is_empty() {
+            out.push_str("\n\n### Last Run\n\n");
+            out.push_str(&table);
+        }
+        return out;
+    }
     if let Some(repeat) = repeat {
         let mut out = repeat_markdown(repeat);
         if !table.is_empty() {
@@ -726,6 +770,122 @@ fn results_markdown(metrics: Option<&RunResult>, repeat: Option<&RepeatSummary>)
     } else {
         format!("## Benchmark Results\n\n{table}")
     }
+}
+
+fn comparison_markdown(comparison: &GroupComparison) -> String {
+    let mut out = String::from(
+        "## Comparison Summary\n\n| Variant | Samples | Execution+Commit | Delta | Verdict | \
+         Calibration |\n| ---- | ---- | ---- | ---- | ---- | ---- |\n",
+    );
+    out.push_str(&format!(
+        "| Baseline `{}` | {} | {} | — | — | {} |\n",
+        table_cell(
+            &comparison
+                .baseline
+                .ref_display
+        ),
+        samples_cell(
+            comparison
+                .baseline
+                .stats
+                .completed,
+            comparison
+                .baseline
+                .stats
+                .requested,
+        ),
+        stats_cell(&comparison.baseline.stats),
+        calibration_cell(
+            comparison
+                .baseline
+                .baseline_calibration_id
+        ),
+    ));
+    for delta in &comparison.variants {
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} |\n",
+            table_cell(&delta.variant.ref_display),
+            samples_cell(delta.variant.stats.completed, delta.variant.stats.requested),
+            stats_cell(&delta.variant.stats),
+            delta_cell(delta),
+            verdict_cell(delta),
+            calibration_cell(
+                delta
+                    .variant
+                    .baseline_calibration_id
+            ),
+        ));
+    }
+    out
+}
+
+fn samples_cell(completed: usize, requested: i32) -> String {
+    format!("{completed} / {}", requested.max(0))
+}
+
+fn stats_cell(stats: &crate::comparison::VariantRunStats) -> String {
+    stats
+        .combined_mean_us
+        .map(format_us)
+        .unwrap_or_else(|| "_No metrics_".to_string())
+}
+
+fn delta_cell(delta: &crate::comparison::VariantDelta) -> String {
+    let Some(comparison) = delta.comparison.as_ref() else {
+        return unavailable_cell(delta.unavailable);
+    };
+    let direction = if comparison.delta_pct > 0.05 {
+        "slower"
+    } else if comparison.delta_pct < -0.05 {
+        "faster"
+    } else {
+        "no change"
+    };
+    format!("{:+.2}% {direction}", comparison.delta_pct)
+}
+
+fn verdict_cell(delta: &crate::comparison::VariantDelta) -> String {
+    let Some(comparison) = delta.comparison.as_ref() else {
+        return unavailable_cell(delta.unavailable);
+    };
+    match comparison.sigma {
+        Some(sigma) if sigma.is_finite() => {
+            format!("{} ({sigma:.1}σ)", verdict_label(comparison.verdict))
+        }
+        Some(_) => format!("{} (∞σ)", verdict_label(comparison.verdict)),
+        None => verdict_label(comparison.verdict).to_string(),
+    }
+}
+
+fn unavailable_cell(unavailable: Option<ComparisonUnavailable>) -> String {
+    match unavailable {
+        Some(ComparisonUnavailable::MissingBaselineMetric) => "_Missing baseline metrics_",
+        Some(ComparisonUnavailable::MissingVariantMetric) => "_Missing metrics_",
+        Some(ComparisonUnavailable::IncomparableWorkload) => "_Incomparable workload_",
+        Some(ComparisonUnavailable::DegenerateBaseline) => "_Invalid baseline_",
+        None => "_Unavailable_",
+    }
+    .to_string()
+}
+
+fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Strong => "Strong",
+        Verdict::Moderate => "Moderate",
+        Verdict::Weak => "Weak",
+        Verdict::Inconclusive => "Inconclusive",
+        Verdict::Provisional => "Provisional",
+    }
+}
+
+fn calibration_cell(calibration_id: Option<i64>) -> String {
+    calibration_id
+        .map(|id| format!("#{id}"))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn table_cell(s: &str) -> String {
+    s.replace('|', "\\|")
 }
 
 fn repeat_markdown(repeat: &RepeatSummary) -> String {
@@ -927,6 +1087,7 @@ mod tests {
             job_id: "job-1",
             bench_args: &args,
             repeat: Some(RepeatContext { index: 0, total: 10 }),
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         };
@@ -958,6 +1119,7 @@ mod tests {
             job_id: "job-1",
             bench_args: &args,
             repeat: None,
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         };
@@ -979,6 +1141,7 @@ mod tests {
         card.results = Some(Results {
             metrics: Some(&r),
             repeat_summary: None,
+            comparison: None,
             db_url: Some("https://s3/stacks-bench.db"),
         });
 
@@ -1016,6 +1179,7 @@ mod tests {
         card.results = Some(Results {
             metrics: Some(&r),
             repeat_summary: None,
+            comparison: None,
             db_url: None,
         });
         let v = render(&card);
@@ -1092,7 +1256,7 @@ mod tests {
     /// table.
     #[test]
     fn results_markdown_falls_back_without_metrics() {
-        let md = results_markdown(None, None);
+        let md = results_markdown(None, None, None);
         assert!(md.starts_with("## Benchmark Results"), "{md}");
         assert!(md.contains("No parsed metrics"), "{md}");
         assert!(!md.contains("| Metric |"), "no empty table: {md}");
@@ -1108,6 +1272,7 @@ mod tests {
             job_id: "job-1",
             bench_args: &[],
             repeat: None,
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         }
@@ -1124,6 +1289,7 @@ mod tests {
             job_id: "job-1",
             bench_args: &[],
             repeat: None,
+            group_run: None,
             cached_build: Some("abc123def456"),
             cached_build_staging: false,
         };
@@ -1177,6 +1343,7 @@ mod tests {
             Results {
                 metrics: Some(&r),
                 repeat_summary: None,
+                comparison: None,
                 db_url: Some("https://s3/db"),
             },
         );
@@ -1206,6 +1373,7 @@ mod tests {
             job_id: "job-1",
             bench_args: &[],
             repeat: Some(RepeatContext { index: 1, total: 3 }),
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         };
@@ -1228,6 +1396,25 @@ mod tests {
                 .contains("repeat 2/3"),
             "{v}"
         );
+    }
+
+    #[test]
+    fn group_run_context_updates_title_without_repeat_summary() {
+        let group_ctx = CardCtx {
+            rev: "sb-integration/3.4.0.0.3",
+            commit: Some("e07976949c88"),
+            commit_url: Some("https://github.com/o/r/commit/e07976949c88"),
+            job_id: "job-1",
+            bench_args: &[],
+            repeat: None,
+            group_run: Some(GroupRunContext { index: 1, total: 2 }),
+            cached_build: None,
+            cached_build_staging: false,
+        };
+
+        let s = running(&group_ctx, 2).to_string();
+        assert!(s.contains("run 2/2"), "{s}");
+        assert!(!s.contains("repeat 2/2"), "{s}");
     }
 
     #[test]
@@ -1256,7 +1443,7 @@ mod tests {
             3,
             &[metric(1, 1_000, 100), metric(2, 1_200, 200), metric(3, 1_300, 300)],
         );
-        let md = results_markdown(Some(&r), Some(&summary));
+        let md = results_markdown(Some(&r), Some(&summary), None);
         assert!(md.contains("## Clean Repeat Summary"), "{md}");
         assert!(md.contains("| Samples | 3 / 3 |"), "{md}");
         assert!(md.contains("| Execution+Commit mean | 1,367 µs |"), "{md}");
@@ -1265,6 +1452,98 @@ mod tests {
         assert!(md.contains("| CV |"), "{md}");
         assert!(md.contains("### Last Run"), "{md}");
         assert!(md.contains("| Metric | Value |"), "{md}");
+    }
+
+    fn variant_stats(
+        requested: i32,
+        completed: usize,
+        mean: Option<f64>,
+    ) -> crate::comparison::VariantRunStats {
+        crate::comparison::VariantRunStats {
+            requested,
+            completed,
+            combined_mean_us: mean,
+            combined_min_us: mean.map(|v| v.round() as i64),
+            combined_max_us: mean.map(|v| v.round() as i64),
+            combined_stddev_us: Some(0.0),
+            combined_cv_pct: Some(0.0),
+            workload: Some(crate::comparison::WorkloadShape {
+                measured_blocks: 1,
+                warmup_blocks: 2,
+            }),
+            workload_consistent: true,
+        }
+    }
+
+    fn comparison_variant(
+        index: i32,
+        rev: &str,
+        completed: usize,
+        mean: Option<f64>,
+        baseline_id: Option<i64>,
+    ) -> crate::comparison::ComparisonVariant {
+        crate::comparison::ComparisonVariant {
+            benchmark_spec_id: uuid::Uuid::from_u128(index as u128 + 1),
+            spec_index: index,
+            ref_display: rev.to_string(),
+            commit: None,
+            baseline_calibration_id: baseline_id,
+            stats: variant_stats(3, completed, mean),
+        }
+    }
+
+    #[test]
+    fn comparison_summary_renders_before_last_run_metrics() {
+        let r = run_result();
+        let comparison = GroupComparison {
+            baseline: comparison_variant(0, "sb-integration/3.4.0.0.2", 3, Some(1_000.0), Some(11)),
+            variants: vec![crate::comparison::VariantDelta {
+                variant: comparison_variant(
+                    1,
+                    "sb-integration/3.4.0.0.3",
+                    3,
+                    Some(1_148.5),
+                    Some(12),
+                ),
+                comparison: Some(crate::comparison::Comparison {
+                    base_combined_us: 1_000,
+                    pr_combined_us: 1_149,
+                    delta_pct: 14.85,
+                    sigma: Some(3.4),
+                    verdict: Verdict::Strong,
+                }),
+                unavailable: None,
+            }],
+        };
+
+        let md = results_markdown(Some(&r), None, Some(&comparison));
+        assert!(md.contains("## Comparison Summary"), "{md}");
+        assert!(md.contains("Baseline `sb-integration/3.4.0.0.2`"), "{md}");
+        assert!(md.contains("`sb-integration/3.4.0.0.3`"), "{md}");
+        assert!(md.contains("+14.85% slower"), "{md}");
+        assert!(md.contains("Strong (3.4σ)"), "{md}");
+        assert!(md.contains("#11"), "{md}");
+        assert!(md.contains("#12"), "{md}");
+        assert!(md.contains("### Last Run"), "{md}");
+        assert!(md.contains("| Metric | Value |"), "{md}");
+        assert!(!md.contains("Clean Repeat Summary"), "{md}");
+    }
+
+    #[test]
+    fn comparison_summary_renders_unavailable_variants() {
+        let comparison = GroupComparison {
+            baseline: comparison_variant(0, "main", 1, Some(1_000.0), None),
+            variants: vec![crate::comparison::VariantDelta {
+                variant: comparison_variant(1, "candidate", 0, None, None),
+                comparison: None,
+                unavailable: Some(ComparisonUnavailable::MissingVariantMetric),
+            }],
+        };
+
+        let md = results_markdown(None, None, Some(&comparison));
+        assert!(md.contains("## Comparison Summary"), "{md}");
+        assert!(md.contains("_Missing metrics_"), "{md}");
+        assert!(!md.contains("No parsed metrics"), "{md}");
     }
 
     /// `failed(stage)` marks the errored row, earlier complete, later pending.
@@ -1298,6 +1577,7 @@ mod tests {
             job_id: "j",
             bench_args: &[],
             repeat: None,
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         };
@@ -1318,6 +1598,7 @@ mod tests {
             job_id: "j",
             bench_args: &[],
             repeat: None,
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         };
@@ -1347,6 +1628,7 @@ mod tests {
             job_id: "j",
             bench_args: &[],
             repeat: None,
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         };

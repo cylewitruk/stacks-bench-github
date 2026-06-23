@@ -30,7 +30,7 @@ use crate::bench_summary::RunResult;
 use crate::comparison::{BaselineComparison, GroupComparison, compare};
 use crate::events::{Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
-use crate::report::{ReportSurface, build_report_surface};
+use crate::report::{CompletionReport, ReportSurface, build_report_surface};
 use crate::slack::client::SlackClient;
 use crate::slack::session::SlackSessionRegistry;
 
@@ -480,7 +480,11 @@ impl Reporter {
                     .baseline_comparison(&summary)
                     .await;
                 surface
-                    .completed(&summary, comparison.as_ref())
+                    .completed(CompletionReport {
+                        summary: &summary,
+                        baseline_comparison: comparison.as_ref(),
+                        group_comparison: group_comparison.as_ref(),
+                    })
                     .await;
                 None
             }

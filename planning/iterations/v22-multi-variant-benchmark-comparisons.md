@@ -3,7 +3,7 @@
 Promote explicit ad-hoc comparison benchmarks so a Slack request can benchmark
 one workload against two refs and report one noise-aware delta summary (`0039`).
 
-> **Status:** in_progress - Phase 2 implemented and ready for external review.
+> **Status:** in_progress - Phase 5 implemented and ready for external review.
 >
 > v21 remains planned but deferred. Comparison benchmarks are the next
 > operational need, and they can build on the already-shipped group/run,
@@ -352,9 +352,9 @@ preserving one carried group DB and one calibration per variant.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
 - [ ] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**

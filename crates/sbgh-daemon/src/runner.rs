@@ -709,6 +709,7 @@ impl Coordinator {
             job_id: &job_id,
             bench_args: &job.bench_args,
             repeat: None,
+            group_run: None,
             cached_build: None,
             cached_build_staging: false,
         };

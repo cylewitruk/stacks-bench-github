@@ -37,7 +37,7 @@ use tokio::sync::Mutex;
 
 use crate::artifact_store::{ArtifactStore, GROUP_SQLITE_RELATIVE, group_artifact_key};
 use crate::bench_summary::{self, RunResult, thousands};
-use crate::comparison::BaselineComparison;
+use crate::comparison::{BaselineComparison, GroupComparison};
 use crate::events::{PhaseLabel, ProgressUpdate};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::libvirt::format_elapsed;
@@ -57,6 +57,16 @@ const DB_LINK_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// is always allowed through.
 const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Successful-run report data passed to surfaces at terminal completion.
+/// Surfaces consume only the fields they own: GitHub uses the PR baseline
+/// comparison, while Slack uses the group comparison for v22 ad-hoc
+/// comparison groups.
+pub struct CompletionReport<'a> {
+    pub summary: &'a serde_json::Value,
+    pub baseline_comparison: Option<&'a BaselineComparison>,
+    pub group_comparison: Option<&'a GroupComparison>,
+}
+
 /// A job's reporting surface — the whole lifecycle on one target family. Built
 /// once per job by [`build_report_surface`]; the reporter drives it (`started`
 /// → `phase`/`heartbeat` → one of `completed`/`failed`/`cancelled`).
@@ -75,7 +85,7 @@ pub trait ReportSurface: Send + Sync {
     /// Fine-grained task progress (best-effort).
     async fn progress(&self, progress: &ProgressUpdate);
     /// Terminal success — the run produced results.
-    async fn completed(&self, summary: &serde_json::Value, comparison: Option<&BaselineComparison>);
+    async fn completed(&self, report: CompletionReport<'_>);
     /// Terminal failure — the run couldn't run / produce results.
     async fn failed(&self, error: &str);
     /// Terminal cancellation — deliberately stopped (shutdown / orphan
@@ -434,13 +444,9 @@ impl ReportSurface for GitHubReportSurface {
         }
     }
 
-    async fn completed(
-        &self,
-        summary: &serde_json::Value,
-        comparison: Option<&BaselineComparison>,
-    ) {
+    async fn completed(&self, report: CompletionReport<'_>) {
         let body = self
-            .completed_body(summary, comparison)
+            .completed_body(report.summary, report.baseline_comparison)
             .await;
         self.update_comment(&body)
             .await;
@@ -628,11 +634,7 @@ impl ReportSurface for SlackReportSurface {
             .await;
     }
 
-    async fn completed(
-        &self,
-        summary: &serde_json::Value,
-        _comparison: Option<&BaselineComparison>,
-    ) {
+    async fn completed(&self, report: CompletionReport<'_>) {
         // Run-end is activity: refresh the abandonment clock so the next run's
         // inter-run carry-forward gap is bridged by the sweep's grace TTL.
         self.session.touch();
@@ -651,10 +653,13 @@ impl ReportSurface for SlackReportSurface {
                 .await;
             return;
         }
-        let result = parsed_run(self.store.as_ref(), summary).await;
+        let result = parsed_run(self.store.as_ref(), report.summary).await;
         let repeat_summary = if self
             .timeline()
-            .is_repeat_group()
+            .renders_repeat_summary()
+            && report
+                .group_comparison
+                .is_none()
         {
             self.repeat_summary().await
         } else {
@@ -663,24 +668,11 @@ impl ReportSurface for SlackReportSurface {
         let db_url = if self
             .timeline()
             .is_repeat_group()
-            && !self
-                .timeline()
-                .is_final_repeat()
-        {
-            signed_group_db_url(
-                self.store.as_ref(),
-                self.timeline()
-                    .group_artifact_prefix(),
-            )
-            .await
-        } else if self
-            .timeline()
-            .is_repeat_group()
         {
             // The final run's job-scoped DB has already been seeded from the
             // group DB and appended to by stacks-bench, while the runner's
             // final promotion to the group namespace happens after reporting.
-            match signed_db_url(self.store.as_ref(), summary).await {
+            match signed_db_url(self.store.as_ref(), report.summary).await {
                 Some(url) => Some(url),
                 None => {
                     signed_group_db_url(
@@ -692,10 +684,10 @@ impl ReportSurface for SlackReportSurface {
                 }
             }
         } else {
-            signed_db_url(self.store.as_ref(), summary).await
+            signed_db_url(self.store.as_ref(), report.summary).await
         };
         self.timeline()
-            .completed(result, db_url, repeat_summary)
+            .completed(result, db_url, repeat_summary, report.group_comparison)
             .await;
         self.reap_if_group_terminal(TerminalOutcome::Success);
     }
@@ -738,7 +730,14 @@ impl ReportSurface for SlackReportSurface {
 
 impl SlackReportSurface {
     async fn repeat_payload(&self) -> (Option<RepeatSummary>, Option<String>) {
-        let repeat_summary = self.repeat_summary().await;
+        let repeat_summary = if self
+            .timeline()
+            .renders_repeat_summary()
+        {
+            self.repeat_summary().await
+        } else {
+            None
+        };
         let db_url = signed_group_db_url(
             self.store.as_ref(),
             self.timeline()
@@ -788,7 +787,7 @@ impl ReportSurface for NoopReportSurface {
     async fn phase(&self, _label: &PhaseLabel, _elapsed: Duration) {}
     async fn heartbeat(&self, _label: &PhaseLabel, _elapsed: Duration) {}
     async fn progress(&self, _progress: &ProgressUpdate) {}
-    async fn completed(&self, _s: &serde_json::Value, _c: Option<&BaselineComparison>) {}
+    async fn completed(&self, _report: CompletionReport<'_>) {}
     async fn failed(&self, _error: &str) {}
     async fn cancelled(&self, _reason: &str) {}
 }
@@ -917,6 +916,14 @@ mod tests {
         Arc::new(LocalFsStore::new(std::env::temp_dir()))
     }
 
+    fn completion_report(summary: &serde_json::Value) -> CompletionReport<'_> {
+        CompletionReport {
+            summary,
+            baseline_comparison: None,
+            group_comparison: None,
+        }
+    }
+
     fn job_with(progress: ProgressTarget) -> RunnableJob {
         RunnableJob {
             id: Uuid::new_v4(),
@@ -966,8 +973,9 @@ mod tests {
     #[tokio::test]
     async fn github_completed_concludes_check_success() {
         let gh = Arc::new(FakeGitHub::new());
+        let summary = serde_json::json!({});
         github(&gh, check_job(11))
-            .completed(&serde_json::json!({}), None)
+            .completed(completion_report(&summary))
             .await;
         assert_eq!(
             concluded_state(&gh),
@@ -1322,6 +1330,56 @@ mod tests {
         }
     }
 
+    fn comparison_variant(
+        index: i32,
+        rev: &str,
+        completed: usize,
+        mean_us: Option<f64>,
+        calibration_id: Option<i64>,
+    ) -> crate::comparison::ComparisonVariant {
+        crate::comparison::ComparisonVariant {
+            benchmark_spec_id: Uuid::from_u128(index as u128 + 1),
+            spec_index: index,
+            ref_display: rev.to_string(),
+            commit: None,
+            baseline_calibration_id: calibration_id,
+            stats: crate::comparison::VariantRunStats {
+                requested: 1,
+                completed,
+                combined_mean_us: mean_us,
+                combined_min_us: mean_us.map(|v| v.round() as i64),
+                combined_max_us: mean_us.map(|v| v.round() as i64),
+                combined_stddev_us: Some(0.0),
+                combined_cv_pct: Some(0.0),
+                workload: None,
+                workload_consistent: true,
+            },
+        }
+    }
+
+    fn group_comparison() -> GroupComparison {
+        GroupComparison {
+            baseline: comparison_variant(0, "sb-integration/3.4.0.0.2", 1, Some(1_000.0), Some(11)),
+            variants: vec![crate::comparison::VariantDelta {
+                variant: comparison_variant(
+                    1,
+                    "sb-integration/3.4.0.0.3",
+                    1,
+                    Some(1_200.0),
+                    Some(12),
+                ),
+                comparison: Some(crate::comparison::Comparison {
+                    base_combined_us: 1_000,
+                    pr_combined_us: 1_200,
+                    delta_pct: 20.0,
+                    sigma: Some(2.5),
+                    verdict: crate::comparison::Verdict::Moderate,
+                }),
+                unavailable: None,
+            }],
+        }
+    }
+
     /// The Slack surface delegates the lifecycle to the timeline. This fake
     /// client does not implement streaming, so the timeline exercises the
     /// block fallback path while still proving heartbeat/phase/completion reach
@@ -1347,8 +1405,9 @@ mod tests {
         surface
             .phase(&PhaseLabel::new("running", false), Duration::ZERO)
             .await;
+        let summary = serde_json::json!({});
         surface
-            .completed(&serde_json::json!({}), None)
+            .completed(completion_report(&summary))
             .await;
 
         assert_eq!(
@@ -1375,6 +1434,55 @@ mod tests {
             vec![RUNNING_REACTION.to_string(), COMPLETED_REACTION.to_string()],
             "⏳ → 🚀 (run 0 started) → ✅ (completed)",
         );
+    }
+
+    #[tokio::test]
+    async fn slack_surface_renders_group_comparison_on_final_card() {
+        let recording = Arc::new(FakeSlack::default());
+        let slack = recording.clone() as Arc<dyn SlackClient>;
+        let jobs: Arc<dyn RunnableJobStore> = Arc::new(RecordingStore::default());
+        let mut job = slack_job();
+        job.progress = ProgressTarget::Slack {
+            channel: "C1".into(),
+            message_ts: "REQ".into(),
+            plan_message_ts: Some("PLAN_TS".into()),
+        };
+        job.requested_run_count = 1;
+        job.group_requested_run_count = 2;
+        job.group_run_index = 1;
+        let surface = build_report_surface(
+            Arc::new(FakeGitHub::new()),
+            jobs,
+            store(),
+            Some(&slack),
+            &Arc::new(SlackSessionRegistry::new()),
+            &job,
+        );
+
+        let summary = serde_json::json!({});
+        let comparison = group_comparison();
+        surface
+            .completed(CompletionReport {
+                summary: &summary,
+                baseline_comparison: None,
+                group_comparison: Some(&comparison),
+            })
+            .await;
+
+        let updates = recording
+            .update_blocks
+            .lock()
+            .unwrap();
+        let rendered = updates
+            .last()
+            .expect("final comparison updates the shared card");
+        assert!(rendered.contains("Comparison Summary"), "{rendered}");
+        assert!(rendered.contains("sb-integration/3.4.0.0.2"), "{rendered}");
+        assert!(rendered.contains("sb-integration/3.4.0.0.3"), "{rendered}");
+        assert!(rendered.contains("+20.00% slower"), "{rendered}");
+        assert!(rendered.contains("Moderate (2.5σ)"), "{rendered}");
+        assert!(rendered.contains("run 2/2"), "{rendered}");
+        assert!(!rendered.contains("Clean Repeat Summary"), "{rendered}");
     }
 
     #[tokio::test]
@@ -1514,7 +1622,8 @@ mod tests {
                 .keepalive_running(),
             "keepalive armed after the first started()",
         );
-        s0.completed(&serde_json::json!({}), None)
+        let summary = serde_json::json!({});
+        s0.completed(completion_report(&summary))
             .await; // non-final success
         assert_eq!(sessions.len(), 1, "non-final completion keeps the session");
         assert!(
@@ -1538,7 +1647,8 @@ mod tests {
                 .keepalive_running(),
             "keepalive still running across the begin_run/started handoff",
         );
-        s1.completed(&serde_json::json!({}), None)
+        let summary = serde_json::json!({});
+        s1.completed(completion_report(&summary))
             .await; // final success
         assert!(sessions.is_empty(), "final completion reaps the session");
     }
@@ -1562,8 +1672,9 @@ mod tests {
 
         surface.started().await;
         assert_eq!(sessions.len(), 1);
+        let summary = serde_json::json!({});
         surface
-            .completed(&serde_json::json!({}), None)
+            .completed(completion_report(&summary))
             .await;
         assert!(sessions.is_empty(), "single-run job reaps its session on completion");
     }
@@ -1593,8 +1704,9 @@ mod tests {
         surface
             .heartbeat(&PhaseLabel::new("running", false), Duration::ZERO)
             .await;
+        let summary = serde_json::json!({});
         surface
-            .completed(&serde_json::json!({}), None)
+            .completed(completion_report(&summary))
             .await;
         surface.failed("boom").await;
         surface
@@ -1617,8 +1729,9 @@ mod tests {
             &Arc::new(SlackSessionRegistry::new()),
             &check_job(99),
         );
+        let summary = serde_json::json!({});
         surface
-            .completed(&serde_json::json!({}), None)
+            .completed(completion_report(&summary))
             .await;
         assert!(
             gh.calls()
