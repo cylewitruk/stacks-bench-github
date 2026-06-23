@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sbgh_core::config::SlackConfig;
-use sbgh_core::db::JobStore;
+use sbgh_core::db::{JobStore, NewBenchmarkSpec};
 use sbgh_core::models::{
     BuildTarget, GitRefKind, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail, TaskKind,
 };
@@ -194,36 +194,54 @@ impl SlackConnector {
             .await;
             return;
         }
-        let spec = match request {
-            BenchmarkRequest::Single(spec) => spec,
-            BenchmarkRequest::Comparison(comparison) => {
-                tracing::info!(
-                    variants = comparison.variants.len(),
-                    clean_repetitions = comparison
-                        .workload
-                        .clean_repetitions,
-                    "slack: comparison request resolved but group planning is not enabled yet"
-                );
-                self.reject_after_ack(
-                    &event,
-                    "comparison benchmarks are not enabled yet — this daemon can parse the \
-                     request shape, but group execution lands in v22 Phase 2",
+        // 3. Enqueue an ad-hoc benchmark group. A singleton request creates one spec; a
+        //    comparison request creates one ordered spec per variant and queues only
+        //    spec 0/run 0. Later specs are materialized by the DB-backed lazy chain.
+        let (rev_label, bench_args, clean_repetitions, specs) = match request {
+            BenchmarkRequest::Single(spec) => {
+                let rev = spec
+                    .rev
+                    .clone()
+                    .unwrap_or_else(|| self.cfg.default_rev.clone());
+                let clean_repetitions = spec.clean_repetitions;
+                let bench_args = spec.to_bench_args();
+                let new_job = self.new_slack_benchmark_job(rev.clone());
+                (
+                    rev,
+                    bench_args,
+                    clean_repetitions,
+                    vec![NewBenchmarkSpec::singleton(new_job, clean_repetitions as i32)],
                 )
-                .await;
-                return;
+            }
+            BenchmarkRequest::Comparison(comparison) => {
+                let clean_repetitions = comparison
+                    .workload
+                    .clean_repetitions;
+                let bench_args = comparison
+                    .workload
+                    .to_bench_args();
+                let revs: Vec<_> = comparison
+                    .variants
+                    .iter()
+                    .map(|variant| variant.rev.clone())
+                    .collect();
+                let specs = revs
+                    .iter()
+                    .cloned()
+                    .map(|rev| {
+                        NewBenchmarkSpec::singleton(
+                            self.new_slack_benchmark_job(rev),
+                            clean_repetitions as i32,
+                        )
+                    })
+                    .collect();
+                (revs.join(" vs "), bench_args, clean_repetitions, specs)
             }
         };
-        // 3. Enqueue an ad-hoc job. Default repo (target ids) + rev (`--rev` override,
-        //    else the configured default); the parsed workload becomes `bench_args`;
-        //    channel/message_ts ride along as reporting provenance.
-        let rev = spec
-            .rev
-            .clone()
-            .unwrap_or_else(|| self.cfg.default_rev.clone());
-        let bench_args = spec.to_bench_args();
         tracing::info!(
-            rev = %rev,
-            clean_repetitions = spec.clean_repetitions,
+            rev = %rev_label,
+            variants = specs.len(),
+            clean_repetitions,
             "slack: workload resolved — enqueuing"
         );
         tracing::debug!(bench_args = ?bench_args, "slack: resolved bench args");
@@ -231,29 +249,9 @@ impl SlackConnector {
             channel: event.channel.clone(),
             message_ts: event.message_ts.clone(),
             bench_args: bench_args.clone(),
-            clean_repetitions: spec.clean_repetitions,
+            clean_repetitions,
         })
         .expect("QueuedEventDetail serializes");
-        let new_job = NewJob {
-            github_installation_id: self.target.installation_id,
-            github_repo_id: self.target.repo_id,
-            axes: JobAxes {
-                source: JobSource::Slack,
-                intent: JobIntent::AdhocBenchmark,
-                task_kind: TaskKind::Benchmark,
-                build_target: BuildTarget::StacksBench,
-            },
-            // `Branch` is the neutral default for a default-rev like `develop`;
-            // `git_commit_hash` is `None`, so the rev resolves to a commit at
-            // claim time — the reporter's `prepare` resolves a Slack job's bare
-            // rev (branch/tag/SHA) via `resolve_commit`, so it passes the
-            // empty-commit guard like a PR-head or tag job.
-            git_ref_kind: GitRefKind::Branch,
-            git_ref_display: rev,
-            git_commit_hash: None,
-            git_committed_at: None,
-            workload_key: None,
-        };
 
         // 3a. Post the card before creating the job: its `ts` needs the job id,
         //     and recording it atomically with creation (3b) closes the
@@ -261,13 +259,7 @@ impl SlackConnector {
         //     Slack rejected the post (the reporter then posts at claim).
         let job_id = Uuid::new_v4();
         let posted = self
-            .post_queued_card(
-                &event,
-                &new_job.git_ref_display,
-                &bench_args,
-                spec.clean_repetitions,
-                job_id,
-            )
+            .post_queued_card(&event, &rev_label, &bench_args, clean_repetitions, job_id)
             .await;
 
         // 3b. Create the job, its queued event, and (when posted) the
@@ -275,9 +267,9 @@ impl SlackConnector {
         //     claimable without its plan `ts`.
         if let Err(e) = self
             .jobs
-            .create_unlinked_job(
+            .create_unlinked_benchmark_group(
                 job_id,
-                &new_job,
+                &specs,
                 &detail,
                 posted
                     .as_ref()
@@ -379,6 +371,29 @@ impl SlackConnector {
             self.max_variants,
             self.max_comparison_lifecycles,
         )
+    }
+
+    fn new_slack_benchmark_job(&self, rev: String) -> NewJob {
+        NewJob {
+            github_installation_id: self.target.installation_id,
+            github_repo_id: self.target.repo_id,
+            axes: JobAxes {
+                source: JobSource::Slack,
+                intent: JobIntent::AdhocBenchmark,
+                task_kind: TaskKind::Benchmark,
+                build_target: BuildTarget::StacksBench,
+            },
+            // `Branch` is the neutral default for a default-rev like `develop`;
+            // `git_commit_hash` is `None`, so the rev resolves to a commit at
+            // claim time — the reporter's `prepare` resolves a Slack job's bare
+            // rev (branch/tag/SHA) via `resolve_commit`, so it passes the
+            // empty-commit guard like a PR-head or tag job.
+            git_ref_kind: GitRefKind::Branch,
+            git_ref_display: rev,
+            git_commit_hash: None,
+            git_committed_at: None,
+            workload_key: None,
+        }
     }
 
     async fn resolve_request_for_event(
@@ -1313,7 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_comparison_is_validated_but_not_enqueued_in_phase_1() {
+    async fn deterministic_comparison_enqueues_ordered_group_run0() {
         let (c, store, slack) = harness();
         c.handle_mention(event(
             "<@U07BOT> bench --start-at 100 --count 3 --rev baseline --compare-rev candidate \
@@ -1321,24 +1336,30 @@ mod tests {
         ))
         .await;
 
-        assert!(store.all_jobs().is_empty(), "Phase 1 must not enqueue comparison as singleton");
-        assert!(
+        let jobs = store.all_jobs();
+        assert_eq!(jobs.len(), 1, "comparison groups initially enqueue only spec 0/run 0");
+        assert_eq!(jobs[0].git_ref_display, "baseline");
+        assert_eq!(jobs[0].benchmark_run_index, 0);
+        let specs = store.specs_for_group(jobs[0].benchmark_group_id);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].spec_index, 0);
+        assert_eq!(specs[0].git_ref_display, "baseline");
+        assert_eq!(specs[1].spec_index, 1);
+        assert_eq!(specs[1].git_ref_display, "candidate");
+        assert_eq!(
             slack
                 .net_reactions()
-                .is_empty(),
-            "rejected comparison must not get accepted reaction",
+                .iter()
+                .map(|(_, _, r)| r.as_str())
+                .collect::<Vec<_>>(),
+            vec![QUEUED_REACTION],
         );
-        let eph = slack
-            .ephemerals
-            .lock()
-            .unwrap();
-        assert_eq!(eph.len(), 1);
         assert!(
-            eph[0]
-                .2
-                .contains("comparison benchmarks are not enabled yet"),
-            "{}",
-            eph[0].2
+            slack
+                .ephemerals
+                .lock()
+                .unwrap()
+                .is_empty(),
         );
     }
 
@@ -1446,7 +1467,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn natural_language_comparison_uses_same_phase_1_gate() {
+    async fn natural_language_comparison_uses_same_group_planner() {
         let request = BenchmarkRequest::Comparison(crate::workload::ComparisonRequest {
             workload: WorkloadSpec {
                 target: crate::workload::WorkloadTarget::Txids(vec![
@@ -1475,23 +1496,47 @@ mod tests {
         .await;
 
         assert_eq!(resolver.calls(), 1);
-        assert!(store.all_jobs().is_empty());
+        let jobs = store.all_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].git_ref_display, "sb-integration/3.4.0.0.2");
+        let specs = store.specs_for_group(jobs[0].benchmark_group_id);
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.git_ref_display.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sb-integration/3.4.0.0.2", "sb-integration/3.4.0.0.3"],
+        );
+        let queued = store
+            .queued_event(jobs[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap().0).unwrap();
+        let QueuedEventDetail::SlackAdhoc {
+            bench_args, clean_repetitions, ..
+        } = detail
+        else {
+            panic!("expected SlackAdhoc");
+        };
+        assert_eq!(
+            bench_args,
+            vec![
+                "--txid",
+                "f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce",
+                "--repetitions",
+                "1",
+                "--warmup",
+                "10",
+            ],
+        );
+        assert_eq!(clean_repetitions, 1);
         assert!(
             slack
-                .net_reactions()
+                .ephemerals
+                .lock()
+                .unwrap()
                 .is_empty()
-        );
-        let eph = slack
-            .ephemerals
-            .lock()
-            .unwrap();
-        assert_eq!(eph.len(), 1);
-        assert!(
-            eph[0]
-                .2
-                .contains("comparison benchmarks are not enabled yet"),
-            "{}",
-            eph[0].2
         );
     }
 

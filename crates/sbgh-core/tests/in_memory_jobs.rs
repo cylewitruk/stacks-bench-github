@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use sbgh_core::db::{
     BaselineSelection, InMemoryJobStore, JobCompletion, JobCreationOutcome, JobFailure, JobStore,
+    NewBenchmarkSpec,
 };
 use sbgh_core::models::{
     GitRefKind, JobAxes, JobCreationRequest, JobKind, JobMetric, JobResult, JobSource, JobStatus,
@@ -37,6 +38,19 @@ fn make_request(webhook_id: i64) -> JobCreationRequest {
             triggering_comment_id: Some(9001),
         }),
         queued_event_detail: Some(serde_json::json!({"trigger": "pr_comment"})),
+    }
+}
+
+fn slack_job(rev: &str) -> NewJob {
+    NewJob {
+        github_installation_id: 100,
+        github_repo_id: 10,
+        axes: JobAxes::from_legacy(TriggerKind::SlackAdhoc, JobKind::AdHoc),
+        git_ref_kind: GitRefKind::Branch,
+        git_ref_display: rev.into(),
+        git_commit_hash: Some(format!("{rev}-commit")),
+        git_committed_at: None,
+        workload_key: Some("wk".into()),
     }
 }
 
@@ -182,6 +196,127 @@ async fn in_memory_repeat_planner_appends_and_resumes_next_run() {
             .is_empty(),
         "active run 1 blocks duplicate resume"
     );
+}
+
+#[tokio::test]
+async fn in_memory_comparison_group_appends_and_resumes_next_spec() {
+    let store = InMemoryJobStore::new();
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 1,
+    })
+    .unwrap();
+    let first = store
+        .create_unlinked_benchmark_group(
+            Uuid::new_v4(),
+            &[
+                NewBenchmarkSpec::singleton(slack_job("baseline"), 1),
+                NewBenchmarkSpec {
+                    new_job: slack_job("candidate"),
+                    requested_run_count: 1,
+                    baseline_calibration_id: Some(42),
+                },
+            ],
+            &detail,
+            Some("1700000000.000200"),
+        )
+        .await
+        .unwrap();
+    let specs = store.specs_for_group(first.benchmark_group_id);
+    assert_eq!(specs.len(), 2);
+    assert_eq!(specs[0].git_ref_display, "baseline");
+    assert_eq!(specs[1].git_ref_display, "candidate");
+    assert_eq!(specs[1].baseline_calibration_id, Some(42));
+    assert_eq!(first.benchmark_spec_id, specs[0].id);
+    assert_eq!(first.benchmark_run_index, 0);
+
+    let token = Uuid::new_v4();
+    let claimed = store
+        .claim_next_queued(token)
+        .await
+        .unwrap()
+        .expect("baseline run claimed");
+    store
+        .mark_running(claimed.id, token, None)
+        .await
+        .unwrap();
+    store
+        .complete_job(&JobCompletion {
+            job_id: claimed.id,
+            claim_token: token,
+            result: JobResult {
+                job_id: claimed.id,
+                run_json: None,
+                archive_dir: "/tmp".into(),
+                created_at: chrono::Utc::now(),
+            },
+            metric: None,
+            baseline_calibration_id: None,
+            event_detail: None,
+        })
+        .await
+        .unwrap();
+
+    let resumed = store
+        .resume_pending_benchmark_runs()
+        .await
+        .unwrap();
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].benchmark_spec_id, specs[1].id);
+    assert_eq!(resumed[0].benchmark_run_index, 0);
+    assert_eq!(resumed[0].git_ref_display, "candidate");
+    assert_eq!(
+        store
+            .latest_plan_message_ts(resumed[0].id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1700000000.000200"),
+    );
+    assert!(
+        store
+            .append_next_benchmark_run(claimed.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "active candidate run blocks duplicate spec transition",
+    );
+}
+
+#[tokio::test]
+async fn in_memory_comparison_group_create_failure_leaves_no_orphans() {
+    let store = InMemoryJobStore::new();
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 1,
+    })
+    .unwrap();
+    let mut github = slack_job("candidate");
+    github.axes = JobAxes::from_legacy(TriggerKind::BranchPush, JobKind::Baseline);
+
+    let err = store
+        .create_unlinked_benchmark_group(
+            Uuid::new_v4(),
+            &[
+                NewBenchmarkSpec::singleton(slack_job("baseline"), 1),
+                NewBenchmarkSpec::singleton(github, 1),
+            ],
+            &detail,
+            Some("1700000000.000200"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("must share installation, source, and intent"),
+        "{err}",
+    );
+    assert!(store.all_jobs().is_empty());
+    assert!(store.all_events().is_empty());
 }
 
 #[tokio::test]

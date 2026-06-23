@@ -3,7 +3,7 @@
 Promote explicit ad-hoc comparison benchmarks so a Slack request can benchmark
 one workload against two refs and report one noise-aware delta summary (`0039`).
 
-> **Status:** in_progress - Phase 1 implemented and ready for external review.
+> **Status:** in_progress - Phase 2 implemented and ready for external review.
 >
 > v21 remains planned but deferred. Comparison benchmarks are the next
 > operational need, and they can build on the already-shipped group/run,
@@ -201,23 +201,23 @@ DB-resumable across multiple specs.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] Creating a comparison group is atomic: failures leave no orphan specs,
+- [x] Creating a comparison group is atomic: failures leave no orphan specs,
   steps, or jobs.
-- [ ] The store creation API accepts an ordered spec collection and persists
+- [x] The store creation API accepts an ordered spec collection and persists
   `spec_index` from that order, even though request validation currently caps it
   at two variants.
-- [ ] Each variant has its own explicit persisted calibration id and resume can
+- [x] Each variant has its own explicit persisted calibration id and resume can
   derive the next action without guessing from spec 0.
-- [ ] Startup resume can continue a partially completed comparison group from
+- [x] Startup resume can continue a partially completed comparison group from
   persisted DB state.
-- [ ] Concurrent append/resume attempts cannot enqueue two active runs for the
+- [x] Concurrent append/resume attempts cannot enqueue two active runs for the
   same group.
 
 **Tests:**
@@ -251,6 +251,10 @@ preserving one carried group DB and one calibration per variant.
   (`requested_run_count > 1`) is insufficient for two variants with one repeat
   each, because each spec has `requested_run_count = 1` but still needs its own
   calibration.
+- Update the descriptive workflow-step insertion in both Postgres and
+  in-memory stores in lockstep with the runtime calibration trigger, so the
+  inert `calibrate` step rows accurately reflect per-variant calibration for
+  comparison groups.
 - Reuse a variant's persisted `baseline_id` across clean repeats of that same
   variant.
 - Fail closed if carry-forward or `--baseline-id` validation fails; do not

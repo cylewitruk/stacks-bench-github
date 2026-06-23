@@ -69,8 +69,7 @@ pub enum WorkloadTarget {
 pub struct WorkloadSpec {
     pub target: WorkloadTarget,
     /// User-facing `--repetitions` — daemon-level clean VM executions (≥ 1).
-    /// The current v15 Phase 1 runtime still executes one run; later phases
-    /// fan this out at the benchmark-group layer.
+    /// The benchmark-group planner fans this out as isolated VM runs.
     pub clean_repetitions: u32,
     /// `--warmup` — warmup iterations before measurement. `None` → default.
     pub warmup: Option<u32>,
@@ -143,9 +142,9 @@ pub struct ComparisonRequest {
     pub variants: Vec<ComparisonVariant>,
 }
 
-/// A resolved benchmark request before enqueue planning. Phase 1 only enqueues
-/// [`Single`](Self::Single); comparison requests are validated and then
-/// rejected loudly until the group planner lands in Phase 2.
+/// A resolved benchmark request before enqueue planning. Both variants flow
+/// through the same validation gate before the Slack connector creates a
+/// singleton or multi-spec benchmark group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BenchmarkRequest {
     Single(WorkloadSpec),

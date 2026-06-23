@@ -1,7 +1,9 @@
 //! 0037: every current job is a singleton `benchmark_group -> benchmark_spec
 //! -> job(run)` without changing creation behavior.
 
-use sbgh_core::db::{JobCreationOutcome, JobStore, Pool, PostgresJobStore, setup_pg_db};
+use sbgh_core::db::{
+    JobCreationOutcome, JobStore, NewBenchmarkSpec, Pool, PostgresJobStore, setup_pg_db,
+};
 use sbgh_core::models::{
     BenchmarkStepKind, BuildTarget, GitRefKind, JobAxes, JobCreationRequest, JobIntent, JobKind,
     JobSource, JobStatus, NewJob, QueuedEventDetail, TaskKind, TriggerKind,
@@ -313,6 +315,265 @@ async fn resume_pending_benchmark_runs_derives_next_run_from_db_state() {
             .is_empty(),
         "the active resumed run prevents duplicate startup enqueue"
     );
+}
+
+#[tokio::test]
+async fn create_unlinked_benchmark_group_persists_ordered_specs_and_first_run() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 1,
+    })
+    .unwrap();
+    let mut baseline = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
+    baseline.git_ref_display = "release/3.4.0.0.2".into();
+    let mut candidate = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
+    candidate.git_ref_display = "release/3.4.0.0.3".into();
+
+    let first = store
+        .create_unlinked_benchmark_group(
+            Uuid::new_v4(),
+            &[
+                NewBenchmarkSpec::singleton(baseline, 1),
+                NewBenchmarkSpec {
+                    new_job: candidate,
+                    requested_run_count: 1,
+                    baseline_calibration_id: Some(42),
+                },
+            ],
+            &detail,
+            Some("1700000000.000200"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.benchmark_run_index, 0);
+    assert_eq!(first.git_ref_display, "release/3.4.0.0.2");
+    assert_eq!(
+        store
+            .latest_plan_message_ts(first.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1700000000.000200"),
+    );
+
+    let specs: Vec<(Uuid, i32, String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, spec_index, git_ref_display, baseline_calibration_id
+           FROM benchmark_spec
+          WHERE benchmark_group_id = $1
+       ORDER BY spec_index",
+    )
+    .bind(first.benchmark_group_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(specs.len(), 2);
+    assert_eq!(specs[0].1, 0);
+    assert_eq!(specs[0].2, "release/3.4.0.0.2");
+    assert_eq!(specs[0].3, None);
+    assert_eq!(specs[1].1, 1);
+    assert_eq!(specs[1].2, "release/3.4.0.0.3");
+    assert_eq!(specs[1].3, Some(42));
+
+    let jobs: Vec<(Uuid, Uuid, i32)> = sqlx::query_as(
+        "SELECT id, benchmark_spec_id, benchmark_run_index
+           FROM job
+          WHERE benchmark_group_id = $1
+       ORDER BY created_at, id",
+    )
+    .bind(first.benchmark_group_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(jobs, vec![(first.id, specs[0].0, 0)]);
+
+    let steps: Vec<(i32, BenchmarkStepKind, Option<Uuid>)> = sqlx::query_as(
+        "SELECT step_index, step_kind, benchmark_spec_id
+           FROM benchmark_workflow_step
+          WHERE benchmark_group_id = $1
+       ORDER BY step_index",
+    )
+    .bind(first.benchmark_group_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        steps,
+        vec![
+            (0, BenchmarkStepKind::Build, Some(specs[0].0)),
+            (1, BenchmarkStepKind::Run, Some(specs[0].0)),
+            (2, BenchmarkStepKind::Build, Some(specs[1].0)),
+            (3, BenchmarkStepKind::Run, Some(specs[1].0)),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn create_unlinked_benchmark_group_rolls_back_on_invalid_spec_collection() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 1,
+    })
+    .unwrap();
+    let slack = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
+    let github = new_job(TriggerKind::BranchPush, JobKind::Baseline);
+
+    let err = store
+        .create_unlinked_benchmark_group(
+            Uuid::new_v4(),
+            &[NewBenchmarkSpec::singleton(slack, 1), NewBenchmarkSpec::singleton(github, 1)],
+            &detail,
+            Some("1700000000.000200"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("must share installation, source, and intent"),
+        "{err}",
+    );
+
+    let groups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM benchmark_group")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let specs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM benchmark_spec")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let steps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM benchmark_workflow_step")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((groups, specs, steps, jobs), (0, 0, 0, 0));
+}
+
+#[tokio::test]
+async fn append_next_benchmark_run_moves_from_final_run_to_next_spec() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 1,
+    })
+    .unwrap();
+    let mut baseline = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
+    baseline.git_ref_display = "baseline".into();
+    let mut candidate = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
+    candidate.git_ref_display = "candidate".into();
+    let first = store
+        .create_unlinked_benchmark_group(
+            Uuid::new_v4(),
+            &[NewBenchmarkSpec::singleton(baseline, 1), NewBenchmarkSpec::singleton(candidate, 1)],
+            &detail,
+            Some("1700000000.000200"),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let second = store
+        .append_next_benchmark_run(first.id)
+        .await
+        .unwrap()
+        .expect("candidate spec run 0 is queued");
+    assert_eq!(second.benchmark_group_id, first.benchmark_group_id);
+    assert_ne!(second.benchmark_spec_id, first.benchmark_spec_id);
+    assert_eq!(second.benchmark_run_index, 0);
+    assert_eq!(second.git_ref_display, "candidate");
+    assert_eq!(second.status, JobStatus::Queued);
+    assert_eq!(
+        store
+            .latest_plan_message_ts(second.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1700000000.000200"),
+    );
+    assert!(
+        store
+            .append_next_benchmark_run(first.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "active candidate run prevents duplicate spec transition",
+    );
+
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(second.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .append_next_benchmark_run(second.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "final spec completion terminates the group",
+    );
+}
+
+#[tokio::test]
+async fn resume_pending_benchmark_runs_continues_across_specs() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        channel: "C123".into(),
+        message_ts: "1700000000.000100".into(),
+        bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
+        clean_repetitions: 1,
+    })
+    .unwrap();
+    let mut baseline = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
+    baseline.git_ref_display = "baseline".into();
+    let mut candidate = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
+    candidate.git_ref_display = "candidate".into();
+    let first = store
+        .create_unlinked_benchmark_group(
+            Uuid::new_v4(),
+            &[NewBenchmarkSpec::singleton(baseline, 1), NewBenchmarkSpec::singleton(candidate, 1)],
+            &detail,
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let resumed = store
+        .resume_pending_benchmark_runs()
+        .await
+        .unwrap();
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].git_ref_display, "candidate");
+    assert_eq!(resumed[0].benchmark_run_index, 0);
+    assert_ne!(resumed[0].benchmark_spec_id, first.benchmark_spec_id);
 }
 
 #[tokio::test]

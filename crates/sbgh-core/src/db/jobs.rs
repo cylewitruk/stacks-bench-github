@@ -165,6 +165,28 @@ pub struct BenchmarkRunMetric {
     pub metric: JobMetric,
 }
 
+/// One requested benchmark spec inside a newly-created benchmark group.
+///
+/// The store API is deliberately N-shaped: v22 caps comparison requests at two
+/// variants at validation time, but the persistence layer accepts an ordered
+/// list so future cap lifts do not require a schema/API retrofit.
+#[derive(Debug, Clone)]
+pub struct NewBenchmarkSpec {
+    pub new_job: NewJob,
+    pub requested_run_count: i32,
+    pub baseline_calibration_id: Option<i64>,
+}
+
+impl NewBenchmarkSpec {
+    pub fn singleton(new_job: NewJob, requested_run_count: i32) -> Self {
+        Self {
+            new_job,
+            requested_run_count,
+            baseline_calibration_id: None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait JobStore: Send + Sync + 'static {
     async fn insert_job(&self, new: &NewJob) -> Result<Job>;
@@ -214,6 +236,24 @@ pub trait JobStore: Send + Sync + 'static {
         &self,
         job_id: Uuid,
         new_job: &NewJob,
+        queued_event_detail: &serde_json::Value,
+        plan_message_ts: Option<&str>,
+    ) -> Result<Job>;
+
+    /// Create a webhook-less benchmark group with an ordered set of benchmark
+    /// specs and enqueue only the first spec's run 0.
+    ///
+    /// This is the comparison-group sibling of
+    /// [`create_unlinked_job`](Self::create_unlinked_job). It has the same
+    /// Slack-card atomicity guarantee (queued event + optional
+    /// `plan_message_sent` in the creation transaction), but persists multiple
+    /// `benchmark_spec` rows up front. Later runs/specs are materialized by
+    /// [`append_next_benchmark_run`](Self::append_next_benchmark_run) so the
+    /// group preserves the "at most one active run" scheduling invariant.
+    async fn create_unlinked_benchmark_group(
+        &self,
+        first_job_id: Uuid,
+        specs: &[NewBenchmarkSpec],
         queued_event_detail: &serde_json::Value,
         plan_message_ts: Option<&str>,
     ) -> Result<Job>;

@@ -55,7 +55,7 @@ pub use ingest::{IngestOutcome, IngestStore, NewWebhook, SUPPORTED_WEBHOOK_EVENT
 pub use installation::{DeleteInstallationOutcome, InstallationStore, NewInstallation};
 pub use jobs::{
     BaselineAnchor, BaselineMatch, BaselineSelection, BenchmarkRunMetric, CreatedJob,
-    JobCompletion, JobCreationOutcome, JobFailure, JobStore,
+    JobCompletion, JobCreationOutcome, JobFailure, JobStore, NewBenchmarkSpec,
 };
 pub use migrate::migrate;
 pub use policy::PolicyStore;

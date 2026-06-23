@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::db::jobs::{
     BaselineAnchor, BaselineMatch, BaselineSelection, BenchmarkRunMetric, CreatedJob,
-    JobCompletion, JobCreationOutcome, JobFailure, JobStore, PendingBenchmarkRun,
+    JobCompletion, JobCreationOutcome, JobFailure, JobStore, NewBenchmarkSpec, PendingBenchmarkRun,
 };
 use crate::models::{
     BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, BenchmarkWorkflowStep, GithubPullRequestJob,
@@ -130,6 +130,21 @@ impl InMemoryJobStore {
             .get(&id)
             .cloned()
     }
+
+    /// Test-only accessor for all specs in one benchmark group.
+    pub fn specs_for_group(&self, group_id: Uuid) -> Vec<BenchmarkSpec> {
+        let mut specs: Vec<_> = self
+            .state
+            .lock()
+            .unwrap()
+            .specs
+            .values()
+            .filter(|spec| spec.benchmark_group_id == group_id)
+            .cloned()
+            .collect();
+        specs.sort_by_key(|spec| spec.spec_index);
+        specs
+    }
 }
 
 /// Build a [`BaselineMatch`] from an in-memory job + its metric (mirrors the
@@ -151,72 +166,112 @@ fn make_match(job: &Job, metric: &JobMetric, selection: BaselineSelection) -> Ba
     }
 }
 
-fn singleton_group_spec(
-    new: &NewJob,
+fn group_specs(
+    specs: &[NewBenchmarkSpec],
     now: chrono::DateTime<Utc>,
-    requested_run_count: i32,
-) -> (BenchmarkGroup, BenchmarkSpec, Vec<BenchmarkWorkflowStep>) {
+) -> Result<(BenchmarkGroup, Vec<BenchmarkSpec>, Vec<BenchmarkWorkflowStep>)> {
+    let Some(first) = specs.first() else {
+        return Err(crate::Error::Other(anyhow::anyhow!(
+            "benchmark group needs at least one spec"
+        )));
+    };
+    let first_job = &first.new_job;
     let group_id = Uuid::new_v4();
-    let spec_id = Uuid::new_v4();
     let group = BenchmarkGroup {
         id: group_id,
-        github_installation_id: new.github_installation_id,
-        github_repo_id: new.github_repo_id,
-        source: new.axes.source,
-        intent: new.axes.intent,
+        github_installation_id: first_job.github_installation_id,
+        github_repo_id: first_job.github_repo_id,
+        source: first_job.axes.source,
+        intent: first_job.axes.intent,
         artifact_prefix: group_id.to_string(),
         host_key: None,
         created_at: now,
         updated_at: now,
     };
-    let spec = BenchmarkSpec {
-        id: spec_id,
-        benchmark_group_id: group_id,
-        spec_index: 0,
-        requested_run_count: requested_run_count.max(1),
-        baseline_calibration_id: None,
-        github_repo_id: new.github_repo_id,
-        task_kind: new.axes.task_kind,
-        build_target: new.axes.build_target,
-        git_ref_kind: new.git_ref_kind,
-        git_ref_display: new.git_ref_display.clone(),
-        git_commit_hash: new.git_commit_hash.clone(),
-        git_committed_at: new.git_committed_at,
-        workload_key: new.workload_key.clone(),
-        created_at: now,
-        updated_at: now,
-    };
-    let mut steps = vec![BenchmarkWorkflowStep {
-        id: Uuid::new_v4(),
-        benchmark_group_id: group_id,
-        step_index: 0,
-        step_kind: BenchmarkStepKind::Build,
-        benchmark_spec_id: Some(spec_id),
-        created_at: now,
-    }];
-    let calibrates =
-        uses_shared_calibration(new.axes.task_kind, new.axes.build_target, requested_run_count);
-    if calibrates {
+
+    let mut out_specs = Vec::with_capacity(specs.len());
+    let mut steps = Vec::new();
+    let mut step_index = 0i32;
+    for (spec_index, requested) in specs.iter().enumerate() {
+        let new = &requested.new_job;
+        if new.github_installation_id != first_job.github_installation_id
+            || new.axes.source != first_job.axes.source
+            || new.axes.intent != first_job.axes.intent
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "benchmark group specs must share installation, source, and intent"
+            )));
+        }
+        let spec_id = Uuid::new_v4();
+        let requested_run_count = requested
+            .requested_run_count
+            .max(1);
+        let spec = BenchmarkSpec {
+            id: spec_id,
+            benchmark_group_id: group_id,
+            spec_index: spec_index as i32,
+            requested_run_count,
+            baseline_calibration_id: requested.baseline_calibration_id,
+            github_repo_id: new.github_repo_id,
+            task_kind: new.axes.task_kind,
+            build_target: new.axes.build_target,
+            git_ref_kind: new.git_ref_kind,
+            git_ref_display: new.git_ref_display.clone(),
+            git_commit_hash: new.git_commit_hash.clone(),
+            git_committed_at: new.git_committed_at,
+            workload_key: new.workload_key.clone(),
+            created_at: now,
+            updated_at: now,
+        };
         steps.push(BenchmarkWorkflowStep {
             id: Uuid::new_v4(),
             benchmark_group_id: group_id,
-            step_index: 1,
-            step_kind: BenchmarkStepKind::Calibrate,
+            step_index,
+            step_kind: BenchmarkStepKind::Build,
             benchmark_spec_id: Some(spec_id),
             created_at: now,
         });
+        step_index += 1;
+
+        if uses_shared_calibration(new.axes.task_kind, new.axes.build_target, requested_run_count) {
+            steps.push(BenchmarkWorkflowStep {
+                id: Uuid::new_v4(),
+                benchmark_group_id: group_id,
+                step_index,
+                step_kind: BenchmarkStepKind::Calibrate,
+                benchmark_spec_id: Some(spec_id),
+                created_at: now,
+            });
+            step_index += 1;
+        }
+        if new.axes.task_kind != TaskKind::BuildOnly {
+            steps.push(BenchmarkWorkflowStep {
+                id: Uuid::new_v4(),
+                benchmark_group_id: group_id,
+                step_index,
+                step_kind: BenchmarkStepKind::Run,
+                benchmark_spec_id: Some(spec_id),
+                created_at: now,
+            });
+            step_index += 1;
+        }
+        out_specs.push(spec);
     }
-    if new.axes.task_kind != TaskKind::BuildOnly {
-        steps.push(BenchmarkWorkflowStep {
-            id: Uuid::new_v4(),
-            benchmark_group_id: group_id,
-            step_index: if calibrates { 2 } else { 1 },
-            step_kind: BenchmarkStepKind::Run,
-            benchmark_spec_id: Some(spec_id),
-            created_at: now,
-        });
-    }
-    (group, spec, steps)
+
+    Ok((group, out_specs, steps))
+}
+
+fn singleton_group_spec(
+    new: &NewJob,
+    now: chrono::DateTime<Utc>,
+    requested_run_count: i32,
+) -> Result<(BenchmarkGroup, BenchmarkSpec, Vec<BenchmarkWorkflowStep>)> {
+    let specs = [NewBenchmarkSpec::singleton(new.clone(), requested_run_count)];
+    let (group, mut specs, steps) = group_specs(&specs, now)?;
+    let spec = specs
+        .pop()
+        .expect("singleton creation returns one spec");
+    Ok((group, spec, steps))
 }
 
 fn requested_run_count_from_detail(detail: &serde_json::Value) -> i32 {
@@ -253,12 +308,42 @@ fn next_run_from_prior(prior: &Job, next_index: i32, now: chrono::DateTime<Utc>)
     }
 }
 
+fn initial_run_from_spec(
+    group: &BenchmarkGroup,
+    spec: &BenchmarkSpec,
+    id: Uuid,
+    now: chrono::DateTime<Utc>,
+) -> Job {
+    Job {
+        id,
+        benchmark_group_id: group.id,
+        benchmark_spec_id: spec.id,
+        benchmark_run_index: 0,
+        github_installation_id: group.github_installation_id,
+        github_repo_id: spec.github_repo_id,
+        status: JobStatus::Queued,
+        source: group.source,
+        intent: group.intent,
+        task_kind: spec.task_kind,
+        build_target: spec.build_target,
+        git_ref_kind: spec.git_ref_kind,
+        git_ref_display: spec.git_ref_display.clone(),
+        git_commit_hash: spec.git_commit_hash.clone(),
+        git_committed_at: spec.git_committed_at,
+        workload_key: spec.workload_key.clone(),
+        claim_token: None,
+        claimed_at: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 #[async_trait]
 impl JobStore for InMemoryJobStore {
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
         let now = Utc::now();
         let id = Uuid::new_v4();
-        let (group, spec, steps) = singleton_group_spec(new, now, 1);
+        let (group, spec, steps) = singleton_group_spec(new, now, 1)?;
         // v10 (0005): jobs carry the axes natively — set by the handler.
         let job = Job {
             id,
@@ -310,7 +395,7 @@ impl JobStore for InMemoryJobStore {
         // `ON CONFLICT (github_webhook_id)` race-safety).
         let now = Utc::now();
         let job_id = Uuid::new_v4();
-        let (group, spec, steps) = singleton_group_spec(&request.new_job, now, 1);
+        let (group, spec, steps) = singleton_group_spec(&request.new_job, now, 1)?;
 
         // v10 (0005): jobs carry the axes natively — set by the handler.
         // Build all the rows locally.
@@ -449,7 +534,7 @@ impl JobStore for InMemoryJobStore {
         }
         let now = Utc::now();
         let requested_run_count = requested_run_count_from_detail(queued_event_detail);
-        let (group, spec, steps) = singleton_group_spec(new_job, now, requested_run_count);
+        let (group, spec, steps) = singleton_group_spec(new_job, now, requested_run_count)?;
         // v10 (0005): jobs carry the axes natively — set by the caller.
         let job = Job {
             id: job_id,
@@ -520,6 +605,72 @@ impl JobStore for InMemoryJobStore {
         Ok(job)
     }
 
+    async fn create_unlinked_benchmark_group(
+        &self,
+        first_job_id: Uuid,
+        specs: &[NewBenchmarkSpec],
+        queued_event_detail: &serde_json::Value,
+        plan_message_ts: Option<&str>,
+    ) -> Result<Job> {
+        if self
+            .fail_create_unlinked
+            .load(Ordering::SeqCst)
+        {
+            return Err(crate::Error::Other(anyhow::anyhow!(
+                "injected create_unlinked_job failure"
+            )));
+        }
+        let now = Utc::now();
+        let (group, specs, steps) = group_specs(specs, now)?;
+        let first_spec = specs
+            .first()
+            .expect("group_specs rejects empty input");
+        let job = initial_run_from_spec(&group, first_spec, first_job_id, now);
+        let queued_event = JobEvent {
+            id: self
+                .next_event_id
+                .fetch_add(1, Ordering::SeqCst),
+            job_id: first_job_id,
+            event_kind: JobEventKind::Queued,
+            event_status: JobEventStatus::Success,
+            occurred_at: now,
+            github_comment_id: None,
+            github_check_run_id: None,
+            github_check_run_url: None,
+            remark: None,
+            detail: Some(sqlx::types::Json(queued_event_detail.clone())),
+        };
+        let mut s = self.state.lock().unwrap();
+        s.groups
+            .insert(group.id, group);
+        for spec in specs {
+            s.specs.insert(spec.id, spec);
+        }
+        s.steps.extend(steps);
+        s.jobs
+            .insert(first_job_id, job.clone());
+        s.insertion_order
+            .push(first_job_id);
+        s.events.push(queued_event);
+        if let Some(ts) = plan_message_ts {
+            s.events.push(JobEvent {
+                id: self
+                    .next_event_id
+                    .fetch_add(1, Ordering::SeqCst),
+                job_id: first_job_id,
+                event_kind: JobEventKind::PlanMessageSent,
+                event_status: JobEventStatus::Success,
+                occurred_at: now,
+                github_comment_id: None,
+                github_check_run_id: None,
+                github_check_run_url: None,
+                remark: None,
+                detail: Some(sqlx::types::Json(serde_json::json!({ "plan_message_ts": ts }))),
+            });
+        }
+        Ok(job)
+    }
+
     async fn append_next_benchmark_run(&self, completed_job_id: Uuid) -> Result<Option<Job>> {
         let mut s = self.state.lock().unwrap();
         let Some(prior) = s
@@ -540,7 +691,7 @@ impl JobStore for InMemoryJobStore {
             return Ok(None);
         }
         if s.jobs.values().any(|j| {
-            j.benchmark_spec_id == prior.benchmark_spec_id
+            j.benchmark_group_id == prior.benchmark_group_id
                 && matches!(j.status, JobStatus::Queued | JobStatus::Claimed | JobStatus::Running)
         }) {
             return Ok(None);
@@ -556,12 +707,37 @@ impl JobStore for InMemoryJobStore {
             return Ok(None);
         }
         let next_index = max_index + 1;
-        if next_index >= spec.requested_run_count {
-            return Ok(None);
-        }
-
         let now = Utc::now();
-        let job = next_run_from_prior(&prior, next_index, now);
+        let job = if next_index < spec.requested_run_count {
+            next_run_from_prior(&prior, next_index, now)
+        } else {
+            let Some(next_spec) = s
+                .specs
+                .values()
+                .filter(|candidate| {
+                    candidate.benchmark_group_id == prior.benchmark_group_id
+                        && candidate.spec_index > spec.spec_index
+                })
+                .min_by_key(|candidate| candidate.spec_index)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            if s.jobs
+                .values()
+                .any(|j| j.benchmark_spec_id == next_spec.id)
+            {
+                return Ok(None);
+            }
+            let Some(group) = s
+                .groups
+                .get(&prior.benchmark_group_id)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            initial_run_from_spec(&group, &next_spec, Uuid::new_v4(), now)
+        };
         let detail = s
             .events
             .iter()
@@ -631,12 +807,9 @@ impl JobStore for InMemoryJobStore {
     async fn pending_completed_benchmark_runs(&self) -> Result<Vec<PendingBenchmarkRun>> {
         let s = self.state.lock().unwrap();
         let mut pending = Vec::new();
-        for spec in s.specs.values() {
-            if spec.task_kind == TaskKind::BuildOnly {
-                continue;
-            }
+        for group in s.groups.values() {
             if s.jobs.values().any(|j| {
-                j.benchmark_spec_id == spec.id
+                j.benchmark_group_id == group.id
                     && matches!(
                         j.status,
                         JobStatus::Queued | JobStatus::Claimed | JobStatus::Running
@@ -647,22 +820,34 @@ impl JobStore for InMemoryJobStore {
             let latest = s
                 .jobs
                 .values()
-                .filter(|j| j.benchmark_spec_id == spec.id)
-                .max_by_key(|j| j.benchmark_run_index);
-            let Some(job) = latest else {
+                .filter(|j| j.benchmark_group_id == group.id)
+                .filter_map(|job| {
+                    s.specs
+                        .get(&job.benchmark_spec_id)
+                        .map(|spec| (spec, job))
+                })
+                .max_by_key(|(spec, job)| (spec.spec_index, job.benchmark_run_index));
+            let Some((spec, job)) = latest else {
                 continue;
             };
-            if job.status != JobStatus::Completed
-                || job.benchmark_run_index + 1 >= spec.requested_run_count
-            {
+            if spec.task_kind == TaskKind::BuildOnly || job.status != JobStatus::Completed {
                 continue;
             }
-            let Some(group) = s
-                .groups
-                .get(&job.benchmark_group_id)
-            else {
+            let has_next_same_spec = job.benchmark_run_index + 1 < spec.requested_run_count;
+            let has_next_spec = s
+                .specs
+                .values()
+                .any(|candidate| {
+                    candidate.benchmark_group_id == group.id
+                        && candidate.spec_index > spec.spec_index
+                        && !s
+                            .jobs
+                            .values()
+                            .any(|job| job.benchmark_spec_id == candidate.id)
+                });
+            if !has_next_same_spec && !has_next_spec {
                 continue;
-            };
+            }
             pending.push(PendingBenchmarkRun {
                 completed_job_id: job.id,
                 benchmark_group_id: job.benchmark_group_id,
