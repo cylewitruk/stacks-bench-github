@@ -3,8 +3,9 @@
 Retire the compatibility-first result parsing path and make the daemon's
 `stacks-bench --json` integration speak schema-v1 natively (`0050`).
 
-> **Status:** planned - scheduled after v19/v20 so the native parser covers the
-> final workflow/result shapes, including calibration and progress artifacts.
+> **Status:** planned - intentionally deferred while v22 implements the
+> currently-needed ad-hoc comparison workflow. Native schema-v1 parsing should
+> still follow once the comparison result/reporting shape has settled.
 
 ## Items
 

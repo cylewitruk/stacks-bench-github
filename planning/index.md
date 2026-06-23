@@ -56,7 +56,7 @@ need editing when an item's status or location changes.
 | `0036-pr-comment-llm-intent` | PR-comment LLM intent resolution | `backlog` | [backlog.md](backlog.md) |
 | `0037-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 | `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
-| `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `backlog` | [backlog.md](backlog.md) |
+| `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `in_progress` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
 | `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `shipped` | [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md) |
 | `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
@@ -91,6 +91,7 @@ need editing when an item's status or location changes.
 | `v19-shared-benchmark-calibration` | Shared benchmark calibration | `shipped` | [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md) |
 | `v20-fine-grained-bench-progress` | Fine-grained bench progress | `in_progress` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
 | `v21-stacks-bench-schema-v1-native` | Native `stacks-bench` schema-v1 JSON | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
+| `v22-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `in_progress` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
 
 ## Decisions
 

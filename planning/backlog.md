@@ -350,51 +350,8 @@ Promoted to `v21-stacks-bench-schema-v1-native` →
 *`0038-isolated-benchmark-repetitions` shipped (iteration v15, 2026-06) →
 [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md).*
 
-### 0039 — Multi-variant benchmark comparisons
-
-- **id:** `0039-multi-variant-benchmark-comparisons`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0037-benchmark-group-run-model`
-- **relates_to:** `0020-llm-intent-resolution`, `0028-results-summary-restructure`,
-  `0015-resource-aware-admission`, `0038-isolated-benchmark-repetitions`
-- **source:** experiment-group modeling follow-up (2026-06)
-
-**Problem:** Users legitimately want ad-hoc release/branch comparisons such as
-"benchmark tx X on 3.4.0.0.3 and compare it with 3.4.0.0.2". Today comparison
-logic is mostly PR-vs-baseline shaped; there is no first-class way to run two
-explicit variants under one request and summarize their delta.
-
-**Scope:** Lift the 0037 runtime cap from one active `BenchmarkSpec` to multiple
-variants for the same workload. Variant identity belongs to the daemon's
-group/spec/run mapping (run → variant/ref/build target), not to columns that may
-or may not exist inside `stacks-bench.db`; treat the shared DB as the raw sample
-store. Each variant resolves/builds independently through the same reusable
-build-VM/cache path and runs in its own isolated VM/snapshot/process, writing
-into the group's shared `stacks-bench.db` via the same carry-forward mechanic as
-`0038` when multiple executions are involved. The final report renders a
-comparison summary modeled on the existing PR-vs-baseline delta, but without
-requiring PR semantics. The LLM resolver can later emit this as a structured
-comparison request; the initial slice may expose a narrower explicit CLI/Slack
-syntax.
-
-Land a daemon-side `max_variants` cap before any LLM/Slack/PR field can fan out
-to multiple VM lifecycles. When combined with clean repeats, enforce the product
-(`variants × clean_repetitions`) under a hard cap until `0015` grows richer
-resource budgets.
-
-**Acceptance:** A request comparing two explicit refs runs both variants,
-persists both results into one group DB, and reports a clear delta summary
-(percentage change, links/artifacts, and a noise-aware classification) on the
-selected surface. The summary must not crown a winner on a sub-noise delta; when
-variants have repeats, classify the delta against per-variant variance and the
-existing PR-vs-baseline threshold discipline. Requests exceeding `max_variants`
-or the total lifecycle cap are rejected before enqueue. Existing PR baseline
-comparisons continue to work unchanged.
-
-**Deferred / non-goals:** No matrix comparisons, no automatic baseline
-selection beyond the explicitly requested refs, and no parallel variant
-scheduling until resource-aware admission/worker-fleet policy exists.
+*`0039-multi-variant-benchmark-comparisons` in progress (iteration v22) →
+[iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md).*
 
 *`0041-shared-benchmark-calibration` shipped (iteration v19, 2026-06) →
 [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md).*
