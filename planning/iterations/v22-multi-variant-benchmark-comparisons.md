@@ -313,9 +313,9 @@ preserving one carried group DB and one calibration per variant.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
 - [ ] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**

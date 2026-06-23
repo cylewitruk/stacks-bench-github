@@ -30,8 +30,8 @@ use sbgh_core::db::{
     RepoStore,
 };
 use sbgh_core::models::{
-    GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent,
-    QueuedEventDetail, ResolvedCommit,
+    BenchmarkSpec, GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult,
+    NewJobEvent, QueuedEventDetail, ResolvedCommit,
 };
 use uuid::Uuid;
 
@@ -221,6 +221,14 @@ pub trait RunnableJobStore: Send + Sync + 'static {
         benchmark_spec_id: Uuid,
     ) -> anyhow::Result<Vec<BenchmarkRunMetric>> {
         let _ = benchmark_spec_id;
+        Ok(Vec::new())
+    }
+
+    async fn benchmark_group_specs(
+        &self,
+        benchmark_group_id: Uuid,
+    ) -> anyhow::Result<Vec<BenchmarkSpec>> {
+        let _ = benchmark_group_id;
         Ok(Vec::new())
     }
 
@@ -441,6 +449,16 @@ impl RunnableJobStore for JobSource {
         Ok(self
             .jobs
             .benchmark_run_metrics(benchmark_spec_id)
+            .await?)
+    }
+
+    async fn benchmark_group_specs(
+        &self,
+        benchmark_group_id: Uuid,
+    ) -> anyhow::Result<Vec<BenchmarkSpec>> {
+        Ok(self
+            .jobs
+            .lookup_benchmark_specs(benchmark_group_id)
             .await?)
     }
 

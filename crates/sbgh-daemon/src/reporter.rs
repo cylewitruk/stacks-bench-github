@@ -17,6 +17,7 @@
 //! poll loop (preflight resolve failure, a lost claim on `start_running`, a
 //! recipe `SetupError`) — matching the prior inline `execute` semantics.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use sbgh_core::config::DaemonConfig;
@@ -26,7 +27,7 @@ use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use crate::artifact_store::build_store_or_local;
 use crate::bench_summary::RunResult;
-use crate::comparison::{BaselineComparison, compare};
+use crate::comparison::{BaselineComparison, GroupComparison, compare};
 use crate::events::{Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::{ReportSurface, build_report_surface};
@@ -366,6 +367,69 @@ impl Reporter {
         })
     }
 
+    /// v22 Phase 4: best-effort comparison summary for an explicitly grouped
+    /// multi-variant benchmark. Computed only after the current terminal state
+    /// has been persisted, so the final run's promoted metric is included.
+    async fn group_comparison(&self) -> Option<GroupComparison> {
+        if self
+            .job
+            .group_requested_run_count
+            <= self.job.requested_run_count
+        {
+            return None;
+        }
+        if self.job.group_run_index + 1
+            < self
+                .job
+                .group_requested_run_count
+        {
+            return None;
+        }
+
+        let specs = match self
+            .jobs
+            .benchmark_group_specs(self.job.benchmark_group_id)
+            .await
+        {
+            Ok(specs) if specs.len() > 1 => specs,
+            Ok(_) => return None,
+            Err(e) => {
+                tracing::debug!(job_id = %self.job.id, error = ?e, "group comparison: loading specs failed");
+                return None;
+            }
+        };
+
+        let mut metrics_by_spec = HashMap::with_capacity(specs.len());
+        for spec in &specs {
+            match self
+                .jobs
+                .benchmark_run_metrics(spec.id)
+                .await
+            {
+                Ok(metrics) => {
+                    metrics_by_spec.insert(spec.id, metrics);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        job_id = %self.job.id,
+                        benchmark_spec_id = %spec.id,
+                        error = ?e,
+                        "group comparison: loading metrics failed",
+                    );
+                    return None;
+                }
+            }
+        }
+
+        GroupComparison::from_specs(
+            &specs,
+            &metrics_by_spec,
+            self.config
+                .reporting
+                .noise_cv_pct,
+        )
+    }
+
     /// This run's metric, parsed from the archived `run.json` referenced in the
     /// forensics `summary` — the same `metric_from_run` the persistence path
     /// uses, so the comment's delta is on the numbers we store.
@@ -404,6 +468,14 @@ impl Reporter {
                     return Some(e);
                 }
                 tracing::info!(job_id = %self.job.id, "job result persisted (status=completed)");
+                let group_comparison = self.group_comparison().await;
+                if let Some(comparison) = &group_comparison {
+                    tracing::debug!(
+                        job_id = %self.job.id,
+                        variants = comparison.variants.len(),
+                        "group comparison summary computed",
+                    );
+                }
                 let comparison = self
                     .baseline_comparison(&summary)
                     .await;
@@ -718,6 +790,7 @@ impl Reporter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
 
@@ -726,8 +799,9 @@ mod tests {
         ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
         PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
     };
+    use sbgh_core::db::BenchmarkRunMetric;
     use sbgh_core::github::test_support::{FakeCall, FakeGitHub};
-    use sbgh_core::models::GitRefKind;
+    use sbgh_core::models::{BenchmarkSpec, BuildTarget, GitRefKind, JobMetric, TaskKind};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -767,6 +841,8 @@ mod tests {
     struct RecordingStore {
         calls: StdMutex<Vec<&'static str>>,
         baseline: Option<BaselineRef>,
+        specs: Vec<BenchmarkSpec>,
+        metrics: HashMap<Uuid, Vec<BenchmarkRunMetric>>,
     }
 
     impl RecordingStore {
@@ -781,6 +857,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .clone()
+        }
+        fn with_group(
+            specs: Vec<BenchmarkSpec>,
+            metrics: HashMap<Uuid, Vec<BenchmarkRunMetric>>,
+        ) -> Self {
+            Self {
+                specs,
+                metrics,
+                ..Self::default()
+            }
         }
     }
 
@@ -822,6 +908,22 @@ mod tests {
             _workload_key: &str,
         ) -> anyhow::Result<Option<BaselineRef>> {
             Ok(self.baseline.clone())
+        }
+        async fn benchmark_run_metrics(
+            &self,
+            benchmark_spec_id: Uuid,
+        ) -> anyhow::Result<Vec<BenchmarkRunMetric>> {
+            Ok(self
+                .metrics
+                .get(&benchmark_spec_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        async fn benchmark_group_specs(
+            &self,
+            _benchmark_group_id: Uuid,
+        ) -> anyhow::Result<Vec<BenchmarkSpec>> {
+            Ok(self.specs.clone())
         }
         async fn fail(
             &self,
@@ -1163,6 +1265,38 @@ mod tests {
         }
     }
 
+    fn comparison_spec(
+        group_id: Uuid,
+        index: i32,
+        rev: &str,
+        calibration_id: i64,
+    ) -> BenchmarkSpec {
+        BenchmarkSpec {
+            id: Uuid::from_u128((index + 1) as u128),
+            benchmark_group_id: group_id,
+            spec_index: index,
+            requested_run_count: 1,
+            baseline_calibration_id: Some(calibration_id),
+            github_repo_id: 10,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+            git_ref_kind: GitRefKind::Branch,
+            git_ref_display: rev.into(),
+            git_commit_hash: Some(format!("{rev}-sha")),
+            git_committed_at: None,
+            workload_key: Some("wk".into()),
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        }
+    }
+
+    fn run_metric(index: i32, metric: JobMetric) -> BenchmarkRunMetric {
+        BenchmarkRunMetric {
+            benchmark_run_index: index,
+            metric,
+        }
+    }
+
     fn side(
         owner: &str,
         name: &str,
@@ -1214,6 +1348,7 @@ mod tests {
                 committed_at: chrono::DateTime::from_timestamp(1_716_000_000, 0),
                 selection: sbgh_core::db::BaselineSelection::NearestBefore,
             }),
+            ..Default::default()
         });
 
         let gh = Arc::new(FakeGitHub::new());
@@ -1271,6 +1406,83 @@ mod tests {
         assert_eq!(c.head_owner, "cylewitruk");
         assert_eq!(c.head_ref, "feat/foo");
         assert_eq!(c.selection, sbgh_core::db::BaselineSelection::NearestBefore);
+    }
+
+    #[tokio::test]
+    async fn group_comparison_loads_specs_and_metrics_for_final_group_run() {
+        let tmp = TempDir::new().unwrap();
+        let group_id = Uuid::new_v4();
+        let baseline = comparison_spec(group_id, 0, "release/3.4.0.0.2", 11);
+        let candidate = comparison_spec(group_id, 1, "release/3.4.0.0.3", 22);
+        let store = Arc::new(RecordingStore::with_group(
+            vec![baseline.clone(), candidate.clone()],
+            HashMap::from([
+                (baseline.id, vec![run_metric(0, baseline_metric(700_000, 300_000))]),
+                (candidate.id, vec![run_metric(0, baseline_metric(718_000, 300_000))]),
+            ]),
+        ));
+        let mut job = job_with(ProgressTarget::Slack {
+            channel: "C1".into(),
+            message_ts: "REQ".into(),
+            plan_message_ts: Some("PLAN".into()),
+        });
+        job.benchmark_group_id = group_id;
+        job.benchmark_spec_id = candidate.id;
+        job.benchmark_run_index = 0;
+        job.requested_run_count = 1;
+        job.group_run_index = 1;
+        job.group_requested_run_count = 2;
+
+        let reporter = Reporter::new(
+            Arc::new(no_report_config(&tmp)),
+            store,
+            Arc::new(FakeGitHub::new()),
+            Arc::new(OnceCell::new()),
+            None,
+            Default::default(),
+            job,
+        );
+
+        let comparison = reporter
+            .group_comparison()
+            .await
+            .expect("final comparison run computes group summary");
+
+        assert_eq!(
+            comparison
+                .baseline
+                .ref_display,
+            "release/3.4.0.0.2"
+        );
+        assert_eq!(
+            comparison
+                .baseline
+                .baseline_calibration_id,
+            Some(11)
+        );
+        assert_eq!(comparison.variants.len(), 1);
+        assert_eq!(
+            comparison.variants[0]
+                .variant
+                .ref_display,
+            "release/3.4.0.0.3"
+        );
+        assert_eq!(
+            comparison.variants[0]
+                .variant
+                .baseline_calibration_id,
+            Some(22)
+        );
+        assert!(
+            (comparison.variants[0]
+                .comparison
+                .as_ref()
+                .unwrap()
+                .delta_pct
+                - 1.8)
+                .abs()
+                < 1e-9
+        );
     }
 
     /// A baseline (non-PR) job has no fork-point → no comparison.
