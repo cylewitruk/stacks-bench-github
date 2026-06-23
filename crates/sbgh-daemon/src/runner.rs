@@ -1864,6 +1864,8 @@ mod tests {
             runner: RunnerConfig {
                 max_concurrent_jobs: 1,
                 max_clean_repetitions: 5,
+                max_variants: 2,
+                max_comparison_lifecycles: 10,
                 cpu_sets: vec![],
                 host_cpus: None,
             },

@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::workload::{BlockSelector, WorkloadSpec, WorkloadTarget};
+use crate::workload::{
+    BenchmarkRequest, BlockSelector, ComparisonRequest, ComparisonVariant, WorkloadSpec,
+    WorkloadTarget,
+};
 
 const MAX_INVALID_REASON_CHARS: usize = 512;
 const MAX_INVALID_ISSUES: usize = 7;
@@ -49,6 +52,7 @@ pub enum IntentIssueField {
     Repetitions,
     Warmup,
     Rev,
+    VariantRefs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -95,6 +99,7 @@ pub struct IntentResolutionJson {
     pub repetitions: Option<u32>,
     pub warmup: Option<u32>,
     pub rev: Option<String>,
+    pub variant_refs: Option<Vec<String>>,
     pub reason: Option<String>,
     pub issues: Option<Vec<IntentIssueJson>>,
 }
@@ -150,13 +155,14 @@ impl IntentIssueField {
             Self::Repetitions => "repetitions",
             Self::Warmup => "warmup",
             Self::Rev => "rev",
+            Self::VariantRefs => "variant refs",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntentOutcome {
-    Resolved(WorkloadSpec),
+    Resolved(BenchmarkRequest),
     Invalid(IntentInvalid),
 }
 
@@ -198,6 +204,7 @@ fn validate_invalid_intent(
         || intent.repetitions.is_some()
         || intent.warmup.is_some()
         || intent.rev.is_some()
+        || intent.variant_refs.is_some()
     {
         return Err(IntentValidationError::InvalidShape(
             "invalid status must not carry target or run fields".into(),
@@ -231,6 +238,7 @@ fn validate_resolved_intent(
     }
     let warmup = required(intent.warmup, "warmup")?;
     let rev = normalize_optional_text(intent.rev);
+    let variant_refs = normalize_variant_refs(intent.variant_refs)?;
 
     let target = match target_kind {
         TargetKind::Block => {
@@ -283,12 +291,24 @@ fn validate_resolved_intent(
         }
     };
 
-    Ok(IntentOutcome::Resolved(WorkloadSpec {
+    let workload = WorkloadSpec {
         target,
         clean_repetitions: repetitions,
         warmup: Some(warmup),
         rev,
-    }))
+    };
+    if let Some(variants) = variant_refs {
+        if workload.rev.is_some() {
+            return Err(IntentValidationError::InvalidShape(
+                "comparison requests must use variant_refs instead of rev".into(),
+            ));
+        }
+        return Ok(IntentOutcome::Resolved(BenchmarkRequest::Comparison(ComparisonRequest {
+            workload,
+            variants,
+        })));
+    }
+    Ok(IntentOutcome::Resolved(BenchmarkRequest::Single(workload)))
 }
 
 fn validate_issues(
@@ -401,6 +421,30 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_variant_refs(
+    value: Option<Vec<String>>,
+) -> Result<Option<Vec<ComparisonVariant>>, IntentValidationError> {
+    let Some(values) = value else {
+        return Ok(None);
+    };
+    if values.len() < 2 {
+        return Err(IntentValidationError::InvalidShape(
+            "variant_refs needs at least two refs".into(),
+        ));
+    }
+    let mut variants = Vec::with_capacity(values.len());
+    for value in values {
+        let rev = value.trim().to_string();
+        if rev.is_empty() {
+            return Err(IntentValidationError::InvalidShape(
+                "variant_refs entries must be non-empty".into(),
+            ));
+        }
+        variants.push(ComparisonVariant { rev });
+    }
+    Ok(Some(variants))
+}
+
 /// JSON schema body for OpenAI `text.format` (`type = json_schema`).
 ///
 /// This is intentionally pinned rather than relying solely on generated schema:
@@ -423,6 +467,7 @@ pub fn intent_response_text_format() -> Value {
                 "repetitions",
                 "warmup",
                 "rev",
+                "variant_refs",
                 "reason",
                 "issues"
             ],
@@ -461,6 +506,12 @@ pub fn intent_response_text_format() -> Value {
                 "repetitions": { "type": ["integer", "null"], "minimum": 1 },
                 "warmup": { "type": ["integer", "null"], "minimum": 0 },
                 "rev": { "type": ["string", "null"] },
+                "variant_refs": {
+                    "type": ["array", "null"],
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": { "type": "string" }
+                },
                 "reason": { "type": ["string", "null"] },
                 "issues": {
                     "type": ["array", "null"],
@@ -478,7 +529,8 @@ pub fn intent_response_text_format() -> Value {
                                     "txids",
                                     "repetitions",
                                     "warmup",
-                                    "rev"
+                                    "rev",
+                                    "variant_refs"
                                 ]
                             },
                             "code": {
@@ -648,6 +700,7 @@ mod tests {
             repetitions: Some(1),
             warmup: Some(0),
             rev: None,
+            variant_refs: None,
             reason: None,
             issues: None,
         }
@@ -668,7 +721,9 @@ mod tests {
                 hash: Some(HASH.into()),
             },
         ]);
-        let IntentOutcome::Resolved(spec) = validate_intent_resolution(intent).unwrap() else {
+        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
+            validate_intent_resolution(intent).unwrap()
+        else {
             panic!("expected resolved");
         };
         assert_eq!(spec.clean_repetitions, 1);
@@ -691,7 +746,9 @@ mod tests {
         intent.repetitions = Some(3);
         intent.warmup = Some(2);
         intent.rev = Some(" develop ".into());
-        let IntentOutcome::Resolved(spec) = validate_intent_resolution(intent).unwrap() else {
+        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
+            validate_intent_resolution(intent).unwrap()
+        else {
             panic!("expected resolved");
         };
         assert_eq!(spec.clean_repetitions, 3);
@@ -704,7 +761,9 @@ mod tests {
     fn validates_txids_and_strips_prefix() {
         let mut intent = resolved_base(TargetKind::Txids);
         intent.txids = Some(vec![TXID.into()]);
-        let IntentOutcome::Resolved(spec) = validate_intent_resolution(intent).unwrap() else {
+        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
+            validate_intent_resolution(intent).unwrap()
+        else {
             panic!("expected resolved");
         };
         assert_eq!(
@@ -713,6 +772,50 @@ mod tests {
                 "f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce".into()
             ])
         );
+    }
+
+    #[test]
+    fn validates_comparison_variant_refs() {
+        let mut intent = resolved_base(TargetKind::Txids);
+        intent.txids = Some(vec![TXID.into()]);
+        intent.repetitions = Some(5);
+        intent.warmup = Some(10);
+        intent.variant_refs =
+            Some(vec![" sb-integration/3.4.0.0.2 ".into(), "sb-integration/3.4.0.0.3".into()]);
+        let IntentOutcome::Resolved(BenchmarkRequest::Comparison(comparison)) =
+            validate_intent_resolution(intent).unwrap()
+        else {
+            panic!("expected comparison");
+        };
+        assert_eq!(comparison.workload.rev, None);
+        assert_eq!(
+            comparison
+                .workload
+                .clean_repetitions,
+            5
+        );
+        assert_eq!(comparison.workload.warmup, Some(10));
+        assert_eq!(
+            comparison
+                .variants
+                .iter()
+                .map(|v| v.rev.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sb-integration/3.4.0.0.2", "sb-integration/3.4.0.0.3"]
+        );
+    }
+
+    #[test]
+    fn comparison_intent_rejects_rev_field() {
+        let mut intent = resolved_base(TargetKind::Txids);
+        intent.txids = Some(vec![TXID.into()]);
+        intent.rev = Some("baseline".into());
+        intent.variant_refs = Some(vec!["baseline".into(), "candidate".into()]);
+        assert!(matches!(
+            validate_intent_resolution(intent),
+            Err(IntentValidationError::InvalidShape(msg))
+                if msg.contains("variant_refs instead of rev")
+        ));
     }
 
     #[test]
@@ -726,6 +829,7 @@ mod tests {
             repetitions: None,
             warmup: None,
             rev: None,
+            variant_refs: None,
             reason: Some("I need a target".into()),
             issues: Some(vec![IntentIssueJson {
                 field: IntentIssueField::Target,
@@ -769,6 +873,7 @@ mod tests {
             repetitions: None,
             warmup: None,
             rev: None,
+            variant_refs: None,
             reason: Some("r".repeat(600)),
             issues: Some(issues),
         };
@@ -805,6 +910,7 @@ mod tests {
             "repetitions": null,
             "warmup": null,
             "rev": null,
+            "variant_refs": null,
             "reason": "missing target",
             "issues": null,
             "extra": "nope"
@@ -860,6 +966,7 @@ mod tests {
             "repetitions",
             "warmup",
             "rev",
+            "variant_refs",
             "reason",
             "issues",
         ] {

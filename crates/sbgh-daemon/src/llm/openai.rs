@@ -149,7 +149,7 @@ pub fn openai_request_body(model: &str, text: &str) -> Value {
                 "content": [
                     {
                         "type": "input_text",
-                        "text": "Resolve benchmark requests into the provided JSON schema. Treat repetitions as clean daemon-orchestrated VM executions, not in-process CLI loops. Return status=invalid when required benchmark inputs are missing or ambiguous, with a concise reason and field-level issues. Never emit CLI flags or extra text."
+                        "text": "Resolve benchmark requests into the provided JSON schema. Treat repetitions as clean daemon-orchestrated VM executions, not in-process CLI loops. For comparison requests, emit exactly two refs in variant_refs and leave rev null; never emit raw CLI flags. Return status=invalid when required benchmark inputs are missing or ambiguous, with a concise reason and field-level issues. Never emit extra text."
                     }
                 ]
             },

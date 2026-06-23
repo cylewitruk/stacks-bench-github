@@ -26,6 +26,8 @@ use crate::slack::target::SlackJobTarget;
 pub struct SocketRunOptions {
     pub intent_rate_limit_per_minute: u32,
     pub max_clean_repetitions: u32,
+    pub max_variants: u32,
+    pub max_comparison_lifecycles: u32,
     pub binary_cache_enabled: bool,
 }
 
@@ -160,6 +162,7 @@ pub async fn run(
     // rides into the listener via user state.
     let mut connector = SlackConnector::new(cfg, target, jobs, web_client)
         .with_max_clean_repetitions(options.max_clean_repetitions)
+        .with_comparison_limits(options.max_variants, options.max_comparison_lifecycles)
         .with_binary_cache_enabled(options.binary_cache_enabled);
     if let Some(resolver) = intent_resolver {
         connector = connector.with_intent_resolver(resolver, options.intent_rate_limit_per_minute);

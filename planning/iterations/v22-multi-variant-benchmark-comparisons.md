@@ -3,7 +3,7 @@
 Promote explicit ad-hoc comparison benchmarks so a Slack request can benchmark
 one workload against two refs and report one noise-aware delta summary (`0039`).
 
-> **Status:** in_progress - planning scoped; implementation not started.
+> **Status:** in_progress - Phase 1 implemented and ready for external review.
 >
 > v21 remains planned but deferred. Comparison benchmarks are the next
 > operational need, and they can build on the already-shipped group/run,
@@ -151,21 +151,21 @@ on the v21 native schema-v1 cleanup.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] Existing single-ref Slack requests resolve exactly as before.
-- [ ] An explicit two-ref Slack request resolves to one comparison request with
+- [x] Existing single-ref Slack requests resolve exactly as before.
+- [x] An explicit two-ref Slack request resolves to one comparison request with
   two ordered variants.
-- [ ] A natural-language comparison request resolves through the LLM into the
+- [x] A natural-language comparison request resolves through the LLM into the
   same comparison request model.
-- [ ] Txid, block selector, and block-range comparison requests all flow through
+- [x] Txid, block selector, and block-range comparison requests all flow through
   the same request model and validation path.
-- [ ] Requests exceeding variant or total-lifecycle caps are rejected before any
+- [x] Requests exceeding variant or total-lifecycle caps are rejected before any
   job/group rows are created.
 
 **Tests:**

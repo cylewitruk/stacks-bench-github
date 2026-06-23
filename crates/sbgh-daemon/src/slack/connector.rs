@@ -35,7 +35,9 @@ use crate::slack::card::{self, CardCtx, RepeatContext};
 use crate::slack::client::{ACK_REACTION, QUEUED_REACTION, SlackClient};
 use crate::slack::stream::initial_chunks_for_card;
 use crate::slack::target::SlackJobTarget;
-use crate::workload::{WorkloadSpec, resolve_workload};
+use crate::workload::{
+    BenchmarkRequest, RequestLimits, resolve_benchmark_request, validate_benchmark_request,
+};
 
 /// One inbound Slack mention, normalized from the Socket Mode `app_mention`
 /// envelope (the receive loop, wiring slice, builds these).
@@ -71,6 +73,8 @@ pub struct SlackConnector {
     intent_resolver: Option<Arc<dyn IntentResolver>>,
     intent_rate_limit_per_minute: u32,
     max_clean_repetitions: u32,
+    max_variants: u32,
+    max_comparison_lifecycles: u32,
     binary_cache_enabled: bool,
     intent_calls: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
@@ -90,6 +94,8 @@ impl SlackConnector {
             intent_resolver: None,
             intent_rate_limit_per_minute: 0,
             max_clean_repetitions: 5,
+            max_variants: 2,
+            max_comparison_lifecycles: 10,
             binary_cache_enabled: false,
             intent_calls: Mutex::new(HashMap::new()),
         }
@@ -97,6 +103,16 @@ impl SlackConnector {
 
     pub fn with_max_clean_repetitions(mut self, max_clean_repetitions: u32) -> Self {
         self.max_clean_repetitions = max_clean_repetitions.max(1);
+        self
+    }
+
+    pub fn with_comparison_limits(
+        mut self,
+        max_variants: u32,
+        max_comparison_lifecycles: u32,
+    ) -> Self {
+        self.max_variants = max_variants.max(1);
+        self.max_comparison_lifecycles = max_comparison_lifecycles.max(1);
         self
     }
 
@@ -151,29 +167,26 @@ impl SlackConnector {
         // 2. Resolve the workload (mention stripped → parser fast-path, then optional
         //    LLM resolver).
         let text = strip_leading_mention(&event.text);
-        let spec = match self
-            .resolve_workload_for_event(&event, text)
+        let request = match self
+            .resolve_request_for_event(&event, text)
             .await
         {
-            Ok(spec) => spec,
+            Ok(request) => request,
             Err(reason) => {
                 self.reject_after_ack(&event, &reason)
                     .await;
                 return;
             }
         };
-        if spec.clean_repetitions > self.max_clean_repetitions {
-            self.reject_after_ack(
-                &event,
-                &format!(
-                    "too many clean repetitions — requested {}, max is {}",
-                    spec.clean_repetitions, self.max_clean_repetitions
-                ),
-            )
-            .await;
-            return;
-        }
-        if spec.clean_repetitions > 1 && !self.binary_cache_enabled {
+        let request = match validate_benchmark_request(request, self.request_limits()) {
+            Ok(request) => request,
+            Err(e) => {
+                self.reject_after_ack(&event, &e.to_string())
+                    .await;
+                return;
+            }
+        };
+        if request.clean_repetitions() > 1 && !self.binary_cache_enabled {
             self.reject_after_ack(
                 &event,
                 "clean repetitions require the binary cache to be enabled",
@@ -181,6 +194,25 @@ impl SlackConnector {
             .await;
             return;
         }
+        let spec = match request {
+            BenchmarkRequest::Single(spec) => spec,
+            BenchmarkRequest::Comparison(comparison) => {
+                tracing::info!(
+                    variants = comparison.variants.len(),
+                    clean_repetitions = comparison
+                        .workload
+                        .clean_repetitions,
+                    "slack: comparison request resolved but group planning is not enabled yet"
+                );
+                self.reject_after_ack(
+                    &event,
+                    "comparison benchmarks are not enabled yet — this daemon can parse the \
+                     request shape, but group execution lands in v22 Phase 2",
+                )
+                .await;
+                return;
+            }
+        };
         // 3. Enqueue an ad-hoc job. Default repo (target ids) + rev (`--rev` override,
         //    else the configured default); the parsed workload becomes `bench_args`;
         //    channel/message_ts ride along as reporting provenance.
@@ -341,15 +373,26 @@ impl SlackConnector {
         }
     }
 
-    async fn resolve_workload_for_event(
+    fn request_limits(&self) -> RequestLimits {
+        RequestLimits::new(
+            self.max_clean_repetitions,
+            self.max_variants,
+            self.max_comparison_lifecycles,
+        )
+    }
+
+    async fn resolve_request_for_event(
         &self,
         event: &MentionEvent,
         text: &str,
-    ) -> Result<WorkloadSpec, String> {
-        match resolve_workload(text) {
-            Ok(spec) => {
-                tracing::info!("slack: workload resolved via deterministic parser fast-path");
-                return Ok(spec);
+    ) -> Result<BenchmarkRequest, String> {
+        match resolve_benchmark_request(text) {
+            Ok(request) => {
+                tracing::info!(
+                    request_kind = request.kind_label(),
+                    "slack: workload resolved via deterministic parser fast-path"
+                );
+                return Ok(request);
             }
             Err(e) if self.intent_resolver.is_none() => return Err(e.to_string()),
             Err(_) => {}
@@ -367,7 +410,7 @@ impl SlackConnector {
         }
         tracing::info!("slack: parser did not match — resolving via the llm intent resolver");
         match resolver.resolve(text).await {
-            Ok(IntentOutcome::Resolved(spec)) => Ok(spec),
+            Ok(IntentOutcome::Resolved(request)) => Ok(request),
             Ok(IntentOutcome::Invalid(invalid)) => Err(invalid.user_message()),
             Err(e) => {
                 tracing::warn!(error = %e, "slack: intent resolver failed");
@@ -522,6 +565,7 @@ mod tests {
     use sbgh_core::models::JobSource;
 
     use super::*;
+    use crate::workload::WorkloadSpec;
 
     const TARGET: SlackJobTarget = SlackJobTarget {
         installation_id: 100,
@@ -587,9 +631,13 @@ mod tests {
 
     impl FakeIntentResolver {
         fn resolved(spec: WorkloadSpec) -> Self {
+            Self::resolved_request(BenchmarkRequest::Single(spec))
+        }
+
+        fn resolved_request(request: BenchmarkRequest) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
-                outcome: Ok(IntentOutcome::Resolved(spec)),
+                outcome: Ok(IntentOutcome::Resolved(request)),
             }
         }
 
@@ -1157,7 +1205,7 @@ mod tests {
         assert!(
             eph[0]
                 .2
-                .contains("only one of"),
+                .contains("only one target mode"),
             "ephemeral carries the parse reason: {}",
             eph[0].2
         );
@@ -1265,6 +1313,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deterministic_comparison_is_validated_but_not_enqueued_in_phase_1() {
+        let (c, store, slack) = harness();
+        c.handle_mention(event(
+            "<@U07BOT> bench --start-at 100 --count 3 --rev baseline --compare-rev candidate \
+             --repetitions 1",
+        ))
+        .await;
+
+        assert!(store.all_jobs().is_empty(), "Phase 1 must not enqueue comparison as singleton");
+        assert!(
+            slack
+                .net_reactions()
+                .is_empty(),
+            "rejected comparison must not get accepted reaction",
+        );
+        let eph = slack
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("comparison benchmarks are not enabled yet"),
+            "{}",
+            eph[0].2
+        );
+    }
+
+    #[tokio::test]
+    async fn comparison_variant_cap_rejects_before_phase_1_gate() {
+        let store = Arc::new(InMemoryJobStore::new());
+        let client = Arc::new(FakeSlackClient::default());
+        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
+            .with_binary_cache_enabled(true)
+            .with_comparison_limits(1, 10);
+
+        connector
+            .handle_mention(event(
+                "<@U07BOT> bench --block 1 --rev baseline --compare-rev candidate",
+            ))
+            .await;
+
+        assert!(store.all_jobs().is_empty());
+        let eph = client
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("too many comparison refs"),
+            "{}",
+            eph[0].2
+        );
+    }
+
+    #[tokio::test]
+    async fn comparison_lifecycle_cap_rejects_before_phase_1_gate() {
+        let store = Arc::new(InMemoryJobStore::new());
+        let client = Arc::new(FakeSlackClient::default());
+        let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
+            .with_binary_cache_enabled(true)
+            .with_max_clean_repetitions(5)
+            .with_comparison_limits(2, 9);
+
+        connector
+            .handle_mention(event(
+                "<@U07BOT> bench --block 1 --rev baseline --compare-rev candidate --repetitions 5",
+            ))
+            .await;
+
+        assert!(store.all_jobs().is_empty());
+        let eph = client
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("requested 10 VM runs, max is 9"),
+            "{}",
+            eph[0].2
+        );
+    }
+
+    #[tokio::test]
     async fn flag_shaped_request_uses_parser_fast_path_without_llm_call() {
         let resolver = Arc::new(FakeIntentResolver::invalid("should not be used"));
         let (c, store, _slack, resolver) = harness_with_intent(resolver);
@@ -1306,6 +1443,56 @@ mod tests {
         };
         assert_eq!(bench_args, vec!["--start-at", "10", "--count", "3", "--warmup", "1"]);
         assert_eq!(clean_repetitions, 1);
+    }
+
+    #[tokio::test]
+    async fn natural_language_comparison_uses_same_phase_1_gate() {
+        let request = BenchmarkRequest::Comparison(crate::workload::ComparisonRequest {
+            workload: WorkloadSpec {
+                target: crate::workload::WorkloadTarget::Txids(vec![
+                    "f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce".into(),
+                ]),
+                clean_repetitions: 1,
+                warmup: Some(10),
+                rev: None,
+            },
+            variants: vec![
+                crate::workload::ComparisonVariant {
+                    rev: "sb-integration/3.4.0.0.2".into(),
+                },
+                crate::workload::ComparisonVariant {
+                    rev: "sb-integration/3.4.0.0.3".into(),
+                },
+            ],
+        });
+        let resolver = Arc::new(FakeIntentResolver::resolved_request(request));
+        let (c, store, slack, resolver) = harness_with_intent(resolver);
+        c.handle_mention(event(
+            "<@U07BOT> benchmark and compare tx \
+             f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce between 3.4.0.0.2 \
+             and 3.4.0.0.3 with 10 warmup",
+        ))
+        .await;
+
+        assert_eq!(resolver.calls(), 1);
+        assert!(store.all_jobs().is_empty());
+        assert!(
+            slack
+                .net_reactions()
+                .is_empty()
+        );
+        let eph = slack
+            .ephemerals
+            .lock()
+            .unwrap();
+        assert_eq!(eph.len(), 1);
+        assert!(
+            eph[0]
+                .2
+                .contains("comparison benchmarks are not enabled yet"),
+            "{}",
+            eph[0].2
+        );
     }
 
     #[tokio::test]

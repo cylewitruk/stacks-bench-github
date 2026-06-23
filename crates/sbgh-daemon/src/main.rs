@@ -218,6 +218,10 @@ async fn main() -> anyhow::Result<()> {
             config
                 .runner
                 .max_clean_repetitions,
+            config.runner.max_variants,
+            config
+                .runner
+                .max_comparison_lifecycles,
             config
                 .artifacts
                 .binary_cache
@@ -321,6 +325,8 @@ async fn main() -> anyhow::Result<()> {
                 intent_resolver,
                 intent_rate_limit,
                 max_clean_repetitions,
+                max_variants,
+                max_comparison_lifecycles,
                 binary_cache_enabled,
             )) = slack_runtime
             {
@@ -333,6 +339,8 @@ async fn main() -> anyhow::Result<()> {
                     slack::socket::SocketRunOptions {
                         intent_rate_limit_per_minute: intent_rate_limit,
                         max_clean_repetitions,
+                        max_variants,
+                        max_comparison_lifecycles,
                         binary_cache_enabled,
                     },
                     shutdown.draining.clone(),

@@ -192,6 +192,12 @@ pub struct RunnerConfig {
     /// once grouped execution lands. v15 Phase 1 parses/caps the value before
     /// enqueue; later phases consume it to create one VM run per repetition.
     pub max_clean_repetitions: u32,
+    /// Maximum comparison variants accepted from Slack/LLM requests. v22 keeps
+    /// the model N-shaped but caps Phase 1 request validation to two variants.
+    pub max_variants: u32,
+    /// Maximum measured VM lifecycles a comparison request may imply
+    /// (`variants × clean repetitions`).
+    pub max_comparison_lifecycles: u32,
     /// Optional CPU pinning (roadmap-v5 Phase 5), one **libvirt cpuset** per
     /// concurrency slot — e.g. `["0-1", "2-3"]` pins slot 0's VM to cores 0,1
     /// and slot 1's to 2,3. Length must be ≥ `max_concurrent_jobs`. Empty (the
@@ -672,6 +678,8 @@ struct RawReporting {
 struct RawRunner {
     max_concurrent_jobs: Option<usize>,
     max_clean_repetitions: Option<u32>,
+    max_variants: Option<u32>,
+    max_comparison_lifecycles: Option<u32>,
     cpu_sets: Option<Vec<String>>,
     host_cpus: Option<String>,
 }
@@ -784,6 +792,15 @@ impl RawDaemon {
             other
                 .runner
                 .max_clean_repetitions,
+        );
+        merge_opt(&mut self.runner.max_variants, other.runner.max_variants);
+        merge_opt(
+            &mut self
+                .runner
+                .max_comparison_lifecycles,
+            other
+                .runner
+                .max_comparison_lifecycles,
         );
 
         merge_opt(&mut self.vm.golden_image, other.vm.golden_image);
@@ -989,6 +1006,13 @@ impl RawDaemon {
                 .runner
                 .max_clean_repetitions,
             "SBGH_RUNNER_MAX_CLEAN_REPETITIONS",
+        );
+        env_parse_into(&mut self.runner.max_variants, "SBGH_RUNNER_MAX_VARIANTS");
+        env_parse_into(
+            &mut self
+                .runner
+                .max_comparison_lifecycles,
+            "SBGH_RUNNER_MAX_COMPARISON_LIFECYCLES",
         );
         // cpu_sets is a list of cpusets (each may contain commas, e.g. "0,2"),
         // so it's `;`-separated rather than CSV.
@@ -1235,6 +1259,16 @@ impl RawDaemon {
                         .runner
                         .max_clean_repetitions
                         .unwrap_or(5)
+                        .max(1),
+                    max_variants: self
+                        .runner
+                        .max_variants
+                        .unwrap_or(2)
+                        .max(1),
+                    max_comparison_lifecycles: self
+                        .runner
+                        .max_comparison_lifecycles
+                        .unwrap_or(10)
                         .max(1),
                     cpu_sets,
                     host_cpus: self.runner.host_cpus,
@@ -1613,6 +1647,12 @@ mod tests {
                 .max_clean_repetitions,
             5
         );
+        assert_eq!(cfg.runner.max_variants, 2);
+        assert_eq!(
+            cfg.runner
+                .max_comparison_lifecycles,
+            10
+        );
         assert_eq!(cfg.runner.cpu_sets, vec!["0-1".to_string(), "2-3".to_string()]);
         assert_eq!(
             cfg.runner
@@ -1632,6 +1672,12 @@ mod tests {
                 .max_clean_repetitions,
             5
         );
+        assert_eq!(cfg.runner.max_variants, 2);
+        assert_eq!(
+            cfg.runner
+                .max_comparison_lifecycles,
+            10
+        );
         assert!(cfg.runner.cpu_sets.is_empty(), "no pinning by default");
         assert!(cfg.runner.host_cpus.is_none());
     }
@@ -1647,6 +1693,22 @@ mod tests {
             cfg.runner
                 .max_clean_repetitions,
             7
+        );
+    }
+
+    #[test]
+    fn daemon_runner_comparison_caps_toml_then_env_override() {
+        let mut env = daemon_env();
+        env.push(("SBGH_RUNNER_MAX_VARIANTS", "4"));
+        env.push(("SBGH_RUNNER_MAX_COMPARISON_LIFECYCLES", "12"));
+        let _g = EnvGuard::set(&env);
+        let f = write("[runner]\nmax_variants = 3\nmax_comparison_lifecycles = 8\n");
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert_eq!(cfg.runner.max_variants, 4);
+        assert_eq!(
+            cfg.runner
+                .max_comparison_lifecycles,
+            12
         );
     }
 
