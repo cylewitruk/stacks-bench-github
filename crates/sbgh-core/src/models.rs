@@ -503,19 +503,29 @@ pub struct BenchmarkSpec {
 }
 
 impl BenchmarkSpec {
-    pub fn uses_shared_calibration(&self) -> bool {
-        uses_shared_calibration(self.task_kind, self.build_target, self.requested_run_count)
+    pub fn uses_shared_calibration_for_group(&self, group_measured_run_count: i32) -> bool {
+        uses_shared_calibration(self.task_kind, self.build_target, group_measured_run_count)
+    }
+
+    pub fn measured_run_count(&self) -> i32 {
+        measured_run_count(self.task_kind, self.requested_run_count)
     }
 }
 
 pub fn uses_shared_calibration(
     task_kind: TaskKind,
     build_target: BuildTarget,
-    requested_run_count: i32,
+    measured_run_count: i32,
 ) -> bool {
-    task_kind == TaskKind::Benchmark
-        && build_target == BuildTarget::StacksBench
-        && requested_run_count > 1
+    supports_shared_calibration(task_kind, build_target) && measured_run_count > 1
+}
+
+pub fn supports_shared_calibration(task_kind: TaskKind, build_target: BuildTarget) -> bool {
+    task_kind == TaskKind::Benchmark && build_target == BuildTarget::StacksBench
+}
+
+pub fn measured_run_count(task_kind: TaskKind, requested_run_count: i32) -> i32 {
+    if task_kind == TaskKind::BuildOnly { 0 } else { requested_run_count.max(1) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]

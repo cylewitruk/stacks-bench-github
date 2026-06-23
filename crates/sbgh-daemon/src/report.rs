@@ -924,6 +924,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            group_requested_run_count: 1,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "acme/widgets".into(),
@@ -1293,6 +1295,8 @@ mod tests {
         });
         job.benchmark_run_index = 1;
         job.requested_run_count = 3;
+        job.group_requested_run_count = 3;
+        job.group_run_index = 1;
         job
     }
 
@@ -1487,6 +1491,8 @@ mod tests {
             j.benchmark_group_id = group;
             j.benchmark_run_index = idx;
             j.requested_run_count = 2;
+            j.group_requested_run_count = 2;
+            j.group_run_index = idx;
             j
         };
         let jobs = || -> Arc<dyn RunnableJobStore> {

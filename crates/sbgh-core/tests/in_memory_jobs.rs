@@ -14,8 +14,8 @@ use sbgh_core::db::{
     NewBenchmarkSpec,
 };
 use sbgh_core::models::{
-    GitRefKind, JobAxes, JobCreationRequest, JobKind, JobMetric, JobResult, JobSource, JobStatus,
-    NewJob, NewPullRequestLink, QueuedEventDetail, TriggerKind,
+    BenchmarkStepKind, GitRefKind, JobAxes, JobCreationRequest, JobKind, JobMetric, JobResult,
+    JobSource, JobStatus, NewJob, NewPullRequestLink, QueuedEventDetail, TriggerKind,
 };
 use uuid::Uuid;
 
@@ -231,6 +231,22 @@ async fn in_memory_comparison_group_appends_and_resumes_next_spec() {
     assert_eq!(specs[1].baseline_calibration_id, Some(42));
     assert_eq!(first.benchmark_spec_id, specs[0].id);
     assert_eq!(first.benchmark_run_index, 0);
+    let steps: Vec<_> = store
+        .steps_for_group(first.benchmark_group_id)
+        .into_iter()
+        .map(|step| (step.step_index, step.step_kind, step.benchmark_spec_id))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            (0, BenchmarkStepKind::Build, Some(specs[0].id)),
+            (1, BenchmarkStepKind::Calibrate, Some(specs[0].id)),
+            (2, BenchmarkStepKind::Run, Some(specs[0].id)),
+            (3, BenchmarkStepKind::Build, Some(specs[1].id)),
+            (4, BenchmarkStepKind::Calibrate, Some(specs[1].id)),
+            (5, BenchmarkStepKind::Run, Some(specs[1].id)),
+        ],
+    );
 
     let token = Uuid::new_v4();
     let claimed = store

@@ -59,6 +59,11 @@ impl PostgresJobStore {
         .execute(&mut **tx)
         .await?;
 
+        let group_measured_run_count = specs
+            .iter()
+            .map(NewBenchmarkSpec::measured_run_count)
+            .sum::<i32>();
+
         let mut spec_ids = Vec::with_capacity(specs.len());
         let mut step_index = 0i32;
         for (spec_index, spec) in specs.iter().enumerate() {
@@ -120,7 +125,7 @@ impl PostgresJobStore {
             if uses_shared_calibration(
                 new.axes.task_kind,
                 new.axes.build_target,
-                requested_run_count,
+                group_measured_run_count,
             ) {
                 sqlx::query(
                     r#"
@@ -985,6 +990,25 @@ impl JobStore for PostgresJobStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    async fn lookup_benchmark_specs(&self, group_id: Uuid) -> Result<Vec<BenchmarkSpec>> {
+        let rows = sqlx::query_as::<_, BenchmarkSpec>(
+            r#"
+            SELECT id, benchmark_group_id, spec_index, requested_run_count,
+                   baseline_calibration_id,
+                   github_repo_id, task_kind, build_target, git_ref_kind,
+                   git_ref_display, git_commit_hash, git_committed_at,
+                   workload_key, created_at, updated_at
+              FROM benchmark_spec
+             WHERE benchmark_group_id = $1
+          ORDER BY spec_index ASC
+            "#,
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     async fn completed_event_detail(&self, job_id: Uuid) -> Result<Option<serde_json::Value>> {

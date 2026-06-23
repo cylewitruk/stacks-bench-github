@@ -145,6 +145,20 @@ impl InMemoryJobStore {
         specs.sort_by_key(|spec| spec.spec_index);
         specs
     }
+
+    pub fn steps_for_group(&self, group_id: Uuid) -> Vec<BenchmarkWorkflowStep> {
+        let mut steps: Vec<_> = self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .iter()
+            .filter(|step| step.benchmark_group_id == group_id)
+            .cloned()
+            .collect();
+        steps.sort_by_key(|step| step.step_index);
+        steps
+    }
 }
 
 /// Build a [`BaselineMatch`] from an in-memory job + its metric (mirrors the
@@ -192,6 +206,10 @@ fn group_specs(
     let mut out_specs = Vec::with_capacity(specs.len());
     let mut steps = Vec::new();
     let mut step_index = 0i32;
+    let group_measured_run_count = specs
+        .iter()
+        .map(NewBenchmarkSpec::measured_run_count)
+        .sum::<i32>();
     for (spec_index, requested) in specs.iter().enumerate() {
         let new = &requested.new_job;
         if new.github_installation_id != first_job.github_installation_id
@@ -233,7 +251,11 @@ fn group_specs(
         });
         step_index += 1;
 
-        if uses_shared_calibration(new.axes.task_kind, new.axes.build_target, requested_run_count) {
+        if uses_shared_calibration(
+            new.axes.task_kind,
+            new.axes.build_target,
+            group_measured_run_count,
+        ) {
             steps.push(BenchmarkWorkflowStep {
                 id: Uuid::new_v4(),
                 benchmark_group_id: group_id,
@@ -912,6 +934,20 @@ impl JobStore for InMemoryJobStore {
             .specs
             .get(&spec_id)
             .cloned())
+    }
+
+    async fn lookup_benchmark_specs(&self, group_id: Uuid) -> Result<Vec<BenchmarkSpec>> {
+        let mut specs: Vec<_> = self
+            .state
+            .lock()
+            .unwrap()
+            .specs
+            .values()
+            .filter(|spec| spec.benchmark_group_id == group_id)
+            .cloned()
+            .collect();
+        specs.sort_by_key(|spec| spec.spec_index);
+        Ok(specs)
     }
 
     async fn completed_event_detail(&self, job_id: Uuid) -> Result<Option<serde_json::Value>> {

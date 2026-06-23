@@ -406,9 +406,11 @@ async fn create_unlinked_benchmark_group_persists_ordered_specs_and_first_run() 
         steps,
         vec![
             (0, BenchmarkStepKind::Build, Some(specs[0].0)),
-            (1, BenchmarkStepKind::Run, Some(specs[0].0)),
-            (2, BenchmarkStepKind::Build, Some(specs[1].0)),
-            (3, BenchmarkStepKind::Run, Some(specs[1].0)),
+            (1, BenchmarkStepKind::Calibrate, Some(specs[0].0)),
+            (2, BenchmarkStepKind::Run, Some(specs[0].0)),
+            (3, BenchmarkStepKind::Build, Some(specs[1].0)),
+            (4, BenchmarkStepKind::Calibrate, Some(specs[1].0)),
+            (5, BenchmarkStepKind::Run, Some(specs[1].0)),
         ],
     );
 }

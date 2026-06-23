@@ -38,7 +38,7 @@ use crate::Result;
 use crate::models::{
     BenchmarkGroup, BenchmarkSpec, GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job,
     JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJob,
-    NewJobEvent, ResolvedCommit, TerminalJobStatus,
+    NewJobEvent, ResolvedCommit, TerminalJobStatus, measured_run_count,
 };
 
 /// Slice 10: atomic "the run completed" write. Bundles the terminal
@@ -185,6 +185,10 @@ impl NewBenchmarkSpec {
             baseline_calibration_id: None,
         }
     }
+
+    pub fn measured_run_count(&self) -> i32 {
+        measured_run_count(self.new_job.axes.task_kind, self.requested_run_count)
+    }
 }
 
 #[async_trait]
@@ -263,6 +267,8 @@ pub trait JobStore: Send + Sync + 'static {
     async fn lookup_benchmark_group(&self, group_id: Uuid) -> Result<Option<BenchmarkGroup>>;
 
     async fn lookup_benchmark_spec(&self, spec_id: Uuid) -> Result<Option<BenchmarkSpec>>;
+
+    async fn lookup_benchmark_specs(&self, group_id: Uuid) -> Result<Vec<BenchmarkSpec>>;
 
     /// The terminal completed event detail for `job_id`, if the run completed.
     /// Failed/cancelled runs intentionally return `None`, which stops a repeat

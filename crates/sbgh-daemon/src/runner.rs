@@ -1213,7 +1213,7 @@ impl JobDeps {
                     error = ?e,
                     "repeat planner: will not enqueue next run until carried SQLite DB is available",
                 );
-                if !job_is_final_repeat(job) {
+                if !job_is_final_group_run(job) {
                     self.fail_repeat_group_surface(
                         job,
                         "repeat group stalled: carrying the shared SQLite DB to the next run \
@@ -1225,7 +1225,7 @@ impl JobDeps {
             }
         };
         if !promoted {
-            if !job_is_final_repeat(job) {
+            if !job_is_final_group_run(job) {
                 self.fail_repeat_group_surface(
                     job,
                     "repeat group stalled: the completed run did not produce a SQLite DB to carry \
@@ -1325,15 +1325,15 @@ fn group_sqlite_key(artifact_prefix: &str) -> String {
 }
 
 fn job_should_carry_sqlite(job: &RunnableJob) -> bool {
-    uses_shared_calibration(job.task_kind, job.build_target, job.requested_run_count)
+    uses_shared_calibration(job.task_kind, job.build_target, job.group_requested_run_count)
 }
 
-fn job_is_final_repeat(job: &RunnableJob) -> bool {
-    job.benchmark_run_index + 1 >= job.requested_run_count
+fn job_is_final_group_run(job: &RunnableJob) -> bool {
+    job.group_run_index + 1 >= job.group_requested_run_count
 }
 
 fn sqlite_seed_key_for(job: &RunnableJob) -> Option<String> {
-    if job_should_carry_sqlite(job) && job.benchmark_run_index > 0 {
+    if job_should_carry_sqlite(job) && job.group_run_index > 0 {
         Some(group_sqlite_key(&job.group_artifact_prefix))
     } else {
         None
@@ -1875,6 +1875,54 @@ mod tests {
         }
     }
 
+    fn benchmark_job(
+        benchmark_run_index: i32,
+        requested_run_count: i32,
+        group_run_index: i32,
+        group_requested_run_count: i32,
+    ) -> RunnableJob {
+        RunnableJob {
+            id: Uuid::new_v4(),
+            benchmark_group_id: Uuid::new_v4(),
+            benchmark_spec_id: Uuid::new_v4(),
+            benchmark_run_index,
+            requested_run_count,
+            group_requested_run_count,
+            group_run_index,
+            baseline_calibration_id: None,
+            group_artifact_prefix: "group-a".into(),
+            repository: "acme/widgets".into(),
+            commit: "abc123".into(),
+            git_ref_display: "develop".into(),
+            git_ref_kind: GitRefKind::Branch,
+            installation_id: 7,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+            workload_key: None,
+            bench_args: vec![],
+            progress: ProgressTarget::CommitCheck { check_run_id: None },
+            claim_token: Some(Uuid::new_v4()),
+        }
+    }
+
+    #[test]
+    fn sqlite_carry_uses_group_sequence_not_spec_run_index() {
+        let first = benchmark_job(0, 1, 0, 2);
+        assert!(job_should_carry_sqlite(&first));
+        assert_eq!(sqlite_seed_key_for(&first), None);
+
+        let second_spec_first_run = benchmark_job(0, 1, 1, 2);
+        assert!(job_should_carry_sqlite(&second_spec_first_run));
+        assert_eq!(
+            sqlite_seed_key_for(&second_spec_first_run),
+            Some(group_sqlite_key(&second_spec_first_run.group_artifact_prefix)),
+        );
+        assert!(
+            job_is_final_group_run(&second_spec_first_run),
+            "spec 1 run 0 is the final group run in a two-variant comparison"
+        );
+    }
+
     /// The runner drives ANY `RunnableJobStore` (here a baseline job with
     /// reporting disabled — `baseline_report = none`, the default
     /// `test_config`) through `start_running` and, when the driver reports
@@ -1891,6 +1939,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            group_requested_run_count: 2,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
@@ -1954,6 +2004,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            group_requested_run_count: 2,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
@@ -2001,6 +2053,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            group_requested_run_count: 2,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: "group-a".into(),
             repository: "acme/widgets".into(),
@@ -2066,6 +2120,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            group_requested_run_count: 2,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: "group-b".into(),
             repository: "acme/widgets".into(),
@@ -2127,6 +2183,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            group_requested_run_count: 2,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: "group-failed".into(),
             repository: "acme/widgets".into(),
@@ -2179,6 +2237,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 2,
+            group_requested_run_count: 2,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: "group-missing".into(),
             repository: "acme/widgets".into(),
@@ -2198,7 +2258,7 @@ mod tests {
             claim_token: Some(Uuid::new_v4()),
         };
         let source = Arc::new(FakeSource::new(job.clone()));
-        assert!(!job_is_final_repeat(&job), "fixture must be an intermediate repeat");
+        assert!(!job_is_final_group_run(&job), "fixture must be an intermediate group run");
         let planner = Arc::new(FakeRepeatPlanner::default());
         planner.set_completed_detail(
             job.id,
@@ -2325,6 +2385,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            group_requested_run_count: 1,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
@@ -2395,6 +2457,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            group_requested_run_count: 1,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
@@ -2483,6 +2547,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            group_requested_run_count: 1,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "acme/widgets".into(),
@@ -3616,6 +3682,8 @@ mod tests {
         let mut repeat = slack_job(Some("PLAN_TS"));
         repeat.benchmark_run_index = 1;
         repeat.requested_run_count = 2;
+        repeat.group_requested_run_count = 2;
+        repeat.group_run_index = 1;
         source.set_queued(vec![repeat]);
         let slack = Arc::new(FakePositionSlack::default());
         let mut coord = position_coord_with_slack(config, source.clone(), slack.clone());

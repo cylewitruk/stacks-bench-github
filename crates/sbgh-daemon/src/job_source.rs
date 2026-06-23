@@ -95,6 +95,12 @@ pub struct RunnableJob {
     pub benchmark_run_index: i32,
     /// Requested isolated run count for this spec. Singleton jobs store 1.
     pub requested_run_count: i32,
+    /// Total measured executions in this benchmark group across all specs.
+    /// Build-only groups store 0.
+    pub group_requested_run_count: i32,
+    /// Zero-based measured-execution index across the whole group. For a
+    /// two-variant, one-repeat comparison, spec 1 run 0 is group run 1.
+    pub group_run_index: i32,
     /// Shared stacks-bench baseline calibration id for repeat groups, once run
     /// 0 has produced it.
     pub baseline_calibration_id: Option<i64>,
@@ -621,6 +627,20 @@ impl JobSource {
                     job.benchmark_spec_id
                 )
             })?;
+        let specs = self
+            .jobs
+            .lookup_benchmark_specs(job.benchmark_group_id)
+            .await?;
+        let group_requested_run_count = specs
+            .iter()
+            .map(|spec| spec.measured_run_count())
+            .sum::<i32>();
+        let prior_group_run_count = specs
+            .iter()
+            .filter(|candidate| candidate.spec_index < spec.spec_index)
+            .map(|spec| spec.measured_run_count())
+            .sum::<i32>();
+        let group_run_index = prior_group_run_count + job.benchmark_run_index;
 
         // bench_args live in the queued event's provenance detail.
         let queued = self
@@ -721,6 +741,8 @@ impl JobSource {
             benchmark_spec_id: job.benchmark_spec_id,
             benchmark_run_index: job.benchmark_run_index,
             requested_run_count: spec.requested_run_count,
+            group_requested_run_count,
+            group_run_index,
             baseline_calibration_id: spec.baseline_calibration_id,
             group_artifact_prefix: group.artifact_prefix,
             repository: format!("{}/{}", repo.owner, repo.name),

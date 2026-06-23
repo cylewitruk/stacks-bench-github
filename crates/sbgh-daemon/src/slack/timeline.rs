@@ -1150,6 +1150,8 @@ mod tests {
             benchmark_spec_id: Uuid::new_v4(),
             benchmark_run_index: 0,
             requested_run_count: 1,
+            group_requested_run_count: 1,
+            group_run_index: 0,
             baseline_calibration_id: None,
             group_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "octo/core".into(),
@@ -1186,6 +1188,8 @@ mod tests {
         let mut job = job();
         job.benchmark_run_index = 0;
         job.requested_run_count = 2;
+        job.group_requested_run_count = 2;
+        job.group_run_index = 0;
         SlackTimeline::new(slack, store, job, "C1".into(), "REQ_TS".into(), resume_ts)
     }
 
@@ -1592,6 +1596,8 @@ mod tests {
         run1.id = Uuid::from_u128(0xB0B);
         run1.benchmark_run_index = 1;
         run1.requested_run_count = 2;
+        run1.group_requested_run_count = 2;
+        run1.group_run_index = 1;
         run1.commit = "ffffffffffffffff".into();
         tl.begin_run(&run1).await;
 
@@ -1899,6 +1905,8 @@ mod tests {
         let mut job = job();
         job.benchmark_run_index = 1;
         job.requested_run_count = 2;
+        job.group_requested_run_count = 2;
+        job.group_run_index = 1;
         let tl = SlackTimeline::new(
             slack.clone(),
             store.clone(),
