@@ -68,6 +68,7 @@ need editing when an item's status or location changes.
 | `0048-slack-stream-error-classification` | Transient vs permanent stream-append errors (don't abandon streaming on a blip) | `backlog` | [backlog.md](backlog.md) |
 | `0049-libvirt-pure-driver-spike` | Direct libvirt RPC driver spike (`libvirt-pure`) | `backlog` | [backlog.md](backlog.md) |
 | `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
+| `0051-slack-progress-sections-as-plan-tasks` | Slack progress sections as first-class plan tasks | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 

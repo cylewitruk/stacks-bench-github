@@ -218,11 +218,6 @@ fn validate_invalid_intent(
 fn validate_resolved_intent(
     intent: IntentResolutionJson,
 ) -> Result<IntentOutcome, IntentValidationError> {
-    if intent.reason.is_some() || intent.issues.is_some() {
-        return Err(IntentValidationError::InvalidShape(
-            "resolved status must not carry reason or issues".into(),
-        ));
-    }
     let target_kind = intent
         .target_kind
         .ok_or_else(|| {
@@ -772,6 +767,31 @@ mod tests {
                 "f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce".into()
             ])
         );
+    }
+
+    #[test]
+    fn resolved_status_ignores_diagnostic_fields() {
+        let mut intent = resolved_base(TargetKind::Txids);
+        intent.txids = Some(vec![TXID.into()]);
+        intent.repetitions = Some(5);
+        intent.warmup = Some(2);
+        intent.rev = Some("sb-integration/squash".into());
+        intent.reason = Some("model-generated summary".into());
+        intent.issues = Some(vec![IntentIssueJson {
+            field: IntentIssueField::Target,
+            code: IntentIssueCode::NeedsContext,
+            message: "diagnostic noise from resolved response".into(),
+        }]);
+
+        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
+            validate_intent_resolution(intent).unwrap()
+        else {
+            panic!("expected resolved");
+        };
+
+        assert_eq!(spec.clean_repetitions, 5);
+        assert_eq!(spec.warmup, Some(2));
+        assert_eq!(spec.rev.as_deref(), Some("sb-integration/squash"));
     }
 
     #[test]

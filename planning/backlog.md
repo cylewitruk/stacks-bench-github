@@ -200,7 +200,10 @@ state before the worker claims the job, so the first reporter append sees
 That is safe, but it loses the no-collapse stream behavior before the benchmark
 has even started. The current pre-claim queue-position updater only appends when
 position changes; a job stuck at the same position behind one long run can
-therefore produce no stream activity for the whole wait.
+therefore produce no stream activity for the whole wait. This has now been
+observed on-host: queued Slack streams are not heartbeated, appear to time out
+after the Slack stream TTL (roughly minutes), and then update in block mode once
+the job is claimed.
 
 **Scope:** Split the Slack surface into two phases. At enqueue, post a normal
 threaded queue receipt (plain Block Kit or text) that acknowledges the request,
@@ -229,6 +232,50 @@ does not recreate the same expiry window.
 **Deferred / non-goals:** No automatic Slack Home integration, no cancellation
 buttons, and no attempt to keep a pre-claim plan stream alive with heartbeats.
 This is a surface/lifecycle split, not a scheduler change.
+
+### 0051 — Slack progress sections as first-class plan tasks
+
+- **id:** `0051-slack-progress-sections-as-plan-tasks`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** `0027-fine-grained-progress`
+- **relates_to:** `0023-slack-card-redesign`,
+  `0047-slack-reporting-session`
+- **source:** Slack progress UX follow-up (2026-06)
+
+**Problem:** Fine-grained `stacks-bench` progress currently renders as section
+text under the single "Running benchmark" task. For long phases, this creates a
+tall, hard-to-scan task body and prevents Slack from collapsing completed
+subsections into concise final messages. Users need the benchmark workflow to
+read like a sequence of meaningful sub-tasks: baseline calibration, indexing,
+warmup, measurement, cleanup, finalization, and later per-variant/per-repeat
+units. Repeated benchmark groups also expose a correctness/UX failure in the
+current append-only transcript: progress sections can duplicate or appear
+incoherently across multiple clean runs, making the active run's log hard to
+trust at a glance.
+
+**Scope:** Promote the progress sections currently rendered inside the
+benchmark task into first-class Slack plan tasks. The Slack reporter owns the UX
+mapping from structured progress events to tasks; do not render upstream
+human-readable messages verbatim. Use daemon-owned task titles and concise
+progress details, and mark a task complete with a final output once its phase is
+done so Slack can collapse it. Preserve the existing high-level job/build/final
+tasks, but split the benchmark body into structured children such as:
+calibration, indexing blocks and transactions, measurement N/M, cleanup, and
+finalizing results. Keep GitHub/check-run surfaces on the simpler progress
+summary unless/until they need richer structure.
+
+**Acceptance:** A long Slack benchmark no longer accumulates all progress under
+one "Running benchmark" body. Each meaningful progress section appears as its
+own plan task, completed sections collapse with a final message, active sections
+continue to update from structured progress fields, and repeated/comparison runs
+remain scoped to the active group run without leaking, duplicating, or
+interleaving prior-run transcript.
+
+**Deferred / non-goals:** No new upstream `stacks-bench` event schema is
+required for the first pass; any missing high-quality final messages should be
+derived only from structured fields or left generic. Full rich result tables
+remain with the final report/result-summary items.
 
 ### 0046 — Reaction state from `reactions.list` (drop brute-force removal)
 
