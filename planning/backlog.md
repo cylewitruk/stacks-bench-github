@@ -321,16 +321,32 @@ Slack/API blip therefore permanently abandons streaming (and stops the keepalive
 for a card that's otherwise fine. Only `message_not_in_streaming_state` /
 `MissingMessage` are genuinely terminal for the stream.
 
+Host observation (2026-06-25): a long-running card appended keepalives
+successfully every ~10s for at least 40s, then the next keepalive returned
+`message_not_in_streaming_state` with no obvious daemon-side terminal event.
+That means this is not only the old idle-timeout class; Slack may invalidate a
+stream despite recent accepted `appendStream` calls, or the current "quiet"
+`task_update` keepalive may not reliably extend the stream lifetime even when it
+returns OK.
+
 **Scope:** Extend `classify_stream_error` (or the call sites) to distinguish
 **transient** append failures (network/5xx/rate-limit) from **permanent** ones
 (`not_in_streaming_state`, `message_not_found`, `not_owned`). On transient, keep
 `streaming = true` and let the next tick/append retry, with a bounded
 consecutive-failure budget before giving up; only permanent errors flip to block
-mode.
+mode. Also re-evaluate the keepalive semantics themselves: confirm whether
+identical/minimal `task_update` chunks actually preserve stream liveness, whether
+Slack requires meaningful/new appended content, and whether the keepalive should
+occasionally emit a distinct low-noise update or accept stream loss as an
+expected degradation path.
 
 **Acceptance:** A single transient append error does not permanently disable
 streaming — the next keepalive/append retries on the stream; a genuine
 not-streaming/missing error still falls back to `chat.update` as today.
+Host validation covers the observed case: if `message_not_in_streaming_state`
+appears immediately after regular successful keepalives, the logs make it clear
+whether the daemon finalized the stream, Slack invalidated it, or the keepalive
+payload failed to preserve liveness.
 
 **Deferred / non-goals:** No change to the keepalive cadence or the block-update
 render path; the failure budget/backoff shape is a design detail.
