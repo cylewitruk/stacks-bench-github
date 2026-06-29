@@ -513,46 +513,13 @@ today's literal `stable` behavior.
 implicit bug fix. This is a policy choice and should be opt-in or clearly
 documented if made default.
 
-### 0026 — Central block/tx index cache (pre-seed)
+### 0026 — Central chainstate index ledger (pre-seed)
 
 - **id:** `0026-central-block-index-cache`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** *(none)* — gated on a schema spike of `stacks-bench.db`
-- **relates_to:** `0037-benchmark-group-run-model`,
-  `0038-isolated-benchmark-repetitions`
-- **source:** high-value list (2026-06)
+- **status:** `in_progress`
 
-**Problem:** Benching a range far from chain tip pays a large indexing cost —
-`stacks-bench` walks backward from tip (8.2M+ blocks, +1/~5s) to resolve the
-canonical Stacks block per height. That walk is recomputed per job even though,
-below the reorg horizon, the canonical mapping is stable.
-
-**Scope:** Extract the **block/tx index portion** (resolved canonical
-height→block mapping and tx index) from completed `stacks-bench.db` files and
-**merge into a central store** — idempotent, conflict-aware (deeper/newer wins;
-a disagreement *below* the finality depth is flagged, not merged). The store is
-**keyed and validated by provenance** — network (mainnet/testnet),
-chainstate/source identity, the index-schema version, and the
-stacks-core/stacks-bench DB-schema version — so a pre-seed can never mix
-networks or incompatible layouts. **Pre-seed** a fresh bench DB with the
-requested range when present and final, so the bench only indexes the uncovered
-tail, then merges its new portion back. A **finality-depth guard** is
-load-bearing — pre-seeding a not-yet-final block corrupts the run.
-
-**Acceptance:** A bench over a previously-indexed, final range starts measuring
-without re-walking from tip; a partially-covered range indexes only the
-uncovered tail and merges it back.
-
-**Group interaction:** Once `0037`/`0038` exist, pre-seeding must be aware of the
-group DB carry-forward mechanic: seed only the missing index portion of the
-group's DB, never overwrite prior repeats/variants already carried forward.
-
-**Deferred / non-goals:** Storage model (canonical SQLite "index pack" copied
-range-wise vs Postgres + re-inject), exact tables to extract, per-network
-scoping, and the finality depth are design questions. **Highest-risk of the
-batch** (reorg correctness + stacks-core schema coupling) — wants a schema spike
-before an iteration.
+Promoted to `v23-central-block-tx-index-cache` →
+[iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md).
 
 ### 0027 — Fine-grained bench progress (JSONL)
 

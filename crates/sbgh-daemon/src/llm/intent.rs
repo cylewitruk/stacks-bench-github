@@ -500,9 +500,13 @@ pub fn intent_response_text_format() -> Value {
                 },
                 "repetitions": { "type": ["integer", "null"], "minimum": 1 },
                 "warmup": { "type": ["integer", "null"], "minimum": 0 },
-                "rev": { "type": ["string", "null"] },
+                "rev": {
+                    "type": ["string", "null"],
+                    "description": "Single benchmark ref. Use this for one-ref requests phrased as on/against <ref>."
+                },
                 "variant_refs": {
                     "type": ["array", "null"],
+                    "description": "Exactly two refs only for explicit comparison requests; otherwise null.",
                     "minItems": 2,
                     "maxItems": 2,
                     "items": { "type": "string" }
@@ -584,6 +588,11 @@ pub const EVAL_FIXTURES: &[IntentEvalFixture] = &[
     },
     IntentEvalFixture {
         prompt: "bench blocks 8123456 to 8200000 on 3.4.0.0.3",
+        expected: EvalExpected::Resolved,
+    },
+    IntentEvalFixture {
+        prompt: "bench 10k blocks from height 8500000, twice, with a 2.5k block warmup, against \
+                 sb-integration/squash",
         expected: EvalExpected::Resolved,
     },
     IntentEvalFixture {
@@ -750,6 +759,36 @@ mod tests {
         assert_eq!(spec.target, WorkloadTarget::BlockRange { start: 10, end: 12 });
         assert_eq!(spec.to_bench_args(), vec!["--start-at", "10", "--count", "3", "--warmup", "2"]);
         assert_eq!(spec.rev.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn validates_single_ref_block_range_from_against_phrase_shape() {
+        let mut intent = resolved_base(TargetKind::BlockRange);
+        intent.block_range = Some(IntentBlockRangeJson {
+            start: 8_500_000,
+            end: 8_509_999,
+        });
+        intent.repetitions = Some(2);
+        intent.warmup = Some(2_500);
+        intent.rev = Some("sb-integration/squash".into());
+        intent.variant_refs = None;
+
+        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
+            validate_intent_resolution(intent).unwrap()
+        else {
+            panic!("expected single-ref benchmark");
+        };
+
+        assert_eq!(spec.clean_repetitions, 2);
+        assert_eq!(spec.warmup, Some(2_500));
+        assert_eq!(
+            spec.target,
+            WorkloadTarget::BlockRange {
+                start: 8_500_000,
+                end: 8_509_999,
+            }
+        );
+        assert_eq!(spec.rev.as_deref(), Some("sb-integration/squash"));
     }
 
     #[test]

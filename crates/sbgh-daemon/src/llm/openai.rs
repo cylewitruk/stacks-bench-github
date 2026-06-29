@@ -9,6 +9,19 @@ use crate::llm::intent::{
     intent_response_text_format, validate_intent_resolution,
 };
 
+const INTENT_SYSTEM_PROMPT: &str = concat!(
+    "Resolve benchmark requests into the provided JSON schema. ",
+    "Treat repetitions as clean daemon-orchestrated VM executions, not in-process CLI loops. ",
+    "A request that says `on <ref>` or `against <ref>` with one ref is a single-ref request: ",
+    "set rev to that ref and set variant_refs to null. ",
+    "Only emit variant_refs for explicit comparison wording such as compare, compared to, vs, ",
+    "versus, or between <ref> and <ref>, and only when exactly two refs are present. ",
+    "For comparison requests, emit exactly two refs in variant_refs and leave rev null; ",
+    "never emit raw CLI flags. ",
+    "Return status=invalid when required benchmark inputs are missing or ambiguous, ",
+    "with a concise reason and field-level issues. Never emit extra text."
+);
+
 pub struct OpenAiIntentResolver {
     client: reqwest::Client,
     api_key: String,
@@ -149,7 +162,7 @@ pub fn openai_request_body(model: &str, text: &str) -> Value {
                 "content": [
                     {
                         "type": "input_text",
-                        "text": "Resolve benchmark requests into the provided JSON schema. Treat repetitions as clean daemon-orchestrated VM executions, not in-process CLI loops. For comparison requests, emit exactly two refs in variant_refs and leave rev null; never emit raw CLI flags. Return status=invalid when required benchmark inputs are missing or ambiguous, with a concise reason and field-level issues. Never emit extra text."
+                        "text": INTENT_SYSTEM_PROMPT
                     }
                 ]
             },
@@ -229,6 +242,12 @@ mod tests {
         let body = openai_request_body("gpt-test", "bench block 1");
         assert_eq!(body["model"], "gpt-test");
         assert_eq!(body["input"][0]["role"], "system");
+        assert!(
+            body["input"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("against <ref>` with one ref is a single-ref request")
+        );
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][1]["content"][0]["text"], "bench block 1");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
