@@ -14,8 +14,10 @@ planning/design/0003-results-portal.md
 
 > **Current contents:** living design docs for the unshipped items —
 > [`0003-results-portal`](0003-results-portal.md),
-> [`0004-worker-fleet`](0004-worker-fleet.md), and
-> [`0019-block-validation-recipe`](0019-block-validation-recipe.md). Shipped items
+> [`0004-worker-fleet`](0004-worker-fleet.md),
+> [`0019-block-validation-recipe`](0019-block-validation-recipe.md), and
+> [`0052-managed-stacks-node-chainstate-producer`](0052-managed-stacks-node-chainstate-producer.md).
+> Shipped items
 > keep **no** live design here: on ship, each is folded into
 > [archive/completed/](../archive/completed/) and removed (per the rule below);
 > durable rules live in [decisions/](../decisions/).

@@ -69,6 +69,7 @@ need editing when an item's status or location changes.
 | `0049-libvirt-pure-driver-spike` | Direct libvirt RPC driver spike (`libvirt-pure`) | `backlog` | [backlog.md](backlog.md) |
 | `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 | `0051-slack-progress-sections-as-plan-tasks` | Slack progress sections as first-class plan tasks | `backlog` | [backlog.md](backlog.md) |
+| `0052-managed-stacks-node-chainstate-producer` | Managed stacks-node chainstate producer | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 

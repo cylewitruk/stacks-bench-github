@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "description": "Draft managed-node historical backfill plan. Review producer releases and approximate release cut heights before running on the host.",
+  "snapshot_script": "managed-node-snapshot.sh",
+  "operator_notes": [
+    "This plan is intentionally argv-hook based. Replace install_release with the host-local script that checks out, builds, and installs a release build of stacks-node.",
+    "Epoch activation heights are the known hard boundaries. Release rows with estimated=true use rough LLM-derived Bitcoin heights and should be treated as operational cut points, not consensus boundaries.",
+    "For pre-activation snapshots, target_burn_height is activation_height - 1 so the snapshot metadata's actual_epoch is the epoch the chainstate is still running under.",
+    "The base LV starting point determines first-cut duration. For real backfills, seed the base LV from a trusted archive/snapshot near the first cut instead of syncing from genesis if possible.",
+    "If a long run fails, resume with managed-node-backfill.sh run --plan <plan> --from <event>. Use the current cut unless the snapshot completed, then use the next cut."
+  ],
+  "defaults": {
+    "vg": "vg0",
+    "base_lv": "stacks-node-mainnet",
+    "base_mount": "/var/lib/stacks-chainstate",
+    "snapshot_prefix": "mainnet-node-",
+    "service": "stacks-node.service",
+    "api_url": "http://127.0.0.1:20443/v2/info",
+    "metadata_dir": "/var/lib/sbgh/chainstate-snapshots",
+    "quiesce": "umount",
+    "snapshot_mount_options": "ro,nouuid,norecovery",
+    "poll_secs": 30,
+    "restart_after_snapshot": false,
+    "validate_snapshot": true,
+    "reason": "release"
+  },
+  "hooks": {
+    "install_release": [
+      "/usr/local/sbin/sbgh-install-stacks-node-release",
+      "{{producer_release}}"
+    ],
+    "start_node": [
+      "sudo",
+      "systemctl",
+      "start",
+      "{{service}}"
+    ],
+    "after_snapshot": []
+  },
+  "cuts": [
+    {
+      "event": "rel-3.0.0.0.0-before-epoch-3.0",
+      "reason": "epoch",
+      "producer_release": "3.0.0.0.0",
+      "expected_producer_release": "3.0.0.0.0",
+      "target_burn_height": 867866,
+      "implements_epoch": "3.0",
+      "notes": "Pre-Nakamoto snapshot; actual_epoch should still derive as 2.5."
+    },
+    {
+      "event": "epoch-3.0-activation",
+      "reason": "epoch",
+      "producer_release": "3.0.0.0.0",
+      "expected_producer_release": "3.0.0.0.0",
+      "target_burn_height": 867867,
+      "implements_epoch": "3.0",
+      "notes": "Nakamoto activation snapshot; actual_epoch should derive as 3.0."
+    },
+    {
+      "event": "rel-3.1.0.0.2-before-epoch-3.1",
+      "reason": "epoch",
+      "producer_release": "3.1.0.0.2",
+      "expected_producer_release": "3.1.0.0.2",
+      "target_burn_height": 874999,
+      "implements_epoch": "3.1",
+      "notes": "Pre-3.1 snapshot; actual_epoch should still derive as 3.0."
+    },
+    {
+      "event": "epoch-3.1-activation",
+      "reason": "epoch",
+      "producer_release": "3.1.0.0.2",
+      "expected_producer_release": "3.1.0.0.2",
+      "target_burn_height": 875000,
+      "implements_epoch": "3.1",
+      "notes": "SIP-029 activation snapshot."
+    },
+    {
+      "event": "rel-3.2.0.0.0-before-epoch-3.2",
+      "reason": "epoch",
+      "producer_release": "3.2.0.0.0",
+      "expected_producer_release": "3.2.0.0.0",
+      "target_burn_height": 907739,
+      "implements_epoch": "3.2",
+      "notes": "Pre-3.2 snapshot; actual_epoch should still derive as 3.1."
+    },
+    {
+      "event": "epoch-3.2-activation",
+      "reason": "epoch",
+      "producer_release": "3.2.0.0.0",
+      "expected_producer_release": "3.2.0.0.0",
+      "target_burn_height": 907740,
+      "implements_epoch": "3.2",
+      "notes": "SIP-031 activation snapshot."
+    },
+    {
+      "event": "rel-3.3.0.0.0-before-epoch-3.3",
+      "reason": "epoch",
+      "producer_release": "3.3.0.0.0",
+      "expected_producer_release": "3.3.0.0.0",
+      "target_burn_height": 923221,
+      "implements_epoch": "3.3",
+      "notes": "Pre-3.3 snapshot; actual_epoch should still derive as 3.2."
+    },
+    {
+      "event": "epoch-3.3-activation",
+      "reason": "epoch",
+      "producer_release": "3.3.0.0.0",
+      "expected_producer_release": "3.3.0.0.0",
+      "target_burn_height": 923222,
+      "implements_epoch": "3.3",
+      "notes": "Clarity 4 / epoch 3.3 activation snapshot."
+    },
+    {
+      "event": "rel-3.4.0.0.0-before-epoch-3.4",
+      "reason": "epoch",
+      "producer_release": "3.4.0.0.0",
+      "expected_producer_release": "3.4.0.0.0",
+      "target_burn_height": 943332,
+      "implements_epoch": "3.4",
+      "notes": "Pre-3.4 snapshot; actual_epoch should still derive as 3.3."
+    },
+    {
+      "event": "epoch-3.4-activation",
+      "reason": "epoch",
+      "producer_release": "3.4.0.0.0",
+      "expected_producer_release": "3.4.0.0.0",
+      "target_burn_height": 943333,
+      "implements_epoch": "3.4",
+      "notes": "Clarity 5 / at-block removal activation snapshot."
+    },
+    {
+      "event": "rel-3.4.0.0.1-approx",
+      "reason": "release",
+      "producer_release": "3.4.0.0.1",
+      "expected_producer_release": "3.4.0.0.1",
+      "target_burn_height": 943500,
+      "estimated": true,
+      "notes": "Approximate operational cut from release timestamp; verify if exact release-height mapping matters."
+    },
+    {
+      "event": "rel-3.4.0.0.2-approx",
+      "reason": "release",
+      "producer_release": "3.4.0.0.2",
+      "expected_producer_release": "3.4.0.0.2",
+      "target_burn_height": 948000,
+      "estimated": true,
+      "notes": "Approximate operational cut from release timestamp."
+    },
+    {
+      "event": "rel-3.4.0.0.3-approx",
+      "reason": "release",
+      "producer_release": "3.4.0.0.3",
+      "expected_producer_release": "3.4.0.0.3",
+      "target_burn_height": 951300,
+      "estimated": true,
+      "notes": "Approximate operational cut from release timestamp."
+    }
+  ]
+}

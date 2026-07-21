@@ -277,6 +277,42 @@ required for the first pass; any missing high-quality final messages should be
 derived only from structured fields or left generic. Full rich result tables
 remain with the final report/result-summary items.
 
+### 0052 — Managed stacks-node chainstate producer
+
+- **id:** `0052-managed-stacks-node-chainstate-producer`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** `0015-resource-aware-admission`
+- **relates_to:** `0026-central-block-index-cache`,
+  `0039-multi-variant-benchmark-comparisons`
+- **source:** chainstate freshness/provenance design discussion (2026-06)
+- **design:**
+  [design/0052-managed-stacks-node-chainstate-producer.md](design/0052-managed-stacks-node-chainstate-producer.md)
+
+**Problem:** Chainstate archives and nightly LVs are produced outside sbgh's
+admission and provenance model. That makes near-tip benchmark requests slow to
+set up, leaves snapshot creation invisible to job planning, and gives weak
+compatibility metadata for branch/release comparisons.
+
+**Scope:** Put a real `stacks-node` under sbgh management. While the host is
+idle, sbgh runs the node on a writable base LV. Before benchmark/index jobs or
+planned cut points, sbgh gracefully stops the node, verifies quiescence, takes
+tagged LVM-thin snapshots, records provenance, and restarts the node when idle.
+Support an initial forward reconstruction from an older release through
+release/epoch/daily cut points, then ongoing nightly and release/epoch
+snapshots.
+
+**Acceptance:** sbgh can produce a tagged read-only chainstate snapshot by
+gracefully stopping a managed node, records producer version/tip/epoch metadata,
+keeps benchmark jobs off the mutable base LV, and restarts the node when the
+queue is idle. Admission treats node sync/snapshot work and benchmark/index
+groups as mutually exclusive on the host.
+
+**Deferred / non-goals:** No live snapshot from a writing node, no benchmark
+directly against the mutable node LV, no automatic ref-expansion policy, and no
+attempt to make near-tip snapshots reusable for v23 ledger facts before the
+finality boundary says they are safe.
+
 ### 0046 — Reaction state from `reactions.list` (drop brute-force removal)
 
 - **id:** `0046-slack-reaction-state-from-api`
