@@ -15,6 +15,7 @@ planning/design/0003-results-portal.md
 > **Current contents:** living design docs for the unshipped items —
 > [`0003-results-portal`](0003-results-portal.md),
 > [`0004-worker-fleet`](0004-worker-fleet.md),
+> [`0017-generic-phase-events`](0017-generic-phase-events.md),
 > [`0019-block-validation-recipe`](0019-block-validation-recipe.md), and
 > [`0052-managed-stacks-node-chainstate-producer`](0052-managed-stacks-node-chainstate-producer.md).
 > Shipped items

@@ -21,7 +21,7 @@ need editing when an item's status or location changes.
 | `0001-artifact-store` | Artifact store | `shipped` | [archive/completed/0001-artifact-store.md](archive/completed/0001-artifact-store.md) |
 | `0002-slack-adhoc-profiling` | Slack ad-hoc profiling | `shipped` | [archive/completed/0002-slack-adhoc-profiling.md](archive/completed/0002-slack-adhoc-profiling.md) |
 | `0003-results-portal` | Results portal | `backlog` | [backlog.md](backlog.md) |
-| `0004-worker-fleet` | Worker fleet (`remote-daemon`) | `backlog` | [backlog.md](backlog.md) |
+| `0004-worker-fleet` | Worker fleet (`remote-daemon`) | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
 | `0005-task-kind-platform` | Job-model decomposition + task-kind platform | `shipped` | [archive/completed/0005-task-kind-platform.md](archive/completed/0005-task-kind-platform.md) |
 | `0006-aws-cloud-backend` | AWS / cloud backend | `parked` | [backlog.md](backlog.md) |
 | `0007-check-run-surface` | Check-run surface | `shipped` | [archive/completed/0007-check-run-surface.md](archive/completed/0007-check-run-surface.md) |
@@ -34,9 +34,9 @@ need editing when an item's status or location changes.
 | `0014-preclaim-placeholder-checks` | Pre-claim placeholder checks | `backlog` | [backlog.md](backlog.md) |
 | `0015-resource-aware-admission` | Resource-aware admission | `backlog` | [backlog.md](backlog.md) |
 | `0016-db-enforced-same-sha-dedup` | DB-enforced same-SHA dedup | `parked` | [backlog.md](backlog.md) |
-| `0017-generic-phase-events` | Generic phase-event enum | `backlog` | [backlog.md](backlog.md) |
+| `0017-generic-phase-events` | Task-neutral durable worker events | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
 | `0018-auto-rerun-confidence-gate` | Auto-rerun confidence gate | `parked` | [backlog.md](backlog.md) |
-| `0019-block-validation-recipe` | Block-validation recipe | `backlog` | [backlog.md](backlog.md) |
+| `0019-block-validation-recipe` | Block-validation recipe | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
 | `0020-llm-intent-resolution` | LLM intent resolution (Slack) | `shipped` | [archive/completed/0020-llm-intent-resolution.md](archive/completed/0020-llm-intent-resolution.md) |
 | `0021-slack-live-timeline` | Slack live timeline | `shipped` | [archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md) |
 | `0022-report-surface-trait` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
@@ -70,6 +70,9 @@ need editing when an item's status or location changes.
 | `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 | `0051-slack-progress-sections-as-plan-tasks` | Slack progress sections as first-class plan tasks | `backlog` | [backlog.md](backlog.md) |
 | `0052-managed-stacks-node-chainstate-producer` | Managed stacks-node chainstate producer | `backlog` | [backlog.md](backlog.md) |
+| `0053-repository-workspace-cleanup` | Repository and workspace truth cleanup | `planned` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `0054-application-crate-boundaries` | Application crate and dependency boundaries | `planned` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `0055-execution-boundary-preparation` | In-process execution-boundary preparation | `planned` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
 
 ## Iterations
 
@@ -95,6 +98,8 @@ need editing when an item's status or location changes.
 | `v21-stacks-bench-schema-v1-native` | Native `stacks-bench` schema-v1 JSON | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 | `v22-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `in_progress` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
 | `v23-central-block-tx-index-cache` | Central chainstate index ledger | `in_progress` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
+| `v24-workspace-architecture-cleanup` | Workspace and architecture cleanup | `planned` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
 
 ## Decisions
 

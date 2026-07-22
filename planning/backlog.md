@@ -17,55 +17,14 @@ Its live-timeline follow-on `0021-slack-live-timeline` shipped (iteration v6) �
 
 ## Backlog (unscheduled)
 
-### 0004 — Distributed worker fleet (`remote-daemon`)
-
-- **id:** `0004-worker-fleet`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0010-driver-seam` (shipped)
-- **review:** `Codex signed off` (design)
-- **design:** [design/0004-worker-fleet.md](design/0004-worker-fleet.md)
-
-**Problem:** A single host caps concurrency and can't serve heterogeneous
-hardware (pinned bench boxes vs. big-local-NVMe block-val boxes).
-
-**Scope:** Split `sbgh-daemon` into orchestrator + `sbgh-worker` (shared
-`sbgh-exec`); thin pull-based worker API; capability matching;
-per-`measurement_profile` baseline trust. After `0037`, a benchmark group is an
-indivisible host-pinned scheduling unit: all repeats/variants/calibration for
-that group run on the same worker so carried DBs and host-stable calibration
-remain valid.
-
-**Acceptance:** A remote worker runs a bench end-to-end; orchestrator stays the
-sole DB client.
+*`0004-worker-fleet`, `0019-block-validation-recipe`, and load-bearing event item
+`0017-generic-phase-events` are planned in
+[v25-worker-fleet-block-validation](iterations/v25-worker-fleet-block-validation.md).*
 
 *`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
 model: source / intent / task_kind / build_target / derived report; build-only
 proven) — as-built record in
 [archive/completed/0005-task-kind-platform.md](archive/completed/0005-task-kind-platform.md).*
-
-### 0019 — Block-validation recipe (second task kind)
-
-- **id:** `0019-block-validation-recipe`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0005-task-kind-platform`
-- **relates_to:** `0037-benchmark-group-run-model`
-- **review:** `Codex signed off` (design sketch)
-- **design:**
-  [design/0019-block-validation-recipe.md](design/0019-block-validation-recipe.md)
-  *(from roadmap-v6 Phase 3 + block-validation-taskspec)*
-
-**Problem:** Block validation is the planned second task kind — the proof that
-the platform costs ~one crate per kind.
-
-**Scope:** A `BlockValidationRecipe` with a probe-driven, K-shard fan-out over
-CoW chainstate workspaces; terminal semantics (invalid-blocks = red check, not
-infra failure).
-
-**Acceptance:** Block validation lands on top of `0005` with no engine edits,
-and composes with the reusable build/workflow model from `0037` rather than
-creating a separate build pipeline.
 
 ### 0014 — Pre-claim placeholder / skipped checks + queue visibility
 
@@ -477,23 +436,6 @@ whose total expected duration/resource footprint may monopolize that host until
 the group completes.
 
 **Deferred / non-goals:** Only pays off at `max_concurrent > 1`.
-
-### 0017 — Generic phase-event enum
-
-- **id:** `0017-generic-phase-events`
-- **status:** `backlog`
-- **priority:** `low`
-- **unblocks:** `0019-block-validation-recipe`
-- **source:** `archive/completed/0008` (v5 forward-looking constraint)
-
-**Problem:** `job_event` carries bench-specific `PhaseBuild*`/`PhaseBench*`; a
-second task kind needs task-agnostic phase events.
-
-**Scope:** Collapse to `PhaseStarted{label}`/`PhaseFinished{label}` via an
-additive `ALTER TYPE … ADD VALUE` migration.
-
-**Acceptance:** Phase events carry a task-agnostic label; bench + block-val both
-fit.
 
 ### 0013 — Drop legacy `jobs` table
 

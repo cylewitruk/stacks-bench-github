@@ -1,10 +1,13 @@
 # Design 0004: Distributed worker fleet (`remote-daemon`, capability-scheduled)
 
 - **id:** `0004-worker-fleet`
-- **status:** `backlog`
-- **depends_on:** `0010-driver-seam` (shipped)
+- **status:** `planned` (`v25-worker-fleet-block-validation`)
+- **depends_on:** `0010-driver-seam` (shipped),
+  `0055-execution-boundary-preparation` (v24)
+- **iteration:**
+  [`v25-worker-fleet-block-validation`](../iterations/v25-worker-fleet-block-validation.md)
 - **review:** Codex signed off (design)
-- **source:** roadmap-v9
+- **source:** roadmap-v9 + v25 dedicated-worker activation
 
 Turns the single-host daemon into an **orchestrator + a fleet of remote worker
 daemons**, each declaring **capabilities** (`benchmark`, `block-validation`, …)
@@ -12,6 +15,14 @@ and pulling compatible work — the GitHub self-hosted-runner model applied to
 benchmark/validation jobs. Dedicated bare-metal boxes (pinned bench hosts,
 big-local-NVMe block-validation hosts) and eventual cloud-ephemeral instances all
 become **instances of one fleet model**.
+
+**Concrete v25 deployment:** a dedicated Hetzner host is available for the
+first remote worker: 64 CPU cores, 256 GB RAM, and four 4 TB NVMe drives. It is
+the `block_validation` worker. Existing benchmark execution moves to a separate
+co-located loopback worker so the orchestrator has no production inline
+execution path. The host's filesystem, NUMA, NVMe layout, safe shard count, and
+dataset capacity remain measured Phase 1 inputs—not assumptions derived from
+the advertised specifications.
 
 **Goal:** scale concurrency and heterogeneous hardware by **adding workers**, not
 by sharing one host. A worker dials *out*, registers its capabilities, long-polls
@@ -118,7 +129,11 @@ run by a worker.
   (`Driver`/`TaskSpec`/`DriverOutcome`/`Placement`), `libvirt/`, `recipe`,
   `bench_recipe`, and the worker run loop. Depends only on the wire-contract
   types, never on the DB or GitHub.
-- **Wire contract** (in `sbgh-core`, or a small `sbgh-proto`) — `TaskContext`,
+- **`sbgh-proto` (new, dependency-light library)** — owned, versioned worker
+  wire DTOs for execution/task context, events/terminal outcomes, registration,
+  capabilities, claim/lease, and artifact results. It does not expose core/DB
+  structs or depend on the HTTP client implementation.
+- **Wire contract payload** — task context,
   `TaskSpec`, `WorkerEvent`/`Terminal`/`PhaseLabel`, the registration/capability/
   claim/lease messages, and the `summary` shape. The only thing both sides share.
 - **`sbgh-worker` (new binary)** — thin: register → long-poll → run `sbgh-exec`
@@ -130,9 +145,12 @@ run by a worker.
   **Never executes a job itself** — execution only happens in an `sbgh-worker`.
 
 **The `events.rs` seam is where the split runs.** `EventSink` (the *producer*) is
-worker-side; the **reporter** (the *consumer*) is orchestrator-side; today's
-per-job mpsc channel simply **becomes the network**. The roadmap-v5 reliable/
-best-effort channel discipline carries straight over to the wire.
+worker-side; the **reporter** (the *consumer*) is orchestrator-side. The network
+does not merely replace mpsc: reliable task-neutral events are first committed
+to the durable attempt ledger from
+[`0017`](0017-generic-phase-events.md), then projected/replayed by the reporter.
+The roadmap-v5 reliable/best-effort discipline carries across the wire without
+pretending every heartbeat/progress sample is durable.
 
 **Single-box deployments — a co-located, but always *separate*, `sbgh-worker`
 (decided).** Even on one host, the worker is a **separate `sbgh-worker` process**
@@ -160,6 +178,11 @@ state directly — and auth, leases, drain, event streaming, and artifact upload
 **need a protocol anyway**. So the orchestrator brokers everything over a thin
 **pull-based API**; the DB stays behind it. This also matches the GitHub-runner
 model and works across NAT/firewalls because workers dial *out*.
+
+**v25 protocol upgrades are coordinated, not rolling.** Worker and orchestrator
+must report the same protocol version. Operators drain/stop workers, upgrade
+both sides, and restart them as one compatibility set. Supporting an explicit
+version-skew window is a later design change, not implied by versioned DTOs.
 
 ## Phase 1: Worker protocol + registry (control plane)
 
@@ -205,18 +228,25 @@ streams events, and uploads results — bench end-to-end on a remote worker.
 - **Extract the execution substrate into `sbgh-exec` (the move, not a copy; see
   "The split" above).** `driver`, `libvirt/`, `recipe`, `bench_recipe`, and the
   `run_worker` loop **leave `sbgh-daemon`** for the shared crate; the orchestrator
-  loses its inline worker. This is a pure code move — v8 Phase 1 already made the
-  recipe/driver seam clean, so the coordinator/reporter plumbing is untouched.
+  loses its inline worker. v24 first removes the current `RunnableJob`/`Prepared`,
+  aggregate-config, and task-input boundary leaks; Phase 2 then moves that proven
+  execution closure without copying it. The transport/artifact/event adapters
+  are new data-plane work, not part of the mechanical move.
 - Worker invokes its configured **local `Driver::run_task(TaskSpec)`** (v8 Phase 1,
   now in `sbgh-exec`) on the claimed spec; the worker's local config picks the
   Driver (pinned/libvirt for bench, reflink-fan-out for block-val).
-- **Event ingest**: worker POSTs `WorkerEvent`s with **sequence numbers**;
-  orchestrator ingest is idempotent + ordered, then fans into the **existing
-  reporter** exactly as the in-process `EventSink` does today.
-- **Artifact upload**: the worker ships `archive_dir` (tarball) or an object-store
-  pointer + the `summary` blob; the orchestrator lands it where the reporter +
-  `extract_outcome` already read. **Reporter/DB/vs-baseline path unchanged.**
-- A loopback worker first; then a **second physical host** (the real test).
+- **Event ingest**: worker POSTs reliable task-neutral events with
+  attempt-scoped sequence numbers; orchestrator ingest commits them durably
+  before acknowledgement, then the reporter projects/replays them per
+  [`0017`](0017-generic-phase-events.md). Best-effort progress cannot create a
+  reliable-sequence gap.
+- **Artifact upload**: the worker stages `archive_dir` (tarball) or an
+  object-store pointer + the `summary` blob under its attempt. Only an accepted,
+  fenced terminal promotes/attaches those store keys; rejected/stale attempts
+  are invisible to consumers and GC-reclaimable. **Reporter/DB/vs-baseline path
+  remains orchestrator-owned.**
+- A loopback benchmark worker first; then the dedicated **Hetzner
+  block-validation worker** as the real second-host test.
 - **Baseline-safety rule (Codex) — `measurement_profile` cannot wait for Phase 4.**
   v7 comparisons are *live*, so the moment a job can run on a remote worker it
   could otherwise reuse the local host's baselines. Phase 2 must therefore do one
@@ -263,10 +293,17 @@ streams events, and uploads results — bench end-to-end on a remote worker.
   - **If the worker never returns** — the orchestrator can only cancel the row and
     surface the worker as stale; the remote-local resources are unreachable until
     (and if) the host comes back. No false promise of central reaping.
+- **Single-capability hold:** if no other online worker can satisfy the task, a
+  fenced attempt is held with an operator alert rather than silently requeued in
+  a loop. Cleanup/recovery or an explicit operator abandonment decision gates a
+  successor attempt.
 - **Graceful drain**: a worker stops claiming, finishes its current job,
   deregisters (for planned host maintenance / ephemeral-worker teardown).
 - **Event resume**: sequence numbers let a reconnecting worker resume its stream
   without duplicating side effects.
+- **Attempt artifact GC:** staged artifacts from fenced/expired attempts without
+  an accepted terminal are reclaimed after an auditable grace period; attached
+  result artifacts are never swept by this path.
 
 **Status:**
 
