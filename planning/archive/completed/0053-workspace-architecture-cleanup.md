@@ -6,7 +6,7 @@ before the repository crosses a process boundary in v25.
 > **Status:** shipped — implementation and local validation completed in
 > `90361a0`; compiler-enforced crate boundaries and the remaining hosted-CI and
 > live single-host acceptance checks continue in
-> [v24.1](../../iterations/v24.1-compiler-enforced-crate-boundaries.md).
+> [v24.1](0056-compiler-enforced-crate-boundaries.md).
 > Started from green trunk `dd16cd3`; v20-v23 remain parked.
 >
 > This is a behavior-preserving cleanup iteration. It addresses repository
@@ -403,7 +403,7 @@ Local validation on 2026-07-25:
 
 ## Follow-Ups
 
-- [v24.1](../../iterations/v24.1-compiler-enforced-crate-boundaries.md) replaces
+- [v24.1](0056-compiler-enforced-crate-boundaries.md) replaces
   the transitional source-analysis ratchet with `sbgh-driver`,
   `sbgh-libvirt`, and an in-process `sbgh-worker`, then separates concrete
   adapters from `sbgh-core`.

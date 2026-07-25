@@ -8,8 +8,8 @@ use sbgh_api::{
     AddTriggerRequest, AllowPolicyRequest, DisablePolicyRequest, PinTriggerRequest, PolicyView,
     TriggerView,
 };
-use sbgh_core::admin;
 use sbgh_core::models::{SourceRepoPolicy, TargetRepoPolicy, TriggerKind, TriggerPolicy};
+use sbgh_postgres::admin;
 use serde::Deserialize;
 
 use crate::api::conv::{enum_str, parse_enum};
@@ -52,7 +52,7 @@ fn trigger_view(r: TriggerPolicy) -> TriggerView {
         install_id: r.github_installation_id,
         repo_id: r.github_repo_id,
         kind: enum_str(&r.trigger_kind),
-        match_spec: r.match_spec.0,
+        match_spec: r.match_spec,
         bench_args: r.bench_args,
         is_enabled: r.is_enabled,
         note: r.note,

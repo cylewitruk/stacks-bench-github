@@ -9,7 +9,7 @@
 //!      side effects.
 //!
 //!   2. **Admin writes** seed policies — the operator drives them through the
-//!      daemon `/api` (which runs `sbgh_core::admin`): `upsert_target_policy`,
+//!      daemon `/api` (which runs `sbgh_postgres::admin`): `upsert_target_policy`,
 //!      `upsert_source_policy`, `add_trigger_policy`, plus the corresponding
 //!      disable / list helpers. Operator-curated; the processor only reads
 //!      through the trait (and flips `is_enabled` on install-deleted cleanup),

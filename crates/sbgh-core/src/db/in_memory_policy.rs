@@ -99,9 +99,7 @@ impl InMemoryPolicyStore {
                     github_installation_id: install_id,
                     github_repo_id: repo_id,
                     trigger_kind: kind,
-                    match_spec: sqlx::types::Json(
-                        serde_json::to_value(spec).expect("spec serialises"),
-                    ),
+                    match_spec: serde_json::to_value(spec).expect("spec serialises"),
                     bench_args: None,
                     is_enabled,
                     note: None,
@@ -331,9 +329,7 @@ impl PolicyStore for InMemoryPolicyStore {
             github_installation_id: install_id,
             github_repo_id: repo_id,
             trigger_kind: kind,
-            match_spec: sqlx::types::Json(
-                serde_json::to_value(match_spec).expect("spec serialises"),
-            ),
+            match_spec: serde_json::to_value(match_spec).expect("spec serialises"),
             bench_args: bench_args.map(str::to_string),
             is_enabled: true,
             note: note.map(str::to_string),

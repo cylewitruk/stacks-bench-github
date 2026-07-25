@@ -16,21 +16,6 @@ pub enum Error {
     #[error("invalid command: {0}")]
     InvalidCommand(String),
 
-    #[error("github api error: {0}")]
-    GitHub(#[from] octocrab::Error),
-
-    #[error("jwt error: {0}")]
-    Jwt(#[from] jsonwebtoken::errors::Error),
-
-    #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
-
-    #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
-
-    #[error("migration error: {0}")]
-    Migrate(#[from] sqlx::migrate::MigrateError),
-
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

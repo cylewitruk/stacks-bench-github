@@ -494,8 +494,7 @@ impl JobStore for InMemoryJobStore {
             remark: None,
             detail: request
                 .queued_event_detail
-                .clone()
-                .map(sqlx::types::Json),
+                .clone(),
         };
 
         // Commit: single mutex acquisition for ALL mutations (and the
@@ -596,7 +595,7 @@ impl JobStore for InMemoryJobStore {
             github_check_run_id: None,
             github_check_run_url: None,
             remark: None,
-            detail: Some(sqlx::types::Json(queued_event_detail.clone())),
+            detail: Some(queued_event_detail.clone()),
         };
         let mut s = self.state.lock().unwrap();
         s.jobs
@@ -621,7 +620,7 @@ impl JobStore for InMemoryJobStore {
                 github_check_run_id: None,
                 github_check_run_url: None,
                 remark: None,
-                detail: Some(sqlx::types::Json(serde_json::json!({ "plan_message_ts": ts }))),
+                detail: Some(serde_json::json!({ "plan_message_ts": ts })),
             });
         }
         Ok(job)
@@ -660,7 +659,7 @@ impl JobStore for InMemoryJobStore {
             github_check_run_id: None,
             github_check_run_url: None,
             remark: None,
-            detail: Some(sqlx::types::Json(queued_event_detail.clone())),
+            detail: Some(queued_event_detail.clone()),
         };
         let mut s = self.state.lock().unwrap();
         s.groups
@@ -687,7 +686,7 @@ impl JobStore for InMemoryJobStore {
                 github_check_run_id: None,
                 github_check_run_url: None,
                 remark: None,
-                detail: Some(sqlx::types::Json(serde_json::json!({ "plan_message_ts": ts }))),
+                detail: Some(serde_json::json!({ "plan_message_ts": ts })),
             });
         }
         Ok(job)
@@ -963,11 +962,7 @@ impl JobStore for InMemoryJobStore {
                     && e.event_kind == JobEventKind::Completed
                     && e.event_status == JobEventStatus::Success
             })
-            .and_then(|e| {
-                e.detail
-                    .as_ref()
-                    .map(|d| d.0.clone())
-            }))
+            .and_then(|e| e.detail.clone()))
     }
 
     async fn claim_next_queued(&self, claim_token: Uuid) -> Result<Option<Job>> {
@@ -1085,8 +1080,7 @@ impl JobStore for InMemoryJobStore {
             remark: None,
             detail: completion
                 .event_detail
-                .clone()
-                .map(sqlx::types::Json),
+                .clone(),
         };
         let job = s
             .jobs
@@ -1140,10 +1134,7 @@ impl JobStore for InMemoryJobStore {
             github_check_run_id: None,
             github_check_run_url: None,
             remark: Some(failure.remark.clone()),
-            detail: failure
-                .event_detail
-                .clone()
-                .map(sqlx::types::Json),
+            detail: failure.event_detail.clone(),
         };
         let job = s
             .jobs
@@ -1414,7 +1405,7 @@ impl JobStore for InMemoryJobStore {
                 e.detail
                     .as_ref()
                     .and_then(|d| {
-                        d.0.get("plan_message_ts")
+                        d.get("plan_message_ts")
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                     })
@@ -1436,10 +1427,7 @@ impl JobStore for InMemoryJobStore {
                 .github_check_run_url
                 .clone(),
             remark: new.remark.clone(),
-            detail: new
-                .detail
-                .clone()
-                .map(sqlx::types::Json),
+            detail: new.detail.clone(),
         };
         self.state
             .lock()

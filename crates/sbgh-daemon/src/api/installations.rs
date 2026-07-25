@@ -22,12 +22,7 @@ fn view(r: GithubInstallation) -> InstallationView {
 }
 
 pub async fn list(State(s): State<ApiState>) -> Result<Json<Vec<InstallationView>>, ApiErr> {
-    let rows = sqlx::query_as::<_, GithubInstallation>(
-        "SELECT id, github_account_id, account_login, account_type, suspended_at, deleted_at, \
-         created_at, updated_at FROM github_installation ORDER BY created_at DESC",
-    )
-    .fetch_all(&s.pool)
-    .await?;
+    let rows = sbgh_postgres::application::list_installations(&s.pool).await?;
     Ok(Json(
         rows.into_iter()
             .map(view)

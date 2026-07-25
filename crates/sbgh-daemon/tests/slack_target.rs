@@ -2,11 +2,11 @@
 //! its `(installation, repo)` FK ids against real Postgres (item 0002, v5
 //! wiring). Proves the happy path + each actionable misconfiguration error.
 
-use sbgh_core::db::{
-    InstallationStore, NewInstallation, Pool, PostgresInstallationStore, setup_pg_db,
-};
 use sbgh_core::models::GithubAccountType;
 use sbgh_daemon::{ResolveTargetError, resolve_target};
+use sbgh_postgres::db::{
+    InstallationStore, NewInstallation, Pool, PostgresInstallationStore, setup_pg_db,
+};
 
 /// Seed an installation (by `account_login`) and, optionally, a `github_repo`
 /// row for `owner/name`. `suspended` marks the install suspended.

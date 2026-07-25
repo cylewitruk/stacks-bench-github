@@ -145,7 +145,10 @@ execution implementation is copied or retained in the orchestrator.
 - **Wire contract payload** — versioned equivalents of task context,
   task/event/terminal outcomes, registration/capability/claim/lease messages,
   and artifact results. Each side validates and converts these DTOs at its
-  boundary; internal driver types are not serialized implicitly.
+  boundary; internal driver types are not serialized implicitly. A task
+  assignment carries effective arguments persisted at enqueue, not a reference
+  to mutable daemon defaults. The persisted workload key and argument tokens
+  are produced by one resolution pass.
 - **`sbgh-daemon` / orchestrator (existing binary)** — `api`, `webhook_processor`,
   the scheduler/registry, the reporter, and the worker-API server. Sole DB
   client and GitHub/Slack side-effect owner. It alone holds Slack credentials

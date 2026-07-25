@@ -86,7 +86,7 @@ pub fn pinned_targets(
             continue;
         }
         for r in refs {
-            if r.repo_id == policy.github_repo_id && ref_matches(&policy.match_spec.0, r) {
+            if r.repo_id == policy.github_repo_id && ref_matches(&policy.match_spec, r) {
                 targets.push(PinnedTarget {
                     trigger_id: policy.id,
                     installation_id: policy.github_installation_id,
@@ -103,7 +103,7 @@ pub fn pinned_targets(
 }
 
 /// The distinct commit set across `targets` — the eviction-protection key for
-/// [`set_pinned_by_commit`](crate::binary_cache::BinaryCache::set_pinned_by_commit).
+/// `CacheControl::set_pinned_by_commit`.
 pub fn commits_of(targets: &[PinnedTarget]) -> HashSet<String> {
     targets
         .iter()
@@ -137,7 +137,6 @@ fn ref_matches(match_spec: &serde_json::Value, r: &RemoteRef) -> bool {
 mod tests {
     use chrono::TimeZone;
     use sbgh_core::models::{TriggerKind, TriggerMatchSpec};
-    use sqlx::types::Json;
 
     use super::*;
 
@@ -163,7 +162,7 @@ mod tests {
             github_installation_id: 1,
             github_repo_id: repo_id,
             trigger_kind: TriggerKind::BranchPush,
-            match_spec: Json(serde_json::to_value(spec).unwrap()),
+            match_spec: serde_json::to_value(spec).unwrap(),
             bench_args: None,
             is_enabled: true,
             note: None,

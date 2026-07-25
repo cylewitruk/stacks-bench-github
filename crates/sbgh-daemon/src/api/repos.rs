@@ -4,8 +4,8 @@
 use axum::Json;
 use axum::extract::State;
 use sbgh_api::{AllowRepoRequest, DisableRepoRequest, RepoRootView};
-use sbgh_core::admin;
-use sbgh_core::admin::AllowedRepoRoot;
+use sbgh_postgres::admin;
+use sbgh_postgres::admin::AllowedRepoRoot;
 
 use crate::api::error::ApiErr;
 use crate::api::extract::ApiJson;

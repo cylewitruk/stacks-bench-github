@@ -4,8 +4,8 @@
 use axum::Json;
 use axum::extract::State;
 use sbgh_api::{AllowInstallerRequest, DisableInstallerRequest, InstallerView};
-use sbgh_core::admin;
 use sbgh_core::models::AllowedInstaller;
+use sbgh_postgres::admin;
 
 use crate::api::conv::enum_str;
 use crate::api::error::ApiErr;

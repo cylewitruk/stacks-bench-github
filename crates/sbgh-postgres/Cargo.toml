@@ -1,0 +1,33 @@
+[package]
+name = "sbgh-postgres"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sbgh-core.workspace = true
+
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+sqlx.workspace = true
+reqwest = { workspace = true, features = ["rustls", "json"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+axum.workspace = true
+sbgh-postgres = { path = ".", features = ["testing"] }
+
+[features]
+testing = []

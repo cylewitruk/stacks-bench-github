@@ -1,0 +1,628 @@
+//! Slice 5 integration tests for `PostgresPolicyStore` against a real
+//! Postgres. Covers all three policy tables — the
+//! target/source upsert + soft-disable semantics, the FK-enforced
+//! relationship from trigger_policy → target_repo_policy, and the
+//! processor's hot-path `list_enabled_triggers` query.
+
+use sbgh_core::models::{TriggerKind, TriggerMatchSpec};
+use sbgh_postgres::db::{PolicyStore, Pool, PostgresPolicyStore, setup_pg_db};
+
+/// Seed allowlist + install + repo + membership so the slice 5
+/// policy FKs are all satisfiable.
+async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         ($1, 'octo', 'organization') ON CONFLICT DO NOTHING",
+    )
+    .bind(install_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES ($1, $1, 'octo', 'organization') ON CONFLICT DO NOTHING",
+    )
+    .bind(install_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_repo (id, owner, name) VALUES ($1, 'o', 'r') ON CONFLICT DO NOTHING",
+    )
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation_repo (github_installation_id, github_repo_id) VALUES \
+         ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(install_id)
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn lookup_target_policy_returns_none_when_no_row() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresPolicyStore::new(pool);
+    assert!(
+        store
+            .lookup_target_policy(999, 999)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn upsert_target_policy_enforces_membership_fk() {
+    // No `github_installation_repo` row for (100, 10) → FK violation.
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresPolicyStore::new(pool);
+    let result = store
+        .upsert_target_policy(100, 10, None)
+        .await;
+    assert!(
+        result.is_err(),
+        "FK from target_repo_policy → github_installation_repo must reject orphan inserts; got: \
+         {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn upsert_target_policy_then_disable_round_trip() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresPolicyStore::new(pool);
+
+    let row = store
+        .upsert_target_policy(100, 10, Some("operator note"))
+        .await
+        .unwrap();
+    assert!(row.is_enabled);
+    assert_eq!(row.note.as_deref(), Some("operator note"));
+
+    let disabled = store
+        .disable_target_policy(100, 10)
+        .await
+        .unwrap()
+        .expect("row must exist");
+    assert!(!disabled.is_enabled);
+
+    // Re-enable via upsert — and verify note isn't clobbered when the
+    // re-allow doesn't provide one.
+    let re = store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+    assert!(re.is_enabled, "upsert re-enables");
+    assert_eq!(
+        re.note.as_deref(),
+        Some("operator note"),
+        "upsert without note preserves existing note"
+    );
+}
+
+#[tokio::test]
+async fn upsert_source_policy_does_not_require_membership() {
+    // Source policy intentionally has no membership FK — sources can
+    // be arbitrary forks the install doesn't own.
+    let (_db, pool) = setup_pg_db().await;
+    // Need install + repo for the per-table FKs (just no membership).
+    sqlx::query(
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES \
+         (100, 'octo', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (100, 100, 'octo', 'organization')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (20, 'alice', 'fork')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = PostgresPolicyStore::new(pool);
+
+    let row = store
+        .upsert_source_policy(100, 20, None)
+        .await
+        .unwrap();
+    assert!(row.is_enabled);
+}
+
+#[tokio::test]
+async fn add_trigger_policy_requires_target_fk() {
+    // FK from trigger_policy → target_repo_policy (composite). Adding
+    // a trigger before the target row must fail.
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresPolicyStore::new(pool);
+
+    let result = store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "FK to target_repo_policy must reject orphan trigger inserts; got: {result:?}"
+    );
+}
+
+/// v5: trigger policies are **webhook** triggers — `admin::add_trigger_policy`
+/// (the API/CLI boundary) rejects any non-`branch_push`/`tag_created` kind, so
+/// a raw request can't create a meaningless `trigger_policy` row (e.g. the new
+/// `slack_adhoc`, or `pr_comment`/`scheduled`/`manual`). The kind guard fires
+/// before any DB access, so no seeding is needed.
+#[tokio::test]
+async fn add_trigger_policy_rejects_non_webhook_kinds() {
+    use sbgh_postgres::admin::PolicyError;
+    let (_db, pool) = setup_pg_db().await;
+    for kind in [
+        TriggerKind::SlackAdhoc,
+        TriggerKind::PrComment,
+        TriggerKind::Scheduled,
+        TriggerKind::Manual,
+    ] {
+        let err = sbgh_postgres::admin::add_trigger_policy(&pool, 1, 1, kind, "{}", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PolicyError::UnsupportedTriggerKind(_)),
+            "kind {kind:?} must be rejected, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn add_then_list_enabled_triggers_round_trip() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresPolicyStore::new(pool);
+    store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+
+    let branch_trigger = store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+            Some("--cargo-args --release"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(branch_trigger.is_enabled);
+    assert_eq!(
+        branch_trigger
+            .bench_args
+            .as_deref(),
+        Some("--cargo-args --release")
+    );
+
+    // List with the right kind returns it.
+    let rows = store
+        .list_enabled_triggers(100, 10, TriggerKind::BranchPush)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, branch_trigger.id);
+
+    // List with the wrong kind returns empty.
+    let tag_rows = store
+        .list_enabled_triggers(100, 10, TriggerKind::TagCreated)
+        .await
+        .unwrap();
+    assert!(tag_rows.is_empty());
+
+    // Disabling the trigger removes it from the enabled list.
+    store
+        .disable_trigger_policy(branch_trigger.id)
+        .await
+        .unwrap();
+    let rows = store
+        .list_enabled_triggers(100, 10, TriggerKind::BranchPush)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "disabled trigger must NOT appear in enabled list");
+}
+
+/// v9 (item 0025): `admin::pin_trigger_policy` round-trips the pin flag +
+/// optional expiry, and the pinned state surfaces through the processor's
+/// `list_enabled_triggers` read path. (Also exercises a `BranchPrefix`
+/// trigger.)
+#[tokio::test]
+async fn pin_trigger_policy_round_trip() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresPolicyStore::new(pool.clone());
+    store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+
+    let trigger = store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPrefix {
+                prefix: "sb-integration/3.".into(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // A new trigger is unpinned by default.
+    assert!(!trigger.pinned, "new trigger unpinned by default");
+    assert!(trigger.pinned_until.is_none());
+
+    // Pin with an expiry (reuse a real timestamp to avoid a chrono dep here).
+    let until = trigger.created_at;
+    let pinned = sbgh_postgres::admin::pin_trigger_policy(&pool, trigger.id, true, Some(until))
+        .await
+        .unwrap();
+    assert!(pinned.pinned);
+    assert_eq!(pinned.pinned_until, Some(until));
+
+    // The pin surfaces on the processor's read path too.
+    let listed = store
+        .list_enabled_triggers(100, 10, TriggerKind::BranchPush)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].pinned, "pinned flag visible to list_enabled_triggers");
+    assert_eq!(listed[0].pinned_until, Some(until));
+
+    // Unpin clears both.
+    let unpinned = sbgh_postgres::admin::pin_trigger_policy(&pool, trigger.id, false, None)
+        .await
+        .unwrap();
+    assert!(!unpinned.pinned);
+    assert!(
+        unpinned
+            .pinned_until
+            .is_none()
+    );
+
+    // Unpinning with a stray expiry normalizes pinned_until to NULL (no orphan
+    // `pinned = false, pinned_until = <ts>` state).
+    let renorm = sbgh_postgres::admin::pin_trigger_policy(&pool, trigger.id, false, Some(until))
+        .await
+        .unwrap();
+    assert!(!renorm.pinned);
+    assert!(renorm.pinned_until.is_none(), "unpin clears pinned_until even when one is passed",);
+
+    // Pinning a missing id errors.
+    assert!(
+        sbgh_postgres::admin::pin_trigger_policy(&pool, 999_999, true, None)
+            .await
+            .is_err()
+    );
+}
+
+/// v9 (item 0025): `list_pinned_triggers` returns enabled + pinned triggers
+/// across **all** installs whose parent target is enabled, and excludes the
+/// three non-qualifying shapes — unpinned, disabled-trigger, and
+/// disabled-parent. Expiry is NOT filtered here (the resolver applies it).
+#[tokio::test]
+async fn list_pinned_triggers_filters_to_enabled_pinned_with_enabled_parent() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    seed_install_repo(&pool, 200, 10).await;
+    seed_install_repo(&pool, 300, 10).await;
+    let store = PostgresPolicyStore::new(pool.clone());
+    for install in [100, 200, 300] {
+        store
+            .upsert_target_policy(install, 10, None)
+            .await
+            .unwrap();
+    }
+
+    // (a) install 100, enabled parent, pinned → the only row that should surface.
+    let surface = store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPrefix {
+                prefix: "sb-integration/3.".into(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    sbgh_postgres::admin::pin_trigger_policy(&pool, surface.id, true, None)
+        .await
+        .unwrap();
+
+    // (b) install 100, left unpinned → excluded.
+    store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // (c) install 200, pinned then disabled → excluded (trigger disabled).
+    let disabled = store
+        .add_trigger_policy(
+            200,
+            10,
+            TriggerKind::TagCreated,
+            &TriggerMatchSpec::TagCreated { tag_pattern: r"^3\.".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    sbgh_postgres::admin::pin_trigger_policy(&pool, disabled.id, true, None)
+        .await
+        .unwrap();
+    store
+        .disable_trigger_policy(disabled.id)
+        .await
+        .unwrap();
+
+    // (d) install 300, pinned + enabled trigger but parent target disabled →
+    // excluded.
+    let orphan = store
+        .add_trigger_policy(
+            300,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "main".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    sbgh_postgres::admin::pin_trigger_policy(&pool, orphan.id, true, None)
+        .await
+        .unwrap();
+    store
+        .disable_target_policy(300, 10)
+        .await
+        .unwrap();
+
+    let pinned = store
+        .list_pinned_triggers()
+        .await
+        .unwrap();
+    assert_eq!(pinned.len(), 1, "only the enabled+pinned+enabled-parent trigger surfaces");
+    assert_eq!(pinned[0].id, surface.id);
+    assert!(pinned[0].pinned);
+}
+
+#[tokio::test]
+async fn list_enabled_triggers_excludes_triggers_whose_parent_target_is_disabled() {
+    // Slice 5 second-pass review fix: even with `trigger_policy.is_enabled
+    // = TRUE`, a trigger must NOT surface if its parent
+    // `target_repo_policy.is_enabled = FALSE`. Without this, a manual
+    // `sbgh-cli policy target disable` (which doesn't cascade through
+    // the same code path as `installation_repositories.removed`) would
+    // leave triggers effective.
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresPolicyStore::new(pool);
+    store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+    let trigger = store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Sanity: with both enabled, the trigger appears.
+    let rows = store
+        .list_enabled_triggers(100, 10, TriggerKind::BranchPush)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, trigger.id);
+
+    // Disable ONLY the parent target; trigger row stays is_enabled=TRUE.
+    store
+        .disable_target_policy(100, 10)
+        .await
+        .unwrap();
+    let rows = store
+        .list_enabled_triggers(100, 10, TriggerKind::BranchPush)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "trigger must NOT surface when parent target_repo_policy is disabled");
+
+    // Re-enable target → trigger reappears (since its is_enabled was
+    // never flipped here).
+    store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+    let rows = store
+        .list_enabled_triggers(100, 10, TriggerKind::BranchPush)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "re-enabling target makes the trigger visible again");
+}
+
+#[tokio::test]
+async fn disable_target_and_triggers_cascades_in_single_transaction() {
+    // Slice 5 review fix: the InstallationRepositoriesHandler.removed
+    // path calls this method BEFORE revoking the membership, so a
+    // stale inbox event arriving later sees a disabled policy +
+    // disabled triggers and correctly fails policy eval.
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    // Also seed a SECOND install+repo to verify cascade doesn't
+    // scope-creep.
+    seed_install_repo(&pool, 200, 10).await;
+    let store = PostgresPolicyStore::new(pool.clone());
+    store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+    store
+        .upsert_target_policy(200, 10, None)
+        .await
+        .unwrap();
+    store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "main".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::TagCreated,
+            &TriggerMatchSpec::TagCreated { tag_pattern: r"^v\d+$".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // Trigger for the OTHER install — must NOT be cascade-disabled.
+    let other_trigger = store
+        .add_trigger_policy(
+            200,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "main".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    store
+        .disable_target_and_triggers(100, 10)
+        .await
+        .unwrap();
+
+    // Install 100's target + both triggers all disabled.
+    let target_100 = store
+        .lookup_target_policy(100, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!target_100.is_enabled);
+    let triggers_100 = store
+        .list_triggers(100, 10)
+        .await
+        .unwrap();
+    assert_eq!(triggers_100.len(), 2);
+    assert!(
+        triggers_100
+            .iter()
+            .all(|t| !t.is_enabled)
+    );
+
+    // Install 200's target + trigger UNTOUCHED.
+    let target_200 = store
+        .lookup_target_policy(200, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(target_200.is_enabled, "other install's target must NOT be cascade-disabled");
+    let triggers_200 = store
+        .list_enabled_triggers(200, 10, TriggerKind::BranchPush)
+        .await
+        .unwrap();
+    assert_eq!(triggers_200.len(), 1);
+    assert_eq!(triggers_200[0].id, other_trigger.id);
+}
+
+#[tokio::test]
+async fn disable_target_and_triggers_is_idempotent() {
+    // Predicates filter `is_enabled = TRUE` so re-running against
+    // already-disabled rows is a no-op.
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresPolicyStore::new(pool);
+    store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+    store
+        .disable_target_and_triggers(100, 10)
+        .await
+        .unwrap();
+    // Second call must succeed silently.
+    store
+        .disable_target_and_triggers(100, 10)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn list_triggers_returns_disabled_too() {
+    // `list_triggers` (the CLI list path) includes disabled rows so
+    // operators can see them.
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresPolicyStore::new(pool);
+    store
+        .upsert_target_policy(100, 10, None)
+        .await
+        .unwrap();
+
+    let t = store
+        .add_trigger_policy(
+            100,
+            10,
+            TriggerKind::BranchPush,
+            &TriggerMatchSpec::BranchPush { branch_name: "main".into() },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .disable_trigger_policy(t.id)
+        .await
+        .unwrap();
+    let rows = store
+        .list_triggers(100, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "list_triggers includes disabled rows");
+    assert!(!rows[0].is_enabled);
+}

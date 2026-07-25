@@ -7,15 +7,15 @@
 
 use std::sync::Arc;
 
-use sbgh_core::db::{
-    JobCreationOutcome, JobStore, Pool, PostgresJobStore, PostgresPullRequestStore,
-    PostgresRepoStore, setup_pg_db,
-};
 use sbgh_core::models::{
     GitRefKind, JobAxes, JobCreationRequest, JobKind, NewJob, NewPullRequestLink,
     QueuedEventDetail, TriggerKind,
 };
 use sbgh_daemon::{JobSource, LocalFsStore, ProgressTarget, RunnableJobStore};
+use sbgh_postgres::db::{
+    JobCreationOutcome, JobStore, Pool, PostgresJobStore, PostgresPullRequestStore,
+    PostgresRepoStore, setup_pg_db,
+};
 use uuid::Uuid;
 
 /// Seed install + repo + membership so a `job` row's composite FK and

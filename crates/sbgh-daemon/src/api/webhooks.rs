@@ -6,7 +6,7 @@ use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use sbgh_api::{WebhookSubmitResponse, WebhookSummary};
-use sbgh_core::db::{IngestOutcome, NewWebhook, SUPPORTED_WEBHOOK_EVENT_TYPES};
+use sbgh_postgres::db::{IngestOutcome, NewWebhook, SUPPORTED_WEBHOOK_EVENT_TYPES};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -202,7 +202,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use http_body_util::BodyExt;
-    use sbgh_core::db::{Pool, PostgresIngestStore, setup_pg_db};
+    use sbgh_postgres::db::{Pool, PostgresIngestStore, setup_pg_db};
     use serde::de::DeserializeOwned;
     use tower::ServiceExt;
 

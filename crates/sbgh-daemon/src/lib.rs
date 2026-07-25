@@ -1,20 +1,12 @@
 pub mod api;
 mod artifact_store;
-mod bench_progress;
-mod bench_recipe;
 mod bench_summary;
-mod binary_cache;
-mod build_recipe;
 mod comparison;
-mod driver;
-mod events;
-mod execution;
+mod duration;
 mod job_source;
-mod libvirt;
 mod llm;
 mod pin_manager;
 mod pin_resolver;
-mod recipe;
 mod report;
 mod reporter;
 mod runner;
@@ -27,14 +19,15 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use sbgh_core::config::{ArtifactStoreKind, DaemonConfig};
-use sbgh_core::db::{
-    self, PostgresIngestStore, PostgresInstallationStore, PostgresJobStore, PostgresPolicyStore,
-    PostgresPullRequestStore, PostgresRepoStore, PostgresUserStore, PostgresWebhookInbox,
+use sbgh_github::{AppCredentials, InstallationTokenCache, OctocrabClient};
+use sbgh_postgres::{
+    self as db, PostgresIngestStore, PostgresInstallationStore, PostgresJobStore,
+    PostgresPolicyStore, PostgresPullRequestStore, PostgresRepoStore, PostgresUserStore,
+    PostgresWebhookInbox,
 };
-use sbgh_core::github::{AppCredentials, InstallationTokenCache, OctocrabClient};
 
-use crate::libvirt::SystemShell;
 use crate::runner::Runner;
+use sbgh_libvirt::SystemShell;
 
 fn execution_artifact_store_config(
     config: &DaemonConfig,

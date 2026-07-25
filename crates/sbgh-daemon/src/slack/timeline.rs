@@ -25,9 +25,8 @@ use uuid::Uuid;
 
 use crate::bench_summary::RunResult;
 use crate::comparison::GroupComparison;
-use crate::events::ProgressUpdate;
+use crate::duration::format_elapsed;
 use crate::job_source::{RunnableJob, RunnableJobStore};
-use crate::libvirt::format_elapsed;
 use crate::slack::card::{
     self, CardCtx, GroupRunContext, RepeatContext, RepeatSummary, Results, STAGES, TASK_IDS,
 };
@@ -39,6 +38,7 @@ use crate::slack::stream::{
     StreamChunk, StreamFailure, StreamTaskStatus, TaskUpdate, chunks_for_card,
     classify_stream_error, terminal_chunks_for_card,
 };
+use sbgh_driver::ProgressUpdate;
 
 /// Slack marks a long-idle stream as no longer actively streaming after a few
 /// minutes, painting pending rows as failed until a terminal update corrects
@@ -1220,7 +1220,7 @@ mod tests {
 
     fn progress_update(progress: u64) -> ProgressUpdate {
         ProgressUpdate {
-            workflow_step: crate::events::WorkflowStep::Run,
+            workflow_step: sbgh_driver::WorkflowStep::Run,
             run_index: 0,
             requested_run_count: 1,
             phase: "replay".into(),

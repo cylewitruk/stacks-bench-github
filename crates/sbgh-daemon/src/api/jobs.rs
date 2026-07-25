@@ -51,18 +51,7 @@ pub async fn list(
         .unwrap_or(50)
         .clamp(1, 500);
 
-    let rows = sqlx::query_as::<_, Job>(
-        r#"
-        SELECT * FROM job
-         WHERE ($1::text IS NULL OR status = $1::job_status)
-         ORDER BY created_at DESC
-         LIMIT $2
-        "#,
-    )
-    .bind(&p.status)
-    .bind(limit)
-    .fetch_all(&s.pool)
-    .await?;
+    let rows = sbgh_postgres::application::list_jobs(&s.pool, p.status.as_deref(), limit).await?;
     Ok(Json(
         rows.into_iter()
             .map(view)

@@ -10,7 +10,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use sbgh_api::ApiError;
-use sbgh_core::admin::{InstallerError, PolicyError, RepoError, UserError};
+use sbgh_postgres::admin::{InstallerError, PolicyError, RepoError, UserError};
 
 #[derive(Debug)]
 pub struct ApiErr {

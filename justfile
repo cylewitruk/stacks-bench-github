@@ -44,6 +44,9 @@ fmt:
 check-docs:
     python3 scripts/check-docs.py
 
+check-architecture:
+    python3 scripts/check-package-dag.py
+
 lint *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -71,6 +74,7 @@ lint *args:
     done
 
     python3 scripts/check-docs.py
+    python3 scripts/check-package-dag.py
     cargo machete --with-metadata
     RUST_LOG=warn cargo --locked clippy --all-targets -- -D warnings
     cargo --locked fmt --all -- --check

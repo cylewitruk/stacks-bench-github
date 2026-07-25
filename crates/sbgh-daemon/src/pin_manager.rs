@@ -31,11 +31,10 @@ use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
 use sbgh_core::models::{
     BuildTarget, GitRefKind, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail, TaskKind,
 };
+use sbgh_driver::{CacheControl, CacheEnvironment};
 
-use crate::binary_cache::{BinaryCache, CacheEnvironment};
-use crate::libvirt::driver;
-use crate::libvirt::shell::{Shell, spec};
 use crate::pin_resolver::{PinnedTarget, RefKind, RemoteRef, commits_of, pinned_targets};
+use sbgh_libvirt::{Shell, command_spec, current_cache_environment};
 
 /// Bound a whole recompute so a slow / hung `ls-remote` can't stall its caller
 /// (boot, or a job task's completion).
@@ -61,7 +60,7 @@ const WARM_RETRY_COOLDOWN_HOURS: i64 = 6;
 /// load-bearing: publish (driver) and re-pin / evict (here) then coordinate
 /// under the one cache mutex.
 pub struct PinManager {
-    cache: Arc<BinaryCache>,
+    cache: Arc<dyn CacheControl>,
     policy_store: Arc<dyn PolicyStore>,
     repo_store: Arc<dyn RepoStore>,
     /// v11 (item 0031): the store warming enqueues build-only jobs into.
@@ -73,7 +72,7 @@ pub struct PinManager {
 
 impl PinManager {
     pub fn new(
-        cache: Arc<BinaryCache>,
+        cache: Arc<dyn CacheControl>,
         policy_store: Arc<dyn PolicyStore>,
         repo_store: Arc<dyn RepoStore>,
         jobs: Arc<dyn JobStore>,
@@ -98,7 +97,7 @@ impl PinManager {
     /// resolved target set. Logs + swallows everything (never propagates): a
     /// slow `ls-remote` is bounded so it can't stall the caller.
     pub async fn recompute(&self, now: DateTime<Utc>) {
-        let Some(env) = driver::current_cache_environment(&self.golden_image) else {
+        let Some(env) = current_cache_environment(&self.golden_image) else {
             tracing::warn!(
                 "pin manager: cache environment unresolved (golden image?); skipping recompute"
             );
@@ -145,7 +144,7 @@ impl PinManager {
 /// `Ok(Vec::new())` *without* mutating pins (the existing set is preserved, and
 /// nothing is warmed). Errors only on a store failure.
 pub async fn recompute_pins(
-    cache: &BinaryCache,
+    cache: &dyn CacheControl,
     policy_store: &dyn PolicyStore,
     repo_store: &dyn RepoStore,
     shell: &dyn Shell,
@@ -229,7 +228,7 @@ fn git_ref_kind(kind: RefKind) -> GitRefKind {
 /// same commit twice when two repos pin it.
 async fn warm_missing(
     jobs: &dyn JobStore,
-    cache: &BinaryCache,
+    cache: &dyn CacheControl,
     targets: &[PinnedTarget],
     env: &CacheEnvironment,
     now: DateTime<Utc>,
@@ -328,7 +327,7 @@ async fn ls_remote_refs(
 ) -> Option<Vec<RemoteRef>> {
     let out = match shell
         .run_bounded(
-            spec(git_binary, &["ls-remote", repo_url]),
+            command_spec(git_binary, &["ls-remote", repo_url]),
             Duration::from_secs(LS_REMOTE_TIMEOUT_SECS),
         )
         .await
@@ -418,8 +417,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::binary_cache::BinaryCache;
-    use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
+    use sbgh_libvirt::shell_test_support::{PreparedReply, RecordingShell};
+    use sbgh_worker::BinaryCache;
 
     fn at(rfc3339: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc3339)
@@ -538,7 +537,6 @@ mod tests {
             cache
                 .get(&fp, 11)
                 .unwrap()
-                .meta
                 .pinned,
             "develop's binary must be pinned"
         );
@@ -570,7 +568,6 @@ mod tests {
             cache
                 .get(&fp, 11)
                 .unwrap()
-                .meta
                 .pinned
         );
 
@@ -608,7 +605,6 @@ mod tests {
         cache
             .get(&fp, 12)
             .unwrap()
-            .meta
             .pinned
     }
 
@@ -639,7 +635,7 @@ mod tests {
             .path()
             .join("golden.qcow2");
         std::fs::write(&golden, b"golden").unwrap();
-        let env = driver::current_cache_environment(&golden).expect("env from golden image");
+        let env = current_cache_environment(&golden).expect("env from golden image");
 
         let cache = Arc::new(BinaryCache::new(tmp.path().join("cache"), 1 << 30));
         let bin = tmp.path().join("bin");
@@ -681,7 +677,6 @@ mod tests {
             cache
                 .get(&fp, 11)
                 .unwrap()
-                .meta
                 .pinned,
             "PinManager recompute derives the env + pins the matching entry"
         );

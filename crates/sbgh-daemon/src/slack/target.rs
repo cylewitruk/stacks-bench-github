@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use sbgh_core::db::Pool;
+use sbgh_postgres::Pool;
 
 /// The resolved code-under-test for Slack jobs: the configured default repo as
 /// its `(installation, repo)` FK ids. Resolved once at startup via

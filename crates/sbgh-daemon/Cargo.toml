@@ -17,6 +17,11 @@ path = "src/main.rs"
 [dependencies]
 sbgh-core.workspace = true
 sbgh-api.workspace = true
+sbgh-driver.workspace = true
+sbgh-libvirt.workspace = true
+sbgh-worker.workspace = true
+sbgh-postgres.workspace = true
+sbgh-github.workspace = true
 
 tokio = { workspace = true, features = [
     "fs",
@@ -54,7 +59,6 @@ sqlx.workspace = true
 dotenvy.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-quick-xml.workspace = true
 clap.workspace = true
 # S3-compatible artifact storage, driven by Reqwest.
 reqwest = { workspace = true, features = ["rustls", "json", "stream"] }
@@ -62,11 +66,6 @@ rusty-s3.workspace = true
 url.workspace = true
 # Regex matching for tag-pattern trigger policies.
 regex.workspace = true
-# Binary-cache fingerprint hashing and binary-integrity SHA-256;
-# `toml` parses `rust-toolchain.toml` for the pinned-channel fingerprint input.
-sha2.workspace = true
-hex.workspace = true
-toml.workspace = true
 # Slack ad-hoc profiling connector: Socket Mode client and typed
 # Block Kit builders for the result card.
 slack-morphism.workspace = true
@@ -74,10 +73,9 @@ slack-messaging.workspace = true
 
 [dev-dependencies]
 sbgh-core = { workspace = true, features = ["testing"] }
+sbgh-libvirt = { workspace = true, features = ["testing"] }
+sbgh-postgres = { workspace = true, features = ["testing"] }
 tempfile = "3"
 # `oneshot` for driving the axum router in API auth/health tests.
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
-# Syntax-aware execution-boundary ratchet; test-only and already present in the
-# proc-macro dependency graph.
-syn = { version = "2.0.117", features = ["full", "visit"] }

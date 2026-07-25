@@ -729,7 +729,10 @@ By default the daemon deletes the per-job dir on completion. The console tail an
 SBGH_DEBUG_KEEP_JOB_DIR=1 target/release/sbgh-daemon
 ```
 
-(That flag isn't wired up yet — open a TODO. Until then, comment out the `remove_dir_all(job_dir)` line in [crates/sbgh-daemon/src/libvirt/driver.rs](../crates/sbgh-daemon/src/libvirt/driver.rs) during bringup.)
+(That flag isn't wired up yet — open a TODO. Until then, comment out the
+`remove_dir_all(job_dir)` line in
+[crates/sbgh-libvirt/src/libvirt/driver.rs](../crates/sbgh-libvirt/src/libvirt/driver.rs)
+during bringup.)
 
 ### Domain stuck in `paused` or `crashed`
 

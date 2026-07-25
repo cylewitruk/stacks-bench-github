@@ -875,7 +875,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap().0).unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap()).unwrap();
         match detail {
             QueuedEventDetail::SlackAdhoc {
                 channel,
@@ -1312,7 +1312,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap().0).unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap()).unwrap();
         let QueuedEventDetail::SlackAdhoc { clean_repetitions, .. } = detail else {
             panic!("expected SlackAdhoc detail");
         };
@@ -1456,7 +1456,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap().0).unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap()).unwrap();
         let QueuedEventDetail::SlackAdhoc {
             bench_args, clean_repetitions, ..
         } = detail
@@ -1513,7 +1513,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap().0).unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap()).unwrap();
         let QueuedEventDetail::SlackAdhoc {
             bench_args, clean_repetitions, ..
         } = detail

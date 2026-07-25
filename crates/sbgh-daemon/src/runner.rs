@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use sbgh_core::bench_args::resolve_bench_args;
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
@@ -24,20 +25,20 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::artifact_store::{ArtifactStore, GROUP_SQLITE_RELATIVE, group_artifact_key};
+use sbgh_driver::{
+    BenchmarkRunContext, BenchmarkTask, CacheControl, ExecutionContext, ExecutionPlacement,
+    ExecutionRequest, ExecutionTask,
+};
+use sbgh_libvirt::{LibvirtConfig, LvmConfig, PathsConfig, Shell, VmConfig};
+use sbgh_worker::{BinaryCacheConfig, WorkerRuntime, build_binary_cache};
+
+use crate::artifact_store::{
+    ArtifactStore, GROUP_SQLITE_RELATIVE, execution_sink, group_artifact_key,
+};
 #[cfg(test)]
 use crate::artifact_store::{ArtifactStoreConfig, build_store_or_local};
-use crate::binary_cache::build_binary_cache;
-use crate::driver::{BenchmarkRunContext, Driver};
-use crate::events::{ChannelSink, Terminal, WorkerEvent};
-use crate::execution::{
-    BenchmarkTask, ExecutionContext, ExecutionDependencies, ExecutionPlacement, ExecutionRequest,
-    ExecutionTask, execute,
-};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
-use crate::libvirt::{LibvirtConfig, LibvirtDriver, Shell};
 use crate::pin_manager::PinManager;
-use crate::recipe::TaskStatus;
 use crate::report::build_report_surface;
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, ReporterDependencies, resolved_app_id};
 use crate::shutdown::Shutdown;
@@ -141,9 +142,12 @@ struct JobDeps {
     /// The artifact store built at process composition and shared by execution,
     /// repeat planning, orphan recovery, and reporting surfaces.
     artifact_store: Arc<dyn ArtifactStore>,
-    /// The execution backend. Shared by per-job execution and startup orphan
-    /// recovery; built once from `[backend]` config (libvirt today).
-    driver: Arc<dyn Driver>,
+    /// In-process execution owner. Shared by per-job execution and startup
+    /// orphan recovery.
+    worker: Arc<WorkerRuntime>,
+    /// Separately injected cache policy handle; never discovered through the
+    /// driver.
+    cache_control: Option<Arc<dyn CacheControl>>,
     /// Shared App-id cache, resolved via `GET /app` and cached on **success**
     /// only — a `get_or_try_init` that leaves the cell empty on error, so a
     /// transient blip is retried on the next job rather than disabling the
@@ -196,37 +200,116 @@ impl Runner {
             .max_concurrent_jobs
             .max(1);
         let libvirt_config = LibvirtConfig {
-            vm: config.vm.clone(),
-            paths: config.paths.clone(),
-            lvm: config.lvm.clone(),
+            vm: VmConfig {
+                golden_image: config.vm.golden_image.clone(),
+                build_vcpus: config.vm.build_vcpus,
+                bench_vcpus: config.vm.bench_vcpus,
+                build_memory_bytes: config
+                    .vm
+                    .build_memory
+                    .as_bytes(),
+                bench_memory_bytes: config
+                    .vm
+                    .bench_memory
+                    .as_bytes(),
+                boot_disk_gib: config.vm.boot_disk_gib,
+                job_timeout_secs: config.vm.job_timeout_secs,
+                network: config.vm.network.clone(),
+                poll_interval_secs: config.vm.poll_interval_secs,
+                heartbeat_interval_secs: config
+                    .vm
+                    .heartbeat_interval_secs,
+            },
+            paths: PathsConfig {
+                jobs_dir: config.paths.jobs_dir.clone(),
+                git_mirror: config
+                    .paths
+                    .git_mirror
+                    .clone(),
+                results_tmpfs_root: config
+                    .paths
+                    .results_tmpfs_root
+                    .clone(),
+                results_archive_dir: config
+                    .paths
+                    .results_archive_dir
+                    .clone(),
+                sccache_dir: config
+                    .paths
+                    .sccache_dir
+                    .clone(),
+                virsh_binary: config
+                    .paths
+                    .virsh_binary
+                    .clone(),
+                sudo_binary: config
+                    .paths
+                    .sudo_binary
+                    .clone(),
+                qemu_img_binary: config
+                    .paths
+                    .qemu_img_binary
+                    .clone(),
+                cloud_localds_binary: config
+                    .paths
+                    .cloud_localds_binary
+                    .clone(),
+                git_binary: config
+                    .paths
+                    .git_binary
+                    .clone(),
+            },
+            lvm: LvmConfig {
+                vg_name: config.lvm.vg_name.clone(),
+                thinpool: config.lvm.thinpool.clone(),
+                chainstate_base_prefix: config
+                    .lvm
+                    .chainstate_base_prefix
+                    .clone(),
+                chainstate_snapshot_size_gib: config
+                    .lvm
+                    .chainstate_snapshot_size_gib,
+            },
             service_user: config
                 .server
                 .service_user
-                .clone(),
-            default_bench_args: config
-                .stacks_bench
-                .default_args
                 .clone(),
             host_cpus: config
                 .runner
                 .host_cpus
                 .clone(),
         };
-        let binary_cache = build_binary_cache(&config.artifacts.binary_cache);
-        let config = Arc::new(config);
-        let driver: Arc<dyn Driver> = Arc::new(LibvirtDriver::new(
+        let binary_cache = build_binary_cache(&BinaryCacheConfig {
+            enabled: config
+                .artifacts
+                .binary_cache
+                .enabled,
+            max_bytes: config
+                .artifacts
+                .binary_cache
+                .max_size
+                .as_bytes(),
+            dir: config
+                .artifacts
+                .binary_cache
+                .dir
+                .clone(),
+        });
+        let built_worker = WorkerRuntime::libvirt(
             libvirt_config,
             shell,
-            artifact_store.clone(),
+            execution_sink(artifact_store.clone()),
             binary_cache,
-        ));
+        );
+        let config = Arc::new(config);
         Self {
             deps: JobDeps {
                 config,
                 jobs,
                 gh,
                 artifact_store,
-                driver,
+                worker: built_worker.runtime,
+                cache_control: built_worker.cache_control,
                 app_id: Arc::new(OnceCell::new()),
                 slack: None,
                 pin_manager: None,
@@ -260,8 +343,8 @@ impl Runner {
     ) -> Self {
         if let Some(cache) = self
             .deps
-            .driver
-            .binary_cache()
+            .cache_control
+            .clone()
         {
             self.deps.pin_manager = Some(Arc::new(PinManager::new(
                 cache,
@@ -486,7 +569,7 @@ impl Coordinator {
             // cancelling it now would lose the only handle back to the leak.
             if !self
                 .deps
-                .driver
+                .worker
                 .cleanup_by_job_id(&id.to_string())
                 .await
             {
@@ -1177,14 +1260,18 @@ impl JobDeps {
         // in-process worker boundary.
         let worker_completed = match prepared_rx.await {
             Ok(Prepared::Run { commit }) => {
-                let request = execution_request_for(&job, commit, vcpu_cpuset);
-                run_execution(
-                    request,
-                    ExecutionDependencies { driver: self.driver.clone() },
-                    events_tx,
-                    token,
-                )
-                .await
+                let request = execution_request_for(
+                    &job,
+                    commit,
+                    vcpu_cpuset,
+                    &self
+                        .config
+                        .stacks_bench
+                        .default_args,
+                );
+                self.worker
+                    .run(request, events_tx, token)
+                    .await
             }
             Ok(Prepared::Abort) | Err(_) => false,
         };
@@ -1374,11 +1461,13 @@ fn execution_request_for(
     job: &RunnableJob,
     commit: String,
     vcpu_cpuset: Option<String>,
+    default_bench_args: &str,
 ) -> ExecutionRequest {
     let task = match (job.task_kind, job.build_target) {
         (TaskKind::Benchmark, BuildTarget::StacksBench) => {
+            let resolved = resolve_bench_args(&job.bench_args, default_bench_args);
             ExecutionTask::Benchmark(BenchmarkTask {
-                args: job.bench_args.clone(),
+                args: resolved.effective_args,
                 sqlite_seed_key: sqlite_seed_key_for(job),
                 shared_baseline_calibration: job_should_carry_sqlite(job),
                 baseline_calibration_id: job.baseline_calibration_id,
@@ -1402,47 +1491,6 @@ fn execution_request_for(
         task,
         placement: ExecutionPlacement { vcpu_cpuset },
     }
-}
-
-/// Run one already-prepared owned execution request and forward its terminal
-/// result to the orchestrator channel.
-async fn run_execution(
-    request: ExecutionRequest,
-    dependencies: ExecutionDependencies,
-    events_tx: mpsc::Sender<WorkerEvent>,
-    token: CancellationToken,
-) -> bool {
-    let job_id = request.context.job_id;
-    let sink = ChannelSink::new(events_tx.clone());
-    let outcome = execute(request, dependencies, &sink, &token).await;
-    let terminal = if token.is_cancelled() {
-        tracing::warn!(%job_id, "run cancelled; reporting aborted");
-        Terminal::Aborted
-    } else {
-        match outcome {
-            Ok(outcome) => match outcome.status {
-                TaskStatus::Completed => Terminal::Completed { summary: outcome.summary },
-                TaskStatus::Failed(error) => Terminal::Failed {
-                    error,
-                    summary: outcome.summary,
-                },
-            },
-            // A setup-level error (the run couldn't start). Log the full anyhow
-            // chain locally; the reporter posts only a short snippet to the PR.
-            Err(e) => {
-                tracing::error!(%job_id, error = ?e, "execution returned setup error");
-                Terminal::SetupError { error: format!("{e:#}") }
-            }
-        }
-    };
-
-    // Send the terminal; dropping `events_tx` + the sink's clone afterwards
-    // closes the channel, ending the reporter's drain loop.
-    let completed = matches!(terminal, Terminal::Completed { .. });
-    let _ = events_tx
-        .send(WorkerEvent::Finished(terminal))
-        .await;
-    completed
 }
 
 /// Whether a queued job's `[reporting]` config wants a Check Run surface, so a

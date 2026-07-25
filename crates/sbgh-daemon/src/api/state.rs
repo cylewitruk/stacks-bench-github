@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use sbgh_core::db::{IngestStore, Pool};
+use sbgh_core::db::IngestStore;
+use sbgh_postgres::Pool;
 
 /// Shared state for the `/api` route handlers. The owner `pool` backs the
 /// direct read queries + admin writes (Phase 3 moved the daemon to

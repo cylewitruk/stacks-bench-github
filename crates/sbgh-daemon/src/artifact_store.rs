@@ -34,6 +34,7 @@ use std::time::Duration;
 use anyhow::Context;
 use futures::StreamExt;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
+use sbgh_driver::ArtifactSink;
 use tokio::io::AsyncWriteExt;
 
 /// TTL for the short-lived presigned URLs the store mints for its **own**
@@ -154,6 +155,37 @@ pub trait ArtifactStore: Send + Sync {
 
     /// Whether `key` exists in the store (local mirror **or** the bucket).
     async fn exists(&self, key: &str) -> bool;
+}
+
+/// Restricts the full orchestrator-owned store to the operations execution is
+/// allowed to perform.
+struct ExecutionArtifactSink {
+    store: Arc<dyn ArtifactStore>,
+}
+
+#[async_trait::async_trait]
+impl ArtifactSink for ExecutionArtifactSink {
+    async fn put(&self, key: &str, src: &Path) -> Option<u64> {
+        self.store.put(key, src).await
+    }
+
+    async fn put_local_only(&self, key: &str, src: &Path) -> Option<u64> {
+        self.store
+            .put_local_only(key, src)
+            .await
+    }
+
+    async fn get(&self, key: &str) -> std::io::Result<PathBuf> {
+        self.store.get(key).await
+    }
+
+    fn job_dir(&self, job_id: &str) -> PathBuf {
+        self.store.job_dir(job_id)
+    }
+}
+
+pub fn execution_sink(store: Arc<dyn ArtifactStore>) -> Arc<dyn ArtifactSink> {
+    Arc::new(ExecutionArtifactSink { store })
 }
 
 /// Execution-owned artifact-store configuration. Process composition projects

@@ -1,0 +1,29 @@
+[package]
+name = "sbgh-github"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sbgh-core.workspace = true
+
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+octocrab.workspace = true
+reqwest = { workspace = true, features = ["rustls", "json"] }
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

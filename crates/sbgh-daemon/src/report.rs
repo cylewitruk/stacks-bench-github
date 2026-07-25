@@ -38,13 +38,13 @@ use tokio::sync::Mutex;
 use crate::artifact_store::{ArtifactStore, GROUP_SQLITE_RELATIVE, group_artifact_key};
 use crate::bench_summary::{self, RunResult, thousands};
 use crate::comparison::{BaselineComparison, GroupComparison};
-use crate::events::{PhaseLabel, ProgressUpdate};
+use crate::duration::format_elapsed;
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
-use crate::libvirt::format_elapsed;
 use crate::slack::card::RepeatSummary;
 use crate::slack::client::SlackClient;
 use crate::slack::session::{SlackSession, SlackSessionRegistry, SlackTarget};
 use crate::slack::timeline::{SlackTimeline, stage_for_phase};
+use sbgh_driver::{PhaseLabel, ProgressUpdate};
 
 /// Lifetime of the presigned `stacks-bench.db` download link in a Slack card.
 /// Kept in sync with [`bench_summary::DB_LINK_TTL_HUMAN`]; 3 days is under S3's
@@ -1100,7 +1100,7 @@ mod tests {
         });
         github(&gh, job)
             .progress(&ProgressUpdate {
-                workflow_step: crate::events::WorkflowStep::Run,
+                workflow_step: sbgh_driver::WorkflowStep::Run,
                 run_index: 0,
                 requested_run_count: 1,
                 phase: "replay".into(),
@@ -1505,7 +1505,7 @@ mod tests {
             .await;
         surface
             .progress(&ProgressUpdate {
-                workflow_step: crate::events::WorkflowStep::Run,
+                workflow_step: sbgh_driver::WorkflowStep::Run,
                 run_index: 0,
                 requested_run_count: 1,
                 phase: "replay".into(),

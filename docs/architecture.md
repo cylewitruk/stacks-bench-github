@@ -4,12 +4,17 @@
 
 `stacks-bench-github` is a GitHub App that runs the [`stacks-bench`](https://github.com/cylewitruk/stacks-core/tree/feat/stacks-bench/stacks-bench) tool against pull requests, either automatically or in response to `/benchmark` slash-commands posted in PR comments.
 
-The system is one Cargo workspace with six crates and four binaries:
+The system is one Cargo workspace with eleven crates and four binaries:
 
 ```text
 crates/
   sbgh-api/          wire DTOs and typed daemon API client
-  sbgh-core/         daemon-owned database, GitHub, configuration, and model code
+  sbgh-core/         dependency-light domain policy, ports, configuration, and models
+  sbgh-driver/       backend-neutral execution contracts
+  sbgh-github/       GitHub App authentication and Octocrab adapter
+  sbgh-libvirt/      concrete libvirt execution adapter
+  sbgh-postgres/     SQLx stores, migrations, row mappings, and admin queries
+  sbgh-worker/       in-process execution orchestration and recipes
   sbgh-handler/      library + HTTP binary for webhook verification/forwarding
   sbgh-cli/          operator API-client binary
   sbgh-daemon/       library + host binary for orchestration and inline execution
@@ -17,6 +22,8 @@ crates/
 ```
 
 A Postgres database (run locally via `docker/docker-compose.yml`) is the only persistent state, and the **daemon is its sole client**. The handler and `sbgh-cli` never touch Postgres — they reach the daemon over the authenticated `/api` (see [daemon-api.md](./daemon-api.md)).
+Concrete persistence and GitHub integrations live in `sbgh-postgres` and
+`sbgh-github`, respectively.
 
 ## Data flow
 
@@ -70,10 +77,11 @@ For each verify-and-forward request:
 | Concern | Where |
 | ---- | ---- |
 | Main loop | [crates/sbgh-daemon/src/runner.rs](../crates/sbgh-daemon/src/runner.rs) |
-| Queue claim | [crates/sbgh-core/src/db/jobs.rs](../crates/sbgh-core/src/db/jobs.rs) |
-| Worker events | [crates/sbgh-daemon/src/events.rs](../crates/sbgh-daemon/src/events.rs) |
+| Queue contract | [crates/sbgh-core/src/db/jobs.rs](../crates/sbgh-core/src/db/jobs.rs) |
+| PostgreSQL queue implementation | [crates/sbgh-postgres/src/postgres_jobs.rs](../crates/sbgh-postgres/src/postgres_jobs.rs) |
+| Worker events | [crates/sbgh-driver/src/events.rs](../crates/sbgh-driver/src/events.rs) |
 | Report surfaces | [crates/sbgh-daemon/src/report.rs](../crates/sbgh-daemon/src/report.rs) |
-| libvirt driver | [crates/sbgh-daemon/src/libvirt/driver.rs](../crates/sbgh-daemon/src/libvirt/driver.rs) |
+| libvirt driver | [crates/sbgh-libvirt/src/libvirt/driver.rs](../crates/sbgh-libvirt/src/libvirt/driver.rs) |
 
 The coordinator claims serially with `SELECT ... FOR UPDATE SKIP LOCKED LIMIT
 1`, then executes up to `[runner].max_concurrent_jobs` jobs concurrently.
@@ -92,7 +100,10 @@ Two layers of credential:
 
 The private key never lives in an env var — env vars get into process listings, log scrapers, and crash dumps. It's a file on disk, owned by the service user, with restrictive permissions. The webhook secret is fine in an env var because it isn't a signing key for outbound calls.
 
-Installation tokens are minted + cached in memory by [`InstallationTokenCache`](../crates/sbgh-core/src/github/auth.rs), refreshed when less than 5 minutes remain. Only the **daemon** uses it — it holds the App key; the handler does not. (The implementation lives in `sbgh-core`, but the handler never instantiates it.)
+Installation tokens are minted and cached in memory by
+[`InstallationTokenCache`](../crates/sbgh-github/src/auth.rs), refreshed when
+less than 5 minutes remain. Only the **daemon** uses it: the handler never
+receives the App key.
 
 ## Local development
 
@@ -121,7 +132,8 @@ For local webhook delivery from GitHub, use `smee.io` or `cloudflared tunnel` an
 
 ## Daemon: libvirt benchmark driver
 
-For each job, the daemon runs a self-contained VM. The lifecycle is in [crates/sbgh-daemon/src/libvirt/driver.rs](../crates/sbgh-daemon/src/libvirt/driver.rs):
+For each job, the in-process worker runs a self-contained VM. The lifecycle is
+in [crates/sbgh-libvirt/src/libvirt/driver.rs](../crates/sbgh-libvirt/src/libvirt/driver.rs):
 
 1. **Provision** (host-side):
     - qcow2 boot overlay backed by the configured golden image.
@@ -138,7 +150,11 @@ Failure modes are surfaced as `BenchmarkOutcome { status: Failed(_), summary }` 
 
 ### In-VM startup script
 
-The VM-side scripts are [sbgh-build.sh.tmpl](../crates/sbgh-daemon/src/libvirt/templates/sbgh-build.sh.tmpl) (build phase) and [sbgh-bench.sh.tmpl](../crates/sbgh-daemon/src/libvirt/templates/sbgh-bench.sh.tmpl) (benchmark phase). Phases they write (host polls these):
+The VM-side scripts are
+[sbgh-build.sh.tmpl](../crates/sbgh-libvirt/src/libvirt/templates/sbgh-build.sh.tmpl)
+(build phase) and
+[sbgh-bench.sh.tmpl](../crates/sbgh-libvirt/src/libvirt/templates/sbgh-bench.sh.tmpl)
+(benchmark phase). Phases they write (host polls these):
 
 | Phase | Meaning |
 | ---- | ---- |
@@ -216,10 +232,8 @@ target/release/sbgh-daemon
 
 ## Fleet boundary
 
-Execution remains in-process after v24. The owned execution request, task
-dispatch, driver, recipes, and artifact dependency form a movable closure.
-[v24.1](../planning/iterations/v24.1-compiler-enforced-crate-boundaries.md)
-replaces that module-level closure with three Cargo boundaries:
+Execution remains in-process after v24.1, but its dependency direction is now
+compiler-enforced through three Cargo boundaries:
 `sbgh-driver` for the internal driver API, `sbgh-libvirt` for the concrete
 backend, and an in-process `sbgh-worker` library for dispatch and recipes.
 v25 adds the worker protocol and separate process; worker registration,
@@ -237,18 +251,13 @@ The movable closure starts at the owned dispatcher and concrete libvirt
 backend:
 
 - request/task dispatch, recipes, driver contracts, and worker events;
-- artifact storage and binary cache;
+- the worker-side artifact port and binary cache;
 - the production libvirt modules and their host-side helpers.
 
-The syntax-aware
-[`execution_boundary.rs`](../crates/sbgh-daemon/tests/execution_boundary.rs)
-discovers every production `Driver` implementation, then follows production
-module declarations and local imports from the dispatcher and those backends.
-A new backend or imported module therefore joins the checked closure
-automatically. The test skips individual `#[cfg(test)]` items without hiding
-later production code and rejects scheduler preparation/job types, aggregate
-daemon configuration, database/GitHub models and clients, SQLx/Octocrab,
-Slack, and reporting imports. Process composition projects artifact settings
-into execution-owned configuration before constructing the shared store. This
-test is intentionally transitional and is deleted in v24.1 after Cargo and a
-package-DAG check enforce the boundary directly.
+Cargo enforces the source boundary, while
+[`check-package-dag.py`](../scripts/check-package-dag.py) verifies the allowed
+workspace DAG and rejects forbidden transitive execution dependencies. The
+daemon owns the full artifact store and hands the worker only the narrow
+staging/read port. Its direct `sbgh-driver`, `sbgh-worker`, and
+`sbgh-libvirt` dependencies are transitional in-process composition edges;
+v25 removes them when protocol DTOs replace internal execution types.

@@ -13,12 +13,17 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
-use crate::driver::{DriverOutcome, DriverStatus, Placement, TaskSpec};
-use crate::events::EventSink;
 use crate::job_source::ProgressTarget;
-use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
-use crate::recipe::TaskContext;
 use crate::reporter::CHECK_NAME;
+use sbgh_driver::TaskContext;
+use sbgh_driver::{
+    Driver, DriverOutcome, DriverStatus, EventSink, Placement, TaskSpec, Terminal, WorkerEvent,
+};
+use sbgh_libvirt::shell_test_support::{PreparedReply, RecordingShell};
+use sbgh_libvirt::{
+    LibvirtDriver, LvmConfig as LibvirtLvmConfig, PathsConfig as LibvirtPathsConfig,
+    VmConfig as LibvirtVmConfig,
+};
 
 /// A [`RunnableJobStore`] fake that hands out a single pre-staged job
 /// then goes empty, and records which lifecycle methods the runner
@@ -437,19 +442,98 @@ fn test_config(tmp: &TempDir) -> DaemonConfig {
 
 fn test_libvirt_driver(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Arc<dyn Driver> {
     let artifact_store = build_test_artifact_store(&config);
-    let binary_cache = build_binary_cache(&config.artifacts.binary_cache);
+    let binary_cache = build_binary_cache(&BinaryCacheConfig {
+        enabled: config
+            .artifacts
+            .binary_cache
+            .enabled,
+        max_bytes: config
+            .artifacts
+            .binary_cache
+            .max_size
+            .as_bytes(),
+        dir: config
+            .artifacts
+            .binary_cache
+            .dir
+            .clone(),
+    })
+    .map(|cache| cache as Arc<dyn sbgh_driver::BinaryCacheStore>);
     Arc::new(LibvirtDriver::new(
         LibvirtConfig {
-            vm: config.vm.clone(),
-            paths: config.paths.clone(),
-            lvm: config.lvm.clone(),
+            vm: LibvirtVmConfig {
+                golden_image: config.vm.golden_image.clone(),
+                build_vcpus: config.vm.build_vcpus,
+                bench_vcpus: config.vm.bench_vcpus,
+                build_memory_bytes: config
+                    .vm
+                    .build_memory
+                    .as_bytes(),
+                bench_memory_bytes: config
+                    .vm
+                    .bench_memory
+                    .as_bytes(),
+                boot_disk_gib: config.vm.boot_disk_gib,
+                job_timeout_secs: config.vm.job_timeout_secs,
+                network: config.vm.network.clone(),
+                poll_interval_secs: config.vm.poll_interval_secs,
+                heartbeat_interval_secs: config
+                    .vm
+                    .heartbeat_interval_secs,
+            },
+            paths: LibvirtPathsConfig {
+                jobs_dir: config.paths.jobs_dir.clone(),
+                git_mirror: config
+                    .paths
+                    .git_mirror
+                    .clone(),
+                results_tmpfs_root: config
+                    .paths
+                    .results_tmpfs_root
+                    .clone(),
+                results_archive_dir: config
+                    .paths
+                    .results_archive_dir
+                    .clone(),
+                sccache_dir: config
+                    .paths
+                    .sccache_dir
+                    .clone(),
+                virsh_binary: config
+                    .paths
+                    .virsh_binary
+                    .clone(),
+                sudo_binary: config
+                    .paths
+                    .sudo_binary
+                    .clone(),
+                qemu_img_binary: config
+                    .paths
+                    .qemu_img_binary
+                    .clone(),
+                cloud_localds_binary: config
+                    .paths
+                    .cloud_localds_binary
+                    .clone(),
+                git_binary: config
+                    .paths
+                    .git_binary
+                    .clone(),
+            },
+            lvm: LibvirtLvmConfig {
+                vg_name: config.lvm.vg_name.clone(),
+                thinpool: config.lvm.thinpool.clone(),
+                chainstate_base_prefix: config
+                    .lvm
+                    .chainstate_base_prefix
+                    .clone(),
+                chainstate_snapshot_size_gib: config
+                    .lvm
+                    .chainstate_snapshot_size_gib,
+            },
             service_user: config
                 .server
                 .service_user
-                .clone(),
-            default_bench_args: config
-                .stacks_bench
-                .default_args
                 .clone(),
             host_cpus: config
                 .runner
@@ -457,7 +541,7 @@ fn test_libvirt_driver(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Arc<
                 .clone(),
         },
         shell,
-        artifact_store,
+        execution_sink(artifact_store),
         binary_cache,
     ))
 }
@@ -497,7 +581,8 @@ fn execution_request_is_owned_discriminated_and_fails_closed() {
     let mut job = benchmark_job(2, 4, 2, 4);
     job.repository = "octo/core".into();
     job.bench_args = vec!["--count=10".into()];
-    let request = execution_request_for(&job, "resolved-sha".into(), Some("2-3".into()));
+    let request =
+        execution_request_for(&job, "resolved-sha".into(), Some("2-3".into()), "--default");
     drop(job);
 
     assert_eq!(request.context.repository, "octo/core");
@@ -521,9 +606,36 @@ fn execution_request_is_owned_discriminated_and_fails_closed() {
     let mut unsupported = benchmark_job(0, 1, 0, 1);
     unsupported.build_target = BuildTarget::StacksInspect;
     assert!(matches!(
-        execution_request_for(&unsupported, "sha".into(), None).task,
+        execution_request_for(&unsupported, "sha".into(), None, "--default").task,
         ExecutionTask::Unsupported { .. }
     ));
+}
+
+#[test]
+fn execution_request_uses_the_same_resolved_tokens_as_its_workload_key() {
+    let mut job = benchmark_job(0, 1, 0, 1);
+    let resolved = sbgh_core::bench_args::resolve_bench_args(&[], "--count 10");
+    job.workload_key = Some(resolved.workload_key.clone());
+
+    let request = execution_request_for(&job, "sha".into(), None, "--count 10");
+    match request.task {
+        ExecutionTask::Benchmark(task) => {
+            assert_eq!(task.args, resolved.effective_args);
+            assert_eq!(sbgh_core::bench_args::workload_key(&task.args), job.workload_key.unwrap(),);
+        }
+        other => panic!("expected benchmark task, got {other:?}"),
+    }
+}
+
+#[test]
+fn stale_workload_key_does_not_add_a_runtime_failure_path() {
+    let mut job = benchmark_job(0, 1, 0, 1);
+    job.workload_key = Some("stale-key".into());
+    let request = execution_request_for(&job, "sha".into(), None, "--count 10");
+    match request.task {
+        ExecutionTask::Benchmark(task) => assert_eq!(task.args, ["--count", "10"]),
+        other => panic!("expected benchmark task, got {other:?}"),
+    }
 }
 
 #[test]
@@ -692,10 +804,8 @@ async fn completed_run_appends_next_repeat_after_terminal_persist() {
     };
     let source = Arc::new(FakeSource::new(job.clone()));
     let planner = Arc::new(FakeRepeatPlanner::default());
-    let sqlite_key = crate::artifact_store::artifact_key(
-        &job.id.to_string(),
-        crate::libvirt::forensics::SQLITE_RELATIVE,
-    );
+    let sqlite_key =
+        crate::artifact_store::artifact_key(&job.id.to_string(), sbgh_libvirt::SQLITE_RELATIVE);
     let sqlite_path = config
         .paths
         .results_archive_dir
@@ -708,7 +818,8 @@ async fn completed_run_appends_next_repeat_after_terminal_persist() {
         config,
         jobs: source.clone(),
         gh: Arc::new(FakeGitHub::new()),
-        driver: Arc::new(CompletedDriver),
+        worker: WorkerRuntime::with_driver(Arc::new(CompletedDriver)),
+        cache_control: None,
         app_id: Arc::new(OnceCell::new()),
         slack: None,
         pin_manager: None,
@@ -757,10 +868,8 @@ async fn repeat_append_failure_is_nonfatal_to_completed_run() {
     };
     let source = Arc::new(FakeSource::new(job.clone()));
     let planner = Arc::new(FakeRepeatPlanner::default());
-    let sqlite_key = crate::artifact_store::artifact_key(
-        &job.id.to_string(),
-        crate::libvirt::forensics::SQLITE_RELATIVE,
-    );
+    let sqlite_key =
+        crate::artifact_store::artifact_key(&job.id.to_string(), sbgh_libvirt::SQLITE_RELATIVE);
     let sqlite_path = config
         .paths
         .results_archive_dir
@@ -774,7 +883,8 @@ async fn repeat_append_failure_is_nonfatal_to_completed_run() {
         config,
         jobs: source.clone(),
         gh: Arc::new(FakeGitHub::new()),
-        driver: Arc::new(CompletedDriver),
+        worker: WorkerRuntime::with_driver(Arc::new(CompletedDriver)),
+        cache_control: None,
         app_id: Arc::new(OnceCell::new()),
         slack: None,
         pin_manager: None,
@@ -823,7 +933,8 @@ async fn failed_repeat_does_not_try_to_carry_or_append_next_run() {
         config,
         jobs: source.clone(),
         gh: Arc::new(FakeGitHub::new()),
-        driver: Arc::new(FailedDriver),
+        worker: WorkerRuntime::with_driver(Arc::new(FailedDriver)),
+        cache_control: None,
         app_id: Arc::new(OnceCell::new()),
         slack: None,
         pin_manager: None,
@@ -888,7 +999,8 @@ async fn missing_carried_sqlite_blocks_next_repeat_append() {
         config,
         jobs: source.clone(),
         gh: Arc::new(FakeGitHub::new()),
-        driver: Arc::new(CompletedDriver),
+        worker: WorkerRuntime::with_driver(Arc::new(CompletedDriver)),
+        cache_control: None,
         app_id: Arc::new(OnceCell::new()),
         slack: Some(slack.clone()),
         pin_manager: None,
@@ -943,7 +1055,7 @@ async fn coordinator_resumes_pending_repeats_on_startup() {
     let completed_job_id = Uuid::new_v4();
     let sqlite_key = crate::artifact_store::artifact_key(
         &completed_job_id.to_string(),
-        crate::libvirt::forensics::SQLITE_RELATIVE,
+        sbgh_libvirt::SQLITE_RELATIVE,
     );
     let sqlite_path = config
         .paths
@@ -968,7 +1080,8 @@ async fn coordinator_resumes_pending_repeats_on_startup() {
         config,
         jobs: source,
         gh: Arc::new(FakeGitHub::new()),
-        driver: Arc::new(CompletedDriver),
+        worker: WorkerRuntime::with_driver(Arc::new(CompletedDriver)),
+        cache_control: None,
         app_id: Arc::new(OnceCell::new()),
         slack: None,
         pin_manager: None,
@@ -1449,7 +1562,8 @@ async fn concurrent_jobs_reach_terminal_independently() {
             config: config.clone(),
             jobs: source.clone(),
             gh: Arc::new(FakeGitHub::new()),
-            driver,
+            worker: WorkerRuntime::with_driver(driver),
+            cache_control: None,
             app_id: app_id.clone(),
             slack: None,
             pin_manager: None,
@@ -1622,7 +1736,8 @@ async fn coordinator_enforces_limit_and_tops_up() {
         config,
         jobs: source.clone(),
         gh: Arc::new(FakeGitHub::new()),
-        driver,
+        worker: WorkerRuntime::with_driver(driver),
+        cache_control: None,
         app_id: Arc::new(OnceCell::new()),
         slack: None,
         pin_manager: None,
@@ -1691,13 +1806,9 @@ async fn a_cancelled_run_is_reported_aborted() {
     let token = CancellationToken::new();
     token.cancel(); // cancelled before the run → outcome is overridden to aborted
 
-    run_execution(
-        execution_request_for(&job, "abc123".into(), None),
-        ExecutionDependencies { driver },
-        events_tx,
-        token,
-    )
-    .await;
+    WorkerRuntime::with_driver(driver)
+        .run(execution_request_for(&job, "abc123".into(), None, "--default"), events_tx, token)
+        .await;
 
     match events_rx.recv().await {
         Some(WorkerEvent::Finished(Terminal::Aborted)) => {}
@@ -1948,7 +2059,8 @@ fn position_coord(
         config,
         jobs: source,
         gh,
-        driver,
+        worker: WorkerRuntime::with_driver(driver),
+        cache_control: None,
         app_id: Arc::new(OnceCell::new()),
         slack: None,
         pin_manager: None,
@@ -2208,7 +2320,8 @@ fn position_coord_with_slack(
         config,
         jobs: source,
         gh: Arc::new(FakeGitHub::new()),
-        driver,
+        worker: WorkerRuntime::with_driver(driver),
+        cache_control: None,
         app_id: Arc::new(OnceCell::new()),
         slack: Some(slack),
         pin_manager: None,

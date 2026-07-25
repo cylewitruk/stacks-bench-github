@@ -30,11 +30,11 @@ use crate::artifact_store::ArtifactStore;
 use crate::artifact_store::{ArtifactStoreConfig, build_store_or_local};
 use crate::bench_summary::RunResult;
 use crate::comparison::{BaselineComparison, GroupComparison, compare};
-use crate::events::{Terminal, WorkerEvent};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::{CompletionReport, ReportSurface, build_report_surface};
 use crate::slack::client::SlackClient;
 use crate::slack::session::SlackSessionRegistry;
+use sbgh_driver::{Terminal, WorkerEvent};
 
 /// Resolve the App's numeric id via `GET /app`, cached on **success** in `cell`
 /// (a `get_or_try_init` that leaves the cell empty on error, so a transient
@@ -1256,7 +1256,7 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel(4);
         events_tx
             .send(WorkerEvent::Phase {
-                label: crate::events::PhaseLabel::new("running", false),
+                label: sbgh_driver::PhaseLabel::new("running", false),
                 elapsed: std::time::Duration::ZERO,
             })
             .await

@@ -4,8 +4,8 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use sbgh_api::{GrantRoleResult, RoleRequest, RoleView, UserView};
-use sbgh_core::admin;
 use sbgh_core::models::{GithubUser, GithubUserRole, UserRole};
+use sbgh_postgres::admin;
 use serde::Deserialize;
 
 use crate::api::conv::{enum_str, parse_enum};

@@ -10,7 +10,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use sbgh_core::db::{Pool, PostgresIngestStore, setup_pg_db};
+use sbgh_postgres::db::{Pool, PostgresIngestStore, setup_pg_db};
 use tower::ServiceExt;
 
 use super::{ApiState, ApiTokens, build_router};

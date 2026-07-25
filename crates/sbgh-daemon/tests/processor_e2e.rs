@@ -11,25 +11,33 @@
 
 use std::sync::Arc;
 
-use sbgh_core::db::{
-    IngestStore, NewWebhook, Pool, PostgresIngestStore, PostgresInstallationStore,
-    PostgresJobStore, PostgresPolicyStore, PostgresPullRequestStore, PostgresRepoStore,
-    PostgresUserStore, PostgresWebhookInbox, setup_pg_db,
-};
 use sbgh_core::github::RepoRef;
 use sbgh_core::github::test_support::FakeGitHub;
-use sbgh_core::models::{GithubAccountType, WebhookOutcome, WebhookStatus};
+use sbgh_core::models::{WebhookOutcome, WebhookStatus};
 use sbgh_daemon::{
     BasicClassifier, CreateHandler, InstallationHandler, InstallationRepositoriesHandler,
     IssueCommentHandler, ProcessorConfig, PullRequestHandler, PushHandler, WebhookProcessor,
 };
+use sbgh_postgres::db::{
+    IngestStore, NewWebhook, Pool, PostgresIngestStore, PostgresInstallationStore,
+    PostgresJobStore, PostgresPolicyStore, PostgresPullRequestStore, PostgresRepoStore,
+    PostgresUserStore, PostgresWebhookInbox, setup_pg_db,
+};
 
 async fn read_row_status(pool: &Pool, delivery: &str) -> (WebhookStatus, Option<WebhookOutcome>) {
-    sqlx::query_as("SELECT status, outcome FROM github_webhook WHERE delivery_id = $1")
-        .bind(delivery)
-        .fetch_one(pool)
-        .await
-        .expect("read row")
+    let (status, outcome): (String, Option<String>) = sqlx::query_as(
+        "SELECT status::text, outcome::text FROM github_webhook WHERE delivery_id = $1",
+    )
+    .bind(delivery)
+    .fetch_one(pool)
+    .await
+    .expect("read row");
+    (
+        serde_json::from_value(serde_json::Value::String(status)).expect("known webhook status"),
+        outcome.map(|value| {
+            serde_json::from_value(serde_json::Value::String(value)).expect("known webhook outcome")
+        }),
+    )
 }
 
 fn issue_comment_webhook(delivery: &str, body: &str, is_pr: bool) -> NewWebhook {
@@ -592,14 +600,15 @@ async fn pipeline_installation_created_for_allowed_account_materialises_install_
     assert_eq!(outcome, Some(WebhookOutcome::ProcessedInstallation));
 
     // The install row must exist with the right account fields.
-    let (login, account_type): (String, GithubAccountType) =
-        sqlx::query_as("SELECT account_login, account_type FROM github_installation WHERE id = $1")
-            .bind(100_i64)
-            .fetch_one(&pool)
-            .await
-            .expect("install row must exist after processed_installation outcome");
+    let (login, account_type): (String, String) = sqlx::query_as(
+        "SELECT account_login, account_type::text FROM github_installation WHERE id = $1",
+    )
+    .bind(100_i64)
+    .fetch_one(&pool)
+    .await
+    .expect("install row must exist after processed_installation outcome");
     assert_eq!(login, "octo-org");
-    assert_eq!(account_type, GithubAccountType::Organization);
+    assert_eq!(account_type, "organization");
 }
 
 #[tokio::test]

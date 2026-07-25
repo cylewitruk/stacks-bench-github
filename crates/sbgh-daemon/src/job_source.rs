@@ -668,7 +668,7 @@ impl JobSource {
         let bench_args = queued
             .as_ref()
             .and_then(|e| e.detail.as_ref())
-            .map(|d| normalize_stored_value(&d.0))
+            .map(normalize_stored_value)
             .unwrap_or_default();
 
         // The report surface is derived from the job's axes (v10 0005): a
@@ -687,7 +687,7 @@ impl JobSource {
             let (channel, message_ts) = queued
                 .as_ref()
                 .and_then(|e| e.detail.as_ref())
-                .and_then(|d| serde_json::from_value::<QueuedEventDetail>(d.0.clone()).ok())
+                .and_then(|d| serde_json::from_value::<QueuedEventDetail>(d.clone()).ok())
                 .and_then(|d| match d {
                     QueuedEventDetail::SlackAdhoc { channel, message_ts, .. } => {
                         Some((channel, message_ts))
@@ -803,8 +803,7 @@ async fn extract_outcome(
     let bytes = run_json_path.and_then(|p| std::fs::read(p).ok());
     let run_json = bytes
         .as_deref()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
-        .map(sqlx::types::Json);
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
     let metric = bytes
         .as_deref()
         .and_then(RunResult::from_bytes)

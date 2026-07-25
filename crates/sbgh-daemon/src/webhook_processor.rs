@@ -1779,7 +1779,7 @@ impl EventHandler for PushHandler {
 
         let matched: Vec<&TriggerPolicy> = triggers
             .iter()
-            .filter(|t| matches_branch_push(&t.match_spec.0, branch))
+            .filter(|t| matches_branch_push(&t.match_spec, branch))
             .collect();
         let Some(trigger) = matched.first().copied() else {
             tracing::debug!(
@@ -1940,7 +1940,7 @@ impl EventHandler for CreateHandler {
 
         let mut matched: Vec<&TriggerPolicy> = Vec::new();
         for t in &triggers {
-            match matches_tag_created(&t.match_spec.0, &event.ref_field) {
+            match matches_tag_created(&t.match_spec, &event.ref_field) {
                 Ok(true) => matched.push(t),
                 Ok(false) => {}
                 Err(msg) => {
@@ -2900,8 +2900,7 @@ mod tests {
             events[0]
                 .detail
                 .clone()
-                .unwrap()
-                .0,
+                .unwrap(),
         )
         .unwrap();
         match detail {

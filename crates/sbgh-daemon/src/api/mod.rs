@@ -180,7 +180,7 @@ mod tests {
             .unwrap();
         ApiState {
             pool: pool.clone(),
-            ingest: Arc::new(sbgh_core::db::PostgresIngestStore::new(pool)),
+            ingest: Arc::new(sbgh_postgres::PostgresIngestStore::new(pool)),
             gh_api_base: "https://api.github.com".into(),
         }
     }

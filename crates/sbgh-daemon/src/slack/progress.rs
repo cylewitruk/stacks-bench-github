@@ -5,7 +5,7 @@
 //! `chat.update` fallback renders.
 
 use crate::bench_summary::thousands;
-use crate::events::{ProgressUpdate, WorkflowStep};
+use sbgh_driver::{ProgressUpdate, WorkflowStep};
 
 const PERCENT_MILESTONE: u64 = 10;
 // Total-less phases are generally status/counter streams. `txid_scan` can

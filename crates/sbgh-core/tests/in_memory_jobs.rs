@@ -98,8 +98,7 @@ async fn create_unlinked_job_is_webhook_less_and_preserves_detail() {
     assert_eq!(
         queued
             .detail
-            .expect("queued event carries detail")
-            .0,
+            .expect("queued event carries detail"),
         detail
     );
 }

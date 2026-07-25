@@ -148,7 +148,7 @@ pub struct BaselineMatch {
 /// v15 Phase 4: a completed repeat run whose next run still needs to be
 /// materialized. The runner uses this to carry the group SQLite artifact
 /// before calling [`JobStore::append_next_benchmark_run`].
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingBenchmarkRun {
     pub completed_job_id: Uuid,
     pub benchmark_group_id: Uuid,

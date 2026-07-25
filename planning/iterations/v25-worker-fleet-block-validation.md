@@ -5,7 +5,7 @@ validation on the available dedicated Hetzner host while preserving benchmark
 behavior on a separate co-located worker.
 
 > **Status:** planned — depends on the compiler-enforced crate topology from
-> [v24.1](v24.1-compiler-enforced-crate-boundaries.md).
+> [v24.1](../archive/completed/0056-compiler-enforced-crate-boundaries.md).
 >
 > The deployment target is now concrete: one dedicated Hetzner worker with a
 > 64-core CPU, 256 GB RAM, and four 4 TB NVMe drives is available for
@@ -73,6 +73,10 @@ protocol as the remote host.
 - Introduce dependency-light worker protocol types and an orchestrator worker
   API; turn the v24.1 `sbgh-worker` library into the separately deployed worker
   process.
+- Persist fully resolved effective task arguments, or an equivalent immutable
+  configuration snapshot, when work is enqueued. The workload key and persisted
+  arguments must derive from the same tokens; leases carry those arguments so
+  worker execution cannot change when daemon defaults drift.
 - Register workers with capabilities, resource facts, version, and an
   operator-declared measurement profile; workers dial out and never receive DB
   credentials.

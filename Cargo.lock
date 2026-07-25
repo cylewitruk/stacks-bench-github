@@ -2740,18 +2740,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
  "chrono",
  "hex",
- "jsonwebtoken",
- "octocrab",
  "percent-encoding",
- "reqwest 0.13.4",
  "sbgh-core",
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "sqlx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2770,35 +2765,67 @@ dependencies = [
  "clap",
  "dotenvy",
  "futures",
- "hex",
  "http-body-util",
- "quick-xml 0.40.1",
  "regex",
  "reqwest 0.13.4",
  "rustls",
  "rusty-s3",
  "sbgh-api",
  "sbgh-core",
+ "sbgh-driver",
+ "sbgh-github",
+ "sbgh-libvirt",
+ "sbgh-postgres",
+ "sbgh-worker",
  "schemars",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "slack-messaging",
  "slack-morphism",
  "sqlx",
  "subtle",
- "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "toml",
  "tower",
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "sbgh-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "sbgh-github"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "jsonwebtoken",
+ "octocrab",
+ "reqwest 0.13.4",
+ "sbgh-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -2829,6 +2856,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbgh-libvirt"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "quick-xml 0.40.1",
+ "sbgh-driver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "sbgh-postgres"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "reqwest 0.13.4",
+ "sbgh-core",
+ "sbgh-postgres",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "sbgh-smee"
 version = "0.1.0"
 dependencies = [
@@ -2842,6 +2906,25 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sbgh-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hex",
+ "sbgh-driver",
+ "sbgh-libvirt",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

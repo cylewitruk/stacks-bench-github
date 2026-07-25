@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::types::Json;
 use uuid::Uuid;
 
 /// Slice 8 added `Claimed` between `Queued` and `Running` per the
@@ -9,8 +8,7 @@ use uuid::Uuid;
 /// daemon's claim path transitions queued→claimed (with a
 /// claim_token + claimed_at), then claimed→running when execution
 /// actually starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "job_status", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
@@ -50,8 +48,7 @@ impl From<TerminalJobStatus> for JobStatus {
 /// `github_webhook_status` DB enum. Distinct from `WebhookOutcome`:
 /// status is the queue/processing state; outcome is the specific
 /// terminal decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "github_webhook_status", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WebhookStatus {
     Received,
@@ -65,8 +62,7 @@ pub enum WebhookStatus {
 
 /// Specific processor decision attached to a terminal webhook row.
 /// Mirrors the `github_webhook_outcome` DB enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "github_webhook_outcome", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WebhookOutcome {
     EnqueuedJob,
@@ -134,8 +130,7 @@ impl WebhookOutcome {
 /// included for completeness even though the App is unlikely to be
 /// installed by a bot in practice — present so we don't panic if the
 /// API ever hands us one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "github_account_type", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GithubAccountType {
     User,
@@ -145,7 +140,7 @@ pub enum GithubAccountType {
 
 /// Operator-curated allowlist row. PK is the GitHub-assigned numeric
 /// account id — stable across renames and case.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllowedInstaller {
     pub github_account_id: i64,
     pub account_login: String,
@@ -166,7 +161,7 @@ pub struct AllowedInstaller {
 /// remain valid) but `deleted_at IS NOT NULL` means it's retired. The
 /// "currently active" predicate is `deleted_at IS NULL AND suspended_at IS
 /// NULL`.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubInstallation {
     pub id: i64,
     pub github_account_id: i64,
@@ -191,7 +186,7 @@ pub struct GithubInstallation {
 /// (GitHub's `source` in the REST response). Both are nullable
 /// because slices 4-6 may insert a repo for identity-only purposes
 /// (PR target/source) before the lineage walk has run.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubRepo {
     pub id: i64,
     pub owner: String,
@@ -207,7 +202,7 @@ pub struct GithubRepo {
 
 /// Operator-curated canonical-root row. A repo is in-scope iff its id OR
 /// its `fork_root_github_repo_id` matches an enabled row here.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupportedRepoRoot {
     pub github_repo_id: i64,
     pub is_enabled: bool,
@@ -219,7 +214,7 @@ pub struct SupportedRepoRoot {
 /// Per-installation repo membership. `revoked_at IS NULL` means active.
 /// Composite PK doubles as the FK anchor for slice 5+ policy + slice 8+
 /// job tables that need to prove the (install, repo) pair was ever known.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubInstallationRepo {
     pub github_installation_id: i64,
     pub github_repo_id: i64,
@@ -260,8 +255,7 @@ pub enum TriggerMatchSpec {
 /// (no trigger_policy row needed). `SlackAdhoc` (v5, item 0002) is the
 /// no-commit Slack profiling trigger. `Scheduled` and `Manual` are
 /// reserved for post-slice-9 work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "trigger_kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerKind {
     PrComment,
@@ -277,7 +271,7 @@ pub enum TriggerKind {
 /// `github_installation_repo` enforces "the (install, repo) pair must
 /// exist as a membership row" — but currently-active access is a
 /// separate app-level join on `revoked_at IS NULL`.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetRepoPolicy {
     pub github_installation_id: i64,
     pub github_repo_id: i64,
@@ -291,7 +285,7 @@ pub struct TargetRepoPolicy {
 /// trusts this repo as the source side of a PR — its code may execute
 /// in our benchmark VM"). Unlike `TargetRepoPolicy`, no membership FK
 /// — sources can be arbitrary forks the install doesn't own.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceRepoPolicy {
     pub github_installation_id: i64,
     pub github_repo_id: i64,
@@ -305,7 +299,7 @@ pub struct SourceRepoPolicy {
 /// (install, repo) — one per `trigger_kind` + `match_spec` combo.
 /// `bench_args` (optional) is forwarded to the eventual job as
 /// CLI args once slice 9 starts creating jobs.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerPolicy {
     pub id: i64,
     pub github_installation_id: i64,
@@ -313,7 +307,7 @@ pub struct TriggerPolicy {
     pub trigger_kind: TriggerKind,
     /// Stored as JSONB; deserialise into `TriggerMatchSpec` for typed
     /// matching at evaluation time.
-    pub match_spec: sqlx::types::Json<serde_json::Value>,
+    pub match_spec: serde_json::Value,
     pub bench_args: Option<String>,
     pub is_enabled: bool,
     pub note: Option<String>,
@@ -332,8 +326,7 @@ pub struct TriggerPolicy {
 /// `user_role` DB enum from slice 0. Phase 1 only acts on
 /// `TriggerPrBenchmark` (the `/benchmark` authz gate); `Admin` and
 /// `ViewResults` are present for forward-compat but unused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "user_role", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserRole {
     Admin,
@@ -343,7 +336,7 @@ pub enum UserRole {
 
 /// Lazily upserted identity row for a GH user we've encountered.
 /// `login` is display-only; the natural key is the numeric `id`.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubUser {
     pub id: i64,
     pub login: String,
@@ -360,7 +353,7 @@ pub struct GithubUser {
 /// rather than deleting the row, and a subsequent re-grant clears
 /// `revoked_at` on the existing row — preserving the original
 /// `granted_at` audit timestamp across the cycle.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubUserRole {
     pub id: i64,
     pub github_user_id: i64,
@@ -377,7 +370,7 @@ pub struct GithubUserRole {
 /// the PR if the opened event predates the new pipeline). Soft-close
 /// via `closed_at`; closed PRs stay in the table so slice 8+ job FKs
 /// remain valid.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubPullRequest {
     pub id: i64,
     pub target_github_repo_id: i64,
@@ -399,7 +392,7 @@ pub struct GithubPullRequest {
 ///   - `status = Claimed` ⇔ both Some
 ///   - `status IN (Running, Completed, Failed, Cancelled)` → both PRESERVED as
 ///     audit
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: Uuid,
     /// 0037: user-facing benchmark request this claimable run belongs to.
@@ -459,7 +452,7 @@ pub struct NewJob {
 
 /// 0037: user-facing benchmark request boundary. A group owns reporting,
 /// shared artifact identity, and future multi-run/multi-variant summaries.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkGroup {
     pub id: Uuid,
     pub github_installation_id: i64,
@@ -478,7 +471,7 @@ pub struct BenchmarkGroup {
 /// 0037: one concrete variant in a benchmark group: workload + ref + target.
 /// Groups can model multiple specs now, while current creation paths cap at
 /// one.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkSpec {
     pub id: Uuid,
     pub benchmark_group_id: Uuid,
@@ -528,8 +521,7 @@ pub fn measured_run_count(task_kind: TaskKind, requested_run_count: i32) -> i32 
     if task_kind == TaskKind::BuildOnly { 0 } else { requested_run_count.max(1) }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "benchmark_step_kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkStepKind {
     Build,
@@ -539,7 +531,7 @@ pub enum BenchmarkStepKind {
 
 /// 0037: inert ordered workflow model for a group. Runtime execution still
 /// follows today's job path; later slices attach behavior to these steps.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkWorkflowStep {
     pub id: Uuid,
     pub benchmark_group_id: Uuid,
@@ -598,16 +590,14 @@ pub struct NewPullRequestLink {
     pub triggering_comment_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "job_kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     AdHoc,
     Baseline,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "git_ref_kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitRefKind {
     Branch,
@@ -628,8 +618,7 @@ pub enum GitRefKind {
 // still runs off the old enums (Phase 2 rewires reads/writes).
 
 /// WHO requested a job. Replaces the *source* half of [`TriggerKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "job_source", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobSource {
     GithubWebhook,
@@ -643,8 +632,7 @@ pub enum JobSource {
 /// WHY a job runs + how its result is used. **Absorbs** [`JobKind`] —
 /// `adhoc_benchmark` / `baseline_benchmark` carry the `AdHoc` / `Baseline`
 /// result-role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "job_intent", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobIntent {
     AdhocBenchmark,
@@ -655,8 +643,7 @@ pub enum JobIntent {
 
 /// WHICH VM workload runs after build — the recipe-dispatch axis. `BuildOnly`
 /// produces + caches an artifact and stops (no measurement).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "task_kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     Benchmark,
@@ -665,8 +652,7 @@ pub enum TaskKind {
 }
 
 /// WHICH artifact binary a job produces / consumes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "build_target", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildTarget {
     StacksBench,
@@ -711,8 +697,7 @@ impl JobAxes {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "job_event_kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobEventKind {
     Queued,
@@ -741,8 +726,7 @@ pub enum JobEventKind {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "job_event_status", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobEventStatus {
     Started,
@@ -755,7 +739,7 @@ pub enum JobEventStatus {
 /// Rust enum keyed off the queued-event `trigger` provenance tag (slice 9
 /// defines the queued-event provenance shape; later phases extend
 /// for the other event kinds).
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEvent {
     pub id: i64,
     pub job_id: Uuid,
@@ -766,7 +750,7 @@ pub struct JobEvent {
     pub github_check_run_id: Option<i64>,
     pub github_check_run_url: Option<String>,
     pub remark: Option<String>,
-    pub detail: Option<Json<serde_json::Value>>,
+    pub detail: Option<serde_json::Value>,
 }
 
 /// Slice 9: typed provenance for the `queued` job_event's `detail`
@@ -850,7 +834,7 @@ pub struct NewJobEvent {
 
 /// Write-once promoted bench metrics. Adding/removing columns
 /// requires a coordinated change with stacks-bench.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobMetric {
     pub job_id: Uuid,
     pub envelope_duration_us: i64,
@@ -871,10 +855,10 @@ pub struct JobMetric {
 /// Raw run.json + archive path. `run_json` is None for jobs that
 /// failed before producing it; `archive_dir` is required so ops
 /// can find post-mortem artefacts even on failure.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobResult {
     pub job_id: Uuid,
-    pub run_json: Option<Json<serde_json::Value>>,
+    pub run_json: Option<serde_json::Value>,
     pub archive_dir: String,
     pub created_at: DateTime<Utc>,
 }
@@ -883,7 +867,7 @@ pub struct JobResult {
 /// `triggering_comment_id` is the slice 7 `comment.id` for
 /// pr_comment-triggered jobs; None for other PR jobs (e.g. a
 /// future "PR opened auto-bench" feature).
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubPullRequestJob {
     pub job_id: Uuid,
     pub github_pull_request_id: i64,
@@ -894,7 +878,7 @@ pub struct GithubPullRequestJob {
 /// Slice 8 ingest link: webhook → job. The slice-9 processor inserts
 /// the webhook row earlier (via the handler's ingest path), then
 /// creates the job + this link inside one transaction.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubWebhookJob {
     pub github_webhook_id: i64,
     pub job_id: Uuid,
@@ -905,7 +889,7 @@ pub struct GithubWebhookJob {
 /// Populated for pr_comment / manual triggers; absent for
 /// branch_push / tag_created / scheduled triggers (no responsible
 /// user).
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubUserJob {
     pub github_user_id: i64,
     pub job_id: Uuid,
