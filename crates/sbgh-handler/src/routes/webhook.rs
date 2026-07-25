@@ -16,8 +16,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use sbgh_api::ClientError;
-use sbgh_core::github::verify_signature;
 
+use crate::signature::verify_signature;
 use crate::state::AppState;
 
 const EVENT_HEADER: &str = "x-github-event";

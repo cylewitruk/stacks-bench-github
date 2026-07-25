@@ -15,15 +15,8 @@
 use std::time::Duration;
 
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
-use sbgh_core::config::S3Config;
+use sbgh_daemon::{ArtifactStore, S3Store, S3StoreConfig, artifact_key};
 use uuid::Uuid;
-
-// Daemon is a bin-only crate; pull the module under test in by path. It has no
-// `crate::`-internal deps, so it stands alone.
-#[path = "../src/artifact_store.rs"]
-mod artifact_store;
-
-use artifact_store::{ArtifactStore, S3Store, artifact_key};
 
 const ENDPOINT: &str = "http://127.0.0.1:9100";
 const BUCKET: &str = "sbgh-test";
@@ -31,8 +24,8 @@ const REGION: &str = "us-east-1";
 const ACCESS: &str = "minioadmin";
 const SECRET: &str = "minioadmin";
 
-fn s3_config() -> S3Config {
-    S3Config {
+fn s3_config() -> S3StoreConfig {
+    S3StoreConfig {
         endpoint: ENDPOINT.into(),
         bucket: BUCKET.into(),
         region: REGION.into(),

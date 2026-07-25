@@ -1,41 +1,29 @@
 [package]
 name = "sbgh-cli"
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[lib]
-name = "sbgh_cli"
-path = "src/lib.rs"
+[lints]
+workspace = true
 
 [[bin]]
 name = "sbgh-cli"
 path = "src/main.rs"
 
 [dependencies]
-# `sbgh-core` for the `sbgh_core::admin` re-exports (lib, test-only);
-# `sbgh-api` for the client + DTOs (bin). No DB access — the CLI is a pure
-# `/api` client since Phase 5.
-sbgh-core.workspace = true
+# The CLI is a pure daemon `/api` client.
 sbgh-api.workspace = true
 
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 anyhow.workspace = true
 tracing-subscriber.workspace = true
+rustls.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 serde_json.workspace = true
-# v9 (item 0025): flag an expired `pinned_until` in `policy trigger list`.
+# Flag an expired `pinned_until` in `policy trigger list`.
 chrono.workspace = true
-
-[dev-dependencies]
-# Re-imports sbgh-core with the `testing` feature so integration tests
-# can use the shared setup_pg_db() helper.
-sbgh-core = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["full"] }
-# In-process mock of GitHub's /users/{login} endpoint for installer tests.
-axum.workspace = true
-# Test-only: direct SQL for seeding fixtures + asserting row state.
-sqlx.workspace = true

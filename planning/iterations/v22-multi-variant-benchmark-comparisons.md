@@ -3,9 +3,10 @@
 Promote explicit ad-hoc comparison benchmarks so a Slack request can benchmark
 one workload against two refs and report one noise-aware delta summary (`0039`).
 
-> **Status:** in_progress - Phase 5 implemented and ready for external review.
+> **Status:** parked - Phase 5 was implemented and is ready for external
+> review. Validation and any reporting refactor will resume after v24.
 >
-> v21 remains planned but deferred. Comparison benchmarks are the next
+> v21 remains parked. Comparison benchmarks are the next
 > operational need, and they can build on the already-shipped group/run,
 > repetition, calibration, and Slack-session work without waiting for the native
 > schema-v1 parser cleanup.
@@ -14,7 +15,7 @@ one workload against two refs and report one noise-aware delta summary (`0039`).
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0039-multi-variant-benchmark-comparisons` | primary | in_progress |
+| `0039-multi-variant-benchmark-comparisons` | primary | parked |
 
 ## Why
 

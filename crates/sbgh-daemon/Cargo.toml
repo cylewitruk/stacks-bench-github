@@ -1,10 +1,14 @@
 [package]
 name = "sbgh-daemon"
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "sbgh-daemon"
@@ -14,12 +18,22 @@ path = "src/main.rs"
 sbgh-core.workspace = true
 sbgh-api.workspace = true
 
-tokio.workspace = true
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 tokio-util.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 
-# roadmap-v3 Phase 2: the `/api` server.
+# Daemon admin and webhook-ingest `/api` server.
 axum.workspace = true
 tower-http.workspace = true
 # Constant-time token comparison in the auth layer.
@@ -34,6 +48,7 @@ anyhow.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rustls.workspace = true
 
 sqlx.workspace = true
 dotenvy.workspace = true
@@ -41,18 +56,18 @@ uuid.workspace = true
 chrono.workspace = true
 quick-xml.workspace = true
 clap.workspace = true
-# Artifact store (item 0001): S3-compatible object storage, driven by reqwest.
-reqwest.workspace = true
+# S3-compatible artifact storage, driven by Reqwest.
+reqwest = { workspace = true, features = ["rustls", "json", "stream"] }
 rusty-s3.workspace = true
 url.workspace = true
-# Slice 5 trigger_policy: regex matching for tag_pattern matchers.
+# Regex matching for tag-pattern trigger policies.
 regex.workspace = true
-# Binary cache (item 0025): fingerprint hashing + binary integrity sha256;
+# Binary-cache fingerprint hashing and binary-integrity SHA-256;
 # `toml` parses `rust-toolchain.toml` for the pinned-channel fingerprint input.
 sha2.workspace = true
 hex.workspace = true
 toml.workspace = true
-# Slack ad-hoc profiling connector (item 0002): Socket Mode client + typed
+# Slack ad-hoc profiling connector: Socket Mode client and typed
 # Block Kit builders for the result card.
 slack-morphism.workspace = true
 slack-messaging.workspace = true
@@ -63,3 +78,6 @@ tempfile = "3"
 # `oneshot` for driving the axum router in API auth/health tests.
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+# Syntax-aware execution-boundary ratchet; test-only and already present in the
+# proc-macro dependency graph.
+syn = { version = "2.0.117", features = ["full", "visit"] }

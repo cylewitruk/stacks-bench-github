@@ -1,18 +1,14 @@
-//! The backend axis (roadmap-v8 Phase 1): a task-agnostic execution substrate.
+//! Task-agnostic execution backends.
 //!
 //! A [`Driver`] runs a [`TaskSpec`] to completion on one host's backend
 //! (libvirt today) and reports progress to the recipe-neutral
 //! [`EventSink`](crate::events::EventSink). It is the *backend* counterpart to
 //! [`Recipe`](crate::recipe::Recipe) (the *task* axis): `{task} × {backend}` is
 //! a matrix, not one driver per task. Bench is the sole task today, so the only
-//! [`TaskSpec`] carries the bench args; the seam stays open for
-//! block-validation (roadmap-v6) and remote/cloud backends (roadmap-v9 worker
-//! fleet) without an engine change.
-//!
-//! **Scope of v8 Phase 1:** the trait + neutral outcome/placement seam, with
-//! the libvirt driver as the sole impl, behavior-preserving. The cloud-init
-//! split (driver-owned generic shell vs. a task-supplied in-VM script) is
-//! deferred to when a second task kind needs a different script (roadmap-v6).
+//! Task input is discriminated so benchmark-only fields cannot leak into
+//! build-only work. The task/backend split lets future tasks and remote
+//! backends compose without changing scheduler lifecycle code. The libvirt
+//! driver is the sole implementation today.
 
 use std::sync::Arc;
 
@@ -23,29 +19,21 @@ use crate::binary_cache::BinaryCache;
 use crate::events::EventSink;
 use crate::recipe::TaskContext;
 
-/// What the *task* (a [`Recipe`](crate::recipe::Recipe)) hands the driver: the
-/// task-supplied inputs the backend feeds to the in-VM workload. Today bench
-/// fills `args` with its CLI args; the driver renders its own backend envelope
-/// (cloud-init/user-data) around them — the spec carries **no** backend details
-/// (roadmap-v8 Phase 1 invariant).
-#[derive(Debug, Clone, Default)]
-pub struct TaskSpec {
-    /// The task's invocation args (bench: `bench_args`), replayed into the
-    /// backend's in-VM task.
+/// Task-specific input handed to an execution backend. Placement remains a
+/// separate axis.
+#[derive(Debug, Clone)]
+pub enum TaskSpec {
+    Benchmark(BenchmarkTaskSpec),
+    BuildOnly,
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkTaskSpec {
+    /// Benchmark CLI arguments replayed into the in-VM task.
     pub args: Vec<String>,
-    /// v10 (0005): build-only mode — provision + build + publish the artifact
-    /// to the cache, then stop (no in-VM task phase). `false` is the
-    /// benchmark shape; `true` is the `0031` warming primitive.
-    pub build_only: bool,
-    /// Optional group-scoped SQLite DB artifact to seed into the results tmpfs
-    /// before the in-VM task starts. Used by v15 clean repetitions; ordinary
-    /// singleton runs leave this unset.
     pub sqlite_seed_key: Option<String>,
-    /// v19: repeat groups calibrate once, then measured runs consume the saved
-    /// stacks-bench baseline id with `--baseline-id`.
     pub shared_baseline_calibration: bool,
     pub baseline_calibration_id: Option<i64>,
-    /// Benchmark repeat identity for fine-grained progress events.
     pub benchmark_run: BenchmarkRunContext,
 }
 
@@ -113,17 +101,15 @@ pub trait Driver: Send + Sync {
     ) -> anyhow::Result<DriverOutcome>;
 
     /// Best-effort, idempotent teardown of every per-job artifact addressed
-    /// purely by `job_id` — the orphan-recovery primitive (roadmap-v5 Phase
-    /// 4B-2): a hard-killed daemon can leave host state behind with no live
-    /// handle. Returns `false` if cleanup couldn't be verified complete, so the
-    /// caller leaves the row `running` to retry on the next boot.
+    /// purely by `job_id`. A hard-killed daemon can leave host state behind
+    /// with no live handle. Returns `false` if cleanup could not be verified,
+    /// so the caller leaves the row `running` to retry on the next boot.
     async fn cleanup_by_job_id(&self, job_id: &str) -> bool;
 
     /// The backend's binary cache, if it runs one — shared as an `Arc` so the
-    /// pin manager re-pins / evicts under the **same** mutex the driver
-    /// publishes under (item 0025, v9 Phase 2). Default `None` for backends
-    /// without a cache; the runner builds its `PinManager` only when this is
-    /// `Some`.
+    /// pin manager re-pins and evicts under the **same** mutex the driver
+    /// publishes under. Default `None` for backends without a cache; the runner
+    /// builds its `PinManager` only when this is `Some`.
     fn binary_cache(&self) -> Option<Arc<BinaryCache>> {
         None
     }

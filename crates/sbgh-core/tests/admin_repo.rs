@@ -13,7 +13,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use sbgh_cli::{
+use sbgh_core::admin::{
     RepoError, allow_repo_root, disable_repo_root, disable_repo_root_by_id, list_repo_roots,
 };
 use sbgh_core::db::{Pool, setup_pg_db};

@@ -2,7 +2,7 @@
 //! Pure-SQL paths — no GitHub API mocking needed (operator types
 //! numeric ids directly into the CLI).
 
-use sbgh_cli::{
+use sbgh_core::admin::{
     PolicyError, add_trigger_policy, allow_source_policy, allow_target_policy,
     disable_source_policy, disable_target_policy, disable_trigger_policy, list_source_policies,
     list_target_policies, list_trigger_policies,

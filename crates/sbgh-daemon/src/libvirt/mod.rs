@@ -17,7 +17,7 @@ pub mod virsh;
 
 #[allow(unused_imports)]
 pub use driver::{
-    BenchmarkOutcome, LibvirtDriver, NoopPhaseListener, OutcomeStatus, PhaseListener,
+    BenchmarkOutcome, LibvirtConfig, LibvirtDriver, NoopPhaseListener, OutcomeStatus, PhaseListener,
 };
 pub use phase::format_elapsed;
 pub use shell::{Shell, SystemShell};

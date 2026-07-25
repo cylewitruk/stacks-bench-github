@@ -1,5 +1,6 @@
 use sbgh_api::Client;
-use sbgh_core::config::HandlerConfig;
+
+use crate::config::HandlerConfig;
 
 /// Handler state.
 ///

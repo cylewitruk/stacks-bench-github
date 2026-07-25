@@ -1,5 +1,4 @@
-//! Fingerprint-keyed local cache of built `stacks-bench` binaries (item
-//! `0025-baseline-binary-cache`, iteration v9).
+//! Fingerprint-keyed local cache of built `stacks-bench` binaries.
 //!
 //! A `stacks-bench` build is ~5–7 min; the binary is deterministic per
 //! `(source commit, build environment)`, so it's cacheable. This module owns
@@ -16,12 +15,8 @@
 //!   **least-recently-used** (pinned entries are never evicted; the budget caps
 //!   the LRU tail).
 //!
-//! Local-only (v9 Phase 1/2). Sharing the cache across a worker fleet (an
-//! S3-backed store keyed by the same fingerprint) is deferred to ride
-//! `0004-worker-fleet`.
-//!
-//! Wiring lands across the v9 phases (driver build-skip, pin policy), so the
-//! module keeps `allow(dead_code)` until every surface is connected.
+//! The cache is local-only. A worker fleet may share the same fingerprint
+//! contract through a remote store, but that is outside this module.
 #![allow(dead_code)]
 
 use std::collections::HashSet;
@@ -29,7 +24,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use sbgh_core::config::DaemonConfig;
+use sbgh_core::config::BinaryCacheConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -87,7 +82,7 @@ impl BuildFingerprint {
 
     /// The build-environment projection — every field except the source
     /// identity (`commit`, `toolchain`). The pin resolver matches a cached
-    /// entry by commit **and** this environment (v9 Phase 2).
+    /// entry by commit **and** this environment.
     pub fn environment(&self) -> CacheEnvironment {
         CacheEnvironment {
             profile: self.profile.clone(),
@@ -106,7 +101,7 @@ impl BuildFingerprint {
 /// by commit **and** this environment, so a golden-image / recipe / protocol
 /// change retires stale same-commit pins instead of keeping them warm forever.
 /// Toolchain is deliberately out: same commit implies the same declared
-/// `rust-toolchain` under the Phase 1 reuse contract.
+/// `rust-toolchain` under the declared-toolchain reuse contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheEnvironment {
     pub profile: String,
@@ -154,25 +149,10 @@ impl CacheEnvironment {
 /// `[artifacts.binary_cache].enabled` is false (the default). Shared by the
 /// driver (publish / get) and the pin resolver (set-pinned / evict) so both
 /// agree on the same on-disk dir + size budget.
-pub fn build_binary_cache(config: &DaemonConfig) -> Option<Arc<BinaryCache>> {
+pub fn build_binary_cache(config: &BinaryCacheConfig) -> Option<Arc<BinaryCache>> {
     config
-        .artifacts
-        .binary_cache
         .enabled
-        .then(|| {
-            Arc::new(BinaryCache::new(
-                config
-                    .artifacts
-                    .binary_cache
-                    .dir
-                    .clone(),
-                config
-                    .artifacts
-                    .binary_cache
-                    .max_size
-                    .as_bytes(),
-            ))
-        })
+        .then(|| Arc::new(BinaryCache::new(config.dir.clone(), config.max_size.as_bytes())))
 }
 
 /// Per-entry metadata, stored alongside the binary as `meta.json`.
@@ -186,8 +166,7 @@ pub struct CacheMeta {
     /// Unix seconds; set at publish, bumped on every hit (drives LRU).
     pub last_used: u64,
     pub created_at: u64,
-    /// Pin-protected from LRU eviction while `true` (Phase 2 sets this from the
-    /// resolved pinned-ref set).
+    /// Pin-protected from LRU eviction while `true`.
     pub pinned: bool,
 }
 
@@ -305,8 +284,8 @@ impl BinaryCache {
 
     /// Re-evaluate the size budget, evicting non-pinned entries LRU until the
     /// store fits. Pinned entries (flagged by [`Self::set_pinned_by_commit`])
-    /// are never evicted. The v9 Phase-2 resolver calls this after re-pinning.
-    /// No-op when already under budget.
+    /// are never evicted. Called after the pin resolver recomputes the pinned
+    /// set. No-op when already under budget.
     pub fn evict_to_budget(&self) {
         let _g = self.lock();
         self.evict_locked(&[]);
@@ -317,7 +296,7 @@ impl BinaryCache {
     /// entry. The pinned set follows the resolved refs (a ref that moved off a
     /// commit un-pins the old binary), and the env guard keeps a pin from
     /// protecting a stale same-commit binary built under a prior image / recipe
-    /// era. The v9 Phase-2 resolver calls this on startup + after each publish.
+    /// era. Called on startup and after each publish.
     pub fn set_pinned_by_commit(&self, commits: &HashSet<String>, env: &CacheEnvironment) {
         let _g = self.lock();
         for meta in self.scan_entries() {
@@ -332,7 +311,7 @@ impl BinaryCache {
     }
 
     /// Whether a built binary for `commit` under `env` is already cached — the
-    /// warming skip-check (item `0031-reusable-build-jobs`). **Repo-agnostic by
+    /// warming skip-check. **Repo-agnostic by
     /// design**: the cache is keyed by `(commit, build env)`, not repo, so a
     /// commit's binary counts as present regardless of which repo / fork
     /// reached it. Same match as [`Self::set_pinned_by_commit`] (commit +
@@ -473,9 +452,8 @@ pub fn legacy_toolchain_channel(toolchain: &str) -> Option<String> {
 
 /// A cheap identity for the golden VM image: `<size>:<mtime_secs>`. The image's
 /// OS / glibc / linker fix the binary's runtime ABI, so a changed image must
-/// invalidate cached binaries. Interim per the v9 spike's open question — an
-/// operator-declared id folding into `measurement_profile` is the eventual
-/// shape; hashing a multi-GB qcow2 every job is too costly.
+/// invalidate cached binaries. Hashing a multi-GB qcow2 for every job is too
+/// costly, so size and mtime provide the current cache-invalidation proxy.
 pub fn image_proxy_id(image_path: &Path) -> std::io::Result<String> {
     let m = std::fs::metadata(image_path)?;
     let mtime = m

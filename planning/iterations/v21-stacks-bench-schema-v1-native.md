@@ -3,15 +3,14 @@
 Retire the compatibility-first result parsing path and make the daemon's
 `stacks-bench --json` integration speak schema-v1 natively (`0050`).
 
-> **Status:** planned - intentionally deferred while v22 implements the
-> currently-needed ad-hoc comparison workflow. Native schema-v1 parsing should
-> still follow once the comparison result/reporting shape has settled.
+> **Status:** parked - intentionally deferred until after v24 establishes the
+> new application and execution boundaries.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0050-stacks-bench-schema-v1-native` | primary | planned |
+| `0050-stacks-bench-schema-v1-native` | primary | parked |
 
 ## Why
 

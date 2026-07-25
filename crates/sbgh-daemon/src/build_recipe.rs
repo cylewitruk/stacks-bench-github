@@ -1,12 +1,11 @@
-//! The build-only task kind (v10 0005 / item 0031 warming).
+//! The build-only cache-warming task.
 //!
 //! Builds the `build_target` binary and publishes it to the cache, then stops —
 //! no in-VM workload, no measurement, no render. Selected for a
 //! `task_kind = build_only` job; the daemon-initiated warming primitive
 //! (`0031`) enqueues these to pre-populate the cache. The artifact build +
-//! publish is the driver's existing path; this recipe just sets
-//! [`TaskSpec::build_only`] so the driver stops after publishing instead of
-//! running the bench phase.
+//! publish is the driver's existing path; this recipe selects
+//! [`TaskSpec::BuildOnly`] so the driver stops after publishing.
 
 use std::sync::Arc;
 
@@ -23,7 +22,7 @@ use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 pub struct BuildOnlyRecipe {
     driver: Arc<dyn Driver>,
     /// The cpuset this job's VM vCPUs are pinned to (its concurrency slot's
-    /// `[runner].cpu_sets` entry), or `None` to float (Phase 5).
+    /// `[runner].cpu_sets` entry), or `None` to float.
     vcpu_cpuset: Option<String>,
 }
 
@@ -60,14 +59,7 @@ impl Recipe for BuildOnlyRecipe {
         sink: &dyn EventSink,
         cancel: &CancellationToken,
     ) -> anyhow::Result<Self::Outcome> {
-        let spec = TaskSpec {
-            args: Vec::new(),
-            build_only: true,
-            sqlite_seed_key: None,
-            shared_baseline_calibration: false,
-            baseline_calibration_id: None,
-            benchmark_run: Default::default(),
-        };
+        let spec = TaskSpec::BuildOnly;
         let placement = Placement {
             vcpu_cpuset: self.vcpu_cpuset.clone(),
         };
@@ -130,7 +122,9 @@ mod tests {
             *self.seen.lock().unwrap() = Some(spec.clone());
             Ok(DriverOutcome {
                 status: self.status.clone(),
-                summary: serde_json::json!({ "build_only": spec.build_only }),
+                summary: serde_json::json!({
+                    "build_only": matches!(spec, TaskSpec::BuildOnly),
+                }),
             })
         }
         async fn cleanup_by_job_id(&self, _job_id: &str) -> bool {
@@ -165,8 +159,7 @@ mod tests {
             .unwrap()
             .clone()
             .expect("recipe ran the driver");
-        assert!(spec.build_only, "build-only recipe sets TaskSpec.build_only");
-        assert!(spec.args.is_empty(), "build-only carries no task args");
+        assert!(matches!(spec, TaskSpec::BuildOnly));
         assert_eq!(outcome.status(), TaskStatus::Completed);
     }
 }

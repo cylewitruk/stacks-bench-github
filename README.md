@@ -77,6 +77,12 @@ trust (a fork into a different org's install) uses raw `--install-id`/`--repo-id
 
 ```bash
 just build   # build the workspace
-just lint    # clippy + rustfmt check
-just test    # run the suite (needs Docker — a shared Postgres is started for DB tests)
+just lint    # docs/registry, unused dependencies, clippy, and pinned rustfmt
+just test    # full suite; starts shared Postgres/MinIO fixtures with Docker
 ```
+
+The pinned toolchain is declared in `rust-toolchain.toml`; local commands and
+CI use the same `just` entry points. `just lint` requires `cargo-machete 0.9.2`
+(CI installs the pinned version). Build and lint do not require Docker.
+`just test` starts the Postgres-backed test tier automatically, and starts
+MinIO only for the S3 integration test.

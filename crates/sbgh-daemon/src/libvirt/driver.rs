@@ -24,17 +24,18 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use async_trait::async_trait;
 use sbgh_core::bench_args::effective_arg_string;
-use sbgh_core::config::DaemonConfig;
+use sbgh_core::config::{LvmConfig, PathsConfig, VmConfig};
 use tokio_util::sync::CancellationToken;
 
-use crate::artifact_store::{artifact_key, build_store_or_local};
+use crate::artifact_store::{ArtifactStore, artifact_key};
 use crate::bench_progress::parse_progress_line;
-use crate::bench_summary::BaselineCalibrationResult;
 use crate::binary_cache::{self, BinaryCache, BuildFingerprint, CacheEnvironment};
 use crate::driver::{
-    BenchmarkRunContext, Driver, DriverOutcome, DriverStatus, Placement, TaskSpec,
+    BenchmarkRunContext, BenchmarkTaskSpec, Driver, DriverOutcome, DriverStatus, Placement,
+    TaskSpec,
 };
 use crate::events::{EventSink, PhaseLabel, ProgressUpdate, WorkflowStep};
+use crate::execution::BaselineCalibrationResult;
 use crate::libvirt::boot::BootDisk;
 use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitCommon};
 use crate::libvirt::domain::{self, DomainSpec};
@@ -71,7 +72,7 @@ const SCCACHE_MOUNT: &str = "/var/cache/sccache";
 /// jobs run against it.
 const SCCACHE_MAX_SIZE: &str = "20G";
 
-// ── Binary-cache build fingerprint constants (item 0025, v9) ──
+// ── Binary-cache build fingerprint constants ──
 // The repo-pinned `[profile.release]` (lto/codegen-units) is commit-determined;
 // these capture the daemon's invariant build invocation + environment
 // dimensions (the rest of the fingerprint — commit, resolved toolchain, golden
@@ -91,7 +92,7 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Assemble the build fingerprint for `commit` (item 0025, v9). Reads
+/// Assemble the build fingerprint for `commit`. Reads
 /// `rust-toolchain.toml` (or legacy `rust-toolchain`) from the **bare git
 /// mirror** (no source-disk mount — the disk is detached after provisioning),
 /// keys by the **declared** toolchain channel (pragmatic reuse, not `rustc -vV`
@@ -267,38 +268,58 @@ struct RunInputs<'a> {
     shared_baseline_calibration: bool,
     baseline_calibration_id: Option<i64>,
     benchmark_run: BenchmarkRunContext,
-    /// v10 (0005): build-only mode — stop after the build VM publishes the
-    /// artifact; skip the bench phase entirely.
+    /// Build-only mode stops after the build VM publishes the artifact and
+    /// skips the bench phase.
     build_only: bool,
 }
 
 pub struct LibvirtDriver {
-    config: Arc<DaemonConfig>,
+    config: Arc<LibvirtConfig>,
     shell: Arc<dyn Shell>,
-    /// Opt-in `stacks-bench` binary cache (item 0025, v9). `None` when
+    artifact_store: Arc<dyn ArtifactStore>,
+    /// Opt-in `stacks-bench` binary cache. `None` when
     /// `[artifacts.binary_cache].enabled` is false (the default), in which case
     /// the build/bench flow is byte-identical to before.
     binary_cache: Option<Arc<BinaryCache>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LibvirtConfig {
+    pub vm: VmConfig,
+    pub paths: PathsConfig,
+    pub lvm: LvmConfig,
+    pub service_user: String,
+    pub default_bench_args: String,
+    pub host_cpus: Option<String>,
+}
+
 impl LibvirtDriver {
-    pub fn new(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Self {
-        let binary_cache = binary_cache::build_binary_cache(&config);
-        Self { config, shell, binary_cache }
+    pub fn new(
+        config: LibvirtConfig,
+        shell: Arc<dyn Shell>,
+        artifact_store: Arc<dyn ArtifactStore>,
+        binary_cache: Option<Arc<BinaryCache>>,
+    ) -> Self {
+        Self {
+            config: Arc::new(config),
+            shell,
+            artifact_store,
+            binary_cache,
+        }
     }
 
     /// Run one libvirt job to a terminal outcome. The shared
     /// provision → build → publish path, then either the bench phase
-    /// (`build_only = false`) or a stop after publish (`build_only = true`,
-    /// v10 0005 — the warming primitive). Forensics + teardown are identical.
+    /// (`build_only = false`) or a stop after publish (`build_only = true`).
+    /// Forensics and teardown are identical.
     pub async fn run_benchmark(
         &self,
         ctx: &TaskContext<'_>,
         spec: &TaskSpec,
         listener: &dyn PhaseListener,
         cancel: &CancellationToken,
-        // Phase 5 CPU pinning: the libvirt cpuset this job's slot owns, or
-        // `None` to float. Threaded down to the domain XML.
+        // The libvirt cpuset this job's slot owns, or `None` to float. Threaded
+        // down to the domain XML.
         vcpu_cpuset: Option<&str>,
     ) -> anyhow::Result<BenchmarkOutcome> {
         let job_id = ctx.job_id.to_string();
@@ -312,17 +333,41 @@ impl LibvirtDriver {
 
         let mut arts = JobArtifacts::default();
         let started = Instant::now();
+        let (
+            bench_args,
+            sqlite_seed_key,
+            shared_baseline_calibration,
+            baseline_calibration_id,
+            benchmark_run,
+            build_only,
+        ) = match spec {
+            TaskSpec::Benchmark(BenchmarkTaskSpec {
+                args,
+                sqlite_seed_key,
+                shared_baseline_calibration,
+                baseline_calibration_id,
+                benchmark_run,
+            }) => (
+                args.as_slice(),
+                sqlite_seed_key.as_deref(),
+                *shared_baseline_calibration,
+                *baseline_calibration_id,
+                *benchmark_run,
+                false,
+            ),
+            TaskSpec::BuildOnly => {
+                (&[][..], None, false, None, BenchmarkRunContext::default(), true)
+            }
+        };
         let inputs = RunInputs {
             repository: ctx.repository,
             commit: ctx.commit,
-            bench_args: &spec.args,
-            sqlite_seed_key: spec
-                .sqlite_seed_key
-                .as_deref(),
-            shared_baseline_calibration: spec.shared_baseline_calibration,
-            baseline_calibration_id: spec.baseline_calibration_id,
-            benchmark_run: spec.benchmark_run,
-            build_only: spec.build_only,
+            bench_args,
+            sqlite_seed_key,
+            shared_baseline_calibration,
+            baseline_calibration_id,
+            benchmark_run,
+            build_only,
         };
 
         // Run the inner pipeline. Any error becomes a Failed outcome with
@@ -348,12 +393,12 @@ impl LibvirtDriver {
             .map(|p| p.label().to_string());
 
         // Archive the per-job artifacts through the configured store (local FS,
-        // or S3 with a local mirror — Phase 2). The summary records each
+        // or S3 with a local mirror). The summary records each
         // artifact's store **key** (`<job_id>/<relative>`, Decision 0002), not a
         // bare path; `put` returns the byte size, or `None` when the VM produced
         // no such file (or, for S3, the local mirror write failed — a failed S3
         // upload is logged but still returns the local size, Decision 0003).
-        let store = build_store_or_local(self.config.as_ref());
+        let store = self.artifact_store.clone();
         let tmpfs = arts.tmpfs.as_ref();
 
         let (sqlite_archived_path, sqlite_size_bytes) =
@@ -435,13 +480,7 @@ impl LibvirtDriver {
         // warning and we proceed with whatever forensics we have.
         let console_log = job_dir.join("console.log");
         if console_log.exists() {
-            let owner = format!(
-                "{u}:{u}",
-                u = self
-                    .config
-                    .server
-                    .service_user
-            );
+            let owner = format!("{u}:{u}", u = self.config.service_user);
             let console_s = console_log
                 .display()
                 .to_string();
@@ -548,7 +587,7 @@ impl LibvirtDriver {
         vcpu_cpuset: Option<&str>,
     ) -> anyhow::Result<FinishReason> {
         // ── one-time provisioning shared by both phases ────────────────
-        // v16: fetch the commit into the bare mirror first (fingerprinting
+        // Fetch the commit into the bare mirror first (fingerprinting
         // reads toolchain files from it), then resolve the binary-cache plan
         // before any source-disk write. A hit can therefore provision a minimal
         // source disk instead of doing a full checkout and chown.
@@ -562,7 +601,7 @@ impl LibvirtDriver {
             .await?;
 
         // ── phase 1: build VM (skipped on a binary-cache hit) ─────────
-        // item 0025 (v9) + v16: if a fingerprint-matched binary is cached, the
+        // If a fingerprint-matched binary is cached, the
         // source disk has already been provisioned with just that binary, so
         // skip the build VM entirely. Gated by
         // `[artifacts.binary_cache].enabled` — disabled (default) always builds.
@@ -605,8 +644,8 @@ impl LibvirtDriver {
                 .await;
         }
 
-        // v10 (0005): a build-only job stops here — there is no bench phase. Its
-        // purpose is the cached artifact, so it succeeds ONLY if the artifact is
+        // A build-only job stops here: there is no bench phase. Its purpose is
+        // the cached artifact, so it succeeds ONLY if the artifact is
         // now in the cache: `reused` (already warm) or freshly `published`.
         // Otherwise fail closed — cache disabled, no binary, or a fingerprint /
         // publish error (a benchmark run keeps caching best-effort; here the
@@ -700,7 +739,7 @@ impl LibvirtDriver {
         git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, inputs.commit).await
     }
 
-    /// Resolve the binary-cache plan before source-disk provisioning (v16).
+    /// Resolve the binary-cache plan before source-disk provisioning.
     /// The caller has already fetched `inputs.commit` into the bare mirror, so
     /// fingerprinting can read `rust-toolchain(.toml)` without a source mount.
     async fn resolve_build_plan(&self, inputs: &RunInputs<'_>) -> BuildPlan {
@@ -745,7 +784,7 @@ impl LibvirtDriver {
             "binary cache: reusing cached stacks-bench binary; skipping the build VM"
         );
         // Drive the reporter with a single opaque `build_cached:<digest>` phase
-        // (item 0025, v9): each surface interprets it — the Slack card marks the
+        // Each surface interprets it: the Slack card marks the
         // Build row done with a "Reused cached build · <digest>" title; the
         // GitHub surface shows "build (cached)". The build VM that normally emits
         // `building`/`build_done` never runs.
@@ -840,10 +879,7 @@ impl LibvirtDriver {
                     job_dir,
                     &source_mount,
                     &binary,
-                    &self
-                        .config
-                        .server
-                        .service_user,
+                    &self.config.service_user,
                 )
                 .await
                 {
@@ -863,10 +899,7 @@ impl LibvirtDriver {
                                 job_dir,
                                 &source_mount,
                                 inputs.commit,
-                                &self
-                                    .config
-                                    .server
-                                    .service_user,
+                                &self.config.service_user,
                             )
                             .await?,
                         );
@@ -882,10 +915,7 @@ impl LibvirtDriver {
                         job_dir,
                         &source_mount,
                         inputs.commit,
-                        &self
-                            .config
-                            .server
-                            .service_user,
+                        &self.config.service_user,
                     )
                     .await?,
                 );
@@ -908,15 +938,12 @@ impl LibvirtDriver {
                 &self.config.paths,
                 job_id,
                 RESULTS_TMPFS_MIB,
-                &self
-                    .config
-                    .server
-                    .service_user,
+                &self.config.service_user,
             )
             .await?,
         );
         if let (Some(seed_key), Some(tmpfs)) = (inputs.sqlite_seed_key, arts.tmpfs.as_ref()) {
-            seed_sqlite_from_store(self.config.as_ref(), seed_key, tmpfs).await?;
+            seed_sqlite_from_store(self.artifact_store.as_ref(), seed_key, tmpfs).await?;
         }
         if let (BuildPlan::CacheHit { binary, .. }, Some(tmpfs)) = (&plan, arts.tmpfs.as_ref()) {
             let _ = std::fs::copy(binary, tmpfs.stacks_bench_binary());
@@ -924,13 +951,8 @@ impl LibvirtDriver {
 
         // Cloud-init: two ISOs, one per phase, distinct instance-ids
         // so cloud-init re-runs user-data on the second boot.
-        let stacks_bench_args = effective_arg_string(
-            inputs.bench_args,
-            &self
-                .config
-                .stacks_bench
-                .default_args,
-        );
+        let stacks_bench_args =
+            effective_arg_string(inputs.bench_args, &self.config.default_bench_args);
         let cidata = CloudInitArtifacts::build(
             self.shell.as_ref(),
             &self.config.paths,
@@ -1031,7 +1053,6 @@ impl LibvirtDriver {
             // are pinned (`[runner].host_cpus`); meaningless otherwise.
             emulator_cpuset: vcpu_cpuset.and(
                 self.config
-                    .runner
                     .host_cpus
                     .as_deref(),
             ),
@@ -1297,8 +1318,8 @@ impl LibvirtDriver {
 
     /// Best-effort, idempotent teardown of every per-job artifact addressed
     /// purely by `job_id` — no live [`JobArtifacts`] handle required. This is
-    /// the orphan-recovery primitive (roadmap-v5 Phase 4B-2): a hard-killed
-    /// daemon or dead reporter can leave a VM plus its disks/mounts behind with
+    /// the orphan-recovery primitive: a hard-killed daemon or dead reporter can
+    /// leave a VM plus its disks/mounts behind with
     /// no driver to run the normal [`teardown`](Self::teardown). Every step is
     /// logged-and-continued, so a missing artifact (already gone, or never
     /// created) never blocks the rest.
@@ -1537,8 +1558,8 @@ async fn archive_optional(
 
 /// Bridges the libvirt driver's `Phase` callbacks to recipe-neutral
 /// [`EventSink`] calls. The `Phase` → [`PhaseLabel`] mapping lives here so the
-/// driver speaks the neutral event surface — roadmap-v8 Phase 1 moved this
-/// adapter *inside* the libvirt driver (it was on the bench recipe), so the
+/// driver speaks the neutral event surface. Keeping this adapter inside the
+/// libvirt driver means the
 /// `Driver` trait takes a backend-neutral `&dyn EventSink`.
 struct SinkAdapter<'a> {
     sink: &'a dyn EventSink,
@@ -1556,13 +1577,13 @@ impl PhaseListener for SinkAdapter<'_> {
         // A just-entered phase → 0 elapsed (matches the prior reporting path,
         // whose prose still reads naturally as "running for 00:00:00").
         //
-        // A phase is a RELIABLE event (roadmap-v5 channel discipline): it must
+        // A phase is a reliable event: it must
         // not be lost. A `SinkClosed` here means the reporter is gone (it
         // panicked) — surfaced loudly below.
         //
-        // TODO(Phase 4 — cancel-safety): *acting* on this (aborting the in-flight
+        // TODO(cancel-safety): acting on this (aborting the in-flight
         // run rather than logging-and-continuing) needs the driver cancellation
-        // path + `cleanup_by_job_id` Phase 4 builds — a dirty drop here would
+        // path plus `cleanup_by_job_id` are complete; a dirty drop here would
         // leak the VM. The `PhaseListener` boundary will grow an abort signal
         // there (`on_phase` returns `()` and the driver has no cancellation path
         // yet). Do not copy this swallow forward without that abort handling.
@@ -1575,7 +1596,7 @@ impl PhaseListener for SinkAdapter<'_> {
             tracing::error!(
                 phase = %phase,
                 "reliable phase event dropped: reporting sink closed (reporter gone) — \
-                 VM-safe abort deferred to Phase 4 cancel-safety (see TODO)",
+                 VM-safe abort deferred until cancel-safety is implemented (see TODO)",
             );
         }
     }
@@ -1594,11 +1615,10 @@ impl PhaseListener for SinkAdapter<'_> {
 }
 
 async fn seed_sqlite_from_store(
-    config: &DaemonConfig,
+    store: &dyn ArtifactStore,
     seed_key: &str,
     tmpfs: &ResultsTmpfs,
 ) -> anyhow::Result<()> {
-    let store = build_store_or_local(config);
     let src = store
         .get(seed_key)
         .await
@@ -1626,9 +1646,9 @@ async fn seed_sqlite_from_store(
 #[async_trait]
 impl Driver for LibvirtDriver {
     /// Bench's `TaskSpec.args` are this run's benchmark CLI args; `Placement`
-    /// carries the Phase-5 cpuset. Wraps the inherent
+    /// carries the placement cpuset. Wraps the inherent
     /// [`run_benchmark`](LibvirtDriver::run_benchmark) (bench specifics still
-    /// live there — the cloud-init split is deferred to roadmap-v6) and adapts
+    /// live there; the cloud-init split remains deferred) and adapts
     /// its `BenchmarkOutcome` into the neutral [`DriverOutcome`].
     async fn run_task(
         &self,
@@ -1676,1221 +1696,4 @@ impl Driver for LibvirtDriver {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use sbgh_core::config::{
-        ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig,
-        PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
-    };
-    use tempfile::TempDir;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::job_source::{ProgressTarget, RunnableJob};
-    use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
-
-    /// A platform-neutral [`TaskContext`] borrowed from a fake job — the
-    /// `run_benchmark` inputs the driver actually reads.
-    fn ctx_of(job: &RunnableJob) -> TaskContext<'_> {
-        TaskContext {
-            job_id: job.id,
-            repository: &job.repository,
-            commit: &job.commit,
-        }
-    }
-
-    // ── binary-cache fingerprint (item 0025, v9) ──
-
-    #[tokio::test]
-    async fn assemble_fingerprint_reads_toolchain_from_the_mirror() {
-        let tmp = TempDir::new().unwrap();
-        let golden = tmp
-            .path()
-            .join("golden.qcow2");
-        std::fs::write(&golden, b"img").unwrap();
-        let shell = RecordingShell::new();
-        shell.reply(PreparedReply::with_stdout("[toolchain]\nchannel = \"1.95.0\"\n"));
-
-        let fp = assemble_fingerprint(
-            &shell,
-            std::path::Path::new("/usr/bin/git"),
-            std::path::Path::new("/var/lib/sbgh/mirror.git"),
-            &golden,
-            "deadbeef",
-        )
-        .await
-        .expect("declared toolchain → Some fingerprint");
-        assert_eq!(fp.commit, "deadbeef");
-        assert_eq!(fp.toolchain, "1.95.0");
-        assert_eq!(fp.target_triple, "x86_64-unknown-linux-gnu");
-
-        // Read from the bare mirror via `git --git-dir … show <sha>:<file>` — no
-        // source-disk mount (the disk is detached after provisioning).
-        let calls = shell.calls();
-        assert!(
-            calls[0]
-                .program
-                .ends_with("git")
-        );
-        assert!(
-            calls[0]
-                .args
-                .iter()
-                .any(|a| a == "--git-dir")
-        );
-        assert!(
-            calls[0]
-                .args
-                .iter()
-                .any(|a| a == "show")
-        );
-        assert!(
-            calls[0]
-                .args
-                .iter()
-                .any(|a| a == "deadbeef:rust-toolchain.toml")
-        );
-    }
-
-    #[tokio::test]
-    async fn assemble_fingerprint_falls_back_to_legacy_toolchain_file() {
-        let tmp = TempDir::new().unwrap();
-        let golden = tmp
-            .path()
-            .join("golden.qcow2");
-        std::fs::write(&golden, b"img").unwrap();
-        let shell = RecordingShell::new();
-        shell.reply(PreparedReply::fail("fatal: path does not exist"));
-        shell.reply(PreparedReply::with_stdout("stable\n"));
-
-        let fp = assemble_fingerprint(
-            &shell,
-            std::path::Path::new("/usr/bin/git"),
-            std::path::Path::new("/var/lib/sbgh/mirror.git"),
-            &golden,
-            "deadbeef",
-        )
-        .await
-        .expect("legacy rust-toolchain → Some fingerprint");
-        assert_eq!(fp.toolchain, "stable");
-
-        let calls = shell.calls();
-        assert!(
-            calls[0]
-                .args
-                .iter()
-                .any(|a| a == "deadbeef:rust-toolchain.toml")
-        );
-        assert!(
-            calls[1]
-                .args
-                .iter()
-                .any(|a| a == "deadbeef:rust-toolchain")
-        );
-    }
-
-    #[tokio::test]
-    async fn assemble_fingerprint_keys_floating_channel_and_none_when_missing() {
-        let tmp = TempDir::new().unwrap();
-        let golden = tmp
-            .path()
-            .join("golden.qcow2");
-        std::fs::write(&golden, b"img").unwrap();
-
-        // A floating channel is keyed as itself (pragmatic reuse, not provenance).
-        let floating = RecordingShell::new();
-        floating.reply(PreparedReply::with_stdout("[toolchain]\nchannel = \"stable\"\n"));
-        let fp = assemble_fingerprint(
-            &floating,
-            std::path::Path::new("/git"),
-            std::path::Path::new("/m"),
-            &golden,
-            "sha",
-        )
-        .await
-        .expect("floating channel still keys");
-        assert_eq!(fp.toolchain, "stable");
-
-        // Both toolchain file probes fail → None.
-        let missing = RecordingShell::new();
-        missing.reply(PreparedReply::fail("fatal: path does not exist"));
-        missing.reply(PreparedReply::fail("fatal: path does not exist"));
-        assert!(
-            assemble_fingerprint(
-                &missing,
-                std::path::Path::new("/git"),
-                std::path::Path::new("/m"),
-                &golden,
-                "sha",
-            )
-            .await
-            .is_none(),
-            "missing toolchain files → None"
-        );
-    }
-
-    #[derive(Default)]
-    struct RecordingListener {
-        phases: std::sync::Mutex<Vec<Phase>>,
-        progresses: std::sync::Mutex<Vec<ProgressUpdate>>,
-    }
-
-    #[async_trait::async_trait]
-    impl PhaseListener for RecordingListener {
-        async fn on_phase(&self, phase: &Phase) {
-            self.phases
-                .lock()
-                .unwrap()
-                .push(phase.clone());
-        }
-
-        async fn on_progress(&self, progress: ProgressUpdate) {
-            self.progresses
-                .lock()
-                .unwrap()
-                .push(progress);
-        }
-    }
-
-    /// Enabled cache + a fingerprint-matched entry: the driver resolves the hit
-    /// before source provisioning, creates a minimal binary-only source disk,
-    /// reports the cached build, and skips the build VM.
-    #[tokio::test]
-    async fn enabled_cache_hit_uses_minimal_source_disk_and_skips_build_vm() {
-        let tmp = TempDir::new().unwrap();
-        let mut cfg = test_config(&tmp);
-        // `image_proxy_id` needs a real golden-image file; enable the cache.
-        std::fs::write(&cfg.vm.golden_image, b"golden").unwrap();
-        let cache_dir = tmp.path().join("bincache");
-        cfg.artifacts
-            .binary_cache
-            .enabled = true;
-        cfg.artifacts.binary_cache.dir = cache_dir.clone();
-
-        // The exact fingerprint the driver will compute for this run, then a
-        // cached binary published under it.
-        let toolchain = "[toolchain]\nchannel = \"1.95.0\"\n";
-        let fp = BuildFingerprint {
-            commit: "abc123def456".into(),
-            toolchain: binary_cache::toolchain_channel(toolchain).unwrap(),
-            profile: BUILD_PROFILE.into(),
-            features: String::new(),
-            rustflags: String::new(),
-            target_triple: BUILD_TARGET_TRIPLE.into(),
-            recipe_version: BUILD_RECIPE_VERSION,
-            image_id: binary_cache::image_proxy_id(&cfg.vm.golden_image).unwrap(),
-            protocol_version: BUILD_PROTOCOL_VERSION.into(),
-        };
-        let cached_bin = tmp.path().join("cached-bin");
-        std::fs::write(&cached_bin, b"CACHED").unwrap();
-        binary_cache::BinaryCache::new(cache_dir.clone(), 1 << 30)
-            .publish(&fp, &cached_bin, 1, false)
-            .unwrap();
-
-        let cfg = Arc::new(cfg);
-        let job = fake_job();
-        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
-        let tmpfs_dir = cfg
-            .paths
-            .results_tmpfs_root
-            .join(job.id.to_string());
-        std::fs::create_dir_all(&tmpfs_dir).unwrap();
-        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 done\n").unwrap();
-
-        // Shell: fetch, `git show` for the fingerprint, minimal source seed,
-        // shared artifacts, bench VM only, teardown.
-        let shell = RecordingShell::new();
-        shell
-            .expect_ok(1) // git fetch_sha
-            .reply(PreparedReply::with_stdout(toolchain)) // git show <sha>:rust-toolchain.toml
-            .expect_ok(1) // qemu-img create
-            .expect_ok(1) // truncate (minimal source)
-            .expect_ok(1) // mkfs.ext4
-            .reply(PreparedReply::with_stdout("/dev/loop9\n")) // losetup --show
-            .expect_ok(1) // mount
-            .expect_ok(1) // chown empty fs to service user
-            .expect_ok(1) // chown seeded binary tree to root
-            .expect_ok(1) // umount
-            .expect_ok(1) // losetup -d
-            .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
-            .expect_ok(1) // lvcreate snapshot
-            .expect_ok(1) // mount tmpfs
-            .expect_ok(1) // cloud-localds (build ISO, optional but still rendered)
-            .expect_ok(1) // cloud-localds (bench ISO)
-            // ── NO build VM lifecycle on a cache hit ──
-            .expect_ok(1) // virsh define (bench)
-            .expect_ok(1) // virsh start (bench)
-            .reply(PreparedReply::with_stdout("shut off\n")) // domstate bench
-            .expect_ok(1) // virsh destroy
-            .expect_ok(1) // virsh undefine
-            .expect_ok(1) // umount tmpfs
-            .expect_ok(1) // lvremove
-            .expect_ok(1); // git update-ref -d
-        let shell = Arc::new(shell);
-
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        let listener = RecordingListener::default();
-        let outcome = driver
-            .run_benchmark(
-                &ctx_of(&job),
-                &task_spec(vec![], false),
-                &listener,
-                &CancellationToken::new(),
-                None,
-            )
-            .await;
-        let outcome = outcome.expect("cache-hit benchmark should run");
-        assert_eq!(outcome.status, OutcomeStatus::Ok);
-
-        // The reporter sees staging, then a cached-build completion.
-        assert_eq!(
-            *listener
-                .phases
-                .lock()
-                .unwrap(),
-            vec![
-                Phase::Other(format!("build_cache_staging:{}", &fp.digest()[..12])),
-                Phase::Other(format!("build_cached:{}", &fp.digest()[..12])),
-                Phase::Done,
-            ]
-        );
-        // It fetched the commit, read the toolchain, ran the minimal seed
-        // sequence, skipped the checkout/chown-heavy path, and never touched a
-        // build VM.
-        let calls = shell.calls();
-        assert!(calls.iter().any(|c| {
-            c.args
-                .iter()
-                .any(|a| a == "abc123def456:rust-toolchain.toml")
-        }));
-        assert!(
-            !calls
-                .iter()
-                .any(|c| c.program.ends_with("git")
-                    && c.args
-                        .iter()
-                        .any(|a| a == "clone" || a == "checkout")),
-            "cache hit must not checkout a source tree"
-        );
-        assert!(calls.iter().any(|c| {
-            c.program.ends_with("losetup")
-                && c.args
-                    .contains(&"-d".to_string())
-        }));
-        assert!(
-            !calls
-                .iter()
-                .any(|c| c.program.ends_with("virsh")
-                    && c.args
-                        .iter()
-                        .any(|a| a.contains("domain.build.xml"))),
-            "no build VM define/start on a cache hit"
-        );
-    }
-
-    #[tokio::test]
-    async fn sqlite_seed_key_copies_group_db_into_results_tmpfs() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = test_config(&tmp);
-        let seed_key =
-            crate::artifact_store::group_artifact_key("group1", "shared/stacks-bench.db");
-        let seed_path = cfg
-            .paths
-            .results_archive_dir
-            .join(&seed_key);
-        std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
-        std::fs::write(&seed_path, b"group sqlite").unwrap();
-
-        let tmpfs = ResultsTmpfs {
-            mount_dir: tmp.path().join("results"),
-            size_mib: 256,
-        };
-        std::fs::create_dir_all(&tmpfs.mount_dir).unwrap();
-
-        seed_sqlite_from_store(&cfg, &seed_key, &tmpfs)
-            .await
-            .unwrap();
-
-        assert_eq!(std::fs::read(tmpfs.sqlite_file()).unwrap(), b"group sqlite");
-    }
-
-    #[test]
-    fn baseline_calibration_id_reads_json_or_handoff_file() {
-        let tmp = TempDir::new().unwrap();
-        let tmpfs = ResultsTmpfs {
-            mount_dir: tmp.path().to_path_buf(),
-            size_mib: 64,
-        };
-        std::fs::write(
-            tmpfs.calibration_json(),
-            br#"{"schema_version":1,"success":true,"result_type":"baseline_calibration","result_version":1,"result":{"calibration_id":12}}"#,
-        )
-        .unwrap();
-        assert_eq!(baseline_calibration_id_from_tmpfs(&tmpfs), Some(12));
-
-        std::fs::remove_file(tmpfs.calibration_json()).unwrap();
-        std::fs::write(tmpfs.baseline_id_file(), "13\n").unwrap();
-        assert_eq!(baseline_calibration_id_from_tmpfs(&tmpfs), Some(13));
-    }
-
-    fn test_config(tmp: &TempDir) -> DaemonConfig {
-        let p = tmp.path();
-        DaemonConfig {
-            server: DaemonServerConfig {
-                database_url: "postgres://unused".into(),
-                service_user: "sbgh".into(),
-            },
-            github: GitHubConfig {
-                client_id: "Iv23litest".into(),
-                api_base_url: "https://api.github.test".into(),
-                private_key_path: PathBuf::from("/dev/null"),
-            },
-            vm: VmConfig {
-                golden_image: p.join("golden.qcow2"),
-                build_vcpus: 4,
-                bench_vcpus: 2,
-                build_memory: sbgh_core::memory::MemorySize::from_gib(16),
-                bench_memory: sbgh_core::memory::MemorySize::from_gib(8),
-                boot_disk_gib: 64,
-                // Big enough that we never reach the timeout in the test.
-                job_timeout_secs: 30,
-                network: "default".into(),
-                // Tight intervals so the test driver doesn't sleep for
-                // multiple seconds between poll iterations.
-                poll_interval_secs: 1,
-                heartbeat_interval_secs: 60,
-            },
-            paths: PathsConfig {
-                jobs_dir: p.join("jobs"),
-                git_mirror: p.join("mirror.git"),
-                results_tmpfs_root: p.join("tmpfs"),
-                results_archive_dir: p.join("archive"),
-                sccache_dir: p.join("sccache"),
-                virsh_binary: "/usr/bin/virsh".into(),
-                sudo_binary: "/usr/bin/sudo".into(),
-                qemu_img_binary: "/usr/bin/qemu-img".into(),
-                cloud_localds_binary: "/usr/bin/cloud-localds".into(),
-                git_binary: "/usr/bin/git".into(),
-            },
-            lvm: LvmConfig {
-                vg_name: "sbgh-vg".into(),
-                thinpool: "thinpool".into(),
-                chainstate_base_prefix: "mainnet-".into(),
-                chainstate_snapshot_size_gib: None,
-            },
-            stacks_bench: StacksBenchConfig { default_args: String::new() },
-            api: ApiConfig {
-                listen: vec!["127.0.0.1:8787".into()],
-                cookie_path: "/tmp/sbgh-test.cookie".into(),
-                ingest_token: None,
-            },
-            // The driver doesn't report; value is irrelevant here.
-            reporting: ReportingConfig {
-                pr_report: PrReport::Both,
-                baseline_report: BaselineReport::Check,
-                noise_cv_pct: None,
-            },
-            runner: RunnerConfig {
-                max_concurrent_jobs: 1,
-                max_clean_repetitions: 5,
-                max_variants: 2,
-                max_comparison_lifecycles: 10,
-                cpu_sets: vec![],
-                host_cpus: None,
-            },
-            artifacts: Default::default(),
-            slack: Default::default(),
-            llm: Default::default(),
-        }
-    }
-
-    fn task_spec(args: Vec<String>, build_only: bool) -> TaskSpec {
-        TaskSpec {
-            args,
-            build_only,
-            sqlite_seed_key: None,
-            shared_baseline_calibration: false,
-            baseline_calibration_id: None,
-            benchmark_run: Default::default(),
-        }
-    }
-
-    fn fake_job() -> RunnableJob {
-        RunnableJob {
-            id: Uuid::new_v4(),
-            benchmark_group_id: Uuid::new_v4(),
-            benchmark_spec_id: Uuid::new_v4(),
-            benchmark_run_index: 0,
-            requested_run_count: 1,
-            group_requested_run_count: 1,
-            group_run_index: 0,
-            baseline_calibration_id: None,
-            group_artifact_prefix: Uuid::new_v4().to_string(),
-            repository: "acme/widgets".into(),
-            commit: "abc123def456".into(),
-            git_ref_display: "PR #42".into(),
-            git_ref_kind: sbgh_core::models::GitRefKind::Branch,
-            installation_id: 7,
-            task_kind: sbgh_core::models::TaskKind::Benchmark,
-            build_target: sbgh_core::models::BuildTarget::StacksBench,
-            workload_key: None,
-            bench_args: vec!["--iters=2".into()],
-            progress: ProgressTarget::PullRequest {
-                pr_number: 42,
-                comment_id: Some(1000),
-                check_run_id: None,
-                check_run_url: None,
-            },
-            claim_token: None,
-        }
-    }
-
-    /// Build a shell that returns canned outputs in the order the driver
-    /// will issue them, all the way through provisioning, both VM
-    /// lifecycles, and teardown. The test pre-writes the phase log
-    /// with both `build_done` and `done` so each poll loop sees its
-    /// success phase on iteration 1; the very next domstate poll
-    /// returns ShutOff (success-poweroff) which we map to PhaseDone.
-    fn happy_path_shell() -> RecordingShell {
-        let shell = RecordingShell::new();
-        shell
-            .expect_ok(1) // git fetch_sha
-            .expect_ok(1) // qemu-img create
-            .expect_ok(1) // truncate (source)
-            .expect_ok(1) // mkfs.ext4
-            .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP --show
-            .expect_ok(1) // mount loop
-            .expect_ok(1) // chown
-            .expect_ok(1) // rmdir lost+found (ext4 leftover, blocks git clone)
-            .expect_ok(1) // git clone --reference
-            .expect_ok(1) // git checkout
-            .expect_ok(1) // umount source
-            .expect_ok(1) // losetup -d
-            .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
-            .expect_ok(1) // lvcreate snapshot
-            .expect_ok(1) // mount tmpfs
-            // Two cloud-localds calls — one per cidata ISO (build, bench).
-            .expect_ok(1) // cloud-localds (build)
-            .expect_ok(1) // cloud-localds (bench)
-            // ── build VM lifecycle ──────────────────────────────────
-            .expect_ok(1) // virsh define (build)
-            .expect_ok(1) // virsh start (build)
-            .reply(PreparedReply::with_stdout("shut off\n")) // virsh domstate (build poll, ShutOff after seeing BuildDone)
-            // ── bench VM lifecycle ──────────────────────────────────
-            .expect_ok(1) // virsh define (bench, replaces inactive build def)
-            .expect_ok(1) // virsh start (bench)
-            .reply(PreparedReply::with_stdout("shut off\n")) // virsh domstate (bench poll, ShutOff after seeing Done)
-            // ── teardown ────────────────────────────────────────────
-            .expect_ok(1) // virsh destroy
-            .expect_ok(1) // virsh undefine
-            .expect_ok(1) // umount tmpfs
-            .expect_ok(1) // lvremove
-            .expect_ok(1); // git update-ref -d (prune)
-        shell
-    }
-
-    /// Like [`happy_path_shell`] but for a **build-only** run: the bench VM
-    /// lifecycle is absent — the driver stops after the build VM publishes.
-    fn build_only_shell() -> RecordingShell {
-        let shell = RecordingShell::new();
-        shell
-            .expect_ok(1) // git fetch_sha
-            .expect_ok(1) // qemu-img create
-            .expect_ok(1) // truncate (source)
-            .expect_ok(1) // mkfs.ext4
-            .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP --show
-            .expect_ok(1) // mount loop
-            .expect_ok(1) // chown
-            .expect_ok(1) // rmdir lost+found
-            .expect_ok(1) // git clone --reference
-            .expect_ok(1) // git checkout
-            .expect_ok(1) // umount source
-            .expect_ok(1) // losetup -d
-            .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
-            .expect_ok(1) // lvcreate snapshot
-            .expect_ok(1) // mount tmpfs
-            // Both cidata ISOs are still provisioned upfront (provision is shared).
-            .expect_ok(1) // cloud-localds (build)
-            .expect_ok(1) // cloud-localds (bench)
-            // ── build VM lifecycle ──────────────────────────────────
-            .expect_ok(1) // virsh define (build)
-            .expect_ok(1) // virsh start (build)
-            .reply(PreparedReply::with_stdout("shut off\n")) // virsh domstate (build poll, ShutOff after BuildDone)
-            // ── NO bench VM lifecycle — build-only stops after publish ──
-            // ── teardown ────────────────────────────────────────────
-            .expect_ok(1) // virsh destroy
-            .expect_ok(1) // virsh undefine
-            .expect_ok(1) // umount tmpfs
-            .expect_ok(1) // lvremove
-            .expect_ok(1); // git update-ref -d (prune)
-        shell
-    }
-
-    /// v10 (0005): a build-only run goes provision → build → stop — the bench
-    /// VM lifecycle is skipped entirely. And (M1, Codex) because its
-    /// purpose is the cached artifact, with the binary cache disabled (the
-    /// default test config) it **fails closed** instead of reporting a
-    /// hollow success — while still never touching the bench VM.
-    #[tokio::test]
-    async fn build_only_skips_bench_and_fails_closed_without_cache() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job = fake_job();
-
-        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
-        let tmpfs_dir = cfg
-            .paths
-            .results_tmpfs_root
-            .join(job.id.to_string());
-        std::fs::create_dir_all(&tmpfs_dir).unwrap();
-        // Build-only: only the build VM runs, so seed `build_done` (no `done`).
-        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 build_done\n").unwrap();
-
-        let shell = Arc::new(build_only_shell());
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        let outcome = driver
-            .run_benchmark(
-                &ctx_of(&job),
-                &task_spec(vec![], true), // build_only
-                &NoopPhaseListener,
-                &CancellationToken::new(),
-                None,
-            )
-            .await
-            .expect("driver returns Ok even when the run fails");
-
-        // M1: the build ran but nothing was cached (cache disabled) → fail closed
-        // rather than a hollow "build-only succeeded".
-        match outcome.status {
-            OutcomeStatus::Failed(ref m) => {
-                assert!(m.contains("no cached artifact"), "fail-closed reason: {m}")
-            }
-            other => panic!("expected fail-closed Failed, got {other:?}"),
-        }
-        // The build VM still ran (last phase = build) and no bench measurement
-        // was produced.
-        assert_eq!(outcome.summary["last_phase"], "build_done");
-        assert!(
-            outcome.summary["run_json_archived_path"].is_null(),
-            "build-only produces no run.json",
-        );
-
-        // The command sequence proves the bench VM lifecycle is absent.
-        let programs: Vec<String> = shell
-            .calls()
-            .iter()
-            .map(|c| {
-                std::path::Path::new(&c.program)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        let expected = [
-            "git",
-            "qemu-img",
-            "truncate",
-            "mkfs.ext4",
-            "losetup",
-            "mount",
-            "chown",
-            "rmdir",
-            "git",
-            "git",
-            "umount",
-            "losetup",
-            "lvs",
-            "lvcreate",
-            "mount",
-            "cloud-localds", // build ISO
-            "cloud-localds", // bench ISO (still provisioned)
-            "virsh",         // define (build)
-            "virsh",         // start (build)
-            "virsh",         // domstate poll → ShutOff after BuildDone
-            // no bench define/start/poll
-            "virsh",    // destroy
-            "virsh",    // undefine
-            "umount",   // tmpfs
-            "lvremove", // chainstate
-            "git",      // mirror prune
-        ];
-        assert_eq!(programs, expected, "build-only must skip the bench VM lifecycle");
-    }
-
-    #[tokio::test]
-    async fn end_to_end_happy_path_with_recording_shell() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job = fake_job();
-
-        // Pre-create the bare mirror so git_mirror::ensure() is a no-op,
-        // and pre-create the tmpfs mount dir + write a `.phase-log`
-        // entry of `done` so the poll loop exits on its very first
-        // iteration (the recording shell can't actually mount the tmpfs).
-        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
-        let tmpfs_dir = cfg
-            .paths
-            .results_tmpfs_root
-            .join(job.id.to_string());
-        std::fs::create_dir_all(&tmpfs_dir).unwrap();
-        // Two-phase happy path: build VM writes `build_done`, then bench
-        // VM writes `done`. Both pre-seeded so each phase's poll loop
-        // observes its success phase on the first read.
-        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 build_done\n1700000060 done\n")
-            .unwrap();
-        std::fs::write(
-            tmpfs_dir.join("run.progress.jsonl"),
-            br#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"replay","progress":42,"total":100,"message":"Replaying measured entries"}}"#,
-        )
-        .unwrap();
-
-        let shell = Arc::new(happy_path_shell());
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        let listener = RecordingListener::default();
-        let outcome = driver
-            .run_benchmark(
-                &ctx_of(&job),
-                &task_spec(job.bench_args.clone(), false),
-                &listener,
-                &CancellationToken::new(),
-                None,
-            )
-            .await
-            .expect("driver should return Ok even on VM-side failures");
-
-        // Outcome status + key summary fields.
-        assert_eq!(outcome.status, OutcomeStatus::Ok);
-        assert_eq!(outcome.summary["finish_reason"], "phase_done");
-        assert_eq!(outcome.summary["last_phase"], "done");
-        assert_eq!(outcome.summary["head_sha"], "abc123def456");
-        assert_eq!(outcome.summary["repository"], "acme/widgets");
-        assert_eq!(
-            outcome.summary["run_progress_archived_path"]
-                .as_str()
-                .unwrap(),
-            format!("{}/{}", job.id, forensics::RUN_PROGRESS_JSONL_RELATIVE)
-        );
-        assert_eq!(
-            std::fs::read_to_string(
-                cfg.paths
-                    .results_archive_dir
-                    .join(
-                        outcome.summary["run_progress_archived_path"]
-                            .as_str()
-                            .unwrap()
-                    )
-            )
-            .unwrap(),
-            r#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"replay","progress":42,"total":100,"message":"Replaying measured entries"}}"#
-        );
-        assert_eq!(
-            *listener
-                .progresses
-                .lock()
-                .unwrap(),
-            vec![ProgressUpdate {
-                workflow_step: WorkflowStep::Run,
-                run_index: 0,
-                requested_run_count: 1,
-                phase: "replay".into(),
-                progress: 42,
-                total: Some(100),
-                message: Some("Replaying measured entries".into()),
-            }]
-        );
-
-        // Command sequence: assert the exact shell program names in order,
-        // skipping the `program` -> basename comparison detail.
-        let calls = shell.calls();
-        let programs: Vec<String> = calls
-            .iter()
-            .map(|c| {
-                std::path::Path::new(&c.program)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        let expected = [
-            "git",           // fetch_sha
-            "qemu-img",      // boot create
-            "truncate",      // source: sparse file
-            "mkfs.ext4",     // source: format
-            "losetup",       // source: attach loop
-            "mount",         // source: mount loop
-            "chown",         // source: chown to service user
-            "rmdir",         // source: drop ext4 lost+found
-            "git",           // source: clone --reference
-            "git",           // source: checkout sha
-            "umount",        // source: unmount
-            "losetup",       // source: detach loop
-            "lvs",           // chainstate: pick base
-            "lvcreate",      // chainstate: snapshot
-            "mount",         // tmpfs mount
-            "cloud-localds", // cidata ISO (build)
-            "cloud-localds", // cidata ISO (bench)
-            // build phase
-            "virsh", // define (build)
-            "virsh", // start (build)
-            "virsh", // domstate poll → ShutOff after BuildDone
-            // bench phase — same domain redefined with new memory + cidata
-            "virsh", // define (bench)
-            "virsh", // start (bench)
-            "virsh", // domstate poll → ShutOff after Done
-            // teardown
-            "virsh",    // destroy
-            "virsh",    // undefine
-            "umount",   // tmpfs unmount
-            "lvremove", // chainstate teardown
-            "git",      // mirror prune
-        ];
-        assert_eq!(programs, expected, "command order mismatch");
-
-        // Privileged calls: anything LVM, mount/umount, mkfs, losetup, chown, virsh.
-        for (i, c) in calls.iter().enumerate() {
-            let needs_priv = matches!(
-                programs[i].as_str(),
-                "lvs"
-                    | "lvcreate"
-                    | "lvremove"
-                    | "mkfs.ext4"
-                    | "losetup"
-                    | "mount"
-                    | "umount"
-                    | "chown"
-                    | "virsh"
-            );
-            assert_eq!(
-                c.privileged, needs_priv,
-                "privilege mismatch at index {i} ({})",
-                programs[i]
-            );
-        }
-
-        // Per-job dir must be gone after teardown.
-        assert!(
-            !cfg.paths
-                .jobs_dir
-                .join(job.id.to_string())
-                .exists()
-        );
-    }
-
-    #[tokio::test]
-    async fn vm_shutoff_without_phase_done_is_failure() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job = fake_job();
-
-        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
-        let tmpfs_dir = cfg
-            .paths
-            .results_tmpfs_root
-            .join(job.id.to_string());
-        std::fs::create_dir_all(&tmpfs_dir).unwrap();
-        // Note: no .phase-log pre-written. The poll loop finds an empty
-        // journal, then queries virsh domstate, which we'll return as
-        // "shut off". This simulates a VM that crashed before writing
-        // any phase entries.
-
-        let shell = Arc::new(RecordingShell::new());
-        shell
-            .expect_ok(1) // git fetch_sha
-            .expect_ok(1) // qemu-img create
-            .expect_ok(1) // truncate (source)
-            .expect_ok(1) // mkfs.ext4
-            .reply(PreparedReply::with_stdout("/dev/loop42\n")) // losetup -fP --show
-            .expect_ok(1) // mount loop
-            .expect_ok(1) // chown
-            .expect_ok(1) // rmdir lost+found (ext4 leftover, blocks git clone)
-            .expect_ok(1) // git clone --reference
-            .expect_ok(1) // git checkout
-            .expect_ok(1) // umount source
-            .expect_ok(1) // losetup -d
-            .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
-            .expect_ok(1) // lvcreate snapshot
-            .expect_ok(1) // mount tmpfs
-            .expect_ok(1) // cloud-localds
-            .expect_ok(1) // virsh define
-            .expect_ok(1) // virsh start
-            // First poll: phase file absent → falls through to domstate.
-            .reply(PreparedReply::with_stdout("shut off\n")) // virsh domstate
-            // Teardown
-            .expect_ok(1) // virsh destroy
-            .expect_ok(1) // virsh undefine
-            .expect_ok(1) // umount tmpfs
-            .expect_ok(1) // lvremove
-            .expect_ok(1); // git prune
-
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        let outcome = driver
-            .run_benchmark(
-                &ctx_of(&job),
-                &task_spec(job.bench_args.clone(), false),
-                &NoopPhaseListener,
-                &CancellationToken::new(),
-                None,
-            )
-            .await
-            .unwrap();
-
-        match &outcome.status {
-            OutcomeStatus::Failed(msg) => {
-                assert!(msg.contains("powered off"), "got: {msg}");
-                assert!(msg.contains("last_phase=<none>"), "got: {msg}");
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
-        assert_eq!(outcome.summary["finish_reason"], "shut_off");
-        assert!(outcome.summary["last_phase"].is_null());
-    }
-
-    #[tokio::test]
-    async fn vm_phase_error_returns_failed_outcome_with_forensics() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job = fake_job();
-
-        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
-        let tmpfs_dir = cfg
-            .paths
-            .results_tmpfs_root
-            .join(job.id.to_string());
-        std::fs::create_dir_all(&tmpfs_dir).unwrap();
-        // Phase=error → driver should classify the outcome as Failed but
-        // still go through cleanup + return Ok.
-        std::fs::write(tmpfs_dir.join(".phase-log"), b"1700000000 error\n").unwrap();
-        // Drop a small console.log into the job dir so we can verify
-        // the tail makes it into the summary.
-        let job_dir = cfg
-            .paths
-            .jobs_dir
-            .join(job.id.to_string());
-        std::fs::create_dir_all(&job_dir).unwrap();
-        std::fs::write(job_dir.join("console.log"), b"kernel panic at 0x...").unwrap();
-
-        let shell = Arc::new(happy_path_shell());
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        let outcome = driver
-            .run_benchmark(
-                &ctx_of(&job),
-                &task_spec(job.bench_args.clone(), false),
-                &NoopPhaseListener,
-                &CancellationToken::new(),
-                None,
-            )
-            .await
-            .unwrap();
-
-        match outcome.status {
-            OutcomeStatus::Failed(msg) => assert!(msg.contains("phase=error"), "got: {msg}"),
-            other => panic!("expected Failed, got {other:?}"),
-        }
-        assert_eq!(outcome.summary["finish_reason"], "phase_error");
-        assert_eq!(outcome.summary["last_phase"], "error");
-        assert_eq!(
-            outcome.summary["console_tail"]
-                .as_str()
-                .unwrap(),
-            "kernel panic at 0x..."
-        );
-    }
-
-    /// Cancellation is honored at the poll loop (not mid-provision): a
-    /// pre-cancelled token lets provisioning finish atomically, then the poll
-    /// loop returns `cancelled` and the **normal teardown** (with handles —
-    /// including the source loop device) runs.
-    #[tokio::test]
-    async fn cancellation_breaks_at_poll_loop_and_tears_down() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job = fake_job();
-        std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
-        std::fs::create_dir_all(
-            cfg.paths
-                .results_tmpfs_root
-                .join(job.id.to_string()),
-        )
-        .unwrap();
-
-        let shell = Arc::new(happy_path_shell());
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        let cancel = CancellationToken::new();
-        cancel.cancel(); // pre-cancelled → the poll loop's top check fires first
-
-        let outcome = driver
-            .run_benchmark(
-                &ctx_of(&job),
-                &task_spec(job.bench_args.clone(), false),
-                &NoopPhaseListener,
-                &cancel,
-                None,
-            )
-            .await
-            .expect("driver returns Ok");
-
-        assert_eq!(
-            outcome
-                .summary
-                .get("finish_reason")
-                .and_then(|v| v.as_str()),
-            Some("cancelled"),
-            "the run ended via the poll-loop cancellation",
-        );
-        let calls = shell.calls();
-        let issued = |prog: &str, arg: &str| {
-            calls.iter().any(|c| {
-                c.program.ends_with(prog)
-                    && c.args
-                        .iter()
-                        .any(|a| a == arg)
-            })
-        };
-        // The exact High-finding regression: provisioning ran **atomically** —
-        // the source loop device was detached (`losetup -d`) before cancel was
-        // ever observed, so it can't leak.
-        assert!(
-            issued("losetup", "-d"),
-            "provision completed (source loop device detached) before cancellation",
-        );
-        // And the normal teardown ran (destroyed the running domain by name).
-        assert!(issued("virsh", "destroy"), "teardown destroyed the domain on cancel");
-    }
-
-    /// Handle-less orphan cleanup (Phase 4B-2): from a job id alone,
-    /// `cleanup_by_job_id` must destroy/undefine the domain, unmount the
-    /// results tmpfs AND the source mount, find+detach the dynamically-named
-    /// loop device via `losetup -j`, lvremove the chainstate snapshot, prune
-    /// the git ref, and remove the job dir — in that order, best-effort.
-    #[tokio::test]
-    async fn cleanup_by_job_id_reconstructs_full_teardown_from_id() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job_id = "orphan-123";
-
-        // A leftover job dir (with the source.raw backing file) + tmpfs dir,
-        // as a crashed daemon would leave them.
-        let job_dir = cfg
-            .paths
-            .jobs_dir
-            .join(job_id);
-        std::fs::create_dir_all(&job_dir).unwrap();
-        std::fs::write(job_dir.join("source.raw"), b"raw").unwrap();
-        std::fs::create_dir_all(
-            cfg.paths
-                .results_tmpfs_root
-                .join(job_id),
-        )
-        .unwrap();
-
-        // Canned replies in the exact order cleanup issues them. `losetup -j`
-        // reports one association so a `losetup -d` must follow.
-        let shell = Arc::new(RecordingShell::new());
-        shell
-            .expect_ok(1) // virsh destroy
-            .expect_ok(1) // virsh undefine
-            .expect_ok(1) // umount results tmpfs
-            .expect_ok(1) // umount source.mnt
-            .reply(PreparedReply::with_stdout(
-                "/dev/loop42: [2049]:7 (/var/lib/sbgh/jobs/orphan-123/source.raw)\n",
-            )) // losetup -j
-            .expect_ok(1) // losetup -d /dev/loop42
-            .expect_ok(1) // lvremove
-            .expect_ok(1); // git update-ref -d (prune)
-
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        driver
-            .cleanup_by_job_id(job_id)
-            .await;
-
-        let calls = shell.calls();
-        let prog = |i: usize| {
-            std::path::Path::new(&calls[i].program)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        };
-        let programs: Vec<String> = (0..calls.len())
-            .map(prog)
-            .collect();
-        assert_eq!(
-            programs,
-            [
-                "virsh",    // destroy
-                "virsh",    // undefine
-                "umount",   // results tmpfs
-                "umount",   // source.mnt
-                "losetup",  // -j (find loop)
-                "losetup",  // -d (detach)
-                "lvremove", // chainstate snapshot
-                "git",      // ref prune
-            ],
-            "cleanup command order",
-        );
-        // The detach targeted the exact device `losetup -j` reported.
-        assert!(
-            calls[5]
-                .args
-                .contains(&"-d".to_string())
-                && calls[5]
-                    .args
-                    .contains(&"/dev/loop42".to_string()),
-            "losetup -d must detach the device losetup -j surfaced",
-        );
-        // lvremove targets the job-id-named snapshot.
-        assert!(
-            calls[6]
-                .args
-                .iter()
-                .any(|a| a == "sbgh-vg/sbgh-orphan-123-chainstate"),
-            "lvremove must target the per-job snapshot",
-        );
-        // The job dir (and its source.raw) is gone.
-        assert!(!job_dir.exists(), "job dir removed");
-    }
-
-    /// `losetup -j` with no association (the source disk was already torn down,
-    /// or never provisioned) must NOT issue a `losetup -d`, and cleanup still
-    /// completes the rest. Proves the no-leak path is also the no-spurious-op
-    /// path.
-    #[tokio::test]
-    async fn cleanup_by_job_id_skips_loop_detach_when_none_attached() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job_id = "orphan-empty";
-
-        let shell = Arc::new(RecordingShell::new());
-        shell
-            .expect_ok(1) // virsh destroy
-            .expect_ok(1) // virsh undefine
-            .expect_ok(1) // umount results tmpfs
-            .expect_ok(1) // umount source.mnt
-            .reply(PreparedReply::with_stdout("")) // losetup -j → nothing attached
-            .expect_ok(1) // lvremove
-            .expect_ok(1); // git update-ref -d (prune)
-
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        driver
-            .cleanup_by_job_id(job_id)
-            .await;
-
-        let calls = shell.calls();
-        let detaches = calls
-            .iter()
-            .filter(|c| {
-                c.program.ends_with("losetup")
-                    && c.args
-                        .contains(&"-d".to_string())
-            })
-            .count();
-        assert_eq!(detaches, 0, "no loop attached → no losetup -d");
-        // lvremove + prune still ran after the (empty) loop query.
-        assert!(
-            calls.iter().any(|c| c
-                .program
-                .ends_with("lvremove")),
-            "cleanup continues past the empty loop query",
-        );
-    }
-
-    /// Codex 4B-2 Medium: when the source loop device can't be detached,
-    /// cleanup must PRESERVE the job dir (so `source.raw` — the only handle to
-    /// re-find the loop — survives) and report incomplete (`false`), so the
-    /// caller leaves the row `running` for retry instead of failing it and
-    /// stranding the leak.
-    #[tokio::test]
-    async fn cleanup_by_job_id_preserves_backing_file_when_loop_detach_fails() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job_id = "orphan-stuck-loop";
-
-        let job_dir = cfg
-            .paths
-            .jobs_dir
-            .join(job_id);
-        std::fs::create_dir_all(&job_dir).unwrap();
-        std::fs::write(job_dir.join("source.raw"), b"raw").unwrap();
-
-        let shell = Arc::new(RecordingShell::new());
-        shell
-            .expect_ok(1) // virsh destroy
-            .expect_ok(1) // virsh undefine
-            .expect_ok(1) // umount tmpfs
-            .expect_ok(1) // umount source.mnt
-            .reply(PreparedReply::with_stdout(
-                "/dev/loop42: [2049]:7 (/var/lib/sbgh/jobs/orphan-stuck-loop/source.raw)\n",
-            )) // losetup -j
-            .reply(PreparedReply::fail("losetup: cannot detach: device or resource busy")) // -d fails
-            .expect_ok(1) // lvremove
-            .expect_ok(1); // git prune
-
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        let clean = driver
-            .cleanup_by_job_id(job_id)
-            .await;
-
-        assert!(!clean, "a failed loop detach must report incomplete cleanup");
-        assert!(
-            job_dir
-                .join("source.raw")
-                .exists(),
-            "source.raw must survive so the next recovery can re-find the loop",
-        );
-        assert!(job_dir.exists(), "job dir preserved on incomplete cleanup");
-    }
-
-    /// Codex 4B-2 re-review Medium: a **non-zero** `losetup -j` (a genuine
-    /// query failure, not a missing-file no-op) must NOT be read as "all
-    /// clear" just because stdout is empty — we can't enumerate, so we
-    /// can't safely delete `source.raw`. Cleanup must preserve the backing
-    /// file, issue no blind `losetup -d`, and report incomplete.
-    #[tokio::test]
-    async fn cleanup_by_job_id_preserves_backing_file_when_losetup_query_fails() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = Arc::new(test_config(&tmp));
-        let job_id = "orphan-query-fail";
-
-        let job_dir = cfg
-            .paths
-            .jobs_dir
-            .join(job_id);
-        std::fs::create_dir_all(&job_dir).unwrap();
-        std::fs::write(job_dir.join("source.raw"), b"raw").unwrap();
-
-        let shell = Arc::new(RecordingShell::new());
-        shell
-            .expect_ok(1) // virsh destroy
-            .expect_ok(1) // virsh undefine
-            .expect_ok(1) // umount tmpfs
-            .expect_ok(1) // umount source.mnt
-            .reply(PreparedReply::fail("losetup: cannot read /dev: permission denied")) // -j non-zero, empty stdout
-            .expect_ok(1) // lvremove
-            .expect_ok(1); // git prune
-
-        let driver = LibvirtDriver::new(cfg.clone(), shell.clone());
-        let clean = driver
-            .cleanup_by_job_id(job_id)
-            .await;
-
-        assert!(!clean, "a non-zero losetup -j must report incomplete cleanup");
-        let calls = shell.calls();
-        assert!(
-            !calls.iter().any(|c| {
-                c.program.ends_with("losetup")
-                    && c.args
-                        .contains(&"-d".to_string())
-            }),
-            "must not blindly detach when the query itself failed",
-        );
-        assert!(
-            job_dir
-                .join("source.raw")
-                .exists(),
-            "source.raw preserved when the loop query fails",
-        );
-    }
-}
+mod tests;

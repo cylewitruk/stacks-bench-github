@@ -19,21 +19,7 @@ use sbgh_core::db::{
 use sbgh_core::github::RepoRef;
 use sbgh_core::github::test_support::FakeGitHub;
 use sbgh_core::models::{GithubAccountType, WebhookOutcome, WebhookStatus};
-
-// Pull in the daemon's webhook_processor module via path include
-// (daemon is a bin-only crate so its modules aren't normally
-// reachable from tests). Same pattern the handler integration tests
-// use for routes/mod.rs.
-//
-// allow(dead_code): the e2e tests exercise process_one + the router
-// builder but not run() or NoopClassifier; from this test binary's POV
-// some symbols are dead, but they're real production code in the main
-// binary.
-#[path = "../src/webhook_processor.rs"]
-#[allow(dead_code)]
-mod webhook_processor;
-
-use webhook_processor::{
+use sbgh_daemon::{
     BasicClassifier, CreateHandler, InstallationHandler, InstallationRepositoriesHandler,
     IssueCommentHandler, ProcessorConfig, PullRequestHandler, PushHandler, WebhookProcessor,
 };

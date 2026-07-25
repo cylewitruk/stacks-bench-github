@@ -5,9 +5,10 @@ fresh or ad-hoc chainstates: reuse provenance-checked canonical block/tx index
 facts from Postgres instead of rediscovering millions of historical
 blocks/transactions.
 
-> **Status:** in_progress - planning complete; implementation not started.
+> **Status:** parked - planning is complete and implementation has not started.
+> Revisit after v24 establishes the new application and execution boundaries.
 >
-> v22 remains in progress for comparison validation, but host testing exposed a
+> v22 remains parked, but host testing exposed a
 > separate blocker: older tx/range workloads on fresh ad-hoc chainstates can
 > spend over an hour indexing before measurement. This iteration addresses that
 > first-run cost without changing benchmark semantics.
@@ -21,7 +22,7 @@ blocks/transactions.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0026-central-block-index-cache` | primary | in_progress |
+| `0026-central-block-index-cache` | primary | parked |
 
 ## Why
 

@@ -1,21 +1,10 @@
 //! Configuration.
 //!
-//! The handler and the daemon hold different secrets and so are
-//! deliberately given separate config schemas:
-//!
-//! - [`HandlerConfig`] — webhook-facing service. Only the HMAC secret and the
-//!   daemon `/api` URL + ingest token. **No GitHub App credentials, no DB
-//!   access, no authorization allowlist** (the daemon owns authorization).
-//! - [`DaemonConfig`] — host-side benchmark runner. Holds the App private key,
-//!   libvirt/LVM knobs, and everything required to run a job.
-//!
-//! Each binary loads its own type from its own TOML file. They never share a
-//! config dir on disk — see [`HANDLER_DEFAULT_CONFIG_PATH`] /
-//! [`DAEMON_DEFAULT_CONFIG_PATH`].
+//! Configuration for the host-side daemon.
 //!
 //! Loading precedence (lowest → highest):
 //!   1. compiled-in defaults
-//!   2. TOML config file (see [`HandlerConfig::load`] / [`DaemonConfig::load`])
+//!   2. TOML config file (see [`DaemonConfig::load`])
 //!   3. environment variables (always win)
 
 use std::env;
@@ -26,142 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::memory::MemorySize;
 use crate::{Error, Result};
 
-/// Default on-disk path for the handler's TOML config. Bind-mounted into the
-/// container at the same path so file refs work in both contexts.
-pub const HANDLER_DEFAULT_CONFIG_PATH: &str = "/etc/sbgh/handler/config.toml";
 /// Default on-disk path for the daemon's TOML config.
 pub const DAEMON_DEFAULT_CONFIG_PATH: &str = "/etc/sbgh/daemon/config.toml";
 
-const HANDLER_HOME_RELATIVE: &str = ".config/sbgh/handler/config.toml";
 const DAEMON_HOME_RELATIVE: &str = ".config/sbgh/daemon/config.toml";
-
-// ─────────────────────────── Shared subtypes ───────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
-    pub bind_addr: String,
-}
-
-// ─────────────────────────── HandlerConfig ───────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandlerConfig {
-    pub server: ServerConfig,
-    pub webhook: WebhookConfig,
-    pub api: HandlerApiConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookConfig {
-    /// HMAC-SHA256 secret used to verify inbound webhook signatures. The
-    /// handler holds nothing else GitHub-related — no App ID, no private
-    /// key — so a compromised handler cannot impersonate the App.
-    pub secret: String,
-}
-
-/// How the handler reaches the daemon `/api` to submit verified
-/// deliveries. Replaces the handler's former direct DB access.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandlerApiConfig {
-    /// Base URL of the daemon `/api` (e.g.
-    /// `http://host.docker.internal:8787`). From `[api].url` or
-    /// `SBGH_API_URL`.
-    pub url: String,
-    /// Shared static token presented for the `ingest` scope — must match
-    /// the daemon's `SBGH_API_INGEST_TOKEN`. **Env-only**
-    /// (`SBGH_API_INGEST_TOKEN`), never read from the TOML, so the secret
-    /// doesn't live in the bind-mounted config file.
-    pub ingest_token: String,
-}
-
-impl HandlerConfig {
-    pub fn load() -> Result<Self> {
-        let path = resolve_config_path(HANDLER_DEFAULT_CONFIG_PATH, HANDLER_HOME_RELATIVE);
-        Self::load_layered(path.as_deref())
-    }
-
-    pub fn load_layered(file: Option<&std::path::Path>) -> Result<Self> {
-        let mut raw = RawHandler::default();
-        if let Some(p) = file
-            && p.exists()
-        {
-            let body = std::fs::read_to_string(p)?;
-            let from_file: RawHandler = toml::from_str(&body)
-                .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display())))?;
-            raw.merge(from_file);
-        }
-        raw.apply_env();
-        raw.into_config()
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawHandler {
-    server: RawServer,
-    webhook: RawWebhook,
-    api: RawHandlerApi,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawServer {
-    bind_addr: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawWebhook {
-    secret: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawHandlerApi {
-    url: Option<String>,
-    /// **Env-only** (`SBGH_API_INGEST_TOKEN`); `deny_unknown_fields` makes
-    /// an `ingest_token` key in `[api]` a hard error, keeping the secret
-    /// out of the bind-mounted TOML.
-    #[serde(skip)]
-    ingest_token: Option<String>,
-}
-
-impl RawHandler {
-    fn merge(&mut self, other: RawHandler) {
-        merge_opt(&mut self.server.bind_addr, other.server.bind_addr);
-        merge_opt(&mut self.webhook.secret, other.webhook.secret);
-        merge_opt(&mut self.api.url, other.api.url);
-        // `api.ingest_token` is env-only (#[serde(skip)]); nothing to merge
-        // from a file.
-    }
-
-    fn apply_env(&mut self) {
-        env_into(&mut self.server.bind_addr, "SBGH_BIND_ADDR");
-        env_into(&mut self.webhook.secret, "SBGH_WEBHOOK_SECRET");
-        env_into(&mut self.api.url, "SBGH_API_URL");
-        env_into(&mut self.api.ingest_token, "SBGH_API_INGEST_TOKEN");
-    }
-
-    fn into_config(self) -> Result<HandlerConfig> {
-        Ok(HandlerConfig {
-            server: ServerConfig {
-                bind_addr: self
-                    .server
-                    .bind_addr
-                    .unwrap_or_else(|| "0.0.0.0:8080".into()),
-            },
-            webhook: WebhookConfig {
-                secret: required(self.webhook.secret, "[webhook].secret / SBGH_WEBHOOK_SECRET")?,
-            },
-            api: HandlerApiConfig {
-                url: required(self.api.url, "[api].url / SBGH_API_URL")?,
-                ingest_token: required(self.api.ingest_token, "SBGH_API_INGEST_TOKEN")?,
-            },
-        })
-    }
-}
-
-// ─────────────────────────── DaemonConfig ───────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -179,26 +36,23 @@ pub struct DaemonConfig {
     pub llm: LlmConfig,
 }
 
-/// Daemon run-loop tuning (roadmap-v5). Deliberately **not** under `[vm]`: the
-/// limit is on daemon execution *slots*, not VM capacity — task kinds become
-/// non-VM in v6, so the run-loop knob lives on its own.
+/// Daemon run-loop tuning. Deliberately **not** under `[vm]`: the limit is on
+/// execution slots, not VM capacity, and not every task must use a VM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerConfig {
     /// Maximum jobs executed concurrently. Default `1` (sequential — the
     /// historical behavior). Raise it only when the host can run that many
     /// jobs at once (each is a full VM today). Values below 1 are clamped to 1.
     pub max_concurrent_jobs: usize,
-    /// Maximum daemon-level clean VM repetitions a user request may fan out to
-    /// once grouped execution lands. v15 Phase 1 parses/caps the value before
-    /// enqueue; later phases consume it to create one VM run per repetition.
+    /// Maximum daemon-level clean VM repetitions a user request may fan out to.
+    /// Request validation applies this cap before enqueue.
     pub max_clean_repetitions: u32,
-    /// Maximum comparison variants accepted from Slack/LLM requests. v22 keeps
-    /// the model N-shaped but caps Phase 1 request validation to two variants.
+    /// Maximum comparison variants accepted from Slack/LLM requests.
     pub max_variants: u32,
     /// Maximum measured VM lifecycles a comparison request may imply
     /// (`variants × clean repetitions`).
     pub max_comparison_lifecycles: u32,
-    /// Optional CPU pinning (roadmap-v5 Phase 5), one **libvirt cpuset** per
+    /// Optional CPU pinning, one **libvirt cpuset** per
     /// concurrency slot — e.g. `["0-1", "2-3"]` pins slot 0's VM to cores 0,1
     /// and slot 1's to 2,3. Length must be ≥ `max_concurrent_jobs`. Empty (the
     /// default) → no pinning, vCPUs float across all host cores. Pinning each
@@ -215,9 +69,8 @@ pub struct RunnerConfig {
     pub host_cpus: Option<String>,
 }
 
-/// The daemon's `/api` server (roadmap-v3). Reachable only from the
-/// local CLI (loopback) and the handler container (docker bridge) — never
-/// a public interface.
+/// The daemon's `/api` server. Reachable only from the local CLI (loopback) and
+/// the handler container (Docker bridge), never as a public interface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     /// Listen addresses. Loopback for the local CLI; add the docker-bridge
@@ -252,8 +105,8 @@ pub struct GitHubConfig {
     pub private_key_path: PathBuf,
 }
 
-/// Which surfaces a job's benchmark result is reported on (roadmap-v4).
-// No `Eq`: `noise_cv_pct: Option<f64>` (roadmap-v7) is only `PartialEq`.
+/// Which surfaces receive a job's benchmark result.
+// No `Eq`: `noise_cv_pct: Option<f64>` is only `PartialEq`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ReportingConfig {
     /// PR (`/benchmark`) jobs. Default `both` (a Check Run + a summary comment
@@ -262,8 +115,8 @@ pub struct ReportingConfig {
     /// Baseline (`branch_push`/`tag_created`) jobs. Default `check` (a
     /// commit-level Check Run); `none` keeps them headless/DB-only.
     pub baseline_report: BaselineReport,
-    /// roadmap-v7: the measured per-run coefficient of variation of the
-    /// combined Execution+Commit metric, as a **percent** (e.g. `0.37`). Drives
+    /// The measured per-run coefficient of variation of the combined
+    /// Execution+Commit metric, as a **percent** (e.g. `0.37`). Drives
     /// the vs-baseline confidence (sigma). `None` → the delta is shown but the
     /// confidence reads "provisional" until the host noise floor is
     /// re-measured.
@@ -383,9 +236,9 @@ pub struct StacksBenchConfig {
     pub default_args: String,
 }
 
-/// LLM-backed intent extraction (item `0020`, iteration v13). Disabled by
-/// default; when enabled, Slack input can be resolved through a structured
-/// OpenAI response. The API key is env-only.
+/// LLM-backed intent extraction. Disabled by default; when enabled, Slack input
+/// can be resolved through a structured OpenAI response. The API key is
+/// environment-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub enabled: bool,
@@ -436,15 +289,15 @@ impl std::str::FromStr for LlmProvider {
     }
 }
 
-/// Where run artifacts are stored and fetched (item `0001-artifact-store`,
-/// iteration v4). `local` (default) keeps today's on-disk behavior; `s3` ships
-/// artifacts to S3-compatible object storage (e.g. Hetzner) for off-box fetch.
+/// Where run artifacts are stored and fetched. `local` (default) keeps on-disk
+/// behavior; `s3` ships artifacts to S3-compatible object storage for off-box
+/// fetch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactsConfig {
     pub kind: ArtifactStoreKind,
     /// S3 settings — `Some` iff `kind == S3` (enforced at load).
     pub s3: Option<S3Config>,
-    /// Local fingerprint-keyed `stacks-bench` binary cache (item 0025, v9).
+    /// Local fingerprint-keyed `stacks-bench` binary cache.
     pub binary_cache: BinaryCacheConfig,
 }
 
@@ -459,8 +312,7 @@ impl Default for ArtifactsConfig {
     }
 }
 
-/// Local cache of built `stacks-bench` binaries (item
-/// `0025-baseline-binary-cache`, iteration v9). Opt-in: a fingerprint-matched
+/// Local cache of built `stacks-bench` binaries. Opt-in: a fingerprint-matched
 /// binary is reused instead of rebuilt, skipping the ~5–7 min build VM.
 /// Local-only — fleet / S3 sharing is deferred.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,8 +375,8 @@ pub struct S3Config {
     pub secret_access_key: String,
 }
 
-/// Slack ad-hoc profiling connector (item `0002`, iteration v5). Disabled by
-/// default; when `enabled`, the orchestrator opens a Socket Mode connection and
+/// Slack ad-hoc profiling connector. Disabled by default; when `enabled`, the
+/// orchestrator opens a Socket Mode connection and
 /// serves `@BenchBot` mention benches. The code under test is a **constant**
 /// (`default_repository`/`default_rev`); the workload is the variable (the
 /// mention's args). Tokens are **env-only**; identities are allowlisted.
@@ -1534,66 +1386,6 @@ mod tests {
             }
         }
     }
-
-    // ─── HandlerConfig ───
-
-    fn handler_env() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("SBGH_API_URL", "http://api:8787"),
-            ("SBGH_API_INGEST_TOKEN", "ingest-tok"),
-            ("SBGH_WEBHOOK_SECRET", "hunter2"),
-        ]
-    }
-
-    #[test]
-    fn handler_loads_from_env_only() {
-        let _g = EnvGuard::set(&handler_env());
-        let cfg = HandlerConfig::load_layered(None).unwrap();
-        assert_eq!(cfg.webhook.secret, "hunter2");
-        assert_eq!(cfg.api.url, "http://api:8787");
-        assert_eq!(cfg.api.ingest_token, "ingest-tok");
-    }
-
-    #[test]
-    fn handler_api_ingest_token_in_toml_is_rejected() {
-        let _g = EnvGuard::set(&handler_env());
-        // The ingest token is env-only; a TOML `ingest_token` key must be a
-        // hard error (deny_unknown_fields), keeping the secret out of the
-        // bind-mounted config file.
-        let f = write("[api]\nurl = \"http://api\"\ningest_token = \"leaked\"\n");
-        let err = HandlerConfig::load_layered(Some(f.path())).unwrap_err();
-        assert!(matches!(err, Error::Config(_)));
-    }
-
-    #[test]
-    fn handler_toml_overrides_defaults_env_overrides_toml() {
-        let mut env = handler_env();
-        env.push(("SBGH_BIND_ADDR", "127.0.0.1:9000"));
-        let _g = EnvGuard::set(&env);
-        let f = write(
-            r#"
-            [server]
-            bind_addr = "0.0.0.0:8081"
-
-            [api]
-            url = "http://toml-api"
-            "#,
-        );
-        let cfg = HandlerConfig::load_layered(Some(f.path())).unwrap();
-        assert_eq!(cfg.server.bind_addr, "127.0.0.1:9000", "env wins over TOML");
-        // TOML supplies [api].url; env (handler_env) overrides it.
-        assert_eq!(cfg.api.url, "http://api:8787", "env wins over TOML for api.url");
-    }
-
-    #[test]
-    fn handler_missing_secret_errors() {
-        // API env present but no webhook secret → Config error.
-        let _g = EnvGuard::set(&[("SBGH_API_URL", "http://api"), ("SBGH_API_INGEST_TOKEN", "tok")]);
-        let err = HandlerConfig::load_layered(None).unwrap_err();
-        assert!(matches!(err, Error::Config(_)));
-    }
-
-    // ─── DaemonConfig ───
 
     fn daemon_env() -> Vec<(&'static str, &'static str)> {
         vec![

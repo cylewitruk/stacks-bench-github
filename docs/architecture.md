@@ -1,29 +1,19 @@
 # Architecture
 
-> **Status note.** This document predates roadmap-v3; some lower sections
-> still describe older internals. The current top-level shape (roadmap-v3
-> Phases 4–6): the **handler** is a thin verify-and-forward shim — it checks
-> the webhook HMAC and forwards the raw delivery to the **daemon's** `/api`
-> (`POST /api/webhooks`, ingest token). It holds **no** DB access and **no**
-> App key. The daemon owns Postgres outright: it filters event types, writes
-> the `github_webhook` inbox, then runs the **processor** (classify /
-> authorize → create `job` rows) and the **runner** (execute in libvirt VMs).
-> `sbgh-cli` is a pure `/api` client (cookie auth). The legacy `jobs`-table
-> path was removed in Phase 1. Where a section below still says "handler
-> records a webhook to Postgres", read "handler forwards to `/api`; the
-> daemon records it."
-
 ## Overview
 
 `stacks-bench-github` is a GitHub App that runs the [`stacks-bench`](https://github.com/cylewitruk/stacks-core/tree/feat/stacks-bench/stacks-bench) tool against pull requests, either automatically or in response to `/benchmark` slash-commands posted in PR comments.
 
-The system is split into two Rust binaries plus a shared library, all in a single Cargo workspace:
+The system is one Cargo workspace with six crates and four binaries:
 
 ```text
 crates/
-  sbgh-core/         shared library: config, db, github (auth/client/webhook/command), models, error
-  sbgh-handler/      axum HTTP server: verifies the webhook HMAC and forwards each delivery to the daemon's /api (no DB)
-  sbgh-daemon/       long-running worker: owns Postgres — serves /api, processes the inbox into jobs, then executes them in libvirt VMs
+  sbgh-api/          wire DTOs and typed daemon API client
+  sbgh-core/         daemon-owned database, GitHub, configuration, and model code
+  sbgh-handler/      library + HTTP binary for webhook verification/forwarding
+  sbgh-cli/          operator API-client binary
+  sbgh-daemon/       library + host binary for orchestration and inline execution
+  sbgh-smee/         local-development smee.io forwarding binary
 ```
 
 A Postgres database (run locally via `docker/docker-compose.yml`) is the only persistent state, and the **daemon is its sole client**. The handler and `sbgh-cli` never touch Postgres — they reach the daemon over the authenticated `/api` (see [daemon-api.md](./daemon-api.md)).
@@ -63,12 +53,12 @@ The `/api` server, the processor, and the runner all live in `sbgh-daemon`.
 
 | Concern | Where |
 | ---- | ---- |
-| HTTP server | [crates/sbgh-handler/src/main.rs](../crates/sbgh-handler/src/main.rs) |
+| HTTP server | [crates/sbgh-handler/src/lib.rs](../crates/sbgh-handler/src/lib.rs) |
 | Webhook route | [crates/sbgh-handler/src/routes/webhook.rs](../crates/sbgh-handler/src/routes/webhook.rs) |
-| Signature verify | [crates/sbgh-core/src/github/webhook.rs](../crates/sbgh-core/src/github/webhook.rs) |
+| Signature verify | [crates/sbgh-handler/src/signature.rs](../crates/sbgh-handler/src/signature.rs) |
 | `/api` client | [crates/sbgh-api/src/client.rs](../crates/sbgh-api/src/client.rs) (`submit_webhook`) |
 
-Per request (verify-and-forward since roadmap-v3 Phase 4):
+For each verify-and-forward request:
 
 1. Read raw body (signature is over bytes, not parsed JSON).
 2. Verify `X-Hub-Signature-256` (HMAC-SHA256, constant-time compare).
@@ -81,10 +71,13 @@ Per request (verify-and-forward since roadmap-v3 Phase 4):
 | ---- | ---- |
 | Main loop | [crates/sbgh-daemon/src/runner.rs](../crates/sbgh-daemon/src/runner.rs) |
 | Queue claim | [crates/sbgh-core/src/db/jobs.rs](../crates/sbgh-core/src/db/jobs.rs) |
-| Comment updates | [crates/sbgh-daemon/src/progress.rs](../crates/sbgh-daemon/src/progress.rs) |
+| Worker events | [crates/sbgh-daemon/src/events.rs](../crates/sbgh-daemon/src/events.rs) |
+| Report surfaces | [crates/sbgh-daemon/src/report.rs](../crates/sbgh-daemon/src/report.rs) |
 | libvirt driver | [crates/sbgh-daemon/src/libvirt/driver.rs](../crates/sbgh-daemon/src/libvirt/driver.rs) |
 
-Single-threaded poll loop. We only run one benchmark at a time on the libvirt host, so `claim_next` uses `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1` and the loop processes the job to completion before claiming the next.
+The coordinator claims serially with `SELECT ... FOR UPDATE SKIP LOCKED LIMIT
+1`, then executes up to `[runner].max_concurrent_jobs` jobs concurrently.
+Configured CPU sets give each execution slot stable placement.
 
 ## GitHub App authentication
 
@@ -114,9 +107,10 @@ cp .env.example .env
 chmod 0600 .env
 # edit .env, point SBGH_GH_PRIVATE_KEY_PATH at your local PEM
 
-# Run the daemon — it applies migrations at startup (no sqlx-cli needed),
-# serves /api, and runs the processor + runner.
-cargo run -p sbgh-daemon
+# Build, then run the daemon. It applies migrations at startup, serves /api,
+# and runs the processor + runner.
+just build
+target/debug/sbgh-daemon
 
 # The handler runs in Docker (`docker compose up -d handler`), or as a host
 # binary with its OWN env (SBGH_API_URL → the daemon, SBGH_WEBHOOK_SECRET,
@@ -220,9 +214,28 @@ $EDITOR .env
 target/release/sbgh-daemon
 ```
 
-## Open design questions
+## Fleet boundary
 
-- **Webhook delivery while offline**: GitHub retries failed webhook deliveries, but if the handler is down for an extended period we lose commands. Could add a periodic reconciliation that polls open PRs for missed `/benchmark` comments.
-- **Multiple installations / multi-tenant**: the current design handles N installations naturally (installation id is on the job row) but we haven't decided whether the allowlist should be per-installation.
-- **Result format**: `BenchmarkOutcome.summary` is `serde_json::Value` for now; should become a typed struct once we know what `stacks-bench` emits.
-- **VM teardown on daemon crash**: needs a startup sweep that destroys orphaned VMs from jobs left in `running` state.
+Execution remains in-process in v24. The owned execution request, task dispatch,
+driver, recipes, and artifact dependency form the closure that v25 will move
+into `sbgh-exec`. Worker registration, networking, leases, remote event
+durability, and remote artifacts are v25 work; they are not part of the current
+deployment.
+
+The movable closure starts at the owned dispatcher and concrete libvirt
+backend:
+
+- request/task dispatch, recipes, driver contracts, and worker events;
+- artifact storage and binary cache;
+- the production libvirt modules and their host-side helpers.
+
+The syntax-aware
+[`execution_boundary.rs`](../crates/sbgh-daemon/tests/execution_boundary.rs)
+discovers every production `Driver` implementation, then follows production
+module declarations and local imports from the dispatcher and those backends.
+A new backend or imported module therefore joins the checked closure
+automatically. The test skips individual `#[cfg(test)]` items without hiding
+later production code and rejects scheduler preparation/job types, aggregate
+daemon configuration, database/GitHub models and clients, SQLx/Octocrab,
+Slack, and reporting imports. Process composition projects artifact settings
+into execution-owned configuration before constructing the shared store.

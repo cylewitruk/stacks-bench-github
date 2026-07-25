@@ -3,8 +3,10 @@
 Establish an honest Cargo/application boundary and a fleet-ready execution seam
 before the repository crosses a process boundary in v25.
 
-> **Status:** planned — starts from a green trunk after the currently active
-> feature iterations close.
+> **Status:** in_progress — core implementation is complete; review-driven
+> ratchet hardening, clean-checkout CI, and live single-host
+> benchmark/build-only smoke remain.
+> Started from green trunk `dd16cd3`; v20-v23 remain parked.
 >
 > This is a behavior-preserving cleanup iteration. It addresses repository
 > truth, synthetic integration-test module graphs, accidental dependency
@@ -16,9 +18,9 @@ before the repository crosses a process boundary in v25.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0053-repository-workspace-cleanup` | repository truth and Cargo/tooling guardrails | planned |
-| `0054-application-crate-boundaries` | library-first applications and dependency direction | planned |
-| `0055-execution-boundary-preparation` | fleet-ready in-process execution seam | planned |
+| `0053-repository-workspace-cleanup` | repository truth and Cargo/tooling guardrails | in_progress |
+| `0054-application-crate-boundaries` | library-first applications and dependency direction | in_progress |
+| `0055-execution-boundary-preparation` | fleet-ready in-process execution seam | in_progress |
 
 ## Why
 
@@ -113,23 +115,23 @@ documentation accurately describe and validate the current workspace.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] Every documented `just` command references existing packages/targets and
+- [x] Every documented `just` command references existing packages/targets and
   its `--help` output is current.
-- [ ] Formatting uses a reproducible toolchain; a developer without a floating
+- [x] Formatting uses a reproducible toolchain; a developer without a floating
   nightly gets the same result as CI.
-- [ ] Cargo resolver 3 is either adopted with a reviewed lockfile and green
+- [x] Cargo resolver 3 is either adopted with a reviewed lockfile and green
   suite, or retained resolver 2 has a documented concrete incompatibility and
   follow-up.
-- [ ] CI runs the repository's standard lint/test entry points and documents
+- [x] CI runs the repository's standard lint/test entry points and documents
   which tier requires Docker/Postgres.
-- [ ] Architecture and planning links resolve, and the documented workspace
+- [x] Architecture and planning links resolve, and the documented workspace
   inventory matches Cargo metadata.
 
 **Tests:**
@@ -159,18 +161,18 @@ crate surfaces.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] `sbgh-daemon` and `sbgh-handler` each build as a library and binary.
-- [ ] No integration test includes production Rust source via `#[path]`.
-- [ ] Integration tests exercise the same router/runtime construction used by
+- [x] `sbgh-daemon` and `sbgh-handler` each build as a library and binary.
+- [x] No integration test includes production Rust source via `#[path]`.
+- [x] Integration tests exercise the same router/runtime construction used by
   the binaries.
-- [ ] Binary startup behavior and configuration precedence remain unchanged.
+- [x] Binary startup behavior and configuration precedence remain unchanged.
 
 **Tests:**
 
@@ -202,21 +204,21 @@ boundaries before adding worker crates.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] `sbgh-cli` does not transitively depend on SQLx or Octocrab.
-- [ ] `sbgh-handler` does not transitively depend on SQLx or Octocrab unless a
+- [x] `sbgh-cli` does not transitively depend on SQLx or Octocrab.
+- [x] `sbgh-handler` does not transitively depend on SQLx or Octocrab unless a
   reviewed runtime requirement proves unavoidable.
-- [ ] CLI tests cover command/API-client behavior; core admin tests live with
+- [x] CLI tests cover command/API-client behavior; core admin tests live with
   the implementation they exercise.
-- [ ] Handler webhook verification and configuration tests remain complete at
+- [x] Handler webhook verification and configuration tests remain complete at
   the handler boundary.
-- [ ] Each binary installs the selected rustls crypto provider exactly once at
+- [x] Each binary installs the selected rustls crypto provider exactly once at
   process bootstrap, before its first TLS use; moving code out of `sbgh-core`
   does not make provider selection implicit or order-dependent.
 
@@ -259,20 +261,20 @@ changing execution behavior.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
 - [ ] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] The executor can run benchmark and build-only tasks from an owned request,
+- [x] The executor can run benchmark and build-only tasks from an owned request,
   execution dependencies, event sink, and cancellation token.
-- [ ] Executor APIs contain no `RunnableJob`, `Prepared`, database, GitHub,
+- [x] Executor APIs contain no `RunnableJob`, `Prepared`, database, GitHub,
   Slack, or report-surface types.
-- [ ] Task-specific input is represented by explicit variants/structures rather
+- [x] Task-specific input is represented by explicit variants/structures rather
   than unrelated optional fields.
-- [ ] Unknown `(task_kind, build_target)` combinations still fail closed.
+- [x] Unknown `(task_kind, build_target)` combinations still fail closed.
 - [ ] Existing single-host benchmark, build-only, cancellation, orphan cleanup,
   progress, reporting, and carried-group behavior remain unchanged.
 
@@ -310,20 +312,20 @@ the same repository drift from immediately returning.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] `cargo machete` (or the adopted equivalent) reports no unexplained unused
+- [x] `cargo machete` (or the adopted equivalent) reports no unexplained unused
   normal dependencies.
-- [ ] Runtime crates enable only the Tokio/Reqwest features they use, with any
+- [x] Runtime crates enable only the Tokio/Reqwest features they use, with any
   deliberate broad feature set documented.
-- [ ] No new production comment narrates an implementation slice/review instead
+- [x] No new production comment narrates an implementation slice/review instead
   of a current contract.
-- [ ] Test relocation and comment cleanup produce no behavior-only churn outside
+- [x] Test relocation and comment cleanup produce no behavior-only churn outside
   files already touched by the iteration.
 
 **Tests:**
@@ -336,16 +338,63 @@ the same repository drift from immediately returning.
 
 ## Final Validation
 
-- [ ] `just build --no-sccache`
-- [ ] `just lint --no-sccache`
-- [ ] `just test --summary --no-sccache`
+- [x] `just build --no-sccache`
+- [x] `just lint --no-sccache`
+- [x] `just test --summary --no-sccache`
+- [x] The execution-closure guard derives or verifies its file coverage,
+  rejects aggregate configuration and all relevant DB/GitHub/runtime-client
+  dependencies, and cannot be bypassed by a forgotten hardcoded entry.
+- [x] Documentation validation checks heading fragments and reference-style
+  local links, not only target-file existence.
+- [x] CI installs the toolchain pinned by `rust-toolchain.toml` and identifies
+  the Docker/Postgres-backed test tier explicitly.
+- [x] A per-binary tripwire enforces exactly one rustls provider installation
+  before configuration or TLS-client construction.
+- [x] Execution-closure scanning remains complete when a production file
+  contains a mid-file `#[cfg(test)]` item.
 - [ ] CI passes from a clean checkout.
-- [ ] No production `#[path = "../src/..."]` integration-test imports remain.
-- [ ] CLI and handler dependency assertions pass.
+- [x] No production `#[path = "../src/..."]` integration-test imports remain.
+- [x] CLI and handler dependency assertions pass.
 - [ ] A current single-host benchmark and build-only/cache-warm job complete and
   report identically to pre-v24 behavior.
-- [ ] The v25 execution surface has an explicit dependency-closure map and no
+- [x] The v25 execution surface has an explicit dependency-closure map and no
   unresolved DB/GitHub/Slack coupling.
+
+## Validation Evidence
+
+Local validation on 2026-07-25:
+
+- Workspace topology remained six packages and four binaries; every package is
+  explicitly non-publishable.
+- Warm runs completed in 13.08 seconds for `just build --no-sccache` and 3.83
+  seconds for `just lint --no-sccache`.
+- The full Nextest workspace run passed all 830 tests with one skipped. Focused
+  runs passed 533 daemon tests (one skipped), 17 handler tests, and 12 CLI
+  tests.
+- A source-only snapshot with no `.git` or `target` directory completed
+  `just build`, `just lint`, and the full Docker-backed `just test` entry
+  points. The clean build took 69 seconds, lint took 34.35 seconds, and all 830
+  tests passed.
+- Cargo resolver 3 is active, the lockfile was reviewed, the documented
+  topology/link checks pass, and `cargo machete --with-metadata` reports no
+  unused dependencies.
+- CLI and handler normal dependency graphs contain no SQLx or Octocrab edge.
+  `sbgh-smee` intentionally retains Reqwest 0.12 through
+  `reqwest-eventsource` 0.6 and Reqwest 0.13 for its direct client.
+- `execution.rs` owns the worker request/task/dependency contract. A
+  syntax-aware integration test derives the production closure from module
+  declarations and local imports, rejects orchestrator dependencies, and
+  proves that a new import is discovered and a mid-file test item cannot hide
+  later production code.
+- Artifact-store construction now consumes an execution-owned projection
+  rather than `DaemonConfig`. Documentation validation checks GitHub-style
+  heading anchors and reference links, while the workspace inventory check
+  enforces one first-statement rustls provider installation in every binary.
+- The CI workflow parses successfully and an `act` pull-request dry run
+  resolves the pinned-toolchain, build, lint, and Docker-backed test steps.
+- Clean-checkout CI has not yet been observed. This development machine has no
+  libvirt/QEMU executable or configured benchmark host, so the live benchmark
+  and build-only/cache-warm smoke remains a host-side acceptance check.
 
 ## Follow-Ups
 

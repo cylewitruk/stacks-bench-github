@@ -18,7 +18,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use sbgh_cli::{
+use sbgh_core::admin::{
     InstallerError, allow_installer, disable_installer, disable_installer_by_account_id,
     list_installers,
 };

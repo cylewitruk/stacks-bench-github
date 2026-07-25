@@ -3,14 +3,15 @@
 Consume upstream `stacks-bench --json` stderr JSONL progress events and feed
 them into report surfaces as live sub-phase progress (`0027`).
 
-> **Status:** in_progress - Phase 2 implemented and locally validated; paused
-> for review before report-surface rendering work.
+> **Status:** parked - Phase 2 was implemented and locally validated. The
+> remaining reporting work will be revisited after v24 establishes the new
+> application and execution boundaries.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0027-fine-grained-progress` | primary | in_progress |
+| `0027-fine-grained-progress` | primary | parked |
 
 ## Why
 

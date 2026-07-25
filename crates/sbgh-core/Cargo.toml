@@ -1,26 +1,27 @@
 [package]
 name = "sbgh-core"
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 async-trait.workspace = true
 
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["rustls", "json"] }
 octocrab.workspace = true
 jsonwebtoken.workspace = true
 
-hmac.workspace = true
 sha2.workspace = true
-subtle.workspace = true
 hex.workspace = true
 
 sqlx.workspace = true
-rustls.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
@@ -28,19 +29,15 @@ serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 
-tracing.workspace = true
-
 uuid.workspace = true
 chrono.workspace = true
-url.workspace = true
 percent-encoding.workspace = true
 toml.workspace = true
-# Slice 5 trigger_policy: regex matching for tag_pattern triggers.
-regex.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true, features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+axum.workspace = true
 
 # sbgh-core's own integration tests need the `testing` feature for the
 # shared setup_pg_db() helper + in-memory stores. Self-dep is the canonical

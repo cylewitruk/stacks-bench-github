@@ -43,8 +43,8 @@ need editing when an item's status or location changes.
 | `0023-slack-card-redesign` | Slack card redesign (live queue + rich results) | `shipped` | [archive/completed/0023-slack-card-redesign.md](archive/completed/0023-slack-card-redesign.md) |
 | `0024-slack-card-stage-timings` | Slack card stage timings | `shipped` | [archive/completed/0024-slack-card-stage-timings.md](archive/completed/0024-slack-card-stage-timings.md) |
 | `0025-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
-| `0026-central-block-index-cache` | Central chainstate index ledger | `in_progress` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
-| `0027-fine-grained-progress` | Fine-grained bench progress | `in_progress` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
+| `0026-central-block-index-cache` | Central chainstate index ledger | `parked` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
+| `0027-fine-grained-progress` | Fine-grained bench progress | `parked` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
@@ -56,7 +56,7 @@ need editing when an item's status or location changes.
 | `0036-pr-comment-llm-intent` | PR-comment LLM intent resolution | `backlog` | [backlog.md](backlog.md) |
 | `0037-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 | `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
-| `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `in_progress` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
+| `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `parked` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
 | `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `shipped` | [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md) |
 | `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
@@ -67,12 +67,12 @@ need editing when an item's status or location changes.
 | `0047-slack-reporting-session` | Group-scoped Slack reporting session (surface lifetime = trigger, not run) | `shipped` | [archive/completed/0047-slack-reporting-session.md](archive/completed/0047-slack-reporting-session.md) |
 | `0048-slack-stream-error-classification` | Transient vs permanent stream-append errors (don't abandon streaming on a blip) | `backlog` | [backlog.md](backlog.md) |
 | `0049-libvirt-pure-driver-spike` | Direct libvirt RPC driver spike (`libvirt-pure`) | `backlog` | [backlog.md](backlog.md) |
-| `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
+| `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `parked` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 | `0051-slack-progress-sections-as-plan-tasks` | Slack progress sections as first-class plan tasks | `backlog` | [backlog.md](backlog.md) |
 | `0052-managed-stacks-node-chainstate-producer` | Managed stacks-node chainstate producer | `backlog` | [backlog.md](backlog.md) |
-| `0053-repository-workspace-cleanup` | Repository and workspace truth cleanup | `planned` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
-| `0054-application-crate-boundaries` | Application crate and dependency boundaries | `planned` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
-| `0055-execution-boundary-preparation` | In-process execution-boundary preparation | `planned` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `0053-repository-workspace-cleanup` | Repository and workspace truth cleanup | `in_progress` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `0054-application-crate-boundaries` | Application crate and dependency boundaries | `in_progress` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `0055-execution-boundary-preparation` | In-process execution-boundary preparation | `in_progress` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
 
 ## Iterations
 
@@ -94,11 +94,11 @@ need editing when an item's status or location changes.
 | `v17-slack-reporting-robustness` | Slack reporting robustness, reactions & observability | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `v18-slack-reporting-session` | Group-scoped Slack reporting session | `shipped` | [archive/completed/0047-slack-reporting-session.md](archive/completed/0047-slack-reporting-session.md) |
 | `v19-shared-benchmark-calibration` | Shared benchmark calibration | `shipped` | [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md) |
-| `v20-fine-grained-bench-progress` | Fine-grained bench progress | `in_progress` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
-| `v21-stacks-bench-schema-v1-native` | Native `stacks-bench` schema-v1 JSON | `planned` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
-| `v22-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `in_progress` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
-| `v23-central-block-tx-index-cache` | Central chainstate index ledger | `in_progress` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
-| `v24-workspace-architecture-cleanup` | Workspace and architecture cleanup | `planned` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `v20-fine-grained-bench-progress` | Fine-grained bench progress | `parked` | [iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md) |
+| `v21-stacks-bench-schema-v1-native` | Native `stacks-bench` schema-v1 JSON | `parked` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
+| `v22-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `parked` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
+| `v23-central-block-tx-index-cache` | Central chainstate index ledger | `parked` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
+| `v24-workspace-architecture-cleanup` | Workspace and architecture cleanup | `in_progress` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
 | `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
 
 ## Decisions

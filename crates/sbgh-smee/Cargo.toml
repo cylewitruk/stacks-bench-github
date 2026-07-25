@@ -1,29 +1,34 @@
 [package]
 name = "sbgh-smee"
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "sbgh-smee"
 path = "src/main.rs"
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 futures.workspace = true
 
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
+# reqwest-eventsource 0.6 still targets Reqwest 0.12. Keep the direct client on
+# workspace Reqwest 0.13 and accept this isolated duplicate until its adapter
+# supports the current major version.
 reqwest-eventsource.workspace = true
 rustls.workspace = true
 
 clap.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 anyhow.workspace = true
-thiserror.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true

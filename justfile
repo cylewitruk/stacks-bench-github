@@ -38,36 +38,11 @@ build *args:
 
     cargo --locked build --all-targets "${profile_args[@]}"
 
-install *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    set -- {{args}}
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --no-sccache)
-                export RUSTC_WRAPPER=
-                shift
-                ;;
-            -h|--help)
-                printf '%s\n' \
-                    'Usage: just install [--no-sccache]' \
-                    '' \
-                    'Options:' \
-                    '  --no-sccache  Clear RUSTC_WRAPPER for sandboxed agent runs.'
-                exit 0
-                ;;
-            *)
-                echo "error: unsupported install option: $1" >&2
-                exit 1
-                ;;
-        esac
-    done
-
-    cargo --locked install --release --path crates/stacks-bench-agent
-
 fmt:
-    cargo +nightly --locked fmt --all
+    cargo --locked fmt --all
+
+check-docs:
+    python3 scripts/check-docs.py
 
 lint *args:
     #!/usr/bin/env bash
@@ -95,8 +70,10 @@ lint *args:
         esac
     done
 
+    python3 scripts/check-docs.py
+    cargo machete --with-metadata
     RUST_LOG=warn cargo --locked clippy --all-targets -- -D warnings
-    cargo +nightly --locked fmt --all -- --check
+    cargo --locked fmt --all -- --check
 
 fix *args:
     #!/usr/bin/env bash
@@ -125,7 +102,7 @@ fix *args:
     done
 
     RUST_LOG=warn cargo --locked clippy --fix --all-targets --allow-dirty
-    cargo +nightly --locked fmt --all
+    cargo --locked fmt --all
 
 # Run workspace tests (use `just test --help` for modes and filters).
 test *args:
@@ -200,7 +177,7 @@ test *args:
                     '  just test archive' \
                     '  just test --summary archive' \
                     '  just test --failures archive' \
-                    '  just test --results -p stacks-bench-agent archive' \
+                    '  just test --results -p sbgh-daemon runner' \
                     '  just test --no-sccache pull_rebase_with_auth_fast_forwards_against_local_remote'
                 exit 0
                 ;;
@@ -229,12 +206,16 @@ test *args:
         export RUSTC_WRAPPER=
     fi
 
+    selection=(--workspace)
+    if [[ ${#pkg_arg[@]} -gt 0 ]]; then
+        selection=("${pkg_arg[@]}")
+    fi
+
     cmd=(
         cargo --locked nextest run
-        --workspace
+        "${selection[@]}"
         --no-fail-fast
         --all-targets
-        ${pkg_arg[@]+"${pkg_arg[@]}"}
         ${rest[@]+"${rest[@]}"}
         ${nocapture[@]+"${nocapture[@]}"}
     )

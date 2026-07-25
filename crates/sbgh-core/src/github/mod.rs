@@ -16,5 +16,5 @@ pub use webhook::{
     CreateEvent, InstallationAccount, InstallationDetails, InstallationEvent,
     InstallationRepositoriesEvent, InstallationRepository, IssueCommentEvent, PullRequestBody,
     PullRequestBranchRef, PullRequestChanges, PullRequestEvent, PullRequestRepo, PushCommit,
-    PushEvent, verify_signature,
+    PushEvent,
 };

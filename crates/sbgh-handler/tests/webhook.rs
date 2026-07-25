@@ -16,16 +16,11 @@ use axum::routing::post;
 use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::BodyExt;
 use sbgh_api::Client;
-use sbgh_core::config::{HandlerApiConfig, HandlerConfig, ServerConfig, WebhookConfig};
+use sbgh_handler::{
+    AppState, HandlerApiConfig, HandlerConfig, ServerConfig, WebhookConfig, build_router,
+};
 use sha2::Sha256;
 use tower::ServiceExt;
-
-#[path = "../src/routes/mod.rs"]
-mod routes;
-#[path = "../src/state.rs"]
-mod state;
-
-use state::AppState;
 
 const SECRET: &str = "test-webhook-secret";
 const INGEST_TOKEN: &str = "ingest-token-xyz";
@@ -148,13 +143,52 @@ async fn setup(status: StatusCode, resp: serde_json::Value) -> Harness {
                 .clone(),
         ),
     );
-    let router = routes::router().with_state(AppState { config, api });
+    let router = build_router(AppState { config, api });
     Harness { router, daemon }
 }
 
 /// Default success daemon (records, returns 200 `recorded`).
 async fn setup_ok() -> Harness {
     setup(StatusCode::OK, ok_response("recorded")).await
+}
+
+#[tokio::test]
+async fn production_router_composes_health_and_body_limit() {
+    let config = test_config("http://127.0.0.1:1".into());
+    let api = Client::new(
+        config.api.url.clone(),
+        Some(
+            config
+                .api
+                .ingest_token
+                .clone(),
+        ),
+    );
+    let router = build_router(AppState { config, api });
+
+    let health = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let oversized = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .body(Body::from(vec![0_u8; 2 * 1024 * 1024 + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 fn sign(body: &[u8]) -> String {
@@ -378,7 +412,7 @@ async fn daemon_unreachable_maps_to_502() {
                 .clone(),
         ),
     );
-    let router = routes::router().with_state(AppState { config, api });
+    let router = build_router(AppState { config, api });
     let body = b"{}".to_vec();
     let sig = sign(&body);
     let (status, _) = post_webhook(&router, "push", body, Some(&sig), Some("d1")).await;

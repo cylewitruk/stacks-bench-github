@@ -34,7 +34,6 @@ use std::time::Duration;
 use anyhow::Context;
 use futures::StreamExt;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
-use sbgh_core::config::{ArtifactStoreKind, DaemonConfig, S3Config};
 use tokio::io::AsyncWriteExt;
 
 /// TTL for the short-lived presigned URLs the store mints for its **own**
@@ -157,47 +156,73 @@ pub trait ArtifactStore: Send + Sync {
     async fn exists(&self, key: &str) -> bool;
 }
 
-/// Pick the configured store: [`LocalFsStore`] (default) or [`S3Store`], from
-/// `[artifacts]`. The single S3-wiring construction site (Codex, 1b review) —
-/// adding a backend touches only here. Fails fast on a bad S3 endpoint, so call
-/// it at startup; hot paths that only hold the config use
-/// [`build_store_or_local`].
-pub fn build_store(config: &DaemonConfig) -> anyhow::Result<Arc<dyn ArtifactStore>> {
-    let root = config
-        .paths
-        .results_archive_dir
-        .clone();
-    match config.artifacts.kind {
-        ArtifactStoreKind::Local => Ok(Arc::new(LocalFsStore::new(root))),
-        ArtifactStoreKind::S3 => {
-            let s3 = config
-                .artifacts
-                .s3
-                .as_ref()
-                .context("[artifacts] kind = s3 but S3 settings are missing (config bug)")?;
+/// Execution-owned artifact-store configuration. Process composition projects
+/// the aggregate daemon configuration into this type before constructing the
+/// movable execution dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactStoreConfig {
+    pub local_root: PathBuf,
+    pub backend: ArtifactStoreBackend,
+}
+
+impl ArtifactStoreConfig {
+    pub fn local(local_root: PathBuf) -> Self {
+        Self {
+            local_root,
+            backend: ArtifactStoreBackend::Local,
+        }
+    }
+
+    pub fn s3(local_root: PathBuf, config: S3StoreConfig) -> Self {
+        Self {
+            local_root,
+            backend: ArtifactStoreBackend::S3(config),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactStoreBackend {
+    Local,
+    S3(S3StoreConfig),
+}
+
+/// S3-compatible endpoint settings owned by the artifact implementation rather
+/// than the aggregate daemon configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3StoreConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Pick the configured [`LocalFsStore`] or [`S3Store`]. Fails fast on a bad S3
+/// endpoint, so process composition calls this once at startup and shares the
+/// resulting dependency with execution and reporting.
+pub fn build_store(config: &ArtifactStoreConfig) -> anyhow::Result<Arc<dyn ArtifactStore>> {
+    match &config.backend {
+        ArtifactStoreBackend::Local => Ok(Arc::new(LocalFsStore::new(config.local_root.clone()))),
+        ArtifactStoreBackend::S3(s3) => {
             let http = reqwest::Client::builder()
                 .connect_timeout(S3_CONNECT_TIMEOUT)
                 .read_timeout(S3_READ_TIMEOUT)
                 .build()
                 .context("building the HTTP client for the S3 artifact store")?;
-            Ok(Arc::new(S3Store::new(root, s3, http)?))
+            Ok(Arc::new(S3Store::new(config.local_root.clone(), s3, http)?))
         }
     }
 }
 
 /// Like [`build_store`] but never fails: on an init error it logs and degrades
-/// to a local-only store so the run still archives its breadcrumb (Decision
-/// 0003). For the producer/reporter hot paths, which only hold the config — the
-/// strict [`build_store`] runs once at startup as the fail-fast validator.
-pub fn build_store_or_local(config: &DaemonConfig) -> Arc<dyn ArtifactStore> {
+/// to a local-only store so tests and recovery paths still archive a breadcrumb
+/// (Decision 0003). Production composition uses strict [`build_store`] once.
+#[cfg(test)]
+pub fn build_store_or_local(config: &ArtifactStoreConfig) -> Arc<dyn ArtifactStore> {
     build_store(config).unwrap_or_else(|e| {
         tracing::error!(error = %e, "artifact store init failed; falling back to local-only archiving");
-        Arc::new(LocalFsStore::new(
-            config
-                .paths
-                .results_archive_dir
-                .clone(),
-        ))
+        Arc::new(LocalFsStore::new(config.local_root.clone()))
     })
 }
 
@@ -306,7 +331,11 @@ pub struct S3Store {
 }
 
 impl S3Store {
-    pub fn new(local_root: PathBuf, cfg: &S3Config, http: reqwest::Client) -> anyhow::Result<Self> {
+    pub fn new(
+        local_root: PathBuf,
+        cfg: &S3StoreConfig,
+        http: reqwest::Client,
+    ) -> anyhow::Result<Self> {
         let endpoint = url::Url::parse(&cfg.endpoint)
             .with_context(|| format!("[artifacts] invalid S3 endpoint: {}", cfg.endpoint))?;
         // Path-style addressing is the portable choice for custom endpoints
@@ -632,7 +661,7 @@ mod tests {
     // ─── S3Store (no live endpoint needed) ───
 
     fn s3_store(tmp: &TempDir, endpoint: &str) -> S3Store {
-        let cfg = S3Config {
+        let cfg = S3StoreConfig {
             endpoint: endpoint.to_string(),
             bucket: "sbgh-artifacts".into(),
             region: "fsn1".into(),

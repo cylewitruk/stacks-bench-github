@@ -112,48 +112,6 @@ impl RunResult {
     }
 }
 
-/// Schema-v1 envelope written by
-/// `stacks-bench bench baseline calibrate --json`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct BaselineCalibrationResult {
-    pub schema_version: Option<u32>,
-    pub success: Option<bool>,
-    pub result_type: Option<String>,
-    pub result_version: Option<u32>,
-    pub result: Option<BaselineCalibrationData>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct BaselineCalibrationData {
-    pub calibration_id: Option<i64>,
-}
-
-impl BaselineCalibrationResult {
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        match serde_json::from_slice::<Self>(bytes) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to parse calibration.json");
-                None
-            }
-        }
-    }
-
-    pub fn calibration_id(&self) -> Option<i64> {
-        match (self.schema_version, self.result_type.as_deref(), self.result_version, self.success)
-        {
-            (Some(1), Some("baseline_calibration"), Some(1), Some(true)) => self
-                .result
-                .as_ref()
-                .and_then(|r| r.calibration_id),
-            _ => None,
-        }
-    }
-}
-
 /// Render the per-job PR comment for a successful run.
 ///
 /// `archive_dir` is the per-job archive path on the host (the place
@@ -512,50 +470,6 @@ mod tests {
         assert_eq!(d.warmup_blocks, Some(1000));
         assert_eq!(d.sampled_metric_rows, Some(4000));
         assert!(d.mode_summary.is_some());
-    }
-
-    #[test]
-    fn parse_schema_v1_baseline_calibration_payload() {
-        let json = br#"{
-            "schema_version": 1,
-            "success": true,
-            "result_type": "baseline_calibration",
-            "result_version": 1,
-            "duration_secs": 12.0,
-            "result": {
-                "calibration_id": 12
-            }
-        }"#;
-
-        let result = BaselineCalibrationResult::from_bytes(json).unwrap();
-        assert_eq!(result.calibration_id(), Some(12));
-    }
-
-    #[test]
-    fn baseline_calibration_rejects_wrong_type_or_missing_id() {
-        let wrong_type = BaselineCalibrationResult::from_bytes(
-            br#"{
-                "schema_version": 1,
-                "success": true,
-                "result_type": "run",
-                "result_version": 1,
-                "result": { "calibration_id": 12 }
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(wrong_type.calibration_id(), None);
-
-        let missing_id = BaselineCalibrationResult::from_bytes(
-            br#"{
-                "schema_version": 1,
-                "success": true,
-                "result_type": "baseline_calibration",
-                "result_version": 1,
-                "result": {}
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(missing_id.calibration_id(), None);
     }
 
     #[test]

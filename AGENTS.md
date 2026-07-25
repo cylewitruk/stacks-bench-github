@@ -20,8 +20,7 @@ fall-back to custom tool calls if necessary.
 - `just test --results <filter>` prints per-test pass/fail statuses without
   captured success output.
 - Add `--no-sccache` when the sandbox blocks the configured compiler cache.
-  This is supported by `just build`, `just install`, `just lint`,
-  `just fix`, and `just test`.
+  This is supported by `just build`, `just lint`, `just fix`, and `just test`.
 
 ## Database Tests
 

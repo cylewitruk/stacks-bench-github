@@ -7,9 +7,6 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
 
-    #[error("invalid webhook signature")]
-    InvalidSignature,
-
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 

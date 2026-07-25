@@ -1,4 +1,4 @@
-//! The per-job reporter (roadmap-v5).
+//! The per-job reporter.
 //!
 //! Spawned once per claimed job, the [`Reporter`] owns **every** GitHub +
 //! job-lifecycle side-effect (the coordinator only claims/sweeps; the worker
@@ -25,7 +25,9 @@ use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi
 use sbgh_core::models::{GitRefKind, ResolvedCommit};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
-use crate::artifact_store::build_store_or_local;
+use crate::artifact_store::ArtifactStore;
+#[cfg(test)]
+use crate::artifact_store::{ArtifactStoreConfig, build_store_or_local};
 use crate::bench_summary::RunResult;
 use crate::comparison::{BaselineComparison, GroupComparison, compare};
 use crate::events::{Terminal, WorkerEvent};
@@ -57,7 +59,7 @@ pub async fn resolved_app_id(cell: &OnceCell<i64>, gh: &dyn GitHubApi) -> Option
     }
 }
 
-/// Display name of the Check Run the daemon posts (roadmap-v4). Stable so the
+/// Display name of the Check Run the daemon posts. Stable so the
 /// reconcile filter (`check_name`) and GitHub's per-name dedup both work.
 pub const CHECK_NAME: &str = "stacks-bench";
 
@@ -74,22 +76,31 @@ pub struct Reporter {
     config: Arc<DaemonConfig>,
     jobs: Arc<dyn RunnableJobStore>,
     gh: Arc<dyn GitHubApi>,
+    artifact_store: Arc<dyn ArtifactStore>,
     /// Shared App-id cache (the runner owns it). Resolved lazily by
     /// `ensure_check` only when a Check Run is actually wanted, so a no-report
     /// job makes no `GET /app` call.
     app_id: Arc<OnceCell<i64>>,
-    /// The Slack surface for `ProgressTarget::Slack` jobs (item 0002), shared
-    /// from the runner. `None` for a GitHub-only deployment, or until the
-    /// wiring slice injects a real client.
+    /// The Slack surface for `ProgressTarget::Slack` jobs, shared from the
+    /// runner. `None` for a GitHub-only deployment.
     slack: Option<Arc<dyn SlackClient>>,
-    /// Group-scoped Slack reporting sessions (v18, 0047), shared from the
-    /// runner so a repeat group's per-run surfaces reuse one live card +
-    /// keepalive.
+    /// Group-scoped Slack reporting sessions, shared from the runner so a
+    /// repeat group's per-run surfaces reuse one live card and keepalive.
     slack_sessions: Arc<SlackSessionRegistry>,
     job: RunnableJob,
 }
 
+pub(crate) struct ReporterDependencies {
+    pub jobs: Arc<dyn RunnableJobStore>,
+    pub gh: Arc<dyn GitHubApi>,
+    pub artifact_store: Arc<dyn ArtifactStore>,
+    pub app_id: Arc<OnceCell<i64>>,
+    pub slack: Option<Arc<dyn SlackClient>>,
+    pub slack_sessions: Arc<SlackSessionRegistry>,
+}
+
 impl Reporter {
+    #[cfg(test)]
     pub fn new(
         config: Arc<DaemonConfig>,
         jobs: Arc<dyn RunnableJobStore>,
@@ -99,10 +110,44 @@ impl Reporter {
         slack_sessions: Arc<SlackSessionRegistry>,
         job: RunnableJob,
     ) -> Self {
+        let artifact_store = build_store_or_local(&ArtifactStoreConfig::local(
+            config
+                .paths
+                .results_archive_dir
+                .clone(),
+        ));
+        Self::new_with_dependencies(
+            config,
+            ReporterDependencies {
+                jobs,
+                gh,
+                artifact_store,
+                app_id,
+                slack,
+                slack_sessions,
+            },
+            job,
+        )
+    }
+
+    pub(crate) fn new_with_dependencies(
+        config: Arc<DaemonConfig>,
+        dependencies: ReporterDependencies,
+        job: RunnableJob,
+    ) -> Self {
+        let ReporterDependencies {
+            jobs,
+            gh,
+            artifact_store,
+            app_id,
+            slack,
+            slack_sessions,
+        } = dependencies;
         Self {
             config,
             jobs,
             gh,
+            artifact_store,
             app_id,
             slack,
             slack_sessions,
@@ -156,16 +201,15 @@ impl Reporter {
             "job running (claimed → running)",
         );
 
-        // item 0022: the one reporting surface for this job — the Slack live
-        // card (Slack job + wired client), an explicit no-op (Slack, no client),
-        // or the GitHub comment+check. Built **once** and shared across
+        // The one reporting surface for this job: the Slack live card, an
+        // explicit no-op for Slack without a client, or the GitHub
+        // comment+check. Built **once** and shared across
         // `started`, the drain loop, and `finish`, so a stateful surface (the
         // Slack card) keeps a single timeline across the whole run.
-        let store = build_store_or_local(self.config.as_ref());
         let surface = build_report_surface(
             self.gh.clone(),
             self.jobs.clone(),
-            store,
+            self.artifact_store.clone(),
             self.slack.as_ref(),
             &self.slack_sessions,
             &self.job,
@@ -264,8 +308,8 @@ impl Reporter {
     /// Write the terminal state (DB + GitHub). Returns `Some(err)` when the run
     /// loop should back off: a persistence failure, or a recipe `SetupError`
     /// (the run couldn't start) — preserving the prior `execute` semantics.
-    /// roadmap-v7: best-effort vs-baseline comparison for a completed PR run.
-    /// Resolves the PR's base ref + head identity (`get_pull_request`), the
+    /// Best-effort comparison against the baseline for a completed PR run.
+    /// Resolves the PR's base ref and head identity (`get_pull_request`), the
     /// merge-base (`compare_commits`), the matching baseline (`find_baseline`),
     /// and this run's metric, then [`compare`]s them. `None` (→ absolute-only
     /// render) for non-PR jobs, no comparable baseline, or any lookup/parse
@@ -296,8 +340,8 @@ impl Reporter {
         // The benchmarked commit was captured at claim time. If the PR branch
         // advanced during the run, the *current* head (and its merge-base /
         // baseline / diff link) no longer matches the metrics we have — comparing
-        // them would mislead. Degrade to absolute-only rather than compare across
-        // commits (Codex Phase-3 finding).
+        // them would mislead. Degrade to absolute-only rather than compare
+        // across commits.
         if pr.head.sha != self.job.commit {
             tracing::debug!(
                 job_id = %self.job.id,
@@ -367,8 +411,8 @@ impl Reporter {
         })
     }
 
-    /// v22 Phase 4: best-effort comparison summary for an explicitly grouped
-    /// multi-variant benchmark. Computed only after the current terminal state
+    /// Best-effort comparison summary for an explicitly grouped multi-variant
+    /// benchmark. Computed only after the current terminal state
     /// has been persisted, so the final run's promoted metric is included.
     async fn group_comparison(&self) -> Option<GroupComparison> {
         if self
@@ -437,8 +481,11 @@ impl Reporter {
         let key = summary
             .get("run_json_archived_path")?
             .as_str()?;
-        let store = build_store_or_local(self.config.as_ref());
-        let path = store.get(key).await.ok()?;
+        let path = self
+            .artifact_store
+            .get(key)
+            .await
+            .ok()?;
         let bytes = std::fs::read(path).ok()?;
         let run = RunResult::from_bytes(&bytes)?;
         crate::job_source::metric_from_run(self.job.id, &run)
@@ -523,8 +570,8 @@ impl Reporter {
                 Some(anyhow::anyhow!("{error}"))
             }
             Terminal::Aborted => {
-                // Operator shutdown/abort (Phase 4): the run already tore its
-                // host artifacts down. Record a terminal **cancellation** (4C) —
+                // The run already tore its host artifacts down. Record a
+                // terminal cancellation:
                 // a deliberately-stopped run, not a failure: status `cancelled`
                 // + a neutral-gray check, re-triggerable.
                 let msg = "aborted by shutdown";
@@ -658,7 +705,7 @@ impl Reporter {
             // reaction is added by the connector at enqueue, and the threaded
             // result is posted at terminal (connector slice). Nothing here.
             ProgressTarget::Slack { .. } => {}
-            // Build-only/silent jobs (v10 0005) surface nothing.
+            // Build-only and silent jobs have no GitHub surface.
             ProgressTarget::Silent => {}
         }
     }

@@ -17,7 +17,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use sbgh_cli::{
+use sbgh_core::admin::{
     UserError, grant_role, grant_role_by_user_id, list_roles, list_users, revoke_role,
     revoke_role_by_user_id,
 };

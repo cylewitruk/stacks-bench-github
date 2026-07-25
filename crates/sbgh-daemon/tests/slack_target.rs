@@ -6,14 +6,7 @@ use sbgh_core::db::{
     InstallationStore, NewInstallation, Pool, PostgresInstallationStore, setup_pg_db,
 };
 use sbgh_core::models::GithubAccountType;
-
-// Daemon is a bin-only crate; pull in the unit under test via path include.
-// `target.rs` depends only on `sbgh_core::db::Pool` + `sqlx`, so no other
-// daemon modules are needed here.
-#[path = "../src/slack/target.rs"]
-mod target;
-
-use target::{ResolveTargetError, resolve_target};
+use sbgh_daemon::{ResolveTargetError, resolve_target};
 
 /// Seed an installation (by `account_login`) and, optionally, a `github_repo`
 /// row for `owner/name`. `suspended` marks the install suspended.

@@ -1,8 +1,8 @@
-//! The benchmark task kind (roadmap-v5) — the sole [`Recipe`] today.
+//! The benchmark task recipe.
 //!
 //! Builds a benchmark [`TaskSpec`] (this run's `bench_args`) + [`Placement`]
-//! (its Phase-5 cpuset) and runs it on an injected [`Driver`]
-//! (`LibvirtDriver` today — roadmap-v8 Phase 1), mapping the driver's neutral
+//! (its assigned cpuset) and runs it on an injected [`Driver`]
+//! (`LibvirtDriver` today), mapping the driver's neutral
 //! [`DriverOutcome`](crate::driver::DriverOutcome) onto the recipe's
 //! [`TaskOutcome`]. The benchmark CLI args live **here**, not on the
 //! platform-neutral [`TaskContext`].
@@ -12,7 +12,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::driver::{BenchmarkRunContext, Driver, DriverStatus, Placement, TaskSpec};
+use crate::driver::{
+    BenchmarkRunContext, BenchmarkTaskSpec, Driver, DriverStatus, Placement, TaskSpec,
+};
 use crate::events::EventSink;
 use crate::recipe::{Recipe, TaskContext, TaskOutcome, TaskStatus};
 
@@ -28,7 +30,7 @@ pub struct BenchRecipe {
     baseline_calibration_id: Option<i64>,
     benchmark_run: BenchmarkRunContext,
     /// The cpuset this job's VM vCPUs are pinned to (its concurrency slot's
-    /// `[runner].cpu_sets` entry), or `None` to float (Phase 5).
+    /// `[runner].cpu_sets` entry), or `None` to float.
     vcpu_cpuset: Option<String>,
 }
 
@@ -80,14 +82,13 @@ impl Recipe for BenchRecipe {
         sink: &dyn EventSink,
         cancel: &CancellationToken,
     ) -> anyhow::Result<Self::Outcome> {
-        let spec = TaskSpec {
+        let spec = TaskSpec::Benchmark(BenchmarkTaskSpec {
             args: self.bench_args.clone(),
-            build_only: false,
             sqlite_seed_key: self.sqlite_seed_key.clone(),
             shared_baseline_calibration: self.shared_baseline_calibration,
             baseline_calibration_id: self.baseline_calibration_id,
             benchmark_run: self.benchmark_run,
-        };
+        });
         let placement = Placement {
             vcpu_cpuset: self.vcpu_cpuset.clone(),
         };

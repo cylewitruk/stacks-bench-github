@@ -10,8 +10,8 @@
 //! `/etc/sbgh/daemon/.cookie`) and target `--api-url` (default
 //! `http://127.0.0.1:8787`).
 //!
-//! Migrations are no longer the CLI's job — the daemon applies them at
-//! startup (roadmap-v3 Phase 6 retired the `migrate` subcommand).
+//! Migrations are the daemon's responsibility and are applied at startup; the
+//! CLI has no schema-management subcommand.
 
 use std::path::{Path, PathBuf};
 
@@ -389,15 +389,15 @@ enum JobsAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    sbgh_core::install_default_crypto_provider();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     load_env(cli.env_file.as_deref())?;
     init_tracing();
 
     let api_url = cli.api_url.clone();
     let cookie = cli.cookie.clone();
-    // Build the API client (reading the admin cookie) on demand — `migrate`
-    // never needs it.
+    // Build the API client and read the admin cookie only for the selected
+    // command.
     let mk_client = move || -> anyhow::Result<Client> {
         let token = read_cookie(&cookie).with_context(|| {
             format!("reading admin cookie from {} (is the daemon running?)", cookie.display())
@@ -796,7 +796,7 @@ async fn run_policy_trigger(client: &Client, action: PolicyTriggerAction) -> any
     Ok(())
 }
 
-/// Operator-friendly pin state for a trigger row (v9, item 0025):
+/// Operator-friendly pin state for a trigger row:
 /// `pin=none` / `pin=pinned` / `pin=pinned_until:<rfc3339>` /
 /// `pin=expired:<rfc3339>` (a pin whose `pinned_until` is already in the past —
 /// the resolver treats it as unpinned).
