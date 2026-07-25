@@ -2,7 +2,8 @@
 
 - **id:** `0017-generic-phase-events`
 - **status:** `planned` (`v25-worker-fleet-block-validation`)
-- **depends_on:** `0055-execution-boundary-preparation` (v24)
+- **depends_on:** `0055-execution-boundary-preparation` (v24),
+  `0056-compiler-enforced-execution-boundaries` (v24.1)
 - **unblocks:** `0004-worker-fleet`, `0019-block-validation-recipe`
 - **iteration:**
   [`v25-worker-fleet-block-validation`](../iterations/v25-worker-fleet-block-validation.md)

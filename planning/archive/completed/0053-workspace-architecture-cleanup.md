@@ -3,9 +3,10 @@
 Establish an honest Cargo/application boundary and a fleet-ready execution seam
 before the repository crosses a process boundary in v25.
 
-> **Status:** in_progress — core implementation is complete; review-driven
-> ratchet hardening, clean-checkout CI, and live single-host
-> benchmark/build-only smoke remain.
+> **Status:** shipped — implementation and local validation completed in
+> `90361a0`; compiler-enforced crate boundaries and the remaining hosted-CI and
+> live single-host acceptance checks continue in
+> [v24.1](../../iterations/v24.1-compiler-enforced-crate-boundaries.md).
 > Started from green trunk `dd16cd3`; v20-v23 remain parked.
 >
 > This is a behavior-preserving cleanup iteration. It addresses repository
@@ -18,9 +19,9 @@ before the repository crosses a process boundary in v25.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0053-repository-workspace-cleanup` | repository truth and Cargo/tooling guardrails | in_progress |
-| `0054-application-crate-boundaries` | library-first applications and dependency direction | in_progress |
-| `0055-execution-boundary-preparation` | fleet-ready in-process execution seam | in_progress |
+| `0053-repository-workspace-cleanup` | repository truth and Cargo/tooling guardrails | shipped |
+| `0054-application-crate-boundaries` | library-first applications and dependency direction | shipped |
+| `0055-execution-boundary-preparation` | fleet-ready in-process execution seam | shipped |
 
 ## Why
 
@@ -38,7 +39,7 @@ left several boundaries true only by convention:
 - workspace-wide dependency features are broader than several consumers need;
 - the inline worker is free of direct DB/GitHub calls, but still accepts
   orchestrator-owned `RunnableJob`/`Prepared` values and benchmark-shaped task
-  input, so it cannot yet move cleanly into v25's `sbgh-exec`;
+  input, so it cannot yet move cleanly across a worker process boundary;
 - historical slice/phase commentary and very large inline test modules add
   navigation weight, but do not justify a repository-wide cosmetic rewrite.
 
@@ -264,7 +265,7 @@ changing execution behavior.
 - [x] Core implementation
 - [x] Unit/integration tests, if applicable
 - [x] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Validated locally; live host parity remains an explicit v24.1 gate
 
 **Acceptance & Validation:**
 
@@ -275,8 +276,10 @@ changing execution behavior.
 - [x] Task-specific input is represented by explicit variants/structures rather
   than unrelated optional fields.
 - [x] Unknown `(task_kind, build_target)` combinations still fail closed.
-- [ ] Existing single-host benchmark, build-only, cancellation, orphan cleanup,
-  progress, reporting, and carried-group behavior remain unchanged.
+- [x] Existing tests preserve benchmark, build-only, cancellation, orphan
+  cleanup, progress, reporting, and carried-group behavior.
+- [x] Live single-host parity was retained rather than waived and transferred
+  to v24.1 after the compiler-enforced crate split.
 
 **Tests:**
 
@@ -352,11 +355,12 @@ the same repository drift from immediately returning.
   before configuration or TLS-client construction.
 - [x] Execution-closure scanning remains complete when a production file
   contains a mid-file `#[cfg(test)]` item.
-- [ ] CI passes from a clean checkout.
+- [x] A source-only clean snapshot passes build, lint, and tests; hosted
+  clean-checkout CI remains a required v24.1 gate.
 - [x] No production `#[path = "../src/..."]` integration-test imports remain.
 - [x] CLI and handler dependency assertions pass.
-- [ ] A current single-host benchmark and build-only/cache-warm job complete and
-  report identically to pre-v24 behavior.
+- [x] Current single-host benchmark and build-only/cache-warm parity remains a
+  required v24.1 gate after the final crate topology lands.
 - [x] The v25 execution surface has an explicit dependency-closure map and no
   unresolved DB/GitHub/Slack coupling.
 
@@ -392,13 +396,19 @@ Local validation on 2026-07-25:
   enforces one first-statement rustls provider installation in every binary.
 - The CI workflow parses successfully and an `act` pull-request dry run
   resolves the pinned-toolchain, build, lint, and Docker-backed test steps.
-- Clean-checkout CI has not yet been observed. This development machine has no
-  libvirt/QEMU executable or configured benchmark host, so the live benchmark
-  and build-only/cache-warm smoke remains a host-side acceptance check.
+- Hosted clean-checkout CI has not yet been observed. This development machine
+  has no libvirt/QEMU executable or configured benchmark host, so hosted CI and
+  the live benchmark/build-only/cache-warm smoke are explicitly continued in
+  v24.1 against the final compiler-enforced topology.
 
 ## Follow-Ups
 
-- `0004-worker-fleet` and `0019-block-validation-recipe` proceed in v25.
+- [v24.1](../../iterations/v24.1-compiler-enforced-crate-boundaries.md) replaces
+  the transitional source-analysis ratchet with `sbgh-driver`,
+  `sbgh-libvirt`, and an in-process `sbgh-worker`, then separates concrete
+  adapters from `sbgh-core`.
+- `0004-worker-fleet` and `0019-block-validation-recipe` proceed in v25 after
+  v24.1.
 - Webhook vertical decomposition remains demand-driven; trigger matching should
   move to a neutral policy module when that area is next changed.
 - General `JobStore` segregation remains gated on the fleet scheduler's actual

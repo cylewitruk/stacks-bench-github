@@ -216,11 +216,22 @@ target/release/sbgh-daemon
 
 ## Fleet boundary
 
-Execution remains in-process in v24. The owned execution request, task dispatch,
-driver, recipes, and artifact dependency form the closure that v25 will move
-into `sbgh-exec`. Worker registration, networking, leases, remote event
-durability, and remote artifacts are v25 work; they are not part of the current
-deployment.
+Execution remains in-process after v24. The owned execution request, task
+dispatch, driver, recipes, and artifact dependency form a movable closure.
+[v24.1](../planning/iterations/v24.1-compiler-enforced-crate-boundaries.md)
+replaces that module-level closure with three Cargo boundaries:
+`sbgh-driver` for the internal driver API, `sbgh-libvirt` for the concrete
+backend, and an in-process `sbgh-worker` library for dispatch and recipes.
+v25 adds the worker protocol and separate process; worker registration,
+networking, leases, durable remote events, and remote artifacts are not part of
+the current deployment.
+
+Workers emit task-neutral events and outcomes rather than performing external
+reporting. `sbgh-daemon` remains the sole DB client and GitHub/Slack side-effect
+owner, including reporting credentials, rendering, debounce, rate limiting,
+retries, and reporting-session state. A worker may receive a short-lived,
+lease-scoped GitHub token for repository access, but never Slack credentials or
+a GitHub/Slack reporting client.
 
 The movable closure starts at the owned dispatcher and concrete libvirt
 backend:
@@ -238,4 +249,6 @@ automatically. The test skips individual `#[cfg(test)]` items without hiding
 later production code and rejects scheduler preparation/job types, aggregate
 daemon configuration, database/GitHub models and clients, SQLx/Octocrab,
 Slack, and reporting imports. Process composition projects artifact settings
-into execution-owned configuration before constructing the shared store.
+into execution-owned configuration before constructing the shared store. This
+test is intentionally transitional and is deleted in v24.1 after Cargo and a
+package-DAG check enforce the boundary directly.

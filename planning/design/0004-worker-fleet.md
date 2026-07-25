@@ -3,7 +3,8 @@
 - **id:** `0004-worker-fleet`
 - **status:** `planned` (`v25-worker-fleet-block-validation`)
 - **depends_on:** `0010-driver-seam` (shipped),
-  `0055-execution-boundary-preparation` (v24)
+  `0055-execution-boundary-preparation` (v24),
+  `0056-compiler-enforced-execution-boundaries` (v24.1)
 - **iteration:**
   [`v25-worker-fleet-block-validation`](../iterations/v25-worker-fleet-block-validation.md)
 - **review:** Codex signed off (design)
@@ -28,9 +29,11 @@ the advertised specifications.
 by sharing one host. A worker dials *out*, registers its capabilities, long-polls
 for compatible jobs, runs them via its **local `Driver`** (the shipped seam,
 `0010`), and streams events + artifacts back. The orchestrator stays the **sole DB
-client** and owns all GitHub side effects. This doc owns the **distribution
-layer** — getting jobs *to* capable workers; the task axis is `0005`/`0019`, the
-local execution substrate is `0010`, change-impact reporting is `0009`.
+client** and owns all GitHub/Slack side effects, including report rendering,
+debounce, rate limiting, retries, and reporting-session state. This doc owns the
+**distribution layer** — getting jobs *to* capable workers; the task axis is
+`0005`/`0019`, the local execution substrate is `0010`, change-impact reporting
+is `0009`.
 
 *(Below, "v8/v9/…" are historical roadmap shorthands — resolve via
 [index.md](../index.md): v5→`0008`, v6→`0005`/`0019`, v7→`0009`, v8 seam→`0010`,
@@ -75,7 +78,7 @@ worker daemon starts
   → runs local Driver (v8 Phase 1)
   → streams WorkerEvents back (sequence-numbered)
   → uploads artifacts / summary
-orchestrator-side reporter owns DB + GitHub side effects (unchanged)
+orchestrator-side reporter owns DB + GitHub/Slack side effects (unchanged)
 ```
 
 ## What's reused vs. genuinely new
@@ -105,44 +108,49 @@ orchestrator-side reporter owns DB + GitHub side effects (unchanged)
 - **Capability + resource matching & fairness** — so a flood of multi-hour
   block-validations can't starve bench (this answers v6 Open-Q#4).
 
-## The split: **move** logic out, don't duplicate it
+## The split: change process placement, don't duplicate logic
 
-v9 is a **split of today's `sbgh-daemon` monolith**, not a new parallel codebase.
-The worker-execution logic is **extracted into a shared crate** — it is *not*
-copied, and the two binaries do *not* carry forked copies of it. The orchestrator
-stops executing jobs itself; execution lives in one place (the exec crate) and is
-run by a worker.
+v24.1 moves execution ownership out of `sbgh-daemon` before networking: the
+driver API lives in `sbgh-driver`, the concrete VM adapter lives in
+`sbgh-libvirt`, and dispatch/recipes/run-loop logic lives in the in-process
+`sbgh-worker` library. v25 adds the worker binary and transport, then removes
+the daemon's transitional `sbgh-worker` and `sbgh-driver` dependencies. No
+execution implementation is copied or retained in the orchestrator.
 
 **Where each of today's `sbgh-daemon` modules goes:**
 
 | Module(s) | Destination |
 | --------- | ----------- |
-| `api/`, `webhook_processor`, `reporter`, `progress`, `comparison`, `bench_summary`, `job_source` | **orchestrator** (keeps DB ownership + all GitHub side-effects) |
+| `api/`, `webhook_processor`, `reporter`, `progress`, `comparison`, `bench_summary`, `job_source` | **orchestrator** (keeps DB ownership + all GitHub/Slack side effects) |
 | `runner` coordinator (claim/lease/slots/`recover_orphans`) | **orchestrator** → grows into the scheduler + worker registry + the worker-API server |
-| `runner::run_worker` + `JobDeps::run` inline worker loop | **moves to the worker** (this is the worker logic that must leave the orchestrator) |
-| `driver`, `libvirt/`, `recipe`, `bench_recipe` | **moves to the shared exec crate** (the execution substrate) |
+| execution request, recipes, dispatch, and run loop | **`sbgh-worker`** |
+| `Driver`, task/context/outcome, and event ports | **`sbgh-driver`** |
+| `libvirt/` and backend-owned configuration | **`sbgh-libvirt`** |
 | `events` | **splits at the existing producer/consumer seam** — see below |
 
 **Proposed crate structure (one impl each, no duplication):**
 
-- **`sbgh-exec` (new, shared library)** — the execution substrate: `driver`
-  (`Driver`/`TaskSpec`/`DriverOutcome`/`Placement`), `libvirt/`, `recipe`,
-  `bench_recipe`, and the worker run loop. Depends only on the wire-contract
-  types, never on the DB or GitHub.
+- **`sbgh-driver` (added in v24.1)** — dependency-light internal
+  driver/task/event API. It has no concrete backend, daemon model, wire DTO, or
+  infrastructure client.
+- **`sbgh-libvirt` (added in v24.1)** — the concrete pinned/libvirt benchmark
+  adapter and its backend-owned configuration.
+- **`sbgh-worker` (library added in v24.1; binary added in v25)** — execution
+  dispatch, recipes, run loop, cache/artifact service composition, then the
+  register/long-poll/event/upload transport shell.
 - **`sbgh-proto` (new, dependency-light library)** — owned, versioned worker
   wire DTOs for execution/task context, events/terminal outcomes, registration,
   capabilities, claim/lease, and artifact results. It does not expose core/DB
   structs or depend on the HTTP client implementation.
-- **Wire contract payload** — task context,
-  `TaskSpec`, `WorkerEvent`/`Terminal`/`PhaseLabel`, the registration/capability/
-  claim/lease messages, and the `summary` shape. The only thing both sides share.
-- **`sbgh-worker` (new binary)** — thin: register → long-poll → run `sbgh-exec`
-  against the claimed `TaskSpec` → stream events + upload artifacts. Its
-  `EventSink` is a **network sink** (today's `ChannelSink` over mpsc becomes an
-  HTTP client).
+- **Wire contract payload** — versioned equivalents of task context,
+  task/event/terminal outcomes, registration/capability/claim/lease messages,
+  and artifact results. Each side validates and converts these DTOs at its
+  boundary; internal driver types are not serialized implicitly.
 - **`sbgh-daemon` / orchestrator (existing binary)** — `api`, `webhook_processor`,
-  the scheduler/registry, the reporter, and the worker-API server. Sole DB client.
-  **Never executes a job itself** — execution only happens in an `sbgh-worker`.
+  the scheduler/registry, the reporter, and the worker-API server. Sole DB
+  client and GitHub/Slack side-effect owner. It alone holds Slack credentials
+  and reporting clients. **Never executes a job itself** — execution only
+  happens in an `sbgh-worker`.
 
 **The `events.rs` seam is where the split runs.** `EventSink` (the *producer*) is
 worker-side; the **reporter** (the *consumer*) is orchestrator-side. The network
@@ -161,7 +169,8 @@ just `localhost`, byte-identical to remote), gives crash isolation (a worker
 panic on a long or fan-out job can't take down the orchestrator), and avoids a
 special in-process path that would re-fork the very thing the split consolidates.
 A one-box install therefore runs two processes — orchestrator + `sbgh-worker` —
-both built from this repo, sharing the single `sbgh-exec` implementation.
+both built from this repo, with execution implemented once in the
+`sbgh-worker` library and its selected adapter crates.
 
 The **loopback worker** in Phase 1 below is therefore the *real* `sbgh-worker`
 binary pointed at localhost — not ad-hoc worker logic re-embedded in the
@@ -194,13 +203,14 @@ any network/firewall concerns.
 > **Transition note (Codex).** Phase 1 is **control-plane-only / non-production**:
 > it proves the protocol with *stub* work. The orchestrator's existing **in-process
 > execution stays for production** through Phase 1 — the "orchestrator never
-> executes" end state (above) is reached only in **Phase 2**, when `run_worker`
-> and the execution substrate move into `sbgh-exec`/`sbgh-worker` and the
-> in-process path is removed.
+> executes" end state (above) is reached only in **Phase 2**, when the existing
+> v24.1 worker library is hosted by the `sbgh-worker` binary and the daemon's
+> in-process library edge is removed.
 
 **Scope:**
 
-- A new `sbgh-worker` binary (or daemon mode): config = `{ accepted_tasks,
+- Add the `sbgh-worker` binary around the existing worker library: config =
+  `{ accepted_tasks,
   resource facts, orchestrator URL, auth token }`; registers + long-polls.
 - Orchestrator-side **worker registry** (a `worker` table — orchestrator-owned, so
   the sole-DB-client rule holds) tracking `{ id, capabilities, resources, version,
@@ -225,16 +235,13 @@ streams events, and uploads results — bench end-to-end on a remote worker.
 
 **Scope:**
 
-- **Extract the execution substrate into `sbgh-exec` (the move, not a copy; see
-  "The split" above).** `driver`, `libvirt/`, `recipe`, `bench_recipe`, and the
-  `run_worker` loop **leave `sbgh-daemon`** for the shared crate; the orchestrator
-  loses its inline worker. v24 first removes the current `RunnableJob`/`Prepared`,
-  aggregate-config, and task-input boundary leaks; Phase 2 then moves that proven
-  execution closure without copying it. The transport/artifact/event adapters
-  are new data-plane work, not part of the mechanical move.
-- Worker invokes its configured **local `Driver::run_task(TaskSpec)`** (v8 Phase 1,
-  now in `sbgh-exec`) on the claimed spec; the worker's local config picks the
-  Driver (pinned/libvirt for bench, reflink-fan-out for block-val).
+- Host the existing v24.1 `sbgh-worker` library in the worker binary and remove
+  `sbgh-daemon`'s in-process worker and direct driver-API dependencies after
+  loopback parity. The transport/artifact/event adapters are new data-plane
+  work; the driver API, recipes, and libvirt are reused unchanged.
+- Worker invokes its configured local
+  **`Driver::run_task(TaskSpec)`** implementation from `sbgh-libvirt` or the
+  block-validation adapter selected by its advertised capability.
 - **Event ingest**: worker POSTs reliable task-neutral events with
   attempt-scoped sequence numbers; orchestrator ingest commits them durably
   before acknowledgement, then the reporter projects/replays them per
@@ -388,23 +395,25 @@ declare that, and **several physical hosts may legitimately share one profile.**
   short-lived, and delivered with the `TaskSpec` over the authenticated channel —
   never long-lived on a worker.
 - **Least privilege**: a worker can only act on jobs it was handed (lease-scoped);
-  it cannot enumerate or mutate the queue.
+  it cannot enumerate or mutate the queue. It has no Slack credential or
+  client, and any GitHub token is limited to repository access rather than
+  reporting.
 
 ## Decisions
 
 1. **`remote-daemon` is a distribution layer, not a `Driver` kind.** It sits above
    the v8 Driver seam; a worker runs the *real* local Driver. (Codex-confirmed.)
-2. **v9 is a *split* of `sbgh-daemon`, not parallel logic.** The worker-execution
-   substrate (`driver`/`libvirt`/`recipe`/`run_worker`) **moves once** into a
-   shared `sbgh-exec` crate; it is never duplicated, and none of it is left behind
-   executing in the orchestrator. The orchestrator **never executes a job
-   itself**; even single-box installs run a **separate co-located `sbgh-worker`
-   process** over loopback (never in-process), keeping one execution model. (User-
-   directed.)
+2. **v9 changes process placement, not execution ownership.** v24.1 already
+   establishes `sbgh-driver`, `sbgh-libvirt`, and the `sbgh-worker` library.
+   v25 hosts that library in a separate process and removes the daemon's
+   transitional worker and direct driver-API edges; it does not create a
+   parallel executor. Even single-box installs use a co-located `sbgh-worker`
+   process over loopback. (User-directed.)
 3. **Thin pull-based worker API, not shared-Postgres claiming.** The orchestrator
    stays the sole DB client; workers dial out and never touch the DB. (Codex.)
 4. **The orchestrator-side reporter is unchanged.** Events + summary arrive over
-   the wire instead of mpsc; DB + GitHub side effects stay central.
+   the wire instead of mpsc; DB + GitHub/Slack side effects, credentials,
+   debounce, rate limiting, retries, and reporting-session state stay central.
 5. **Capability matching supersedes static per-task-kind backend config** (v8
    Phase 2's `[backend.<kind>]`). Workers advertise what they can run; the
    scheduler routes. Per-job routing — deferred in v8 Decision #6 — is delivered

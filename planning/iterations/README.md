@@ -11,6 +11,9 @@ reference the numbered items they implement.
 > to 1.** The last deployed version was **v3** (see `docs/v2-to-v3-upgrade.md`), so
 > deliverables start at **v4** (`v4-artifact-store`). Each iteration is the next
 > version milestone; the canonical item identity is still its `NNNN` id.
+> A `vN.M` iteration is a behavior-preserving continuation that must land before
+> the next version milestone; it does not introduce an independently deployed
+> version.
 
 When an iteration ships, archive each completed item under its own `NNNN-slug.md`
 in `archive/completed/`. Keep the iteration file only if it's still useful as a

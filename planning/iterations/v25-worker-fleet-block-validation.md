@@ -4,7 +4,8 @@ Turn the single-host daemon into an orchestrator plus workers, then place block
 validation on the available dedicated Hetzner host while preserving benchmark
 behavior on a separate co-located worker.
 
-> **Status:** planned — depends on the v24 execution-boundary and crate cleanup.
+> **Status:** planned — depends on the compiler-enforced crate topology from
+> [v24.1](v24.1-compiler-enforced-crate-boundaries.md).
 >
 > The deployment target is now concrete: one dedicated Hetzner worker with a
 > 64-core CPU, 256 GB RAM, and four 4 TB NVMe drives is available for
@@ -53,7 +54,7 @@ Those shards are not K independently scheduled fleet workers.
 GitHub / Slack / CLI
           |
           v
-sbgh-daemon (orchestrator; sole DB client and GitHub side-effect owner)
+sbgh-daemon (orchestrator; sole DB client and GitHub/Slack side-effect owner)
     |                           |
     | loopback worker API       | authenticated outbound worker connection
     v                           v
@@ -69,8 +70,9 @@ protocol as the remote host.
 
 ## Scope
 
-- Introduce dependency-light worker protocol types, an orchestrator worker API,
-  `sbgh-worker`, and `sbgh-exec`.
+- Introduce dependency-light worker protocol types and an orchestrator worker
+  API; turn the v24.1 `sbgh-worker` library into the separately deployed worker
+  process.
 - Register workers with capabilities, resource facts, version, and an
   operator-declared measurement profile; workers dial out and never receive DB
   credentials.
@@ -99,8 +101,12 @@ remains `0015`.
 
 ## Design Rules
 
-- **Workers pull; the orchestrator owns truth.** All DB state transitions and
-  GitHub/Slack effects occur in `sbgh-daemon`.
+- **Workers pull; the orchestrator owns truth and external reporting.** All DB
+  state transitions and GitHub/Slack side effects occur in `sbgh-daemon`. It
+  alone holds Slack credentials and owns report rendering, debounce, rate
+  limiting, retries, and reporting-session state. A worker may receive only a
+  short-lived, lease-scoped GitHub token for repository access; it does not
+  perform GitHub or Slack reporting.
 - **One production execution model.** The inline daemon worker is removed once
   the loopback worker passes parity validation.
 - **Protocol DTOs are not DB models.** Worker messages are versioned,
@@ -135,8 +141,9 @@ measured rather than assumed.
 
 **Scope:**
 
-- Reconcile the `0004`/`0019` names and contracts around `sbgh-proto`,
-  `sbgh-exec`, `sbgh-worker`, fleet workers, and local validation shards.
+- Reconcile the `0004`/`0019` protocol contracts around `sbgh-proto`, the
+  existing `sbgh-worker`/`sbgh-libvirt` crates, fleet workers, and local
+  validation shards.
 - Add a dependency-light `sbgh-proto` with the minimum Phase 1 messages:
   register, heartbeat, long-poll, offer/claim acknowledgement, stub complete,
   and stub fail.
@@ -147,8 +154,8 @@ measured rather than assumed.
   measurement profile, last heartbeat, and drain state.
 - Add authenticated worker endpoints. Use an outbound worker connection over a
   documented secured network path; workers receive no database credentials.
-- Add a thin `sbgh-worker` library/binary that registers, heartbeats, long-polls,
-  and executes stub work.
+- Add registration, heartbeat, long-poll, and stub execution transport to the
+  existing worker library and its new binary.
 - Run the real worker binary over loopback, then from the Hetzner host.
 - Inventory the Hetzner CPU topology/NUMA layout, memory, NVMe devices,
   filesystem/reflink support, usable capacity, sustained read/write behavior,
@@ -196,12 +203,13 @@ execution from the orchestrator before adding block validation.
 
 **Scope:**
 
-- Extract the v24 execution closure into `sbgh-exec`; move driver, libvirt,
-  recipe, benchmark/build recipes, local binary cache, and execution-loop code
-  rather than copying it.
-- Keep worker transport/configuration in `sbgh-worker`; keep DB, GitHub, Slack,
-  scheduling, reporting, comparison, and webhook processing in `sbgh-daemon`.
-- Turn the v24 owned execution request/task payload into validated worker wire
+- Add transport and a binary composition root to the v24.1 `sbgh-worker`
+  library. Reuse its driver API, recipes, cache/artifact services, and
+  `sbgh-libvirt` adapter rather than copying or re-extracting them.
+- Keep worker transport/configuration in `sbgh-worker`; keep DB, GitHub/Slack
+  clients and credentials, scheduling, reporting, comparison, and webhook
+  processing in `sbgh-daemon`.
+- Turn the v24.1 owned execution request/task payload into validated worker wire
   DTOs without exposing DB row shapes or backend-only configuration.
 - Mint any private-repository credential per job and deliver it short-lived and
   lease-scoped; workers never receive the GitHub App private key or another
@@ -226,8 +234,9 @@ execution from the orchestrator before adding block validation.
 - Stamp `{worker_id, measurement_profile, attempt/lease}` atomically when the
   orchestrator assigns work.
 - Run all benchmark variants/repeats/calibration for a group on the same worker.
-- Deploy a co-located benchmark worker over loopback and remove the daemon's
-  inline execution path after parity validation.
+- Deploy a co-located benchmark worker over loopback and, after parity
+  validation, remove the daemon's inline execution path and its transitional
+  `sbgh-worker`/`sbgh-driver` dependencies.
 
 **Status:**
 
@@ -238,9 +247,14 @@ execution from the orchestrator before adding block validation.
 
 **Acceptance & Validation:**
 
-- [ ] `sbgh-exec` has no dependency on `sbgh-core`, SQLx, Octocrab, Axum, Slack,
-  or report-surface modules.
-- [ ] `sbgh-worker` has no database credentials or direct DB client dependency.
+- [ ] `sbgh-worker`, `sbgh-libvirt`, and `sbgh-driver` retain the v24.1
+  dependency boundaries and have no dependency on `sbgh-core`, SQLx, Octocrab,
+  Axum, Slack, or report-surface crates.
+- [ ] `sbgh-worker` has no database or Slack credentials, direct DB client,
+  Slack client, or GitHub reporting client. Any GitHub credential it receives
+  is short-lived, lease-scoped, and limited to repository access.
+- [ ] GitHub/Slack report rendering, debounce, rate limiting, retries,
+  idempotency, and reporting-session state execute only in `sbgh-daemon`.
 - [ ] A loopback worker completes benchmark and build-only jobs through the
   protocol, including progress, artifacts, reporting, cache publication,
   cancellation, and carried-group behavior.
@@ -262,6 +276,9 @@ execution from the orchestrator before adding block validation.
   rather than matched to an unsafe baseline.
 - [ ] The daemon contains no production path that executes a recipe/driver
   locally after cutover.
+- [ ] After cutover, `sbgh-daemon` has no normal dependency on `sbgh-worker`,
+  `sbgh-driver`, or `sbgh-libvirt`; it exchanges only versioned `sbgh-proto`
+  request/event DTOs with workers.
 
 **Tests:**
 
@@ -272,8 +289,8 @@ execution from the orchestrator before adding block validation.
 - Artifact checksum, size-limit, interrupted-upload, stage/promote, stale
   terminal, and store-key tests.
 - Existing benchmark/build-only suites rerun through loopback transport.
-- Host benchmark parity smoke against the pre-v25 execution path before that
-  path is removed.
+- Host benchmark parity smoke against the v24.1 in-process worker path before
+  the daemon-to-worker library edge is removed.
 
 ### Phase 3: Block-Validation Recipe
 
@@ -283,7 +300,7 @@ scheduling or execution lifecycle control flow.
 **Scope:**
 
 - Add the block-validation task/build target and a validated task payload;
-  register the recipe through the v24 dispatch seam.
+  register the recipe through the v24.1 worker dispatch seam.
 - Add a worker-local block-validation execution substrate for:
   `stacks-inspect` build/cache, canonical dataset validation, K CoW workspace
   creation, probe/index-range planning, contiguous shard assignment, bounded
@@ -431,9 +448,9 @@ Hetzner block-validation worker.
   verified local dataset, completes K-shard reduction, uploads artifacts, and
   renders its terminal result through the orchestrator.
 - [ ] Neither worker can claim a task outside its configured capabilities.
-- [ ] PostgreSQL credentials and long-lived GitHub App credentials exist only
-  on the orchestrator; any worker repository token is short-lived,
-  least-privilege, and lease-scoped.
+- [ ] PostgreSQL credentials, Slack credentials, and long-lived GitHub App
+  credentials exist only on the orchestrator; any worker repository token is
+  short-lived, least-privilege, and lease-scoped.
 - [ ] Worker and orchestrator restart/upgrade procedures have been exercised,
   not merely documented.
 - [ ] The deployment soaks for an agreed period with no duplicate terminal
@@ -455,8 +472,8 @@ Hetzner block-validation worker.
   schema succeeds.
 - [ ] Protocol tests prove the current exact-match pair and reject every tested
   mismatch; the coordinated drain/upgrade procedure is exercised.
-- [ ] The orchestrator is the sole DB client and GitHub side-effect owner and
-  contains no inline production executor.
+- [ ] The orchestrator is the sole DB client and GitHub/Slack side-effect owner
+  and contains no inline production executor.
 - [ ] Loopback benchmark parity and remote block-validation acceptance both
   pass.
 - [ ] Lease, event, artifact, restart, drain, and cleanup failure-injection

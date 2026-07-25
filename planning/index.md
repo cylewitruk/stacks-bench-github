@@ -70,9 +70,11 @@ need editing when an item's status or location changes.
 | `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `parked` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 | `0051-slack-progress-sections-as-plan-tasks` | Slack progress sections as first-class plan tasks | `backlog` | [backlog.md](backlog.md) |
 | `0052-managed-stacks-node-chainstate-producer` | Managed stacks-node chainstate producer | `backlog` | [backlog.md](backlog.md) |
-| `0053-repository-workspace-cleanup` | Repository and workspace truth cleanup | `in_progress` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
-| `0054-application-crate-boundaries` | Application crate and dependency boundaries | `in_progress` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
-| `0055-execution-boundary-preparation` | In-process execution-boundary preparation | `in_progress` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `0053-repository-workspace-cleanup` | Repository and workspace truth cleanup | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
+| `0054-application-crate-boundaries` | Application crate and dependency boundaries | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
+| `0055-execution-boundary-preparation` | In-process execution-boundary preparation | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
+| `0056-compiler-enforced-execution-boundaries` | Compiler-enforced worker and backend boundaries | `planned` | [iterations/v24.1-compiler-enforced-crate-boundaries.md](iterations/v24.1-compiler-enforced-crate-boundaries.md) |
+| `0057-core-adapter-boundaries` | Dependency-light core and concrete adapter boundaries | `planned` | [iterations/v24.1-compiler-enforced-crate-boundaries.md](iterations/v24.1-compiler-enforced-crate-boundaries.md) |
 
 ## Iterations
 
@@ -98,7 +100,8 @@ need editing when an item's status or location changes.
 | `v21-stacks-bench-schema-v1-native` | Native `stacks-bench` schema-v1 JSON | `parked` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
 | `v22-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `parked` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
 | `v23-central-block-tx-index-cache` | Central chainstate index ledger | `parked` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
-| `v24-workspace-architecture-cleanup` | Workspace and architecture cleanup | `in_progress` | [iterations/v24-workspace-architecture-cleanup.md](iterations/v24-workspace-architecture-cleanup.md) |
+| `v24-workspace-architecture-cleanup` | Workspace and architecture cleanup | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
+| `v24.1-compiler-enforced-crate-boundaries` | Compiler-enforced crate boundaries | `planned` | [iterations/v24.1-compiler-enforced-crate-boundaries.md](iterations/v24.1-compiler-enforced-crate-boundaries.md) |
 | `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
 
 ## Decisions

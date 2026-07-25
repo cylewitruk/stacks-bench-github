@@ -3,7 +3,8 @@
 - **id:** `0019-block-validation-recipe`
 - **status:** `planned` (`v25-worker-fleet-block-validation`)
 - **depends_on:** `0005-task-kind-platform` (shipped),
-  `0055-execution-boundary-preparation` (v24)
+  `0055-execution-boundary-preparation` (v24),
+  `0056-compiler-enforced-execution-boundaries` (v24.1)
 - **relates_to:** `0004-worker-fleet`, `0037-benchmark-group-run-model`
 - **iteration:**
   [`v25-worker-fleet-block-validation`](../iterations/v25-worker-fleet-block-validation.md)
@@ -66,7 +67,7 @@ non-fatal/retry machinery meant for infra faults.
 - Register `block_validation` + `/validate-blocks` (and/or a trigger policy).
 - **Additive lifecycle:** block validation may add its payload, recipe/driver,
   registration, persistence, and rendering. If it forces changes to
-  `sbgh-exec` scheduling-independent execution lifecycle or to orchestrator
+  `sbgh-worker`'s scheduling-independent execution lifecycle or to orchestrator
   claim/lease/event/terminal control flow, that is a boundary leak to fix rather
   than patch around inside the task.
 
@@ -74,8 +75,8 @@ non-fatal/retry machinery meant for infra faults.
 
 - Block-val wants the **full chainstate + N CoW workspaces** — *not* bench's single
   small golden chainstate (roadmap-v6 Open question 2). The worker-local
-  block-validation substrate in `sbgh-exec` must expose "provision dataset + N
-  CoW workspaces."
+  block-validation adapter must expose "provision dataset + N CoW workspaces"
+  through the driver API.
 - I/O-bound on marf reads → wants **big local NVMe / dedicated bare metal**, not
   cloud volumes (the analysis behind `0004`/`0006`). Correctness-oriented → no
   low-variance/pinning need; its own `measurement_profile`.
