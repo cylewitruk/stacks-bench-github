@@ -24,14 +24,17 @@ fall-back to custom tool calls if necessary.
 
 ## Database Tests
 
-Integration tests that need Postgres pick one of two helpers in
-`sbgh-postgres::test_support`:
+Integration tests that need Postgres use `sbgh-postgres::test_support`:
 
 - `setup_pg_db()` (default) — a fresh, migrated database on a shared,
   compose-managed server; the returned guard drops it on teardown. Use for
   schema-isolated tests.
 
 `just test` auto-starts the shared server. The helper requires Docker.
+
+Test persistence semantics against the production Postgres stores. For
+orchestration tests that do not exercise persistence, prefer a narrow
+purpose-built fake for the smallest relevant interface.
 
 ## Coding Style
 

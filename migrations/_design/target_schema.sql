@@ -408,7 +408,7 @@ CREATE INDEX github_user_role_active_idx ON github_user_role (github_user_id, gi
 -- (branch_push, tag_created — pr_comment/scheduled/manual don't use
 -- this table). The processor lists rows for the affected (installation,
 -- repo) on each inbound event and matches in code (handful of rows,
--- in-memory iteration cheaper than per-row SQL regex). match_spec
+-- application-side iteration cheaper than per-row SQL regex). match_spec
 -- shape varies by trigger_kind:
 --   branch_push:  {"branch_name": "develop"}
 --   tag_created:  {"tag_pattern": "^release/\\d+\\.\\d+\\.\\d+\\.\\d+\\.\\d+$"}
@@ -743,4 +743,3 @@ CREATE INDEX job_event_job_occurred_at_idx ON job_event (job_id, occurred_at);
 CREATE INDEX job_event_comment_idx ON job_event (job_id, occurred_at DESC)
 WHERE
     github_comment_id IS NOT NULL;
-

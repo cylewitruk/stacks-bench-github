@@ -56,8 +56,6 @@ HISTORICAL_MARKER_BUDGET = {
     "crates/sbgh-postgres/src/admin/repo.rs": 1,
     "crates/sbgh-postgres/src/admin/user.rs": 2,
     "crates/sbgh-core/src/bench_args.rs": 1,
-    "crates/sbgh-core/src/db/in_memory_jobs.rs": 8,
-    "crates/sbgh-core/src/db/in_memory_policy.rs": 1,
     "crates/sbgh-core/src/db/ingest.rs": 2,
     "crates/sbgh-core/src/db/installation.rs": 6,
     "crates/sbgh-core/src/db/jobs.rs": 32,

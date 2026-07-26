@@ -26,6 +26,85 @@ impl PostgresInstallationStore {
     }
 }
 
+#[cfg(feature = "testing")]
+impl PostgresInstallationStore {
+    pub async fn seed_allowed(
+        &self,
+        github_account_id: i64,
+        account_login: &str,
+        account_type: crate::models::GithubAccountType,
+        is_enabled: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO allowed_installer \
+             (github_account_id, account_login, account_type, is_enabled) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (github_account_id) DO UPDATE SET \
+             account_login = EXCLUDED.account_login, account_type = EXCLUDED.account_type, \
+             is_enabled = EXCLUDED.is_enabled",
+        )
+        .bind(github_account_id)
+        .bind(account_login)
+        .bind(Db(account_type))
+        .bind(is_enabled)
+        .execute(&self.pool)
+        .await
+        .expect("seed allowed installer");
+    }
+
+    pub async fn installation(&self, id: i64) -> Option<GithubInstallation> {
+        sqlx::query_as::<_, Db<GithubInstallation>>(
+            "SELECT id, github_account_id, account_login, account_type, suspended_at, \
+             deleted_at, created_at, updated_at FROM github_installation WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("read installation")
+        .into_domain()
+    }
+
+    pub async fn installations(&self) -> Vec<GithubInstallation> {
+        sqlx::query_as::<_, Db<GithubInstallation>>(
+            "SELECT id, github_account_id, account_login, account_type, suspended_at, \
+             deleted_at, created_at, updated_at FROM github_installation ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("read installations")
+        .into_domain()
+    }
+
+    pub async fn membership(
+        &self,
+        installation_id: i64,
+        repo_id: i64,
+    ) -> Option<GithubInstallationRepo> {
+        sqlx::query_as::<_, Db<GithubInstallationRepo>>(
+            "SELECT github_installation_id, github_repo_id, granted_at, revoked_at \
+             FROM github_installation_repo \
+             WHERE github_installation_id = $1 AND github_repo_id = $2",
+        )
+        .bind(installation_id)
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("read membership")
+        .into_domain()
+    }
+
+    pub async fn memberships(&self) -> Vec<GithubInstallationRepo> {
+        sqlx::query_as::<_, Db<GithubInstallationRepo>>(
+            "SELECT github_installation_id, github_repo_id, granted_at, revoked_at \
+             FROM github_installation_repo ORDER BY github_installation_id, github_repo_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("read memberships")
+        .into_domain()
+    }
+}
+
 #[async_trait]
 impl InstallationStore for PostgresInstallationStore {
     async fn lookup_allowed(&self, github_account_id: i64) -> Result<Option<AllowedInstaller>> {

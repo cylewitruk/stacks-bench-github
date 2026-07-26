@@ -14,12 +14,11 @@
 use std::sync::Arc;
 
 use sbgh_core::config::SlackConfig;
-use sbgh_core::db::JobStore;
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 use tokio_util::sync::CancellationToken;
 
-use crate::slack::connector::{MentionEvent, SlackConnector};
+use crate::slack::connector::{BenchmarkQueue, MentionEvent, SlackConnector};
 use crate::slack::target::SlackJobTarget;
 
 #[derive(Debug, Clone, Copy)]
@@ -145,7 +144,7 @@ fn is_transient_socket_error(err: &(dyn std::error::Error + Send + Sync + 'stati
 pub async fn run(
     cfg: SlackConfig,
     target: SlackJobTarget,
-    jobs: Arc<dyn JobStore>,
+    jobs: Arc<dyn BenchmarkQueue>,
     web_client: Arc<dyn crate::slack::client::SlackClient>,
     intent_resolver: Option<Arc<dyn crate::llm::intent::IntentResolver>>,
     options: SocketRunOptions,
@@ -202,12 +201,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use sbgh_core::db::InMemoryJobStore;
     use sbgh_core::models::JobSource;
     use slack_morphism::errors::{SlackClientEndOfStreamError, SlackClientSocketModeProtocolError};
 
     use super::*;
     use crate::slack::client::{QUEUED_REACTION, SlackClient};
+    use crate::slack::test_support::RecordingBenchmarkQueue;
 
     /// A realistic Slack Socket Mode `event_callback` envelope for an
     /// `app_mention` (the shape slack-morphism deserializes off the wire).
@@ -306,7 +305,7 @@ mod tests {
     /// connector compose.
     #[tokio::test]
     async fn parsed_mention_dispatched_through_connector_enqueues_job() {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let slack = Arc::new(FakeSlackClient::default());
         let target = SlackJobTarget {
             installation_id: 100,
@@ -319,7 +318,7 @@ mod tests {
             .handle_mention(mention)
             .await;
 
-        let jobs = store.all_jobs();
+        let jobs = store.jobs();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].source, JobSource::Slack);
         assert_eq!(
@@ -337,7 +336,7 @@ mod tests {
     /// task lands the job.
     #[tokio::test]
     async fn spawn_dispatch_enqueues_off_the_ack_path() {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let slack = Arc::new(FakeSlackClient::default());
         let target = SlackJobTarget {
             installation_id: 100,
@@ -350,12 +349,12 @@ mod tests {
         // Returns immediately (the ack); the spawned task enqueues shortly after.
         // Yield until it lands (bounded, so a regression fails rather than hangs).
         for _ in 0..1000 {
-            if !store.all_jobs().is_empty() {
+            if !store.jobs().is_empty() {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(store.all_jobs().len(), 1, "spawned dispatch must enqueue the job");
+        assert_eq!(store.jobs().len(), 1, "spawned dispatch must enqueue the job");
     }
 
     /// A `ResetWithoutClosingHandshake` (any socket-transport error) classifies

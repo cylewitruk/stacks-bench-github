@@ -1,7 +1,7 @@
 # Workspace nextest config.
 #
 # Every DB-backed suite uses `setup_pg_db()`
-# (crates/sbgh-core/src/db/test_support.rs): one shared, compose-managed
+# (`sbgh-postgres::test_support`): one shared, compose-managed
 # Postgres (the `postgres` setup script) with a fresh, migrated database per
 # test. Schema isolation per test is all any suite needs — the role split
 # that once forced per-test containers was removed in roadmap-v3 Phase 6.
@@ -36,7 +36,7 @@ command = "docker compose -f docker/docker-compose.test.yml up --wait -d minio"
 # so new DB tests are covered without editing a list; a unit test in these
 # crates just triggers a (cheap, idempotent) `up` it doesn't use.
 [[profile.default.scripts]]
-filter = "package(=sbgh-core) | package(=sbgh-cli) | package(=sbgh-daemon)"
+filter = "package(=sbgh-postgres) | package(=sbgh-cli) | package(=sbgh-daemon)"
 setup = "postgres"
 
 # MinIO for the S3 round-trip test. Scoped to that one integration-test binary,
@@ -50,5 +50,5 @@ setup = "minio"
 # hiccups. Harmless on the deterministic unit tests in the same crates: they
 # don't flake, so they don't retry.
 [[profile.default.overrides]]
-filter = "package(=sbgh-core) | package(=sbgh-cli) | package(=sbgh-daemon)"
+filter = "package(=sbgh-postgres) | package(=sbgh-cli) | package(=sbgh-daemon)"
 retries = 2

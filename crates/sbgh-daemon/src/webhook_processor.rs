@@ -595,7 +595,7 @@ impl InstallationHandler {
     /// client so `installation.created` can materialise initial
     /// memberships from the payload's `repositories` array (Codex's
     /// slice-4 high-finding fix). Slice 3 callers can pass
-    /// `Arc::new(InMemoryRepoStore::new())` + `Arc::new(FakeGitHub::new())`
+    /// a repository store plus `Arc::new(FakeGitHub::new())`
     /// in tests that don't exercise the initial-repos path.
     pub fn new(
         install_store: Arc<dyn InstallationStore>,
@@ -2364,8 +2364,12 @@ fn backoff_delay(attempt: i32, base: chrono::Duration, max: chrono::Duration) ->
 mod tests {
     use std::sync::Mutex;
 
-    use sbgh_core::db::{InMemoryWebhookInbox, SeedWebhook};
     use sbgh_core::models::{WebhookOutcome, WebhookStatus};
+    use sbgh_postgres::db::{
+        Pool, PostgresInstallationStore, PostgresJobStore, PostgresPolicyStore,
+        PostgresPullRequestStore, PostgresRepoStore, PostgresUserStore, PostgresWebhookInbox,
+        TestDb, setup_pg_db,
+    };
 
     use super::*;
 
@@ -2396,13 +2400,97 @@ mod tests {
         }
     }
 
-    fn seed(inbox: &InMemoryWebhookInbox, delivery: &str, event: &str) -> i64 {
-        inbox.seed(SeedWebhook {
-            delivery_id: delivery.into(),
-            event_type: event.into(),
-            payload_size_bytes: 42,
-            ..Default::default()
-        })
+    struct WebhookRow {
+        status: WebhookStatus,
+        outcome: Option<WebhookOutcome>,
+        claimed_at: Option<chrono::DateTime<Utc>>,
+        claim_token: Option<uuid::Uuid>,
+        next_attempt_at: chrono::DateTime<Utc>,
+        attempts: i32,
+        last_error: Option<String>,
+        processed_at: Option<chrono::DateTime<Utc>>,
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct RawWebhookRow {
+        status: String,
+        outcome: Option<String>,
+        claimed_at: Option<chrono::DateTime<Utc>>,
+        claim_token: Option<uuid::Uuid>,
+        next_attempt_at: chrono::DateTime<Utc>,
+        attempts: i32,
+        last_error: Option<String>,
+        processed_at: Option<chrono::DateTime<Utc>>,
+    }
+
+    async fn seed(pool: &Pool, delivery: &str, event: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO github_webhook (delivery_id, event_type, payload_size_bytes) \
+             VALUES ($1, $2, 42) RETURNING id",
+        )
+        .bind(delivery)
+        .bind(event)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn test_inbox() -> (TestDb, Pool, Arc<PostgresWebhookInbox>) {
+        let (db, pool) = setup_pg_db().await;
+        let inbox = Arc::new(PostgresWebhookInbox::new(pool.clone()));
+        (db, pool, inbox)
+    }
+
+    async fn test_installation_store() -> (TestDb, Arc<PostgresInstallationStore>) {
+        let (db, pool) = setup_pg_db().await;
+        (db, Arc::new(PostgresInstallationStore::new(pool)))
+    }
+
+    fn lazy_pool() -> Pool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@localhost/unused")
+            .unwrap()
+    }
+
+    async fn row(pool: &Pool, id: i64) -> WebhookRow {
+        let raw: RawWebhookRow = sqlx::query_as(
+            "SELECT status::text, outcome::text, claimed_at, claim_token, next_attempt_at, \
+             attempts, last_error, processed_at FROM github_webhook WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        WebhookRow {
+            status: serde_json::from_value(serde_json::Value::String(raw.status)).unwrap(),
+            outcome: raw
+                .outcome
+                .map(|value| serde_json::from_value(serde_json::Value::String(value)).unwrap()),
+            claimed_at: raw.claimed_at,
+            claim_token: raw.claim_token,
+            next_attempt_at: raw.next_attempt_at,
+            attempts: raw.attempts,
+            last_error: raw.last_error,
+            processed_at: raw.processed_at,
+        }
+    }
+
+    async fn set_next_attempt_at(pool: &Pool, id: i64, when: chrono::DateTime<Utc>) {
+        sqlx::query("UPDATE github_webhook SET next_attempt_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(when)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn set_claimed_at(pool: &Pool, id: i64, when: chrono::DateTime<Utc>) {
+        sqlx::query("UPDATE github_webhook SET claimed_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(when)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     /// Test classifier that pops a programmed outcome per call.
@@ -2441,8 +2529,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_one_terminates_with_outcome() {
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
-        let id = seed(&inbox, "d-1", "push");
+        let (_db, pool, inbox) = test_inbox().await;
+        let id = seed(&pool, "d-1", "push").await;
         let classifier =
             ScriptedClassifier::new(vec![ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)]);
         let proc = WebhookProcessor::new(inbox.clone(), classifier, fast_config());
@@ -2452,7 +2540,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let row = inbox.row(id).unwrap();
+        let row = row(&pool, id).await;
         assert_eq!(row.status, WebhookStatus::Ignored);
         assert_eq!(row.outcome, Some(WebhookOutcome::IgnoredAction));
         assert!(row.processed_at.is_some());
@@ -2461,7 +2549,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_one_returns_false_when_empty() {
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
+        let (_db, _pool, inbox) = test_inbox().await;
         let proc = WebhookProcessor::new(inbox, Arc::new(NoopClassifier::new()), fast_config());
         assert!(
             !proc
@@ -2473,8 +2561,8 @@ mod tests {
 
     #[tokio::test]
     async fn retryable_increments_attempts_and_sets_backoff() {
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
-        let id = seed(&inbox, "d-2", "push");
+        let (_db, pool, inbox) = test_inbox().await;
+        let id = seed(&pool, "d-2", "push").await;
         let classifier =
             ScriptedClassifier::new(vec![ClassifyOutcome::Retryable("transient".into())]);
         let proc = WebhookProcessor::new(inbox.clone(), classifier, fast_config());
@@ -2485,7 +2573,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let row = inbox.row(id).unwrap();
+        let row = row(&pool, id).await;
         assert_eq!(row.status, WebhookStatus::RetryableError);
         assert_eq!(row.attempts, 1);
         assert_eq!(row.last_error.as_deref(), Some("transient"));
@@ -2502,8 +2590,8 @@ mod tests {
 
     #[tokio::test]
     async fn attempts_exhausted_promotes_to_permanent_failure() {
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
-        let id = seed(&inbox, "d-3", "push");
+        let (_db, pool, inbox) = test_inbox().await;
+        let id = seed(&pool, "d-3", "push").await;
         let mut config = fast_config();
         config.max_attempts = 2;
         // Three retryable classifications scheduled, but only the
@@ -2520,14 +2608,14 @@ mod tests {
             .await
             .unwrap();
         // Make the row immediately claimable again.
-        inbox.set_next_attempt_at(id, Utc::now());
+        set_next_attempt_at(&pool, id, Utc::now()).await;
         // Second attempt → next_attempts (2) >= max_attempts (2) →
         // permanent failure.
         proc.process_one()
             .await
             .unwrap();
 
-        let row = inbox.row(id).unwrap();
+        let row = row(&pool, id).await;
         assert_eq!(row.status, WebhookStatus::Failed);
         assert_eq!(row.outcome, Some(WebhookOutcome::Error));
         assert_eq!(row.last_error.as_deref(), Some("second"));
@@ -2543,8 +2631,8 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_resets_stuck_processing_rows() {
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
-        let id = seed(&inbox, "d-4", "push");
+        let (_db, pool, inbox) = test_inbox().await;
+        let id = seed(&pool, "d-4", "push").await;
         // Simulate a crashed processor: claim normally, then backdate
         // claimed_at past the lease window.
         let _ = inbox
@@ -2552,7 +2640,7 @@ mod tests {
             .await
             .unwrap()
             .expect("seeded row must be claimable");
-        inbox.set_claimed_at(id, Utc::now() - chrono::Duration::seconds(60));
+        set_claimed_at(&pool, id, Utc::now() - chrono::Duration::seconds(60)).await;
 
         let recovered = inbox
             .sweep_stuck_claims(chrono::Duration::seconds(10))
@@ -2560,7 +2648,7 @@ mod tests {
             .unwrap();
         assert_eq!(recovered, 1);
 
-        let row = inbox.row(id).unwrap();
+        let row = row(&pool, id).await;
         assert_eq!(row.status, WebhookStatus::RetryableError);
         assert!(row.claim_token.is_none());
         assert!(row.claimed_at.is_none());
@@ -2574,13 +2662,11 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_claims_pick_disjoint_rows() {
-        // Both calls run sequentially in this test (Mutex on the
-        // in-memory state), but the semantic we verify is that each
-        // claim_next returns a different row id — which is the
-        // guarantee FOR UPDATE SKIP LOCKED gives in Postgres.
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
-        let id_a = seed(&inbox, "d-a", "push");
-        let id_b = seed(&inbox, "d-b", "push");
+        // The semantic we verify is that each claim returns a different row,
+        // backed here by the production `FOR UPDATE SKIP LOCKED` query.
+        let (_db, pool, inbox) = test_inbox().await;
+        let id_a = seed(&pool, "d-a", "push").await;
+        let id_b = seed(&pool, "d-b", "push").await;
 
         let claim1 = inbox
             .claim_next(ALL_EVENT_TYPES)
@@ -2612,8 +2698,8 @@ mod tests {
         // Processor A claims; sweeper resets the row; processor A
         // tries to complete with its stale token. Must be a no-op:
         // the row stays in retryable_error.
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
-        let id = seed(&inbox, "d-5", "push");
+        let (_db, pool, inbox) = test_inbox().await;
+        let id = seed(&pool, "d-5", "push").await;
 
         let claimed = inbox
             .claim_next(ALL_EVENT_TYPES)
@@ -2621,7 +2707,7 @@ mod tests {
             .unwrap()
             .unwrap();
         // Force the claim to look ancient and sweep it.
-        inbox.set_claimed_at(id, Utc::now() - chrono::Duration::seconds(60));
+        set_claimed_at(&pool, id, Utc::now() - chrono::Duration::seconds(60)).await;
         let recovered = inbox
             .sweep_stuck_claims(chrono::Duration::seconds(10))
             .await
@@ -2633,7 +2719,7 @@ mod tests {
             .complete(id, claimed.claim_token, WebhookOutcome::IgnoredAction)
             .await
             .unwrap();
-        let row = inbox.row(id).unwrap();
+        let row = row(&pool, id).await;
         assert_eq!(row.status, WebhookStatus::RetryableError);
         assert!(row.outcome.is_none(), "stale write must not set outcome");
     }
@@ -2642,8 +2728,8 @@ mod tests {
     async fn complete_clears_last_error_from_prior_retries() {
         // A row that transient-failed once and then succeeded must
         // not leave a stale last_error string visible to ops queries.
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
-        let id = seed(&inbox, "d-6", "push");
+        let (_db, pool, inbox) = test_inbox().await;
+        let id = seed(&pool, "d-6", "push").await;
         // Sequence: retryable → reset for re-claim → terminal success.
         let classifier = ScriptedClassifier::new(vec![
             ClassifyOutcome::Retryable("transient blip".into()),
@@ -2655,20 +2741,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            inbox
-                .row(id)
-                .unwrap()
+            row(&pool, id)
+                .await
                 .last_error
                 .as_deref(),
             Some("transient blip")
         );
 
-        inbox.set_next_attempt_at(id, Utc::now());
+        set_next_attempt_at(&pool, id, Utc::now()).await;
         proc.process_one()
             .await
             .unwrap();
 
-        let row = inbox.row(id).unwrap();
+        let row = row(&pool, id).await;
         assert_eq!(row.status, WebhookStatus::Ignored);
         assert!(
             row.last_error.is_none(),
@@ -2769,26 +2854,55 @@ mod tests {
     /// seeded for a /benchmark eval. Returns the handler, the
     /// `FakeGitHub`, the policy/install/user stores (so each test can
     /// stage exactly which policies are enabled), and the slice-9
-    /// `InMemoryJobStore` (so the accept-path test can assert a job
-    /// was created). The FakeGitHub is pre-seeded with the standard PR
+    /// Postgres stores (so handler tests exercise the production persistence
+    /// implementation). The FakeGitHub is pre-seeded with the standard PR
     /// response (base id=10, head id=20).
     async fn make_benchmark_handler() -> (
+        TestDb,
         IssueCommentHandler,
         sbgh_core::github::test_support::FakeGitHub,
-        Arc<sbgh_core::db::InMemoryPolicyStore>,
-        Arc<sbgh_core::db::InMemoryInstallationStore>,
-        Arc<sbgh_core::db::InMemoryUserStore>,
-        Arc<sbgh_core::db::InMemoryJobStore>,
+        Arc<PostgresPolicyStore>,
+        Arc<PostgresInstallationStore>,
+        Arc<PostgresUserStore>,
+        Arc<PostgresJobStore>,
     ) {
-        let repo_store = Arc::new(sbgh_core::db::InMemoryRepoStore::new());
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
+        let (db, pool) = setup_pg_db().await;
+        let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
+        for identity in [
+            NewRepoIdentity {
+                id: 10,
+                owner: "o".into(),
+                name: "r".into(),
+                default_branch: None,
+            },
+            NewRepoIdentity {
+                id: 20,
+                owner: "alice".into(),
+                name: "r".into(),
+                default_branch: None,
+            },
+            NewRepoIdentity {
+                id: 999,
+                owner: "other".into(),
+                name: "repo".into(),
+                default_branch: None,
+            },
+        ] {
+            repo_store
+                .upsert_repo_identity(&identity)
+                .await
+                .unwrap();
+        }
+        let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
         // Slice 5 review fix: handler now gates policy eval on
         // is_membership_active. Seed install 1 + membership for the
         // base repo so the happy-path tests pass through the gate.
         // Tests that need to exercise the gate failure paths construct
         // their own install_store state.
-        let install_store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        install_store.seed_allowed(1, "octo-org", GithubAccountType::Organization, true);
+        let install_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
+        install_store
+            .seed_allowed(1, "octo-org", GithubAccountType::Organization, true)
+            .await;
         install_store
             .upsert_installation(&NewInstallation {
                 id: 1,
@@ -2832,12 +2946,24 @@ mod tests {
         // accept-path tests pass authz. Tests that need to exercise
         // the unauthorized branch use `seed_denied_user` below or
         // skip the grant entirely.
-        let user_store = Arc::new(sbgh_core::db::InMemoryUserStore::new());
-        user_store.seed_user(42, "alice", GithubAccountType::User);
-        user_store.seed_role(42, 1, Some(10), UserRole::TriggerPrBenchmark);
+        let user_store = Arc::new(PostgresUserStore::new(pool.clone()));
+        user_store
+            .seed_user(42, "alice", GithubAccountType::User)
+            .await;
+        user_store
+            .seed_role(42, 1, Some(10), UserRole::TriggerPrBenchmark)
+            .await;
 
-        let pull_request_store = Arc::new(sbgh_core::db::InMemoryPullRequestStore::new());
-        let job_store = Arc::new(sbgh_core::db::InMemoryJobStore::new());
+        let pull_request_store = Arc::new(PostgresPullRequestStore::new(pool.clone()));
+        let job_store = Arc::new(PostgresJobStore::new(pool.clone()));
+        sqlx::query(
+            "INSERT INTO github_webhook \
+             (id, delivery_id, event_type, action, payload_size_bytes) \
+             VALUES (1, 'unit-benchmark', 'issue_comment', 'created', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let handler = IssueCommentHandler::new(
             repo_store,
@@ -2848,7 +2974,7 @@ mod tests {
             Arc::new(gh.clone()),
             job_store.clone(),
         );
-        (handler, gh, policy_store, install_store, user_store, job_store)
+        (db, handler, gh, policy_store, install_store, user_store, job_store)
     }
 
     #[tokio::test]
@@ -2857,10 +2983,14 @@ mod tests {
         // + an authorized user → accepted → creates a `pr_comment`
         // ad-hoc job (+ webhook/user/PR links + queued event) and
         // terminates as `EnqueuedJob`.
-        let (h, _gh, policy_store, _install_store, _user_store, job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store) =
             make_benchmark_handler().await;
-        policy_store.seed_target(1, 10, true); // base
-        policy_store.seed_source(1, 20, true); // head
+        policy_store
+            .seed_target(1, 10, true)
+            .await; // base
+        policy_store
+            .seed_source(1, 20, true)
+            .await; // head
 
         let webhook = make_claimed(
             "issue_comment",
@@ -2872,7 +3002,7 @@ mod tests {
 
         // One job created, with the expected subject identity. The job's
         // repo is the TARGET (base, id=10); the ref is the PR HEAD.
-        let jobs = job_store.all_jobs();
+        let jobs = job_store.all_jobs().await;
         assert_eq!(jobs.len(), 1, "exactly one job created");
         let job = &jobs[0];
         assert_eq!(job.github_repo_id, 10, "job runs against the target (base) repo");
@@ -2884,17 +3014,29 @@ mod tests {
         assert_eq!(job.status, sbgh_core::models::JobStatus::Queued);
 
         // Links: triggering user (the commenter) + the PR.
-        assert_eq!(job_store.user_links().len(), 1);
-        assert_eq!(job_store.user_links()[0].github_user_id, 42);
-        assert_eq!(job_store.pr_links().len(), 1);
         assert_eq!(
-            job_store.pr_links()[0].triggering_comment_id,
+            job_store
+                .user_links()
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(job_store.user_links().await[0].github_user_id, 42);
+        assert_eq!(
+            job_store
+                .pr_links()
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            job_store.pr_links().await[0].triggering_comment_id,
             Some(1),
             "links the triggering comment id"
         );
 
         // Queued event carries the pr_comment provenance with bench args.
-        let events = job_store.all_events();
+        let events = job_store.all_events().await;
         assert_eq!(events.len(), 1);
         let detail: sbgh_core::models::QueuedEventDetail = serde_json::from_value(
             events[0]
@@ -2926,10 +3068,14 @@ mod tests {
         // claim lease. Handling the SAME webhook twice must yield
         // EnqueuedJob both times but only ONE job (idempotent on
         // github_webhook_id).
-        let (h, _gh, policy_store, _install_store, _user_store, job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store) =
             make_benchmark_handler().await;
-        policy_store.seed_target(1, 10, true);
-        policy_store.seed_source(1, 20, true);
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        policy_store
+            .seed_source(1, 20, true)
+            .await;
         let webhook = make_claimed(
             "issue_comment",
             Some("created"),
@@ -2944,7 +3090,14 @@ mod tests {
             matches!(second, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)),
             "reprocess must still terminalize as EnqueuedJob (idempotent)"
         );
-        assert_eq!(job_store.all_jobs().len(), 1, "reprocess must NOT create a duplicate job");
+        assert_eq!(
+            job_store
+                .all_jobs()
+                .await
+                .len(),
+            1,
+            "reprocess must NOT create a duplicate job"
+        );
     }
 
     #[tokio::test]
@@ -2953,10 +3106,14 @@ mod tests {
         // so it clears the per-webhook idempotency) for a commit that already
         // has an active job must NOT enqueue a duplicate — two jobs on one head
         // SHA would fight over GitHub's single check per `(name, head_sha)`.
-        let (h, _gh, policy_store, _install_store, _user_store, job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store) =
             make_benchmark_handler().await;
-        policy_store.seed_target(1, 10, true);
-        policy_store.seed_source(1, 20, true);
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        policy_store
+            .seed_source(1, 20, true)
+            .await;
 
         // First /benchmark → one job for (repo 10, head "headsha").
         let first = make_claimed(
@@ -2968,7 +3125,13 @@ mod tests {
             h.handle(&first).await,
             ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
         ));
-        assert_eq!(job_store.all_jobs().len(), 1);
+        assert_eq!(
+            job_store
+                .all_jobs()
+                .await
+                .len(),
+            1
+        );
 
         // A distinct second webhook for the SAME PR/commit while the first is
         // still active (queued) → deduped, no second job.
@@ -2986,7 +3149,10 @@ mod tests {
             "a deduped request still terminalizes as EnqueuedJob (the benchmark is covered)"
         );
         assert_eq!(
-            job_store.all_jobs().len(),
+            job_store
+                .all_jobs()
+                .await
+                .len(),
             1,
             "no duplicate job for a commit already being benchmarked",
         );
@@ -2999,7 +3165,7 @@ mod tests {
         // surfaces the denial — even though the legacy handler may
         // still run the bench in Phase 1, the inbox row signals "the
         // new pipeline would have denied this."
-        let (h, _gh, _policy_store, _install_store, _user_store, _job_store) =
+        let (_db, h, _gh, _policy_store, _install_store, _user_store, _job_store) =
             make_benchmark_handler().await;
         // No target policy seeded.
         let webhook = make_claimed(
@@ -3015,10 +3181,14 @@ mod tests {
     async fn benchmark_with_disabled_target_policy_is_denied_target_policy() {
         // Soft-disabled target (operator paused) takes the same deny
         // path as a missing target row.
-        let (h, _gh, policy_store, _install_store, _user_store, _job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, _job_store) =
             make_benchmark_handler().await;
-        policy_store.seed_target(1, 10, false);
-        policy_store.seed_source(1, 20, true);
+        policy_store
+            .seed_target(1, 10, false)
+            .await;
+        policy_store
+            .seed_source(1, 20, true)
+            .await;
         let webhook = make_claimed(
             "issue_comment",
             Some("created"),
@@ -3030,9 +3200,11 @@ mod tests {
 
     #[tokio::test]
     async fn benchmark_with_no_source_policy_is_denied_source_policy() {
-        let (h, _gh, policy_store, _install_store, _user_store, _job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, _job_store) =
             make_benchmark_handler().await;
-        policy_store.seed_target(1, 10, true);
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
         // No source policy.
         let webhook = make_claimed(
             "issue_comment",
@@ -3049,11 +3221,15 @@ mod tests {
     /// grant seeded. Tests can then either grant the user explicitly
     /// or assert that the unauthorized path fires.
     async fn make_benchmark_handler_without_role_grant()
-    -> (IssueCommentHandler, Arc<sbgh_core::db::InMemoryUserStore>) {
-        let (h, _gh, policy_store, _install_store, user_store, _job_store) =
+    -> (TestDb, IssueCommentHandler, Arc<PostgresUserStore>) {
+        let (db, h, _gh, policy_store, _install_store, user_store, _job_store) =
             make_benchmark_handler().await;
-        policy_store.seed_target(1, 10, true);
-        policy_store.seed_source(1, 20, true);
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        policy_store
+            .seed_source(1, 20, true)
+            .await;
         // Wipe the role seeded by `make_benchmark_handler` so the
         // user starts with no grants. (Building the store from
         // scratch would require duplicating all the install / repo
@@ -3061,7 +3237,7 @@ mod tests {
         let _ = user_store
             .revoke_role(42, 1, Some(10), UserRole::TriggerPrBenchmark)
             .await;
-        (h, user_store)
+        (db, h, user_store)
     }
 
     #[tokio::test]
@@ -3070,7 +3246,7 @@ mod tests {
         // `trigger_pr_benchmark` grant on the target repo terminates
         // as `DeniedUnauthorized` (NOT `WouldEnqueueJob`), even if
         // both target+source policies are enabled.
-        let (h, _user_store) = make_benchmark_handler_without_role_grant().await;
+        let (_db, h, _user_store) = make_benchmark_handler_without_role_grant().await;
         let webhook = make_claimed(
             "issue_comment",
             Some("created"),
@@ -3087,9 +3263,11 @@ mod tests {
         // scope. Without admin-implies, `admin` would be a lie — the
         // schema documents it as "full control" and the CLI exposes
         // it as grantable.
-        let (h, user_store) = make_benchmark_handler_without_role_grant().await;
+        let (_db, h, user_store) = make_benchmark_handler_without_role_grant().await;
         // Install-wide admin (NOT trigger_pr_benchmark explicit).
-        user_store.seed_role(42, 1, None, UserRole::Admin);
+        user_store
+            .seed_role(42, 1, None, UserRole::Admin)
+            .await;
         let webhook = make_claimed(
             "issue_comment",
             Some("created"),
@@ -3103,8 +3281,10 @@ mod tests {
     async fn benchmark_with_revoked_grant_is_denied_unauthorized() {
         // Post-slice-6 review M2 fix: revoked grants must not
         // authorize even though the row is still in the table.
-        let (h, user_store) = make_benchmark_handler_without_role_grant().await;
-        user_store.seed_role(42, 1, Some(10), UserRole::TriggerPrBenchmark);
+        let (_db, h, user_store) = make_benchmark_handler_without_role_grant().await;
+        user_store
+            .seed_role(42, 1, Some(10), UserRole::TriggerPrBenchmark)
+            .await;
         // Soft-revoke via the trait.
         user_store
             .revoke_role(42, 1, Some(10), UserRole::TriggerPrBenchmark)
@@ -3124,8 +3304,10 @@ mod tests {
         // Install-wide grant (`github_repo_id IS NULL`) authorizes
         // /benchmark on any repo within the install — matching the
         // has_role wildcard semantics.
-        let (h, user_store) = make_benchmark_handler_without_role_grant().await;
-        user_store.seed_role(42, 1, None, UserRole::TriggerPrBenchmark);
+        let (_db, h, user_store) = make_benchmark_handler_without_role_grant().await;
+        user_store
+            .seed_role(42, 1, None, UserRole::TriggerPrBenchmark)
+            .await;
         let webhook = make_claimed(
             "issue_comment",
             Some("created"),
@@ -3140,9 +3322,11 @@ mod tests {
         // Repo-scoped grant for a DIFFERENT repo in the same install
         // does NOT authorize. The slice 6 design point: --repo
         // narrows the grant; it doesn't broaden it.
-        let (h, user_store) = make_benchmark_handler_without_role_grant().await;
+        let (_db, h, user_store) = make_benchmark_handler_without_role_grant().await;
         // Grant on repo=999 — but the canned PR's target is repo=10.
-        user_store.seed_role(42, 1, Some(999), UserRole::TriggerPrBenchmark);
+        user_store
+            .seed_role(42, 1, Some(999), UserRole::TriggerPrBenchmark)
+            .await;
         let webhook = make_claimed(
             "issue_comment",
             Some("created"),
@@ -3158,7 +3342,7 @@ mod tests {
         // github_user row so the audit trail of /benchmark attempts is
         // queryable in DB. If we ever add a "list users who attempted
         // /benchmark" view, it wants to see denied users too.
-        let (h, user_store) = make_benchmark_handler_without_role_grant().await;
+        let (_db, h, user_store) = make_benchmark_handler_without_role_grant().await;
         let webhook = make_claimed(
             "issue_comment",
             Some("created"),
@@ -3179,7 +3363,7 @@ mod tests {
         // the sender object → `Error` (the handler can't safely upsert
         // the user with a bogus type). Same defensive pattern as
         // slice 3's InstallationHandler.
-        let (h, _user_store) = make_benchmark_handler_without_role_grant().await;
+        let (_db, h, _user_store) = make_benchmark_handler_without_role_grant().await;
         let payload = serde_json::json!({
             "action": "created",
             "comment": {
@@ -3205,7 +3389,7 @@ mod tests {
     async fn benchmark_gh_api_failure_is_retryable() {
         // If we can't fetch the PR (GH API down, install token expired,
         // etc.), the policy eval can't complete → Retryable.
-        let (h, _gh, _policy_store, _install_store, _user_store, _job_store) =
+        let (_db, h, _gh, _policy_store, _install_store, _user_store, _job_store) =
             make_benchmark_handler().await;
         // Build a webhook for a DIFFERENT PR than the canned one, so
         // FakeGitHub returns an error.
@@ -3252,8 +3436,8 @@ mod tests {
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::Error)));
     }
 
-    #[test]
-    fn basic_classifier_only_lists_registered_handlers() {
+    #[tokio::test]
+    async fn basic_classifier_only_lists_registered_handlers() {
         // The router only advertises event types it has a registered
         // handler for. A slice-2b-only build (issue_comment handler only)
         // must NOT claim `installation` rows even though the schema has
@@ -3266,7 +3450,8 @@ mod tests {
             .build();
         assert_eq!(only_ic.supported_event_types(), &["issue_comment"]);
 
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
+        let pool = lazy_pool();
+        let store = Arc::new(PostgresInstallationStore::new(pool));
         let with_install = BasicClassifier::builder()
             .with_handler(Arc::new(make_issue_comment_handler()))
             .with_handler(Arc::new(make_install_handler(store)))
@@ -3283,22 +3468,16 @@ mod tests {
         // gets it for free from claim filter composition, but pinning
         // it here guards against someone widening the filter without
         // adding a handler.
-        let inbox = Arc::new(InMemoryWebhookInbox::new());
-        let issue_comment_id = inbox.seed(SeedWebhook {
-            delivery_id: "d-ic".into(),
-            event_type: "issue_comment".into(),
-            action: Some("created".into()),
-            payload: Some(issue_comment_payload("created", "looks good", true)),
-            payload_size_bytes: 0,
-            ..Default::default()
-        });
-        let installation_id = inbox.seed(SeedWebhook {
-            delivery_id: "d-inst".into(),
-            event_type: "installation".into(),
-            action: Some("created".into()),
-            payload_size_bytes: 0,
-            ..Default::default()
-        });
+        let (_db, pool, inbox) = test_inbox().await;
+        let issue_comment_id: i64 = sqlx::query_scalar(
+            "INSERT INTO github_webhook (delivery_id, event_type, action, payload, \
+             payload_size_bytes) VALUES ('d-ic', 'issue_comment', 'created', $1, 0) RETURNING id",
+        )
+        .bind(issue_comment_payload("created", "looks good", true))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let installation_id = seed(&pool, "d-inst", "installation").await;
         let classifier = BasicClassifier::builder()
             .with_handler(Arc::new(make_issue_comment_handler()))
             .build();
@@ -3316,22 +3495,18 @@ mod tests {
                 .unwrap()
         );
 
-        let ic = inbox
-            .row(issue_comment_id)
-            .unwrap();
+        let ic = row(&pool, issue_comment_id).await;
         assert!(matches!(ic.status, WebhookStatus::Ignored));
 
-        let inst = inbox
-            .row(installation_id)
-            .unwrap();
+        let inst = row(&pool, installation_id).await;
         assert_eq!(inst.status, WebhookStatus::Received);
         assert!(inst.claim_token.is_none());
         assert!(inst.outcome.is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[should_panic(expected = "duplicate EventHandler")]
-    fn builder_panics_on_duplicate_handler_for_same_event_type() {
+    async fn builder_panics_on_duplicate_handler_for_same_event_type() {
         // Programmer error we want surfaced at startup, not silently
         // shadowed at runtime.
         let _ = BasicClassifier::builder()
@@ -3416,12 +3591,11 @@ mod tests {
     /// `installation.created.repositories`). The new() signature widened to
     /// take three args; this keeps the existing single-store tests
     /// readable.
-    fn make_install_handler(
-        store: Arc<sbgh_core::db::InMemoryInstallationStore>,
-    ) -> InstallationHandler {
+    fn make_install_handler(store: Arc<PostgresInstallationStore>) -> InstallationHandler {
+        let pool = lazy_pool();
         InstallationHandler::new(
             store,
-            Arc::new(sbgh_core::db::InMemoryRepoStore::new()),
+            Arc::new(PostgresRepoStore::new(pool)),
             Arc::new(sbgh_core::github::test_support::FakeGitHub::new()),
         )
     }
@@ -3432,21 +3606,24 @@ mod tests {
     /// constructor to take repo + policy + GH; this keeps existing
     /// tests readable.
     fn make_issue_comment_handler() -> IssueCommentHandler {
+        let pool = lazy_pool();
         IssueCommentHandler::new(
-            Arc::new(sbgh_core::db::InMemoryRepoStore::new()),
-            Arc::new(sbgh_core::db::InMemoryPolicyStore::new()),
-            Arc::new(sbgh_core::db::InMemoryInstallationStore::new()),
-            Arc::new(sbgh_core::db::InMemoryUserStore::new()),
-            Arc::new(sbgh_core::db::InMemoryPullRequestStore::new()),
+            Arc::new(PostgresRepoStore::new(pool.clone())),
+            Arc::new(PostgresPolicyStore::new(pool.clone())),
+            Arc::new(PostgresInstallationStore::new(pool.clone())),
+            Arc::new(PostgresUserStore::new(pool.clone())),
+            Arc::new(PostgresPullRequestStore::new(pool.clone())),
             Arc::new(sbgh_core::github::test_support::FakeGitHub::new()),
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
+            Arc::new(PostgresJobStore::new(pool)),
         )
     }
 
     #[tokio::test]
     async fn installation_created_for_allowed_account_upserts_and_processes() {
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (_db, store) = test_installation_store().await;
+        store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         let h = make_install_handler(store.clone());
         let w = installation_webhook(
             "created",
@@ -3460,6 +3637,7 @@ mod tests {
         ));
         let inst = store
             .installation(100)
+            .await
             .expect("installation row must be materialised");
         assert_eq!(inst.github_account_id, 42);
         assert_eq!(inst.account_login, "octo-org");
@@ -3469,7 +3647,7 @@ mod tests {
 
     #[tokio::test]
     async fn installation_created_for_unknown_account_is_denied() {
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
+        let (_db, store) = test_installation_store().await;
         let h = make_install_handler(store.clone());
         let w = installation_webhook("created", installation_payload("created", 100, 42, "User"));
 
@@ -3481,6 +3659,7 @@ mod tests {
         assert!(
             store
                 .installation(100)
+                .await
                 .is_none(),
             "denied install MUST NOT materialise a row"
         );
@@ -3491,8 +3670,10 @@ mod tests {
         // Disabled (soft-paused) installer must take the same deny path
         // as an unknown one. Operator pause is operationally identical
         // to "never approved" from the App's perspective.
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, false);
+        let (_db, store) = test_installation_store().await;
+        store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, false)
+            .await;
         let h = make_install_handler(store.clone());
         let w = installation_webhook(
             "created",
@@ -3507,6 +3688,7 @@ mod tests {
         assert!(
             store
                 .installation(100)
+                .await
                 .is_none()
         );
     }
@@ -3515,8 +3697,10 @@ mod tests {
     async fn installation_created_is_idempotent_on_redelivery() {
         // GitHub re-delivers webhooks freely. A second installation.created
         // for the same install id must be a no-op upsert, not a new row.
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (_db, store) = test_installation_store().await;
+        store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         let h = make_install_handler(store.clone());
         let w = installation_webhook(
             "created",
@@ -3531,13 +3715,21 @@ mod tests {
             h.handle(&w).await,
             ClassifyOutcome::Terminal(WebhookOutcome::ProcessedInstallation)
         ));
-        assert_eq!(store.installations().len(), 1);
+        assert_eq!(
+            store
+                .installations()
+                .await
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn installation_suspend_sets_suspended_at() {
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (_db, store) = test_installation_store().await;
+        store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         let h = make_install_handler(store.clone());
         // First materialise the install.
         h.handle(&installation_webhook(
@@ -3558,14 +3750,17 @@ mod tests {
         ));
         let inst = store
             .installation(100)
+            .await
             .unwrap();
         assert!(inst.suspended_at.is_some(), "suspend MUST set suspended_at");
     }
 
     #[tokio::test]
     async fn installation_unsuspend_clears_suspended_at() {
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (_db, store) = test_installation_store().await;
+        store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         let h = make_install_handler(store.clone());
         h.handle(&installation_webhook(
             "created",
@@ -3590,6 +3785,7 @@ mod tests {
         ));
         let inst = store
             .installation(100)
+            .await
             .unwrap();
         assert!(inst.suspended_at.is_none(), "unsuspend MUST clear suspended_at");
     }
@@ -3598,7 +3794,7 @@ mod tests {
     async fn installation_suspend_for_unknown_install_is_ignored() {
         // A suspend for an install we never accepted (allowlist denied
         // at create) must not materialise a row; it's harmless to skip.
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
+        let (_db, store) = test_installation_store().await;
         let h = make_install_handler(store.clone());
 
         let outcome = h
@@ -3614,6 +3810,7 @@ mod tests {
         assert!(
             store
                 .installation(100)
+                .await
                 .is_none()
         );
     }
@@ -3623,8 +3820,10 @@ mod tests {
         // Slice 4: install.deleted is a soft-delete (sets deleted_at) so
         // membership FKs and future job FKs stay valid. The row is NOT
         // removed.
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (_db, store) = test_installation_store().await;
+        store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         let h = make_install_handler(store.clone());
         h.handle(&installation_webhook(
             "created",
@@ -3644,13 +3843,14 @@ mod tests {
         ));
         let row = store
             .installation(100)
+            .await
             .expect("soft-delete must keep the row");
         assert!(row.deleted_at.is_some(), "deleted MUST set deleted_at");
     }
 
     #[tokio::test]
     async fn installation_deleted_for_unknown_install_is_ignored() {
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
+        let (_db, store) = test_installation_store().await;
         let h = make_install_handler(store.clone());
 
         let outcome = h
@@ -3669,8 +3869,10 @@ mod tests {
     async fn installation_unknown_action_is_ignored_action() {
         // Forward-compat: a future `installation.new_permissions_accepted`
         // (or whatever GH adds) records-and-skips, not retries forever.
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (_db, store) = test_installation_store().await;
+        store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         let h = make_install_handler(store);
 
         let outcome = h
@@ -3684,7 +3886,7 @@ mod tests {
 
     #[tokio::test]
     async fn installation_null_payload_is_error() {
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
+        let (_db, store) = test_installation_store().await;
         let h = make_install_handler(store);
         let mut w = installation_webhook("created", serde_json::Value::Null);
         w.payload = None;
@@ -3695,7 +3897,7 @@ mod tests {
 
     #[tokio::test]
     async fn installation_bad_typed_shape_is_error() {
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
+        let (_db, store) = test_installation_store().await;
         let h = make_install_handler(store);
         let w = installation_webhook("created", serde_json::json!({ "action": "created" }));
 
@@ -3707,8 +3909,10 @@ mod tests {
     async fn installation_unknown_account_type_is_error() {
         // GH adding a new account type (unlikely but) would land here.
         // Better to record-and-investigate than guess.
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (_db, store) = test_installation_store().await;
+        store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         let h = make_install_handler(store);
         let w = installation_webhook(
             "created",
@@ -3729,22 +3933,28 @@ mod tests {
         root_owner: &'static str,
         root_name: &'static str,
     ) -> (
+        TestDb,
         InstallationHandler,
-        Arc<sbgh_core::db::InMemoryInstallationStore>,
-        Arc<sbgh_core::db::InMemoryRepoStore>,
+        Arc<PostgresInstallationStore>,
+        Arc<PostgresRepoStore>,
         sbgh_core::github::test_support::FakeGitHub,
     ) {
-        let install_store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        install_store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        let repo_store = Arc::new(sbgh_core::db::InMemoryRepoStore::new());
-        repo_store.seed_supported_root(root_repo_id, root_owner, root_name, true);
+        let (db, pool) = setup_pg_db().await;
+        let install_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
+        install_store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
+        let repo_store = Arc::new(PostgresRepoStore::new(pool));
+        repo_store
+            .seed_supported_root(root_repo_id, root_owner, root_name, true)
+            .await;
         let gh = sbgh_core::github::test_support::FakeGitHub::new();
         let handler = InstallationHandler::new(
             install_store.clone(),
             repo_store.clone(),
             Arc::new(gh.clone()),
         );
-        (handler, install_store, repo_store, gh)
+        (db, handler, install_store, repo_store, gh)
     }
 
     #[tokio::test]
@@ -3753,7 +3963,7 @@ mod tests {
         // memberships from the payload's `repositories` array; otherwise
         // there'd be no `github_installation_repo` rows until a later
         // `installation_repositories.added` event happened.
-        let (h, install_store, _repo_store, gh) =
+        let (_db, h, install_store, _repo_store, gh) =
             make_install_handler_with_supported(10, "stacks-network", "stacks-core").await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
         let w = installation_webhook(
@@ -3774,6 +3984,7 @@ mod tests {
         ));
         let m = install_store
             .membership(100, 10)
+            .await
             .expect("initial membership must be materialised by installation.created");
         assert!(m.revoked_at.is_none(), "fresh membership is active");
     }
@@ -3784,7 +3995,7 @@ mod tests {
         // results are reflected in the membership table (none created)
         // but the webhook-level outcome stays ProcessedInstallation —
         // ops query "was this install ingested" should answer yes.
-        let (h, install_store, _repo_store, gh) =
+        let (_db, h, install_store, _repo_store, gh) =
             make_install_handler_with_supported(10, "stacks-network", "stacks-core").await;
         // 99 is NOT under any supported root.
         gh.set_repo_canonical("randos", "unrelated", 99);
@@ -3807,6 +4018,7 @@ mod tests {
         assert!(
             install_store
                 .membership(100, 99)
+                .await
                 .is_none(),
             "unsupported initial repo must NOT get a membership row"
         );
@@ -3814,6 +4026,7 @@ mod tests {
         assert!(
             install_store
                 .installation(100)
+                .await
                 .is_some()
         );
     }
@@ -3824,7 +4037,7 @@ mod tests {
         // /repos lookup resolves to id=99 (rename/recycling staleness).
         // Membership must NOT be granted — otherwise we'd grant on the
         // wrong repo.
-        let (h, install_store, _repo_store, gh) =
+        let (_db, h, install_store, _repo_store, gh) =
             make_install_handler_with_supported(10, "stacks-network", "stacks-core").await;
         // GH resolves "stacks-network/stacks-core" → id=99 (NOT 10).
         gh.set_repo_canonical("stacks-network", "stacks-core", 99);
@@ -3843,11 +4056,13 @@ mod tests {
         assert!(
             install_store
                 .membership(100, 10)
+                .await
                 .is_none()
         );
         assert!(
             install_store
                 .membership(100, 99)
+                .await
                 .is_none()
         );
     }
@@ -3858,7 +4073,7 @@ mod tests {
         // repositories array (e.g. parsed from a payload that omits
         // the field) still upserts the install and returns
         // ProcessedInstallation without doing any membership work.
-        let (h, install_store, _repo_store, _gh) =
+        let (_db, h, install_store, _repo_store, _gh) =
             make_install_handler_with_supported(10, "stacks-network", "stacks-core").await;
         let w = installation_webhook(
             "created",
@@ -3873,18 +4088,19 @@ mod tests {
         assert!(
             install_store
                 .installation(100)
+                .await
                 .is_some()
         );
         assert!(
             install_store
                 .memberships()
+                .await
                 .is_empty()
         );
     }
 
     // ─── InstallationRepositoriesHandler (slice 4) ──────────────────────
 
-    use sbgh_core::db::InMemoryRepoStore;
     use sbgh_core::github::test_support::FakeGitHub;
 
     fn repos_event_payload(
@@ -3924,21 +4140,34 @@ mod tests {
         }
     }
 
-    /// Build a handler wired against in-memory stores + a FakeGitHub.
+    /// Build a handler wired against production Postgres stores + a FakeGitHub.
     /// Seeds an install (id=100) and an allowed account so memberships
     /// can be inserted without FK errors. The caller seeds whatever
     /// supported_repo_root rows + GH-API responses the test needs.
     async fn make_repos_handler() -> (
+        TestDb,
         InstallationRepositoriesHandler,
-        Arc<InMemoryRepoStore>,
-        Arc<sbgh_core::db::InMemoryInstallationStore>,
-        Arc<sbgh_core::db::InMemoryPolicyStore>,
-        Arc<sbgh_core::db::InMemoryUserStore>,
+        Arc<PostgresRepoStore>,
+        Arc<PostgresInstallationStore>,
+        Arc<PostgresPolicyStore>,
+        Arc<PostgresUserStore>,
         FakeGitHub,
     ) {
-        let repo_store = Arc::new(InMemoryRepoStore::new());
-        let install_store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        install_store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (db, pool) = setup_pg_db().await;
+        let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
+        repo_store
+            .upsert_repo_identity(&NewRepoIdentity {
+                id: 10,
+                owner: "stacks-network".into(),
+                name: "stacks-core".into(),
+                default_branch: None,
+            })
+            .await
+            .unwrap();
+        let install_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
+        install_store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         install_store
             .upsert_installation(&NewInstallation {
                 id: 100,
@@ -3948,8 +4177,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        let user_store = Arc::new(sbgh_core::db::InMemoryUserStore::new());
+        let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
+        let user_store = Arc::new(PostgresUserStore::new(pool));
         let gh = FakeGitHub::new();
         let handler = InstallationRepositoriesHandler::new(
             repo_store.clone(),
@@ -3958,15 +4187,17 @@ mod tests {
             user_store.clone(),
             Arc::new(gh.clone()),
         );
-        (handler, repo_store, install_store, policy_store, user_store, gh)
+        (db, handler, repo_store, install_store, policy_store, user_store, gh)
     }
 
     #[tokio::test]
     async fn repos_added_for_canonical_supported_repo_creates_membership() {
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
         // Repo 10 is the canonical root + on the supported list.
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
 
         let outcome = handler
@@ -3982,6 +4213,7 @@ mod tests {
         ));
         let m = install_store
             .membership(100, 10)
+            .await
             .expect("membership must be created");
         assert!(m.revoked_at.is_none(), "new membership is active");
     }
@@ -3991,9 +4223,11 @@ mod tests {
         // Fork whose `source` is the supported canonical. Lineage walk
         // must record both the fork + the source as github_repo rows;
         // the support gate must accept via fork_root_github_repo_id.
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         let root = RepoRef {
             id: 10,
             owner: "stacks-network".into(),
@@ -4015,11 +4249,13 @@ mod tests {
         ));
         let fork = repo_store
             .repo(20)
+            .await
             .expect("fork must be upserted");
         assert_eq!(fork.fork_root_github_repo_id, Some(10));
         assert!(
             install_store
                 .membership(100, 20)
+                .await
                 .is_some()
         );
     }
@@ -4031,9 +4267,11 @@ mod tests {
         // we only need ONE API request to record the whole chain — the
         // lineage walk inserts R and A as identity rows, then B with
         // fork_root=R.
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         let root_ref = RepoRef {
             id: 10,
             owner: "stacks-network".into(),
@@ -4060,13 +4298,21 @@ mod tests {
         ));
         let leaf = repo_store
             .repo(30)
+            .await
             .expect("leaf must be upserted");
         assert_eq!(leaf.fork_root_github_repo_id, Some(10));
         assert_eq!(leaf.parent_github_repo_id, Some(20));
-        assert!(repo_store.repo(20).is_some(), "intermediate parent must be upserted too");
+        assert!(
+            repo_store
+                .repo(20)
+                .await
+                .is_some(),
+            "intermediate parent must be upserted too"
+        );
         assert!(
             install_store
                 .membership(100, 30)
+                .await
                 .is_some()
         );
     }
@@ -4075,7 +4321,7 @@ mod tests {
     async fn repos_added_for_unsupported_lineage_skips_membership_but_caches_repo() {
         // The repo row STILL gets recorded (audit trail of "we saw this
         // repo and decided we don't support it") but no membership.
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
         // No supported_repo_root seeded.
         gh.set_repo_canonical("randos", "unrelated", 99);
@@ -4091,10 +4337,17 @@ mod tests {
             outcome,
             ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnsupportedLineage)
         ));
-        assert!(repo_store.repo(99).is_some(), "repo identity cached even when unsupported");
+        assert!(
+            repo_store
+                .repo(99)
+                .await
+                .is_some(),
+            "repo identity cached even when unsupported"
+        );
         assert!(
             install_store
                 .membership(100, 99)
+                .await
                 .is_none(),
             "no membership for unsupported"
         );
@@ -4105,9 +4358,11 @@ mod tests {
         // Codex M-fix-style aggregation: any-accepted wins over
         // any-rejected for the webhook-level outcome. Per-repo
         // decisions are recorded in their respective rows.
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
         gh.set_repo_canonical("randos", "unrelated", 99);
 
@@ -4130,18 +4385,20 @@ mod tests {
         assert!(
             install_store
                 .membership(100, 10)
+                .await
                 .is_some()
         );
         assert!(
             install_store
                 .membership(100, 99)
+                .await
                 .is_none()
         );
     }
 
     #[tokio::test]
     async fn repos_added_with_no_repos_is_ignored_action() {
-        let (handler, _r, _i, _p, _user_store, _gh) = make_repos_handler().await;
+        let (_db, handler, _r, _i, _p, _user_store, _gh) = make_repos_handler().await;
         let outcome = handler
             .handle(&repos_webhook("added", repos_event_payload("added", 100, &[], &[])))
             .await;
@@ -4152,9 +4409,11 @@ mod tests {
     async fn repos_added_disabled_supported_root_is_unsupported() {
         // A disabled supported_repo_root row must NOT extend support to
         // its forks. Operator soft-disabled, processor must respect.
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", false);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", false)
+            .await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
 
         let outcome = handler
@@ -4170,6 +4429,7 @@ mod tests {
         assert!(
             install_store
                 .membership(100, 10)
+                .await
                 .is_none()
         );
     }
@@ -4178,7 +4438,7 @@ mod tests {
     async fn repos_added_gh_api_error_is_retryable() {
         // FakeGitHub returns Err for repos that weren't pre-programmed
         // (which lets us simulate API failure deterministically).
-        let (handler, _repo_store, _install_store, _policy_store, _user_store, _gh) =
+        let (_db, handler, _repo_store, _install_store, _policy_store, _user_store, _gh) =
             make_repos_handler().await;
         // No canned response for this repo → FakeGitHub returns Err.
         let outcome = handler
@@ -4196,9 +4456,11 @@ mod tests {
         // upsert is a no-op, the lineage walk re-runs the API call but
         // converges to the same row, and the outcome stays
         // ProcessedInstallation (any successful membership op).
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
         let webhook = repos_webhook(
             "added",
@@ -4208,12 +4470,14 @@ mod tests {
         handler.handle(&webhook).await;
         let first_granted_at = install_store
             .membership(100, 10)
+            .await
             .unwrap()
             .granted_at;
 
         handler.handle(&webhook).await;
         let second_granted_at = install_store
             .membership(100, 10)
+            .await
             .unwrap()
             .granted_at;
         assert_eq!(first_granted_at, second_granted_at, "re-delivery must NOT change granted_at");
@@ -4221,9 +4485,11 @@ mod tests {
 
     #[tokio::test]
     async fn repos_removed_revokes_active_memberships() {
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
         // Seed via the add path so we exercise the realistic state.
         handler
@@ -4245,6 +4511,7 @@ mod tests {
         ));
         let m = install_store
             .membership(100, 10)
+            .await
             .unwrap();
         assert!(m.revoked_at.is_some(), "revoked membership must have revoked_at set");
     }
@@ -4253,7 +4520,7 @@ mod tests {
     async fn repos_removed_for_unknown_membership_is_ignored_action() {
         // GitHub backfill / out-of-order delivery: a `removed` for a
         // repo we never tracked is a no-op.
-        let (handler, _r, _i, _p, _user_store, _gh) = make_repos_handler().await;
+        let (_db, handler, _r, _i, _p, _user_store, _gh) = make_repos_handler().await;
         let outcome = handler
             .handle(&repos_webhook(
                 "removed",
@@ -4265,7 +4532,7 @@ mod tests {
 
     #[tokio::test]
     async fn repos_unknown_action_is_ignored_action() {
-        let (handler, _r, _i, _p, _user_store, _gh) = make_repos_handler().await;
+        let (_db, handler, _r, _i, _p, _user_store, _gh) = make_repos_handler().await;
         let outcome = handler
             .handle(&repos_webhook(
                 "weird_action",
@@ -4277,7 +4544,7 @@ mod tests {
 
     #[tokio::test]
     async fn repos_null_payload_is_error() {
-        let (handler, _r, _i, _p, _user_store, _gh) = make_repos_handler().await;
+        let (_db, handler, _r, _i, _p, _user_store, _gh) = make_repos_handler().await;
         let mut w = repos_webhook("added", serde_json::Value::Null);
         w.payload = None;
         let outcome = handler.handle(&w).await;
@@ -4289,9 +4556,11 @@ mod tests {
         // A repo with no '/' in full_name can't be resolved (we'd need
         // owner/name split for the GH API call). Log + skip rather than
         // failing the batch.
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
 
         let outcome = handler
@@ -4313,11 +4582,13 @@ mod tests {
         assert!(
             install_store
                 .membership(100, 10)
+                .await
                 .is_some()
         );
         assert!(
             install_store
                 .membership(100, 99)
+                .await
                 .is_none()
         );
     }
@@ -4332,9 +4603,11 @@ mod tests {
         // `add_or_restore_membership` is the line of defense (returns
         // None for soft-deleted installs); the handler maps that to
         // IgnoredUnknownInstallation.
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
         // Soft-delete the install BEFORE the .added event arrives.
         install_store
@@ -4355,6 +4628,7 @@ mod tests {
         assert!(
             install_store
                 .membership(100, 10)
+                .await
                 .is_none(),
             "membership MUST NOT be resurrected on a soft-deleted install"
         );
@@ -4367,13 +4641,17 @@ mod tests {
         // (rename/recycling staleness). Membership must NOT be created
         // for either id. Other (consistent) repos in the same batch
         // still process normally.
-        let (handler, repo_store, install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         // Mismatch: payload says 10, GH says 99.
         gh.set_repo_canonical("stacks-network", "stacks-core", 99);
         // A second repo in the same batch with consistent ids.
-        repo_store.seed_supported_root(20, "stacks-network", "other", true);
+        repo_store
+            .seed_supported_root(20, "stacks-network", "other", true)
+            .await;
         gh.set_repo_canonical("stacks-network", "other", 20);
 
         let outcome = handler
@@ -4398,17 +4676,20 @@ mod tests {
         assert!(
             install_store
                 .membership(100, 10)
+                .await
                 .is_none()
         );
         assert!(
             install_store
                 .membership(100, 99)
+                .await
                 .is_none()
         );
         // The consistent repo got its membership.
         assert!(
             install_store
                 .membership(100, 20)
+                .await
                 .is_some()
         );
     }
@@ -4420,9 +4701,11 @@ mod tests {
         // should reflect "we couldn't accept anything" — bucketed
         // under IgnoredUnsupportedLineage which is the existing
         // umbrella for "no membership for various reasons".
-        let (handler, repo_store, _install_store, _policy_store, _user_store, gh) =
+        let (_db, handler, repo_store, _install_store, _policy_store, _user_store, gh) =
             make_repos_handler().await;
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        repo_store
+            .seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
         gh.set_repo_canonical("stacks-network", "stacks-core", 99); // mismatch
 
         let outcome = handler
@@ -4435,46 +4718,6 @@ mod tests {
             outcome,
             ClassifyOutcome::Terminal(WebhookOutcome::IgnoredUnsupportedLineage)
         ));
-    }
-
-    #[tokio::test]
-    async fn add_or_restore_membership_returns_none_for_soft_deleted_install() {
-        // Direct store-level test (in-memory) for the M1 fix invariant.
-        let store = sbgh_core::db::InMemoryInstallationStore::new();
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        store
-            .upsert_installation(&NewInstallation {
-                id: 100,
-                github_account_id: 42,
-                account_login: "octo-org".into(),
-                account_type: GithubAccountType::Organization,
-            })
-            .await
-            .unwrap();
-        store
-            .delete_installation(100)
-            .await
-            .unwrap();
-        // Repo doesn't even need to exist — the guard short-circuits
-        // before any FK is checked.
-        let result = store
-            .add_or_restore_membership(100, 10)
-            .await
-            .unwrap();
-        assert!(
-            result.is_none(),
-            "add_or_restore must return None for soft-deleted install (M1 fix)"
-        );
-    }
-
-    #[tokio::test]
-    async fn add_or_restore_membership_returns_none_for_missing_install() {
-        let store = sbgh_core::db::InMemoryInstallationStore::new();
-        let result = store
-            .add_or_restore_membership(999, 10)
-            .await
-            .unwrap();
-        assert!(result.is_none(), "add_or_restore must return None when install doesn't exist");
     }
 
     // ─── Slice 5 unit tests: PullRequest / Push / Create handlers ───────
@@ -4530,16 +4773,39 @@ mod tests {
     /// the install_store after construction (revoke membership /
     /// soft-delete install / suspend).
     async fn make_pr_handler() -> (
+        TestDb,
         PullRequestHandler,
-        Arc<sbgh_core::db::InMemoryPolicyStore>,
-        Arc<sbgh_core::db::InMemoryInstallationStore>,
-        Arc<sbgh_core::db::InMemoryUserStore>,
-        Arc<sbgh_core::db::InMemoryPullRequestStore>,
+        Arc<PostgresPolicyStore>,
+        Arc<PostgresInstallationStore>,
+        Arc<PostgresUserStore>,
+        Arc<PostgresPullRequestStore>,
     ) {
-        let repo_store = Arc::new(sbgh_core::db::InMemoryRepoStore::new());
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        let install_store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        install_store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
+        let (db, pool) = setup_pg_db().await;
+        let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
+        for identity in [
+            NewRepoIdentity {
+                id: 10,
+                owner: "o".into(),
+                name: "r".into(),
+                default_branch: None,
+            },
+            NewRepoIdentity {
+                id: 20,
+                owner: "alice".into(),
+                name: "r".into(),
+                default_branch: None,
+            },
+        ] {
+            repo_store
+                .upsert_repo_identity(&identity)
+                .await
+                .unwrap();
+        }
+        let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
+        let install_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
+        install_store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
         install_store
             .upsert_installation(&NewInstallation {
                 id: 100,
@@ -4553,9 +4819,10 @@ mod tests {
             .add_or_restore_membership(100, 10)
             .await
             .unwrap();
-        let user_store = Arc::new(sbgh_core::db::InMemoryUserStore::new());
-        let pull_request_store = Arc::new(sbgh_core::db::InMemoryPullRequestStore::new());
+        let user_store = Arc::new(PostgresUserStore::new(pool.clone()));
+        let pull_request_store = Arc::new(PostgresPullRequestStore::new(pool));
         (
+            db,
             PullRequestHandler::new(
                 repo_store,
                 policy_store.clone(),
@@ -4578,9 +4845,14 @@ mod tests {
         // `ProcessedPullRequest` (not `WouldEnqueueJob`, which would
         // imply a job is coming, and not `IgnoredAction`, which would
         // hide that PR state changed).
-        let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_source(100, 20, true);
+        let (_db, h, policy_store, _install_store, _user_store, _pr_store) =
+            make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_source(100, 20, true)
+            .await;
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::ProcessedPullRequest)));
@@ -4591,7 +4863,8 @@ mod tests {
         // Slice 6: PullRequestHandler upserts the PR author so slice
         // 7's `github_pull_request.author_github_user_id` FK target
         // exists. Independent of policy eval — even denied PRs upsert.
-        let (h, _policy_store, _install_store, user_store, _pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, user_store, _pr_store) =
+            make_pr_handler().await;
         // No policies seeded → DeniedTargetPolicy.
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let _ = h.handle(&w).await;
@@ -4609,7 +4882,8 @@ mod tests {
     async fn pr_opened_materialises_pull_request_row() {
         // Slice 7: PullRequestHandler materialises the
         // github_pull_request row via the shared helper.
-        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, _user_store, pr_store) =
+            make_pr_handler().await;
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let _ = h.handle(&w).await;
         let pr = pr_store
@@ -4630,9 +4904,13 @@ mod tests {
         // typo fixes into benchmark triggers). The PR row's title
         // still refreshes via the materialise upsert; the outcome
         // is IgnoredAction, not WouldEnqueueJob.
-        let (h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_source(100, 20, true);
+        let (_db, h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_source(100, 20, true)
+            .await;
         // First opened to materialise.
         let w_open = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let _ = h.handle(&w_open).await;
@@ -4662,9 +4940,13 @@ mod tests {
         // does an edited event re-run policy eval. This covers the
         // rare case where the operator changes the PR's base ref,
         // which can shift the target repo identity.
-        let (h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_source(100, 20, true);
+        let (_db, h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_source(100, 20, true)
+            .await;
         let w_open = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let _ = h.handle(&w_open).await;
 
@@ -4694,7 +4976,8 @@ mod tests {
         // PR. The original handler returned Error for closed in this
         // case, losing the close signal. The dispatch reordering means
         // closed only needs base.repo.
-        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, _user_store, pr_store) =
+            make_pr_handler().await;
         // Materialise first via opened (which DOES need head.repo).
         let _ = h
             .handle(&pr_webhook("opened", pr_event_payload("opened", 100, 10, 20)))
@@ -4721,7 +5004,8 @@ mod tests {
     async fn pr_labeled_without_head_repo_terminates_ignored_action() {
         // Slice 7 review fix: ignored-by-default actions terminate as
         // IgnoredAction WITHOUT requiring head.repo (or base.repo).
-        let (h, _policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, _user_store, _pr_store) =
+            make_pr_handler().await;
         let mut payload = pr_event_payload("labeled", 100, 10, 20);
         payload["pull_request"]["head"]["repo"] = serde_json::Value::Null;
         payload["pull_request"]["base"]["repo"] = serde_json::Value::Null;
@@ -4735,7 +5019,8 @@ mod tests {
         // Slice 7: closed sets closed_at on the existing PR row,
         // terminates as IgnoredAction (no policy eval, no enqueue
         // signal — closing isn't a benchmark trigger).
-        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, _user_store, pr_store) =
+            make_pr_handler().await;
         // Materialise via opened first.
         let w_open = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let _ = h.handle(&w_open).await;
@@ -4756,9 +5041,13 @@ mod tests {
         // Slice 7: reopened clears closed_at on the existing row AND
         // re-runs policy eval (policies may have changed since the
         // close).
-        let (h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_source(100, 20, true);
+        let (_db, h, policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_source(100, 20, true)
+            .await;
         // Materialise then close.
         let _ = h
             .handle(&pr_webhook("opened", pr_event_payload("opened", 100, 10, 20)))
@@ -4791,7 +5080,8 @@ mod tests {
         // Slice 7 + slice 5: synchronize refreshes head metadata (via
         // upsert) AND re-runs policy eval. The PR row must remain
         // present even with no policies (denied path).
-        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, _user_store, pr_store) =
+            make_pr_handler().await;
         let w_open = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let _ = h.handle(&w_open).await;
         let w_sync = pr_webhook("synchronize", pr_event_payload("synchronize", 100, 10, 20));
@@ -4809,7 +5099,8 @@ mod tests {
     async fn pr_closed_for_unseen_pr_is_idempotent_no_op() {
         // closed for a PR whose opened event we never saw is a
         // graceful no-op (no row to update; terminal IgnoredAction).
-        let (h, _policy_store, _install_store, _user_store, pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, _user_store, pr_store) =
+            make_pr_handler().await;
         let w = pr_webhook("closed", pr_event_payload("closed", 100, 10, 20));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -4825,7 +5116,8 @@ mod tests {
 
     #[tokio::test]
     async fn pr_opened_missing_target_is_denied_target_policy() {
-        let (h, _policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, _user_store, _pr_store) =
+            make_pr_handler().await;
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)));
@@ -4833,9 +5125,14 @@ mod tests {
 
     #[tokio::test]
     async fn pr_opened_disabled_target_is_denied_target_policy() {
-        let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, false);
-        policy_store.seed_source(100, 20, true);
+        let (_db, h, policy_store, _install_store, _user_store, _pr_store) =
+            make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, false)
+            .await;
+        policy_store
+            .seed_source(100, 20, true)
+            .await;
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::DeniedTargetPolicy)));
@@ -4843,8 +5140,11 @@ mod tests {
 
     #[tokio::test]
     async fn pr_opened_missing_source_is_denied_source_policy() {
-        let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
+        let (_db, h, policy_store, _install_store, _user_store, _pr_store) =
+            make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
         // No source.
         let w = pr_webhook("opened", pr_event_payload("opened", 100, 10, 20));
         let outcome = h.handle(&w).await;
@@ -4858,7 +5158,8 @@ mod tests {
         // edited do have side effects (closed sets closed_at, edited
         // runs materialise + policy eval) and are covered by
         // dedicated tests below.
-        let (h, _policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
+        let (_db, h, _policy_store, _install_store, _user_store, _pr_store) =
+            make_pr_handler().await;
         for action in ["labeled", "unlabeled", "assigned"] {
             let w = pr_webhook(action, pr_event_payload(action, 100, 10, 20));
             let outcome = h.handle(&w).await;
@@ -4871,7 +5172,7 @@ mod tests {
 
     #[tokio::test]
     async fn pr_null_payload_is_error() {
-        let (h, _ps, _install_store, _user_store, _pr_store) = make_pr_handler().await;
+        let (_db, h, _ps, _install_store, _user_store, _pr_store) = make_pr_handler().await;
         let mut w = pr_webhook("opened", serde_json::Value::Null);
         w.payload = None;
         let outcome = h.handle(&w).await;
@@ -4883,8 +5184,11 @@ mod tests {
         // synchronize fires on every new push to a PR's head — should
         // re-evaluate policies (a previously-accepted PR's source repo
         // might have been disabled in the meantime).
-        let (h, policy_store, _install_store, _user_store, _pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
+        let (_db, h, policy_store, _install_store, _user_store, _pr_store) =
+            make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
         // No source enabled.
         let w = pr_webhook("synchronize", pr_event_payload("synchronize", 100, 10, 20));
         let outcome = h.handle(&w).await;
@@ -4898,9 +5202,13 @@ mod tests {
         // Codex slice-5 review High #1: a target_repo_policy row with
         // is_enabled=TRUE must NOT cause acceptance if the membership
         // has been revoked since the policy was created.
-        let (h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_source(100, 20, true);
+        let (_db, h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_source(100, 20, true)
+            .await;
         // Revoke the membership AFTER the policies are seeded.
         install_store
             .revoke_membership(100, 10)
@@ -4916,9 +5224,13 @@ mod tests {
 
     #[tokio::test]
     async fn pr_with_enabled_target_but_suspended_install_is_denied_target_policy() {
-        let (h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_source(100, 20, true);
+        let (_db, h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_source(100, 20, true)
+            .await;
         install_store
             .set_suspended(100, Some(chrono::Utc::now()))
             .await
@@ -4930,9 +5242,13 @@ mod tests {
 
     #[tokio::test]
     async fn pr_with_enabled_target_but_soft_deleted_install_is_denied_target_policy() {
-        let (h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_source(100, 20, true);
+        let (_db, h, policy_store, install_store, _user_store, _pr_store) = make_pr_handler().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_source(100, 20, true)
+            .await;
         install_store
             .delete_installation(100)
             .await
@@ -4944,18 +5260,10 @@ mod tests {
 
     #[tokio::test]
     async fn repos_removed_cascades_to_disable_target_policy_and_triggers() {
-        // Codex slice-5 review High #1 fix: handle_removed cascades to
-        // policy_store.disable_target_and_triggers BEFORE revoking the
-        // membership. This test pins the cascade end-to-end via the
-        // in-memory stores.
-        let (handler, _r, install_store, policy_store, _user_store, gh) =
+        // `handle_removed` cascades to policy_store before revoking the
+        // membership. This pins the cascade against the production stores.
+        let (_db, handler, _r, install_store, policy_store, _user_store, gh) =
             make_repos_handler().await;
-        // Seed: supported root + canned GH response.
-        let repo_store_for_seed = Arc::new(InMemoryRepoStore::new());
-        repo_store_for_seed.seed_supported_root(10, "stacks-network", "stacks-core", true);
-        // Use the SAME repo_store the handler was built with via `make_repos_handler`:
-        // we can't directly grab it because the helper returns it, but we can use the
-        // installation_repositories.added path to materialise it, then verify cascade.
         gh.set_repo_canonical("stacks-network", "stacks-core", 10);
         // Add membership first.
         handler
@@ -5012,6 +5320,7 @@ mod tests {
         assert!(triggers.is_empty(), "trigger_policy must be cascade-disabled by .removed");
         let membership = install_store
             .membership(100, 10)
+            .await
             .unwrap();
         assert!(
             membership
@@ -5025,15 +5334,21 @@ mod tests {
         // Third-pass review fix: handle_removed cascades into
         // github_user_role too, soft-revoking any repo-scoped grants
         // for the removed repo. Install-wide grants stay active.
-        let (handler, _r, install_store, _policy_store, user_store, _gh) =
+        let (_db, handler, _r, install_store, _policy_store, user_store, _gh) =
             make_repos_handler().await;
         let _ = install_store
             .add_or_restore_membership(100, 10)
             .await
             .unwrap();
-        user_store.seed_user(42, "alice", GithubAccountType::User);
-        user_store.seed_role(42, 100, Some(10), UserRole::TriggerPrBenchmark);
-        user_store.seed_role(42, 100, None, UserRole::TriggerPrBenchmark); // install-wide
+        user_store
+            .seed_user(42, "alice", GithubAccountType::User)
+            .await;
+        user_store
+            .seed_role(42, 100, Some(10), UserRole::TriggerPrBenchmark)
+            .await;
+        user_store
+            .seed_role(42, 100, None, UserRole::TriggerPrBenchmark)
+            .await; // install-wide
 
         // Fire .removed for repo=10.
         handler
@@ -5103,16 +5418,26 @@ mod tests {
         }
     }
 
-    /// Build an in-memory install_store with an active install (id=100)
-    /// + active membership for (100, 10).
-    ///
-    /// The slice-5-review gate passes for happy-path push/create tests;
-    /// failure-path tests mutate the returned store (revoke / suspend /
-    /// soft-delete).
-    async fn make_active_install_store() -> Arc<sbgh_core::db::InMemoryInstallationStore> {
-        let store = Arc::new(sbgh_core::db::InMemoryInstallationStore::new());
-        store.seed_allowed(42, "octo-org", GithubAccountType::Organization, true);
-        store
+    /// Production-store fixture for push/create handler tests.
+    async fn make_trigger_stores()
+    -> (TestDb, Arc<PostgresPolicyStore>, Arc<PostgresInstallationStore>, Arc<PostgresJobStore>)
+    {
+        let (db, pool) = setup_pg_db().await;
+        let repo_store = PostgresRepoStore::new(pool.clone());
+        repo_store
+            .upsert_repo_identity(&NewRepoIdentity {
+                id: 10,
+                owner: "o".into(),
+                name: "r".into(),
+                default_branch: None,
+            })
+            .await
+            .unwrap();
+        let install_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
+        install_store
+            .seed_allowed(42, "octo-org", GithubAccountType::Organization, true)
+            .await;
+        install_store
             .upsert_installation(&NewInstallation {
                 id: 100,
                 github_account_id: 42,
@@ -5121,11 +5446,24 @@ mod tests {
             })
             .await
             .unwrap();
-        let _ = store
+        let _ = install_store
             .add_or_restore_membership(100, 10)
             .await
             .unwrap();
-        store
+        sqlx::query(
+            "INSERT INTO github_webhook \
+             (id, delivery_id, event_type, payload_size_bytes) \
+             VALUES (1, 'unit-trigger', 'push', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        (
+            db,
+            Arc::new(PostgresPolicyStore::new(pool.clone())),
+            install_store,
+            Arc::new(PostgresJobStore::new(pool)),
+        )
     }
 
     #[tokio::test]
@@ -5137,23 +5475,25 @@ mod tests {
         // Parent target must be enabled — slice 5 second-pass runtime
         // gate in `list_enabled_triggers` joins through
         // `target_repo_policy` and filters disabled/missing parents.
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let job_store = Arc::new(sbgh_core::db::InMemoryJobStore::new());
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
         let h = PushHandler::new(policy_store, install_store, job_store.clone());
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
 
-        let jobs = job_store.all_jobs();
+        let jobs = job_store.all_jobs().await;
         assert_eq!(jobs.len(), 1);
         let job = &jobs[0];
         assert_eq!(job.github_repo_id, 10);
@@ -5167,11 +5507,13 @@ mod tests {
         assert!(
             job_store
                 .user_links()
+                .await
                 .is_empty()
         );
         assert!(
             job_store
                 .pr_links()
+                .await
                 .is_empty()
         );
     }
@@ -5204,17 +5546,19 @@ mod tests {
         // unit-tested in `sbgh_core::bench_args`; here we assert the handler
         // wires `default_args` through and persists the key.
         const DEFAULT: &str = "--start-at 7800000 --count 5000 --bench-spans-only";
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let job_store = Arc::new(sbgh_core::db::InMemoryJobStore::new());
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
         let h = PushHandler::new(policy_store, install_store, job_store.clone())
             .with_default_args(DEFAULT);
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
@@ -5223,7 +5567,7 @@ mod tests {
             ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
         ));
 
-        let jobs = job_store.all_jobs();
+        let jobs = job_store.all_jobs().await;
         let key = jobs[0].workload_key.clone();
         // NULL trigger args → default_args → same key a bare `/benchmark`
         // (empty override) would resolve to.
@@ -5242,17 +5586,19 @@ mod tests {
         // `head_commit: null`. Even when a branch_push trigger matches the
         // ref, there is nothing to benchmark — terminate as IgnoredAction
         // and create NO job (vs. enqueuing one with no resolvable commit).
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let job_store = Arc::new(sbgh_core::db::InMemoryJobStore::new());
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
         let h = PushHandler::new(policy_store, install_store, job_store.clone());
         // No `head_commit` key → parses as None.
         let payload = serde_json::json!({
@@ -5266,6 +5612,7 @@ mod tests {
         assert!(
             job_store
                 .all_jobs()
+                .await
                 .is_empty(),
             "branch deletion must not enqueue a job"
         );
@@ -5273,20 +5620,20 @@ mod tests {
 
     #[tokio::test]
     async fn push_with_no_matching_trigger_is_ignored_action() {
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let h = PushHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
+        let h = PushHandler::new(policy_store, install_store, job_store);
         let w = push_webhook_claimed(push_event_payload(100, 10, "feature-x"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5295,20 +5642,20 @@ mod tests {
     #[tokio::test]
     async fn push_with_disabled_trigger_does_not_match() {
         // Disabled trigger must not surface in list_enabled_triggers.
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            false, // disabled
-        );
-        let install_store = make_active_install_store().await;
-        let h = PushHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                false, // disabled
+            )
+            .await;
+        let h = PushHandler::new(policy_store, install_store, job_store);
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         // Disabled trigger doesn't surface in list_enabled_triggers, so
@@ -5322,13 +5669,8 @@ mod tests {
     async fn push_non_branch_ref_is_ignored() {
         // Internal refs (refs/internal/...) get skipped without a
         // policy lookup. Rare in practice but defensive.
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        let install_store = make_active_install_store().await;
-        let h = PushHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        let h = PushHandler::new(policy_store, install_store, job_store);
         let payload = serde_json::json!({
             "ref": "refs/tags/v1.0",
             "installation": { "id": 100 },
@@ -5379,25 +5721,27 @@ mod tests {
         //
         // Parent target must be enabled — slice 5 second-pass runtime
         // gate filters triggers whose parent target is disabled / missing.
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_target(100, 10, true);
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::TagCreated,
-            &TriggerMatchSpec::TagCreated {
-                tag_pattern: r"^release/\d+\.\d+$".into(),
-            },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let job_store = Arc::new(sbgh_core::db::InMemoryJobStore::new());
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::TagCreated,
+                &TriggerMatchSpec::TagCreated {
+                    tag_pattern: r"^release/\d+\.\d+$".into(),
+                },
+                true,
+            )
+            .await;
         let h = CreateHandler::new(policy_store, install_store, job_store.clone());
         let w = create_webhook_claimed(create_event_payload(100, 10, "release/1.2", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
 
-        let jobs = job_store.all_jobs();
+        let jobs = job_store.all_jobs().await;
         assert_eq!(jobs.len(), 1);
         let job = &jobs[0];
         assert_eq!(job.intent, sbgh_core::models::JobIntent::BaselineBenchmark);
@@ -5412,22 +5756,22 @@ mod tests {
 
     #[tokio::test]
     async fn create_tag_not_matching_pattern_is_ignored_action() {
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::TagCreated,
-            &TriggerMatchSpec::TagCreated {
-                tag_pattern: r"^release/\d+\.\d+$".into(),
-            },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::TagCreated,
+                &TriggerMatchSpec::TagCreated {
+                    tag_pattern: r"^release/\d+\.\d+$".into(),
+                },
+                true,
+            )
+            .await;
+        let h = CreateHandler::new(policy_store, install_store, job_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "feature/foo", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5437,13 +5781,8 @@ mod tests {
     async fn create_branch_ref_is_skipped_without_policy_lookup() {
         // ref_type=branch must be silently ignored — those events are
         // already covered by `push`.
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        let h = CreateHandler::new(policy_store, install_store, job_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "new-branch", "branch"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5454,44 +5793,41 @@ mod tests {
         // Operator-supplied bad regex should log + skip ONLY that
         // trigger; other (well-formed) triggers in the same batch
         // still evaluate. Modeled here with one bad + one good.
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::TagCreated,
-            &TriggerMatchSpec::TagCreated {
-                tag_pattern: "[malformed".into(),
-            },
-            true,
-        );
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::TagCreated,
-            &TriggerMatchSpec::TagCreated { tag_pattern: r"^v\d+$".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::TagCreated,
+                &TriggerMatchSpec::TagCreated {
+                    tag_pattern: "[malformed".into(),
+                },
+                true,
+            )
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::TagCreated,
+                &TriggerMatchSpec::TagCreated { tag_pattern: r"^v\d+$".into() },
+                true,
+            )
+            .await;
+        let h = CreateHandler::new(policy_store, install_store, job_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
-        // The good trigger still got to match.
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
+        // The good trigger still matches and enqueues despite the malformed peer.
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
     }
 
     #[tokio::test]
     async fn create_null_payload_is_error() {
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        let h = CreateHandler::new(policy_store, install_store, job_store);
         let mut w = create_webhook_claimed(serde_json::Value::Null);
         w.payload = None;
         let outcome = h.handle(&w).await;
@@ -5505,24 +5841,24 @@ mod tests {
         // Codex slice-5 review High #2: even a perfectly matching
         // trigger_policy row must NOT cause acceptance if the
         // membership has been revoked.
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
         install_store
             .revoke_membership(100, 10)
             .await
             .unwrap();
-        let h = PushHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let h = PushHandler::new(policy_store, install_store, job_store);
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5530,24 +5866,24 @@ mod tests {
 
     #[tokio::test]
     async fn push_with_matching_trigger_but_soft_deleted_install_is_ignored() {
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
         install_store
             .delete_installation(100)
             .await
             .unwrap();
-        let h = PushHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let h = PushHandler::new(policy_store, install_store, job_store);
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5555,24 +5891,24 @@ mod tests {
 
     #[tokio::test]
     async fn create_tag_with_matching_trigger_but_revoked_membership_is_ignored() {
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::TagCreated,
-            &TriggerMatchSpec::TagCreated { tag_pattern: r"^v\d+$".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, true)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::TagCreated,
+                &TriggerMatchSpec::TagCreated { tag_pattern: r"^v\d+$".into() },
+                true,
+            )
+            .await;
         install_store
             .revoke_membership(100, 10)
             .await
             .unwrap();
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let h = CreateHandler::new(policy_store, install_store, job_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5590,44 +5926,21 @@ mod tests {
         // disables the trigger row directly; this gate covers ad-hoc
         // CLI disables that pre-date the cascade fix or that take a
         // different code path).
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
         // Parent target exists but DISABLED.
-        policy_store.seed_target(100, 10, false);
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let h = PushHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
-        let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
-        let outcome = h.handle(&w).await;
-        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
-    }
-
-    #[tokio::test]
-    async fn push_with_matching_trigger_and_missing_parent_target_is_ignored() {
-        // No target row at all → trigger must not match.
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let h = PushHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        policy_store
+            .seed_target(100, 10, false)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
+        let h = PushHandler::new(policy_store, install_store, job_store);
         let w = push_webhook_claimed(push_event_payload(100, 10, "develop"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5635,21 +5948,20 @@ mod tests {
 
     #[tokio::test]
     async fn create_tag_with_matching_trigger_but_disabled_parent_target_is_ignored() {
-        let policy_store = Arc::new(sbgh_core::db::InMemoryPolicyStore::new());
-        policy_store.seed_target(100, 10, false);
-        policy_store.seed_trigger(
-            100,
-            10,
-            TriggerKind::TagCreated,
-            &TriggerMatchSpec::TagCreated { tag_pattern: r"^v\d+$".into() },
-            true,
-        );
-        let install_store = make_active_install_store().await;
-        let h = CreateHandler::new(
-            policy_store,
-            install_store,
-            Arc::new(sbgh_core::db::InMemoryJobStore::new()),
-        );
+        let (_db, policy_store, install_store, job_store) = make_trigger_stores().await;
+        policy_store
+            .seed_target(100, 10, false)
+            .await;
+        policy_store
+            .seed_trigger(
+                100,
+                10,
+                TriggerKind::TagCreated,
+                &TriggerMatchSpec::TagCreated { tag_pattern: r"^v\d+$".into() },
+                true,
+            )
+            .await;
+        let h = CreateHandler::new(policy_store, install_store, job_store);
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));

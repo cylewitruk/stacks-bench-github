@@ -26,6 +26,69 @@ impl PostgresPolicyStore {
     }
 }
 
+#[cfg(feature = "testing")]
+impl PostgresPolicyStore {
+    pub async fn seed_target(&self, install_id: i64, repo_id: i64, is_enabled: bool) {
+        self.upsert_target_policy(install_id, repo_id, None)
+            .await
+            .expect("seed target policy");
+        if !is_enabled {
+            self.disable_target_policy(install_id, repo_id)
+                .await
+                .expect("disable seeded target policy");
+        }
+    }
+
+    pub async fn seed_source(&self, install_id: i64, repo_id: i64, is_enabled: bool) {
+        self.upsert_source_policy(install_id, repo_id, None)
+            .await
+            .expect("seed source policy");
+        if !is_enabled {
+            self.disable_source_policy(install_id, repo_id)
+                .await
+                .expect("disable seeded source policy");
+        }
+    }
+
+    pub async fn seed_trigger(
+        &self,
+        install_id: i64,
+        repo_id: i64,
+        kind: crate::models::TriggerKind,
+        spec: &crate::models::TriggerMatchSpec,
+        is_enabled: bool,
+    ) -> i64 {
+        let trigger = self
+            .add_trigger_policy(install_id, repo_id, kind, spec, None, None)
+            .await
+            .expect("seed trigger policy");
+        if !is_enabled {
+            self.disable_trigger_policy(trigger.id)
+                .await
+                .expect("disable seeded trigger policy");
+        }
+        trigger.id
+    }
+
+    pub async fn set_trigger_pinned(
+        &self,
+        id: i64,
+        pinned: bool,
+        pinned_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        sqlx::query(
+            "UPDATE trigger_policy SET pinned = $2, pinned_until = CASE WHEN $2 THEN $3 ELSE NULL \
+             END, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(pinned)
+        .bind(pinned_until)
+        .execute(&self.pool)
+        .await
+        .expect("update seeded trigger pin");
+    }
+}
+
 #[async_trait]
 impl PolicyStore for PostgresPolicyStore {
     async fn lookup_target_policy(

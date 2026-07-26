@@ -26,6 +26,36 @@ impl PostgresUserStore {
     }
 }
 
+#[cfg(feature = "testing")]
+impl PostgresUserStore {
+    pub async fn seed_user(
+        &self,
+        id: i64,
+        login: &str,
+        user_type: crate::models::GithubAccountType,
+    ) {
+        self.upsert_user(&crate::db::NewUser {
+            id,
+            login: login.to_string(),
+            user_type,
+        })
+        .await
+        .expect("seed user");
+    }
+
+    pub async fn seed_role(
+        &self,
+        github_user_id: i64,
+        github_installation_id: i64,
+        github_repo_id: Option<i64>,
+        granted_role: crate::models::UserRole,
+    ) {
+        self.grant_role(github_user_id, github_installation_id, github_repo_id, granted_role, None)
+            .await
+            .expect("seed role");
+    }
+}
+
 #[async_trait]
 impl UserStore for PostgresUserStore {
     async fn upsert_user(&self, new: &NewUser) -> Result<GithubUser> {

@@ -54,7 +54,7 @@ pub trait PolicyStore: Send + Sync + 'static {
     /// List all enabled trigger_policy rows for (install, repo, kind).
     /// Hot-path uses the partial index on `is_enabled`. Caller then
     /// matches each row's `match_spec` against the inbound ref in code
-    /// (handful of rows per repo; in-memory iteration cheaper than
+    /// (handful of rows per repo; application-side iteration is cheaper than
     /// SQL regex). Returns empty vec when no rows match.
     async fn list_enabled_triggers(
         &self,

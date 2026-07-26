@@ -198,7 +198,9 @@ DB-resumable across multiple specs.
   run 0 for spec K+1, and completion of the final spec terminates the group.
 - Preserve the invariant: at most one queued/claimed/running job per comparison
   group, independent of daemon `max_concurrent_jobs`.
-- Keep in-memory and Postgres stores behaviorally aligned.
+- Cover persistence semantics against the production Postgres stores. Use
+  narrow caller-level fakes only for orchestration behavior that does not
+  depend on persistence.
 
 **Status:**
 
@@ -223,7 +225,7 @@ DB-resumable across multiple specs.
 
 **Tests:**
 
-- Postgres and in-memory store tests for two-spec group creation.
+- Postgres store tests for two-spec group creation.
 - Append/resume tests for spec0-final → spec1-run0 and final-spec terminal.
 - Race/backstop tests for duplicate active-run prevention.
 
@@ -252,10 +254,9 @@ preserving one carried group DB and one calibration per variant.
   (`requested_run_count > 1`) is insufficient for two variants with one repeat
   each, because each spec has `requested_run_count = 1` but still needs its own
   calibration.
-- Update the descriptive workflow-step insertion in both Postgres and
-  in-memory stores in lockstep with the runtime calibration trigger, so the
-  inert `calibrate` step rows accurately reflect per-variant calibration for
-  comparison groups.
+- Update the descriptive workflow-step insertion in Postgres in lockstep with
+  the runtime calibration trigger, so the inert `calibrate` step rows
+  accurately reflect per-variant calibration for comparison groups.
 - Reuse a variant's persisted `baseline_id` across clean repeats of that same
   variant.
 - Fail closed if carry-forward or `--baseline-id` validation fails; do not

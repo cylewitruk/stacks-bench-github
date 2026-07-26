@@ -339,8 +339,9 @@ persistence and GitHub integrations owned by adapter crates.
   implementation, and Reqwest/JWT-specific errors.
 - Keep GitHub-facing domain values and the `GitHubApi` port in `sbgh-core` only
   where they are genuine daemon-domain contracts.
-- Keep in-memory stores behind the existing testing feature if they become
-  dependency-light; otherwise move them to a dedicated test-support surface.
+- In-memory stores remained behind the testing feature for this boundary
+  refactor and were subsequently retired in favor of production Postgres
+  persistence tests and narrow orchestration fakes.
 - Update daemon composition to construct the concrete Postgres and GitHub
   adapters.
 

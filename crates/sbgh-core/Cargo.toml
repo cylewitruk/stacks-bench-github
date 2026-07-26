@@ -32,15 +32,11 @@ toml.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 
-# sbgh-core's own integration tests need the `testing` feature for the
-# in-memory stores. Self-dep is the canonical
-# way to enable features only for tests.
+# sbgh-core's integration tests use the feature-gated GitHub test support.
+# A self-dependency is the canonical way to enable features only for tests.
 sbgh-core = { path = ".", features = ["testing"] }
 
 [features]
-# Exposes in-memory / fake implementations of the GitHubApi and JobStore
-# traits, plus the shared `setup_pg_db()` Postgres helper, for downstream
-# test code. Never enable in release builds. (The helper talks to the
-# compose-managed test server started by the nextest setup script — no
-# extra deps.)
+# Exposes the fake GitHub API for downstream test code. Never enable in
+# release builds.
 testing = []

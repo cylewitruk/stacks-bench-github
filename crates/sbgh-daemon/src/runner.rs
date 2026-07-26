@@ -17,7 +17,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use sbgh_core::bench_args::resolve_bench_args;
 use sbgh_core::config::DaemonConfig;
-use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
+use sbgh_core::db::{JobStore, PolicyStore};
 use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use sbgh_core::models::{BuildTarget, TaskKind, uses_shared_calibration};
 use tokio::sync::{OnceCell, mpsc, oneshot};
@@ -38,7 +38,7 @@ use crate::artifact_store::{
 #[cfg(test)]
 use crate::artifact_store::{ArtifactStoreConfig, build_store_or_local};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
-use crate::pin_manager::PinManager;
+use crate::pin_manager::{PinManager, RepoIdentityLookup};
 use crate::report::build_report_surface;
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, ReporterDependencies, resolved_app_id};
 use crate::shutdown::Shutdown;
@@ -337,7 +337,7 @@ impl Runner {
     pub fn with_pin_recompute(
         mut self,
         policy_store: Arc<dyn PolicyStore>,
-        repo_store: Arc<dyn RepoStore>,
+        repo_store: Arc<dyn RepoIdentityLookup>,
         jobs: Arc<dyn JobStore>,
         shell: Arc<dyn Shell>,
     ) -> Self {

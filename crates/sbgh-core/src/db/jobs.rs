@@ -125,7 +125,7 @@ pub enum BaselineSelection {
 /// roadmap-v7: provenance of the baseline a PR run was compared against — what
 /// the report names + links to. Carries `github_repo_id` (NOT owner/name): the
 /// renderer resolves the repo for the GitHub link, keeping this query free of a
-/// `github_repo` join (and the in-memory impl free of repo knowledge).
+/// `github_repo` join (and keeps this interface free of repo knowledge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineAnchor {
     pub job_id: Uuid,

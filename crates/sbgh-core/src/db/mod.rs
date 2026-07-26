@@ -1,19 +1,3 @@
-#[cfg(feature = "testing")]
-pub mod in_memory_ingest;
-#[cfg(feature = "testing")]
-pub mod in_memory_installation;
-#[cfg(feature = "testing")]
-pub mod in_memory_jobs;
-#[cfg(feature = "testing")]
-pub mod in_memory_policy;
-#[cfg(feature = "testing")]
-pub mod in_memory_pull_request;
-#[cfg(feature = "testing")]
-pub mod in_memory_repo;
-#[cfg(feature = "testing")]
-pub mod in_memory_user;
-#[cfg(feature = "testing")]
-pub mod in_memory_webhook;
 pub mod ingest;
 pub mod installation;
 pub mod jobs;
@@ -23,22 +7,6 @@ pub mod repo;
 pub mod user;
 pub mod webhook;
 
-#[cfg(feature = "testing")]
-pub use in_memory_ingest::InMemoryIngestStore;
-#[cfg(feature = "testing")]
-pub use in_memory_installation::InMemoryInstallationStore;
-#[cfg(feature = "testing")]
-pub use in_memory_jobs::InMemoryJobStore;
-#[cfg(feature = "testing")]
-pub use in_memory_policy::InMemoryPolicyStore;
-#[cfg(feature = "testing")]
-pub use in_memory_pull_request::InMemoryPullRequestStore;
-#[cfg(feature = "testing")]
-pub use in_memory_repo::InMemoryRepoStore;
-#[cfg(feature = "testing")]
-pub use in_memory_user::InMemoryUserStore;
-#[cfg(feature = "testing")]
-pub use in_memory_webhook::{InMemoryWebhookInbox, InMemoryWebhookRow, SeedWebhook};
 pub use ingest::{IngestOutcome, IngestStore, NewWebhook, SUPPORTED_WEBHOOK_EVENT_TYPES};
 pub use installation::{DeleteInstallationOutcome, InstallationStore, NewInstallation};
 pub use jobs::{

@@ -1,7 +1,7 @@
 //! Integration tests for `PostgresIngestStore` against a real Postgres
 //! engine, booted per-test via the shared `setup_pg_db()` helper.
 //!
-//! Behaviours pinned here that the in-memory fake can't validate:
+//! Behaviours pinned here that require the production Postgres implementation:
 //!   - `ON CONFLICT (delivery_id)` actually dedupes at the SQL layer.
 //!   - `Option<Value>` payload binds as SQL NULL (not JSON `null`) when None —
 //!     important for ops queries using `payload IS NULL`.

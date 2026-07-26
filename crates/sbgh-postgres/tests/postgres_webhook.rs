@@ -1,11 +1,10 @@
 //! Integration tests for `PostgresWebhookInbox` (slices 2a + 2b) against
 //! a real Postgres engine. The behaviors pinned here can't be validated
-//! by the in-memory `InMemoryWebhookInbox` because they exercise actual
+//! by a fake inbox because they exercise actual
 //! Postgres SQL semantics:
 //!
-//!   - `FOR UPDATE SKIP LOCKED` returns disjoint rows under concurrent claimers
-//!     (the in-memory test uses a Mutex which makes this trivially true; here
-//!     we prove it under real lock semantics).
+//!   - `FOR UPDATE SKIP LOCKED` returns disjoint rows under concurrent
+//!     claimers under real lock semantics.
 //!   - The `event_type = ANY($N)` filter actually leaves non-matching rows in
 //!     `received`.
 //!   - `claim_token`-guarded conditional updates are no-ops when the token

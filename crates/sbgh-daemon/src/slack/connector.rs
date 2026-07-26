@@ -23,10 +23,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use sbgh_core::config::SlackConfig;
 use sbgh_core::db::{JobStore, NewBenchmarkSpec};
 use sbgh_core::models::{
-    BuildTarget, GitRefKind, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail, TaskKind,
+    BuildTarget, GitRefKind, Job, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail,
+    TaskKind,
 };
 use uuid::Uuid;
 
@@ -68,7 +70,7 @@ struct PostedCard {
 pub struct SlackConnector {
     cfg: SlackConfig,
     target: SlackJobTarget,
-    jobs: Arc<dyn JobStore>,
+    jobs: Arc<dyn BenchmarkQueue>,
     client: Arc<dyn SlackClient>,
     intent_resolver: Option<Arc<dyn IntentResolver>>,
     intent_rate_limit_per_minute: u32,
@@ -79,11 +81,50 @@ pub struct SlackConnector {
     intent_calls: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
+/// The only persistence capability the Slack intake path needs.
+///
+/// Keeping this port local to the consumer lets orchestration tests use a
+/// small recorder while the production implementation delegates to the real
+/// transactional [`JobStore`] boundary.
+#[async_trait]
+pub trait BenchmarkQueue: Send + Sync + 'static {
+    async fn create_unlinked_benchmark_group(
+        &self,
+        first_job_id: Uuid,
+        specs: &[NewBenchmarkSpec],
+        queued_event_detail: &serde_json::Value,
+        plan_message_ts: Option<&str>,
+    ) -> sbgh_core::Result<Job>;
+}
+
+#[async_trait]
+impl<T> BenchmarkQueue for T
+where
+    T: JobStore,
+{
+    async fn create_unlinked_benchmark_group(
+        &self,
+        first_job_id: Uuid,
+        specs: &[NewBenchmarkSpec],
+        queued_event_detail: &serde_json::Value,
+        plan_message_ts: Option<&str>,
+    ) -> sbgh_core::Result<Job> {
+        JobStore::create_unlinked_benchmark_group(
+            self,
+            first_job_id,
+            specs,
+            queued_event_detail,
+            plan_message_ts,
+        )
+        .await
+    }
+}
+
 impl SlackConnector {
     pub fn new(
         cfg: SlackConfig,
         target: SlackJobTarget,
-        jobs: Arc<dyn JobStore>,
+        jobs: Arc<dyn BenchmarkQueue>,
         client: Arc<dyn SlackClient>,
     ) -> Self {
         Self {
@@ -577,10 +618,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use sbgh_core::db::InMemoryJobStore;
     use sbgh_core::models::JobSource;
 
     use super::*;
+    use crate::slack::test_support::RecordingBenchmarkQueue;
     use crate::workload::WorkloadSpec;
 
     const TARGET: SlackJobTarget = SlackJobTarget {
@@ -826,9 +867,8 @@ mod tests {
         }
     }
 
-    /// (connector, in-memory store handle, fake slack handle)
-    fn harness() -> (SlackConnector, Arc<InMemoryJobStore>, Arc<FakeSlackClient>) {
-        let store = Arc::new(InMemoryJobStore::new());
+    fn harness() -> (SlackConnector, Arc<RecordingBenchmarkQueue>, Arc<FakeSlackClient>) {
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
             .with_binary_cache_enabled(true);
@@ -837,7 +877,7 @@ mod tests {
 
     fn harness_with_intent(
         resolver: Arc<FakeIntentResolver>,
-    ) -> (SlackConnector, Arc<InMemoryJobStore>, Arc<FakeSlackClient>, Arc<FakeIntentResolver>)
+    ) -> (SlackConnector, Arc<RecordingBenchmarkQueue>, Arc<FakeSlackClient>, Arc<FakeIntentResolver>)
     {
         harness_with_intent_rate(resolver, 5)
     }
@@ -845,9 +885,9 @@ mod tests {
     fn harness_with_intent_rate(
         resolver: Arc<FakeIntentResolver>,
         rate_limit_per_minute: u32,
-    ) -> (SlackConnector, Arc<InMemoryJobStore>, Arc<FakeSlackClient>, Arc<FakeIntentResolver>)
+    ) -> (SlackConnector, Arc<RecordingBenchmarkQueue>, Arc<FakeSlackClient>, Arc<FakeIntentResolver>)
     {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
             .with_binary_cache_enabled(true)
@@ -862,7 +902,7 @@ mod tests {
             .await;
 
         // Exactly one ad-hoc job, with the resolved workload + default rev.
-        let jobs = store.all_jobs();
+        let jobs = store.jobs();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].source, JobSource::Slack);
         assert_eq!(jobs[0].github_installation_id, 100);
@@ -871,11 +911,9 @@ mod tests {
 
         // The queued detail carries the channel/ts + parsed bench_args.
         let queued = store
-            .queued_event(jobs[0].id)
-            .await
-            .unwrap()
+            .queued_event_detail(jobs[0].id)
             .unwrap();
-        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap()).unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued).unwrap();
         match detail {
             QueuedEventDetail::SlackAdhoc {
                 channel,
@@ -940,7 +978,7 @@ mod tests {
         c.handle_mention(event(&format!("<@U07BOT> bench --block 1 --txid {txid}")))
             .await;
 
-        assert!(store.all_jobs().is_empty());
+        assert!(store.jobs().is_empty());
         let added: Vec<String> = slack
             .reactions
             .lock()
@@ -1032,17 +1070,15 @@ mod tests {
             );
         }
 
-        // The card ts was persisted by job id (read back via latest_plan_message_ts).
-        let jobs = store.all_jobs();
+        // The card ts was passed through to the queue.
+        let jobs = store.jobs();
         assert_eq!(jobs.len(), 1);
         assert_eq!(
             store
-                .latest_plan_message_ts(jobs[0].id)
-                .await
-                .unwrap()
+                .plan_message_ts(jobs[0].id)
                 .as_deref(),
             Some("stream_ts"),
-            "queued stream ts persisted by job_id",
+            "queued stream ts passed through with the request",
         );
     }
 
@@ -1053,11 +1089,11 @@ mod tests {
     #[tokio::test]
     async fn create_failure_after_streamed_card_stops_the_stream() {
         let (c, store, slack) = harness();
-        store.fail_create_unlinked_job();
+        store.fail_create();
         c.handle_mention(event("<@U07BOT> bench --block 184231"))
             .await;
 
-        assert!(store.all_jobs().is_empty(), "create failed → no job");
+        assert!(store.jobs().is_empty(), "create failed → no job");
         let stops = slack.stops.lock().unwrap();
         assert_eq!(stops.len(), 1, "the streamed card is stopped, not left queued");
         assert_eq!(stops[0].0, "C1");
@@ -1098,17 +1134,17 @@ mod tests {
     /// start failed), the same create failure updates it in place.
     #[tokio::test]
     async fn create_failure_after_block_card_updates_it() {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let slack = Arc::new(FakeSlackClient::default());
         slack.fail_stream(); // force the block-card fallback
-        store.fail_create_unlinked_job();
+        store.fail_create();
         let c = SlackConnector::new(cfg(), TARGET, store.clone(), slack.clone())
             .with_binary_cache_enabled(true);
 
         c.handle_mention(event("<@U07BOT> bench --block 184231"))
             .await;
 
-        assert!(store.all_jobs().is_empty());
+        assert!(store.jobs().is_empty());
         assert_eq!(
             slack
                 .posts
@@ -1143,7 +1179,7 @@ mod tests {
         let (c, store, _slack) = harness();
         c.handle_mention(event("<@U07BOT> bench --block 1 --rev feature/x"))
             .await;
-        assert_eq!(store.all_jobs()[0].git_ref_display, "feature/x");
+        assert_eq!(store.jobs()[0].git_ref_display, "feature/x");
     }
 
     #[tokio::test]
@@ -1153,7 +1189,7 @@ mod tests {
         ev.team_id = "T_EVIL".into();
         c.handle_mention(ev).await;
 
-        assert!(store.all_jobs().is_empty(), "no job for an off-allowlist workspace");
+        assert!(store.jobs().is_empty(), "no job for an off-allowlist workspace");
         assert!(
             slack
                 .reactions
@@ -1180,7 +1216,7 @@ mod tests {
         ev.user = "U_EVIL".into();
         c.handle_mention(ev).await;
 
-        assert!(store.all_jobs().is_empty());
+        assert!(store.jobs().is_empty());
         assert!(
             slack
                 .reactions
@@ -1206,7 +1242,7 @@ mod tests {
         c.handle_mention(event(&format!("<@U07BOT> bench --block 1 --txid {txid}")))
             .await;
 
-        assert!(store.all_jobs().is_empty(), "no job for an unresolvable request");
+        assert!(store.jobs().is_empty(), "no job for an unresolvable request");
         assert!(
             slack
                 .net_reactions()
@@ -1229,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_repetition_cap_rejects_before_enqueue_or_reaction() {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
             .with_max_clean_repetitions(2);
@@ -1238,7 +1274,7 @@ mod tests {
             .handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 3"))
             .await;
 
-        assert!(store.all_jobs().is_empty(), "over-cap request must not enqueue");
+        assert!(store.jobs().is_empty(), "over-cap request must not enqueue");
         assert!(
             client
                 .net_reactions()
@@ -1261,7 +1297,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_repetitions_above_one_require_binary_cache() {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
             .with_max_clean_repetitions(5)
@@ -1271,7 +1307,7 @@ mod tests {
             .handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 2"))
             .await;
 
-        assert!(store.all_jobs().is_empty(), "cache-off multi-run request must not enqueue");
+        assert!(store.jobs().is_empty(), "cache-off multi-run request must not enqueue");
         assert!(
             client
                 .net_reactions()
@@ -1294,7 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_enabled_clean_repetitions_above_one_enqueue_initial_run() {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
             .with_max_clean_repetitions(5)
@@ -1304,15 +1340,13 @@ mod tests {
             .handle_mention(event("<@U07BOT> bench --block 184231 --repetitions 2"))
             .await;
 
-        let jobs = store.all_jobs();
+        let jobs = store.jobs();
         assert_eq!(jobs.len(), 1, "multi-run requests enqueue run 0");
         assert_eq!(jobs[0].benchmark_run_index, 0);
         let queued = store
-            .queued_event(jobs[0].id)
-            .await
-            .unwrap()
+            .queued_event_detail(jobs[0].id)
             .unwrap();
-        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap()).unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued).unwrap();
         let QueuedEventDetail::SlackAdhoc { clean_repetitions, .. } = detail else {
             panic!("expected SlackAdhoc detail");
         };
@@ -1337,16 +1371,24 @@ mod tests {
         ))
         .await;
 
-        let jobs = store.all_jobs();
+        let jobs = store.jobs();
         assert_eq!(jobs.len(), 1, "comparison groups initially enqueue only spec 0/run 0");
         assert_eq!(jobs[0].git_ref_display, "baseline");
         assert_eq!(jobs[0].benchmark_run_index, 0);
-        let specs = store.specs_for_group(jobs[0].benchmark_group_id);
+        let specs = store.requested_specs_for_group(jobs[0].benchmark_group_id);
         assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].spec_index, 0);
-        assert_eq!(specs[0].git_ref_display, "baseline");
-        assert_eq!(specs[1].spec_index, 1);
-        assert_eq!(specs[1].git_ref_display, "candidate");
+        assert_eq!(
+            specs[0]
+                .new_job
+                .git_ref_display,
+            "baseline"
+        );
+        assert_eq!(
+            specs[1]
+                .new_job
+                .git_ref_display,
+            "candidate"
+        );
         assert_eq!(
             slack
                 .net_reactions()
@@ -1366,7 +1408,7 @@ mod tests {
 
     #[tokio::test]
     async fn comparison_variant_cap_rejects_before_phase_1_gate() {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
             .with_binary_cache_enabled(true)
@@ -1378,7 +1420,7 @@ mod tests {
             ))
             .await;
 
-        assert!(store.all_jobs().is_empty());
+        assert!(store.jobs().is_empty());
         let eph = client
             .ephemerals
             .lock()
@@ -1395,7 +1437,7 @@ mod tests {
 
     #[tokio::test]
     async fn comparison_lifecycle_cap_rejects_before_phase_1_gate() {
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let client = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), client.clone())
             .with_binary_cache_enabled(true)
@@ -1408,7 +1450,7 @@ mod tests {
             ))
             .await;
 
-        assert!(store.all_jobs().is_empty());
+        assert!(store.jobs().is_empty());
         let eph = client
             .ephemerals
             .lock()
@@ -1431,7 +1473,7 @@ mod tests {
             .await;
 
         assert_eq!(resolver.calls(), 0, "clean parser input bypasses LLM");
-        assert_eq!(store.all_jobs().len(), 1);
+        assert_eq!(store.jobs().len(), 1);
     }
 
     #[tokio::test]
@@ -1448,15 +1490,13 @@ mod tests {
             .await;
 
         assert_eq!(resolver.calls(), 1);
-        let jobs = store.all_jobs();
+        let jobs = store.jobs();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].git_ref_display, "feature/nl");
         let queued = store
-            .queued_event(jobs[0].id)
-            .await
-            .unwrap()
+            .queued_event_detail(jobs[0].id)
             .unwrap();
-        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap()).unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued).unwrap();
         let QueuedEventDetail::SlackAdhoc {
             bench_args, clean_repetitions, ..
         } = detail
@@ -1497,23 +1537,24 @@ mod tests {
         .await;
 
         assert_eq!(resolver.calls(), 1);
-        let jobs = store.all_jobs();
+        let jobs = store.jobs();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].git_ref_display, "sb-integration/3.4.0.0.2");
-        let specs = store.specs_for_group(jobs[0].benchmark_group_id);
+        let specs = store.requested_specs_for_group(jobs[0].benchmark_group_id);
         assert_eq!(
             specs
                 .iter()
-                .map(|spec| spec.git_ref_display.as_str())
+                .map(|spec| spec
+                    .new_job
+                    .git_ref_display
+                    .as_str())
                 .collect::<Vec<_>>(),
             vec!["sb-integration/3.4.0.0.2", "sb-integration/3.4.0.0.3"],
         );
         let queued = store
-            .queued_event(jobs[0].id)
-            .await
-            .unwrap()
+            .queued_event_detail(jobs[0].id)
             .unwrap();
-        let detail: QueuedEventDetail = serde_json::from_value(queued.detail.unwrap()).unwrap();
+        let detail: QueuedEventDetail = serde_json::from_value(queued).unwrap();
         let QueuedEventDetail::SlackAdhoc {
             bench_args, clean_repetitions, ..
         } = detail
@@ -1552,7 +1593,7 @@ mod tests {
             rev: None,
         };
         let resolver = Arc::new(FakeIntentResolver::resolved(spec));
-        let store = Arc::new(InMemoryJobStore::new());
+        let store = Arc::new(RecordingBenchmarkQueue::default());
         let slack = Arc::new(FakeSlackClient::default());
         let connector = SlackConnector::new(cfg(), TARGET, store.clone(), slack.clone())
             .with_intent_resolver(resolver.clone(), 5)
@@ -1563,7 +1604,7 @@ mod tests {
             .await;
 
         assert_eq!(resolver.calls(), 1);
-        assert!(store.all_jobs().is_empty());
+        assert!(store.jobs().is_empty());
         assert!(
             slack
                 .net_reactions()
@@ -1587,7 +1628,7 @@ mod tests {
             .await;
 
         assert_eq!(resolver.calls(), 1);
-        assert!(store.all_jobs().is_empty());
+        assert!(store.jobs().is_empty());
         assert!(
             slack
                 .net_reactions()
@@ -1609,7 +1650,7 @@ mod tests {
             .await;
 
         assert_eq!(resolver.calls(), 1);
-        assert!(store.all_jobs().is_empty());
+        assert!(store.jobs().is_empty());
         assert!(
             slack
                 .net_reactions()
@@ -1648,7 +1689,7 @@ mod tests {
             .await;
 
         assert_eq!(resolver.calls(), 1, "second NL request is rejected before provider call");
-        assert_eq!(store.all_jobs().len(), 1);
+        assert_eq!(store.jobs().len(), 1);
         // First request accepted (net ⏳), second rate-limited (ack retired) — net one.
         assert_eq!(slack.net_reactions().len(), 1);
         let eph = slack

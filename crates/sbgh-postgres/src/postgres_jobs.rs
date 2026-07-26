@@ -34,6 +34,91 @@ impl PostgresJobStore {
         Self { pool }
     }
 
+    #[cfg(feature = "testing")]
+    pub async fn all_jobs(&self) -> Vec<Job> {
+        sqlx::query_as::<_, Db<Job>>(
+            r#"
+            SELECT id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                   github_installation_id, github_repo_id, status,
+                   source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
+                   git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
+                   created_at, updated_at
+              FROM job
+          ORDER BY created_at, id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("read jobs")
+        .into_domain()
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn all_events(&self) -> Vec<JobEvent> {
+        sqlx::query_as::<_, Db<JobEvent>>(
+            "SELECT id, job_id, event_kind, event_status, occurred_at, github_comment_id, \
+             github_check_run_id, github_check_run_url, remark, detail \
+             FROM job_event ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("read job events")
+        .into_domain()
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn user_links(&self) -> Vec<GithubUserJob> {
+        sqlx::query_as::<_, Db<GithubUserJob>>(
+            "SELECT github_user_id, job_id, created_at FROM github_user_job ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("read user job links")
+        .into_domain()
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn pr_links(&self) -> Vec<GithubPullRequestJob> {
+        sqlx::query_as::<_, Db<GithubPullRequestJob>>(
+            "SELECT job_id, github_pull_request_id, triggering_comment_id, created_at \
+             FROM github_pull_request_job ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("read pull request job links")
+        .into_domain()
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn spec(&self, id: Uuid) -> Option<BenchmarkSpec> {
+        self.lookup_benchmark_spec(id)
+            .await
+            .expect("read benchmark spec")
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn specs_for_group(&self, group_id: Uuid) -> Vec<BenchmarkSpec> {
+        self.lookup_benchmark_specs(group_id)
+            .await
+            .expect("read benchmark specs")
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn steps_for_group(
+        &self,
+        group_id: Uuid,
+    ) -> Vec<crate::models::BenchmarkWorkflowStep> {
+        sqlx::query_as::<_, Db<crate::models::BenchmarkWorkflowStep>>(
+            "SELECT id, benchmark_group_id, step_index, step_kind, benchmark_spec_id, created_at \
+             FROM benchmark_workflow_step WHERE benchmark_group_id = $1 ORDER BY step_index",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await
+        .expect("read benchmark workflow steps")
+        .into_domain()
+    }
+
     async fn create_group_specs(
         tx: &mut Transaction<'_, Postgres>,
         specs: &[NewBenchmarkSpec],

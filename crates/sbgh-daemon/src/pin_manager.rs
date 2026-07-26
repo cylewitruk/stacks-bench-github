@@ -26,10 +26,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
 use sbgh_core::models::{
-    BuildTarget, GitRefKind, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail, TaskKind,
+    BuildTarget, GitRefKind, GithubRepo, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail,
+    TaskKind,
 };
 use sbgh_driver::{CacheControl, CacheEnvironment};
 
@@ -53,6 +55,22 @@ const LS_REMOTE_TIMEOUT_SECS: u64 = 20;
 /// retry policy (backoff / max attempts) is future work.
 const WARM_RETRY_COOLDOWN_HOURS: i64 = 6;
 
+/// Repository identity capability needed by pin recomputation.
+#[async_trait]
+pub trait RepoIdentityLookup: Send + Sync + 'static {
+    async fn lookup_repo(&self, github_repo_id: i64) -> sbgh_core::Result<Option<GithubRepo>>;
+}
+
+#[async_trait]
+impl<T> RepoIdentityLookup for T
+where
+    T: RepoStore + ?Sized,
+{
+    async fn lookup_repo(&self, github_repo_id: i64) -> sbgh_core::Result<Option<GithubRepo>> {
+        RepoStore::lookup_repo(self, github_repo_id).await
+    }
+}
+
 /// Owns the deps + the **shared** cache `Arc` for recomputing the pinned set.
 /// The runner drives it on startup (before claiming) and after each job
 /// execution (any worker return — a published build, a cache hit, or a
@@ -62,7 +80,7 @@ const WARM_RETRY_COOLDOWN_HOURS: i64 = 6;
 pub struct PinManager {
     cache: Arc<dyn CacheControl>,
     policy_store: Arc<dyn PolicyStore>,
-    repo_store: Arc<dyn RepoStore>,
+    repo_store: Arc<dyn RepoIdentityLookup>,
     /// v11 (item 0031): the store warming enqueues build-only jobs into.
     jobs: Arc<dyn JobStore>,
     shell: Arc<dyn Shell>,
@@ -74,7 +92,7 @@ impl PinManager {
     pub fn new(
         cache: Arc<dyn CacheControl>,
         policy_store: Arc<dyn PolicyStore>,
-        repo_store: Arc<dyn RepoStore>,
+        repo_store: Arc<dyn RepoIdentityLookup>,
         jobs: Arc<dyn JobStore>,
         shell: Arc<dyn Shell>,
         git_binary: PathBuf,
@@ -146,7 +164,7 @@ impl PinManager {
 pub async fn recompute_pins(
     cache: &dyn CacheControl,
     policy_store: &dyn PolicyStore,
-    repo_store: &dyn RepoStore,
+    repo_store: &dyn RepoIdentityLookup,
     shell: &dyn Shell,
     git_binary: &Path,
     env: &CacheEnvironment,
@@ -409,9 +427,14 @@ fn parse_ls_remote(repo_id: i64, stdout: &str) -> Vec<RemoteRef> {
 mod tests {
     use std::collections::HashSet;
 
-    use sbgh_core::db::{InMemoryJobStore, InMemoryPolicyStore, InMemoryRepoStore, JobFailure};
+    use sbgh_core::db::{InstallationStore, JobFailure, JobStore, NewInstallation};
     use sbgh_core::models::{
-        BuildTarget, JobIntent, JobSource, TaskKind, TriggerKind, TriggerMatchSpec,
+        BuildTarget, GithubAccountType, JobIntent, JobSource, TaskKind, TriggerKind,
+        TriggerMatchSpec,
+    };
+    use sbgh_postgres::db::{
+        PostgresInstallationStore, PostgresJobStore, PostgresPolicyStore, PostgresRepoStore,
+        TestDb, setup_pg_db,
     };
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -436,6 +459,46 @@ mod tests {
             image_id: "img-v1".into(),
             protocol_version: "v1".into(),
         }
+    }
+
+    struct MissingRepoLookup;
+
+    #[async_trait]
+    impl RepoIdentityLookup for MissingRepoLookup {
+        async fn lookup_repo(&self, _github_repo_id: i64) -> sbgh_core::Result<Option<GithubRepo>> {
+            Ok(None)
+        }
+    }
+
+    async fn pin_stores()
+    -> (TestDb, Arc<PostgresPolicyStore>, Arc<PostgresRepoStore>, Arc<PostgresJobStore>) {
+        let (db, pool) = setup_pg_db().await;
+        let repo = Arc::new(PostgresRepoStore::new(pool.clone()));
+        repo.seed_supported_root(10, "stacks-network", "stacks-core", true)
+            .await;
+        let installation = PostgresInstallationStore::new(pool.clone());
+        installation
+            .seed_allowed(1, "stacks-network", GithubAccountType::Organization, true)
+            .await;
+        installation
+            .upsert_installation(&NewInstallation {
+                id: 1,
+                github_account_id: 1,
+                account_login: "stacks-network".into(),
+                account_type: GithubAccountType::Organization,
+            })
+            .await
+            .unwrap();
+        installation
+            .add_or_restore_membership(1, 10)
+            .await
+            .unwrap();
+        (
+            db,
+            Arc::new(PostgresPolicyStore::new(pool.clone())),
+            repo,
+            Arc::new(PostgresJobStore::new(pool)),
+        )
     }
 
     #[test]
@@ -480,7 +543,7 @@ mod tests {
         );
     }
 
-    /// End-to-end orchestration over in-memory stores + a canned `ls-remote`:
+    /// End-to-end orchestration over Postgres stores + a canned `ls-remote`:
     /// a pinned `develop` policy on repo 10 resolves to `stacks-network/
     /// stacks-core`, pulls its current refs, and pins the matching cache entry.
     #[tokio::test]
@@ -498,20 +561,22 @@ mod tests {
             .unwrap();
 
         // A pinned `develop` trigger on (install 1, repo 10), parent enabled.
-        let policy_store = InMemoryPolicyStore::new();
-        policy_store.seed_target(1, 10, true);
-        let id = policy_store.seed_trigger(
-            1,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        policy_store.set_trigger_pinned(id, true, None);
-
-        // Repo 10 → stacks-network/stacks-core.
-        let repo_store = InMemoryRepoStore::new();
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        let (_db, policy_store, repo_store, _jobs) = pin_stores().await;
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        let id = policy_store
+            .seed_trigger(
+                1,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
+        policy_store
+            .set_trigger_pinned(id, true, None)
+            .await;
 
         // `ls-remote` returns develop → c-dev (+ a non-matching branch).
         let shell = RecordingShell::new();
@@ -521,8 +586,8 @@ mod tests {
 
         recompute_pins(
             &cache,
-            &policy_store,
-            &repo_store,
+            policy_store.as_ref(),
+            repo_store.as_ref(),
             &shell,
             Path::new("/usr/bin/git"),
             &env,
@@ -552,7 +617,10 @@ mod tests {
     /// Seed a real cache with a *pre-pinned* entry + a still-pinned policy on
     /// repo 10, then run a recompute whose ref resolution fails. The pin must
     /// survive — a failed refresh preserves the last known set.
-    async fn run_failed_recompute(reply: PreparedReply, seed_repo: bool) -> bool {
+    async fn run_failed_recompute(
+        reply: PreparedReply,
+        repo_lookup_override: Option<Arc<dyn RepoIdentityLookup>>,
+    ) -> (bool, usize, usize) {
         let tmp = TempDir::new().unwrap();
         let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
         let env = test_env();
@@ -571,29 +639,31 @@ mod tests {
                 .pinned
         );
 
-        let policy_store = InMemoryPolicyStore::new();
-        policy_store.seed_target(1, 10, true);
-        let id = policy_store.seed_trigger(
-            1,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        policy_store.set_trigger_pinned(id, true, None);
-
-        let repo_store = InMemoryRepoStore::new();
-        if seed_repo {
-            repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
-        }
+        let (_db, policy_store, repo_store, _jobs) = pin_stores().await;
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        let id = policy_store
+            .seed_trigger(
+                1,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
+        policy_store
+            .set_trigger_pinned(id, true, None)
+            .await;
 
         let shell = RecordingShell::new();
         shell.reply(reply);
+        let repo_lookup: Arc<dyn RepoIdentityLookup> = repo_lookup_override.unwrap_or(repo_store);
 
-        recompute_pins(
+        let targets = recompute_pins(
             &cache,
-            &policy_store,
-            &repo_store,
+            policy_store.as_ref(),
+            repo_lookup.as_ref(),
             &shell,
             Path::new("/usr/bin/git"),
             &env,
@@ -602,26 +672,33 @@ mod tests {
         .await
         .unwrap();
 
-        cache
-            .get(&fp, 12)
-            .unwrap()
-            .pinned
+        (
+            cache
+                .get(&fp, 12)
+                .unwrap()
+                .pinned,
+            shell.calls().len(),
+            targets.len(),
+        )
     }
 
     #[tokio::test]
     async fn recompute_preserves_pins_when_lsremote_fails() {
         // A transient `ls-remote` failure must NOT unpin (or evict) the entry.
-        let still_pinned =
-            run_failed_recompute(PreparedReply::fail("ssh: network is unreachable"), true).await;
+        let (still_pinned, shell_calls, targets) =
+            run_failed_recompute(PreparedReply::fail("ssh: network is unreachable"), None).await;
         assert!(still_pinned, "a failed ls-remote must preserve the existing pin");
+        assert_eq!(shell_calls, 1, "the failing ls-remote was attempted");
+        assert_eq!(targets, 0, "a failed refresh must not warm anything");
     }
 
     #[tokio::test]
     async fn recompute_preserves_pins_when_repo_identity_missing() {
-        // The repo isn't seeded → `lookup_repo` returns None → abort, pins kept.
-        // (The shell reply is unused — we abort before any ls-remote.)
-        let still_pinned = run_failed_recompute(PreparedReply::ok(), false).await;
+        let (still_pinned, shell_calls, targets) =
+            run_failed_recompute(PreparedReply::ok(), Some(Arc::new(MissingRepoLookup))).await;
         assert!(still_pinned, "an unresolved repo identity must preserve the existing pin");
+        assert_eq!(shell_calls, 0, "missing identity must abort before ls-remote");
+        assert_eq!(targets, 0, "a skipped recompute must not warm anything");
     }
 
     /// `PinManager::recompute` derives the env from the golden image (via
@@ -645,18 +722,22 @@ mod tests {
             .publish(&fp, &bin, 10, false)
             .unwrap();
 
-        let policy_store = Arc::new(InMemoryPolicyStore::new());
-        policy_store.seed_target(1, 10, true);
-        let id = policy_store.seed_trigger(
-            1,
-            10,
-            TriggerKind::BranchPush,
-            &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
-            true,
-        );
-        policy_store.set_trigger_pinned(id, true, None);
-        let repo_store = Arc::new(InMemoryRepoStore::new());
-        repo_store.seed_supported_root(10, "stacks-network", "stacks-core", true);
+        let (_db, policy_store, repo_store, jobs) = pin_stores().await;
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        let id = policy_store
+            .seed_trigger(
+                1,
+                10,
+                TriggerKind::BranchPush,
+                &TriggerMatchSpec::BranchPush { branch_name: "develop".into() },
+                true,
+            )
+            .await;
+        policy_store
+            .set_trigger_pinned(id, true, None)
+            .await;
 
         let shell = Arc::new(RecordingShell::new());
         shell.reply(PreparedReply::with_stdout("c-dev\trefs/heads/develop\n"));
@@ -665,7 +746,7 @@ mod tests {
             cache.clone(),
             policy_store,
             repo_store,
-            Arc::new(InMemoryJobStore::new()),
+            jobs,
             shell,
             PathBuf::from("/usr/bin/git"),
             golden,
@@ -701,12 +782,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
         let env = test_env();
-        let jobs = InMemoryJobStore::new();
+        let (_db, _policy, _repo, jobs) = pin_stores().await;
 
-        warm_missing(&jobs, &cache, &[warm_target("c-cold")], &env, at("2026-06-01T00:00:00Z"))
-            .await;
+        warm_missing(
+            jobs.as_ref(),
+            &cache,
+            &[warm_target("c-cold")],
+            &env,
+            at("2026-06-01T00:00:00Z"),
+        )
+        .await;
 
-        let all = jobs.all_jobs();
+        let all = jobs.all_jobs().await;
         assert_eq!(all.len(), 1, "one build-only job enqueued for the uncached pin");
         let job = &all[0];
         assert_eq!(job.source, JobSource::Daemon);
@@ -730,11 +817,22 @@ mod tests {
             .publish(&fp, &bin, 10, false)
             .unwrap();
 
-        let jobs = InMemoryJobStore::new();
-        warm_missing(&jobs, &cache, &[warm_target("c-warm")], &env, at("2026-06-01T00:00:00Z"))
-            .await;
+        let (_db, _policy, _repo, jobs) = pin_stores().await;
+        warm_missing(
+            jobs.as_ref(),
+            &cache,
+            &[warm_target("c-warm")],
+            &env,
+            at("2026-06-01T00:00:00Z"),
+        )
+        .await;
 
-        assert!(jobs.all_jobs().is_empty(), "a cached pin must not enqueue a warming build");
+        assert!(
+            jobs.all_jobs()
+                .await
+                .is_empty(),
+            "a cached pin must not enqueue a warming build"
+        );
     }
 
     #[tokio::test]
@@ -742,19 +840,31 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
         let env = test_env();
-        let jobs = InMemoryJobStore::new();
+        let (_db, _policy, _repo, jobs) = pin_stores().await;
 
         // First pass enqueues a build-only job for the uncached pin.
-        warm_missing(&jobs, &cache, &[warm_target("c-cold")], &env, at("2026-06-01T00:00:00Z"))
-            .await;
-        assert_eq!(jobs.all_jobs().len(), 1);
+        warm_missing(
+            jobs.as_ref(),
+            &cache,
+            &[warm_target("c-cold")],
+            &env,
+            at("2026-06-01T00:00:00Z"),
+        )
+        .await;
+        assert_eq!(jobs.all_jobs().await.len(), 1);
 
         // A second pass while the build is still in-flight (uncached, not yet
         // published) must NOT enqueue a duplicate.
-        warm_missing(&jobs, &cache, &[warm_target("c-cold")], &env, at("2026-06-01T00:00:00Z"))
-            .await;
+        warm_missing(
+            jobs.as_ref(),
+            &cache,
+            &[warm_target("c-cold")],
+            &env,
+            at("2026-06-01T00:00:00Z"),
+        )
+        .await;
         assert_eq!(
-            jobs.all_jobs().len(),
+            jobs.all_jobs().await.len(),
             1,
             "an in-flight build-only job dedups the next warming pass"
         );
@@ -765,13 +875,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = BinaryCache::new(tmp.path().join("cache"), 1 << 30);
         let env = test_env();
-        let jobs = InMemoryJobStore::new();
+        let (_db, _policy, _repo, jobs) = pin_stores().await;
 
         // Enqueue a warm build, then drive it to a terminal FAILURE (the cache
         // stays cold — the fail-closed build-only contract).
-        warm_missing(&jobs, &cache, &[warm_target("c-fail")], &env, at("2026-06-01T00:00:00Z"))
-            .await;
-        let job_id = jobs.all_jobs()[0].id;
+        warm_missing(
+            jobs.as_ref(),
+            &cache,
+            &[warm_target("c-fail")],
+            &env,
+            at("2026-06-01T00:00:00Z"),
+        )
+        .await;
+        let job_id = jobs.all_jobs().await[0].id;
         let claimed = jobs
             .claim_next_queued(Uuid::new_v4())
             .await
@@ -796,22 +912,26 @@ mod tests {
 
         // Within the cooldown: the recent failure blocks a re-enqueue — without
         // this guard the after-each-job recompute would retry it forever.
-        warm_missing(&jobs, &cache, &[warm_target("c-fail")], &env, after_fail).await;
+        warm_missing(jobs.as_ref(), &cache, &[warm_target("c-fail")], &env, after_fail).await;
         assert_eq!(
-            jobs.all_jobs().len(),
+            jobs.all_jobs().await.len(),
             1,
             "a warm that just failed must not be retried immediately"
         );
 
         // Past the cooldown: warming retries the failed build once.
         warm_missing(
-            &jobs,
+            jobs.as_ref(),
             &cache,
             &[warm_target("c-fail")],
             &env,
             after_fail + chrono::Duration::hours(WARM_RETRY_COOLDOWN_HOURS + 1),
         )
         .await;
-        assert_eq!(jobs.all_jobs().len(), 2, "past the cooldown, warming retries the failed build");
+        assert_eq!(
+            jobs.all_jobs().await.len(),
+            2,
+            "past the cooldown, warming retries the failed build"
+        );
     }
 }

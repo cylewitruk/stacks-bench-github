@@ -22,4 +22,6 @@ pub mod session;
 pub mod socket;
 pub mod stream;
 pub mod target;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod timeline;

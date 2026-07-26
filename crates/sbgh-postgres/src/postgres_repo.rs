@@ -23,6 +23,40 @@ impl PostgresRepoStore {
     }
 }
 
+#[cfg(feature = "testing")]
+impl PostgresRepoStore {
+    pub async fn seed_supported_root(
+        &self,
+        repo_id: i64,
+        owner: &str,
+        name: &str,
+        is_enabled: bool,
+    ) {
+        self.upsert_repo_identity(&crate::db::NewRepoIdentity {
+            id: repo_id,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            default_branch: None,
+        })
+        .await
+        .expect("seed repo identity");
+        self.upsert_supported_root(repo_id, None)
+            .await
+            .expect("seed supported root");
+        if !is_enabled {
+            self.disable_supported_root(repo_id)
+                .await
+                .expect("disable seeded supported root");
+        }
+    }
+
+    pub async fn repo(&self, id: i64) -> Option<crate::models::GithubRepo> {
+        self.lookup_repo(id)
+            .await
+            .expect("read repo")
+    }
+}
+
 #[async_trait]
 impl RepoStore for PostgresRepoStore {
     async fn lookup_repo(&self, github_repo_id: i64) -> Result<Option<GithubRepo>> {
