@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::Result;
-use crate::github::client::{
+use crate::GitHubResult as Result;
+use crate::api::{
     CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi, PostedCheckRun, PostedComment,
     PullRequestSide, PullRequestSummary, RepoRef, RepoSummary,
 };
-use crate::models::ResolvedCommit;
+use sbgh_core::models::{GithubAccountType, ResolvedCommit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeCall {
@@ -254,10 +254,10 @@ impl FakeGitHub {
             base,
             head,
             "test pr title",
-            crate::github::PullRequestAuthor {
+            crate::PullRequestAuthor {
                 id: 42,
                 login: "alice".into(),
-                account_type: crate::models::GithubAccountType::User,
+                account_type: GithubAccountType::User,
             },
         );
     }
@@ -272,7 +272,7 @@ impl FakeGitHub {
         base: PullRequestSide,
         head: PullRequestSide,
         title: &str,
-        author: crate::github::PullRequestAuthor,
+        author: crate::PullRequestAuthor,
     ) {
         self.inner
             .lock()
@@ -360,7 +360,9 @@ impl GitHubApi for FakeGitHub {
                 returned_id: id,
             });
         if s.fail_create_comment {
-            return Err(crate::Error::Config("FakeGitHub: forced create_comment failure".into()));
+            return Err(crate::GitHubError::Config(
+                "FakeGitHub: forced create_comment failure".into(),
+            ));
         }
         Ok(PostedComment { id })
     }
@@ -419,7 +421,7 @@ impl GitHubApi for FakeGitHub {
             .get(&(owner.into(), name.into()))
             .cloned()
             .ok_or_else(|| {
-                crate::Error::Config(format!(
+                crate::GitHubError::Config(format!(
                     "FakeGitHub: no canned response for repo {owner}/{name} (use \
                      set_repo_canonical / set_repo_fork to stage it)"
                 ))
@@ -443,7 +445,7 @@ impl GitHubApi for FakeGitHub {
             .get(&(repository.into(), pr_number))
             .cloned()
             .ok_or_else(|| {
-                crate::Error::Config(format!(
+                crate::GitHubError::Config(format!(
                     "FakeGitHub: no canned response for PR {repository}#{pr_number} (use \
                      set_pull_request to stage it)"
                 ))
@@ -467,7 +469,7 @@ impl GitHubApi for FakeGitHub {
             .get(&(repository.into(), git_ref.into()))
             .cloned()
             .ok_or_else(|| {
-                crate::Error::Config(format!(
+                crate::GitHubError::Config(format!(
                     "FakeGitHub: no canned response for ref {repository}@{git_ref} (use \
                      set_commit to stage it)"
                 ))
@@ -523,7 +525,9 @@ impl GitHubApi for FakeGitHub {
                 returned_id: id,
             });
         if s.fail_create_check_run {
-            return Err(crate::Error::Config("FakeGitHub: forced create_check_run failure".into()));
+            return Err(crate::GitHubError::Config(
+                "FakeGitHub: forced create_check_run failure".into(),
+            ));
         }
         Ok(PostedCheckRun {
             id,
@@ -585,7 +589,7 @@ impl GitHubApi for FakeGitHub {
             .unwrap()
             .fail_current_app_id
         {
-            return Err(crate::Error::Config("FakeGitHub: forced GET /app failure".into()));
+            return Err(crate::GitHubError::Config("FakeGitHub: forced GET /app failure".into()));
         }
         Ok(4242)
     }

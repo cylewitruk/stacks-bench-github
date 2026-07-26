@@ -21,6 +21,7 @@ ALLOWED_INTERNAL = {
         "sbgh-core",
         "sbgh-driver",
         "sbgh-github",
+        "sbgh-intent",
         "sbgh-libvirt",
         "sbgh-postgres",
         "sbgh-worker",
@@ -28,6 +29,7 @@ ALLOWED_INTERNAL = {
     "sbgh-driver": set(),
     "sbgh-github": {"sbgh-core"},
     "sbgh-handler": {"sbgh-api"},
+    "sbgh-intent": {"sbgh-core"},
     "sbgh-libvirt": {"sbgh-driver"},
     "sbgh-postgres": {"sbgh-core"},
     "sbgh-smee": set(),
@@ -45,7 +47,15 @@ EXECUTION_FORBIDDEN = {
     "slack-morphism",
     "sqlx",
 }
-CORE_FORBIDDEN = {"jsonwebtoken", "octocrab", "reqwest", "sqlx"}
+CORE_FORBIDDEN = {"jsonwebtoken", "octocrab", "reqwest", "schemars", "sqlx"}
+INTENT_FORBIDDEN = {
+    "sbgh-daemon",
+    "sbgh-github",
+    "sbgh-postgres",
+    "slack-messaging",
+    "slack-morphism",
+    "sqlx",
+}
 
 
 def metadata() -> dict:
@@ -120,6 +130,12 @@ def main() -> int:
     forbidden = transitive_names("sbgh-core") & CORE_FORBIDDEN
     if forbidden:
         errors.append(f"sbgh-core: forbidden runtime/build dependency closure: {sorted(forbidden)}")
+
+    forbidden = transitive_names("sbgh-intent") & INTENT_FORBIDDEN
+    if forbidden:
+        errors.append(
+            f"sbgh-intent: forbidden runtime/build dependency closure: {sorted(forbidden)}"
+        )
 
     if errors:
         print("package DAG check failed:", file=sys.stderr)

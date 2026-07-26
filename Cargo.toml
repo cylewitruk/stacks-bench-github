@@ -8,6 +8,7 @@ members = [
     "crates/sbgh-worker",
     "crates/sbgh-postgres",
     "crates/sbgh-github",
+    "crates/sbgh-intent",
     "crates/sbgh-handler",
     "crates/sbgh-cli",
     "crates/sbgh-daemon",
@@ -37,6 +38,7 @@ sbgh-libvirt = { path = "crates/sbgh-libvirt" }
 sbgh-worker = { path = "crates/sbgh-worker" }
 sbgh-postgres = { path = "crates/sbgh-postgres" }
 sbgh-github = { path = "crates/sbgh-github" }
+sbgh-intent = { path = "crates/sbgh-intent" }
 
 # Async runtime
 tokio = { version = "1.52.3", default-features = false }

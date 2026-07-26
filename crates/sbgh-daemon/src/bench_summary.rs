@@ -13,7 +13,7 @@
 //! silently by serde's default behaviour.
 
 use sbgh_core::db::BaselineSelection;
-use sbgh_core::github::encode_ref_path;
+use sbgh_github::encode_ref_path;
 use serde::Deserialize;
 
 use crate::comparison::{BaselineComparison, Verdict};

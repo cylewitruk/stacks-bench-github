@@ -75,8 +75,8 @@ need editing when an item's status or location changes.
 | `0055-execution-boundary-preparation` | In-process execution-boundary preparation | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
 | `0056-compiler-enforced-execution-boundaries` | Compiler-enforced worker and backend boundaries | `shipped` | [archive/completed/0056-compiler-enforced-crate-boundaries.md](archive/completed/0056-compiler-enforced-crate-boundaries.md) |
 | `0057-core-adapter-boundaries` | Dependency-light core and concrete adapter boundaries | `shipped` | [archive/completed/0056-compiler-enforced-crate-boundaries.md](archive/completed/0056-compiler-enforced-crate-boundaries.md) |
-| `0058-github-integration-boundary` | Consolidated GitHub contract and adapter boundary | `planned` | [iterations/v24.2-github-intent-boundaries.md](iterations/v24.2-github-intent-boundaries.md) |
-| `0059-intent-resolution-boundary` | Provider-backed request intent boundary | `planned` | [iterations/v24.2-github-intent-boundaries.md](iterations/v24.2-github-intent-boundaries.md) |
+| `0058-github-integration-boundary` | Consolidated GitHub contract and adapter boundary | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
+| `0059-intent-resolution-boundary` | Provider-backed request intent boundary | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
 | `0060-slack-snapshot-reporting` | Single-message Slack snapshot reporting | `planned` | [iterations/v24.3-slack-snapshot-reporting.md](iterations/v24.3-slack-snapshot-reporting.md) |
 | `0061-slack-integration-boundary` | Extracted Slack integration boundary | `planned` | [iterations/v24.3-slack-snapshot-reporting.md](iterations/v24.3-slack-snapshot-reporting.md) |
 
@@ -106,7 +106,7 @@ need editing when an item's status or location changes.
 | `v23-central-block-tx-index-cache` | Central chainstate index ledger | `parked` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
 | `v24-workspace-architecture-cleanup` | Workspace and architecture cleanup | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
 | `v24.1-compiler-enforced-crate-boundaries` | Compiler-enforced crate boundaries | `shipped` | [archive/completed/0056-compiler-enforced-crate-boundaries.md](archive/completed/0056-compiler-enforced-crate-boundaries.md) |
-| `v24.2-github-intent-boundaries` | GitHub and intent integration boundaries | `planned` | [iterations/v24.2-github-intent-boundaries.md](iterations/v24.2-github-intent-boundaries.md) |
+| `v24.2-github-intent-boundaries` | GitHub and intent integration boundaries | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
 | `v24.3-slack-snapshot-reporting` | Slack snapshot reporting and integration boundary | `planned` | [iterations/v24.3-slack-snapshot-reporting.md](iterations/v24.3-slack-snapshot-reporting.md) |
 | `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
 

@@ -1,4 +1,4 @@
-//! GitHub webhook event types consumed by the daemon.
+//! GitHub webhook event types consumed by application adapters.
 
 use serde::{Deserialize, Serialize};
 

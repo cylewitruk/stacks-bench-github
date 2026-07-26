@@ -16,7 +16,7 @@
 //! recorded on a `comment_posted` / `check_run_created` `job_event`, read back
 //! on re-claim so a reclaimed job updates them rather than duplicating.
 //! `tag_created` jobs are enqueued with no commit and resolved at claim time
-//! (the runner calls [`sbgh_core::github::GitHubApi::resolve_commit`] in
+//! (the runner calls [`sbgh_github::GitHubApi::resolve_commit`] in
 //! preflight). Deferred: the intermediate phase-event timeline (provision/
 //! build/bench `job_event` rows — phase changes are logged only).
 

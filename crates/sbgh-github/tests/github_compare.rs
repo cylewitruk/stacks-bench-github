@@ -8,8 +8,8 @@
 //! .../compare/base...owner:ref`, confirmed during Phase 0).
 
 use chrono::{TimeZone, Utc};
-use sbgh_core::github::GitHubApi;
-use sbgh_core::github::test_support::{FakeCall, FakeGitHub};
+use sbgh_github::GitHubApi;
+use sbgh_github::test_support::{FakeCall, FakeGitHub};
 
 #[tokio::test]
 async fn compare_commits_returns_staged_cross_fork_merge_base() {

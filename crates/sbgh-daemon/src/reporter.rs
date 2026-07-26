@@ -21,8 +21,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sbgh_core::config::DaemonConfig;
-use sbgh_core::github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use sbgh_core::models::{GitRefKind, ResolvedCommit};
+use sbgh_github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 
 use crate::artifact_store::ArtifactStore;
@@ -851,8 +851,8 @@ mod tests {
         PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
     };
     use sbgh_core::db::BenchmarkRunMetric;
-    use sbgh_core::github::test_support::{FakeCall, FakeGitHub};
     use sbgh_core::models::{BenchmarkSpec, BuildTarget, GitRefKind, JobMetric, TaskKind};
+    use sbgh_github::test_support::{FakeCall, FakeGitHub};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -1176,9 +1176,7 @@ mod tests {
             .expect("the check was concluded");
         assert_eq!(
             concluded,
-            sbgh_core::github::CheckRunState::Completed(
-                sbgh_core::github::CheckRunConclusion::Cancelled
-            ),
+            sbgh_github::CheckRunState::Completed(sbgh_github::CheckRunConclusion::Cancelled),
         );
     }
 
@@ -1348,14 +1346,9 @@ mod tests {
         }
     }
 
-    fn side(
-        owner: &str,
-        name: &str,
-        branch: &str,
-        sha: &str,
-    ) -> sbgh_core::github::PullRequestSide {
-        sbgh_core::github::PullRequestSide {
-            repo: sbgh_core::github::RepoRef {
+    fn side(owner: &str, name: &str, branch: &str, sha: &str) -> sbgh_github::PullRequestSide {
+        sbgh_github::PullRequestSide {
+            repo: sbgh_github::RepoRef {
                 id: 1,
                 owner: owner.into(),
                 name: name.into(),

@@ -1,9 +1,9 @@
-//! LLM intent-resolution DTOs and validation.
+//! Intent-resolution DTOs and validation.
 //!
 //! The model-facing JSON is deliberately separate from [`WorkloadSpec`]: it can
 //! represent an invalid/ambiguous request, and it uses a strict-schema-friendly
 //! object shape. Daemon validation then normalizes it into the internal
-//! workload type used by both the deterministic parser and surface adapters.
+//! workload type used by both deterministic parsers and surface adapters.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::workload::{
+use sbgh_core::workload::{
     BenchmarkRequest, BlockSelector, ComparisonRequest, ComparisonVariant, WorkloadSpec,
     WorkloadTarget,
 };

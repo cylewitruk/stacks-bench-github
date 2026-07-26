@@ -2742,14 +2742,11 @@ dependencies = [
  "async-trait",
  "chrono",
  "hex",
- "percent-encoding",
- "sbgh-core",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
  "toml",
  "uuid",
 ]
@@ -2774,10 +2771,10 @@ dependencies = [
  "sbgh-core",
  "sbgh-driver",
  "sbgh-github",
+ "sbgh-intent",
  "sbgh-libvirt",
  "sbgh-postgres",
  "sbgh-worker",
- "schemars",
  "serde",
  "serde_json",
  "slack-messaging",
@@ -2785,7 +2782,6 @@ dependencies = [
  "sqlx",
  "subtle",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tower",
@@ -2819,8 +2815,10 @@ dependencies = [
  "chrono",
  "jsonwebtoken",
  "octocrab",
+ "percent-encoding",
  "reqwest 0.13.4",
  "sbgh-core",
+ "sbgh-github",
  "serde",
  "serde_json",
  "tempfile",
@@ -2853,6 +2851,22 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sbgh-intent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest 0.13.4",
+ "sbgh-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

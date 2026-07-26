@@ -1,17 +1,16 @@
-use crate::IntoCoreResult as _;
+use crate::IntoGitHubResult as _;
 use async_trait::async_trait;
 use octocrab::Octocrab;
 use octocrab::models::CommentId;
-use sbgh_core::github::client::compare_basehead;
-use sbgh_core::github::{
-    CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi, PostedCheckRun,
+use sbgh_core::models::{GithubAccountType, ResolvedCommit};
+
+use crate::api::compare_basehead;
+use crate::{
+    CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi,
+    GitHubError as Error, GitHubResult as Result, InstallationTokenCache, PostedCheckRun,
     PostedComment, PullRequestAuthor, PullRequestSide, PullRequestSummary, RepoRef, RepoSummary,
     encode_ref_path,
 };
-use sbgh_core::models::{GithubAccountType, ResolvedCommit};
-use sbgh_core::{Error, Result};
-
-use crate::InstallationTokenCache;
 
 /// Production `GitHubApi` implementation backed by `octocrab`.
 #[derive(Clone)]
@@ -28,12 +27,11 @@ impl OctocrabClient {
         let token = self
             .tokens
             .token_for(installation_id)
-            .await
-            .core()?;
+            .await?;
         let client = Octocrab::builder()
             .personal_token(token)
             .build()
-            .core()?;
+            .github()?;
         Ok(client)
     }
 }
@@ -50,13 +48,12 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         let comment = client
             .issues(owner, repo)
             .create_comment(pr_number, body)
             .await
-            .core()?;
+            .github()?;
         Ok(PostedComment { id: comment.id.0 as i64 })
     }
 
@@ -70,13 +67,12 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         let comment = client
             .issues(owner, repo)
             .update_comment(CommentId(comment_id as u64), body)
             .await
-            .core()?;
+            .github()?;
         Ok(PostedComment { id: comment.id.0 as i64 })
     }
 
@@ -89,13 +85,12 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         let pr = client
             .pulls(owner, repo)
             .get(pr_number)
             .await
-            .core()?;
+            .github()?;
         let head = pr
             .head
             .as_ref()
@@ -111,13 +106,12 @@ impl GitHubApi for OctocrabClient {
     ) -> Result<RepoSummary> {
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         let repo = client
             .repos(owner, name)
             .get()
             .await
-            .core()?;
+            .github()?;
         Ok(repo_summary_from_octocrab(&repo))
     }
 
@@ -130,13 +124,12 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         let pr = client
             .pulls(owner, repo)
             .get(pr_number)
             .await
-            .core()?;
+            .github()?;
         // octocrab's PullRequest exposes head/base as distinct concrete
         // types (Head vs Base) even though they share fields. Extract
         // the bits we care about manually rather than fight the
@@ -205,8 +198,7 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         // GET /repos/{owner}/{repo}/commits/{ref} — GitHub resolves the
         // ref (dereferencing annotated tags) to the underlying commit.
         // octocrab formats the ref into the route verbatim, so we
@@ -216,7 +208,7 @@ impl GitHubApi for OctocrabClient {
             .commits(owner, repo)
             .get(encode_ref_path(git_ref))
             .await
-            .core()?;
+            .github()?;
         // Prefer the committer date (when the commit landed); fall back
         // to the author date. Either may be absent on unusual commits —
         // `committed_at` is Optional, so a missing date is fine.
@@ -246,8 +238,7 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(base_repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         // GET /repos/{owner}/{repo}/compare/{base_ref}...{head_owner}:{head_ref}
         // The `{owner}:{ref}` head form is cross-fork-safe (and correct for
         // same-repo PRs). Percent-encode each ref segment (preserving `/`) and
@@ -315,8 +306,7 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         let (status, conclusion) = status_strings(update.state);
         // Raw POST: octocrab 0.51's `CheckRun` response model types
         // `pull_requests` as the FULL `PullRequest` (needs `node_id`), but the
@@ -335,7 +325,7 @@ impl GitHubApi for OctocrabClient {
         let resp: CheckRunWriteResp = client
             .post(route, Some(&body))
             .await
-            .core()?;
+            .github()?;
         Ok(PostedCheckRun {
             id: resp.id as i64,
             html_url: resp.html_url,
@@ -352,8 +342,7 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         let (status, conclusion) = status_strings(update.state);
         let body = CheckRunWrite {
             name: None,
@@ -367,7 +356,7 @@ impl GitHubApi for OctocrabClient {
         let resp: CheckRunWriteResp = client
             .patch(route, Some(&body))
             .await
-            .core()?;
+            .github()?;
         Ok(PostedCheckRun {
             id: resp.id as i64,
             html_url: resp.html_url,
@@ -386,8 +375,7 @@ impl GitHubApi for OctocrabClient {
         let (owner, repo) = split_repo(repository)?;
         let client = self
             .installation_client(installation_id)
-            .await
-            .core()?;
+            .await?;
         // The typed octocrab `CheckRun` model omits `external_id`, so GET the
         // raw list. Narrow server-side to OUR App + check name (the two filters
         // the endpoint supports); `external_id` isn't a server filter, so match
@@ -406,7 +394,7 @@ impl GitHubApi for OctocrabClient {
         let resp: ListResp = client
             .get(route, Some(&[("check_name", name.to_string()), ("app_id", app_id.to_string())]))
             .await
-            .core()?;
+            .github()?;
         Ok(resp
             .check_runs
             .into_iter()
@@ -418,10 +406,7 @@ impl GitHubApi for OctocrabClient {
     }
 
     async fn current_app_id(&self) -> Result<i64> {
-        self.tokens
-            .app_id()
-            .await
-            .core()
+        self.tokens.app_id().await
     }
 }
 

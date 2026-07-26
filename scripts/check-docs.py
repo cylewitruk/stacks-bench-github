@@ -72,7 +72,7 @@ HISTORICAL_MARKER_BUDGET = {
     "crates/sbgh-core/src/db/webhook.rs": 3,
     "crates/sbgh-github/src/auth.rs": 1,
     "crates/sbgh-github/src/client.rs": 1,
-    "crates/sbgh-core/src/github/client.rs": 11,
+    "crates/sbgh-github/src/api.rs": 11,
     "crates/sbgh-core/src/models.rs": 38,
     "crates/sbgh-daemon/src/api/mod.rs": 4,
     "crates/sbgh-daemon/src/api/state.rs": 1,
@@ -93,7 +93,7 @@ HISTORICAL_MARKER_BUDGET = {
     "crates/sbgh-daemon/src/slack/session.rs": 1,
     "crates/sbgh-daemon/src/slack/timeline.rs": 1,
     "crates/sbgh-daemon/src/webhook_processor.rs": 73,
-    "crates/sbgh-daemon/src/workload.rs": 1,
+    "crates/sbgh-core/src/workload.rs": 1,
 }
 
 

@@ -14,7 +14,13 @@ A single Cargo workspace (`crates/`):
 | `sbgh-handler` | Thin edge: verifies the webhook HMAC and forwards each delivery to the daemon's `/api`. No DB, no App key. Runs in a container. |
 | `sbgh-cli` | Operator CLI — a pure `/api` client (cookie auth) for the installer/repo/policy/user allowlists plus read commands (`jobs list`, `webhook tail`, …). |
 | `sbgh-api` | Shared wire DTOs + a typed `reqwest` client used by the daemon (server) and both clients. |
-| `sbgh-core` | Shared library: config, db, GitHub auth/client, models. |
+| `sbgh-core` | Dependency-light domain models, configuration, store ports, and workload validation. |
+| `sbgh-postgres` | SQLx implementations of the core persistence ports and migrations. |
+| `sbgh-github` | GitHub contracts, webhook DTOs, App authentication, and Octocrab adapter. |
+| `sbgh-intent` | Request-intent contract, structured validation, and OpenAI adapter. |
+| `sbgh-driver` | Backend-neutral task execution contracts. |
+| `sbgh-libvirt` | Concrete libvirt execution adapter. |
+| `sbgh-worker` | In-process execution orchestration and recipes. |
 | `sbgh-smee` | smee.io → handler webhook forwarder (local/dev delivery). |
 
 Postgres is the only persistent state, and the **daemon is its sole client**;

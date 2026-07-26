@@ -11,13 +11,13 @@
 
 use std::sync::Arc;
 
-use sbgh_core::github::RepoRef;
-use sbgh_core::github::test_support::FakeGitHub;
 use sbgh_core::models::{WebhookOutcome, WebhookStatus};
 use sbgh_daemon::{
     BasicClassifier, CreateHandler, InstallationHandler, InstallationRepositoriesHandler,
     IssueCommentHandler, ProcessorConfig, PullRequestHandler, PushHandler, WebhookProcessor,
 };
+use sbgh_github::RepoRef;
+use sbgh_github::test_support::FakeGitHub;
 use sbgh_postgres::db::{
     IngestStore, NewWebhook, Pool, PostgresIngestStore, PostgresInstallationStore,
     PostgresJobStore, PostgresPolicyStore, PostgresPullRequestStore, PostgresRepoStore,
@@ -272,8 +272,8 @@ async fn pipeline_classifies_pr_benchmark_as_enqueued_job() {
     gh.set_pull_request_full(
         "o/r",
         1,
-        sbgh_core::github::PullRequestSide {
-            repo: sbgh_core::github::RepoRef {
+        sbgh_github::PullRequestSide {
+            repo: sbgh_github::RepoRef {
                 id: 10,
                 owner: "o".into(),
                 name: "r".into(),
@@ -281,8 +281,8 @@ async fn pipeline_classifies_pr_benchmark_as_enqueued_job() {
             sha: "basesha".into(),
             branch: "main".into(),
         },
-        sbgh_core::github::PullRequestSide {
-            repo: sbgh_core::github::RepoRef {
+        sbgh_github::PullRequestSide {
+            repo: sbgh_github::RepoRef {
                 id: 20,
                 owner: "alice-fork".into(),
                 name: "r".into(),
@@ -291,7 +291,7 @@ async fn pipeline_classifies_pr_benchmark_as_enqueued_job() {
             branch: "feat".into(),
         },
         "e2e pr title",
-        sbgh_core::github::PullRequestAuthor {
+        sbgh_github::PullRequestAuthor {
             id: 99,
             login: "alice".into(),
             account_type: sbgh_core::models::GithubAccountType::User,
@@ -453,8 +453,8 @@ async fn pipeline_benchmark_without_role_grant_is_denied_unauthorized() {
     gh.set_pull_request_full(
         "o/r",
         1,
-        sbgh_core::github::PullRequestSide {
-            repo: sbgh_core::github::RepoRef {
+        sbgh_github::PullRequestSide {
+            repo: sbgh_github::RepoRef {
                 id: 10,
                 owner: "o".into(),
                 name: "r".into(),
@@ -462,8 +462,8 @@ async fn pipeline_benchmark_without_role_grant_is_denied_unauthorized() {
             sha: "basesha".into(),
             branch: "main".into(),
         },
-        sbgh_core::github::PullRequestSide {
-            repo: sbgh_core::github::RepoRef {
+        sbgh_github::PullRequestSide {
+            repo: sbgh_github::RepoRef {
                 id: 20,
                 owner: "alice-fork".into(),
                 name: "r".into(),
@@ -472,7 +472,7 @@ async fn pipeline_benchmark_without_role_grant_is_denied_unauthorized() {
             branch: "feat".into(),
         },
         "e2e unauth pr title",
-        sbgh_core::github::PullRequestAuthor {
+        sbgh_github::PullRequestAuthor {
             id: 99,
             login: "alice".into(),
             account_type: sbgh_core::models::GithubAccountType::User,

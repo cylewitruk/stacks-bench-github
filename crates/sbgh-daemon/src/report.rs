@@ -30,9 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sbgh_core::github::{
-    CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi,
-};
+use sbgh_github::{CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use tokio::sync::Mutex;
 
 use crate::artifact_store::{ArtifactStore, GROUP_SQLITE_RELATIVE, group_artifact_key};
@@ -902,9 +900,9 @@ mod tests {
 
     use async_trait::async_trait;
     use sbgh_core::db::BenchmarkRunMetric;
-    use sbgh_core::github::test_support::{FakeCall, FakeGitHub};
-    use sbgh_core::github::{CheckRunConclusion, CheckRunState};
     use sbgh_core::models::{GitRefKind, JobMetric, ResolvedCommit};
+    use sbgh_github::test_support::{FakeCall, FakeGitHub};
+    use sbgh_github::{CheckRunConclusion, CheckRunState};
     use uuid::Uuid;
 
     use super::*;

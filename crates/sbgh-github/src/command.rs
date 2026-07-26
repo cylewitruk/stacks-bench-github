@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{GitHubError as Error, GitHubResult as Result};
 
 const PREFIX: &str = "/benchmark";
 

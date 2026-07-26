@@ -1,23 +1,23 @@
 # v24.2: GitHub and Intent Integration Boundaries
 
 Continuation of
-[v24.1](../archive/completed/0056-compiler-enforced-crate-boundaries.md).
+[v24.1](0056-compiler-enforced-crate-boundaries.md).
 Finish the partially established GitHub adapter boundary and extract request
 intent resolution from the daemon without changing trigger, authorization,
 enqueue, or reporting behavior.
 
-> **Status:** planned
+> **Status:** shipped — completed locally on 2026-07-26 and continued in
+> [v24.3](../../iterations/v24.3-slack-snapshot-reporting.md).
 >
-> v24.1 remains shipped. This continuation is deliberately limited to the
-> contained GitHub and intent seams; Slack reporting changes and extraction are
-> owned by [v24.3](v24.3-slack-snapshot-reporting.md).
+> v24.1 remains shipped. GitHub and intent ownership is now compiler-enforced;
+> the credentialed GitHub/Slack smoke remains an explicit deployment check.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0058-github-integration-boundary` | primary: consolidate the GitHub contract and adapter | planned |
-| `0059-intent-resolution-boundary` | co-primary: extract provider-backed request intent resolution | planned |
+| `0058-github-integration-boundary` | primary: consolidate the GitHub contract and adapter | shipped |
+| `0059-intent-resolution-boundary` | co-primary: extract provider-backed request intent resolution | shipped |
 
 ## Why
 
@@ -104,19 +104,19 @@ without either depending on the daemon.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] `sbgh-core::workload` compiles without daemon, Slack, OpenAI, Reqwest, or
+- [x] `sbgh-core::workload` compiles without daemon, Slack, OpenAI, Reqwest, or
   schema-generation dependencies.
-- [ ] Existing workload parser/validation tests move intact and pass.
-- [ ] CLI-like Slack text and structured intent produce the same
+- [x] Existing workload parser/validation tests move intact and pass.
+- [x] CLI-like Slack text and structured intent produce the same
   `BenchmarkRequest` values as before.
-- [ ] `sbgh-daemon` no longer contains a duplicate workload model.
+- [x] `sbgh-daemon` no longer contains a duplicate workload model.
 
 **Tests:**
 
@@ -143,23 +143,23 @@ DTOs, parsing, test support, and concrete API access.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] No GitHub-specific module, webhook DTO, command parser, or GitHub fake
+- [x] No GitHub-specific module, webhook DTO, command parser, or GitHub fake
   remains in `sbgh-core`.
-- [ ] `sbgh-github` owns all Octocrab/JWT dependencies and GitHub-facing
+- [x] `sbgh-github` owns all Octocrab/JWT dependencies and GitHub-facing
   errors; `sbgh-core` does not reacquire them under any feature.
-- [ ] Webhook signature verification, payload parsing, command parsing,
+- [x] Webhook signature verification, payload parsing, command parsing,
   installation-token caching, pagination, comparison, and reporting calls are
   behavior-identical.
-- [ ] Existing API/status/error mapping and retry classification are preserved
+- [x] Existing API/status/error mapping and retry classification are preserved
   at daemon boundaries.
-- [ ] GitHub test consumers use `sbgh-github` test support directly.
+- [x] GitHub test consumers use `sbgh-github` test support directly.
 
 **Tests:**
 
@@ -184,21 +184,21 @@ its current adapter.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] `sbgh-intent` depends on `sbgh-core` domain types but not
+- [x] `sbgh-intent` depends on `sbgh-core` domain types but not
   `sbgh-daemon`, `sbgh-postgres`, SQLx, Slack transport, or GitHub.
-- [ ] The daemon selects/configures the provider and injects
+- [x] The daemon selects/configures the provider and injects
   `Arc<dyn IntentResolver>` into Slack composition.
-- [ ] Prompt text, structured-output schema, validation, timeout, error
+- [x] Prompt text, structured-output schema, validation, timeout, error
   handling, fallback-to-deterministic-parser behavior, and logs remain
   unchanged.
-- [ ] Secrets remain environment-only and are never placed in domain values,
+- [x] Secrets remain environment-only and are never placed in domain values,
   logs, fixtures, or worker configuration.
 
 **Tests:**
@@ -223,21 +223,21 @@ dependency paths.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] Cargo metadata matches the documented target graph.
-- [ ] `sbgh-core` has no normal/build/feature-hidden GitHub, OpenAI, Reqwest,
+- [x] Cargo metadata matches the documented target graph.
+- [x] `sbgh-core` has no normal/build/feature-hidden GitHub, OpenAI, Reqwest,
   JWT, or schema-generation dependency introduced by this work.
-- [ ] `sbgh-github` and `sbgh-intent` have no dependency on `sbgh-daemon` or
+- [x] `sbgh-github` and `sbgh-intent` have no dependency on `sbgh-daemon` or
   `sbgh-postgres`.
-- [ ] `rg` finds no stale `sbgh_core::github`, `sbgh_daemon::workload`, or
+- [x] `rg` finds no stale `sbgh_core::github`, `sbgh_daemon::workload`, or
   `sbgh_daemon::llm` imports.
-- [ ] Documentation links and the planning registry pass repository checks.
+- [x] Documentation links and the planning registry pass repository checks.
 
 **Tests:**
 
@@ -247,24 +247,42 @@ dependency paths.
 
 ## Final Validation
 
-- [ ] `just build`
-- [ ] `just lint`
-- [ ] `just test --summary`
-- [ ] Cargo metadata matches the documented target dependency graph with all
+- [x] `just build --no-sccache`
+- [x] `just lint --no-sccache`
+- [x] `just test --summary --no-sccache`
+- [x] Cargo metadata matches the documented target dependency graph with all
   features.
-- [ ] Existing GitHub webhook, App authentication, API, reporting, admin, and
+- [x] Existing GitHub webhook, App authentication, API, reporting, admin, and
   comparison integration tests pass unchanged in observable behavior.
-- [ ] Existing deterministic and provider-backed Slack intent-resolution tests
+- [x] Existing deterministic and provider-backed Slack intent-resolution tests
   pass unchanged in observable behavior.
 - [ ] A local smoke with GitHub and Slack enabled accepts the same request,
   enqueues the same group/runs, and produces the same external side effects as
   the pre-v24.2 build.
 
+## Validation Evidence
+
+Local validation on 2026-07-26:
+
+- The pre-change baseline passed build, lint, and 819 tests with one
+  libvirt-host test skipped.
+- The completed workspace passes build, lint, Cargo Machete, the all-feature
+  package-DAG check, documentation/registry checks, and rustfmt.
+- The Docker-backed Nextest run passes 826 tests with one live OpenAI
+  evaluation skipped. All moved tests remain present; seven focused
+  error-classification, timeout, and composition tests were added.
+- Direct dependency inspection confirms `sbgh-core` has no GitHub, Reqwest,
+  OpenAI, SQLx, or schema-generation closure, while `sbgh-intent` reaches no
+  daemon, PostgreSQL, GitHub, SQLx, or Slack dependency.
+- The remaining credentialed smoke would create real GitHub and Slack side
+  effects and was not run in the local agent environment.
+
 ## Follow-Ups
 
-- [v24.3](v24.3-slack-snapshot-reporting.md) intentionally replaces Slack's
+- [v24.3](../../iterations/v24.3-slack-snapshot-reporting.md) intentionally
+  replaces Slack's
   card/stream/timeline presentation with one replay-safe snapshot message, then
   extracts the smaller Slack integration into `sbgh-slack`.
-- [v25](v25-worker-fleet-block-validation.md) remains the owner of worker
+- [v25](../../iterations/v25-worker-fleet-block-validation.md) remains the owner of worker
   protocol, durable attempt events, and task-neutral reporter projection.
   Neither v24.2 extraction is a load-bearing fleet prerequisite.

@@ -2,8 +2,8 @@ pub mod bench_args;
 pub mod config;
 pub mod db;
 pub mod error;
-pub mod github;
 pub mod memory;
 pub mod models;
+pub mod workload;
 
 pub use error::{Error, Result};

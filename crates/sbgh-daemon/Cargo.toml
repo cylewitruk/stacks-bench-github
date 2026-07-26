@@ -22,6 +22,7 @@ sbgh-libvirt.workspace = true
 sbgh-worker.workspace = true
 sbgh-postgres.workspace = true
 sbgh-github.workspace = true
+sbgh-intent.workspace = true
 
 tokio = { workspace = true, features = [
     "fs",
@@ -46,9 +47,7 @@ subtle.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
-schemars.workspace = true
 
-thiserror.workspace = true
 anyhow.workspace = true
 
 tracing.workspace = true
@@ -72,7 +71,7 @@ slack-morphism.workspace = true
 slack-messaging.workspace = true
 
 [dev-dependencies]
-sbgh-core = { workspace = true, features = ["testing"] }
+sbgh-github = { workspace = true, features = ["testing"] }
 sbgh-libvirt = { workspace = true, features = ["testing"] }
 sbgh-postgres = { workspace = true, features = ["testing"] }
 tempfile = "3"

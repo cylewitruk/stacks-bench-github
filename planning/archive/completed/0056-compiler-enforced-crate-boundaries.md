@@ -422,10 +422,10 @@ Local validation on 2026-07-25:
 
 ## Follow-Ups
 
-- [v24.2](../../iterations/v24.2-github-intent-boundaries.md) continues the
+- [v24.2](0058-github-intent-boundaries.md) continued the
   adapter-boundary cleanup by consolidating GitHub-specific contracts in
   `sbgh-github` and extracting request intent resolution into `sbgh-intent`.
-  v24.1 remains shipped; these follow-ons do not reopen its acceptance.
+  v24.1 remains shipped; that follow-on did not reopen its acceptance.
 - v25 adds `sbgh-proto`, worker registration/leases, the `sbgh-worker` binary
   process, and durable remote events/artifacts. After parity validation it
   removes the daemon's transitional `sbgh-worker`, `sbgh-driver`, and

@@ -146,7 +146,7 @@ pub async fn run(
     target: SlackJobTarget,
     jobs: Arc<dyn BenchmarkQueue>,
     web_client: Arc<dyn crate::slack::client::SlackClient>,
-    intent_resolver: Option<Arc<dyn crate::llm::intent::IntentResolver>>,
+    intent_resolver: Option<Arc<dyn sbgh_intent::IntentResolver>>,
     options: SocketRunOptions,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {

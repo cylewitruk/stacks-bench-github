@@ -1,15 +1,16 @@
-//! GitHub API client abstraction.
+//! GitHub API contract.
 //!
-//! The trait `GitHubApi` is the boundary between our handler/daemon and
-//! GitHub itself; everything in the rest of the codebase depends on the trait,
-//! not on `octocrab`. `OctocrabClient` is the real implementation; a fake
-//! implementation lives under the `testing` feature for use in tests.
+//! [`GitHubApi`] is the provider boundary owned by `sbgh-github`. Application
+//! code depends on this contract rather than Octocrab. [`crate::OctocrabClient`]
+//! is the production adapter; the `test_support` module contains the
+//! feature-gated fake.
 
 use async_trait::async_trait;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
-use crate::Result;
-use crate::models::ResolvedCommit;
+use sbgh_core::models::{GithubAccountType, ResolvedCommit};
+
+use crate::GitHubResult as Result;
 
 /// Characters to percent-encode inside a single path segment of a git
 /// ref. Covers the URL-structural / unsafe set — most importantly `#`
@@ -299,7 +300,7 @@ pub struct PullRequestSummary {
 pub struct PullRequestAuthor {
     pub id: i64,
     pub login: String,
-    pub account_type: crate::models::GithubAccountType,
+    pub account_type: GithubAccountType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

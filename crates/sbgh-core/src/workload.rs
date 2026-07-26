@@ -3,8 +3,8 @@
 //! This is the shared seam between *capture* (Slack mentions today, PR comments
 //! later), *resolution* (text → spec), and *execution* (the existing bench
 //! path). The deterministic impl ([`resolve_benchmark_request`]) is a flag
-//! parser; the LLM path in [`crate::llm::intent`] produces the same structured
-//! request. Either way, a resolver never emits raw `bench_args`, so it can't
+//! parser; provider-backed intent resolvers produce the same structured
+//! request. Either way, a resolver never emits raw `bench_args`, so it cannot
 //! inject arbitrary CLI flags.
 //!
 //! The grammar (provisional pending the Phase-0 `stacks-bench` spike): an

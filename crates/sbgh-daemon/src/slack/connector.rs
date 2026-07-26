@@ -30,14 +30,14 @@ use sbgh_core::models::{
     BuildTarget, GitRefKind, Job, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail,
     TaskKind,
 };
+use sbgh_intent::{IntentOutcome, IntentResolver};
 use uuid::Uuid;
 
-use crate::llm::intent::{IntentOutcome, IntentResolver};
 use crate::slack::card::{self, CardCtx, RepeatContext};
 use crate::slack::client::{ACK_REACTION, QUEUED_REACTION, SlackClient};
 use crate::slack::stream::initial_chunks_for_card;
 use crate::slack::target::SlackJobTarget;
-use crate::workload::{
+use sbgh_core::workload::{
     BenchmarkRequest, RequestLimits, resolve_benchmark_request, validate_benchmark_request,
 };
 
@@ -622,7 +622,7 @@ mod tests {
 
     use super::*;
     use crate::slack::test_support::RecordingBenchmarkQueue;
-    use crate::workload::WorkloadSpec;
+    use sbgh_core::workload::WorkloadSpec;
 
     const TARGET: SlackJobTarget = SlackJobTarget {
         installation_id: 100,
@@ -723,12 +723,12 @@ mod tests {
         async fn resolve(
             &self,
             _text: &str,
-        ) -> Result<IntentOutcome, crate::llm::intent::IntentProviderError> {
+        ) -> Result<IntentOutcome, sbgh_intent::IntentProviderError> {
             self.calls
                 .fetch_add(1, Ordering::SeqCst);
             self.outcome
                 .clone()
-                .map_err(crate::llm::intent::IntentProviderError::Message)
+                .map_err(sbgh_intent::IntentProviderError::Message)
         }
     }
 
@@ -1479,7 +1479,7 @@ mod tests {
     #[tokio::test]
     async fn natural_language_can_resolve_through_llm() {
         let spec = WorkloadSpec {
-            target: crate::workload::WorkloadTarget::BlockRange { start: 10, end: 12 },
+            target: sbgh_core::workload::WorkloadTarget::BlockRange { start: 10, end: 12 },
             clean_repetitions: 1,
             warmup: Some(1),
             rev: Some("feature/nl".into()),
@@ -1509,9 +1509,9 @@ mod tests {
 
     #[tokio::test]
     async fn natural_language_comparison_uses_same_group_planner() {
-        let request = BenchmarkRequest::Comparison(crate::workload::ComparisonRequest {
+        let request = BenchmarkRequest::Comparison(sbgh_core::workload::ComparisonRequest {
             workload: WorkloadSpec {
-                target: crate::workload::WorkloadTarget::Txids(vec![
+                target: sbgh_core::workload::WorkloadTarget::Txids(vec![
                     "f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce".into(),
                 ]),
                 clean_repetitions: 1,
@@ -1519,10 +1519,10 @@ mod tests {
                 rev: None,
             },
             variants: vec![
-                crate::workload::ComparisonVariant {
+                sbgh_core::workload::ComparisonVariant {
                     rev: "sb-integration/3.4.0.0.2".into(),
                 },
-                crate::workload::ComparisonVariant {
+                sbgh_core::workload::ComparisonVariant {
                     rev: "sb-integration/3.4.0.0.3".into(),
                 },
             ],
@@ -1585,8 +1585,8 @@ mod tests {
     #[tokio::test]
     async fn llm_resolved_clean_repetitions_are_capped_before_enqueue() {
         let spec = WorkloadSpec {
-            target: crate::workload::WorkloadTarget::Blocks(vec![
-                crate::workload::BlockSelector::Height(1),
+            target: sbgh_core::workload::WorkloadTarget::Blocks(vec![
+                sbgh_core::workload::BlockSelector::Height(1),
             ]),
             clean_repetitions: 4,
             warmup: Some(0),
@@ -1673,8 +1673,8 @@ mod tests {
     #[tokio::test]
     async fn natural_language_rate_limit_rejects_without_second_provider_call() {
         let spec = WorkloadSpec {
-            target: crate::workload::WorkloadTarget::Blocks(vec![
-                crate::workload::BlockSelector::Height(1),
+            target: sbgh_core::workload::WorkloadTarget::Blocks(vec![
+                sbgh_core::workload::BlockSelector::Height(1),
             ]),
             clean_repetitions: 1,
             warmup: Some(0),
@@ -1709,8 +1709,8 @@ mod tests {
     #[tokio::test]
     async fn authz_is_checked_before_llm_resolution() {
         let spec = WorkloadSpec {
-            target: crate::workload::WorkloadTarget::Blocks(vec![
-                crate::workload::BlockSelector::Height(1),
+            target: sbgh_core::workload::WorkloadTarget::Blocks(vec![
+                sbgh_core::workload::BlockSelector::Height(1),
             ]),
             clean_repetitions: 1,
             warmup: Some(0),

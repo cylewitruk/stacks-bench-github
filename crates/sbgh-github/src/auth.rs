@@ -46,7 +46,7 @@ impl AppCredentials {
         check_key_permissions(path)?;
         let pem = std::fs::read(path)?;
         let encoding_key = EncodingKey::from_rsa_pem(&pem)
-            .map_err(|e| GitHubError::Config(format!("invalid RSA private key: {e}")))?;
+            .map_err(|e| GitHubError::AdapterConfig(format!("invalid RSA private key: {e}")))?;
         Ok(Self {
             client_id: client_id.into(),
             encoding_key: Arc::new(encoding_key),
@@ -81,10 +81,10 @@ struct JwtClaims {
 fn check_key_permissions(path: &Path) -> GitHubResult<()> {
     use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::metadata(path)
-        .map_err(|e| GitHubError::Config(format!("stat {}: {e}", path.display())))?;
+        .map_err(|e| GitHubError::AdapterConfig(format!("stat {}: {e}", path.display())))?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
-        return Err(GitHubError::Config(format!(
+        return Err(GitHubError::AdapterConfig(format!(
             "private key {} is group/world-readable (mode {mode:o}); expected 0600",
             path.display(),
         )));

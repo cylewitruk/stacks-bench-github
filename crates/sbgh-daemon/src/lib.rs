@@ -4,7 +4,6 @@ mod bench_summary;
 mod comparison;
 mod duration;
 mod job_source;
-mod llm;
 mod pin_manager;
 mod pin_resolver;
 mod report;
@@ -13,13 +12,13 @@ mod runner;
 mod shutdown;
 mod slack;
 mod webhook_processor;
-mod workload;
 
 use std::sync::Arc;
 
 use anyhow::Context;
-use sbgh_core::config::{ArtifactStoreKind, DaemonConfig};
+use sbgh_core::config::{ArtifactStoreKind, DaemonConfig, LlmConfig};
 use sbgh_github::{AppCredentials, InstallationTokenCache, OctocrabClient};
+use sbgh_intent::{OpenAiIntentConfig, OpenAiIntentResolver};
 use sbgh_postgres::{
     self as db, PostgresIngestStore, PostgresInstallationStore, PostgresJobStore,
     PostgresPolicyStore, PostgresPullRequestStore, PostgresRepoStore, PostgresUserStore,
@@ -56,6 +55,20 @@ fn execution_artifact_store_config(
             ))
         }
     }
+}
+
+fn build_openai_intent_resolver(config: &LlmConfig) -> anyhow::Result<OpenAiIntentResolver> {
+    let api_key = config
+        .openai_api_key
+        .clone()
+        .context("OpenAI API key is not configured")?;
+    let provider_config = OpenAiIntentConfig::new(
+        api_key,
+        config.model.clone(),
+        config.input_max_chars,
+        std::time::Duration::from_secs(config.timeout_secs),
+    );
+    Ok(OpenAiIntentResolver::new(provider_config)?)
 }
 
 /// Compose and run the daemon from validated process configuration.
@@ -194,9 +207,9 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             .context("[slack].enabled but SBGH_SLACK_BOT_TOKEN is unset")?;
         let web_client: Arc<dyn slack::client::SlackClient> =
             Arc::new(slack::api_client::WebApiClient::new(bot_token));
-        let intent_resolver: Option<Arc<dyn llm::intent::IntentResolver>> = if config.llm.enabled {
+        let intent_resolver: Option<Arc<dyn sbgh_intent::IntentResolver>> = if config.llm.enabled {
             Some(Arc::new(
-                llm::openai::OpenAiIntentResolver::from_config(&config.llm)
+                build_openai_intent_resolver(&config.llm)
                     .context("building OpenAI intent resolver")?,
             ))
         } else {
@@ -374,3 +387,26 @@ pub use webhook_processor::{
     BasicClassifier, CreateHandler, InstallationHandler, InstallationRepositoriesHandler,
     IssueCommentHandler, ProcessorConfig, PullRequestHandler, PushHandler, WebhookProcessor,
 };
+
+#[cfg(test)]
+mod composition_tests {
+    use super::build_openai_intent_resolver;
+    use sbgh_core::config::LlmConfig;
+
+    #[test]
+    fn openai_projection_requires_a_credential() {
+        let error = build_openai_intent_resolver(&LlmConfig::default())
+            .err()
+            .expect("missing credential must fail");
+        assert_eq!(error.to_string(), "OpenAI API key is not configured");
+    }
+
+    #[test]
+    fn openai_projection_builds_from_narrow_configuration() {
+        let config = LlmConfig {
+            openai_api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        assert!(build_openai_intent_resolver(&config).is_ok());
+    }
+}

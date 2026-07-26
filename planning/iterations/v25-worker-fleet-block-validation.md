@@ -7,7 +7,7 @@ behavior on a separate co-located worker.
 > **Status:** planned — depends on the compiler-enforced crate topology from
 > [v24.1](../archive/completed/0056-compiler-enforced-crate-boundaries.md).
 >
-> [v24.2](v24.2-github-intent-boundaries.md) and
+> [v24.2](../archive/completed/0058-github-intent-boundaries.md) and
 > [v24.3](v24.3-slack-snapshot-reporting.md) are scheduled orchestrator-side
 > continuations before this milestone, but they are not execution-boundary
 > prerequisites. v24.3 deliberately leaves durable event sequencing and replay

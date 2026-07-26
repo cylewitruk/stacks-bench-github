@@ -1,10 +1,9 @@
 //! OpenAI Responses API adapter for benchmark intent extraction.
 
 use async_trait::async_trait;
-use sbgh_core::config::LlmConfig;
 use serde_json::{Value, json};
 
-use crate::llm::intent::{
+use crate::intent::{
     IntentOutcome, IntentProviderError, IntentResolutionJson, IntentResolver,
     intent_response_text_format, validate_intent_resolution,
 };
@@ -30,39 +29,69 @@ pub struct OpenAiIntentResolver {
     endpoint: String,
 }
 
+/// Provider configuration projected by the application composition root.
+///
+/// Deliberately does not implement `Debug`: it owns a live API credential.
+pub struct OpenAiIntentConfig {
+    api_key: String,
+    model: String,
+    input_max_chars: usize,
+    timeout: std::time::Duration,
+}
+
+impl OpenAiIntentConfig {
+    pub fn new(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        input_max_chars: usize,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            api_key: api_key.into(),
+            model: model.into(),
+            input_max_chars,
+            timeout,
+        }
+    }
+}
+
 impl OpenAiIntentResolver {
-    pub fn from_config(cfg: &LlmConfig) -> Result<Self, IntentProviderError> {
-        let api_key = cfg
-            .openai_api_key
-            .clone()
-            .ok_or_else(|| {
-                IntentProviderError::Message("OpenAI API key is not configured".into())
-            })?;
+    pub fn new(cfg: OpenAiIntentConfig) -> Result<Self, IntentProviderError> {
+        Self::with_endpoint(cfg, "https://api.openai.com/v1/responses")
+    }
+
+    fn with_endpoint(
+        cfg: OpenAiIntentConfig,
+        endpoint: impl Into<String>,
+    ) -> Result<Self, IntentProviderError> {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(cfg.timeout_secs))
+            .timeout(cfg.timeout)
             .build()
             .map_err(|e| {
                 IntentProviderError::Message(format!("OpenAI client setup failed: {e}"))
             })?;
         Ok(Self {
             client,
-            api_key,
-            model: cfg.model.clone(),
+            api_key: cfg.api_key,
+            model: cfg.model,
             input_max_chars: cfg.input_max_chars,
-            endpoint: "https://api.openai.com/v1/responses".into(),
+            endpoint: endpoint.into(),
         })
     }
 
     #[cfg(test)]
     fn for_test(endpoint: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            input_max_chars: 1_000,
-            endpoint: endpoint.into(),
-        }
+        Self::with_endpoint(
+            OpenAiIntentConfig::new(
+                "sk-test",
+                "gpt-test",
+                1_000,
+                std::time::Duration::from_secs(15),
+            ),
+            endpoint,
+        )
+        .expect("test client configuration is valid")
     }
 
     fn request_body(&self, text: &str) -> Value {
@@ -230,10 +259,8 @@ pub fn extract_openai_output_text(body: &Value) -> Result<&str, IntentProviderEr
 
 #[cfg(test)]
 mod tests {
-    use sbgh_core::config::LlmConfig;
-
     use super::*;
-    use crate::llm::intent::{
+    use crate::intent::{
         EVAL_FIXTURES, EvalExpected, IntentEvalFixture, IntentResolutionJson, run_eval_fixtures,
     };
 
@@ -358,19 +385,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_timeout_is_a_provider_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener
+                .accept()
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        let resolver = OpenAiIntentResolver::with_endpoint(
+            OpenAiIntentConfig::new(
+                "sk-test",
+                "gpt-test",
+                1_000,
+                std::time::Duration::from_millis(25),
+            ),
+            format!("http://{address}"),
+        )
+        .unwrap();
+
+        let error = resolver
+            .resolve("bench block 1")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("OpenAI request failed")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     #[ignore = "requires SBGH_OPENAI_API_KEY and calls the real OpenAI Responses API"]
     async fn openai_eval_fixture_set() {
         let api_key = std::env::var("SBGH_OPENAI_API_KEY")
             .expect("set SBGH_OPENAI_API_KEY to run the real-model eval");
-        let mut cfg = LlmConfig {
-            enabled: true,
-            openai_api_key: Some(api_key),
-            ..Default::default()
-        };
-        if let Ok(model) = std::env::var("SBGH_LLM_MODEL") {
-            cfg.model = model;
-        }
-        let resolver = OpenAiIntentResolver::from_config(&cfg).unwrap();
+        let model = std::env::var("SBGH_LLM_MODEL").unwrap_or_else(|_| "gpt-5-mini".to_string());
+        let resolver = OpenAiIntentResolver::new(OpenAiIntentConfig::new(
+            api_key,
+            model,
+            1_000,
+            std::time::Duration::from_secs(15),
+        ))
+        .unwrap();
         let report = run_eval_fixtures(&resolver, EVAL_FIXTURES)
             .await
             .unwrap();

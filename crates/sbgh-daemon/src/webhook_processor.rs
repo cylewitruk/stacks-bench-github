@@ -32,14 +32,14 @@ use sbgh_core::db::{
     NewPullRequest, NewRepoIdentity, NewRepoLineage, NewUser, PolicyStore, PullRequestStore,
     RepoStore, UserStore, WebhookInbox,
 };
-use sbgh_core::github::{
-    CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent, IssueCommentEvent,
-    PullRequestEvent, PushEvent, RepoRef, RepoSummary, parse_command,
-};
 use sbgh_core::models::{
     BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobCreationRequest, JobIntent, JobSource,
     NewJob, NewPullRequestLink, QueuedEventDetail, TaskKind, TriggerKind, TriggerMatchSpec,
     TriggerPolicy, UserRole, WebhookOutcome,
+};
+use sbgh_github::{
+    CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent, IssueCommentEvent,
+    PullRequestEvent, PushEvent, RepoRef, RepoSummary, parse_command,
 };
 
 /// What a [`Classifier`] decides to do with a claimed webhook.
@@ -960,7 +960,7 @@ async fn materialise_repo_membership(
     membership_store: &dyn InstallationStore,
     gh: &dyn GitHubApi,
     install_id: i64,
-    payload_repo: &sbgh_core::github::InstallationRepository,
+    payload_repo: &sbgh_github::InstallationRepository,
 ) -> RepoMembershipOutcome {
     let Some((owner, name)) = split_full_name(&payload_repo.full_name) else {
         tracing::warn!(
@@ -1069,7 +1069,7 @@ async fn handle_repos_added(
     membership_store: &dyn InstallationStore,
     gh: &dyn GitHubApi,
     install_id: i64,
-    repos: &[sbgh_core::github::InstallationRepository],
+    repos: &[sbgh_github::InstallationRepository],
 ) -> ClassifyOutcome {
     let mut any_supported = false;
     let mut any_unsupported = false;
@@ -1105,7 +1105,7 @@ async fn handle_repos_removed(
     policy_store: &dyn PolicyStore,
     user_store: &dyn UserStore,
     install_id: i64,
-    repos: &[sbgh_core::github::InstallationRepository],
+    repos: &[sbgh_github::InstallationRepository],
 ) -> ClassifyOutcome {
     let mut any_revoked = false;
     for repo in repos {
@@ -2860,7 +2860,7 @@ mod tests {
     async fn make_benchmark_handler() -> (
         TestDb,
         IssueCommentHandler,
-        sbgh_core::github::test_support::FakeGitHub,
+        sbgh_github::test_support::FakeGitHub,
         Arc<PostgresPolicyStore>,
         Arc<PostgresInstallationStore>,
         Arc<PostgresUserStore>,
@@ -2917,13 +2917,13 @@ mod tests {
             .await
             .unwrap();
 
-        let gh = sbgh_core::github::test_support::FakeGitHub::new();
+        let gh = sbgh_github::test_support::FakeGitHub::new();
         // Standard PR: base repo id=10, head repo id=20 (a fork).
         gh.set_pull_request(
             "o/r",
             1,
-            sbgh_core::github::PullRequestSide {
-                repo: sbgh_core::github::RepoRef {
+            sbgh_github::PullRequestSide {
+                repo: sbgh_github::RepoRef {
                     id: 10,
                     owner: "o".into(),
                     name: "r".into(),
@@ -2931,8 +2931,8 @@ mod tests {
                 sha: "basesha".into(),
                 branch: "main".into(),
             },
-            sbgh_core::github::PullRequestSide {
-                repo: sbgh_core::github::RepoRef {
+            sbgh_github::PullRequestSide {
+                repo: sbgh_github::RepoRef {
                     id: 20,
                     owner: "alice".into(),
                     name: "r".into(),
@@ -3596,7 +3596,7 @@ mod tests {
         InstallationHandler::new(
             store,
             Arc::new(PostgresRepoStore::new(pool)),
-            Arc::new(sbgh_core::github::test_support::FakeGitHub::new()),
+            Arc::new(sbgh_github::test_support::FakeGitHub::new()),
         )
     }
 
@@ -3613,7 +3613,7 @@ mod tests {
             Arc::new(PostgresInstallationStore::new(pool.clone())),
             Arc::new(PostgresUserStore::new(pool.clone())),
             Arc::new(PostgresPullRequestStore::new(pool.clone())),
-            Arc::new(sbgh_core::github::test_support::FakeGitHub::new()),
+            Arc::new(sbgh_github::test_support::FakeGitHub::new()),
             Arc::new(PostgresJobStore::new(pool)),
         )
     }
@@ -3937,7 +3937,7 @@ mod tests {
         InstallationHandler,
         Arc<PostgresInstallationStore>,
         Arc<PostgresRepoStore>,
-        sbgh_core::github::test_support::FakeGitHub,
+        sbgh_github::test_support::FakeGitHub,
     ) {
         let (db, pool) = setup_pg_db().await;
         let install_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
@@ -3948,7 +3948,7 @@ mod tests {
         repo_store
             .seed_supported_root(root_repo_id, root_owner, root_name, true)
             .await;
-        let gh = sbgh_core::github::test_support::FakeGitHub::new();
+        let gh = sbgh_github::test_support::FakeGitHub::new();
         let handler = InstallationHandler::new(
             install_store.clone(),
             repo_store.clone(),
@@ -4101,7 +4101,7 @@ mod tests {
 
     // ─── InstallationRepositoriesHandler (slice 4) ──────────────────────
 
-    use sbgh_core::github::test_support::FakeGitHub;
+    use sbgh_github::test_support::FakeGitHub;
 
     fn repos_event_payload(
         action: &str,

@@ -7,8 +7,8 @@ use sbgh_core::config::{
     ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig, PrReport,
     ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
 };
-use sbgh_core::github::test_support::FakeGitHub;
 use sbgh_core::models::{BuildTarget, GitRefKind, ResolvedCommit, TaskKind};
+use sbgh_github::test_support::FakeGitHub;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -1166,7 +1166,7 @@ async fn run_once_resolves_tag_commit_in_preflight() {
     assert!(
         gh.calls()
             .iter()
-            .any(|c| matches!(c, sbgh_core::github::test_support::FakeCall::ResolveCommit { .. })),
+            .any(|c| matches!(c, sbgh_github::test_support::FakeCall::ResolveCommit { .. })),
         "runner must call resolve_commit for a tag job"
     );
 }
@@ -1231,14 +1231,14 @@ async fn run_once_resolves_slack_rev_commit_in_preflight() {
             .iter()
             .any(|c| matches!(
                 c,
-                sbgh_core::github::test_support::FakeCall::ResolveCommit { git_ref, .. }
+                sbgh_github::test_support::FakeCall::ResolveCommit { git_ref, .. }
                     if git_ref == "develop"
             )),
         "runner must resolve the bare Slack rev"
     );
 }
 
-use sbgh_core::github::test_support::FakeCall;
+use sbgh_github::test_support::FakeCall;
 
 fn config_with(tmp: &TempDir, pr: PrReport, baseline: BaselineReport) -> DaemonConfig {
     let mut c = test_config(tmp);
@@ -2039,9 +2039,7 @@ async fn startup_concludes_orphan_check_as_cancelled() {
         .expect("the orphan's check was concluded");
     assert_eq!(
         concluded,
-        sbgh_core::github::CheckRunState::Completed(
-            sbgh_core::github::CheckRunConclusion::Cancelled
-        ),
+        sbgh_github::CheckRunState::Completed(sbgh_github::CheckRunConclusion::Cancelled),
     );
 }
 

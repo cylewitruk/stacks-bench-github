@@ -4,14 +4,15 @@
 
 `stacks-bench-github` is a GitHub App that runs the [`stacks-bench`](https://github.com/cylewitruk/stacks-core/tree/feat/stacks-bench/stacks-bench) tool against pull requests, either automatically or in response to `/benchmark` slash-commands posted in PR comments.
 
-The system is one Cargo workspace with eleven crates and four binaries:
+The system is one Cargo workspace with twelve crates and four binaries:
 
 ```text
 crates/
   sbgh-api/          wire DTOs and typed daemon API client
   sbgh-core/         dependency-light domain policy, ports, configuration, and models
   sbgh-driver/       backend-neutral execution contracts
-  sbgh-github/       GitHub App authentication and Octocrab adapter
+  sbgh-github/       GitHub contracts, webhook DTOs, authentication, and Octocrab adapter
+  sbgh-intent/       request-intent contract, validation, and OpenAI adapter
   sbgh-libvirt/      concrete libvirt execution adapter
   sbgh-postgres/     SQLx stores, migrations, row mappings, and admin queries
   sbgh-worker/       in-process execution orchestration and recipes
@@ -22,8 +23,8 @@ crates/
 ```
 
 A Postgres database (run locally via `docker/docker-compose.yml`) is the only persistent state, and the **daemon is its sole client**. The handler and `sbgh-cli` never touch Postgres — they reach the daemon over the authenticated `/api` (see [daemon-api.md](./daemon-api.md)).
-Concrete persistence and GitHub integrations live in `sbgh-postgres` and
-`sbgh-github`, respectively.
+Concrete persistence, GitHub, and provider-backed intent integrations live in
+`sbgh-postgres`, `sbgh-github`, and `sbgh-intent`, respectively.
 
 ## Data flow
 
@@ -79,6 +80,9 @@ For each verify-and-forward request:
 | Main loop | [crates/sbgh-daemon/src/runner.rs](../crates/sbgh-daemon/src/runner.rs) |
 | Queue contract | [crates/sbgh-core/src/db/jobs.rs](../crates/sbgh-core/src/db/jobs.rs) |
 | PostgreSQL queue implementation | [crates/sbgh-postgres/src/stores/jobs.rs](../crates/sbgh-postgres/src/stores/jobs.rs) |
+| Workload domain | [crates/sbgh-core/src/workload.rs](../crates/sbgh-core/src/workload.rs) |
+| Intent resolver | [crates/sbgh-intent/src/lib.rs](../crates/sbgh-intent/src/lib.rs) |
+| GitHub API contract and adapter | [crates/sbgh-github/src/lib.rs](../crates/sbgh-github/src/lib.rs) |
 | Worker events | [crates/sbgh-driver/src/events.rs](../crates/sbgh-driver/src/events.rs) |
 | Report surfaces | [crates/sbgh-daemon/src/report.rs](../crates/sbgh-daemon/src/report.rs) |
 | libvirt driver | [crates/sbgh-libvirt/src/libvirt/driver.rs](../crates/sbgh-libvirt/src/libvirt/driver.rs) |
