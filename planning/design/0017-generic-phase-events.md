@@ -113,6 +113,13 @@ one enum value per recipe phase.
   reconciling external side effects. The event ledger provides repeatable
   internal input; it does not pretend PostgreSQL can transact atomically with
   GitHub or Slack.
+- [v24.3](../iterations/v24.3-slack-snapshot-reporting.md) gives Slack a
+  deterministic full-snapshot renderer and one durable message identity. On
+  catch-up, this projector rebuilds the current `SlackProgressView` from the
+  committed event prefix and renders the entire canonical message; it never
+  replays historical Slack mutations or interprets the prior message body.
+  Re-projecting unchanged state is therefore idempotent, while a later
+  contiguous prefix converges the same message to the newer snapshot.
 - Check Runs retain their stable `external_id` reconciliation. PR comments gain
   a deterministic hidden marker derived from the stable report-surface identity
   (for example `<!-- sbgh-report:<job-or-group-id> -->`). When no comment ID is
