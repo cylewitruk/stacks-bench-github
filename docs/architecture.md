@@ -78,7 +78,7 @@ For each verify-and-forward request:
 | ---- | ---- |
 | Main loop | [crates/sbgh-daemon/src/runner.rs](../crates/sbgh-daemon/src/runner.rs) |
 | Queue contract | [crates/sbgh-core/src/db/jobs.rs](../crates/sbgh-core/src/db/jobs.rs) |
-| PostgreSQL queue implementation | [crates/sbgh-postgres/src/postgres_jobs.rs](../crates/sbgh-postgres/src/postgres_jobs.rs) |
+| PostgreSQL queue implementation | [crates/sbgh-postgres/src/stores/jobs.rs](../crates/sbgh-postgres/src/stores/jobs.rs) |
 | Worker events | [crates/sbgh-driver/src/events.rs](../crates/sbgh-driver/src/events.rs) |
 | Report surfaces | [crates/sbgh-daemon/src/report.rs](../crates/sbgh-daemon/src/report.rs) |
 | libvirt driver | [crates/sbgh-libvirt/src/libvirt/driver.rs](../crates/sbgh-libvirt/src/libvirt/driver.rs) |

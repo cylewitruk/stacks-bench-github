@@ -4,14 +4,7 @@ mod error;
 mod mapping;
 pub mod migrate;
 pub mod pool;
-pub mod postgres_ingest;
-pub mod postgres_installation;
-pub mod postgres_jobs;
-pub mod postgres_policy;
-pub mod postgres_pull_request;
-pub mod postgres_repo;
-pub mod postgres_user;
-pub mod postgres_webhook;
+pub mod stores;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support;
 
@@ -20,14 +13,14 @@ pub use error::{PersistenceError, PersistenceResult};
 pub use mapping::Db;
 pub use migrate::migrate;
 pub use pool::{Pool, connect};
-pub use postgres_ingest::PostgresIngestStore;
-pub use postgres_installation::PostgresInstallationStore;
-pub use postgres_jobs::PostgresJobStore;
-pub use postgres_policy::PostgresPolicyStore;
-pub use postgres_pull_request::PostgresPullRequestStore;
-pub use postgres_repo::PostgresRepoStore;
-pub use postgres_user::PostgresUserStore;
-pub use postgres_webhook::PostgresWebhookInbox;
+pub use stores::ingest::PostgresIngestStore;
+pub use stores::installation::PostgresInstallationStore;
+pub use stores::jobs::PostgresJobStore;
+pub use stores::policy::PostgresPolicyStore;
+pub use stores::pull_request::PostgresPullRequestStore;
+pub use stores::repo::PostgresRepoStore;
+pub use stores::user::PostgresUserStore;
+pub use stores::webhook::PostgresWebhookInbox;
 #[cfg(any(test, feature = "testing"))]
 pub use test_support::{TestDb, TestPgDb, setup_pg_db};
 
