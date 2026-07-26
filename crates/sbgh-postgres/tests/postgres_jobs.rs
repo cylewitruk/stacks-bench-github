@@ -123,6 +123,7 @@ async fn create_unlinked_job_inserts_queued_job_and_event_without_webhook() {
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: None,
         bench_args: vec!["--block".into(), "184231".into()],
         clean_repetitions: 1,
     })

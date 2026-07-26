@@ -4,7 +4,7 @@
 
 `stacks-bench-github` is a GitHub App that runs the [`stacks-bench`](https://github.com/cylewitruk/stacks-core/tree/feat/stacks-bench/stacks-bench) tool against pull requests, either automatically or in response to `/benchmark` slash-commands posted in PR comments.
 
-The system is one Cargo workspace with twelve crates and four binaries:
+The system is one Cargo workspace with thirteen crates and four binaries:
 
 ```text
 crates/
@@ -13,6 +13,7 @@ crates/
   sbgh-driver/       backend-neutral execution contracts
   sbgh-github/       GitHub contracts, webhook DTOs, authentication, and Octocrab adapter
   sbgh-intent/       request-intent contract, validation, and OpenAI adapter
+  sbgh-slack/        Slack intake, transport, snapshot renderer, and publisher
   sbgh-libvirt/      concrete libvirt execution adapter
   sbgh-postgres/     SQLx stores, migrations, row mappings, and admin queries
   sbgh-worker/       in-process execution orchestration and recipes
@@ -24,7 +25,9 @@ crates/
 
 A Postgres database (run locally via `docker/docker-compose.yml`) is the only persistent state, and the **daemon is its sole client**. The handler and `sbgh-cli` never touch Postgres — they reach the daemon over the authenticated `/api` (see [daemon-api.md](./daemon-api.md)).
 Concrete persistence, GitHub, and provider-backed intent integrations live in
-`sbgh-postgres`, `sbgh-github`, and `sbgh-intent`, respectively.
+`sbgh-postgres`, `sbgh-github`, and `sbgh-intent`, respectively. `sbgh-slack`
+owns the Slack transport and deterministic message lifecycle while the daemon
+retains target lookup and benchmark result/comparison policy.
 
 ## Data flow
 
@@ -85,6 +88,8 @@ For each verify-and-forward request:
 | GitHub API contract and adapter | [crates/sbgh-github/src/lib.rs](../crates/sbgh-github/src/lib.rs) |
 | Worker events | [crates/sbgh-driver/src/events.rs](../crates/sbgh-driver/src/events.rs) |
 | Report surfaces | [crates/sbgh-daemon/src/report.rs](../crates/sbgh-daemon/src/report.rs) |
+| Slack contract and adapter | [crates/sbgh-slack/src/lib.rs](../crates/sbgh-slack/src/lib.rs) |
+| Slack result projection | [crates/sbgh-daemon/src/slack_report.rs](../crates/sbgh-daemon/src/slack_report.rs) |
 | libvirt driver | [crates/sbgh-libvirt/src/libvirt/driver.rs](../crates/sbgh-libvirt/src/libvirt/driver.rs) |
 
 The coordinator claims serially with `SELECT ... FOR UPDATE SKIP LOCKED LIMIT
@@ -250,6 +255,15 @@ owner, including reporting credentials, rendering, debounce, rate limiting,
 retries, and reporting-session state. A worker may receive a short-lived,
 lease-scoped GitHub token for repository access, but never Slack credentials or
 a GitHub/Slack reporting client.
+
+Slack uses one ordinary threaded message per request. `sbgh-daemon` projects
+the current benchmark/group state into `SlackProgressView`; `sbgh-slack`
+renders the complete message and posts once or calls `chat.update` thereafter.
+Message metadata carries only an opaque request-stable identity and projection
+version. If the post succeeds but its timestamp is not persisted, the publisher
+searches the known thread for exactly one matching message authored by the
+configured bot. Lookup errors and multiple matches fail closed. Fine-grained
+progress is debounced; phase and terminal transitions flush immediately.
 
 The movable closure starts at the owned dispatcher and concrete libvirt
 backend:

@@ -206,11 +206,11 @@ churn.
 
 - Add a `ReportSurface` progress hook or equivalent event path.
 - Debounce/coalesce updates by time and/or traversed entries.
-- For Slack, append compact details to the active task card: phase headings,
-  milestone counts, and human messages where useful.
+- For Slack, project compact bounded progress into the canonical
+  `SlackProgressView`; the full snapshot renderer owns the update.
 - For GitHub/checks, update a throttled latest-progress summary.
-- Keep the Slack coalescer per run/workflow step so repeat run *K+1* cannot
-  inherit run *K*'s progress transcript.
+- Keep Slack projection order group-scoped and reset run-local progress when
+  run *K+1* begins.
 
 **Status:**
 
@@ -227,7 +227,7 @@ churn.
 
 **Tests:**
 
-- Slack card/timeline tests for coalesced progress details.
+- Slack snapshot tests for coalesced progress details.
 - GitHub/check-surface tests for throttled latest-progress updates.
 
 ### Phase 4: Calibration and Repeat Validation

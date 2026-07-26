@@ -32,9 +32,9 @@ use crate::bench_summary::RunResult;
 use crate::comparison::{BaselineComparison, GroupComparison, compare};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::{CompletionReport, ReportSurface, build_report_surface};
-use crate::slack::client::SlackClient;
-use crate::slack::session::SlackSessionRegistry;
+use crate::slack_report::SlackSessionRegistry;
 use sbgh_driver::{Terminal, WorkerEvent};
+use sbgh_slack::SlackClient;
 
 /// Resolve the App's numeric id via `GET /app`, cached on **success** in `cell`
 /// (a `get_or_try_init` that leaves the cell empty on error, so a transient
@@ -85,7 +85,7 @@ pub struct Reporter {
     /// runner. `None` for a GitHub-only deployment.
     slack: Option<Arc<dyn SlackClient>>,
     /// Group-scoped Slack reporting sessions, shared from the runner so a
-    /// repeat group's per-run surfaces reuse one live card and keepalive.
+    /// repeat group's per-run surfaces reuse one canonical snapshot session.
     slack_sessions: Arc<SlackSessionRegistry>,
     job: RunnableJob,
 }
@@ -201,11 +201,11 @@ impl Reporter {
             "job running (claimed → running)",
         );
 
-        // The one reporting surface for this job: the Slack live card, an
+        // The one reporting surface for this job: the Slack snapshot, an
         // explicit no-op for Slack without a client, or the GitHub
         // comment+check. Built **once** and shared across
         // `started`, the drain loop, and `finish`, so a stateful surface (the
-        // Slack card) keeps a single timeline across the whole run.
+        // Slack message) keeps a single projected state across the whole run.
         let surface = build_report_surface(
             self.gh.clone(),
             self.jobs.clone(),
@@ -858,7 +858,7 @@ mod tests {
 
     use super::*;
     use crate::job_source::BaselineRef;
-    use crate::slack::client::{COMPLETED_REACTION, RUNNING_REACTION};
+    use sbgh_slack::{COMPLETED_REACTION, RUNNING_REACTION};
 
     fn job_with(progress: ProgressTarget) -> RunnableJob {
         RunnableJob {
@@ -1180,59 +1180,83 @@ mod tests {
         );
     }
 
-    // ─── item 0002: Slack live-timeline wiring ───
+    // ─── Slack snapshot wiring ───
 
-    /// Counts the Slack calls the reporter's timeline makes through `run`.
+    /// Counts the Slack calls the reporter's snapshot publisher makes through `run`.
     #[derive(Default)]
     struct TimelineFakeSlack {
         posts: StdMutex<usize>,
         updates: StdMutex<usize>,
+        update_texts: StdMutex<Vec<String>>,
         added: StdMutex<Vec<String>>,
+        messages: StdMutex<Vec<sbgh_slack::FoundMessage>>,
     }
 
     #[async_trait]
     impl SlackClient for TimelineFakeSlack {
-        async fn post_ephemeral(&self, _c: &str, _u: &str, _t: &str) -> anyhow::Result<()> {
+        async fn post_ephemeral(&self, _c: &str, _u: &str, _t: &str) -> sbgh_slack::Result<()> {
             Ok(())
         }
-        async fn post_blocks_in_thread(
+        async fn post_message(
             &self,
-            _c: &str,
-            _ts: &str,
-            _b: &serde_json::Value,
-            _f: &str,
-        ) -> anyhow::Result<String> {
+            _target: &sbgh_slack::SlackMessageTarget,
+            text: &str,
+            _identity: &sbgh_slack::ReportingIdentity,
+            snapshot_version: u64,
+        ) -> sbgh_slack::Result<String> {
             *self.posts.lock().unwrap() += 1;
+            self.messages
+                .lock()
+                .unwrap()
+                .push(sbgh_slack::FoundMessage {
+                    ts: "PLAN_TS".into(),
+                    text: text.into(),
+                    snapshot_version,
+                });
             Ok("PLAN_TS".into())
         }
-        async fn update_blocks(
+        async fn update_message(
             &self,
             _c: &str,
             _ts: &str,
-            _b: &serde_json::Value,
-            _f: &str,
-        ) -> anyhow::Result<()> {
+            text: &str,
+            _identity: &sbgh_slack::ReportingIdentity,
+            _snapshot_version: u64,
+        ) -> sbgh_slack::Result<()> {
             *self.updates.lock().unwrap() += 1;
+            self.update_texts
+                .lock()
+                .unwrap()
+                .push(text.into());
             Ok(())
         }
-        async fn add_reaction(&self, _c: &str, _ts: &str, r: &str) -> anyhow::Result<()> {
+        async fn find_messages(
+            &self,
+            _target: &sbgh_slack::SlackMessageTarget,
+            _identity: &sbgh_slack::ReportingIdentity,
+        ) -> sbgh_slack::Result<Vec<sbgh_slack::FoundMessage>> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .clone())
+        }
+        async fn add_reaction(&self, _c: &str, _ts: &str, r: &str) -> sbgh_slack::Result<()> {
             self.added
                 .lock()
                 .unwrap()
                 .push(r.into());
             Ok(())
         }
-        async fn remove_reaction(&self, _c: &str, _ts: &str, _r: &str) -> anyhow::Result<()> {
+        async fn remove_reaction(&self, _c: &str, _ts: &str, _r: &str) -> sbgh_slack::Result<()> {
             Ok(())
         }
     }
 
-    /// A Slack job driven through `run` posts the live `plan` card at start,
-    /// advances it as the worker reports a phase + completes, and swaps ⏳→✅.
-    /// This fake client exercises the block fallback path; timeline-specific
-    /// tests pin the streaming path.
+    /// A Slack job driven through `run` posts one snapshot, updates it through
+    /// phase and completion, and preserves the reaction lifecycle.
     #[tokio::test]
-    async fn slack_job_drives_the_live_timeline_through_run() {
+    async fn slack_job_drives_the_snapshot_through_run() {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RecordingStore::default());
         let slack = Arc::new(TimelineFakeSlack::default());
@@ -1246,11 +1270,12 @@ mod tests {
             job_with(ProgressTarget::Slack {
                 channel: "C1".into(),
                 message_ts: "REQ".into(),
+                reporting_identity: "0".repeat(64),
                 plan_message_ts: None,
             }),
         );
 
-        // A phase event (advances the card), then a clean completion.
+        // A phase event advances the snapshot, then a clean completion.
         let (events_tx, events_rx) = mpsc::channel(4);
         events_tx
             .send(WorkerEvent::Phase {
@@ -1271,13 +1296,9 @@ mod tests {
             .await
             .unwrap();
 
-        // started() posted the card once; phase(running) + completed updated it.
-        assert_eq!(
-            *slack.posts.lock().unwrap(),
-            1,
-            "the plan card is posted exactly once at start"
-        );
-        assert!(*slack.updates.lock().unwrap() >= 2, "advanced + finalized via fallback update");
+        // started() posts once; phase(running) + completed update the same ts.
+        assert_eq!(*slack.posts.lock().unwrap(), 1, "the canonical message is posted exactly once");
+        assert!(*slack.updates.lock().unwrap() >= 2, "phase + terminal snapshot updates");
         assert_eq!(
             *slack.added.lock().unwrap(),
             vec![RUNNING_REACTION.to_string(), COMPLETED_REACTION.to_string()],
@@ -1468,6 +1489,7 @@ mod tests {
         let mut job = job_with(ProgressTarget::Slack {
             channel: "C1".into(),
             message_ts: "REQ".into(),
+            reporting_identity: "0".repeat(64),
             plan_message_ts: Some("PLAN".into()),
         });
         job.benchmark_group_id = group_id;
@@ -1527,6 +1549,40 @@ mod tests {
                 .abs()
                 < 1e-9
         );
+
+        let slack = Arc::new(TimelineFakeSlack::default());
+        let slack_client: Arc<dyn SlackClient> = slack.clone();
+        let sessions = Arc::new(SlackSessionRegistry::new());
+        let surface = build_report_surface(
+            reporter.gh.clone(),
+            reporter.jobs.clone(),
+            reporter
+                .artifact_store
+                .clone(),
+            Some(&slack_client),
+            &sessions,
+            &reporter.job,
+        );
+        let summary = serde_json::json!({});
+        surface
+            .completed(CompletionReport {
+                summary: &summary,
+                baseline_comparison: None,
+                group_comparison: Some(&comparison),
+            })
+            .await;
+
+        let updates = slack
+            .update_texts
+            .lock()
+            .unwrap();
+        let rendered = updates
+            .last()
+            .expect("comparison updates the shared message");
+        assert!(rendered.contains("release/3.4.0.0.2"), "{rendered}");
+        assert!(rendered.contains("release/3.4.0.0.3"), "{rendered}");
+        assert!(rendered.contains("+1.80% slower"), "{rendered}");
+        assert!(rendered.contains("Run: 2/2"), "{rendered}");
     }
 
     /// A baseline (non-PR) job has no fork-point → no comparison.

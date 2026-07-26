@@ -685,7 +685,7 @@ impl JobStore for PostgresJobStore {
         plan_message_ts: Option<&str>,
     ) -> Result<Job> {
         // One transaction: job insert → queued event → the `plan_message_sent`
-        // event when the connector pre-posted its card. No webhook/user/PR links
+        // event when the connector pre-posted its message. No webhook/user/PR links
         // and no idempotency guard (see the trait docs); a failure rolls back.
         let mut tx = self
             .pool
@@ -699,7 +699,7 @@ impl JobStore for PostgresJobStore {
                 .core()?;
 
         // v10 (0005): jobs carry the axes natively — set by the caller. The id
-        // is caller-provided so the Slack card can be posted before the job
+        // is caller-provided so the Slack message can be posted before the job
         // exists.
         let job: Db<Job> = sqlx::query_as(
             r#"
@@ -750,8 +750,8 @@ impl JobStore for PostgresJobStore {
         .await
         .core()?;
 
-        // Record the pre-posted plan card's `ts` in the same transaction, so the
-        // job is never claimable without its plan-message identity.
+        // Record the pre-posted canonical message's `ts` in the same
+        // transaction, so the job is never claimable without its identity.
         if let Some(ts) = plan_message_ts {
             sqlx::query(
                 r#"

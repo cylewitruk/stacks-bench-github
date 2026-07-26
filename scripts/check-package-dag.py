@@ -24,6 +24,7 @@ ALLOWED_INTERNAL = {
         "sbgh-intent",
         "sbgh-libvirt",
         "sbgh-postgres",
+        "sbgh-slack",
         "sbgh-worker",
     },
     "sbgh-driver": set(),
@@ -32,6 +33,7 @@ ALLOWED_INTERNAL = {
     "sbgh-intent": {"sbgh-core"},
     "sbgh-libvirt": {"sbgh-driver"},
     "sbgh-postgres": {"sbgh-core"},
+    "sbgh-slack": {"sbgh-core", "sbgh-intent"},
     "sbgh-smee": set(),
     "sbgh-worker": {"sbgh-driver", "sbgh-libvirt"},
 }
@@ -54,6 +56,16 @@ INTENT_FORBIDDEN = {
     "sbgh-postgres",
     "slack-messaging",
     "slack-morphism",
+    "sqlx",
+}
+SLACK_FORBIDDEN = {
+    "libvirt",
+    "octocrab",
+    "sbgh-daemon",
+    "sbgh-github",
+    "sbgh-libvirt",
+    "sbgh-postgres",
+    "sbgh-worker",
     "sqlx",
 }
 
@@ -135,6 +147,12 @@ def main() -> int:
     if forbidden:
         errors.append(
             f"sbgh-intent: forbidden runtime/build dependency closure: {sorted(forbidden)}"
+        )
+
+    forbidden = transitive_names("sbgh-slack") & SLACK_FORBIDDEN
+    if forbidden:
+        errors.append(
+            f"sbgh-slack: forbidden runtime/build dependency closure: {sorted(forbidden)}"
         )
 
     if errors:

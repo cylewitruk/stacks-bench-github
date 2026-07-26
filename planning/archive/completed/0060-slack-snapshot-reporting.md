@@ -1,23 +1,28 @@
 # v24.3: Slack Snapshot Reporting and Integration Boundary
 
 Continuation of
-[v24.2](../archive/completed/0058-github-intent-boundaries.md). Replace
+[v24.2](0058-github-intent-boundaries.md). Replace
 Slack's card/stream/timeline lifecycle with one ordinary, canonical progress
 message, then extract the reduced integration into `sbgh-slack`.
 
-> **Status:** planned
+> **Status:** shipped — completed locally on 2026-07-26 after a focused
+> pre-commit hardening pass fixed two version-fencing defects and restored
+> regression coverage.
 >
 > This continuation intentionally changes Slack presentation while preserving
 > authorization, enqueue, execution, persistence, and terminal-result
 > semantics. Its snapshot renderer is designed for v25's durable event replay,
 > but v25 remains the owner of the event ledger and remote-worker protocol.
+> The credentialed Slack sandbox success and crash-window smokes remain
+> deployment checks because this environment has no Slack tokens or designated
+> test channel.
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0060-slack-snapshot-reporting` | primary: one canonical progress/result message | planned |
-| `0061-slack-integration-boundary` | co-primary: extract the reduced Slack integration | planned |
+| `0060-slack-snapshot-reporting` | primary: one canonical progress/result message | shipped |
+| `0061-slack-integration-boundary` | co-primary: extract the reduced Slack integration | shipped |
 
 ## Why
 
@@ -136,27 +141,27 @@ renderer.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] Equal views render byte-identical text; the renderer is pure and never
+- [x] Equal views render byte-identical text; the renderer is pure and never
   consumes prior Slack message contents.
-- [ ] Progress is clamped/validated, fixed-width rows align in a fenced code
+- [x] Progress is clamped/validated, fixed-width rows align in a fenced code
   block, and arbitrary user/repository text cannot break the fence or mention
   unintended users.
-- [ ] Replaying the same snapshot performs no creation and at most one
+- [x] Replaying the same snapshot performs no creation and at most one
   necessary update.
-- [ ] A stale snapshot cannot overwrite a later phase/version.
-- [ ] A failure after Slack accepts `chat.postMessage` but before timestamp
+- [x] A stale snapshot cannot overwrite a later phase/version.
+- [x] A failure after Slack accepts `chat.postMessage` but before timestamp
   persistence is recovered by exact metadata identity and does not create a
   duplicate.
-- [ ] Reconciliation is bounded to the known conversation/thread and configured
+- [x] Reconciliation is bounded to the known conversation/thread and configured
   bot/app; lookup errors are not treated as “not found.”
-- [ ] Added Slack scopes and metadata visibility/security trade-offs are
+- [x] Added Slack scopes and metadata visibility/security trade-offs are
   documented.
 
 **Tests:**
@@ -189,28 +194,28 @@ snapshot-update path.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] One accepted request/group creates one normal Slack message and only
+- [x] One accepted request/group creates one normal Slack message and only
   updates that timestamp through terminal state.
-- [ ] Multi-variant/repetition groups remain one message and expose bounded,
+- [x] Multi-variant/repetition groups remain one message and expose bounded,
   readable progress without unbounded message growth.
-- [ ] Progress storms respect Slack rate limits; milestone and terminal
+- [x] Progress storms respect Slack rate limits; milestone and terminal
   snapshots are not stranded behind the debounce.
-- [ ] Duplicate/replayed/out-of-order source events converge to the same
+- [x] Duplicate/replayed/out-of-order source events converge to the same
   canonical visible state.
-- [ ] Restart with persisted timestamp resumes by rendering current state and
+- [x] Restart with persisted timestamp resumes by rendering current state and
   updating the same message.
-- [ ] Slack update failures remain best-effort reporting failures and do not
+- [x] Slack update failures remain best-effort reporting failures and do not
   change job execution/terminal classification.
-- [ ] Existing authorization, enqueue, thread, reaction, and non-Slack report
+- [x] Existing authorization, enqueue, thread, reaction, and non-Slack report
   surfaces preserve behavior.
-- [ ] `slack-messaging` and other stream/card-only dependencies are removed
+- [x] `slack-messaging` and other stream/card-only dependencies are removed
   when unused.
 
 **Tests:**
@@ -246,22 +251,22 @@ without moving daemon persistence or reporting policy with it.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] `sbgh-slack` has no dependency on `sbgh-daemon`, `sbgh-postgres`, SQLx,
+- [x] `sbgh-slack` has no dependency on `sbgh-daemon`, `sbgh-postgres`, SQLx,
   Octocrab, libvirt, worker, or aggregate `DaemonConfig`.
-- [ ] No raw SQL or broad `RunnableJobStore`/`JobStore` dependency remains in
+- [x] No raw SQL or broad `RunnableJobStore`/`JobStore` dependency remains in
   Slack code.
-- [ ] The daemon is the only production composition root for Slack credentials,
+- [x] The daemon is the only production composition root for Slack credentials,
   client construction, rate limiting, and side effects.
-- [ ] Slack target resolution uses a narrow daemon/persistence seam and
+- [x] Slack target resolution uses a narrow daemon/persistence seam and
   preserves current missing/disabled/error behavior.
-- [ ] Test doubles implement narrow ports rather than recreating database or
+- [x] Test doubles implement narrow ports rather than recreating database or
   daemon machinery.
 
 **Tests:**
@@ -289,21 +294,21 @@ projection will drive it.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed (Codex)
+- [x] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
 
-- [ ] Cargo metadata matches the documented target graph.
-- [ ] `rg` finds no production card/stream/timeline implementation or stale
+- [x] Cargo metadata matches the documented target graph.
+- [x] `rg` finds no production card/stream/timeline implementation or stale
   `sbgh_daemon::slack` import.
-- [ ] Documentation states that v25 replay rebuilds `SlackProgressView` from
+- [x] Documentation states that v25 replay rebuilds `SlackProgressView` from
   durable projected state and renders the full snapshot.
-- [ ] v25 remains the sole owner of event durability, sequence gaps, attempt
+- [x] v25 remains the sole owner of event durability, sequence gaps, attempt
   fencing, and worker reconnect semantics.
-- [ ] Documentation links and the planning registry pass repository checks.
+- [x] Documentation links and the planning registry pass repository checks.
 
 **Tests:**
 
@@ -313,10 +318,10 @@ projection will drive it.
 
 ## Final Validation
 
-- [ ] `just build`
-- [ ] `just lint`
-- [ ] `just test --summary`
-- [ ] Cargo metadata matches the documented target dependency graph with all
+- [x] `just build --no-sccache`
+- [x] `just lint --no-sccache`
+- [x] `just test --no-sccache --summary` — 761 passed, 1 environment skip
+- [x] Cargo metadata matches the documented target dependency graph with all
   features.
 - [ ] Slack sandbox smoke: one request creates one threaded normal message;
   phase/progress and terminal states update that timestamp with a readable
@@ -324,15 +329,31 @@ projection will drive it.
 - [ ] Slack sandbox failure smoke: interrupt after accepted initial post but
   before timestamp persistence, restart, and verify reconciliation updates
   exactly one message.
-- [ ] A progress storm stays within configured update limits and terminal
-  state appears promptly.
-- [ ] GitHub check/comment, CLI, enqueue, execution, artifacts, cancellation,
+- [x] A deterministic-time progress storm stays within configured update
+  limits and terminal state appears promptly.
+- [x] GitHub check/comment, CLI, enqueue, execution, artifacts, cancellation,
   and terminal classification remain unchanged.
+
+## Reopened Pre-Commit Hardening
+
+- [x] Preserve monotonic snapshot versions across queue-to-start and group-run
+  transitions.
+- [x] Never overwrite a reconciled message with an older snapshot; remove the
+  `u64::MAX` enqueue-failure sentinel.
+- [x] Exercise real deferred debounce/coalescing behavior with changing
+  progress views.
+- [x] Restore focused connector coverage for LLM fallback, rate limiting,
+  reactions, rejection, repetition/cache gates, and comparison enqueue.
+- [x] Restore the full abandoned-session predicate coverage.
+- [x] Reject or encode Slack link delimiters and narrow connector configuration
+  to the authority it uses.
+- [x] Re-run focused tests, build, lint, and the complete workspace suite.
 
 ## Follow-Ups
 
-- [v25](v25-worker-fleet-block-validation.md) replaces the in-memory reporter
-  source with committed attempt events. Its projector must rebuild the current
-  `SlackProgressView`; it must not replay historical Slack update commands.
+- [v25](../../iterations/v25-worker-fleet-block-validation.md) replaces the
+  in-memory reporter source with committed attempt events. Its projector must
+  rebuild the current `SlackProgressView`; it must not replay historical Slack
+  update commands.
 - Richer operator dashboards, Slack App Home, and durable fine-grained progress
   remain separate features.

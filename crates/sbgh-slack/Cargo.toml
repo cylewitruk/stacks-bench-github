@@ -1,0 +1,35 @@
+[package]
+name = "sbgh-slack"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sbgh-core.workspace = true
+sbgh-intent.workspace = true
+
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+reqwest = { workspace = true, features = ["rustls", "json"] }
+slack-morphism.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[features]
+testing = []

@@ -7,7 +7,7 @@ intent resolution from the daemon without changing trigger, authorization,
 enqueue, or reporting behavior.
 
 > **Status:** shipped — completed locally on 2026-07-26 and continued in
-> [v24.3](../../iterations/v24.3-slack-snapshot-reporting.md).
+> [v24.3](0060-slack-snapshot-reporting.md).
 >
 > v24.1 remains shipped. GitHub and intent ownership is now compiler-enforced;
 > the credentialed GitHub/Slack smoke remains an explicit deployment check.
@@ -279,7 +279,7 @@ Local validation on 2026-07-26:
 
 ## Follow-Ups
 
-- [v24.3](../../iterations/v24.3-slack-snapshot-reporting.md) intentionally
+- [v24.3](0060-slack-snapshot-reporting.md) intentionally
   replaces Slack's
   card/stream/timeline presentation with one replay-safe snapshot message, then
   extracts the smaller Slack integration into `sbgh-slack`.

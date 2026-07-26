@@ -23,6 +23,7 @@ sbgh-worker.workspace = true
 sbgh-postgres.workspace = true
 sbgh-github.workspace = true
 sbgh-intent.workspace = true
+sbgh-slack.workspace = true
 
 tokio = { workspace = true, features = [
     "fs",
@@ -65,15 +66,11 @@ rusty-s3.workspace = true
 url.workspace = true
 # Regex matching for tag-pattern trigger policies.
 regex.workspace = true
-# Slack ad-hoc profiling connector: Socket Mode client and typed
-# Block Kit builders for the result card.
-slack-morphism.workspace = true
-slack-messaging.workspace = true
-
 [dev-dependencies]
 sbgh-github = { workspace = true, features = ["testing"] }
 sbgh-libvirt = { workspace = true, features = ["testing"] }
 sbgh-postgres = { workspace = true, features = ["testing"] }
+sbgh-slack = { workspace = true, features = ["testing"] }
 tempfile = "3"
 # `oneshot` for driving the axum router in API auth/health tests.
 tower = { workspace = true, features = ["util"] }

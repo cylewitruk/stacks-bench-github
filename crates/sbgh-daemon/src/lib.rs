@@ -10,7 +10,9 @@ mod report;
 mod reporter;
 mod runner;
 mod shutdown;
-mod slack;
+mod slack_queue;
+mod slack_report;
+mod slack_target;
 mod webhook_processor;
 
 use std::sync::Arc;
@@ -192,7 +194,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // and the socket connector (replies/reactions). `jobs_store` is cloned for
     // the connector before it moves into the `JobSource` below.
     let slack_runtime = if config.slack.enabled {
-        let target = slack::target::resolve_target(
+        let target = slack_target::resolve_target(
             &pool,
             &config
                 .slack
@@ -205,8 +207,8 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             .bot_token
             .clone()
             .context("[slack].enabled but SBGH_SLACK_BOT_TOKEN is unset")?;
-        let web_client: Arc<dyn slack::client::SlackClient> =
-            Arc::new(slack::api_client::WebApiClient::new(bot_token));
+        let web_client: Arc<dyn sbgh_slack::SlackClient> =
+            Arc::new(sbgh_slack::WebApiClient::new(bot_token));
         let intent_resolver: Option<Arc<dyn sbgh_intent::IntentResolver>> = if config.llm.enabled {
             Some(Arc::new(
                 build_openai_intent_resolver(&config.llm)
@@ -222,9 +224,26 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             "slack: ad-hoc profiling enabled",
         );
         Some((
-            config.slack.clone(),
+            sbgh_slack::SlackSocketConfig {
+                app_token: config.slack.app_token.clone(),
+                connector: sbgh_slack::SlackConnectorConfig::new(
+                    config
+                        .slack
+                        .default_rev
+                        .clone(),
+                    config
+                        .slack
+                        .allowed_team_ids
+                        .clone(),
+                    config
+                        .slack
+                        .allowed_user_ids
+                        .clone(),
+                ),
+            },
             target,
-            jobs_store.clone(),
+            Arc::new(slack_queue::SlackBenchmarkQueue::new(jobs_store.clone()))
+                as Arc<dyn sbgh_slack::BenchmarkQueue>,
             web_client,
             intent_resolver,
             config
@@ -345,13 +364,13 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                 binary_cache_enabled,
             )) = slack_runtime
             {
-                if let Err(e) = slack::socket::run(
+                if let Err(e) = sbgh_slack::run(
                     cfg,
                     target,
                     jobs,
                     web_client,
                     intent_resolver,
-                    slack::socket::SocketRunOptions {
+                    sbgh_slack::SocketRunOptions {
                         intent_rate_limit_per_minute: intent_rate_limit,
                         max_clean_repetitions,
                         max_variants,
@@ -382,7 +401,8 @@ pub use artifact_store::{
 pub use job_source::{
     BaselineRef, JobSource, ProgressTarget, RunnableJob, RunnableJobStore, metric_from_run,
 };
-pub use slack::target::{ResolveTargetError, SlackJobTarget, resolve_target};
+pub use sbgh_slack::SlackJobTarget;
+pub use slack_target::{ResolveTargetError, resolve_target};
 pub use webhook_processor::{
     BasicClassifier, CreateHandler, InstallationHandler, InstallationRepositoriesHandler,
     IssueCommentHandler, ProcessorConfig, PullRequestHandler, PushHandler, WebhookProcessor,

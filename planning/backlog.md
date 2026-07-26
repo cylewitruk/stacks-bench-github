@@ -83,7 +83,7 @@ old surface marked neutral/cancelled rather than failed.
 - **source:** Slack operator UX follow-up (2026-06)
 
 **Problem:** Operators and Slack users have no single place inside Slack to see
-what the daemon is doing. Queue state is scattered across thread cards and logs;
+what the daemon is doing. Queue state is scattered across thread messages and logs;
 cache-warming jobs are silent by design; recently-finished runs require a CLI or
 log tail. The full portal remains parked, but a lightweight Slack Home tab can
 cover the common "what's happening right now?" need.
@@ -142,99 +142,7 @@ equivalent. Ref existence remains daemon-owned, as in v13. Clean repeats and
 multi-variant comparison grammar/schema belong with `0038`/`0039`, not the
 initial PR-surface reuse.
 
-### 0040 — Slack queue receipt before claimed stream
 
-- **id:** `0040-slack-queue-receipt-before-stream`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0033-slack-streamed-plan-updates`
-- **relates_to:** `0014-preclaim-placeholder-checks`,
-  `0035-slack-app-home-status`
-- **source:** live Slack streaming observation (2026-06)
-
-**Problem:** Starting a Slack `chat.startStream` plan card at enqueue time means
-the message can sit idle while queued. Slack may expire the server-side streaming
-state before the worker claims the job, so the first reporter append sees
-`message_not_in_streaming_state` and permanently falls back to `chat.update`.
-That is safe, but it loses the no-collapse stream behavior before the benchmark
-has even started. The current pre-claim queue-position updater only appends when
-position changes; a job stuck at the same position behind one long run can
-therefore produce no stream activity for the whole wait. This has now been
-observed on-host: queued Slack streams are not heartbeated, appear to time out
-after the Slack stream TTL (roughly minutes), and then update in block mode once
-the job is claimed.
-
-**Scope:** Split the Slack surface into two phases. At enqueue, post a normal
-threaded queue receipt (plain Block Kit or text) that acknowledges the request,
-shows current queue position, and can be `chat.update`d as the position changes
-without involving a `plan` block. When a worker claims the job, start the
-streamed plan card for the actual run and persist that stream `ts` for reporter
-updates. The receipt can either be finalized ("claimed; live card below") or
-left as queue history, but it should not be the plan stream itself.
-
-Treat this as a refactor of the existing queue-position path, not new scheduler
-machinery: today's Slack branch of `update_queue_positions` appends
-`task_update`s to the pre-claim stream; under this item it `chat.update`s the
-queue receipt instead. The reportable gate keys off the receipt `ts` pre-claim,
-while the reporter owns the run stream from claim onward. This brings Slack in
-line with the GitHub lifecycle, where pre-claim position is a placeholder/check
-surface and the running reporter adopts the job later.
-
-**Acceptance:** A queued Slack job shows an immediate receipt with queue
-position; position updates edit only that receipt; the streamed plan card is
-created at claim time and remains stream-active through the run; a long queue
-wait no longer causes `message_not_in_streaming_state` on the first run update.
-The claim-time stream keepalive starts as soon as the run stream is created, so
-a slow first phase (for example VM provisioning before the next semantic update)
-does not recreate the same expiry window.
-
-**Deferred / non-goals:** No automatic Slack Home integration, no cancellation
-buttons, and no attempt to keep a pre-claim plan stream alive with heartbeats.
-This is a surface/lifecycle split, not a scheduler change.
-
-### 0051 — Slack progress sections as first-class plan tasks
-
-- **id:** `0051-slack-progress-sections-as-plan-tasks`
-- **status:** `backlog`
-- **priority:** `medium`
-- **depends_on:** `0027-fine-grained-progress`
-- **relates_to:** `0023-slack-card-redesign`,
-  `0047-slack-reporting-session`
-- **source:** Slack progress UX follow-up (2026-06)
-
-**Problem:** Fine-grained `stacks-bench` progress currently renders as section
-text under the single "Running benchmark" task. For long phases, this creates a
-tall, hard-to-scan task body and prevents Slack from collapsing completed
-subsections into concise final messages. Users need the benchmark workflow to
-read like a sequence of meaningful sub-tasks: baseline calibration, indexing,
-warmup, measurement, cleanup, finalization, and later per-variant/per-repeat
-units. Repeated benchmark groups also expose a correctness/UX failure in the
-current append-only transcript: progress sections can duplicate or appear
-incoherently across multiple clean runs, making the active run's log hard to
-trust at a glance.
-
-**Scope:** Promote the progress sections currently rendered inside the
-benchmark task into first-class Slack plan tasks. The Slack reporter owns the UX
-mapping from structured progress events to tasks; do not render upstream
-human-readable messages verbatim. Use daemon-owned task titles and concise
-progress details, and mark a task complete with a final output once its phase is
-done so Slack can collapse it. Preserve the existing high-level job/build/final
-tasks, but split the benchmark body into structured children such as:
-calibration, indexing blocks and transactions, measurement N/M, cleanup, and
-finalizing results. Keep GitHub/check-run surfaces on the simpler progress
-summary unless/until they need richer structure.
-
-**Acceptance:** A long Slack benchmark no longer accumulates all progress under
-one "Running benchmark" body. Each meaningful progress section appears as its
-own plan task, completed sections collapse with a final message, active sections
-continue to update from structured progress fields, and repeated/comparison runs
-remain scoped to the active group run without leaking, duplicating, or
-interleaving prior-run transcript.
-
-**Deferred / non-goals:** No new upstream `stacks-bench` event schema is
-required for the first pass; any missing high-quality final messages should be
-derived only from structured fields or left generic. Full rich result tables
-remain with the final report/result-summary items.
 
 ### 0052 — Managed stacks-node chainstate producer
 
@@ -301,50 +209,6 @@ a leaked prior reaction is cleared on the next transition.
 read per transition — only worth it as the reaction set grows; no change to the
 lifecycle/emoji set itself.
 
-### 0048 — Transient vs permanent stream-append errors
-
-- **id:** `0048-slack-stream-error-classification`
-- **status:** `backlog`
-- **priority:** `low`
-- **relates_to:** `0033-slack-streamed-plan-updates`, `0047-slack-reporting-session`
-- **source:** v18 Phase 2 review (2026-06)
-
-**Problem:** `touch_stream`/`upsert_stream_or_blocks` treat **any**
-`append_stream` error as permanent stream death — they flip `streaming = false`
-and the card falls back to `chat.update` for the rest of its life. A *transient*
-Slack/API blip therefore permanently abandons streaming (and stops the keepalive)
-for a card that's otherwise fine. Only `message_not_in_streaming_state` /
-`MissingMessage` are genuinely terminal for the stream.
-
-Host observation (2026-06-25): a long-running card appended keepalives
-successfully every ~10s for at least 40s, then the next keepalive returned
-`message_not_in_streaming_state` with no obvious daemon-side terminal event.
-That means this is not only the old idle-timeout class; Slack may invalidate a
-stream despite recent accepted `appendStream` calls, or the current "quiet"
-`task_update` keepalive may not reliably extend the stream lifetime even when it
-returns OK.
-
-**Scope:** Extend `classify_stream_error` (or the call sites) to distinguish
-**transient** append failures (network/5xx/rate-limit) from **permanent** ones
-(`not_in_streaming_state`, `message_not_found`, `not_owned`). On transient, keep
-`streaming = true` and let the next tick/append retry, with a bounded
-consecutive-failure budget before giving up; only permanent errors flip to block
-mode. Also re-evaluate the keepalive semantics themselves: confirm whether
-identical/minimal `task_update` chunks actually preserve stream liveness, whether
-Slack requires meaningful/new appended content, and whether the keepalive should
-occasionally emit a distinct low-noise update or accept stream loss as an
-expected degradation path.
-
-**Acceptance:** A single transient append error does not permanently disable
-streaming — the next keepalive/append retries on the stream; a genuine
-not-streaming/missing error still falls back to `chat.update` as today.
-Host validation covers the observed case: if `message_not_in_streaming_state`
-appears immediately after regular successful keepalives, the logs make it clear
-whether the daemon finalized the stream, Slack invalidated it, or the keepalive
-payload failed to preserve liveness.
-
-**Deferred / non-goals:** No change to the keepalive cadence or the block-update
-render path; the failure budget/backoff shape is a design detail.
 
 ### 0049 — Direct libvirt RPC driver spike (`libvirt-pure`)
 
@@ -539,11 +403,11 @@ renders raw microseconds (`1,655,018 µs avg`) — noisy and hard to read.
   alone; **Clarity execution cost** (runtime, read/write) moves to its own
   section so it doesn't dilute the headline bench figures.
 - **Humanize durations** — render the largest sensible unit (`1,655,018 µs` →
-  `1.66s`) via a shared formatter reused by the PR comment and the Slack card.
+  `1.66s`) via a shared formatter reused by the PR comment and Slack snapshot.
 
 **Acceptance:** A completed run renders an overview block, a core-timing table
 in human units, and a separate Clarity-cost section, on both the PR comment and
-the Slack card.
+the Slack snapshot.
 
 **Deferred / non-goals / upstream:** Clarity **read/write counts** and **baseline
 calibration time** are **not** in `run.json` today (only read/write *lengths*
@@ -607,7 +471,7 @@ answers natural-language questions by querying it. **Read-only** against a
 fetched copy (sandboxed), via a constrained query tool (parameterized /
 whitelisted SQL, never arbitrary writes), with row/time/cost caps. Rides the
 **same provider abstraction** as `0020` (env-only key, configurable model).
-Surface: a thread reply on a Slack results card and/or the portal. After `0037`,
+Surface: a thread reply to the Slack result message and/or the portal. After `0037`,
 questions must be scoped to group/spec/run identity so comparisons and repeats
 remain explainable.
 

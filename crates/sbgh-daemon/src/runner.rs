@@ -42,10 +42,8 @@ use crate::pin_manager::{PinManager, RepoIdentityLookup};
 use crate::report::build_report_surface;
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, ReporterDependencies, resolved_app_id};
 use crate::shutdown::Shutdown;
-use crate::slack::card::{self, CardCtx};
-use crate::slack::client::SlackClient;
-use crate::slack::session::SlackSessionRegistry;
-use crate::slack::stream::chunks_for_card;
+use crate::slack_report::{SlackSessionRegistry, build_slack_surface};
+use sbgh_slack::SlackClient;
 
 /// How often the coordinator wakes to re-sweep + top up slots while jobs run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -166,7 +164,7 @@ struct JobDeps {
     /// stays focused on claim/run lifecycle.
     repeat_planner: Option<Arc<dyn RepeatRunPlanner>>,
     /// Group-scoped Slack reporting sessions, shared into every reporter so a
-    /// repeat group's runs reuse one live card and keepalive.
+    /// repeat group's runs reuse one snapshot projection.
     slack_sessions: Arc<SlackSessionRegistry>,
 }
 
@@ -716,7 +714,7 @@ impl Coordinator {
         };
         // Build the orphan's reporting surface (the same factory the reporter
         // uses) and conclude it cancelled — for a Slack orphan this resumes the
-        // persisted card + swaps the stuck ⏳; for GitHub it concludes the check.
+        // persisted message + swaps the stuck ⏳; for GitHub it concludes the check.
         let surface = build_report_surface(
             self.deps.gh.clone(),
             self.deps.jobs.clone(),
@@ -734,13 +732,13 @@ impl Coordinator {
 
     /// Report each waiting job's queue position on its surface: a GitHub Check
     /// Run ("queued — N ahead"), or, for a
-    /// Slack job whose card was posted, the live card's Job row ("position
+    /// Slack job whose message was posted, the snapshot's queue line ("position
     /// N/M"). Called each loop after `fill_slots`, so `in_flight()`
     /// reflects the just-claimed jobs and the queue is what genuinely
     /// remains. A queued job at index `i` has `ahead` runs before it
     /// (`in_flight()` plus `i`). The GitHub check is created/refreshed
     /// `in_progress` and a later claim adopts its persisted id; the Slack
-    /// card's Job row is streamed with `chat.update` kept as fallback.
+    /// message is fully re-rendered with `chat.update`.
     /// Best-effort: a surface or DB hiccup is logged, never fatal.
     ///
     /// The `last_positions` map suppresses redundant **surface edits** (only
@@ -764,7 +762,7 @@ impl Coordinator {
         let mut seen = HashSet::new();
         for (i, job) in queued.iter().enumerate() {
             let ahead = in_flight + i;
-            // Position-reportable: a **Slack** job whose pre-claim stream/card
+            // Position-reportable: a **Slack** job whose pre-claim message
             // was already posted (it carries a `plan_message_ts`), or a **GitHub**
             // job whose `[reporting]` wants a pre-claim position check and that
             // already carries a head SHA (PR / branch-push; a tag job resolves
@@ -789,12 +787,8 @@ impl Coordinator {
                 continue; // unchanged → no edit
             }
             let updated = match &job.progress {
-                ProgressTarget::Slack {
-                    channel,
-                    plan_message_ts: Some(plan_ts),
-                    ..
-                } => {
-                    self.update_slack_queue_position(job, channel, plan_ts, ahead, total)
+                ProgressTarget::Slack { plan_message_ts: Some(_), .. } => {
+                    self.update_slack_queue_position(job, ahead, total)
                         .await
                 }
                 _ => {
@@ -811,66 +805,30 @@ impl Coordinator {
             .retain(|id, _| seen.contains(id));
     }
 
-    /// Update the queued Slack card's **Job row** with the live queue position
-    /// ("position N/M"). The pre-claim stream/card was posted by the connector
-    /// (its `plan_ts`); this appends a `task_update` while the job waits, with
-    /// `chat.update` kept as fallback. Pre-claim, the rev hasn't resolved, so
-    /// the card carries the rev (not a SHA).
-    /// Best-effort — returns whether the card is now up to date.
+    /// Update the queued Slack snapshot with its live queue position. This
+    /// remains a full deterministic render; it never patches prior content.
     async fn update_slack_queue_position(
         &self,
         job: &RunnableJob,
-        channel: &str,
-        plan_ts: &str,
         ahead: usize,
         total: usize,
     ) -> bool {
         let Some(slack) = &self.deps.slack else {
             return false; // no client wired → nothing to update
         };
-        let job_id = job.id.to_string();
-        let ctx = CardCtx {
-            rev: &job.git_ref_display,
-            commit: None,
-            commit_url: None,
-            job_id: &job_id,
-            bench_args: &job.bench_args,
-            repeat: None,
-            group_run: None,
-            cached_build: None,
-            cached_build_staging: false,
-        };
-        let detail = format!("position {}/{}", ahead + 1, total);
-        let card = card::queued_card(&ctx, Some(&detail));
-        let mut chunks = chunks_for_card(&card);
-        for chunk in &mut chunks {
-            if let crate::slack::stream::StreamChunk::TaskUpdate(update) = chunk
-                && update.id == "job"
-            {
-                update.title = format!("Queued · {detail}");
-            }
-        }
-        let fallback = format!("Benchmarking {} — queued ({detail})", job.git_ref_display);
-        match slack
-            .append_stream(channel, plan_ts, &chunks)
-            .await
-        {
-            Ok(()) => return true,
-            Err(e) => {
-                tracing::warn!(job_id = %job.id, error = ?e, "queue-position: slack stream update failed; falling back to block update");
-            }
-        }
-        let blocks = card::render(&card);
-        match slack
-            .update_blocks(channel, plan_ts, &blocks, &fallback)
-            .await
-        {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(job_id = %job.id, error = ?e, "queue-position: slack card update failed (non-fatal)");
-                false
-            }
-        }
+        build_slack_surface(
+            slack.clone(),
+            self.deps
+                .slack_sessions
+                .clone(),
+            self.deps.jobs.clone(),
+            self.deps
+                .artifact_store
+                .clone(),
+            job,
+        )
+        .queue_position(ahead, total)
+        .await
     }
 
     /// Create-or-update the queued job's position Check Run (`in_progress`

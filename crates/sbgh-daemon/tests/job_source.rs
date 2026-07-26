@@ -98,6 +98,7 @@ async fn enqueue_slack_adhoc(store: &PostgresJobStore, webhook_id: i64) -> Uuid 
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: Some("a".repeat(64)),
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "5".into()],
         clean_repetitions: 1,
     })
@@ -159,17 +160,19 @@ async fn slack_adhoc_job_assembles_as_slack_progress() {
         ProgressTarget::Slack {
             channel,
             message_ts,
+            reporting_identity,
             plan_message_ts,
         } => {
             assert_eq!(channel, "C123");
             assert_eq!(message_ts, "1700000000.000100");
-            assert_eq!(*plan_message_ts, None, "no plan card posted yet → None");
+            assert_eq!(reporting_identity, &"a".repeat(64));
+            assert_eq!(*plan_message_ts, None, "no canonical message posted yet → None");
         }
         other => panic!("slack_adhoc must assemble as Slack, got {other:?}"),
     }
     assert_eq!(job.bench_args, vec!["--block", "184231", "--repetitions", "1"]);
 
-    // Persist the live-timeline plan message ts, then re-load: a reclaimed job
+    // Persist the canonical message ts, then re-load: a reclaimed job
     // reads it back so it resumes updating the same card (no duplicate).
     source
         .set_plan_message_ts(&job, "1700000000.000999")
@@ -248,7 +251,7 @@ async fn slack_queued_card_ts_assembles_on_claim() {
             assert_eq!(
                 plan_message_ts.as_deref(),
                 Some("1700000000.000777"),
-                "the pre-claim queued card ts assembles on claim",
+                "the pre-claim canonical message ts assembles on claim",
             );
         }
         other => panic!("expected Slack, got {other:?}"),

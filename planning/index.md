@@ -57,7 +57,7 @@ need editing when an item's status or location changes.
 | `0037-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 | `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
 | `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `parked` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
-| `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `backlog` | [backlog.md](backlog.md) |
+| `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `superseded` | [archive/superseded/0040-slack-stream-followups.md](archive/superseded/0040-slack-stream-followups.md) |
 | `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `shipped` | [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md) |
 | `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
 | `0043-slack-plan-ts-race` | Slack plan-ts race fix (double card) | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
@@ -65,10 +65,10 @@ need editing when an item's status or location changes.
 | `0045-slack-llm-observability` | Slack/LLM observability logging | `shipped` | [archive/completed/0043-slack-reporting-robustness.md](archive/completed/0043-slack-reporting-robustness.md) |
 | `0046-slack-reaction-state-from-api` | Read reaction state via `reactions.list` instead of brute-force removal | `backlog` | [backlog.md](backlog.md) |
 | `0047-slack-reporting-session` | Group-scoped Slack reporting session (surface lifetime = trigger, not run) | `shipped` | [archive/completed/0047-slack-reporting-session.md](archive/completed/0047-slack-reporting-session.md) |
-| `0048-slack-stream-error-classification` | Transient vs permanent stream-append errors (don't abandon streaming on a blip) | `backlog` | [backlog.md](backlog.md) |
+| `0048-slack-stream-error-classification` | Transient vs permanent stream-append errors (don't abandon streaming on a blip) | `superseded` | [archive/superseded/0040-slack-stream-followups.md](archive/superseded/0040-slack-stream-followups.md) |
 | `0049-libvirt-pure-driver-spike` | Direct libvirt RPC driver spike (`libvirt-pure`) | `backlog` | [backlog.md](backlog.md) |
 | `0050-stacks-bench-schema-v1-native` | Adopt `stacks-bench` schema-v1 JSON natively | `parked` | [iterations/v21-stacks-bench-schema-v1-native.md](iterations/v21-stacks-bench-schema-v1-native.md) |
-| `0051-slack-progress-sections-as-plan-tasks` | Slack progress sections as first-class plan tasks | `backlog` | [backlog.md](backlog.md) |
+| `0051-slack-progress-sections-as-plan-tasks` | Slack progress sections as first-class plan tasks | `superseded` | [archive/superseded/0040-slack-stream-followups.md](archive/superseded/0040-slack-stream-followups.md) |
 | `0052-managed-stacks-node-chainstate-producer` | Managed stacks-node chainstate producer | `backlog` | [backlog.md](backlog.md) |
 | `0053-repository-workspace-cleanup` | Repository and workspace truth cleanup | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
 | `0054-application-crate-boundaries` | Application crate and dependency boundaries | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
@@ -77,8 +77,8 @@ need editing when an item's status or location changes.
 | `0057-core-adapter-boundaries` | Dependency-light core and concrete adapter boundaries | `shipped` | [archive/completed/0056-compiler-enforced-crate-boundaries.md](archive/completed/0056-compiler-enforced-crate-boundaries.md) |
 | `0058-github-integration-boundary` | Consolidated GitHub contract and adapter boundary | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
 | `0059-intent-resolution-boundary` | Provider-backed request intent boundary | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
-| `0060-slack-snapshot-reporting` | Single-message Slack snapshot reporting | `planned` | [iterations/v24.3-slack-snapshot-reporting.md](iterations/v24.3-slack-snapshot-reporting.md) |
-| `0061-slack-integration-boundary` | Extracted Slack integration boundary | `planned` | [iterations/v24.3-slack-snapshot-reporting.md](iterations/v24.3-slack-snapshot-reporting.md) |
+| `0060-slack-snapshot-reporting` | Single-message Slack snapshot reporting | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
+| `0061-slack-integration-boundary` | Extracted Slack integration boundary | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
 
 ## Iterations
 
@@ -107,7 +107,7 @@ need editing when an item's status or location changes.
 | `v24-workspace-architecture-cleanup` | Workspace and architecture cleanup | `shipped` | [archive/completed/0053-workspace-architecture-cleanup.md](archive/completed/0053-workspace-architecture-cleanup.md) |
 | `v24.1-compiler-enforced-crate-boundaries` | Compiler-enforced crate boundaries | `shipped` | [archive/completed/0056-compiler-enforced-crate-boundaries.md](archive/completed/0056-compiler-enforced-crate-boundaries.md) |
 | `v24.2-github-intent-boundaries` | GitHub and intent integration boundaries | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
-| `v24.3-slack-snapshot-reporting` | Slack snapshot reporting and integration boundary | `planned` | [iterations/v24.3-slack-snapshot-reporting.md](iterations/v24.3-slack-snapshot-reporting.md) |
+| `v24.3-slack-snapshot-reporting` | Slack snapshot reporting and integration boundary | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
 | `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
 
 ## Decisions

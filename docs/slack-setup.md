@@ -11,6 +11,10 @@ daemon-side config is the `[slack]` block in `config.example.daemon.toml`.
    create.
 3. **Install to Workspace** (grants the bot token).
 
+Existing installations must reinstall after upgrading the manifest: snapshot
+reconciliation adds `channels:history`, `groups:history`, and
+`metadata.message:read`.
+
 ## 2. Collect the two tokens
 
 Both are **env-only** secrets — never put them in the TOML (a key there is a
@@ -60,3 +64,15 @@ PR opened from it) — startup fails fast otherwise.
 4. Expect: ⏳ on your message → a threaded result with the metrics → ⏳ swapped
    for ✅ (or ❌ on failure). A denied/garbled request gets an ephemeral
    (invoker-only) reply and no reaction.
+
+The threaded result is one ordinary message. Queue, phase, progress, and
+terminal state update that same timestamp; aligned progress rows render in a
+fenced fixed-width block. The daemon always renders the complete current
+snapshot and never parses or patches the previous message.
+
+For crash recovery, the message has Slack metadata containing an opaque
+request identity and monotonic snapshot version. No repository name, user
+input, token, or other secret is stored in metadata. If no timestamp was
+persisted, the daemon uses `conversations.replies` only in the originating
+thread and adopts exactly one matching message from its configured bot. A
+history lookup failure or multiple matches is retried without posting.

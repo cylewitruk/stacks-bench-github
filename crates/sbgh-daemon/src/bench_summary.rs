@@ -234,25 +234,9 @@ fn verdict_phrase(v: Verdict) -> &'static str {
     }
 }
 
-/// Human-readable form of the db link TTL, kept in sync with
-/// `progress::DB_LINK_TTL` so the card's "expires in …" copy matches the signed
-/// URL's lifetime.
-pub const DB_LINK_TTL_HUMAN: &str = "3 days";
-
-/// One Slack `plan` task row's status (the live timeline's per-row state).
-/// Mapped to `slack_messaging`'s `TaskStatus` by [`crate::slack::card`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanTaskStatus {
-    Pending,
-    InProgress,
-    Complete,
-    Error,
-}
-
 /// Build the "Metric | Value" GitHub-flavoured Markdown table from
 /// [`metric_rows`]. Returns an empty string if no metrics were present (caller
-/// renders the fallback message). Shared by the PR comment and the v8 Slack
-/// `markdown` results block ([`crate::slack::card`]).
+/// renders the fallback message).
 pub fn metric_table(r: &RunResult) -> String {
     let rows = metric_rows(r);
     if rows.is_empty() {

@@ -9,6 +9,7 @@ members = [
     "crates/sbgh-postgres",
     "crates/sbgh-github",
     "crates/sbgh-intent",
+    "crates/sbgh-slack",
     "crates/sbgh-handler",
     "crates/sbgh-cli",
     "crates/sbgh-daemon",
@@ -39,6 +40,7 @@ sbgh-worker = { path = "crates/sbgh-worker" }
 sbgh-postgres = { path = "crates/sbgh-postgres" }
 sbgh-github = { path = "crates/sbgh-github" }
 sbgh-intent = { path = "crates/sbgh-intent" }
+sbgh-slack = { path = "crates/sbgh-slack" }
 
 # Async runtime
 tokio = { version = "1.52.3", default-features = false }
@@ -67,10 +69,6 @@ jsonwebtoken = "10.4.0"
 slack-morphism = { version = "2.22.0", default-features = false, features = [
     "hyper",
 ] }
-# Typed Block Kit builders for the terminal result card (`task_card`).
-# Serde-only at runtime — no async/HTTP stack of its own.
-slack-messaging = "0.7.5"
-
 # Crypto / hashing for webhook signature verification
 hmac = "0.13.0"
 sha2 = "0.11.0"

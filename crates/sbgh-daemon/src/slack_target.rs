@@ -11,15 +11,7 @@
 use std::fmt;
 
 use sbgh_postgres::Pool;
-
-/// The resolved code-under-test for Slack jobs: the configured default repo as
-/// its `(installation, repo)` FK ids. Resolved once at startup via
-/// [`resolve_target`] and held by the connector for the process lifetime.
-#[derive(Debug, Clone, Copy)]
-pub struct SlackJobTarget {
-    pub installation_id: i64,
-    pub repo_id: i64,
-}
+use sbgh_slack::SlackJobTarget;
 
 /// Why resolving `[slack].default_repository` failed — each maps to an
 /// actionable misconfiguration (mirrors `/api/resolve`'s 400/404/409). A

@@ -809,10 +809,8 @@ impl LibvirtDriver {
             digest = %digest,
             "binary cache: reusing cached stacks-bench binary; skipping the build VM"
         );
-        // Drive the reporter with a single opaque `build_cached:<digest>` phase
-        // Each surface interprets it: the Slack card marks the
-        // Build row done with a "Reused cached build · <digest>" title; the
-        // GitHub surface shows "build (cached)". The build VM that normally emits
+        // Drive the reporter with a single opaque `build_cached:<digest>`
+        // phase. Each surface interprets it; the build VM that normally emits
         // `building`/`build_done` never runs.
         listener
             .on_phase(&Phase::Other(format!("build_cached:{short}")))

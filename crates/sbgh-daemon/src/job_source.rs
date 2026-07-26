@@ -62,16 +62,16 @@ pub enum ProgressTarget {
     /// `message_ts` the request's timestamp (the thread anchor + the
     /// message the status reaction is added to). No GitHub surface. Assembled
     /// at claim time from a `slack_adhoc` job's `SlackAdhoc` queued detail.
-    /// `plan_message_ts` is the live-timeline `plan` card's own message `ts`,
-    /// `None` until posted and read back on re-claim (a `plan_message_sent`
-    /// event) so a reclaimed job resumes updating the same card.
+    /// `plan_message_ts` is the canonical bot message timestamp (the field
+    /// keeps its historical name), read back from `plan_message_sent` so a
+    /// reclaimed job updates the same message.
     Slack {
         channel: String,
         message_ts: String,
-        /// The live-timeline `plan` card's own message `ts` — populated at
-        /// claim time (read back via `latest_plan_message_ts`) so a
-        /// reclaimed job resumes the existing card; `None` until the
-        /// card is first posted.
+        /// Opaque request-stable identity embedded in Slack message metadata.
+        reporting_identity: String,
+        /// The canonical message timestamp, populated at claim time so a
+        /// reclaimed job resumes it. `None` until first post/reconciliation.
         plan_message_ts: Option<String>,
     },
     /// Build-only job (v10 0005 / item 0031 warming) — builds + caches an
@@ -262,10 +262,8 @@ pub trait RunnableJobStore: Send + Sync + 'static {
         html_url: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// Persist the Slack live-timeline `plan` message `ts` the daemon just
-    /// posted (a `plan_message_sent` `job_event`), read back on re-claim so a
-    /// reclaimed [`ProgressTarget::Slack`] job `chat.update`s the existing card
-    /// instead of posting a duplicate. Only called for Slack jobs.
+    /// Persist the canonical Slack message timestamp in the historical
+    /// `plan_message_sent` event so re-claim updates rather than duplicates.
     async fn set_plan_message_ts(&self, job: &RunnableJob, message_ts: &str) -> anyhow::Result<()>;
 
     /// Orphan recovery (roadmap-v5 Phase 4B-2): job ids stranded in `running`.
@@ -684,14 +682,25 @@ impl JobSource {
             // `channel`/`message_ts` are reporting provenance in the
             // `SlackAdhoc` queued detail — a `slack_adhoc` job MUST carry it (and
             // never falls through to a commit check).
-            let (channel, message_ts) = queued
+            let (channel, message_ts, reporting_identity) = queued
                 .as_ref()
                 .and_then(|e| e.detail.as_ref())
                 .and_then(|d| serde_json::from_value::<QueuedEventDetail>(d.clone()).ok())
                 .and_then(|d| match d {
-                    QueuedEventDetail::SlackAdhoc { channel, message_ts, .. } => {
-                        Some((channel, message_ts))
-                    }
+                    QueuedEventDetail::SlackAdhoc {
+                        channel,
+                        message_ts,
+                        reporting_identity,
+                        ..
+                    } => Some((
+                        channel.clone(),
+                        message_ts.clone(),
+                        reporting_identity.unwrap_or_else(|| {
+                            sbgh_slack::ReportingIdentity::for_request("", &channel, &message_ts)
+                                .as_str()
+                                .to_string()
+                        }),
+                    )),
                     _ => None,
                 })
                 .ok_or_else(|| {
@@ -701,8 +710,8 @@ impl JobSource {
                         job.id
                     )
                 })?;
-            // Read back the live-timeline card's `ts` (if already posted) so a
-            // reclaimed job resumes updating it instead of posting a duplicate.
+            // Read back the canonical message timestamp so a reclaimed job
+            // resumes updating it instead of posting a duplicate.
             let plan_message_ts = self
                 .jobs
                 .latest_plan_message_ts(job.id)
@@ -710,6 +719,7 @@ impl JobSource {
             ProgressTarget::Slack {
                 channel,
                 message_ts,
+                reporting_identity,
                 plan_message_ts,
             }
         } else {

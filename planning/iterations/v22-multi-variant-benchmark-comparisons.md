@@ -346,7 +346,7 @@ preserving one carried group DB and one calibration per variant.
 **Scope:**
 
 - Show the active variant/ref and repeat position while the group runs.
-- Avoid per-run or per-variant Slack card/comment/check fan-out.
+- Avoid per-run or per-variant Slack message/comment/check fan-out.
 - Render one final comparison summary with artifact links and refs.
 - Keep current PR baseline reporting unchanged.
 - Ensure progress from v20 remains scoped to the active run/variant and does not
@@ -361,13 +361,13 @@ preserving one carried group DB and one calibration per variant.
 
 **Acceptance & Validation:**
 
-- [ ] Slack shows one comparison card for the whole request.
+- [ ] Slack shows one comparison snapshot for the whole request.
 - [ ] The final card identifies both refs and reports the delta summary.
 - [ ] Existing PR-vs-baseline comments/checks continue to render as before.
 
 **Tests:**
 
-- Slack timeline/report-surface tests for active variant labels and final
+- Slack snapshot/report-surface tests for active variant labels and final
   comparison blocks.
 - Regression tests for existing PR-vs-baseline reporting.
 

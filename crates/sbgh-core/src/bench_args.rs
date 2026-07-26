@@ -206,6 +206,7 @@ mod tests {
         QueuedEventDetail::SlackAdhoc {
             channel: "C123".into(),
             message_ts: "1700000000.000100".into(),
+            reporting_identity: None,
             bench_args: args
                 .iter()
                 .map(|s| s.to_string())

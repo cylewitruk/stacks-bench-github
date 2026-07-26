@@ -1,0 +1,705 @@
+//! Daemon-owned projection from benchmark lifecycle state into Slack snapshots.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use sbgh_driver::{PhaseLabel, ProgressUpdate};
+use sbgh_slack::{
+    COMPLETED_REACTION, FAILED_REACTION, MessageIdentityStore, PublishUrgency, QUEUED_REACTION,
+    RUNNING_REACTION, ReportingIdentity, RunPosition, SlackClient, SlackMessageTarget,
+    SlackProgress, SlackProgressView, SlackSnapshotPublisher, SlackStatus,
+};
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+use crate::artifact_store::ArtifactStore;
+use crate::comparison::{ComparisonUnavailable, GroupComparison, VariantDelta, Verdict};
+use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
+use crate::report::{
+    CompletionReport, ReportSurface, parsed_run, short_pr_error, signed_db_url, signed_group_db_url,
+};
+
+const RUN_VERSION_STRIDE: u64 = 1_000_000;
+
+struct RunnableMessageIdentityStore {
+    jobs: Arc<dyn RunnableJobStore>,
+    job: RunnableJob,
+}
+
+#[async_trait]
+impl MessageIdentityStore for RunnableMessageIdentityStore {
+    async fn persist_message_ts(&self, message_ts: &str) -> sbgh_slack::Result<()> {
+        self.jobs
+            .set_plan_message_ts(&self.job, message_ts)
+            .await
+            .map_err(|error| sbgh_slack::SlackError::Persistence(error.to_string()))
+    }
+}
+
+struct SnapshotSession {
+    publisher: Arc<SlackSnapshotPublisher>,
+    view: Mutex<SlackProgressView>,
+    last_touched: StdMutex<Instant>,
+}
+
+impl SnapshotSession {
+    fn new(publisher: Arc<SlackSnapshotPublisher>, view: SlackProgressView) -> Self {
+        Self {
+            publisher,
+            view: Mutex::new(view),
+            last_touched: StdMutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        *self
+            .last_touched
+            .lock()
+            .unwrap() = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_touched
+            .lock()
+            .unwrap()
+            .elapsed()
+    }
+
+    async fn try_mutate(
+        &self,
+        urgency: PublishUrgency,
+        update: impl FnOnce(&mut SlackProgressView) -> bool,
+    ) -> sbgh_slack::Result<bool> {
+        self.touch();
+        let snapshot = {
+            let mut view = self.view.lock().await;
+            let previous = view.version;
+            if !update(&mut view) {
+                return Ok(false);
+            }
+            view.version = view
+                .version
+                .max(previous)
+                .saturating_add(1);
+            view.clone()
+        };
+        self.publisher
+            .publish(snapshot, urgency)
+            .await?;
+        Ok(true)
+    }
+
+    async fn mutate(&self, urgency: PublishUrgency, update: impl FnOnce(&mut SlackProgressView)) {
+        if let Err(error) = self
+            .try_mutate(urgency, |view| {
+                update(view);
+                true
+            })
+            .await
+        {
+            tracing::warn!(error = ?error, "slack: snapshot publication failed (non-fatal)");
+        }
+    }
+}
+
+/// Group-scoped snapshot sessions. Groups execute serially, so a session is
+/// the single projection owner across all variants and repetitions.
+#[derive(Default)]
+pub struct SlackSessionRegistry {
+    sessions: StdMutex<HashMap<(Uuid, SlackMessageTarget), Arc<SnapshotSession>>>,
+}
+
+impl SlackSessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get_or_create(
+        &self,
+        group_id: Uuid,
+        target: SlackMessageTarget,
+        create: impl FnOnce() -> SnapshotSession,
+    ) -> Arc<SnapshotSession> {
+        let session = self
+            .sessions
+            .lock()
+            .unwrap()
+            .entry((group_id, target))
+            .or_insert_with(|| Arc::new(create()))
+            .clone();
+        session.touch();
+        session
+    }
+
+    fn reap(&self, group_id: Uuid, target: &SlackMessageTarget) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .remove(&(group_id, target.clone()));
+    }
+
+    pub fn sweep_abandoned(&self, grace: Duration, active_groups: &HashSet<Uuid>) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let stale: Vec<_> = sessions
+            .iter()
+            .filter(|((group, _), session)| {
+                !active_groups.contains(group) && session.idle_for() > grace
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &stale {
+            sessions.remove(key);
+        }
+        stale.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions
+            .lock()
+            .unwrap()
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+pub fn build_slack_surface(
+    client: Arc<dyn SlackClient>,
+    sessions: Arc<SlackSessionRegistry>,
+    jobs: Arc<dyn RunnableJobStore>,
+    store: Arc<dyn ArtifactStore>,
+    job: &RunnableJob,
+) -> SlackReportSurface {
+    let ProgressTarget::Slack {
+        channel,
+        message_ts,
+        plan_message_ts,
+        reporting_identity,
+    } = &job.progress
+    else {
+        unreachable!("Slack surface requires a Slack target");
+    };
+    let identity = ReportingIdentity::parse(reporting_identity.clone())
+        .unwrap_or_else(|_| ReportingIdentity::for_request("", channel, message_ts));
+    let target = SlackMessageTarget {
+        channel: channel.clone(),
+        thread_ts: message_ts.clone(),
+    };
+    let identity_store: Arc<dyn MessageIdentityStore> = Arc::new(RunnableMessageIdentityStore {
+        jobs: jobs.clone(),
+        job: job.clone(),
+    });
+    let initial = initial_view(job, identity.clone());
+    let session = sessions.get_or_create(job.benchmark_group_id, target.clone(), || {
+        SnapshotSession::new(
+            SlackSnapshotPublisher::new(
+                client.clone(),
+                target.clone(),
+                identity,
+                plan_message_ts.clone(),
+                Some(identity_store),
+            ),
+            initial,
+        )
+    });
+    SlackReportSurface {
+        client,
+        sessions,
+        session,
+        target,
+        job: job.clone(),
+        jobs,
+        store,
+    }
+}
+
+fn initial_view(job: &RunnableJob, identity: ReportingIdentity) -> SlackProgressView {
+    let mut view = SlackProgressView::queued(identity, "Benchmark", &job.git_ref_display);
+    view.commit = (!job.commit.is_empty()).then(|| job.commit.clone());
+    view.run = (job.group_requested_run_count > 1).then_some(RunPosition {
+        current: (job.group_run_index + 1).max(1) as u32,
+        total: job
+            .group_requested_run_count
+            .max(1) as u32,
+    });
+    view.version = run_version_base(job);
+    view
+}
+
+fn run_version_base(job: &RunnableJob) -> u64 {
+    (job.group_run_index.max(0) as u64 + 1).saturating_mul(RUN_VERSION_STRIDE)
+}
+
+pub struct SlackReportSurface {
+    client: Arc<dyn SlackClient>,
+    sessions: Arc<SlackSessionRegistry>,
+    session: Arc<SnapshotSession>,
+    target: SlackMessageTarget,
+    job: RunnableJob,
+    jobs: Arc<dyn RunnableJobStore>,
+    store: Arc<dyn ArtifactStore>,
+}
+
+impl SlackReportSurface {
+    /// Refresh a pre-claim queue position through the same versioned session
+    /// used by the reporter. If claim/start wins the race, the status check
+    /// refuses to project queued state over a newer lifecycle phase.
+    pub async fn queue_position(&self, ahead: usize, total: usize) -> bool {
+        match self
+            .session
+            .try_mutate(PublishUrgency::Debounced, |view| {
+                if view.status != SlackStatus::Queued {
+                    return false;
+                }
+                view.phase = Some(format!("queue position {}/{}", ahead + 1, total));
+                true
+            })
+            .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %self.job.id,
+                    error = ?error,
+                    "queue-position: Slack snapshot update failed (non-fatal)"
+                );
+                false
+            }
+        }
+    }
+
+    async fn react(&self, remove: &str, add: &str) {
+        if let Err(error) = self
+            .client
+            .remove_reaction(&self.target.channel, &self.target.thread_ts, remove)
+            .await
+        {
+            tracing::debug!(error = ?error, reaction = remove, "slack: reaction removal failed");
+        }
+        if let Err(error) = self
+            .client
+            .add_reaction(&self.target.channel, &self.target.thread_ts, add)
+            .await
+        {
+            tracing::warn!(error = ?error, reaction = add, "slack: reaction add failed");
+        }
+    }
+
+    fn final_run(&self) -> bool {
+        self.job.group_run_index + 1
+            >= self
+                .job
+                .group_requested_run_count
+    }
+
+    async fn terminal(
+        &self,
+        status: SlackStatus,
+        details: Vec<String>,
+        links: Vec<(String, String)>,
+        reaction: &str,
+    ) {
+        self.session
+            .mutate(PublishUrgency::Immediate, |view| {
+                view.status = status;
+                view.phase = None;
+                view.progress = None;
+                view.details = details;
+                view.links = links;
+            })
+            .await;
+        self.react(RUNNING_REACTION, reaction)
+            .await;
+        self.sessions
+            .reap(self.job.benchmark_group_id, &self.target);
+    }
+
+    async fn repeat_details(&self) -> Vec<String> {
+        match self
+            .jobs
+            .benchmark_run_metrics(self.job.benchmark_spec_id)
+            .await
+        {
+            Ok(metrics) => {
+                let mut values: Vec<i64> = metrics
+                    .iter()
+                    .map(|run| {
+                        run.metric
+                            .execution_duration_us
+                            + run.metric.commit_duration_us
+                    })
+                    .collect();
+                values.sort_unstable();
+                if values.is_empty() {
+                    return vec!["No promoted repeat metrics available".into()];
+                }
+                let mean = values
+                    .iter()
+                    .map(|value| *value as f64)
+                    .sum::<f64>()
+                    / values.len() as f64;
+                vec![
+                    format!(
+                        "Samples: {}/{}",
+                        values.len(),
+                        self.job
+                            .requested_run_count
+                            .max(0)
+                    ),
+                    format!("Execution+Commit mean: {}", format_us(mean)),
+                    format!(
+                        "Range: {}–{}",
+                        format_us(values[0] as f64),
+                        format_us(values[values.len() - 1] as f64)
+                    ),
+                ]
+            }
+            Err(error) => {
+                tracing::warn!(error = ?error, "slack: loading repeat metrics failed");
+                Vec::new()
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ReportSurface for SlackReportSurface {
+    async fn started(&self) {
+        let job = &self.job;
+        self.session
+            .mutate(PublishUrgency::Immediate, |view| {
+                *view = initial_view(job, view.identity.clone());
+                view.version = run_version_base(job);
+                view.status = SlackStatus::Preparing;
+                view.phase = Some("preparing execution".into());
+            })
+            .await;
+        self.react(QUEUED_REACTION, RUNNING_REACTION)
+            .await;
+    }
+
+    async fn phase(&self, label: &PhaseLabel, _elapsed: Duration) {
+        let phase = human_phase(label);
+        self.session
+            .mutate(PublishUrgency::Immediate, |view| {
+                view.status = SlackStatus::Running;
+                view.phase = Some(phase);
+                view.progress = None;
+            })
+            .await;
+    }
+
+    async fn heartbeat(&self, label: &PhaseLabel, _elapsed: Duration) {
+        let phase = human_phase(label);
+        self.session
+            .mutate(PublishUrgency::Debounced, |view| {
+                view.phase = Some(phase);
+            })
+            .await;
+    }
+
+    async fn progress(&self, progress: &ProgressUpdate) {
+        let progress = SlackProgress {
+            label: progress.phase.clone(),
+            current: progress.progress,
+            total: progress.total,
+        };
+        self.session
+            .mutate(PublishUrgency::Debounced, |view| {
+                view.status = SlackStatus::Running;
+                view.phase = None;
+                view.progress = Some(progress);
+            })
+            .await;
+    }
+
+    async fn completed(&self, report: CompletionReport<'_>) {
+        if !self.final_run() {
+            self.session
+                .mutate(PublishUrgency::Immediate, |view| {
+                    view.status = SlackStatus::Queued;
+                    view.phase = Some("run complete; scheduling next run".into());
+                    view.progress = None;
+                })
+                .await;
+            return;
+        }
+
+        let mut details = if let Some(comparison) = report.group_comparison {
+            comparison_details(comparison)
+        } else if self.job.requested_run_count > 1 {
+            self.repeat_details().await
+        } else {
+            parsed_run(self.store.as_ref(), report.summary)
+                .await
+                .map_or_else(
+                    || vec!["Run completed; parsed metrics unavailable".into()],
+                    |result| run_details(&result),
+                )
+        };
+        if details.is_empty() {
+            details.push("Benchmark completed".into());
+        }
+
+        let mut links = Vec::new();
+        let db_url = signed_db_url(self.store.as_ref(), report.summary).await;
+        let db_url = match db_url {
+            Some(url) => Some(url),
+            None if self
+                .job
+                .group_requested_run_count
+                > 1 =>
+            {
+                signed_group_db_url(self.store.as_ref(), &self.job.group_artifact_prefix).await
+            }
+            None => None,
+        };
+        if let Some(url) = db_url {
+            links.push(("Download profiler data".into(), url));
+        }
+        self.terminal(SlackStatus::Completed, details, links, COMPLETED_REACTION)
+            .await;
+    }
+
+    async fn failed(&self, error: &str) {
+        let mut details = vec![short_pr_error(error)];
+        if self
+            .job
+            .group_requested_run_count
+            > 1
+        {
+            details.extend(self.repeat_details().await);
+        }
+        self.terminal(SlackStatus::Failed, details, Vec::new(), FAILED_REACTION)
+            .await;
+    }
+
+    async fn cancelled(&self, reason: &str) {
+        self.terminal(
+            SlackStatus::Cancelled,
+            vec![short_pr_error(reason)],
+            Vec::new(),
+            FAILED_REACTION,
+        )
+        .await;
+    }
+}
+
+fn human_phase(label: &PhaseLabel) -> String {
+    let phase = label.to_string();
+    if phase.starts_with("build_cached:") {
+        "build (cached)".into()
+    } else if phase.starts_with("build_cache_staging:") {
+        "build (cached staging)".into()
+    } else {
+        phase
+    }
+}
+
+fn run_details(result: &crate::bench_summary::RunResult) -> Vec<String> {
+    let Some(data) = result.run_data() else {
+        return vec!["Run completed; parsed metrics unavailable".into()];
+    };
+    let mut details = Vec::new();
+    if let Some(blocks) = data
+        .measured_blocks
+        .or(data.blocks)
+    {
+        details.push(format!("Measured blocks: {blocks}"));
+    }
+    if let Some(summary) = data.summary.as_ref() {
+        if let (Some(execution), Some(commit)) =
+            (summary.execution_duration_us, summary.commit_duration_us)
+        {
+            details.push(format!("Execution+Commit: {}", format_us((execution + commit) as f64)));
+        }
+        if let Some(transactions) = summary.transactions {
+            details.push(format!("Transactions: {transactions}"));
+        }
+    }
+    details
+}
+
+fn comparison_details(comparison: &GroupComparison) -> Vec<String> {
+    let mut details = vec![format!(
+        "Baseline {}: {}/{} samples{}",
+        comparison
+            .baseline
+            .ref_display,
+        comparison
+            .baseline
+            .stats
+            .completed,
+        comparison
+            .baseline
+            .stats
+            .requested
+            .max(0),
+        comparison
+            .baseline
+            .stats
+            .combined_mean_us
+            .map(|value| format!(", {} mean", format_us(value)))
+            .unwrap_or_default()
+    )];
+    details.extend(
+        comparison
+            .variants
+            .iter()
+            .map(variant_detail),
+    );
+    details
+}
+
+fn variant_detail(delta: &VariantDelta) -> String {
+    let samples = format!(
+        "{}/{} samples",
+        delta.variant.stats.completed,
+        delta
+            .variant
+            .stats
+            .requested
+            .max(0)
+    );
+    let result = match delta.comparison {
+        Some(comparison) => {
+            let direction = if comparison.delta_pct > 0.05 {
+                "slower"
+            } else if comparison.delta_pct < -0.05 {
+                "faster"
+            } else {
+                "no change"
+            };
+            let confidence = match comparison.sigma {
+                Some(sigma) if sigma.is_finite() => {
+                    format!(", {} ({sigma:.1}σ)", verdict(comparison.verdict))
+                }
+                Some(_) => format!(", {} (∞σ)", verdict(comparison.verdict)),
+                None => format!(", {}", verdict(comparison.verdict)),
+            };
+            format!("{:+.2}% {direction}{confidence}", comparison.delta_pct)
+        }
+        None => unavailable(delta.unavailable).into(),
+    };
+    format!("{}: {samples}, {result}", delta.variant.ref_display)
+}
+
+fn verdict(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Strong => "strong",
+        Verdict::Moderate => "moderate",
+        Verdict::Weak => "weak",
+        Verdict::Inconclusive => "inconclusive",
+        Verdict::Provisional => "provisional",
+    }
+}
+
+fn unavailable(reason: Option<ComparisonUnavailable>) -> &'static str {
+    match reason {
+        Some(ComparisonUnavailable::MissingBaselineMetric) => "missing baseline metrics",
+        Some(ComparisonUnavailable::MissingVariantMetric) => "missing metrics",
+        Some(ComparisonUnavailable::IncomparableWorkload) => "incomparable workload",
+        Some(ComparisonUnavailable::DegenerateBaseline) => "invalid baseline",
+        None => "comparison unavailable",
+    }
+}
+
+fn format_us(value: f64) -> String {
+    format!("{value:.0} µs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comparison::{Comparison, ComparisonVariant, VariantRunStats};
+
+    #[test]
+    fn registry_reaps_only_inactive_stale_groups() {
+        let registry = SlackSessionRegistry::new();
+        let group = Uuid::new_v4();
+        let target = SlackMessageTarget {
+            channel: "C1".into(),
+            thread_ts: "1.2".into(),
+        };
+        let identity = ReportingIdentity::for_request("T1", "C1", "1.2");
+        let client = Arc::new(sbgh_slack::test_support::FakeSlackClient::default());
+        let session = registry.get_or_create(group, target.clone(), || {
+            SnapshotSession::new(
+                SlackSnapshotPublisher::new(client, target, identity.clone(), None, None),
+                SlackProgressView::queued(identity, "Benchmark", "main"),
+            )
+        });
+
+        assert_eq!(
+            registry.sweep_abandoned(Duration::from_secs(60), &HashSet::new()),
+            0,
+            "fresh inactive sessions remain"
+        );
+        *session
+            .last_touched
+            .lock()
+            .unwrap() = Instant::now() - Duration::from_secs(120);
+        assert_eq!(
+            registry.sweep_abandoned(Duration::from_secs(60), &HashSet::from([group])),
+            0,
+            "active stale sessions remain"
+        );
+        assert_eq!(
+            registry.sweep_abandoned(Duration::from_secs(60), &HashSet::new()),
+            1,
+            "inactive stale sessions are reaped"
+        );
+        assert!(registry.is_empty());
+    }
+
+    fn variant(name: &str, completed: usize, mean: f64) -> ComparisonVariant {
+        ComparisonVariant {
+            benchmark_spec_id: Uuid::new_v4(),
+            spec_index: 0,
+            ref_display: name.into(),
+            commit: None,
+            baseline_calibration_id: None,
+            stats: VariantRunStats {
+                requested: 3,
+                completed,
+                combined_mean_us: Some(mean),
+                combined_min_us: Some(mean as i64),
+                combined_max_us: Some(mean as i64),
+                combined_stddev_us: Some(0.0),
+                combined_cv_pct: Some(0.0),
+                workload: None,
+                workload_consistent: true,
+            },
+        }
+    }
+
+    #[test]
+    fn compact_comparison_details_preserve_samples_delta_and_verdict() {
+        let comparison = GroupComparison {
+            baseline: variant("main", 3, 1_000.0),
+            variants: vec![VariantDelta {
+                variant: variant("candidate", 2, 1_125.0),
+                comparison: Some(Comparison {
+                    base_combined_us: 1_000,
+                    pr_combined_us: 1_125,
+                    delta_pct: 12.5,
+                    sigma: Some(3.2),
+                    verdict: Verdict::Strong,
+                }),
+                unavailable: None,
+            }],
+        };
+
+        assert_eq!(
+            comparison_details(&comparison),
+            vec![
+                "Baseline main: 3/3 samples, 1000 µs mean",
+                "candidate: 2/3 samples, +12.50% slower, strong (3.2σ)",
+            ]
+        );
+    }
+}

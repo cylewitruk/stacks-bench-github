@@ -22,7 +22,7 @@
 //! Wiring status: `put` / `get` / `job_dir` are live (the libvirt driver
 //! archives through `put`; the reporter/job-source/progress readers resolve
 //! keys via `get`; [`build_store`] picks the impl from config).
-//! `signed_url_if_fetchable` is consumed by the Slack (`0002`) result card's DB
+//! `signed_url_if_fetchable` is consumed by the Slack result snapshot's DB
 //! download link; `exists` / `signed_url` / [`ArtifactUrlError`] remain for the
 //! portal (`0003`) fetch path, so the module keeps `allow(dead_code)`.
 #![allow(dead_code)]

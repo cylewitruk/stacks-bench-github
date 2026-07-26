@@ -10,6 +10,9 @@
 #   chat:write         — chat.postMessage (threaded result) + chat.postEphemeral
 #                        (invoker-only rejections)
 #   reactions:write    — reactions.add / reactions.remove (⏳ → ✅/❌ status swap)
+#   channels:history   — reconcile the canonical message in public channels
+#   groups:history     — reconcile it in private channels the bot joined
+#   metadata.message:read — read the opaque reconciliation metadata payload
 #
 # Transport is Socket Mode (an outbound WebSocket), so there is NO request URL /
 # public endpoint. The xapp- App-Level Token that opens the socket carries the
@@ -29,7 +32,10 @@ oauth_config:
   scopes:
     bot:
       - app_mentions:read
+      - channels:history
       - chat:write
+      - groups:history
+      - metadata.message:read
       - reactions:write
 
 settings:

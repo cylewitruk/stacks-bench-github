@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::job_source::ProgressTarget;
+use crate::report::ReportSurface;
 use crate::reporter::CHECK_NAME;
 use sbgh_driver::TaskContext;
 use sbgh_driver::{
@@ -982,6 +983,7 @@ async fn missing_carried_sqlite_blocks_next_repeat_append() {
         progress: ProgressTarget::Slack {
             channel: "C1".into(),
             message_ts: "REQ".into(),
+            reporting_identity: "0".repeat(64),
             plan_message_ts: Some("PLAN_TS".into()),
         },
         claim_token: Some(Uuid::new_v4()),
@@ -1015,34 +1017,21 @@ async fn missing_carried_sqlite_blocks_next_repeat_append() {
     assert_eq!(source.calls(), vec!["start_running", "complete"]);
     assert_eq!(planner.detail_calls(), vec![job.id]);
     assert!(planner.appended().is_empty(), "next repeat waits for carried DB");
-    let stops = slack
-        .stops
-        .lock()
-        .unwrap()
-        .clone();
     let updates = slack
         .updates
         .lock()
         .unwrap()
         .clone();
-    let appends = slack
-        .appends
-        .lock()
-        .unwrap()
-        .clone();
-    let rendered = stops
+    let rendered = updates
         .iter()
-        .chain(updates.iter())
-        .chain(appends.iter())
-        .map(|(_, _, body)| body.as_str())
+        .map(|(_, _, body, _)| body.as_str())
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
         rendered.contains("repeat group stalled"),
-        "carry-forward stall must update the shared Slack surface; stops={stops:?} \
-             updates={updates:?} appends={appends:?}",
+        "carry-forward stall must update the shared Slack surface; updates={updates:?}",
     );
-    assert!(rendered.contains("Clean Repeat Summary"), "{rendered}");
+    assert!(rendered.contains("No promoted repeat metrics available"), "{rendered}");
 }
 
 #[tokio::test]
@@ -1203,6 +1192,7 @@ async fn run_once_resolves_slack_rev_commit_in_preflight() {
         progress: ProgressTarget::Slack {
             channel: "C1".into(),
             message_ts: "1700000000.000100".into(),
+            reporting_identity: "0".repeat(64),
             plan_message_ts: None,
         },
         claim_token: Some(Uuid::new_v4()),
@@ -2214,91 +2204,64 @@ async fn coordinator_retries_position_check_when_persist_fails() {
     );
 }
 
-/// Records Slack stream appends (and fallback `chat.update` calls) so the
-/// queue-position test can assert the queued card was edited and debounced.
+/// Records canonical Slack queue-position snapshots.
 #[derive(Default)]
 struct FakePositionSlack {
-    updates: StdMutex<Vec<(String, String, String)>>, // (channel, ts, blocks-json)
-    appends: StdMutex<Vec<(String, String, String)>>, // (channel, ts, chunks-json)
-    stops: StdMutex<Vec<(String, String, String)>>,   // (channel, ts, chunks+blocks-json)
+    updates: StdMutex<Vec<(String, String, String, u64)>>, // (channel, ts, text, version)
 }
 
 #[async_trait]
 impl SlackClient for FakePositionSlack {
-    async fn post_ephemeral(&self, _c: &str, _u: &str, _t: &str) -> anyhow::Result<()> {
+    async fn post_ephemeral(&self, _c: &str, _u: &str, _t: &str) -> sbgh_slack::Result<()> {
         Ok(())
     }
-    async fn post_blocks_in_thread(
+    async fn post_message(
         &self,
-        _c: &str,
-        _t: &str,
-        _b: &serde_json::Value,
-        _f: &str,
-    ) -> anyhow::Result<String> {
+        _target: &sbgh_slack::SlackMessageTarget,
+        _text: &str,
+        _identity: &sbgh_slack::ReportingIdentity,
+        _snapshot_version: u64,
+    ) -> sbgh_slack::Result<String> {
         Ok("ts".into())
     }
-    async fn update_blocks(
+    async fn update_message(
         &self,
         channel: &str,
         ts: &str,
-        blocks: &serde_json::Value,
-        _f: &str,
-    ) -> anyhow::Result<()> {
+        text: &str,
+        _identity: &sbgh_slack::ReportingIdentity,
+        snapshot_version: u64,
+    ) -> sbgh_slack::Result<()> {
         self.updates
             .lock()
             .unwrap()
-            .push((channel.into(), ts.into(), blocks.to_string()));
+            .push((channel.into(), ts.into(), text.into(), snapshot_version));
         Ok(())
     }
-    async fn append_stream(
+    async fn find_messages(
         &self,
-        channel: &str,
-        ts: &str,
-        chunks: &[crate::slack::stream::StreamChunk],
-    ) -> anyhow::Result<()> {
-        self.appends
-            .lock()
-            .unwrap()
-            .push((channel.into(), ts.into(), serde_json::to_string(chunks).unwrap()));
+        _target: &sbgh_slack::SlackMessageTarget,
+        _identity: &sbgh_slack::ReportingIdentity,
+    ) -> sbgh_slack::Result<Vec<sbgh_slack::FoundMessage>> {
+        Ok(Vec::new())
+    }
+    async fn add_reaction(&self, _c: &str, _t: &str, _r: &str) -> sbgh_slack::Result<()> {
         Ok(())
     }
-    async fn stop_stream(
-        &self,
-        channel: &str,
-        ts: &str,
-        _markdown_text: Option<&str>,
-        chunks: &[crate::slack::stream::StreamChunk],
-        blocks: Option<&serde_json::Value>,
-    ) -> anyhow::Result<()> {
-        let rendered = format!(
-            "{} {}",
-            serde_json::to_string(chunks).unwrap(),
-            blocks
-                .map(serde_json::Value::to_string)
-                .unwrap_or_default(),
-        );
-        self.stops
-            .lock()
-            .unwrap()
-            .push((channel.into(), ts.into(), rendered));
-        Ok(())
-    }
-    async fn add_reaction(&self, _c: &str, _t: &str, _r: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn remove_reaction(&self, _c: &str, _t: &str, _r: &str) -> anyhow::Result<()> {
+    async fn remove_reaction(&self, _c: &str, _t: &str, _r: &str) -> sbgh_slack::Result<()> {
         Ok(())
     }
 }
 
 /// A queued Slack job (pre-claim: empty commit) with an optional
-/// posted-card `plan_message_ts`.
+/// canonical-message `plan_message_ts`.
 fn slack_job(plan_message_ts: Option<&str>) -> RunnableJob {
     RunnableJob {
         commit: String::new(),
         progress: ProgressTarget::Slack {
             channel: "C1".into(),
             message_ts: "REQ".into(),
+            reporting_identity: "0".repeat(64),
             plan_message_ts: plan_message_ts.map(Into::into),
         },
         ..pr_job("unused", None)
@@ -2329,9 +2292,8 @@ fn position_coord_with_slack(
     Coordinator::new(deps, 1, CancellationToken::new())
 }
 
-/// item 0033 (v12): a queued Slack job whose pre-claim stream was posted
-/// (it carries a `plan_message_ts`) gets its Job row updated with a
-/// streamed `task_update`, debounced like the GitHub position check.
+/// A queued Slack job with a persisted message timestamp gets a full
+/// queue-position snapshot, debounced like the GitHub position check.
 #[tokio::test]
 async fn coordinator_updates_slack_queue_position_and_debounces() {
     let tmp = TempDir::new().unwrap();
@@ -2346,47 +2308,136 @@ async fn coordinator_updates_slack_queue_position_and_debounces() {
         .await;
 
     {
-        let appends = slack.appends.lock().unwrap();
-        assert_eq!(appends.len(), 1, "the queued stream was appended once");
-        assert_eq!(appends[0].1, "PLAN_TS", "updated the persisted stream ts");
+        let updates = slack.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1, "the queued snapshot was updated once");
+        assert_eq!(updates[0].1, "PLAN_TS", "updated the persisted message ts");
         // in_flight 0 + 1 queued → total 1, ahead 0 → "position 1/1".
         assert!(
-            appends[0]
+            updates[0]
                 .2
-                .contains("position 1/1"),
+                .contains("queue position 1/1"),
             "{}",
-            appends[0].2
+            updates[0].2
         );
         assert!(
-            appends[0]
+            updates[0]
                 .2
                 .contains("Queued"),
-            "Job row queued: {}",
-            appends[0].2
-        );
-        assert!(
-            slack
-                .updates
-                .lock()
-                .unwrap()
-                .is_empty(),
-            "stream update succeeded, so no block fallback"
+            "snapshot queued: {}",
+            updates[0].2
         );
     }
 
-    // Second pass, unchanged position → debounced (no new stream append).
+    // Second pass, unchanged position → no new update.
     coord
         .update_queue_positions()
         .await;
     assert_eq!(
         slack
-            .appends
+            .updates
             .lock()
             .unwrap()
             .len(),
         1,
         "an unchanged position makes no new edit",
     );
+}
+
+#[tokio::test]
+async fn queued_position_cannot_regress_a_started_slack_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+    let job = slack_job(Some("PLAN_TS"));
+    let source = Arc::new(FakeSource::new(pr_job("unused", None)));
+    source.set_queued(vec![job.clone()]);
+    let slack = Arc::new(FakePositionSlack::default());
+    let mut coord = position_coord_with_slack(config, source, slack.clone());
+
+    let surface = build_slack_surface(
+        slack.clone(),
+        coord
+            .deps
+            .slack_sessions
+            .clone(),
+        coord.deps.jobs.clone(),
+        coord
+            .deps
+            .artifact_store
+            .clone(),
+        &job,
+    );
+    surface.started().await;
+    assert_eq!(
+        slack
+            .updates
+            .lock()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Simulate the coordinator finishing a stale pre-claim queue scan after
+    // the reporter has already projected the job into Preparing.
+    coord
+        .update_queue_positions()
+        .await;
+
+    let updates = slack.updates.lock().unwrap();
+    assert_eq!(updates.len(), 1, "the shared session must reject stale queued state");
+    assert!(
+        updates[0]
+            .2
+            .contains("Preparing"),
+        "{}",
+        updates[0].2
+    );
+}
+
+#[tokio::test]
+async fn started_snapshot_advances_beyond_a_prior_queue_position() {
+    let tmp = TempDir::new().unwrap();
+    let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
+    let job = slack_job(Some("PLAN_TS"));
+    let source = Arc::new(FakeSource::new(pr_job("unused", None)));
+    source.set_queued(vec![job.clone()]);
+    let slack = Arc::new(FakePositionSlack::default());
+    let mut coord = position_coord_with_slack(config, source, slack.clone());
+
+    coord
+        .update_queue_positions()
+        .await;
+    let surface = build_slack_surface(
+        slack.clone(),
+        coord
+            .deps
+            .slack_sessions
+            .clone(),
+        coord.deps.jobs.clone(),
+        coord
+            .deps
+            .artifact_store
+            .clone(),
+        &job,
+    );
+    surface.started().await;
+
+    let updates = slack.updates.lock().unwrap();
+    assert_eq!(updates.len(), 2);
+    assert!(
+        updates[0]
+            .2
+            .contains("queue position 1/1"),
+        "{}",
+        updates[0].2
+    );
+    assert!(
+        updates[1]
+            .2
+            .contains("Preparing"),
+        "{}",
+        updates[1].2
+    );
+    assert!(updates[1].3 > updates[0].3, "started must advance the version fence");
 }
 
 #[tokio::test]
@@ -2409,20 +2460,12 @@ async fn coordinator_skips_queue_position_for_appended_repeat_slack_runs() {
 
     assert!(
         slack
-            .appends
-            .lock()
-            .unwrap()
-            .is_empty(),
-        "later repeat runs inherit the group card but must not overwrite it with queue \
-             position",
-    );
-    assert!(
-        slack
             .updates
             .lock()
             .unwrap()
             .is_empty(),
-        "no block fallback either",
+        "later repeat runs inherit the group message but must not overwrite it with queue \
+             position",
     );
 }
 

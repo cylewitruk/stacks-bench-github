@@ -113,7 +113,7 @@ one enum value per recipe phase.
   reconciling external side effects. The event ledger provides repeatable
   internal input; it does not pretend PostgreSQL can transact atomically with
   GitHub or Slack.
-- [v24.3](../iterations/v24.3-slack-snapshot-reporting.md) gives Slack a
+- [v24.3](../archive/completed/0060-slack-snapshot-reporting.md) gives Slack a
   deterministic full-snapshot renderer and one durable message identity. On
   catch-up, this projector rebuilds the current `SlackProgressView` from the
   committed event prefix and renders the entire canonical message; it never

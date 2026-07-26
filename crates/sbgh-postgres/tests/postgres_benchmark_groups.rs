@@ -153,6 +153,7 @@ async fn slack_unlinked_job_persists_requested_clean_repetitions_on_spec() {
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: None,
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
         clean_repetitions: 4,
     })
@@ -198,6 +199,7 @@ async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: None,
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
         clean_repetitions: 3,
     })
@@ -237,7 +239,7 @@ async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
             .unwrap()
             .as_deref(),
         Some("1700000000.000200"),
-        "repeat run reuses the group's Slack card",
+        "repeat run reuses the group's Slack message",
     );
     assert!(
         store
@@ -283,6 +285,7 @@ async fn resume_pending_benchmark_runs_derives_next_run_from_db_state() {
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: None,
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
         clean_repetitions: 2,
     })
@@ -328,6 +331,7 @@ async fn create_unlinked_benchmark_group_persists_ordered_specs_and_first_run() 
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: None,
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
         clean_repetitions: 1,
     })
@@ -426,6 +430,7 @@ async fn create_unlinked_benchmark_group_rolls_back_on_invalid_spec_collection()
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: None,
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
         clean_repetitions: 1,
     })
@@ -475,6 +480,7 @@ async fn append_next_benchmark_run_moves_from_final_run_to_next_spec() {
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: None,
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
         clean_repetitions: 1,
     })
@@ -548,6 +554,7 @@ async fn resume_pending_benchmark_runs_continues_across_specs() {
     let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
         channel: "C123".into(),
         message_ts: "1700000000.000100".into(),
+        reporting_identity: None,
         bench_args: vec!["--block".into(), "184231".into(), "--repetitions".into(), "1".into()],
         clean_repetitions: 1,
     })

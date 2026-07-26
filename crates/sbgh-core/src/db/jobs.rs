@@ -224,8 +224,8 @@ pub trait JobStore: Send + Sync + 'static {
     /// — and, when `plan_message_ts` is `Some`, the `plan_message_sent` event —
     /// all in one transaction, returning the inserted job.
     ///
-    /// The Slack connector posts its plan card before creating the job (the
-    /// card `ts` needs the id), so it passes that id + the card's `ts` here;
+    /// The Slack connector posts/reconciles its canonical message before
+    /// creating the job, so it passes the id + message `ts` here;
     /// writing `plan_message_sent` in the same transaction means the job is
     /// never claimable without its plan `ts`. Warming passes a generated id +
     /// `None`.
@@ -249,7 +249,7 @@ pub trait JobStore: Send + Sync + 'static {
     ///
     /// This is the comparison-group sibling of
     /// [`create_unlinked_job`](Self::create_unlinked_job). It has the same
-    /// Slack-card atomicity guarantee (queued event + optional
+    /// Slack-message atomicity guarantee (queued event + optional
     /// `plan_message_sent` in the creation transaction), but persists multiple
     /// `benchmark_spec` rows up front. Later runs/specs are materialized by
     /// [`append_next_benchmark_run`](Self::append_next_benchmark_run) so the
@@ -465,18 +465,18 @@ pub trait JobStore: Send + Sync + 'static {
     /// than creating a duplicate.
     async fn latest_check_run(&self, job_id: Uuid) -> Result<Option<(i64, Option<String>)>>;
 
-    /// item 0002: the most-recent Slack `plan` message `ts` recorded on the
-    /// job's timeline (a `plan_message_sent` event, from
+    /// The most-recent canonical Slack message `ts` recorded in the
+    /// historical `plan_message_sent` event, from
     /// `detail->>'plan_message_ts'`). Read on (re-)claim so a reclaimed Slack
-    /// job `chat.update`s the existing live-timeline card instead of posting a
+    /// job `chat.update`s the existing message instead of posting a
     /// duplicate.
     async fn latest_plan_message_ts(&self, job_id: Uuid) -> Result<Option<String>>;
 
-    /// Record a Slack `plan` message `ts` on the job's timeline (a
-    /// `plan_message_sent` event) — the writer behind
+    /// Record a canonical Slack message `ts` in the historical
+    /// `plan_message_sent` event — the writer behind
     /// [`latest_plan_message_ts`]. Keyed by `job_id` so the **pre-claim**
     /// Slack connector (item `0023`, which holds a core [`Job`], not a
-    /// `RunnableJob`) can persist the queued card's identity; the daemon's
+    /// `RunnableJob`) can persist the queued message identity; the daemon's
     /// claimed-world `RunnableJobStore::set_plan_message_ts`
     /// delegates here, so the event shape lives in one place. The default impl
     /// rides [`insert_event`](Self::insert_event); a failure is non-fatal at

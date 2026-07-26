@@ -716,9 +716,9 @@ pub enum JobEventKind {
     /// `github_check_run_id` + `github_check_run_url`, read back on re-claim
     /// so the runner updates the existing check instead of duplicating it.
     CheckRunCreated,
-    /// The Slack live-timeline `plan` message was posted (item 0002). Carries
+    /// The canonical Slack progress message was posted. Carries
     /// the Slack message `ts` in `detail->>'plan_message_ts'`, read back on
-    /// re-claim so a reclaimed job `chat.update`s the existing card instead of
+    /// re-claim so a reclaimed job `chat.update`s the existing message instead of
     /// posting a duplicate.
     PlanMessageSent,
     Completed,
@@ -792,6 +792,11 @@ pub enum QueuedEventDetail {
     SlackAdhoc {
         channel: String,
         message_ts: String,
+        /// Stable opaque identity embedded in the canonical Slack message.
+        /// Older queued rows predate snapshot reconciliation and derive it
+        /// from the request coordinates at read time.
+        #[serde(default)]
+        reporting_identity: Option<String>,
         bench_args: Vec<String>,
         /// v15: user-requested daemon-level clean VM executions. Older queued
         /// rows predate this field and default to one clean run.
@@ -816,6 +821,27 @@ pub enum QueuedEventDetail {
 
 fn default_clean_repetitions() -> u32 {
     1
+}
+
+#[cfg(test)]
+mod queued_detail_compatibility_tests {
+    use super::QueuedEventDetail;
+
+    #[test]
+    fn legacy_slack_detail_without_reporting_identity_still_decodes() {
+        let detail: QueuedEventDetail = serde_json::from_value(serde_json::json!({
+            "trigger": "slack_adhoc",
+            "channel": "C1",
+            "message_ts": "1.2",
+            "bench_args": ["--block", "1"],
+            "clean_repetitions": 1
+        }))
+        .unwrap();
+        let QueuedEventDetail::SlackAdhoc { reporting_identity, .. } = detail else {
+            panic!("expected Slack detail");
+        };
+        assert!(reporting_identity.is_none());
+    }
 }
 
 /// Slice 8 insert payload for `job_event`. occurred_at defaults to

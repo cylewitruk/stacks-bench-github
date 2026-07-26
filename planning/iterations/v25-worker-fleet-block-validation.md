@@ -8,10 +8,10 @@ behavior on a separate co-located worker.
 > [v24.1](../archive/completed/0056-compiler-enforced-crate-boundaries.md).
 >
 > [v24.2](../archive/completed/0058-github-intent-boundaries.md) and
-> [v24.3](v24.3-slack-snapshot-reporting.md) are scheduled orchestrator-side
-> continuations before this milestone, but they are not execution-boundary
-> prerequisites. v24.3 deliberately leaves durable event sequencing and replay
-> ownership here.
+> [v24.3](../archive/completed/0060-slack-snapshot-reporting.md) completed the
+> scheduled orchestrator-side continuations before this milestone. They were
+> not execution-boundary prerequisites; v24.3 deliberately leaves durable
+> event sequencing and replay ownership here.
 >
 > The deployment target is now concrete: one dedicated Hetzner worker with a
 > 64-core CPU, 256 GB RAM, and four 4 TB NVMe drives is available for
