@@ -26,8 +26,9 @@ dataset capacity remain measured Phase 1 inputs—not assumptions derived from
 the advertised specifications.
 
 **Goal:** scale concurrency and heterogeneous hardware by **adding workers**, not
-by sharing one host. A worker dials *out*, registers its capabilities, long-polls
-for compatible jobs, runs them via its **local `Driver`** (the shipped seam,
+by sharing one host. A worker dials *out*, authenticates its pre-registered
+identity, reports local facts, long-polls for work allowed by its registry-bound
+capabilities, runs it via its **local `Driver`** (the shipped seam,
 `0010`), and streams events + artifacts back. The orchestrator stays the **sole DB
 client** and owns all GitHub/Slack side effects, including report rendering,
 debounce, rate limiting, retries, and reporting-session state. This doc owns the
@@ -50,8 +51,9 @@ This is **not** another `Driver` kind. There are two seams, and v9 is the upper 
 2. **Distribution seam (this doc)** — *orchestrator ⟂ fleet*: "get this job to a
    capable, free worker; stream results back." Sits **above** Drivers.
 
-So a **worker = { transport client + advertised capabilities + one-or-more local
-Drivers }**, and the orchestrator becomes a **capability-matched scheduler**.
+So a **worker = { mTLS transport client + server-authorized capabilities +
+one-or-more local Drivers }**, and the orchestrator becomes a
+**capability-matched scheduler**.
 
 ## The GitHub self-hosted runner mapping
 
@@ -60,7 +62,7 @@ Drivers }**, and the orchestrator becomes a **capability-matched scheduler**.
 | labels (`runs-on: [self-hosted, gpu]`) | worker **capabilities** + resource facts (cores, RAM, has-local-nvme, reflink-fs) |
 | runner **polls** control plane (pull) | worker **long-polls** the orchestrator, capability-filtered |
 | one job/runner; logs streamed back | worker runs one job via its local Driver; streams `WorkerEvent`s back |
-| registration token; online/offline/busy | worker register + **heartbeat/lease**; drain/deregister |
+| registered runner identity; online/offline/busy | pre-provisioned mTLS worker identity + **heartbeat/lease**; drain/deregister |
 | ephemeral runners (register→run→deregister) | **cloud-ephemeral workers** later (a provisioner spawns one; it registers, runs, dies) |
 
 The last row is how **cloud stays in scope without committing**: a cloud instance
@@ -72,7 +74,7 @@ provisioner** — *who* spawns the worker host — orthogonal to this protocol.
 
 ```text
 worker daemon starts
-  → registers / heartbeats with { capabilities, resources, version }
+  → opens mTLS session / heartbeats with { session, resources, dataset, version }
   → long-polls: "give me compatible work"
   → receives TaskSpec + lease token
   → runs local Driver (v8 Phase 1)
@@ -103,10 +105,12 @@ orchestrator-side reporter owns DB + GitHub/Slack side effects (unchanged)
   an object-store pointer the reporter fetches.
 - **Worker lifecycle + liveness** — register/heartbeat/lease/drain/deregister; the
   worker registry on the orchestrator.
-- **AuthN/Z** — registration tokens (à la GitHub); per-job secrets (GitHub
-  installation tokens) delivered short-lived over the authenticated channel.
-- **Capability + resource matching & fairness** — so a flood of multi-hour
-  block-validations can't starve bench (this answers v6 Open-Q#4).
+- **AuthN/Z** — mTLS worker identity bound to server-owned capability/profile
+  policy; per-job repository tokens minted short-lived over the authenticated
+  channel.
+- **Capability matching + resource facts** — v25 routes only to authorized,
+  compatible workers. Quotas and weighted fairness remain the later Phase 5
+  admission-control slice.
 
 ## The split: change process placement, don't duplicate logic
 
@@ -146,9 +150,11 @@ execution implementation is copied or retained in the orchestrator.
   task/event/terminal outcomes, registration/capability/claim/lease messages,
   and artifact results. Each side validates and converts these DTOs at its
   boundary; internal driver types are not serialized implicitly. A task
-  assignment carries effective arguments persisted at enqueue, not a reference
-  to mutable daemon defaults. The persisted workload key and argument tokens
-  are produced by one resolution pass.
+  assignment carries the versioned payload, immutable commit, and effective
+  arguments persisted before the job becomes schedulable, not references to a
+  mutable branch or daemon defaults. The persisted workload key and argument
+  tokens are produced by one resolution pass, and the assignment includes a
+  canonical payload hash reused by every retry.
 - **`sbgh-daemon` / orchestrator (existing binary)** — `api`, `webhook_processor`,
   the scheduler/registry, the reporter, and the worker-API server. Sole DB
   client and GitHub/Slack side-effect owner. It alone holds Slack credentials
@@ -196,33 +202,148 @@ must report the same protocol version. Operators drain/stop workers, upgrade
 both sides, and restart them as one compatibility set. Supporting an explicit
 version-skew window is a later design change, not implied by versioned DTOs.
 
+### Worker identity and authorization
+
+v25 uses TLS 1.3 with mutual X.509 authentication for every worker endpoint.
+Each worker has a unique operator-provisioned client certificate from the
+deployment's private CA. Its sole identity URI SAN is
+`urn:sbgh:worker:<worker-uuid>` with client-auth extended key usage; Common Name
+is never an identity fallback. The orchestrator server certificate uses its
+configured DNS SAN and server-auth usage. Bearer tokens are not accepted on the
+normal worker API. `sbgh-daemon` terminates and verifies mTLS directly in v25,
+checks that the message/path worker identity matches the URI SAN, and permits
+TLS 1.3 only. The worker verifies the server name, certificate, and configured
+trust root. The loopback worker resolves the same server name and uses the same
+mTLS protocol rather than a plaintext exception.
+
+The worker API has a dedicated listener and request limits, separate from the
+GitHub/webhook/operator API listener. Firewall/private-network policy exposes
+only that mTLS listener to worker hosts. TLS termination must not be delegated
+to a proxy that can spoof or drop the verified client identity in v25.
+
+Certificate issuance remains an operator/bootstrap concern in v25 rather than
+an application CA. Certificates and keys are installed with least-privilege
+filesystem permissions, rotated with an overlap window, and revocable by
+removing or disabling the corresponding registry identity. The runbook records
+CA, server-certificate, and worker-certificate rotation. A future automated
+bootstrap may use a single-use, short-TTL join token to submit a proof-of-
+possession CSR; such a token would never authorize normal worker API calls.
+
+The orchestrator registry is authoritative for `{worker_id, allowed
+capabilities, measurement_profile, enabled/draining state}`. A worker reports
+software/protocol version, a per-process session ID, and resource/dataset facts,
+but cannot grant itself a capability or comparability profile. Reported facts
+are validated telemetry used only within the server-authorized capability
+envelope. Every attempt endpoint additionally verifies that the authenticated
+worker and current worker session own the presented attempt and opaque lease
+token.
+
+### Assignment, lease, and worker-session state
+
+`worker_id` identifies an installed worker across service restarts.
+`worker_session_id` is a random UUID created on every process start. One healthy
+session is authoritative per worker:
+
+- a planned restart drains and deregisters the old session first;
+- after a crash, a new session waits for the old session's orchestrator-owned
+  TTL to expire, or for an explicit operator fence;
+- a new session never resumes the old session's attempt.
+
+The scheduling transaction uses this attempt state machine:
+
+```text
+queued -> offered -> running -> completed | failed | cancelled
+              |          |
+              v          v
+           expired    cancel_requested -> cancelled
+                         |
+                         v
+                    expired/fenced
+```
+
+- `poll` either returns the session's existing live offer/attempt or atomically
+  creates one; a lost poll response therefore cannot cause a second assignment.
+  An idle session has at most one outstanding long poll. Transport failures use
+  bounded exponential backoff with jitter and honor `Retry-After`.
+- An offer records an immutable attempt UUID, monotonically increasing fencing
+  generation for the scheduling unit, worker/session IDs, trace ID, payload
+  hash, opaque attempt-scoped lease token, and server-time expiry. The token is
+  deterministically authenticated with a daemon-held HMAC key over the
+  worker/session/attempt/fence tuple, so a lost poll response can reissue the
+  same token without storing it in plaintext.
+- `accept` is idempotent and changes a live offer to `running`. Offer expiry
+  fences it before another offer may be created.
+- Heartbeats renew only the authenticated session's current running lease and
+  return its desired state plus the highest contiguous reliable-event ACK.
+  Worker timestamps are diagnostic only; server time controls expiry. Config
+  validation requires at least three heartbeat opportunities per lease TTL.
+- Every event, artifact grant/manifest, cancellation acknowledgement, and
+  terminal submission presents `{attempt_id, fencing_generation, lease_token}`
+  and is rejected after fencing or reassignment.
+- Cancellation is durable desired state. If terminal acceptance commits first,
+  that terminal is immutable; if `cancel_requested` commits first, a later
+  success/failure terminal is rejected and only cancellation may finish the
+  attempt. A non-responsive cancellation expires and fences.
+- Terminal acceptance is one orchestrator transaction checking the active
+  attempt/fence, contiguous reliable prefix through the terminal event, and
+  verified artifact manifest before terminalizing the job and exposing its
+  artifacts.
+
+v25 has one active orchestrator instance. Multi-orchestrator HA, API leader
+election, and rolling protocol skew are explicit non-goals; database uniqueness
+constraints still defend assignment and terminal races.
+
+### Scheduling-unit affinity and recovery
+
+Placement is stored on the scheduling unit, not inferred from an individual
+job. A benchmark group records `{worker_id, measurement_profile,
+execution_generation}` at its first assignment; every lazily materialized
+variant, repeat, calibration, and carried-artifact job inherits it. A
+block-validation job is its own scheduling unit and pins its dataset worker and
+dataset generation.
+
+If a worker session dies, its current attempt is fenced. When the same stable
+worker returns and completes local cleanup, the next job/attempt may continue
+the existing benchmark-group generation because physical placement has not
+changed. Reassignment to a different worker is never implicit: after cleanup is
+resolved or explicitly abandoned, an operator starts a new execution generation
+on the selected worker. That generation reruns the group from its first
+spec/run; prior-generation results and artifacts remain auditable but are
+excluded from the new comparison. This prevents a partially measured group from
+silently mixing hosts.
+
 ## Phase 1: Worker protocol + registry (control plane)
 
-**Goal:** a worker can register, advertise capabilities, long-poll, and be handed
-a job — with a **stub task** (no real Driver yet). Prove the protocol on a single
+**Goal:** a worker can register its session, report facts, long-poll, and be
+handed work allowed by its registry-bound capabilities — with a **stub task**
+(no real Driver yet). Prove the protocol on a single
 **loopback worker** (worker process on the same host as the orchestrator) before
 any network/firewall concerns.
 
 > **Transition note (Codex).** Phase 1 is **control-plane-only / non-production**:
 > it proves the protocol with *stub* work. The orchestrator's existing **in-process
-> execution stays for production** through Phase 1 — the "orchestrator never
-> executes" end state (above) is reached only in **Phase 2**, when the existing
-> v24.1 worker library is hosted by the `sbgh-worker` binary and the daemon's
-> in-process library edge is removed.
+> execution stays for production** through Phase 1. Phase 2 hosts the existing
+> v24.1 worker library in the `sbgh-worker` binary and proves parity, but the
+> daemon's in-process edge remains a fallback reference. The "orchestrator never
+> executes" end state is reached only after Phase 3 failure recovery passes and
+> that edge is removed before production cutover.
 
 **Scope:**
 
 - Add the `sbgh-worker` binary around the existing worker library: config =
-  `{ accepted_tasks,
-  resource facts, orchestrator URL, auth token }`; registers + long-polls.
+  `{ worker identity/certificate, resource facts, orchestrator URL }`;
+  registers + long-polls.
 - Orchestrator-side **worker registry** (a `worker` table — orchestrator-owned, so
   the sole-DB-client rule holds) tracking `{ id, capabilities, resources, version,
-  last_seen, status }`.
+  measurement profile, active session, last_seen, status }`.
 - **Capability-matched offer**: a queued job is offered to a long-polling worker
   whose `capabilities ⊇ job.required_capabilities`. Reuses the atomic claim +
   lease, but the orchestrator performs the DB mutation, not the worker.
 - The worker↔orchestrator API surface: `register`, `heartbeat`, `poll` (long),
-  `complete` / `fail`. (Event + artifact endpoints land in Phase 2.)
+  `accept`, and stub `complete` / `fail`. (Event + artifact endpoints land in
+  Phase 2.)
+- Implement the worker-session, offer/accept, lease-renewal, fencing, and
+  response-loss-safe idempotency rules above before handing out stub work.
 
 **Status:**
 
@@ -238,23 +359,32 @@ streams events, and uploads results — bench end-to-end on a remote worker.
 
 **Scope:**
 
-- Host the existing v24.1 `sbgh-worker` library in the worker binary and remove
-  `sbgh-daemon`'s in-process worker and direct driver-API dependencies after
-  loopback parity. The transport/artifact/event adapters are new data-plane
-  work; the driver API, recipes, and libvirt are reused unchanged.
+- Host the existing v24.1 `sbgh-worker` library in the worker binary. Keep the
+  inline path only as a pre-cutover comparison/fallback until distributed
+  cancellation, expiry, reconnect, and recovery pass Phase 3. The
+  transport/artifact/event adapters are new data-plane work; the driver API,
+  recipes, and libvirt are reused unchanged.
 - Worker invokes its configured local
   **`Driver::run_task(TaskSpec)`** implementation from `sbgh-libvirt` or the
-  block-validation adapter selected by its advertised capability.
+  block-validation adapter selected by its server-authorized capability.
 - **Event ingest**: worker POSTs reliable task-neutral events with
   attempt-scoped sequence numbers; orchestrator ingest commits them durably
   before acknowledgement, then the reporter projects/replays them per
   [`0017`](0017-generic-phase-events.md). Best-effort progress cannot create a
   reliable-sequence gap.
-- **Artifact upload**: the worker stages `archive_dir` (tarball) or an
-  object-store pointer + the `summary` blob under its attempt. Only an accepted,
-  fenced terminal promotes/attaches those store keys; rejected/stale attempts
-  are invisible to consumers and GC-reclaimable. **Reporter/DB/vs-baseline path
-  remains orchestrator-owned.**
+- **Artifact upload**: remote/fleet mode requires the configured S3-compatible
+  store. The orchestrator grants short-TTL presigned PUTs for exact,
+  unguessable attempt-scoped staging keys and signed checksum/content headers;
+  workers receive no object-store credentials. The worker uploads each bounded
+  object, then submits a typed manifest. The orchestrator verifies key
+  ownership, size, and checksum metadata before terminal acceptance. Only an
+  accepted, fenced terminal promotes/attaches those store keys; rejected/stale
+  attempts are invisible to consumers and GC-reclaimable.
+  **Reporter/DB/vs-baseline path remains orchestrator-owned.**
+- Private-repository credentials are fetched on demand for a currently active
+  lease through an mTLS-authenticated endpoint. They are repository-read-only,
+  short-lived, held in memory, redacted from logs, and excluded from assignment
+  DTOs and resend buffers.
 - A loopback benchmark worker first; then the dedicated **Hetzner
   block-validation worker** as the real second-host test.
 - **Baseline-safety rule (Codex) — `measurement_profile` cannot wait for Phase 4.**
@@ -310,10 +440,19 @@ streams events, and uploads results — bench end-to-end on a remote worker.
 - **Graceful drain**: a worker stops claiming, finishes its current job,
   deregisters (for planned host maintenance / ephemeral-worker teardown).
 - **Event resume**: sequence numbers let a reconnecting worker resume its stream
-  without duplicating side effects.
+  without duplicating side effects. This means a network reconnect within the
+  same `worker_session_id`: reliable events use a bounded in-memory resend
+  buffer, are sent in sequence order, and apply backpressure when full. A worker
+  process restart creates a new session, cleans/fences the old attempt, and
+  requeues rather than resuming it; v25 deliberately has no durable worker
+  outbox or mid-attempt process-restart continuation.
 - **Attempt artifact GC:** staged artifacts from fenced/expired attempts without
   an accepted terminal are reclaimed after an auditable grace period; attached
   result artifacts are never swept by this path.
+- **Inline-executor removal gate:** only after lease/cancellation races,
+  same-session reconnect, worker-process restart, cleanup, and drain pass does
+  `sbgh-daemon` lose its in-process executor and normal
+  `sbgh-worker`/`sbgh-driver`/`sbgh-libvirt` dependencies.
 
 **Status:**
 
@@ -392,11 +531,13 @@ declare that, and **several physical hosts may legitimately share one profile.**
 
 ## Security
 
-- **Worker auth**: registration tokens (à la GitHub runner registration), then a
-  per-worker bearer/mTLS identity on every call.
-- **Per-job secrets**: GitHub installation tokens are minted **per job**,
-  short-lived, and delivered with the `TaskSpec` over the authenticated channel —
-  never long-lived on a worker.
+- **Worker auth**: TLS 1.3 mutual authentication with operator-provisioned,
+  per-worker X.509 certificates. The certificate identity maps to
+  orchestrator-owned capability/profile policy; normal worker calls never use a
+  shared bearer token.
+- **Per-job secrets**: GitHub installation tokens are minted on demand for an
+  active attempt, short-lived, repository-read-only, and kept outside persisted
+  assignment/event data — never long-lived on a worker.
 - **Least privilege**: a worker can only act on jobs it was handed (lease-scoped);
   it cannot enumerate or mutate the queue. It has no Slack credential or
   client, and any GitHub token is limited to repository access rather than
@@ -418,9 +559,9 @@ declare that, and **several physical hosts may legitimately share one profile.**
    the wire instead of mpsc; DB + GitHub/Slack side effects, credentials,
    debounce, rate limiting, retries, and reporting-session state stay central.
 5. **Capability matching supersedes static per-task-kind backend config** (v8
-   Phase 2's `[backend.<kind>]`). Workers advertise what they can run; the
-   scheduler routes. Per-job routing — deferred in v8 Decision #6 — is delivered
-   here.
+   Phase 2's `[backend.<kind>]`). Operators authorize what each worker can run;
+   workers report compatible local facts and the scheduler routes within that
+   envelope. Per-job routing — deferred in v8 Decision #6 — is delivered here.
 6. **Baselines are per `measurement_profile`** (Phase 4) — an **operator-declared**
    comparability label, *not* a per-box fingerprint. Several equalized hosts may
    share a profile (the small-VM-on-big-host strategy is *built* for this);
@@ -434,8 +575,9 @@ declare that, and **several physical hosts may legitimately share one profile.**
 
 - **v8 Phase 1 (the `Driver` seam) comes first** — it's the foundation every
   worker runs jobs through. v9 is a no-op without it.
-- **Then v9 Phases 1 → 2** are the MVP: a remote worker runs bench end-to-end.
-  Phase 3 (liveness) is required before any real multi-host use.
+- **Then v9 Phases 1 → 2** prove the control/data planes and loopback parity.
+  Phase 3 (liveness/recovery) is required before deleting the inline executor or
+  any real multi-host production use.
 - **Phase 4** (baseline-trust / `measurement_profile`) lands before mixing
   heterogeneous hardware into one installation's baseline timeline.
 - **Phase 5** (fairness + cloud provisioner) is later, demand-driven.

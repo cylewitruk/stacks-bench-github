@@ -247,14 +247,20 @@ compiler-enforced through three Cargo boundaries:
 backend, and an in-process `sbgh-worker` library for dispatch and recipes.
 v25 adds the worker protocol and separate process; worker registration,
 networking, leases, durable remote events, and remote artifacts are not part of
-the current deployment.
+the current deployment. Its planned control plane uses TLS 1.3 mTLS with a
+private deployment CA and one operator-provisioned certificate identity per
+worker. The orchestrator registry binds that identity to allowed capabilities
+and benchmark measurement profile; worker-reported resource facts cannot
+elevate authorization.
 
 Workers emit task-neutral events and outcomes rather than performing external
 reporting. `sbgh-daemon` remains the sole DB client and GitHub/Slack side-effect
 owner, including reporting credentials, rendering, debounce, rate limiting,
-retries, and reporting-session state. A worker may receive a short-lived,
-lease-scoped GitHub token for repository access, but never Slack credentials or
-a GitHub/Slack reporting client.
+retries, and reporting-session state. A worker may request a short-lived,
+repository-read-only GitHub token for its active lease, held only in memory, but
+never receives Slack credentials, object-store credentials, or a GitHub/Slack
+reporting client. Remote artifacts use exact attempt-scoped presigned object
+writes and become visible only after fenced terminal acceptance.
 
 Slack uses one ordinary threaded message per request. `sbgh-daemon` projects
 the current benchmark/group state into `SlackProgressView`; `sbgh-slack`

@@ -85,6 +85,33 @@ The durable store enforces uniqueness on `(attempt_id, reliable_seq)`.
 - The orchestrator acknowledges a reliable sequence only after the event is
   durably committed. The acknowledgement cursor is the highest **contiguous**
   durable sequence, not merely the highest sequence observed.
+- Duplicate comparison uses the validated typed DTO's canonical protocol bytes
+  (or their stored digest), not incidental JSON map ordering.
+
+## Worker Delivery and Restart Contract
+
+Reliable-event durability is authoritative only after orchestrator commit.
+Within one live `worker_session_id`, the worker:
+
+- assigns reliable sequence numbers in emission order;
+- retains unacknowledged reliable envelopes in a bounded in-memory resend
+  buffer;
+- sends them in sequence order and applies backpressure when that buffer is
+  full;
+- retries after transient transport/orchestrator failure from the highest
+  contiguous orchestrator ACK.
+
+Fine-grained best-effort progress never enters this buffer and cannot block a
+reliable event.
+
+v25 does not resume an execution attempt after worker-process restart. A process
+restart creates a new worker session; the old attempt is fenced, its local
+resources are cleaned, and work is requeued according to the fleet recovery
+policy. Any reliable events lost with that dead process belong to the rejected
+attempt and have no authority over its successor. Consequently v25 does not add
+a durable worker-side event outbox. “Reconnect/resume” in this design means a
+network reconnect by the same live process/session, not mid-attempt process
+recovery.
 
 ## Task-Neutral Phase Persistence
 
@@ -134,8 +161,9 @@ one enum value per recipe phase.
 - Terminal acceptance is idempotent and fenced by attempt. Artifact promotion
   and job terminalization compose with the accepted terminal event as specified
   by v25's artifact lifecycle.
-- Worker reconnect resumes from the highest durably acknowledged reliable
-  sequence, not from process-local reporter memory.
+- A network-reconnecting worker session resumes from the highest durably
+  acknowledged reliable sequence, not from process-local reporter memory. A
+  restarted worker process does not resume the attempt.
 
 ## Trace Correlation
 
@@ -158,9 +186,9 @@ OpenTelemetry deployment in v25.
 - Trace/correlation propagation.
 
 **Non-goals:** no general-purpose event-sourcing framework; no durability
-promise for every heartbeat/progress sample; no arbitrary workflow DSL; no
-removal of historical PostgreSQL enum values; and no multi-version protocol
-skew in v25.
+promise for every heartbeat/progress sample; no durable worker outbox or
+mid-attempt worker-process restart; no arbitrary workflow DSL; no removal of
+historical PostgreSQL enum values; and no multi-version protocol skew in v25.
 
 ## Acceptance
 
@@ -176,6 +204,9 @@ skew in v25.
 - A dropped best-effort progress sample creates no reliable-sequence gap.
 - Reporter catch-up is driven from durable state, not worker resend timing or an
   in-memory channel.
+- A transient network/orchestrator outage within one live worker session resends
+  unacknowledged envelopes without loss or reordering; a worker-process restart
+  fences and requeues instead of pretending to resume.
 - Historical benchmark-specific phase rows remain readable.
 - Crashing after GitHub accepts initial-comment creation but before its ID is
   persisted does not create a second marked comment on reporter replay.
@@ -188,7 +219,8 @@ skew in v25.
   out-of-order gaps, terminal-prefix gating, fencing, and projection cursors.
 - Protocol fixtures for every reliable event payload and version rejection.
 - Orchestrator-kill/restart integration test during an active loopback task.
-- Worker reconnect test beginning from the last durable acknowledgement.
+- Same-session network reconnect test beginning from the last durable
+  acknowledgement, plus worker-process-restart fencing/requeue coverage.
 - Generic phase persistence tests for benchmark and block-validation labels.
 - Compatibility fixture for historical benchmark-specific `job_event` rows.
 - GitHub comment-reconciliation test that loses the create response/ID write,
