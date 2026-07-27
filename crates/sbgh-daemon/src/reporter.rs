@@ -1,29 +1,26 @@
 //! The per-job reporter.
 //!
-//! Spawned once per claimed job, the [`Reporter`] owns **every** GitHub +
-//! job-lifecycle side-effect (the coordinator only claims/sweeps; the worker
-//! only executes). Its lifecycle:
+//! Constructed for each fleet job, the [`Reporter`] owns GitHub/Slack report
+//! preparation and terminal rendering. The fleet state machine owns durable job
+//! lifecycle transitions; workers only execute.
 //!
-//!   1. **`prepare`** — resolve the commit (FATAL), create the Check Run +
-//!      starting comment per `[reporting]` (NON-FATAL), and transition `claimed
-//!      → running`.
-//!   2. **gate the worker** — hand the resolved commit to the inline worker via
-//!      a `oneshot` (or tell it to abort if prepare failed).
-//!   3. **drain** the worker's [`WorkerEvent`] stream onto the job's
-//!      [`ReportSurface`](crate::report::ReportSurface), and write the terminal
-//!      state on `Finished`.
+//! [`Reporter::ensure_fleet_reporting`] reconciles provider identities before
+//! an assignment is offered. [`Reporter::report_fleet_terminal`] renders a
+//! terminal outcome only after fenced acceptance and artifact promotion.
 //!
-//! `run` returns `Err` only for setup-level failures that should back off the
-//! poll loop (preflight resolve failure, a lost claim on `start_running`, a
-//! recipe `SetupError`) — matching the prior inline `execute` semantics.
+//! A test-only `run` method retains the former in-process path as a
+//! behavior-parity harness; it is not compiled into the production daemon.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use sbgh_core::config::DaemonConfig;
+#[cfg(test)]
 use sbgh_core::models::{GitRefKind, ResolvedCommit};
 use sbgh_github::{CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
-use tokio::sync::{OnceCell, mpsc, oneshot};
+use tokio::sync::OnceCell;
+#[cfg(test)]
+use tokio::sync::{mpsc, oneshot};
 
 use crate::artifact_store::ArtifactStore;
 #[cfg(test)]
@@ -31,8 +28,13 @@ use crate::artifact_store::{ArtifactStoreConfig, build_store_or_local};
 use crate::bench_summary::RunResult;
 use crate::comparison::{BaselineComparison, GroupComparison, compare};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
-use crate::report::{CompletionReport, ReportSurface, build_report_surface};
+#[cfg(test)]
+use crate::report::build_report_surface;
+#[cfg(test)]
+use crate::report::log_nonfatal_projection;
+use crate::report::{CompletionReport, ReportSurface, marked_pr_comment, pr_report_marker};
 use crate::slack_report::SlackSessionRegistry;
+#[cfg(test)]
 use sbgh_driver::{Terminal, WorkerEvent};
 use sbgh_slack::SlackClient;
 
@@ -40,8 +42,10 @@ use sbgh_slack::SlackClient;
 /// (a `get_or_try_init` that leaves the cell empty on error, so a transient
 /// startup blip is retried on the next job rather than disabling the reconcile
 /// for the whole process). `None` → the Check Run reconcile is skipped this
-/// time (a fresh check is still created). The `OnceCell` is shared across the
-/// daemon's jobs (the runner owns it), so resolution happens at most once.
+/// time and a fresh check may still be created; PR-comment creation instead
+/// fails closed because its marker is not safe without an authenticated author
+/// id. The `OnceCell` is shared across the daemon's jobs (the fleet coordinator
+/// owns it), so successful resolution happens at most once.
 pub async fn resolved_app_id(cell: &OnceCell<i64>, gh: &dyn GitHubApi) -> Option<i64> {
     match cell
         .get_or_try_init(|| async {
@@ -63,9 +67,9 @@ pub async fn resolved_app_id(cell: &OnceCell<i64>, gh: &dyn GitHubApi) -> Option
 /// reconcile filter (`check_name`) and GitHub's per-name dedup both work.
 pub const CHECK_NAME: &str = "stacks-bench";
 
-/// What `prepare` tells the inline worker: the resolved commit to run, or that
-/// it must not run (prepare failed / no commit / lost claim).
+/// Test-only result passed from the legacy reporter to its in-process worker.
 #[derive(Debug)]
+#[cfg(test)]
 pub enum Prepared {
     Run { commit: String },
     Abort,
@@ -77,15 +81,17 @@ pub struct Reporter {
     jobs: Arc<dyn RunnableJobStore>,
     gh: Arc<dyn GitHubApi>,
     artifact_store: Arc<dyn ArtifactStore>,
-    /// Shared App-id cache (the runner owns it). Resolved lazily by
+    /// Shared App-id cache (the fleet coordinator owns it). Resolved lazily by
     /// `ensure_check` only when a Check Run is actually wanted, so a no-report
     /// job makes no `GET /app` call.
     app_id: Arc<OnceCell<i64>>,
     /// The Slack surface for `ProgressTarget::Slack` jobs, shared from the
-    /// runner. `None` for a GitHub-only deployment.
+    /// coordinator. `None` for a GitHub-only deployment.
+    #[allow(dead_code)]
     slack: Option<Arc<dyn SlackClient>>,
-    /// Group-scoped Slack reporting sessions, shared from the runner so a
+    /// Group-scoped Slack reporting sessions, shared from the coordinator so a
     /// repeat group's per-run surfaces reuse one canonical snapshot session.
+    #[allow(dead_code)]
     slack_sessions: Arc<SlackSessionRegistry>,
     job: RunnableJob,
 }
@@ -155,8 +161,58 @@ impl Reporter {
         }
     }
 
+    /// Prepare only the external reporting identities for a fleet job.
+    /// Execution and lifecycle persistence are owned by the fleet state
+    /// machine; this retains the existing search-before-create reconciliation
+    /// without claiming or starting the job inline.
+    pub(crate) async fn ensure_fleet_reporting(mut self) -> RunnableJob {
+        self.ensure_reporting().await;
+        self.job
+    }
+
+    /// Render an already-persisted fleet terminal through the existing
+    /// provider-owned surfaces. This deliberately performs no lifecycle DB
+    /// write: terminal acceptance is atomic in `FleetStore`.
+    pub(crate) async fn report_fleet_terminal(
+        &self,
+        surface: &dyn ReportSurface,
+        outcome: &sbgh_proto::TerminalOutcome,
+    ) -> anyhow::Result<()> {
+        match outcome {
+            sbgh_proto::TerminalOutcome::Completed { summary, block_validation } => {
+                let group_comparison = self.group_comparison().await;
+                let baseline_comparison = self
+                    .baseline_comparison(summary)
+                    .await;
+                let mut render_summary = summary.clone();
+                if let Some(result) = block_validation
+                    && let Some(object) = render_summary.as_object_mut()
+                {
+                    object.insert(
+                        "block_validation".into(),
+                        serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                surface
+                    .completed(CompletionReport {
+                        summary: &render_summary,
+                        baseline_comparison: baseline_comparison.as_ref(),
+                        group_comparison: group_comparison.as_ref(),
+                    })
+                    .await
+            }
+            sbgh_proto::TerminalOutcome::Failed { error, .. } => surface.failed(error).await,
+            sbgh_proto::TerminalOutcome::Cancelled { reason } => {
+                surface
+                    .cancelled(reason)
+                    .await
+            }
+        }
+    }
+
     /// The reporter task body. Consumes `self`; see module docs for the
     /// lifecycle and the `Err` semantics.
+    #[cfg(test)]
     pub async fn run(
         mut self,
         mut events_rx: mpsc::Receiver<WorkerEvent>,
@@ -224,12 +280,12 @@ impl Reporter {
                 .jobs
                 .fail(&self.job, msg, None)
                 .await;
-            surface.failed(msg).await;
+            log_nonfatal_projection(self.job.id, surface.failed(msg).await);
             let _ = prepared_tx.send(Prepared::Abort);
             return Ok(());
         }
 
-        surface.started().await;
+        log_nonfatal_projection(self.job.id, surface.started().await);
 
         // ── gate the worker on the resolved commit ────────────────────
         if prepared_tx
@@ -251,19 +307,28 @@ impl Reporter {
         while let Some(ev) = events_rx.recv().await {
             match ev {
                 WorkerEvent::Phase { label, elapsed } => {
-                    surface
-                        .phase(&label, elapsed)
-                        .await;
+                    log_nonfatal_projection(
+                        self.job.id,
+                        surface
+                            .phase(&label.into(), elapsed)
+                            .await,
+                    );
                 }
                 WorkerEvent::Heartbeat { label, elapsed } => {
-                    surface
-                        .heartbeat(&label, elapsed)
-                        .await;
+                    log_nonfatal_projection(
+                        self.job.id,
+                        surface
+                            .heartbeat(&label.into(), elapsed)
+                            .await,
+                    );
                 }
                 WorkerEvent::Progress(progress) => {
-                    surface
-                        .progress(&progress)
-                        .await;
+                    log_nonfatal_projection(
+                        self.job.id,
+                        surface
+                            .progress(&progress.into())
+                            .await,
+                    );
                 }
                 WorkerEvent::Finished(terminal) => {
                     saw_terminal = true;
@@ -295,13 +360,14 @@ impl Reporter {
     /// (so it can't hang in `running`) and back off the poll loop. The job is
     /// already `running` by the time the worker is gated, so there's nothing to
     /// leave for the `claimed`-only stuck-claim sweep.
+    #[cfg(test)]
     async fn abandon(&self, surface: &dyn ReportSurface, msg: &str) -> anyhow::Result<()> {
         tracing::error!(job_id = %self.job.id, "{msg}");
         let _ = self
             .jobs
             .fail(&self.job, msg, None)
             .await;
-        surface.failed(msg).await;
+        log_nonfatal_projection(self.job.id, surface.failed(msg).await);
         Err(anyhow::anyhow!("{msg}"))
     }
 
@@ -375,7 +441,13 @@ impl Reporter {
         // The matching baseline (exact → nearest-before), repo resolved.
         let baseline = match self
             .jobs
-            .find_baseline(&merge_base.hash, &pr.base.branch, merge_base.committed_at, workload_key)
+            .find_baseline(
+                self.job.id,
+                &merge_base.hash,
+                &pr.base.branch,
+                merge_base.committed_at,
+                workload_key,
+            )
             .await
         {
             Ok(Some(b)) => b,
@@ -491,6 +563,7 @@ impl Reporter {
         crate::job_source::metric_from_run(self.job.id, &run)
     }
 
+    #[cfg(test)]
     async fn finish(
         &self,
         surface: &dyn ReportSurface,
@@ -526,13 +599,16 @@ impl Reporter {
                 let comparison = self
                     .baseline_comparison(&summary)
                     .await;
-                surface
-                    .completed(CompletionReport {
-                        summary: &summary,
-                        baseline_comparison: comparison.as_ref(),
-                        group_comparison: group_comparison.as_ref(),
-                    })
-                    .await;
+                log_nonfatal_projection(
+                    self.job.id,
+                    surface
+                        .completed(CompletionReport {
+                            summary: &summary,
+                            baseline_comparison: comparison.as_ref(),
+                            group_comparison: group_comparison.as_ref(),
+                        })
+                        .await,
+                );
                 None
             }
             Terminal::Failed { error, summary } => {
@@ -555,7 +631,7 @@ impl Reporter {
                     tracing::error!(job_id = %self.job.id, error = ?e, "persisting failed result failed");
                     return Some(e);
                 }
-                surface.failed(&error).await;
+                log_nonfatal_projection(self.job.id, surface.failed(&error).await);
                 None
             }
             Terminal::SetupError { error } => {
@@ -566,7 +642,7 @@ impl Reporter {
                     .jobs
                     .fail(&self.job, &error, None)
                     .await;
-                surface.failed(&error).await;
+                log_nonfatal_projection(self.job.id, surface.failed(&error).await);
                 Some(anyhow::anyhow!("{error}"))
             }
             Terminal::Aborted => {
@@ -587,7 +663,7 @@ impl Reporter {
                     tracing::error!(job_id = %self.job.id, error = ?e, "persisting cancelled terminal failed");
                     return Some(e);
                 }
-                surface.cancelled(msg).await;
+                log_nonfatal_projection(self.job.id, surface.cancelled(msg).await);
                 None
             }
         }
@@ -597,6 +673,7 @@ impl Reporter {
     /// ad-hoc job → its rev (`[slack].default_rev` / `--rev`); a `tag_created`
     /// baseline → the tag ref. `branch_push` carries its commit from enqueue
     /// (non-empty → no-op). Mutates `self.job.commit`.
+    #[cfg(test)]
     async fn resolve_commit(&mut self) -> anyhow::Result<Option<ResolvedCommit>> {
         if !self.job.commit.is_empty() {
             return Ok(None);
@@ -793,17 +870,71 @@ impl Reporter {
         }
     }
 
-    /// Post the initial "starting" PR comment (carrying the check link when
-    /// present), persist its id. Non-fatal (returns `None` on error).
+    /// Reconcile or post the initial PR comment and persist its id. Lookup
+    /// failure is not permission to create: a later claim may retry safely.
     async fn post_initial_comment(&self, pr_number: i64, check_link: Option<&str>) -> Option<i64> {
+        let marker = pr_report_marker(self.job.benchmark_group_id);
         let link = check_link
             .map(|u| format!(" — [view check ↗]({u})"))
             .unwrap_or_default();
-        let body = format!(
-            ":construction: starting benchmark `{id}` (commit `{sha}`)…{link}",
-            id = self.job.id,
-            sha = self.job.commit,
+        let body = marked_pr_comment(
+            self.job.benchmark_group_id,
+            &format!(
+                ":construction: starting benchmark `{id}` (commit `{sha}`)…{link}",
+                id = self.job.id,
+                sha = self.job.commit,
+            ),
         );
+        let Some(app_id) = resolved_app_id(&self.app_id, self.gh.as_ref()).await else {
+            tracing::warn!(
+                job_id = %self.job.id,
+                "PR comment reconciliation skipped because App identity is unavailable"
+            );
+            return None;
+        };
+        match self
+            .gh
+            .find_pr_comment_by_marker(
+                self.job.installation_id,
+                &self.job.repository,
+                pr_number as u64,
+                app_id,
+                &marker,
+            )
+            .await
+        {
+            Ok(Some(existing)) => {
+                self.persist_comment_id(existing.id)
+                    .await;
+                if let Err(error) = self
+                    .gh
+                    .update_pr_comment(
+                        self.job.installation_id,
+                        &self.job.repository,
+                        existing.id,
+                        &body,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        job_id = %self.job.id,
+                        comment_id = existing.id,
+                        ?error,
+                        "reconciled PR comment could not be refreshed"
+                    );
+                }
+                return Some(existing.id);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %self.job.id,
+                    ?error,
+                    "PR comment reconcile lookup failed; refusing to create blindly"
+                );
+                return None;
+            }
+        }
         match self
             .gh
             .create_pr_comment(
@@ -815,19 +946,8 @@ impl Reporter {
             .await
         {
             Ok(posted) => {
-                if let Err(e) = self
-                    .jobs
-                    .set_comment_id(&self.job, posted.id)
-                    .await
-                {
-                    tracing::warn!(
-                        job_id = %self.job.id,
-                        comment_id = posted.id,
-                        error = ?e,
-                        "PERSISTING comment id failed — a re-claim may double-post the comment \
-                         (non-fatal)",
-                    );
-                }
+                self.persist_comment_id(posted.id)
+                    .await;
                 tracing::info!(job_id = %self.job.id, pr_number, comment_id = posted.id, "posted initial PR comment");
                 Some(posted.id)
             }
@@ -835,6 +955,21 @@ impl Reporter {
                 tracing::warn!(job_id = %self.job.id, error = ?e, "post initial PR comment failed (non-fatal)");
                 None
             }
+        }
+    }
+
+    async fn persist_comment_id(&self, comment_id: i64) {
+        if let Err(error) = self
+            .jobs
+            .set_comment_id(&self.job, comment_id)
+            .await
+        {
+            tracing::warn!(
+                job_id = %self.job.id,
+                comment_id,
+                ?error,
+                "persisting reconciled PR comment identity failed; marker lookup will retry",
+            );
         }
     }
 }
@@ -953,6 +1088,7 @@ mod tests {
         }
         async fn find_baseline(
             &self,
+            _subject_job_id: Uuid,
             _merge_base_sha: &str,
             _base_ref: &str,
             _at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1570,7 +1706,8 @@ mod tests {
                 baseline_comparison: None,
                 group_comparison: Some(&comparison),
             })
-            .await;
+            .await
+            .unwrap();
 
         let updates = slack
             .update_texts

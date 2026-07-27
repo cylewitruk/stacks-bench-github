@@ -1509,6 +1509,15 @@ async fn seed_completed_baseline(
         .execute(pool)
         .await
         .unwrap();
+    sqlx::query(
+        "UPDATE benchmark_group
+            SET measurement_profile = 'test-profile'
+          WHERE id = (SELECT benchmark_group_id FROM job WHERE id = $1)",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await
+    .unwrap();
     store
         .record_metric(&JobMetric {
             job_id: job.id,
@@ -1548,7 +1557,7 @@ async fn find_baseline_for_exact_hit_is_repo_agnostic_and_workload_scoped() {
         .await;
 
     let m = store
-        .find_baseline_for("abc", "develop", Some(ts(2_000)), "wk1")
+        .find_baseline_for(id, "abc", "develop", Some(ts(2_000)), "wk1")
         .await
         .unwrap()
         .expect("exact baseline at the merge-base SHA");
@@ -1561,7 +1570,7 @@ async fn find_baseline_for_exact_hit_is_repo_agnostic_and_workload_scoped() {
     // Different workload → no match (even at the same SHA).
     assert!(
         store
-            .find_baseline_for("abc", "develop", Some(ts(2_000)), "wk2")
+            .find_baseline_for(id, "abc", "develop", Some(ts(2_000)), "wk2")
             .await
             .unwrap()
             .is_none(),
@@ -1570,10 +1579,79 @@ async fn find_baseline_for_exact_hit_is_repo_agnostic_and_workload_scoped() {
     // No exact hit + no fork-point timestamp → no nearest-before → None.
     assert!(
         store
-            .find_baseline_for("zzz", "develop", None, "wk1")
+            .find_baseline_for(id, "zzz", "develop", None, "wk1")
             .await
             .unwrap()
             .is_none(),
+    );
+}
+
+#[tokio::test]
+async fn find_baseline_for_requires_the_subject_measurement_profile() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let baseline =
+        seed_completed_baseline(&pool, 100, 10, "base", "develop", ts(1_000), Some("wk1"), 111)
+            .await;
+    let subject =
+        seed_completed_baseline(&pool, 100, 10, "subject", "feature", ts(1_500), Some("wk1"), 222)
+            .await;
+    sqlx::query(
+        "UPDATE benchmark_group
+            SET measurement_profile = 'different-profile'
+          WHERE id = (SELECT benchmark_group_id FROM job WHERE id = $1)",
+    )
+    .bind(subject)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        store
+            .find_baseline_for(subject, "base", "develop", Some(ts(2_000)), "wk1")
+            .await
+            .unwrap()
+            .is_none(),
+        "a different measurement environment must disable comparison"
+    );
+
+    sqlx::query(
+        "UPDATE benchmark_group
+            SET measurement_profile = 'test-profile'
+          WHERE id = (SELECT benchmark_group_id FROM job WHERE id = $1)",
+    )
+    .bind(subject)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .find_baseline_for(subject, "base", "develop", Some(ts(2_000)), "wk1")
+            .await
+            .unwrap()
+            .unwrap()
+            .anchor
+            .job_id,
+        baseline
+    );
+
+    sqlx::query(
+        "UPDATE benchmark_group
+            SET measurement_profile = NULL
+          WHERE id = (SELECT benchmark_group_id FROM job WHERE id = $1)",
+    )
+    .bind(subject)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        store
+            .find_baseline_for(subject, "base", "develop", Some(ts(2_000)), "wk1")
+            .await
+            .unwrap()
+            .is_none(),
+        "an unstamped subject must remain absolute-only"
     );
 }
 
@@ -1585,14 +1663,16 @@ async fn find_baseline_for_nearest_before_picks_newest_at_or_before_forkpoint() 
 
     // develop timeline: old1 @1000, old2 @2000 (both ≤ fork-point 2500),
     // future @3000 (after). A divergent develop2 @2400 must not leak in.
-    seed_completed_baseline(&pool, 100, 10, "old1", "develop", ts(1_000), Some("wk1"), 100).await;
+    let subject =
+        seed_completed_baseline(&pool, 100, 10, "old1", "develop", ts(1_000), Some("wk1"), 100)
+            .await;
     seed_completed_baseline(&pool, 100, 10, "old2", "develop", ts(2_000), Some("wk1"), 222).await;
     seed_completed_baseline(&pool, 100, 10, "future", "develop", ts(3_000), Some("wk1"), 999).await;
     seed_completed_baseline(&pool, 100, 10, "div", "develop2", ts(2_400), Some("wk1"), 888).await;
 
     // Fork-point SHA wasn't benchmarked → nearest-before on `develop` ≤ 2500.
     let m = store
-        .find_baseline_for("forkpoint-sha", "develop", Some(ts(2_500)), "wk1")
+        .find_baseline_for(subject, "forkpoint-sha", "develop", Some(ts(2_500)), "wk1")
         .await
         .unwrap()
         .expect("nearest-before baseline");
@@ -1603,7 +1683,7 @@ async fn find_baseline_for_nearest_before_picks_newest_at_or_before_forkpoint() 
     // A different ref has no nearest-before here.
     assert!(
         store
-            .find_baseline_for("forkpoint-sha", "release", Some(ts(2_500)), "wk1")
+            .find_baseline_for(subject, "forkpoint-sha", "release", Some(ts(2_500)), "wk1")
             .await
             .unwrap()
             .is_none(),
@@ -1638,7 +1718,7 @@ async fn find_baseline_for_nearest_before_tiebreak_is_deterministic() {
         .unwrap();
 
     let m = store
-        .find_baseline_for("forkpoint", "develop", Some(ts(2_500)), "wk1")
+        .find_baseline_for(a, "forkpoint", "develop", Some(ts(2_500)), "wk1")
         .await
         .unwrap()
         .expect("nearest-before with a timestamp tie");
@@ -1653,11 +1733,12 @@ async fn find_baseline_for_ignores_null_workload_key() {
     let store = PostgresJobStore::new(pool.clone());
 
     // A pre-v7 baseline with a NULL workload_key must never match.
-    seed_completed_baseline(&pool, 100, 10, "abc", "develop", ts(1_000), None, 111).await;
+    let subject =
+        seed_completed_baseline(&pool, 100, 10, "abc", "develop", ts(1_000), None, 111).await;
 
     assert!(
         store
-            .find_baseline_for("abc", "develop", Some(ts(2_000)), "wk1")
+            .find_baseline_for(subject, "abc", "develop", Some(ts(2_000)), "wk1")
             .await
             .unwrap()
             .is_none(),

@@ -1,13 +1,12 @@
-# Design 0004: Distributed worker fleet (`remote-daemon`, capability-scheduled)
+# 0004: Distributed Worker Fleet (`remote-daemon`, capability-scheduled)
 
 - **id:** `0004-worker-fleet`
-- **status:** `planned` (`v25-worker-fleet-block-validation`)
+- **status:** `shipped` (`v25-worker-fleet-block-validation`, 2026-07-27)
 - **depends_on:** `0010-driver-seam` (shipped),
   `0055-execution-boundary-preparation` (v24),
   `0056-compiler-enforced-execution-boundaries` (v24.1)
-- **iteration:**
-  [`v25-worker-fleet-block-validation`](../iterations/v25-worker-fleet-block-validation.md)
-- **review:** Codex signed off (design)
+- **iteration:** `v25-worker-fleet-block-validation` (shipped)
+- **review:** Codex implementation and Opus review signed off
 - **source:** roadmap-v9 + v25 dedicated-worker activation
 
 Turns the single-host daemon into an **orchestrator + a fleet of remote worker
@@ -37,7 +36,7 @@ debounce, rate limiting, retries, and reporting-session state. This doc owns the
 is `0009`.
 
 *(Below, "v8/v9/…" are historical roadmap shorthands — resolve via
-[index.md](../index.md): v5→`0008`, v6→`0005`/`0019`, v7→`0009`, v8 seam→`0010`,
+[index.md](../../index.md): v5→`0008`, v6→`0005`/`0019`, v7→`0009`, v8 seam→`0010`,
 v8 cloud→`0006`, "v9"=this fleet.)*
 
 ## Two orthogonal seams
@@ -67,7 +66,7 @@ one-or-more local Drivers }**, and the orchestrator becomes a
 
 The last row is how **cloud stays in scope without committing**: a cloud instance
 is just a worker on an autoscaled VM. The parked v8 AWS work
-([`0006`](../backlog.md) Phases 3–6) returns here as a **worker
+([`0006`](../../backlog.md) Phases 3–6) returns here as a **worker
 provisioner** — *who* spawns the worker host — orthogonal to this protocol.
 
 ## The worker lifecycle
@@ -223,9 +222,11 @@ to a proxy that can spoof or drop the verified client identity in v25.
 
 Certificate issuance remains an operator/bootstrap concern in v25 rather than
 an application CA. Certificates and keys are installed with least-privilege
-filesystem permissions, rotated with an overlap window, and revocable by
-removing or disabling the corresponding registry identity. The runbook records
-CA, server-certificate, and worker-certificate rotation. A future automated
+filesystem permissions, rotated with an overlap window, and authorized by
+server-owned leaf-certificate SHA-256 fingerprints. Removing one fingerprint
+revokes that certificate without disabling a rotated replacement; disabling
+the registry identity revokes the worker as a whole. The runbook records CA,
+server-certificate, and worker-certificate rotation. A future automated
 bootstrap may use a single-use, short-TTL join token to submit a proof-of-
 possession CSR; such a token would never authorize normal worker API calls.
 
@@ -517,7 +518,7 @@ declare that, and **several physical hosts may legitimately share one profile.**
   matching; a multi-hour block-validation flood can't starve bench (per-kind
   quotas / weighted fairness).
 - **Cloud-ephemeral worker provisioner** — the reborn v8 AWS / Hetzner-Cloud work
-  ([`0006`](../backlog.md) Phases 3–6): a provisioner spawns ephemeral
+  ([`0006`](../../backlog.md) Phases 3–6): a provisioner spawns ephemeral
   workers that register, run, and deregister. Gated on the cost/variance/hydration
   data that parked it. Bench-only at first (block-val wants local NVMe → bare
   metal; see [`0019`](0019-block-validation-recipe.md)).
@@ -587,3 +588,20 @@ declare that, and **several physical hosts may legitimately share one profile.**
 - **The upper stack is reused unchanged** — job engine, reporting, the v7
   comparison; the DB gains the worker registry + the `measurement_profile` column
   only.
+
+## Shipped Outcome
+
+v25 delivered the capability-scheduled orchestrator/worker split, TLS 1.3 mutual
+authentication, server-owned authorization, durable leases and fencing,
+task-neutral event transport, presigned artifact exchange, loopback parity, and
+the first remote block-validation capability. The focused review pass hardened
+comment reconciliation, stale-worker cleanup, response-loss handling, artifact
+authorization, and cancellation/terminal races without weakening fail-closed
+behavior.
+
+Local validation completed with build and lint clean and 829 tests passing with
+one environment-gated skip. Opus signed off after the final review pass.
+Deployment-specific host characterization, certificate rotation, failure
+injection, rollback, and soak checks remain operational rollout work tracked in
+the [worker-fleet operations guide](../../../docs/worker-fleet-operations.md);
+they are not recorded here as locally executed.

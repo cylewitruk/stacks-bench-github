@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use sbgh_daemon::{ArtifactStore, S3Store, S3StoreConfig, artifact_key};
+use sbgh_proto::ArtifactDescriptor;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const ENDPOINT: &str = "http://127.0.0.1:9100";
@@ -236,5 +238,116 @@ async fn put_local_only_mirrors_without_uploading() {
             .await
             .is_none(),
         "a local-only artifact is never offered as a download link",
+    );
+}
+
+#[tokio::test]
+async fn fleet_upload_is_checksum_bound_verified_and_promoted_from_staging() {
+    ensure_bucket().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = S3Store::new(tmp.path().join("mirror"), &s3_config(), http()).unwrap();
+    let attempt = Uuid::new_v4();
+    let staging = format!("staging/{attempt}/{}/run.json", Uuid::new_v4());
+    let logical = format!("{attempt}/run.json");
+    let payload = br#"{"fleet":true}"#;
+    let digest = hex::encode(Sha256::digest(payload));
+    let grant = store
+        .fleet_put_grant(&staging, payload.len() as u64, &digest, Duration::from_secs(300))
+        .unwrap();
+    let mut upload = http().put(&grant.url);
+    for header in &grant.headers {
+        upload = upload.header(&header.name, &header.value);
+    }
+    let response = upload
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "exact signed upload failed: {}", response.status());
+
+    let descriptor = ArtifactDescriptor {
+        key: staging.clone(),
+        logical_key: logical.clone(),
+        size: payload.len() as u64,
+        sha256: digest,
+    };
+    assert!(
+        store
+            .verify_fleet_upload(&descriptor)
+            .await,
+        "orchestrator verifies signed object metadata"
+    );
+    assert!(
+        store
+            .promote_fleet_upload(&descriptor)
+            .await,
+        "accepted staging object promotes to its logical key"
+    );
+    assert!(!store.exists(&staging).await, "promotion removes staging");
+    assert!(
+        store
+            .promote_fleet_upload(&descriptor)
+            .await,
+        "promotion retry verifies the already-copied logical object"
+    );
+
+    let fresh = S3Store::new(
+        tmp.path()
+            .join("fresh-mirror"),
+        &s3_config(),
+        http(),
+    )
+    .unwrap();
+    let downloaded = fresh
+        .get(&logical)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(downloaded).unwrap(), payload);
+
+    let conflicting = tmp
+        .path()
+        .join("conflicting-run.json");
+    std::fs::write(&conflicting, b"wrong").unwrap();
+    assert_eq!(
+        store
+            .put(&logical, &conflicting)
+            .await,
+        Some(5)
+    );
+    assert!(
+        !store
+            .promote_fleet_upload(&descriptor)
+            .await,
+        "an absent staging key must not bless a mismatched logical object"
+    );
+
+    let rejected_key = format!("staging/{attempt}/{}/wrong.json", Uuid::new_v4());
+    let wrong_digest = "00".repeat(32);
+    let rejected = store
+        .fleet_put_grant(
+            &rejected_key,
+            payload.len() as u64,
+            &wrong_digest,
+            Duration::from_secs(300),
+        )
+        .unwrap();
+    let mut upload = http().put(&rejected.url);
+    for header in &rejected.headers {
+        upload = upload.header(&header.name, &header.value);
+    }
+    let response = upload
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !response.status().is_success(),
+        "S3 verifier accepted bytes that violate the signed checksum"
+    );
+    assert!(
+        !store
+            .exists(&rejected_key)
+            .await
     );
 }

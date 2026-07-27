@@ -302,6 +302,7 @@ enum BuildPlan {
 struct RunInputs<'a> {
     repository: &'a str,
     commit: &'a str,
+    repository_credential: Option<&'a str>,
     bench_args: &'a [String],
     sqlite_seed_key: Option<&'a str>,
     shared_baseline_calibration: bool,
@@ -391,6 +392,7 @@ impl LibvirtDriver {
         let inputs = RunInputs {
             repository: ctx.repository,
             commit: ctx.commit,
+            repository_credential: ctx.repository_credential,
             bench_args,
             sqlite_seed_key,
             shared_baseline_calibration,
@@ -761,8 +763,21 @@ impl LibvirtDriver {
 
     async fn prepare_git_mirror(&self, inputs: &RunInputs<'_>, job_id: &str) -> anyhow::Result<()> {
         let repo_url = format!("https://github.com/{}.git", inputs.repository);
-        git_mirror::ensure(self.shell.as_ref(), &self.config.paths, &repo_url).await?;
-        git_mirror::fetch_sha(self.shell.as_ref(), &self.config.paths, job_id, inputs.commit).await
+        git_mirror::ensure(
+            self.shell.as_ref(),
+            &self.config.paths,
+            &repo_url,
+            inputs.repository_credential,
+        )
+        .await?;
+        git_mirror::fetch_sha(
+            self.shell.as_ref(),
+            &self.config.paths,
+            job_id,
+            inputs.commit,
+            inputs.repository_credential,
+        )
+        .await
     }
 
     /// Resolve the binary-cache plan before source-disk provisioning.

@@ -415,13 +415,15 @@ pub trait JobStore: Send + Sync + 'static {
     ///    the fork-point. Best-effort, labelled as such.
     ///
     /// Only `intent='baseline_benchmark'`, `status='completed'`,
-    /// matching-`workload_key` rows are eligible; a NULL `workload_key`
-    /// never matches. `None` when neither step finds one. Ties (a commit
+    /// matching-`workload_key`, and matching non-NULL group
+    /// `measurement_profile` rows are eligible; a NULL workload/profile never
+    /// matches. `None` when neither step finds one. Ties (a commit
     /// benchmarked more than once, or two commits sharing a timestamp) resolve
     /// **deterministically** to the freshest measurement, then the highest job
     /// id — so a report never silently flips which baseline it cites.
     async fn find_baseline_for(
         &self,
+        subject_job_id: Uuid,
         merge_base_sha: &str,
         base_ref: &str,
         merge_base_committed_at: Option<DateTime<Utc>>,

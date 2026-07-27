@@ -146,6 +146,92 @@ pub struct JobView {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnqueueBlockValidationRequest {
+    pub install_id: i64,
+    pub repo_id: i64,
+    pub commit: String,
+    pub worker_id: String,
+    pub dataset_network: String,
+    /// `pre_nakamoto` or `nakamoto`.
+    pub epoch: String,
+    pub range_start: u64,
+    pub range_end: u64,
+    pub requested_shards: u32,
+    pub max_concurrency: u32,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnqueueJobResponse {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetSummaryView {
+    pub registered_workers: u64,
+    pub online_workers: u64,
+    pub draining_workers: u64,
+    pub active_attempts: u64,
+    pub pending_cleanup: u64,
+    pub reliable_event_gap_attempts: u64,
+    pub staged_artifact_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetWorkerView {
+    pub worker_id: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub draining: bool,
+    pub capabilities: Vec<String>,
+    pub measurement_profile: Option<String>,
+    pub worker_session_id: Option<String>,
+    pub session_status: Option<String>,
+    pub software_version: Option<String>,
+    pub last_heartbeat_at: Option<String>,
+    pub session_expires_at: Option<String>,
+    pub resource_facts: Option<serde_json::Value>,
+    pub attempt_id: Option<String>,
+    pub job_id: Option<String>,
+    pub trace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FleetOverview {
+    pub summary: FleetSummaryView,
+    pub workers: Vec<FleetWorkerView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerDrainRequest {
+    pub draining: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetCancellationResponse {
+    pub job_id: String,
+    pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetRecoveryRequest {
+    pub reason: String,
+    /// Optional compatible worker on which to place the fresh generation.
+    pub worker_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetRecoveryResponse {
+    pub prior_group_id: String,
+    pub new_group_id: String,
+    pub first_job_id: String,
+    pub execution_generation: u64,
+}
+
 /// Resolution of an `owner/repo` slug to the ids the policy/role commands
 /// need. `install_id` is the **active** installation on `owner`'s account
 /// (GitHub Apps install at most once per account); `repo_id` is the

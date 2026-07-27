@@ -30,6 +30,11 @@ pub async fn execute(
         job_id: request.context.job_id,
         repository: &request.context.repository,
         commit: &request.context.commit,
+        repository_credential: request
+            .context
+            .repository_credential
+            .as_ref()
+            .map(sbgh_driver::RepositoryCredential::expose),
     };
     match request.task {
         ExecutionTask::Benchmark(task) => {
@@ -121,6 +126,7 @@ mod tests {
                 job_id: Uuid::nil(),
                 repository: "octo/core".into(),
                 commit: "abc123".into(),
+                repository_credential: None,
             },
             task: ExecutionTask::Unsupported {
                 combination: "BlockValidation/StacksInspect".into(),

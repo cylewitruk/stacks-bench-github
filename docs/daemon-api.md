@@ -1,6 +1,6 @@
 # Daemon API (design)
 
-Status: **implemented** — roadmap-v3 Phases 2–6. Tracked by
+Status: **implemented** — including the v25 fleet operator surface. Tracked by
 [`0012` (api-fronted daemon)](../planning/archive/completed/0012-api-fronted-daemon.md).
 
 The daemon becomes the single component that owns the database, the
@@ -54,7 +54,8 @@ internet → handler ──HMAC verify──▶ POST /api/webhooks ─┐
 operator → sbgh-cli ─────────────────▶ /api/* ───────────┤
                                        (cookie token)     ▼
                                                     daemon ──▶ Postgres (sole client, owner)
-                                                       └─ App key, processor, runner, GitHub resolution
+                                                       └─ App key, processor, fleet scheduler,
+                                                          reporting, GitHub resolution
 ```
 
 The `github_webhook` inbox table and the processor loop are **unchanged** —
@@ -209,6 +210,25 @@ not a submit-time response.)
 | `GET` | `/api/jobs` | `read` | List jobs (filter `status`, `limit`) — run visibility |
 | `GET` | `/api/health` | none | Liveness probe |
 | `GET` | `/api/whoami` | `read` | Echo the scope the caller's token resolved to — confirm auth without a side effect (landed in Phase 2 with health + the auth layer) |
+
+### Worker fleet and block validation
+
+These operator endpoints are separate from the dedicated TLS 1.3 mTLS worker
+listener. Workers cannot call the cookie-authenticated operator API.
+
+| Method | Path | Scope | Purpose |
+| ---- | ---- | ---- | ---- |
+| `GET` | `/api/fleet` | `read` | Registry/session/resource/dataset, active attempt, trace, and cleanup summary |
+| `GET` | `/api/fleet/metrics` | `read` | Prometheus text for heartbeat/lease, wait, ACK lag, resend pressure, staging, cleanup |
+| `POST` | `/api/jobs/block-validation` | `admin` | Enqueue a fully specified block-validation job |
+| `POST` | `/api/fleet/workers/{id}/drain` | `admin` | Set/clear durable drain |
+| `POST` | `/api/fleet/jobs/{id}/cancel` | `admin` | Durably request cancellation of a running fleet attempt |
+| `POST` | `/api/fleet/groups/{id}/recover` | `admin` | Start a new generation from the first spec/run, optionally pinned to a compatible `worker_id` |
+
+The bounded GitHub command `/validate-blocks <epoch> <start> <end>` uses the
+same PR-role and target/source policy checks as `/benchmark`. Shard,
+concurrency, timeout, worker, and current verified dataset identity are
+server-owned fleet configuration, never comment input.
 
 ### Not an endpoint
 

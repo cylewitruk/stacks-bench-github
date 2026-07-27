@@ -1,0 +1,37 @@
+[Unit]
+Description=stacks-bench-github fleet worker (%i)
+Documentation=https://github.com/cylewitruk/stacks-bench-github
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sbgh-worker
+Group=sbgh-worker
+WorkingDirectory=/var/lib/sbgh-worker
+ExecStart=/usr/local/bin/sbgh-worker --config /etc/sbgh/worker/%i.toml
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=180s
+KillMode=mixed
+RuntimeDirectory=sbgh-worker
+RuntimeDirectoryPreserve=yes
+UMask=0077
+
+Environment=RUST_LOG=info,sbgh_worker=info
+EnvironmentFile=-/etc/sbgh/worker/secrets.env
+
+# The worker has no database, Slack, GitHub App, or object-store credentials.
+# Benchmark profiles may need the documented narrow sudo/libvirt permissions;
+# block-validation profiles should not grant sudo at all.
+NoNewPrivileges=false
+RestrictSUIDSGID=false
+PrivateDevices=false
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

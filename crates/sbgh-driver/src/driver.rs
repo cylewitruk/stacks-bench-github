@@ -21,6 +21,7 @@ pub struct TaskContext<'a> {
     pub job_id: Uuid,
     pub repository: &'a str,
     pub commit: &'a str,
+    pub repository_credential: Option<&'a str>,
 }
 
 /// Task-specific input handed to an execution backend. Placement remains a

@@ -1,8 +1,8 @@
 //! The daemon's queue abstraction.
 //!
-//! The runner drives the same libvirt logic over a [`RunnableJobStore`],
-//! decoupling it from the `job` family's storage shape and giving tests a
-//! seam (the runner tests use a fake impl). This module provides:
+//! The fleet coordinator drives reporting and immutable assignment preparation
+//! over a [`RunnableJobStore`], decoupling those concerns from the `job`
+//! family's storage shape. The legacy inline-runner tests retain the same seam.
 //!
 //!   - [`RunnableJob`] — a storage-neutral execution view (everything the
 //!     driver + progress reporter need), assembled from the `job` family.
@@ -15,10 +15,9 @@
 //! commit-level Check Run). The comment id and check run id+url are each
 //! recorded on a `comment_posted` / `check_run_created` `job_event`, read back
 //! on re-claim so a reclaimed job updates them rather than duplicating.
-//! `tag_created` jobs are enqueued with no commit and resolved at claim time
-//! (the runner calls [`sbgh_github::GitHubApi::resolve_commit`] in
-//! preflight). Deferred: the intermediate phase-event timeline (provision/
-//! build/bench `job_event` rows — phase changes are logged only).
+//! `tag_created` jobs are enqueued with no commit and resolved before the fleet
+//! payload becomes schedulable. Intermediate phases arrive through the durable,
+//! task-neutral attempt-event ledger.
 
 use std::sync::Arc;
 
@@ -134,7 +133,8 @@ pub struct RunnableJob {
     /// baseline of the *same* workload is comparable). `None` on pre-v7 rows.
     pub workload_key: Option<String>,
     /// Resolved `stacks-bench` CLI args. Empty → the driver falls back to
-    /// the configured `default_args`.
+    /// the configured `default_args`. Fleet enqueue records the resolved token
+    /// snapshot in queued detail so preparation never consults changed defaults.
     pub bench_args: Vec<String>,
     pub progress: ProgressTarget,
     /// Claim token. The store guards its `running`/terminal writes on
@@ -207,6 +207,7 @@ pub trait RunnableJobStore: Send + Sync + 'static {
     /// Best-effort; the caller degrades to absolute-only.
     async fn find_baseline(
         &self,
+        subject_job_id: Uuid,
         merge_base_sha: &str,
         base_ref: &str,
         merge_base_committed_at: Option<DateTime<Utc>>,
@@ -409,6 +410,7 @@ impl RunnableJobStore for JobSource {
 
     async fn find_baseline(
         &self,
+        subject_job_id: Uuid,
         merge_base_sha: &str,
         base_ref: &str,
         merge_base_committed_at: Option<DateTime<Utc>>,
@@ -416,7 +418,13 @@ impl RunnableJobStore for JobSource {
     ) -> anyhow::Result<Option<BaselineRef>> {
         let Some(m) = self
             .jobs
-            .find_baseline_for(merge_base_sha, base_ref, merge_base_committed_at, workload_key)
+            .find_baseline_for(
+                subject_job_id,
+                merge_base_sha,
+                base_ref,
+                merge_base_committed_at,
+                workload_key,
+            )
             .await?
         else {
             return Ok(None);
@@ -794,7 +802,7 @@ impl JobSource {
 /// companions: always a [`JobResult`] (carrying the archived `run.json`
 /// content when readable + the archive dir), and a [`JobMetric`] when
 /// `run.json` parsed with the full promoted-metric set.
-async fn extract_outcome(
+pub(crate) async fn extract_outcome(
     job_id: Uuid,
     summary: &serde_json::Value,
     store: &dyn ArtifactStore,
@@ -836,7 +844,7 @@ fn archive_dir(summary: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
-fn baseline_calibration_id(summary: &serde_json::Value) -> Option<i64> {
+pub(crate) fn baseline_calibration_id(summary: &serde_json::Value) -> Option<i64> {
     summary
         .get("baseline_calibration_id")
         .and_then(|v| v.as_i64())

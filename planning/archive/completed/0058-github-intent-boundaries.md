@@ -283,6 +283,6 @@ Local validation on 2026-07-26:
   replaces Slack's
   card/stream/timeline presentation with one replay-safe snapshot message, then
   extracts the smaller Slack integration into `sbgh-slack`.
-- [v25](../../iterations/v25-worker-fleet-block-validation.md) remains the owner of worker
-  protocol, durable attempt events, and task-neutral reporter projection.
+- [v25](0004-worker-fleet.md) shipped the worker protocol, durable attempt
+  events, and task-neutral reporter projection.
   Neither v24.2 extraction is a load-bearing fleet prerequisite.

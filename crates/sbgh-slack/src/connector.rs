@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use sbgh_core::bench_args::workload_key;
 use sbgh_core::db::NewBenchmarkSpec;
 use sbgh_core::models::{
     BuildTarget, GitRefKind, Job, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail,
@@ -243,7 +244,7 @@ impl SlackConnector {
                     .unwrap_or_else(|| self.cfg.default_rev.clone());
                 let clean_repetitions = spec.clean_repetitions;
                 let bench_args = spec.to_bench_args();
-                let new_job = self.new_slack_benchmark_job(rev.clone());
+                let new_job = self.new_slack_benchmark_job(rev.clone(), workload_key(&bench_args));
                 (
                     rev,
                     bench_args,
@@ -258,6 +259,7 @@ impl SlackConnector {
                 let bench_args = comparison
                     .workload
                     .to_bench_args();
+                let workload_key = workload_key(&bench_args);
                 let revs: Vec<_> = comparison
                     .variants
                     .iter()
@@ -268,7 +270,7 @@ impl SlackConnector {
                     .cloned()
                     .map(|rev| {
                         NewBenchmarkSpec::singleton(
-                            self.new_slack_benchmark_job(rev),
+                            self.new_slack_benchmark_job(rev, workload_key.clone()),
                             clean_repetitions as i32,
                         )
                     })
@@ -285,7 +287,7 @@ impl SlackConnector {
         tracing::debug!(bench_args = ?bench_args, "slack: resolved bench args");
         let reporting_identity =
             ReportingIdentity::for_request(&event.team_id, &event.channel, &event.message_ts);
-        let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+        let mut detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
             channel: event.channel.clone(),
             message_ts: event.message_ts.clone(),
             reporting_identity: Some(
@@ -297,6 +299,13 @@ impl SlackConnector {
             clean_repetitions,
         })
         .expect("QueuedEventDetail serializes");
+        detail
+            .as_object_mut()
+            .expect("queued detail is an object")
+            .insert(
+                "effective_args".into(),
+                serde_json::to_value(&bench_args).expect("benchmark arguments serialize"),
+            );
 
         // 3a. Reconcile or post before creating the job. The identity is stable
         //     across Socket Mode redelivery, so a lost post response can be
@@ -401,7 +410,7 @@ impl SlackConnector {
         )
     }
 
-    fn new_slack_benchmark_job(&self, rev: String) -> NewJob {
+    fn new_slack_benchmark_job(&self, rev: String, workload_key: String) -> NewJob {
         NewJob {
             github_installation_id: self.target.installation_id,
             github_repo_id: self.target.repo_id,
@@ -412,15 +421,14 @@ impl SlackConnector {
                 build_target: BuildTarget::StacksBench,
             },
             // `Branch` is the neutral default for a default-rev like `develop`;
-            // `git_commit_hash` is `None`, so the rev resolves to a commit at
-            // claim time — the reporter's `prepare` resolves a Slack job's bare
-            // rev (branch/tag/SHA) via `resolve_commit`, so it passes the
-            // empty-commit guard like a PR-head or tag job.
+            // `git_commit_hash` is `None`, so the fleet coordinator resolves
+            // the bare rev to an immutable commit before this job becomes
+            // schedulable.
             git_ref_kind: GitRefKind::Branch,
             git_ref_display: rev,
             git_commit_hash: None,
             git_committed_at: None,
-            workload_key: None,
+            workload_key: Some(workload_key),
         }
     }
 

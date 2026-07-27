@@ -39,7 +39,7 @@ use crate::artifact_store::{
 use crate::artifact_store::{ArtifactStoreConfig, build_store_or_local};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::pin_manager::{PinManager, RepoIdentityLookup};
-use crate::report::build_report_surface;
+use crate::report::{build_report_surface, log_nonfatal_projection};
 use crate::reporter::{CHECK_NAME, Prepared, Reporter, ReporterDependencies, resolved_app_id};
 use crate::shutdown::Shutdown;
 use crate::slack_report::{SlackSessionRegistry, build_slack_surface};
@@ -725,9 +725,12 @@ impl Coordinator {
             &self.deps.slack_sessions,
             &job,
         );
-        surface
-            .cancelled(ORPHAN_CHECK_REASON)
-            .await;
+        log_nonfatal_projection(
+            job_id,
+            surface
+                .cancelled(ORPHAN_CHECK_REASON)
+                .await,
+        );
     }
 
     /// Report each waiting job's queue position on its surface: a GitHub Check
@@ -1391,7 +1394,7 @@ impl JobDeps {
             &self.slack_sessions,
             job,
         );
-        surface.failed(reason).await;
+        log_nonfatal_projection(job.id, surface.failed(reason).await);
     }
 }
 
@@ -1445,6 +1448,7 @@ fn execution_request_for(
             job_id: job.id,
             repository: job.repository.clone(),
             commit,
+            repository_credential: None,
         },
         task,
         placement: ExecutionPlacement { vcpu_cpuset },

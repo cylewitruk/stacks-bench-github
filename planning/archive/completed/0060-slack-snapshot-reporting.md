@@ -351,9 +351,8 @@ projection will drive it.
 
 ## Follow-Ups
 
-- [v25](../../iterations/v25-worker-fleet-block-validation.md) replaces the
-  in-memory reporter source with committed attempt events. Its projector must
-  rebuild the current `SlackProgressView`; it must not replay historical Slack
-  update commands.
+- [v25](0004-worker-fleet.md) replaced the in-memory reporter source with
+  committed attempt events. Its projector rebuilds the current
+  `SlackProgressView`; it does not replay historical Slack update commands.
 - Richer operator dashboards, Slack App Home, and durable fine-grained progress
   remain separate features.

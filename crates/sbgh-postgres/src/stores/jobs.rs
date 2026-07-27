@@ -1590,6 +1590,7 @@ impl JobStore for PostgresJobStore {
 
     async fn find_baseline_for(
         &self,
+        subject_job_id: Uuid,
         merge_base_sha: &str,
         base_ref: &str,
         merge_base_committed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1600,6 +1601,13 @@ impl JobStore for PostgresJobStore {
         //    measurement wins if the same (SHA, workload) ran more than once.
         let exact: Option<BaselineRow> = sqlx::query_as(
             r#"
+            WITH subject AS (
+                SELECT bg.measurement_profile
+                  FROM job subject_job
+                  JOIN benchmark_group bg ON bg.id = subject_job.benchmark_group_id
+                 WHERE subject_job.id = $1
+                   AND bg.measurement_profile IS NOT NULL
+            )
             SELECT j.github_repo_id,
                    j.git_commit_hash AS commit,
                    j.git_ref_display,
@@ -1610,9 +1618,11 @@ impl JobStore for PostgresJobStore {
                    m.read_length, m.write_length, m.measured_blocks,
                    m.warmup_blocks, m.created_at
               FROM job j
+              JOIN benchmark_group bg ON bg.id = j.benchmark_group_id
+              JOIN subject ON subject.measurement_profile = bg.measurement_profile
               JOIN job_metric m ON m.job_id = j.id
-             WHERE j.git_commit_hash = $1
-               AND j.workload_key = $2
+             WHERE j.git_commit_hash = $2
+               AND j.workload_key = $3
                AND j.intent = 'baseline_benchmark'
                AND j.status = 'completed'
           -- Deterministic: freshest measurement, then job id, so the same SHA
@@ -1621,6 +1631,7 @@ impl JobStore for PostgresJobStore {
              LIMIT 1
             "#,
         )
+        .bind(subject_job_id)
         .bind(merge_base_sha)
         .bind(workload_key)
         .fetch_optional(&self.pool)
@@ -1637,6 +1648,13 @@ impl JobStore for PostgresJobStore {
         };
         let nearest: Option<BaselineRow> = sqlx::query_as(
             r#"
+            WITH subject AS (
+                SELECT bg.measurement_profile
+                  FROM job subject_job
+                  JOIN benchmark_group bg ON bg.id = subject_job.benchmark_group_id
+                 WHERE subject_job.id = $1
+                   AND bg.measurement_profile IS NOT NULL
+            )
             SELECT j.github_repo_id,
                    j.git_commit_hash AS commit,
                    j.git_ref_display,
@@ -1647,10 +1665,12 @@ impl JobStore for PostgresJobStore {
                    m.read_length, m.write_length, m.measured_blocks,
                    m.warmup_blocks, m.created_at
               FROM job j
+              JOIN benchmark_group bg ON bg.id = j.benchmark_group_id
+              JOIN subject ON subject.measurement_profile = bg.measurement_profile
               JOIN job_metric m ON m.job_id = j.id
-             WHERE j.git_ref_display = $1
-               AND j.workload_key = $2
-               AND j.git_committed_at <= $3
+             WHERE j.git_ref_display = $2
+               AND j.workload_key = $3
+               AND j.git_committed_at <= $4
                AND j.intent = 'baseline_benchmark'
                AND j.status = 'completed'
           -- Newest commit at/before the fork-point; ties (shared timestamp /
@@ -1659,6 +1679,7 @@ impl JobStore for PostgresJobStore {
              LIMIT 1
             "#,
         )
+        .bind(subject_job_id)
         .bind(base_ref)
         .bind(workload_key)
         .bind(ts)

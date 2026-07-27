@@ -15,30 +15,29 @@ ROOT = Path(__file__).resolve().parent.parent
 ALLOWED_INTERNAL = {
     "sbgh-api": set(),
     "sbgh-cli": {"sbgh-api"},
-    "sbgh-core": set(),
+    "sbgh-core": {"sbgh-proto"},
     "sbgh-daemon": {
         "sbgh-api",
         "sbgh-core",
-        "sbgh-driver",
         "sbgh-github",
         "sbgh-intent",
-        "sbgh-libvirt",
         "sbgh-postgres",
         "sbgh-slack",
-        "sbgh-worker",
+        "sbgh-proto",
     },
     "sbgh-driver": set(),
     "sbgh-github": {"sbgh-core"},
     "sbgh-handler": {"sbgh-api"},
     "sbgh-intent": {"sbgh-core"},
     "sbgh-libvirt": {"sbgh-driver"},
-    "sbgh-postgres": {"sbgh-core"},
+    "sbgh-postgres": {"sbgh-core", "sbgh-proto"},
+    "sbgh-proto": set(),
     "sbgh-slack": {"sbgh-core", "sbgh-intent"},
     "sbgh-smee": set(),
-    "sbgh-worker": {"sbgh-driver", "sbgh-libvirt"},
+    "sbgh-worker": {"sbgh-driver", "sbgh-libvirt", "sbgh-proto"},
 }
 
-EXECUTION_FORBIDDEN = {
+DRIVER_FORBIDDEN = {
     "axum",
     "jsonwebtoken",
     "octocrab",
@@ -49,6 +48,7 @@ EXECUTION_FORBIDDEN = {
     "slack-morphism",
     "sqlx",
 }
+WORKER_FORBIDDEN = DRIVER_FORBIDDEN - {"reqwest"}
 CORE_FORBIDDEN = {"jsonwebtoken", "octocrab", "reqwest", "schemars", "sqlx"}
 INTENT_FORBIDDEN = {
     "sbgh-daemon",
@@ -132,12 +132,17 @@ def main() -> int:
             pending.extend(architecture_edges[package_id])
         return {packages[package_id] for package_id in seen}
 
-    for package_name in ("sbgh-driver", "sbgh-libvirt", "sbgh-worker"):
-        forbidden = transitive_names(package_name) & EXECUTION_FORBIDDEN
+    for package_name in ("sbgh-driver", "sbgh-libvirt"):
+        forbidden = transitive_names(package_name) & DRIVER_FORBIDDEN
         if forbidden:
             errors.append(
                 f"{package_name}: forbidden runtime/build dependency closure: {sorted(forbidden)}"
             )
+    forbidden = transitive_names("sbgh-worker") & WORKER_FORBIDDEN
+    if forbidden:
+        errors.append(
+            f"sbgh-worker: forbidden runtime/build dependency closure: {sorted(forbidden)}"
+        )
 
     forbidden = transitive_names("sbgh-core") & CORE_FORBIDDEN
     if forbidden:

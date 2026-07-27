@@ -1,8 +1,9 @@
 # stacks-bench-github
 
-A GitHub App that runs the [`stacks-bench`](https://github.com/cylewitruk/stacks-core/tree/feat/stacks-bench/stacks-bench)
-tool against pull requests — automatically, or on a `/benchmark` slash-command
-in a PR comment — and reports results back on the PR.
+A GitHub App and worker fleet that runs
+[`stacks-bench`](https://github.com/cylewitruk/stacks-core/tree/feat/stacks-bench/stacks-bench)
+benchmarks and distributed-capable task kinds such as block validation, then
+reports results through centralized GitHub and Slack surfaces.
 
 ## Components
 
@@ -10,7 +11,7 @@ A single Cargo workspace (`crates/`):
 
 | Crate | Role |
 | ---- | ---- |
-| `sbgh-daemon` | The trusted core: owns Postgres, serves the authenticated `/api`, runs the webhook **processor** and the libvirt **runner**, and holds the GitHub App key. Runs on the benchmark host. |
+| `sbgh-daemon` | The trusted orchestrator: owns Postgres, scheduling, reporting, the authenticated operator and mTLS worker APIs, and all GitHub/Slack/object-store credentials. It never executes jobs. |
 | `sbgh-handler` | Thin edge: verifies the webhook HMAC and forwards each delivery to the daemon's `/api`. No DB, no App key. Runs in a container. |
 | `sbgh-cli` | Operator CLI — a pure `/api` client (cookie auth) for the installer/repo/policy/user allowlists plus read commands (`jobs list`, `webhook tail`, …). |
 | `sbgh-api` | Shared wire DTOs + a typed `reqwest` client used by the daemon (server) and both clients. |
@@ -20,7 +21,8 @@ A single Cargo workspace (`crates/`):
 | `sbgh-intent` | Request-intent contract, structured validation, and OpenAI adapter. |
 | `sbgh-driver` | Backend-neutral task execution contracts. |
 | `sbgh-libvirt` | Concrete libvirt execution adapter. |
-| `sbgh-worker` | In-process execution orchestration and recipes. |
+| `sbgh-proto` | Dependency-light, versioned worker-fleet wire contracts and validation. |
+| `sbgh-worker` | Separately deployed pull worker for benchmark/libvirt, build-only, and block-validation capabilities. |
 | `sbgh-smee` | smee.io → handler webhook forwarder (local/dev delivery). |
 
 Postgres is the only persistent state, and the **daemon is its sole client**;
@@ -31,6 +33,7 @@ the handler and CLI reach the daemon over `/api`.
 - [docs/architecture.md](docs/architecture.md) — system design + security model.
 - [docs/daemon-api.md](docs/daemon-api.md) — the `/api` surface, auth, and topology.
 - [docs/host-bringup.md](docs/host-bringup.md) — provision a benchmark host from scratch.
+- [docs/worker-fleet-operations.md](docs/worker-fleet-operations.md) — provision, secure, operate, and recover the worker fleet.
 - [docs/v2-to-v3-upgrade.md](docs/v2-to-v3-upgrade.md) — upgrade an existing v2 deployment to v3.
 - [docs/v3-to-v4-upgrade.md](docs/v3-to-v4-upgrade.md) — upgrade v3 → v4 (the artifact store; opt-in S3).
 - [docs/v4-to-v5-upgrade.md](docs/v4-to-v5-upgrade.md) — upgrade v4 → v5 (Slack ad-hoc profiling; opt-in).
@@ -77,6 +80,7 @@ trust (a fork into a different org's install) uses raw `--install-id`/`--repo-id
 | `sbgh installation list` | installed accounts + install-ids |
 | `sbgh policy trigger list --install-id <id>` | configured auto-triggers |
 | `sbgh jobs list` | benchmark jobs + status |
+| `sbgh fleet status` | worker/session/attempt health |
 | `sbgh webhook tail` | recent webhook inbox rows |
 
 ## Development

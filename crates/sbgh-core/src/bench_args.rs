@@ -56,7 +56,9 @@ pub fn normalize_stored(detail: &QueuedEventDetail) -> Vec<String> {
             })
             .unwrap_or_default(),
         // `cache_warm` is a build-only job — it runs no benchmark, so no args.
-        QueuedEventDetail::CacheWarm { .. } => Vec::new(),
+        QueuedEventDetail::CacheWarm { .. } | QueuedEventDetail::BlockValidation { .. } => {
+            Vec::new()
+        }
     }
 }
 
@@ -70,6 +72,11 @@ pub fn normalize_stored(detail: &QueuedEventDetail) -> Vec<String> {
 /// wants the infallible [`normalize_stored_value`] instead (a parse failure
 /// there correctly falls back to `default_args`).
 pub fn try_normalize_stored_value(detail: &serde_json::Value) -> Option<Vec<String>> {
+    if let Some(snapshot) = detail.get("effective_args") {
+        return serde_json::from_value::<Vec<String>>(snapshot.clone())
+            .ok()
+            .map(normalize_in_process_repetitions);
+    }
     serde_json::from_value::<QueuedEventDetail>(detail.clone())
         .ok()
         .map(|d| normalize_stored(&d))
@@ -298,6 +305,20 @@ mod tests {
         let v = serde_json::to_value(pr(&["--count", "5000"])).unwrap();
         assert_eq!(normalize_stored_value(&v), vec!["--count", "5000"]);
         assert!(normalize_stored_value(&serde_json::json!({ "nope": true })).is_empty());
+    }
+
+    #[test]
+    fn persisted_effective_args_override_later_default_resolution() {
+        let mut value = serde_json::to_value(pr(&[])).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("effective_args".into(), serde_json::json!(["--count", "7"]));
+        assert_eq!(normalize_stored_value(&value), vec!["--count".to_string(), "7".to_string()]);
+        assert_eq!(
+            resolve_bench_args(&normalize_stored_value(&value), "--count 999").effective_args,
+            vec!["--count".to_string(), "7".to_string()]
+        );
     }
 
     /// The fallible variant separates "unparseable" (`None`, → NULL key in the

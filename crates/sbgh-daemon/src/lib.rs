@@ -3,11 +3,17 @@ mod artifact_store;
 mod bench_summary;
 mod comparison;
 mod duration;
+mod fleet;
 mod job_source;
+#[cfg(test)]
 mod pin_manager;
+#[cfg(test)]
 mod pin_resolver;
 mod report;
+mod report_event;
 mod reporter;
+#[cfg(test)]
+#[allow(dead_code)]
 mod runner;
 mod shutdown;
 mod slack_queue;
@@ -26,9 +32,6 @@ use sbgh_postgres::{
     PostgresPolicyStore, PostgresPullRequestStore, PostgresRepoStore, PostgresUserStore,
     PostgresWebhookInbox,
 };
-
-use crate::runner::Runner;
-use sbgh_libvirt::SystemShell;
 
 fn execution_artifact_store_config(
     config: &DaemonConfig,
@@ -97,10 +100,8 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             .api_base_url
             .clone(),
     );
-    let gh = Arc::new(OctocrabClient::new(tokens));
-    let shell = Arc::new(SystemShell::new(&config.paths.sudo_binary));
-
-    // The webhook processor runs concurrently with the job runner. Both
+    let gh = Arc::new(OctocrabClient::new(tokens.clone()));
+    // The webhook processor runs concurrently with the fleet coordinator. Both
     // loop indefinitely; if either returns Err the daemon crashes
     // and systemd restarts it.
     //
@@ -111,35 +112,44 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let installation_store = Arc::new(PostgresInstallationStore::new(pool.clone()));
     let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
     let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
-    // Captured before these stores are moved into handlers/sources below so
-    // startup binary-cache pin recomputation can reuse them.
-    let pin_policy_store = policy_store.clone();
-    let pin_repo_store = repo_store.clone();
     let user_store = Arc::new(PostgresUserStore::new(pool.clone()));
     let pull_request_store = Arc::new(PostgresPullRequestStore::new(pool.clone()));
-    // The job store. The three job-creating handlers (issue_comment
-    // /benchmark, push, create) write through it; the runner claims from it.
+    // The job store. The job-creating handlers write through it; the fleet
+    // coordinator prepares immutable assignments from it.
     let jobs_store = Arc::new(PostgresJobStore::new(pool.clone()));
     // Write-through inbox for the `/api` webhook-submit endpoint.
     let api_ingest = Arc::new(PostgresIngestStore::new(pool.clone()));
+    let fleet_config =
+        fleet::FleetConfig::load_from_env().context("loading worker fleet config")?;
+    let postgres_fleet = sbgh_postgres::PostgresFleetStore::new(pool.clone());
+    let block_validation_queue = fleet_config
+        .github_block_validation
+        .clone()
+        .map(|trigger| {
+            Arc::new(fleet::PostgresBlockValidationQueue::new(postgres_fleet.clone(), trigger))
+                as Arc<dyn webhook_processor::BlockValidationQueue>
+        });
+    let issue_comment_handler = IssueCommentHandler::new(
+        repo_store.clone(),
+        policy_store.clone(),
+        installation_store.clone(),
+        user_store.clone(),
+        pull_request_store.clone(),
+        gh.clone(),
+        jobs_store.clone(),
+    )
+    .with_default_args(
+        config
+            .stacks_bench
+            .default_args
+            .clone(),
+    );
+    let issue_comment_handler = match block_validation_queue {
+        Some(queue) => issue_comment_handler.with_block_validation(queue),
+        None => issue_comment_handler,
+    };
     let classifier = BasicClassifier::builder()
-        .with_handler(Arc::new(
-            IssueCommentHandler::new(
-                repo_store.clone(),
-                policy_store.clone(),
-                installation_store.clone(),
-                user_store.clone(),
-                pull_request_store.clone(),
-                gh.clone(),
-                jobs_store.clone(),
-            )
-            .with_default_args(
-                config
-                    .stacks_bench
-                    .default_args
-                    .clone(),
-            ),
-        ))
+        .with_handler(Arc::new(issue_comment_handler))
         .with_handler(Arc::new(InstallationHandler::new(
             installation_store.clone(),
             repo_store.clone(),
@@ -184,9 +194,22 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // The configured artifact store (local FS, or S3 with a local mirror).
     // Built once at startup so a bad `[artifacts]` endpoint fails fast here
     // rather than per-job, then shared by job sourcing and execution/reporting.
+    anyhow::ensure!(
+        config.artifacts.kind == ArtifactStoreKind::S3,
+        "worker fleet mode requires [artifacts] kind = \"s3\""
+    );
     let artifact_store_config = execution_artifact_store_config(&config)?;
     let artifact_store = artifact_store::build_store(&artifact_store_config)
         .context("building the artifact store")?;
+    let fleet_store: Arc<dyn sbgh_core::db::fleet::FleetStore> = Arc::new(postgres_fleet);
+    let fleet_runtime = fleet::FleetRuntime::build(
+        fleet_config,
+        fleet_store.clone(),
+        artifact_store.clone(),
+        tokens,
+    )
+    .await
+    .context("building worker fleet control plane")?;
 
     // Slack ad-hoc profiling, only when `[slack].enabled`. Resolve
     // the default repo → FK ids now (startup-fatal on misconfig, before serving)
@@ -265,20 +288,33 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         None
     };
 
-    // The runner claims from the `job` family and posts PR comments for
-    // `pr_comment` jobs. `jobs_store` is also handed to the pin manager, whose
-    // warming path enqueues build-only jobs through the raw `JobStore`, so clone
-    // the `Arc` before it moves into the `JobSource`.
+    // The coordinator prepares immutable task payloads and projects durable
+    // worker events. Workers are the sole execution owners.
     let runnable_jobs: Arc<dyn RunnableJobStore> = Arc::new(JobSource::new(
         jobs_store.clone(),
-        repo_store,
+        repo_store.clone(),
         pull_request_store,
         artifact_store.clone(),
     ));
+    let fleet_slack = slack_runtime
+        .as_ref()
+        .map(|(_, _, _, web_client, ..)| web_client.clone());
+    let fleet_coordinator = fleet::FleetCoordinator::new(
+        Arc::new(config.clone()),
+        fleet::FleetCoordinatorDependencies {
+            fleet: fleet_store,
+            jobs: runnable_jobs.clone(),
+            repeat_jobs: jobs_store.clone(),
+            repos: repo_store,
+            gh: gh.clone(),
+            artifacts: artifact_store.clone(),
+            slack: fleet_slack,
+        },
+    );
 
     // The operator `admin` API token is a cookie regenerated each boot; the
     // handler's `ingest` token comes from
-    // config. Read the listen list out before `config` moves into Runner.
+    // config.
     let api_cookie =
         api::bootstrap_cookie(&config.api.cookie_path).context("bootstrapping api cookie")?;
     if config
@@ -312,21 +348,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     };
     let api_router = api::build_router(api_state, api_tokens);
 
-    // The reporter posts Slack ad-hoc results through the same Web API client
-    // the socket connector uses (one bot token, one client).
-    let mut runner =
-        Runner::new_with_artifact_store(config, runnable_jobs, gh, shell.clone(), artifact_store)
-            .with_repeat_planning(jobs_store.clone());
-    if let Some((_, _, _, web_client, ..)) = &slack_runtime {
-        runner = runner.with_slack(web_client.clone());
-    }
-    // The runner recomputes binary-cache pins on startup (before claiming) and
-    // after each completed job, sharing the
-    // driver's cache `Arc` so publish / re-pin / evict coordinate under one
-    // mutex. A no-op when the cache is disabled. The same recompute also warms
-    // by enqueueing build-only jobs for uncached pinned refs via `jobs_store`.
-    runner = runner.with_pin_recompute(pin_policy_store, pin_repo_store, jobs_store, shell);
-
     // A `SIGINT` drains (stop claiming, finish in-flight), while a second
     // `SIGINT` or `SIGTERM` aborts. The
     // coordinator owns drain completion and fires `exit`, which stops the other
@@ -334,7 +355,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let shutdown = shutdown::Shutdown::new();
 
     tokio::try_join!(
-        runner.run(shutdown.clone()),
         async {
             // Stop processing webhooks once shutdown is underway; any in-flight
             // claim is reclaimed by the processor's own sweep on the next boot.
@@ -344,6 +364,8 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             }
         },
         api::serve(&api_listen, api_router, shutdown.exit.clone()),
+        fleet::run(fleet_runtime, shutdown.exit.clone()),
+        fleet_coordinator.run(shutdown.clone()),
         shutdown::watch_signals(shutdown.clone()),
         async {
             // Slack socket-mode receive loop, only when enabled. It

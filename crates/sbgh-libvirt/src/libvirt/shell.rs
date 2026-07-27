@@ -11,12 +11,50 @@ use std::process::Output;
 
 use async_trait::async_trait;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub privileged: bool,
     pub stdin: Option<Vec<u8>>,
+    secret_env: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for CommandSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("privileged", &self.privileged)
+            .field(
+                "stdin",
+                &self
+                    .stdin
+                    .as_ref()
+                    .map(|value| value.len()),
+            )
+            .field(
+                "secret_env",
+                &self
+                    .secret_env
+                    .iter()
+                    .map(|(name, _)| (name, "[REDACTED]"))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl CommandSpec {
+    pub fn with_repository_token(mut self, token: &str) -> Self {
+        self.secret_env.extend([
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "http.https://github.com/.extraheader".into()),
+            ("GIT_CONFIG_VALUE_0".into(), format!("Authorization: Bearer {token}")),
+        ]);
+        self
+    }
 }
 
 #[async_trait]
@@ -58,6 +96,7 @@ pub fn spec(program: &Path, args: &[&str]) -> CommandSpec {
             .collect(),
         privileged: false,
         stdin: None,
+        secret_env: Vec::new(),
     }
 }
 
@@ -117,6 +156,11 @@ impl SystemShell {
             c
         };
         command
+            .envs(
+                cmd.secret_env
+                    .iter()
+                    .map(|(name, value)| (name, value)),
+            )
             .stdin(if cmd.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -215,6 +259,23 @@ impl Shell for SystemShell {
                 anyhow::bail!("`{}` timed out after {timeout:?} (process killed)", cmd.program)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::spec;
+
+    #[test]
+    fn repository_token_is_redacted_from_command_debug_output() {
+        let token = "github_pat_secret-value";
+        let command =
+            spec(std::path::Path::new("/usr/bin/git"), &["fetch"]).with_repository_token(token);
+        let debug = format!("{command:?}");
+
+        assert!(!debug.contains(token));
+        assert!(debug.contains("GIT_CONFIG_VALUE_0"));
+        assert!(debug.contains("[REDACTED]"));
     }
 }
 

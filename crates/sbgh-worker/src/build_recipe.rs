@@ -144,6 +144,7 @@ mod tests {
             job_id: Uuid::nil(),
             repository: "octo/core",
             commit: "deadbeef",
+            repository_credential: None,
         };
 
         let outcome = recipe

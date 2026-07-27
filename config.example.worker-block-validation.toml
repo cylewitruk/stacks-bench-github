@@ -1,0 +1,29 @@
+worker_id = "22222222-2222-4222-8222-222222222222"
+orchestrator_url = "https://fleet.internal.example:9443"
+client_certificate = "/etc/sbgh/worker/client.crt"
+client_private_key = "/etc/sbgh/worker/client.key"
+server_ca_certificate = "/etc/sbgh/worker/orchestrator-ca.crt"
+capabilities = ["block_validation"]
+
+[resources]
+logical_cpus = 64
+memory_bytes = 274877906944
+storage_bytes = 16000000000000
+
+[resources.dataset]
+generation = "mainnet-2026-07-26"
+network = "mainnet"
+format_version = "stacks-core-v3"
+covered_start = 0
+covered_end = 8020465
+manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # replace
+
+[block_validation]
+# Point to the immutable generation directory, never a mutable shared dataset.
+canonical_dataset = "/srv/sbgh/datasets/mainnet-2026-07-26"
+workspace_root = "/srv/sbgh/workspaces"
+source_cache = "/var/lib/sbgh-worker/stacks-core"
+binary_cache = "/var/lib/sbgh-worker/stacks-inspect"
+chain_config = "/etc/sbgh/worker/mainnet-follower-conf.toml"
+git_binary = "/usr/bin/git"
+cargo_binary = "/usr/bin/cargo"

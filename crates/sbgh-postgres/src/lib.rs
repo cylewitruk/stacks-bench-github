@@ -13,6 +13,7 @@ pub use error::{PersistenceError, PersistenceResult};
 pub use mapping::Db;
 pub use migrate::migrate;
 pub use pool::{Pool, connect};
+pub use stores::fleet::{PostgresFleetStore, PreparedJobProvenance};
 pub use stores::ingest::PostgresIngestStore;
 pub use stores::installation::PostgresInstallationStore;
 pub use stores::jobs::PostgresJobStore;
@@ -43,7 +44,7 @@ pub mod db {
     pub use sbgh_core::db::*;
 
     pub use crate::{
-        Pool, PostgresIngestStore, PostgresInstallationStore, PostgresJobStore,
+        Pool, PostgresFleetStore, PostgresIngestStore, PostgresInstallationStore, PostgresJobStore,
         PostgresPolicyStore, PostgresPullRequestStore, PostgresRepoStore, PostgresUserStore,
         PostgresWebhookInbox, connect, migrate,
     };

@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmConfig {
     pub golden_image: PathBuf,
     pub build_vcpus: u32,
@@ -14,7 +17,8 @@ pub struct VmConfig {
     pub heartbeat_interval_secs: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathsConfig {
     pub jobs_dir: PathBuf,
     pub git_mirror: PathBuf,
@@ -28,7 +32,8 @@ pub struct PathsConfig {
     pub git_binary: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LvmConfig {
     pub vg_name: String,
     pub thinpool: String,
@@ -36,7 +41,8 @@ pub struct LvmConfig {
     pub chainstate_snapshot_size_gib: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LibvirtConfig {
     pub vm: VmConfig,
     pub paths: PathsConfig,

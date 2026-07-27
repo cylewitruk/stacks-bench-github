@@ -128,6 +128,7 @@ mod tests {
             job_id: Uuid::nil(),
             repository: "octo/core",
             commit: "abc",
+            repository_credential: None,
         };
         let outcome = recipe
             .execute(&ctx, &NoopSink, &CancellationToken::new())

@@ -17,9 +17,11 @@ Its live-timeline follow-on `0021-slack-live-timeline` shipped (iteration v6) â†
 
 ## Backlog (unscheduled)
 
-*`0004-worker-fleet`, `0019-block-validation-recipe`, and load-bearing event item
-`0017-generic-phase-events` are planned in
-[v25-worker-fleet-block-validation](iterations/v25-worker-fleet-block-validation.md).*
+*`0004-worker-fleet`, load-bearing event item
+`0017-generic-phase-events`, and `0019-block-validation-recipe` shipped in v25
+(2026-07) â†’ [fleet](archive/completed/0004-worker-fleet.md),
+[events](archive/completed/0017-generic-phase-events.md), and
+[block validation](archive/completed/0019-block-validation-recipe.md).*
 
 *`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
 model: source / intent / task_kind / build_target / derived report; build-only

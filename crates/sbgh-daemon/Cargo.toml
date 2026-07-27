@@ -17,9 +17,7 @@ path = "src/main.rs"
 [dependencies]
 sbgh-core.workspace = true
 sbgh-api.workspace = true
-sbgh-driver.workspace = true
-sbgh-libvirt.workspace = true
-sbgh-worker.workspace = true
+sbgh-proto.workspace = true
 sbgh-postgres.workspace = true
 sbgh-github.workspace = true
 sbgh-intent.workspace = true
@@ -43,6 +41,7 @@ futures.workspace = true
 # Daemon admin and webhook-ingest `/api` server.
 axum.workspace = true
 tower-http.workspace = true
+tower = { workspace = true, features = ["limit"] }
 # Constant-time token comparison in the auth layer.
 subtle.workspace = true
 
@@ -54,6 +53,14 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+x509-parser.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+toml.workspace = true
 
 sqlx.workspace = true
 dotenvy.workspace = true
@@ -67,11 +74,14 @@ url.workspace = true
 # Regex matching for tag-pattern trigger policies.
 regex.workspace = true
 [dev-dependencies]
+sbgh-driver.workspace = true
 sbgh-github = { workspace = true, features = ["testing"] }
 sbgh-libvirt = { workspace = true, features = ["testing"] }
 sbgh-postgres = { workspace = true, features = ["testing"] }
 sbgh-slack = { workspace = true, features = ["testing"] }
+sbgh-worker.workspace = true
 tempfile = "3"
 # `oneshot` for driving the axum router in API auth/health tests.
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+rcgen = "0.14.7"

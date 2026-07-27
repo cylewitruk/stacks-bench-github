@@ -16,6 +16,26 @@ pub struct ExecutionContext {
     pub job_id: Uuid,
     pub repository: String,
     pub commit: String,
+    pub repository_credential: Option<RepositoryCredential>,
+}
+
+#[derive(Clone)]
+pub struct RepositoryCredential(String);
+
+impl RepositoryCredential {
+    pub fn new(token: String) -> Self {
+        Self(token)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RepositoryCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RepositoryCredential([REDACTED])")
+    }
 }
 
 #[derive(Debug, Clone)]

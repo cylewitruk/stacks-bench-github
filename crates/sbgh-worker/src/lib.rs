@@ -2,10 +2,15 @@
 
 mod bench_recipe;
 pub mod binary_cache;
+mod block_validation;
 mod build_recipe;
+mod config;
 mod events;
 mod execution;
+mod fleet;
 mod recipe;
+mod remote_artifacts;
+mod transport;
 
 use std::sync::Arc;
 
@@ -15,7 +20,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub use binary_cache::{BinaryCache, BinaryCacheConfig, build_binary_cache};
+pub use config::WorkerConfig;
 pub use execution::execute;
+pub use fleet::run as run_fleet;
 pub use sbgh_driver::{
     BenchmarkRunContext, BenchmarkTask, ExecutionContext, ExecutionPlacement, ExecutionRequest,
     ExecutionTask, Terminal, WorkerEvent,

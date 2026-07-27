@@ -13,18 +13,38 @@ workspace = true
 [dependencies]
 sbgh-driver.workspace = true
 sbgh-libvirt.workspace = true
+sbgh-proto.workspace = true
 
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 tokio-util.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 sha2.workspace = true
 hex.workspace = true
+uuid.workspace = true
+clap.workspace = true
+toml.workspace = true
+reqwest = { workspace = true, features = ["rustls", "json", "query", "stream"] }
+rustls.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-uuid.workspace = true
+tokio-rustls.workspace = true
+rcgen = "0.14.7"

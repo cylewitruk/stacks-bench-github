@@ -2,286 +2,179 @@
 
 ## Overview
 
-`stacks-bench-github` is a GitHub App that runs the [`stacks-bench`](https://github.com/cylewitruk/stacks-core/tree/feat/stacks-bench/stacks-bench) tool against pull requests, either automatically or in response to `/benchmark` slash-commands posted in PR comments.
+`stacks-bench-github` is a GitHub App and worker fleet for benchmark,
+build-only, and block-validation tasks. One active `sbgh-daemon` orchestrator
+owns durable truth and external side effects. Separately deployed
+`sbgh-worker` processes pull only work authorized for their registered
+capabilities.
 
-The system is one Cargo workspace with thirteen crates and four binaries:
+The Cargo workspace has fourteen crates and five binaries:
 
 ```text
 crates/
-  sbgh-api/          wire DTOs and typed daemon API client
-  sbgh-core/         dependency-light domain policy, ports, configuration, and models
-  sbgh-driver/       backend-neutral execution contracts
-  sbgh-github/       GitHub contracts, webhook DTOs, authentication, and Octocrab adapter
-  sbgh-intent/       request-intent contract, validation, and OpenAI adapter
-  sbgh-slack/        Slack intake, transport, snapshot renderer, and publisher
-  sbgh-libvirt/      concrete libvirt execution adapter
-  sbgh-postgres/     SQLx stores, migrations, row mappings, and admin queries
-  sbgh-worker/       in-process execution orchestration and recipes
-  sbgh-handler/      library + HTTP binary for webhook verification/forwarding
+  sbgh-api/          operator/ingest API DTOs and typed client
+  sbgh-proto/        versioned, task-neutral worker protocol
+  sbgh-core/         domain policy, persistence ports, configuration, models
+  sbgh-driver/       backend-neutral local execution contracts
+  sbgh-github/       GitHub contracts, webhook DTOs, auth, Octocrab adapter
+  sbgh-intent/       request-intent contract and OpenAI adapter
+  sbgh-slack/        Slack intake, snapshot renderer, transport
+  sbgh-libvirt/      concrete benchmark execution adapter
+  sbgh-postgres/     SQLx stores, migrations, row mappings, admin queries
+  sbgh-worker/       worker binary, transport, recipes, local execution
+  sbgh-handler/      webhook signature-verification/forwarding binary
   sbgh-cli/          operator API-client binary
-  sbgh-daemon/       library + host binary for orchestration and inline execution
-  sbgh-smee/         local-development smee.io forwarding binary
+  sbgh-daemon/       orchestrator/API/reporting binary
+  sbgh-smee/         local-development forwarding binary
 ```
 
-A Postgres database (run locally via `docker/docker-compose.yml`) is the only persistent state, and the **daemon is its sole client**. The handler and `sbgh-cli` never touch Postgres — they reach the daemon over the authenticated `/api` (see [daemon-api.md](./daemon-api.md)).
-Concrete persistence, GitHub, and provider-backed intent integrations live in
-`sbgh-postgres`, `sbgh-github`, and `sbgh-intent`, respectively. `sbgh-slack`
-owns the Slack transport and deterministic message lifecycle while the daemon
-retains target lookup and benchmark result/comparison policy.
+PostgreSQL is the sole durable state store, and the daemon is its sole client.
+The handler and CLI use the authenticated daemon API. Workers have no database,
+Slack, GitHub App private-key, or object-store credentials.
 
-## Data flow
+## Fleet flow
 
 ```text
-PR comment "/benchmark"
-        │
-        ▼
-GitHub ──webhook──► sbgh-handler ──HMAC verify──► daemon: POST /api/webhooks
-                                                  (ingest token)
-                                                     │
-                                              daemon filters event type +
-                                              writes github_webhook inbox
-                                                     │
-                                              processor: classify +
-                                              authorize + INSERT job
-                                                     │
-                                              Postgres (job, queued)
-                                                     │
-                                              runner: claim (FOR UPDATE
-                                              SKIP LOCKED) → run
-                                                     │
-                                              virsh + VM
-                                                     │
-                          ┌──comment "running"───────┤  (daemon posts/
-                          │                          │   edits the PR comment)
-                          └──comment "done + result"─┘
+GitHub / Slack / CLI
+          │
+          ▼
+sbgh-daemon
+  webhook policy + immutable enqueue
+  PostgreSQL scheduling/leases/events/results
+  GitHub/Slack projection and comparison
+          │
+          │ TLS 1.3 mTLS; workers poll outbound
+          ├───────────────────────────────┐
+          ▼                               ▼
+sbgh-worker                         sbgh-worker
+benchmark + build-only              block-validation
+sbgh-libvirt                        immutable dataset
+loopback benchmark host             K local CoW shards
+          │                               │
+          └── exact-key presigned S3 ─────┘
 ```
 
-The `/api` server, the processor, and the runner all live in `sbgh-daemon`.
+Enqueue resolves symbolic refs and effective arguments once and persists a
+typed canonical payload plus SHA-256. Assignment never consults mutable daemon
+defaults. Registry policy—not worker claims—authorizes capabilities and the
+benchmark measurement profile.
 
-## Components
+The scheduling state machine is `queued → offered → running → terminal`.
+Every mutation is bound to worker identity, process session, attempt UUID,
+monotonic fencing generation, and an HMAC-authenticated lease token. Lost
+poll/accept/event/terminal responses are idempotent. A new worker process gets a
+new session and cannot resume its predecessor; cleanup is acknowledged before
+safe requeue.
+
+Task-neutral reliable events are persisted before acknowledgement and projected
+only across their contiguous sequence prefix. Fine progress has an independent
+best-effort wire sequence and becomes durable when accepted. The daemon can
+restart and replay projection without rerunning work or duplicating accepted
+terminals.
+
+## Boundaries
 
 ### `sbgh-handler`
 
-| Concern | Where |
-| ---- | ---- |
-| HTTP server | [crates/sbgh-handler/src/lib.rs](../crates/sbgh-handler/src/lib.rs) |
-| Webhook route | [crates/sbgh-handler/src/routes/webhook.rs](../crates/sbgh-handler/src/routes/webhook.rs) |
-| Signature verify | [crates/sbgh-handler/src/signature.rs](../crates/sbgh-handler/src/signature.rs) |
-| `/api` client | [crates/sbgh-api/src/client.rs](../crates/sbgh-api/src/client.rs) (`submit_webhook`) |
-
-For each verify-and-forward request:
-
-1. Read raw body (signature is over bytes, not parsed JSON).
-2. Verify `X-Hub-Signature-256` (HMAC-SHA256, constant-time compare).
-3. Short-circuit `ping` → `pong` (no forward).
-4. Forward the raw body + `X-GitHub-Event` / `X-GitHub-Delivery` to the daemon's `POST /api/webhooks` (with the ingest token) and map its result back to GitHub (2xx on success; 502 if the daemon is unreachable so GitHub redelivers). That's it — **no** payload parse, event-type filtering, authorization, job creation, or DB access. The daemon owns the event allowlist, the inbox write, authorization, and job creation.
+The handler reads the raw webhook body, verifies
+`X-Hub-Signature-256` with constant-time HMAC comparison, handles `ping`, and
+forwards accepted bytes and GitHub headers to the daemon. It does not parse
+business events, authorize requests, create jobs, or access PostgreSQL.
 
 ### `sbgh-daemon`
 
-| Concern | Where |
-| ---- | ---- |
-| Main loop | [crates/sbgh-daemon/src/runner.rs](../crates/sbgh-daemon/src/runner.rs) |
-| Queue contract | [crates/sbgh-core/src/db/jobs.rs](../crates/sbgh-core/src/db/jobs.rs) |
-| PostgreSQL queue implementation | [crates/sbgh-postgres/src/stores/jobs.rs](../crates/sbgh-postgres/src/stores/jobs.rs) |
-| Workload domain | [crates/sbgh-core/src/workload.rs](../crates/sbgh-core/src/workload.rs) |
-| Intent resolver | [crates/sbgh-intent/src/lib.rs](../crates/sbgh-intent/src/lib.rs) |
-| GitHub API contract and adapter | [crates/sbgh-github/src/lib.rs](../crates/sbgh-github/src/lib.rs) |
-| Worker events | [crates/sbgh-driver/src/events.rs](../crates/sbgh-driver/src/events.rs) |
-| Report surfaces | [crates/sbgh-daemon/src/report.rs](../crates/sbgh-daemon/src/report.rs) |
-| Slack contract and adapter | [crates/sbgh-slack/src/lib.rs](../crates/sbgh-slack/src/lib.rs) |
-| Slack result projection | [crates/sbgh-daemon/src/slack_report.rs](../crates/sbgh-daemon/src/slack_report.rs) |
-| libvirt driver | [crates/sbgh-libvirt/src/libvirt/driver.rs](../crates/sbgh-libvirt/src/libvirt/driver.rs) |
+The daemon owns:
 
-The coordinator claims serially with `SELECT ... FOR UPDATE SKIP LOCKED LIMIT
-1`, then executes up to `[runner].max_concurrent_jobs` jobs concurrently.
-Configured CPU sets give each execution slot stable placement.
+- webhook classification, authorization, and immutable job creation;
+- worker registry, session, placement, lease, fence, cancellation, and
+  recovery state;
+- reliable-event/progress ingest and replayable projection;
+- exact-key artifact grants, manifest verification, promotion, and staging GC;
+- GitHub/Slack reporting, debounce/rate limiting, comparison, and report
+  identity reconciliation;
+- authenticated operator visibility, drain, and explicit group recovery.
 
-## GitHub App authentication
+The daemon has no production dependency on `sbgh-worker`, `sbgh-driver`, or
+`sbgh-libvirt`, and contains no inline execution path.
 
-Two layers of credential:
+### `sbgh-worker`
 
-| Credential | Lifetime | Scope | Storage |
-| ---- | ---- | ---- | ---- |
-| App private key (PEM) | long-lived | the App | file on disk, mode `0600`, path in `SBGH_GH_PRIVATE_KEY_PATH` |
-| App JWT (RS256) | ≤ 10 min | the App | in-memory, minted per installation-token mint |
-| Installation access token | ~1 hour | one installation | in-memory cache, keyed by `installation_id` |
-| Webhook secret | long-lived | inbound HMAC | the handler's `SBGH_WEBHOOK_SECRET` (env var) |
+The worker owns transport reconnect/resend, active-attempt heartbeat and
+cancellation, local recipes, cache/artifact ports, and cleanup. It consumes
+`sbgh-proto` DTOs and never sees database rows. A private-repository assignment
+may include a short-lived repository-read token; the value is held in memory,
+redacted from debug output, and passed only through the child environment.
 
-The private key never lives in an env var — env vars get into process listings, log scrapers, and crash dumps. It's a file on disk, owned by the service user, with restrictive permissions. The webhook secret is fine in an env var because it isn't a signing key for outbound calls.
+Benchmark/build workers compose `sbgh-driver` with the concrete
+`sbgh-libvirt` adapter. Block-validation workers build `stacks-inspect`, probe
+the provisioned dataset for epoch totals, translate the requested inclusive
+global range to epoch-local indices, create one verified reflink workspace per
+shard, execute with bounded concurrency, and reduce fail-closed.
 
-Installation tokens are minted and cached in memory by
-[`InstallationTokenCache`](../crates/sbgh-github/src/auth.rs), refreshed when
-less than 5 minutes remain. Only the **daemon** uses it: the handler never
-receives the App key.
+### Integration crates
 
-## Local development
+`sbgh-postgres`, `sbgh-github`, `sbgh-slack`, and `sbgh-intent` own their
+respective adapters. Core exposes narrow ports/domain types rather than SQLx,
+Octocrab, Slack, or provider-specific values. The package DAG check enforces
+these normal/build dependency boundaries across all features.
 
-```bash
-# Start Postgres
-docker compose -f docker/docker-compose.yml up -d postgres
+## Identity and secrets
 
-# Daemon env: DATABASE_URL (owner DSN), the SBGH_GH_* App secrets,
-# SBGH_API_INGEST_TOKEN, and the LVM/VM bits. See config.example.daemon.toml
-# for the full surface.
-cp .env.example .env
-chmod 0600 .env
-# edit .env, point SBGH_GH_PRIVATE_KEY_PATH at your local PEM
+The worker listener is separate from the operator/webhook API and requires TLS
+1.3 mutual X.509 authentication. A client certificate carries exactly one URI
+identity SAN, `urn:sbgh:worker:<uuid>`, and client-auth usage. Common Name is
+ignored. The daemon registry binds the UUID to allowed capability/profile and
+enabled/draining state.
 
-# Build, then run the daemon. It applies migrations at startup, serves /api,
-# and runs the processor + runner.
-just build
-target/debug/sbgh-daemon
+Attempt lease tokens are HMAC-bound to worker, session, attempt, and fence.
+Workers upload only through short-TTL presigned requests for orchestrator-
+derived staging keys with signed size/checksum metadata. A stale attempt cannot
+publish an object, and only an accepted terminal promotes verified staging to
+logical result keys.
 
-# The handler runs in Docker (`docker compose up -d handler`), or as a host
-# binary with its OWN env (SBGH_API_URL → the daemon, SBGH_WEBHOOK_SECRET,
-# SBGH_API_INGEST_TOKEN). `sbgh-cli` is a pure /api client (reads the cookie).
-```
+GitHub credentials remain layered:
 
-For local webhook delivery from GitHub, use `smee.io` or `cloudflared tunnel` and point the App's webhook URL at the tunnel.
+| Credential | Scope | Storage/owner |
+| ---- | ---- | ---- |
+| App private key | whole App | daemon-only mode-0600 file |
+| App JWT | App, ≤10 min | daemon memory |
+| installation token | one installation, ~1 hour | daemon cache |
+| repository-read token | one active assignment | worker memory only |
+| webhook secret | inbound HMAC | handler secret environment |
 
-## Daemon: libvirt benchmark driver
+## Task model
 
-For each job, the in-process worker runs a self-contained VM. The lifecycle is
-in [crates/sbgh-libvirt/src/libvirt/driver.rs](../crates/sbgh-libvirt/src/libvirt/driver.rs):
+The fleet lifecycle is additive across task kinds:
 
-1. **Provision** (host-side):
-    - qcow2 boot overlay backed by the configured golden image.
-    - Raw ext4 source disk, populated by `git clone --reference <mirror>` then `git checkout <sha>` from a bare host mirror.
-    - LVM-thin snapshot of the newest `<chainstate_base_prefix>*` LV.
-    - Host tmpfs at `paths.results_tmpfs_root/<job-id>`, shared into the VM over virtio-fs.
-    - cloud-init NoCloud ISO with the per-job startup script.
-2. **Define + start**: render the libvirt domain XML programmatically with `quick-xml`, `virsh define`, `virsh start`.
-3. **Poll loop** (1s cadence): emit phase changes to the PR comment when `/results/.phase` changes; finish when phase=`done`, phase=`error`, domain transitions to `shut off`, or `vm.job_timeout_secs` elapses.
-4. **Forensics** (before teardown): capture last phase value, tail of `console.log` (64 KiB), archive `run.sqlite` to `paths.results_archive_dir/<job-id>.sqlite`.
-5. **Teardown**: `virsh destroy + undefine`, unmount tmpfs, `lvremove` the chainstate snapshot, delete source + boot files, prune the per-job ref from the mirror, `rm -rf` the per-job dir.
+- `benchmark`: comparison-bearing group pinned to one worker and measurement
+  profile for every variant/repeat/calibration/carried job;
+- `build_only`: cache production through the same lease/event/artifact path;
+- `block_validation`: one fleet job pinned to one dataset host, with K local
+  shards and its own typed result table;
+- future tasks: add a protocol payload, capability, worker recipe, task-specific
+  persistence/rendering, and composition registration without changing the
+  scheduler/lease/event/terminal state machine.
 
-Failure modes are surfaced as `BenchmarkOutcome { status: Failed(_), summary }` — the summary still carries all forensics. The runner records both on the job row (`status=failed`, `error=...`, `result=summary`).
+Moving a partial benchmark group between workers is never automatic. Explicit
+recovery creates a new execution generation and reruns from its first
+specification so comparison results never mix measurement environments.
 
-### In-VM startup script
+## Reporting
 
-The VM-side scripts are
-[sbgh-build.sh.tmpl](../crates/sbgh-libvirt/src/libvirt/templates/sbgh-build.sh.tmpl)
-(build phase) and
-[sbgh-bench.sh.tmpl](../crates/sbgh-libvirt/src/libvirt/templates/sbgh-bench.sh.tmpl)
-(benchmark phase). Phases they write (host polls these):
+Workers emit events/outcomes only. The daemon is the sole GitHub/Slack
+side-effect owner. Slack uses one snapshot-rendered message per request;
+reprojection converges from durable state rather than patching previous text.
+GitHub check/comment identities use deterministic reconciliation. Block
+validation reports invalid blocks as a completed negative/red correctness
+result; timeout, process loss, setup, and transport faults remain retryable
+infrastructure failures.
 
-| Phase | Meaning |
-| ---- | ---- |
-| `starting` | results virtio-fs mounted |
-| `building` | `cargo build --release -p stacks-bench` running |
-| `running` | `stacks-bench` executing against the chainstate |
-| `collecting` | sync before shutdown |
-| `done` | normal completion (cloud-init `power_state` then triggers poweroff) |
-| `error` | a step failed; see `console.log` tail |
+## Operations
 
-## Operator setup
-
-This section is for the host that runs `sbgh-daemon`. The handler has none of these requirements; it runs in a container and only needs to receive webhook deliveries (via smee) and reach the daemon's `/api`.
-
-### Required host packages (Debian/Ubuntu)
-
-```text
-qemu-system-x86_64, libvirt-daemon-system, virtinst, cloud-image-utils
-git, lvm2, util-linux, e2fsprogs
-```
-
-`cloud-image-utils` provides `cloud-localds`; `util-linux` provides `losetup`, `mount`, `umount`, `truncate`.
-
-### User + sudoers
-
-The daemon runs as a dedicated `sbgh` user. Privileged commands are invoked via `sudo -n -- <binary> <args>`, so each binary must be allowlisted by path:
-
-```text
-# /etc/sudoers.d/sbgh
-sbgh ALL=(root) NOPASSWD: /usr/sbin/lvcreate, /usr/sbin/lvremove, /usr/sbin/lvs
-sbgh ALL=(root) NOPASSWD: /usr/sbin/mkfs.ext4, /usr/sbin/losetup
-sbgh ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/chown
-sbgh ALL=(root) NOPASSWD: /usr/bin/virsh
-```
-
-(Paths in the allowlist must match the values in `[paths]` in the config; the defaults above line up with stock Debian/Ubuntu.)
-
-### LVM layout
-
-The daemon does not create the thin-pool or the base chainstate LV — both are operator-managed and refreshed out-of-band.
-
-```text
-# one-time
-pvcreate /dev/<disk>
-vgcreate sbgh-vg /dev/<disk>
-lvcreate -L 2T --thinpool thinpool sbgh-vg
-
-# refreshed nightly by the out-of-band chainstate loader, named with the date
-# so `chainstate_base_prefix` discovery picks the newest one lexicographically
-lvcreate -V 500G --thin --name mainnet-2026-05-21 sbgh-vg/thinpool
-mkfs.xfs /dev/sbgh-vg/mainnet-2026-05-21
-# (populate it with the chainstate snapshot, then deactivate)
-```
-
-### Local quickstart (sans GitHub App)
-
-```bash
-# Postgres
-docker compose -f docker/docker-compose.yml up -d postgres
-
-# Build
-cargo build --release --workspace
-
-# Daemon env (the daemon is the only host binary). Set DATABASE_URL, the
-# SBGH_GH_* App secrets if you have an App, and SBGH_API_INGEST_TOKEN. See
-# config.example.daemon.toml for the full config surface.
-cp .env.example .env && chmod 0600 .env
-$EDITOR .env
-
-# Run the daemon — it applies migrations at startup, serves /api, and runs
-# the processor + runner. (The handler runs in Docker via docker-compose;
-# `sbgh-cli` is a pure /api client that reads the daemon's cookie.)
-target/release/sbgh-daemon
-```
-
-## Fleet boundary
-
-Execution remains in-process after v24.1, but its dependency direction is now
-compiler-enforced through three Cargo boundaries:
-`sbgh-driver` for the internal driver API, `sbgh-libvirt` for the concrete
-backend, and an in-process `sbgh-worker` library for dispatch and recipes.
-v25 adds the worker protocol and separate process; worker registration,
-networking, leases, durable remote events, and remote artifacts are not part of
-the current deployment. Its planned control plane uses TLS 1.3 mTLS with a
-private deployment CA and one operator-provisioned certificate identity per
-worker. The orchestrator registry binds that identity to allowed capabilities
-and benchmark measurement profile; worker-reported resource facts cannot
-elevate authorization.
-
-Workers emit task-neutral events and outcomes rather than performing external
-reporting. `sbgh-daemon` remains the sole DB client and GitHub/Slack side-effect
-owner, including reporting credentials, rendering, debounce, rate limiting,
-retries, and reporting-session state. A worker may request a short-lived,
-repository-read-only GitHub token for its active lease, held only in memory, but
-never receives Slack credentials, object-store credentials, or a GitHub/Slack
-reporting client. Remote artifacts use exact attempt-scoped presigned object
-writes and become visible only after fenced terminal acceptance.
-
-Slack uses one ordinary threaded message per request. `sbgh-daemon` projects
-the current benchmark/group state into `SlackProgressView`; `sbgh-slack`
-renders the complete message and posts once or calls `chat.update` thereafter.
-Message metadata carries only an opaque request-stable identity and projection
-version. If the post succeeds but its timestamp is not persisted, the publisher
-searches the known thread for exactly one matching message authored by the
-configured bot. Lookup errors and multiple matches fail closed. Fine-grained
-progress is debounced; phase and terminal transitions flush immediately.
-
-The movable closure starts at the owned dispatcher and concrete libvirt
-backend:
-
-- request/task dispatch, recipes, driver contracts, and worker events;
-- the worker-side artifact port and binary cache;
-- the production libvirt modules and their host-side helpers.
-
-Cargo enforces the source boundary, while
-[`check-package-dag.py`](../scripts/check-package-dag.py) verifies the allowed
-workspace DAG and rejects forbidden transitive execution dependencies. The
-daemon owns the full artifact store and hands the worker only the narrow
-staging/read port. Its direct `sbgh-driver`, `sbgh-worker`, and
-`sbgh-libvirt` dependencies are transitional in-process composition edges;
-v25 removes them when protocol DTOs replace internal execution types.
+Production layout, mTLS issuance/rotation/revocation, host characterization,
+immutable dataset refresh, metrics/alerts, drain/upgrade, failure injection,
+and rollback are defined in
+[worker-fleet-operations.md](worker-fleet-operations.md). The daemon API is
+documented in [daemon-api.md](daemon-api.md); initial host prerequisites remain
+in [host-bringup.md](host-bringup.md), with libvirt/LVM permissions applying to
+the benchmark worker rather than the orchestrator.

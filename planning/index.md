@@ -21,7 +21,7 @@ need editing when an item's status or location changes.
 | `0001-artifact-store` | Artifact store | `shipped` | [archive/completed/0001-artifact-store.md](archive/completed/0001-artifact-store.md) |
 | `0002-slack-adhoc-profiling` | Slack ad-hoc profiling | `shipped` | [archive/completed/0002-slack-adhoc-profiling.md](archive/completed/0002-slack-adhoc-profiling.md) |
 | `0003-results-portal` | Results portal | `backlog` | [backlog.md](backlog.md) |
-| `0004-worker-fleet` | Worker fleet (`remote-daemon`) | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
+| `0004-worker-fleet` | Worker fleet (`remote-daemon`) | `shipped` | [archive/completed/0004-worker-fleet.md](archive/completed/0004-worker-fleet.md) |
 | `0005-task-kind-platform` | Job-model decomposition + task-kind platform | `shipped` | [archive/completed/0005-task-kind-platform.md](archive/completed/0005-task-kind-platform.md) |
 | `0006-aws-cloud-backend` | AWS / cloud backend | `parked` | [backlog.md](backlog.md) |
 | `0007-check-run-surface` | Check-run surface | `shipped` | [archive/completed/0007-check-run-surface.md](archive/completed/0007-check-run-surface.md) |
@@ -34,9 +34,9 @@ need editing when an item's status or location changes.
 | `0014-preclaim-placeholder-checks` | Pre-claim placeholder checks | `backlog` | [backlog.md](backlog.md) |
 | `0015-resource-aware-admission` | Resource-aware admission | `backlog` | [backlog.md](backlog.md) |
 | `0016-db-enforced-same-sha-dedup` | DB-enforced same-SHA dedup | `parked` | [backlog.md](backlog.md) |
-| `0017-generic-phase-events` | Task-neutral durable worker events | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
+| `0017-generic-phase-events` | Task-neutral durable worker events | `shipped` | [archive/completed/0017-generic-phase-events.md](archive/completed/0017-generic-phase-events.md) |
 | `0018-auto-rerun-confidence-gate` | Auto-rerun confidence gate | `parked` | [backlog.md](backlog.md) |
-| `0019-block-validation-recipe` | Block-validation recipe | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
+| `0019-block-validation-recipe` | Block-validation recipe | `shipped` | [archive/completed/0019-block-validation-recipe.md](archive/completed/0019-block-validation-recipe.md) |
 | `0020-llm-intent-resolution` | LLM intent resolution (Slack) | `shipped` | [archive/completed/0020-llm-intent-resolution.md](archive/completed/0020-llm-intent-resolution.md) |
 | `0021-slack-live-timeline` | Slack live timeline | `shipped` | [archive/completed/0021-slack-live-timeline.md](archive/completed/0021-slack-live-timeline.md) |
 | `0022-report-surface-trait` | Reporting-surface trait | `shipped` | [archive/completed/0022-report-surface-trait.md](archive/completed/0022-report-surface-trait.md) |
@@ -108,7 +108,7 @@ need editing when an item's status or location changes.
 | `v24.1-compiler-enforced-crate-boundaries` | Compiler-enforced crate boundaries | `shipped` | [archive/completed/0056-compiler-enforced-crate-boundaries.md](archive/completed/0056-compiler-enforced-crate-boundaries.md) |
 | `v24.2-github-intent-boundaries` | GitHub and intent integration boundaries | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
 | `v24.3-slack-snapshot-reporting` | Slack snapshot reporting and integration boundary | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
-| `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `planned` | [iterations/v25-worker-fleet-block-validation.md](iterations/v25-worker-fleet-block-validation.md) |
+| `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `shipped` | [archive/completed/0004-worker-fleet.md](archive/completed/0004-worker-fleet.md) |
 
 ## Decisions
 
@@ -118,6 +118,5 @@ need editing when an item's status or location changes.
 | `0002-artifact-refs-are-store-keys` | Artifact refs are store keys | `accepted` | [decisions/0002-artifact-refs-are-store-keys.md](decisions/0002-artifact-refs-are-store-keys.md) |
 | `0003-artifact-export-failure-not-benchmark-failure` | Export-fail ≠ bench-fail | `accepted` | [decisions/0003-artifact-export-failure-not-benchmark-failure.md](decisions/0003-artifact-export-failure-not-benchmark-failure.md) |
 
-> Migration complete: every `docs/roadmap-vN.md` is a tombstone. `0002`/`0003`/
-> `0004` design now lives in `design/000N-*.md`; they promote to an iteration when
-> selected.
+> Migration complete: every `docs/roadmap-vN.md` is a tombstone. Living designs
+> remain under `design/`; shipped records live in the completed archive.

@@ -38,9 +38,10 @@ use sbgh_core::models::{
     TriggerPolicy, UserRole, WebhookOutcome,
 };
 use sbgh_github::{
-    CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent, IssueCommentEvent,
-    PullRequestEvent, PushEvent, RepoRef, RepoSummary, parse_command,
+    Command, CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent,
+    IssueCommentEvent, PullRequestEvent, PushEvent, RepoRef, RepoSummary, parse_command,
 };
+use sbgh_proto::{InclusiveRange, ValidationEpoch};
 
 /// What a [`Classifier`] decides to do with a claimed webhook.
 #[derive(Debug, Clone)]
@@ -257,6 +258,7 @@ pub struct IssueCommentHandler {
     /// Slice 9: the accept path creates a `pr_comment` `job` row instead
     /// of emitting the Phase-1 `WouldEnqueueJob` shadow signal.
     job_store: Arc<dyn JobStore>,
+    block_validation: Option<Arc<dyn BlockValidationQueue>>,
     /// roadmap-v7: the configured `default_args`, used to compute the job's
     /// `workload_key` at enqueue (a bare `/benchmark` resolves to these).
     /// Defaults to empty; set via [`Self::with_default_args`].
@@ -284,6 +286,7 @@ impl IssueCommentHandler {
             pull_request_store,
             gh,
             job_store,
+            block_validation: None,
             default_args: String::new(),
         }
     }
@@ -294,6 +297,76 @@ impl IssueCommentHandler {
         self.default_args = default_args.into();
         self
     }
+
+    pub fn with_block_validation(mut self, queue: Arc<dyn BlockValidationQueue>) -> Self {
+        self.block_validation = Some(queue);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockValidationJobRequest {
+    pub github_installation_id: i64,
+    pub github_repo_id: i64,
+    pub commit: String,
+    pub webhook_id: i64,
+    pub triggering_user_id: i64,
+    pub github_pull_request_id: i64,
+    pub triggering_comment_id: i64,
+    pub epoch: ValidationEpoch,
+    pub range: InclusiveRange,
+}
+
+#[async_trait]
+pub trait BlockValidationQueue: Send + Sync + 'static {
+    async fn enqueue(&self, request: BlockValidationJobRequest) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IssueTaskCommand {
+    Benchmark(Command),
+    BlockValidation { epoch: ValidationEpoch, range: InclusiveRange },
+}
+
+fn parse_issue_task_command(body: &str) -> std::result::Result<Option<IssueTaskCommand>, ()> {
+    const PREFIX: &str = "/validate-blocks";
+    let line = body
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end();
+    if let Some(rest) = line.strip_prefix(PREFIX) {
+        if !rest.starts_with(char::is_whitespace) {
+            return Ok(None);
+        }
+        let tokens = rest
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        if tokens.len() != 3 {
+            return Err(());
+        }
+        let epoch = match tokens[0] {
+            "pre-nakamoto" | "pre_nakamoto" => ValidationEpoch::PreNakamoto,
+            "nakamoto" => ValidationEpoch::Nakamoto,
+            _ => return Err(()),
+        };
+        let start = tokens[1]
+            .parse()
+            .map_err(|_| ())?;
+        let end = tokens[2]
+            .parse()
+            .map_err(|_| ())?;
+        if start > end {
+            return Err(());
+        }
+        return Ok(Some(IssueTaskCommand::BlockValidation {
+            epoch,
+            range: InclusiveRange { start, end },
+        }));
+    }
+    parse_command(body)
+        .map(|command| command.map(IssueTaskCommand::Benchmark))
+        .map_err(|_| ())
 }
 
 #[async_trait]
@@ -324,10 +397,10 @@ impl EventHandler for IssueCommentHandler {
             return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction);
         }
 
-        match parse_command(&event.comment.body) {
+        match parse_issue_task_command(&event.comment.body) {
             // No /benchmark command → no policy work needed.
             Ok(None) | Err(_) => ClassifyOutcome::Terminal(WebhookOutcome::IgnoredNoCommand),
-            Ok(Some(cmd)) => {
+            Ok(Some(command)) => {
                 // Slice 5: a `/benchmark` PR comment triggers the same
                 // target+source policy evaluation as `pull_request`
                 // events. We have to fetch the PR via GH API first to
@@ -459,6 +532,31 @@ impl EventHandler for IssueCommentHandler {
                         // the membership/policy-gated side. Head SHA is
                         // known from the PR API; committed_at is left for
                         // the daemon to backfill if needed.
+                        if let IssueTaskCommand::BlockValidation { epoch, range } = command {
+                            let Some(queue) = &self.block_validation else {
+                                return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredNoCommand);
+                            };
+                            let request = BlockValidationJobRequest {
+                                github_installation_id: install_id,
+                                github_repo_id: pr.base.repo.id,
+                                commit: pr.head.sha.clone(),
+                                webhook_id: webhook.id,
+                                triggering_user_id: event.sender.id,
+                                github_pull_request_id: pr_row.id,
+                                triggering_comment_id: event.comment.id,
+                                epoch,
+                                range,
+                            };
+                            return match queue.enqueue(request).await {
+                                Ok(()) => ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob),
+                                Err(error) => ClassifyOutcome::Retryable(format!(
+                                    "enqueue block validation: {error}"
+                                )),
+                            };
+                        }
+                        let IssueTaskCommand::Benchmark(cmd) = command else {
+                            unreachable!("block-validation command returned above")
+                        };
                         let detail = QueuedEventDetail::PrComment {
                             sender_id: event.sender.id,
                             sender_login: event.sender.login.clone(),
@@ -467,9 +565,9 @@ impl EventHandler for IssueCommentHandler {
                             subcommand: cmd.subcommand.clone(),
                             bench_args: cmd.args.clone(),
                         };
-                        let workload_key =
-                            resolve_bench_args(&normalize_stored(&detail), &self.default_args)
-                                .workload_key;
+                        let resolved =
+                            resolve_bench_args(&normalize_stored(&detail), &self.default_args);
+                        let workload_key = resolved.workload_key.clone();
                         let request = JobCreationRequest {
                             new_job: NewJob {
                                 github_installation_id: install_id,
@@ -492,7 +590,7 @@ impl EventHandler for IssueCommentHandler {
                                 github_pull_request_id: pr_row.id,
                                 triggering_comment_id: Some(event.comment.id),
                             }),
-                            queued_event_detail: queued_detail(detail),
+                            queued_event_detail: queued_detail(detail, &resolved.effective_args),
                         };
                         // Phase 5 dedup (BEST-EFFORT): if an active `/benchmark`
                         // job already covers this exact commit AND the same
@@ -1346,9 +1444,21 @@ async fn enqueue_job(job_store: &dyn JobStore, request: JobCreationRequest) -> C
 /// of these small, owned structs is infallible in practice; on the
 /// impossible error we log and fall back to `None` (the job + links
 /// still get created — the provenance detail is audit-only).
-fn queued_detail(detail: QueuedEventDetail) -> Option<serde_json::Value> {
+fn queued_detail(
+    detail: QueuedEventDetail,
+    effective_args: &[String],
+) -> Option<serde_json::Value> {
     match serde_json::to_value(&detail) {
-        Ok(v) => Some(v),
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "effective_args".into(),
+                    serde_json::to_value(effective_args)
+                        .expect("benchmark arguments always serialize"),
+                );
+            }
+            Some(value)
+        }
         Err(e) => {
             tracing::error!(error = %e, "failed to serialise queued-event detail; omitting");
             None
@@ -1829,8 +1939,8 @@ impl EventHandler for PushHandler {
             trigger_id: trigger.id,
             bench_args: trigger.bench_args.clone(),
         };
-        let workload_key =
-            resolve_bench_args(&normalize_stored(&detail), &self.default_args).workload_key;
+        let resolved = resolve_bench_args(&normalize_stored(&detail), &self.default_args);
+        let workload_key = resolved.workload_key.clone();
         let request = JobCreationRequest {
             new_job: NewJob {
                 github_installation_id: event.installation.id,
@@ -1851,7 +1961,7 @@ impl EventHandler for PushHandler {
             // No responsible user for an automated branch-push trigger.
             triggering_user_id: None,
             pull_request_link: None,
-            queued_event_detail: queued_detail(detail),
+            queued_event_detail: queued_detail(detail, &resolved.effective_args),
         };
         enqueue_job(self.job_store.as_ref(), request).await
     }
@@ -1992,8 +2102,8 @@ impl EventHandler for CreateHandler {
             trigger_id: trigger.id,
             bench_args: trigger.bench_args.clone(),
         };
-        let workload_key =
-            resolve_bench_args(&normalize_stored(&detail), &self.default_args).workload_key;
+        let resolved = resolve_bench_args(&normalize_stored(&detail), &self.default_args);
+        let workload_key = resolved.workload_key.clone();
         let request = JobCreationRequest {
             new_job: NewJob {
                 github_installation_id: event.installation.id,
@@ -2006,10 +2116,9 @@ impl EventHandler for CreateHandler {
                 },
                 git_ref_kind: GitRefKind::Tag,
                 git_ref_display: event.ref_field.clone(),
-                // The create event carries no SHA; the daemon
-                // resolves the tag → commit at claim time
-                // (`GitHubApi::resolve_commit` in the runner's preflight,
-                // persisted via `mark_running`).
+                // The create event carries no SHA; the fleet coordinator
+                // resolves tag → immutable commit before creating the
+                // schedulable execution payload.
                 git_commit_hash: None,
                 git_committed_at: None,
                 workload_key: Some(workload_key),
@@ -2017,7 +2126,7 @@ impl EventHandler for CreateHandler {
             github_webhook_id: webhook.id,
             triggering_user_id: None,
             pull_request_link: None,
-            queued_event_detail: queued_detail(detail),
+            queued_event_detail: queued_detail(detail, &resolved.effective_args),
         };
         enqueue_job(self.job_store.as_ref(), request).await
     }
@@ -2373,6 +2482,20 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn block_validation_command_is_bounded_and_typed() {
+        assert_eq!(
+            parse_issue_task_command("/validate-blocks nakamoto 185630 185999").unwrap(),
+            Some(IssueTaskCommand::BlockValidation {
+                epoch: ValidationEpoch::Nakamoto,
+                range: InclusiveRange { start: 185_630, end: 185_999 },
+            })
+        );
+        assert!(parse_issue_task_command("/validate-blocks nakamoto 20 10").is_err());
+        assert!(parse_issue_task_command("/validate-blocks nakamoto 1 2 extra").is_err());
+        assert_eq!(parse_issue_task_command("please /validate-blocks nakamoto 1 2"), Ok(None));
+    }
+
     /// Wide event-type filter for tests that exercise the inbox
     /// lifecycle directly (i.e. not through a Classifier).
     const ALL_EVENT_TYPES: &[&str] = &[
@@ -2608,7 +2731,9 @@ mod tests {
             .await
             .unwrap();
         // Make the row immediately claimable again.
-        set_next_attempt_at(&pool, id, Utc::now()).await;
+        // Keep the fixture unambiguously due across the application/DB clock
+        // boundary; equality to two separately sampled "now" values is racy.
+        set_next_attempt_at(&pool, id, Utc::now() - chrono::Duration::seconds(1)).await;
         // Second attempt → next_attempts (2) >= max_attempts (2) →
         // permanent failure.
         proc.process_one()
@@ -2748,7 +2873,7 @@ mod tests {
             Some("transient blip")
         );
 
-        set_next_attempt_at(&pool, id, Utc::now()).await;
+        set_next_attempt_at(&pool, id, Utc::now() - chrono::Duration::seconds(1)).await;
         proc.process_one()
             .await
             .unwrap();

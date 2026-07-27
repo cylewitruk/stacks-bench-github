@@ -1,10 +1,11 @@
 # Example daemon config. Copy to /etc/sbgh/daemon/config.toml
 # (or wherever $SBGH_CONFIG points) and fill in.
 #
-# The daemon runs ON THE HOST (not in a container) — it needs LVM,
-# libvirt, and the golden image. This config holds the GitHub App
-# credentials and everything the libvirt benchmark driver needs. Keep
-# it disjoint from the handler's config.
+# The daemon is the fleet orchestrator and sole DB/GitHub/Slack side-effect
+# owner. Worker transport policy is in config.example.fleet.toml; benchmark
+# libvirt settings are copied into config.example.worker-benchmark.toml.
+# The legacy [vm]/[paths]/[lvm] fields below remain parse-compatible during
+# the v25 rollout but are not a production execution path in the daemon.
 #
 # Secret values can also come from env:
 #   DATABASE_URL                 — overrides [server].database_url
@@ -199,20 +200,18 @@ max_clean_repetitions = 5
 # cpu_sets  = ["0-1", "2-3"]
 # host_cpus = "4-5"
 
-# Run-artifact storage (item 0001). Default `local` keeps artifacts on the
-# orchestrator's disk under [paths].results_archive_dir — today's behavior.
+# Run-artifact storage. The parser retains `local` for old configuration
+# compatibility, but v25 fleet mode requires S3-compatible storage so remote
+# workers can use exact-key delegated transfers. Replace these placeholders or
+# provide the documented environment variables before starting the daemon.
 [artifacts]
-kind = "local"
+kind = "s3"
+endpoint = "https://fsn1.your-objectstorage.com"
+bucket = "sbgh-artifacts"
+region = "fsn1"
 
-# Opt into S3-compatible object storage (e.g. Hetzner) so Slack / the portal can
-# fetch artifacts off-box. The local archive is still written as a diagnostic
-# breadcrumb + retained copy; S3 is the durable, presigned-fetchable backing,
-# and an upload failure never fails the benchmark.
-#
-#   kind     = "s3"
-#   endpoint = "https://fsn1.your-objectstorage.com"
-#   bucket   = "sbgh-artifacts"
-#   region   = "fsn1"
+# The orchestrator retains a local diagnostic mirror while S3 is the durable,
+# presigned-transfer backing used by the fleet.
 #
 # Credentials are ENV-ONLY (never in this file — a TOML key here is a hard
 # error, like [api].ingest_token):
@@ -227,8 +226,9 @@ kind = "local"
 # enabled, a fingerprint-matched binary (commit + resolved toolchain + golden
 # image + recipe/protocol version) is reused instead of rebuilt, skipping the
 # ~5-7 min build VM. Disabled (default) keeps today's always-build behavior.
-# Local-only — fleet / S3 sharing is deferred. Pinned entries (v9 Phase 2 release
-# policy) are kept past `max_size`; non-pinned evict least-recently-used.
+# The cache remains worker-local; cross-worker cache distribution is deferred.
+# Pinned entries are kept past `max_size`; non-pinned entries evict
+# least-recently-used.
 #
 # [artifacts.binary_cache]
 # enabled  = true

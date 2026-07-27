@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/sbgh-core",
     "crates/sbgh-api",
+    "crates/sbgh-proto",
     "crates/sbgh-driver",
     "crates/sbgh-libvirt",
     "crates/sbgh-worker",
@@ -34,6 +35,7 @@ todo = "warn"
 [workspace.dependencies]
 sbgh-core = { path = "crates/sbgh-core" }
 sbgh-api = { path = "crates/sbgh-api" }
+sbgh-proto = { path = "crates/sbgh-proto" }
 sbgh-driver = { path = "crates/sbgh-driver" }
 sbgh-libvirt = { path = "crates/sbgh-libvirt" }
 sbgh-worker = { path = "crates/sbgh-worker" }
@@ -52,7 +54,7 @@ futures = "0.3.32"
 # HTTP / web
 axum = { version = "0.8.9", features = ["macros"] }
 tower = "0.5.3"
-tower-http = { version = "0.7.0", features = ["trace", "limit"] }
+tower-http = { version = "0.7.0", features = ["trace", "limit", "timeout"] }
 reqwest = { version = "0.13.4", default-features = false }
 # S3-compatible object storage for run artifacts. Sans-IO (pure
 # SigV4 signing + request building); driven by reqwest.
@@ -74,6 +76,7 @@ hmac = "0.13.0"
 sha2 = "0.11.0"
 subtle = "2.6.1"
 hex = "0.4.3"
+base64 = "0.22.1"
 
 # Database
 sqlx = { version = "0.9.0", default-features = false, features = [
@@ -125,6 +128,9 @@ regex = "1.12.4"
 # rustls panics on the first handshake. Each binary installs `ring` explicitly at
 # the beginning of its `main` function.
 rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26.4"
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18.1"
 
 [profile.dev]
 debug = "line-tables-only"

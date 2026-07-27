@@ -24,7 +24,7 @@
 | `roadmap-v6` | multi-task platform + block validation | `design/0005` (platform) + `design/0019` (recipe) |
 | `roadmap-v7` | change-impact reporting | `archive/completed/0009` (+ `0018`) |
 | `roadmap-v8` | Driver seam + AWS backend | `archive/completed/0010` (Phase 1) + `0006` (cloud, parked) |
-| `roadmap-v9` | worker fleet | `design/0004-worker-fleet.md` (`0004`) |
+| `roadmap-v9` | worker fleet | `archive/completed/0004-worker-fleet.md` (`0004`) |
 | `roadmap-v10` | Slack ad-hoc profiling | `design/0002-slack-adhoc-profiling.md` (`0002`) |
 | `roadmap-v11` | results portal | `design/0003-results-portal.md` (`0003`) |
 | `roadmap-v12` | artifact store | `0001` / iteration `v4-artifact-store` (converted) |

@@ -37,7 +37,8 @@ const META_NAME: &str = "meta.json";
 /// Prefix for in-flight staging dirs (never served as a hit).
 const TMP_PREFIX: &str = ".staging-";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BinaryCacheConfig {
     pub enabled: bool,
     pub max_bytes: u64,

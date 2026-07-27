@@ -18,5 +18,5 @@ pub use events::{
 };
 pub use execution::{
     BenchmarkTask, ExecutionContext, ExecutionOutcome, ExecutionPlacement, ExecutionRequest,
-    ExecutionTask, TaskStatus,
+    ExecutionTask, RepositoryCredential, TaskStatus,
 };

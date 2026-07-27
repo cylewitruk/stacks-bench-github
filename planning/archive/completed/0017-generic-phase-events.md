@@ -1,13 +1,12 @@
-# Design 0017: Task-Neutral Durable Worker Events
+# 0017: Task-Neutral Durable Worker Events
 
 - **id:** `0017-generic-phase-events`
-- **status:** `planned` (`v25-worker-fleet-block-validation`)
+- **status:** `shipped` (`v25-worker-fleet-block-validation`, 2026-07-27)
 - **depends_on:** `0055-execution-boundary-preparation` (v24),
   `0056-compiler-enforced-execution-boundaries` (v24.1)
 - **unblocks:** `0004-worker-fleet`, `0019-block-validation-recipe`
-- **iteration:**
-  [`v25-worker-fleet-block-validation`](../iterations/v25-worker-fleet-block-validation.md)
-- **review:** Codex signed off (design)
+- **iteration:** `v25-worker-fleet-block-validation` (shipped)
+- **review:** Codex implementation and Opus review signed off
 - **source:** `0008-execution-architecture` generic-event follow-up + v25
   durable remote-event requirement
 
@@ -136,11 +135,16 @@ one enum value per recipe phase.
   reliable prefix through the terminal sequence.
 - Projection progress is durable per attempt. On orchestrator restart, pending
   attempts resume from the first committed, unprojected event.
+- A reliable event is marked projected only after every attempted external
+  side effect succeeds (or the surface deterministically decides it is a
+  no-op). A transport failure leaves that event pending, fences later
+  projections for the same attempt, and does not head-of-line block unrelated
+  attempts. Fine progress remains coalescible/best-effort.
 - Existing persisted check/comment/message identifiers remain the basis for
   reconciling external side effects. The event ledger provides repeatable
   internal input; it does not pretend PostgreSQL can transact atomically with
   GitHub or Slack.
-- [v24.3](../archive/completed/0060-slack-snapshot-reporting.md) gives Slack a
+- [v24.3](0060-slack-snapshot-reporting.md) gives Slack a
   deterministic full-snapshot renderer and one durable message identity. On
   catch-up, this projector rebuilds the current `SlackProgressView` from the
   committed event prefix and renders the entire canonical message; it never
@@ -204,6 +208,9 @@ historical PostgreSQL enum values; and no multi-version protocol skew in v25.
 - A dropped best-effort progress sample creates no reliable-sequence gap.
 - Reporter catch-up is driven from durable state, not worker resend timing or an
   in-memory channel.
+- A transient GitHub/Slack failure leaves the reliable event unprojected; retry
+  converges the stable comment/check/message identity without blocking another
+  attempt's reporter.
 - A transient network/orchestrator outage within one live worker session resends
   unacknowledged envelopes without loss or reordering; a worker-process restart
   fences and requeues instead of pretending to resume.
@@ -226,3 +233,16 @@ historical PostgreSQL enum values; and no multi-version protocol skew in v25.
 - GitHub comment-reconciliation test that loses the create response/ID write,
   restarts the reporter, finds the bot-authored marker, and updates exactly one
   comment.
+
+## Shipped Outcome
+
+v25 shipped the attempt-scoped, gap-free reliable event ledger; typed
+duplicate/conflict/stale handling; fenced projection cursors; stable reporting
+identity reconciliation; and bounded same-session resend without a durable
+worker outbox. Reliable terminal events are accepted only for the current
+attempt and fence, while projector retries converge external reporting without
+re-executing work.
+
+The store contracts, protocol fixtures, reconnect/restart paths, projector
+recovery, compatibility behavior, and final review hardening are covered by the
+green v25 workspace suite.

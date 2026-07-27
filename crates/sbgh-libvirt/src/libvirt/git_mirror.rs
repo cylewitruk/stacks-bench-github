@@ -34,7 +34,12 @@ static MIRROR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Ensure the bare mirror exists at `paths.git_mirror`. Idempotent.
 /// If absent, clone `repo_url` as a bare mirror.
-pub async fn ensure(shell: &dyn Shell, paths: &PathsConfig, repo_url: &str) -> anyhow::Result<()> {
+pub async fn ensure(
+    shell: &dyn Shell,
+    paths: &PathsConfig,
+    repo_url: &str,
+    repository_token: Option<&str>,
+) -> anyhow::Result<()> {
     // Held across the exists()-check + clone so two fresh-host jobs can't both
     // clone into the same directory (TOCTOU).
     let _guard = MIRROR_LOCK.lock().await;
@@ -44,20 +49,22 @@ pub async fn ensure(shell: &dyn Shell, paths: &PathsConfig, repo_url: &str) -> a
     if let Some(parent) = paths.git_mirror.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let out = shell
-        .run(spec(
-            &paths.git_binary,
-            &[
-                "clone",
-                "--mirror",
-                repo_url,
-                &paths
-                    .git_mirror
-                    .display()
-                    .to_string(),
-            ],
-        ))
-        .await?;
+    let mut command = spec(
+        &paths.git_binary,
+        &[
+            "clone",
+            "--mirror",
+            repo_url,
+            &paths
+                .git_mirror
+                .display()
+                .to_string(),
+        ],
+    );
+    if let Some(token) = repository_token {
+        command = command.with_repository_token(token);
+    }
+    let out = shell.run(command).await?;
     check(&out, &format!("git clone --mirror {repo_url}"))
 }
 
@@ -69,24 +76,27 @@ pub async fn fetch_sha(
     paths: &PathsConfig,
     job_id: &str,
     sha: &str,
+    repository_token: Option<&str>,
 ) -> anyhow::Result<()> {
     let _guard = MIRROR_LOCK.lock().await;
     let refspec = format!("+{sha}:refs/sbgh/{job_id}");
-    let out = shell
-        .run(spec(
-            &paths.git_binary,
-            &[
-                "--git-dir",
-                &paths
-                    .git_mirror
-                    .display()
-                    .to_string(),
-                "fetch",
-                "origin",
-                &refspec,
-            ],
-        ))
-        .await?;
+    let mut command = spec(
+        &paths.git_binary,
+        &[
+            "--git-dir",
+            &paths
+                .git_mirror
+                .display()
+                .to_string(),
+            "fetch",
+            "origin",
+            &refspec,
+        ],
+    );
+    if let Some(token) = repository_token {
+        command = command.with_repository_token(token);
+    }
+    let out = shell.run(command).await?;
     check(&out, &format!("git fetch sha {sha} into refs/sbgh/{job_id}"))
 }
 
@@ -142,7 +152,7 @@ mod tests {
         let paths = paths_in(&dir);
         std::fs::create_dir_all(&paths.git_mirror).unwrap();
         let shell = RecordingShell::new();
-        ensure(&shell, &paths, "https://example/foo.git")
+        ensure(&shell, &paths, "https://example/foo.git", None)
             .await
             .unwrap();
         assert!(shell.calls().is_empty());
@@ -154,7 +164,7 @@ mod tests {
         let paths = paths_in(&dir);
         let shell = RecordingShell::new();
         shell.expect_ok(1);
-        ensure(&shell, &paths, "https://example/foo.git")
+        ensure(&shell, &paths, "https://example/foo.git", None)
             .await
             .unwrap();
         let calls = shell.calls();
@@ -177,7 +187,7 @@ mod tests {
         let paths = paths_in(&dir);
         let shell = RecordingShell::new();
         shell.expect_ok(1);
-        fetch_sha(&shell, &paths, "job1", "deadbeef")
+        fetch_sha(&shell, &paths, "job1", "deadbeef", None)
             .await
             .unwrap();
         let calls = shell.calls();
@@ -239,8 +249,8 @@ mod tests {
         let shell = ConcurrencyProbeShell::default();
 
         let (a, b) = tokio::join!(
-            fetch_sha(&shell, &paths, "jobA", "sha-a"),
-            fetch_sha(&shell, &paths, "jobB", "sha-b"),
+            fetch_sha(&shell, &paths, "jobA", "sha-a", None),
+            fetch_sha(&shell, &paths, "jobB", "sha-b", None),
         );
         a.unwrap();
         b.unwrap();

@@ -1,14 +1,7 @@
 [Unit]
-Description=stacks-bench-github daemon (libvirt benchmark runner)
+Description=stacks-bench-github fleet orchestrator
 Documentation=https://github.com/cylewitruk/stacks-bench-github
-# Wait for the prerequisites the daemon immediately touches:
-#   - network-online: GitHub API + git fetches
-#   - libvirtd:       virsh define/start/destroy
-#   - docker:         postgres (job queue) + handler run in containers. The
-#                     daemon connects and migrates ONCE at startup and
-#                     exits on failure, so we order after docker to avoid a
-#                     boot race; `Restart=on-failure` (below) is the retry.
-After=network-online.target libvirtd.service docker.service
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
@@ -17,107 +10,52 @@ User=sbgh
 Group=sbgh
 WorkingDirectory=/var/lib/sbgh
 ExecStart=/usr/local/bin/sbgh-daemon
-
-# Per-job result tmpfs dirs live under /run/sbgh (paths.results_tmpfs_root =
-# /run/sbgh/jobs) — and /run is a tmpfs the kernel wipes on every reboot.
-# RuntimeDirectory recreates /run/sbgh owned by sbgh:sbgh (0755) on every start
-# so the daemon's create_dir_all for /run/sbgh/jobs/<id> succeeds without a
-# manual install -d that wouldn't survive a reboot. Preserve=yes keeps it across
-# a daemon restart so restarting mid-job doesn't yank a running VM's virtio-fs
-# share. NOTE: RuntimeDirectory does NOT imply PrivateMounts (it's absent from
-# the directive list below), so it's safe with the libvirtd mount-sharing.
-RuntimeDirectory=sbgh
-RuntimeDirectoryPreserve=yes
-
-# Restart with a delay on crash so we don't tight-loop if e.g. the DB
-# config is wrong. Per-job failures don't crash the daemon (they're
-# logged + DB-recorded); a Rust panic or unwrap somewhere does.
 Restart=on-failure
 RestartSec=10s
 
-# ─── Shutdown (roadmap-v5 Phase 4) ──────────────────────────────────────
-# `systemctl stop` → SIGTERM, which the daemon handles as an ABORT: it cancels
-# in-flight runs and tears their VMs down (via its own virsh/lvremove calls),
-# then exits cleanly.
-#
-# KillMode=mixed sends SIGTERM to the **main process only** (not the whole
-# cgroup). That's essential: the daemon's teardown spawns `sudo virsh
-# destroy/undefine`, `lvremove`, `umount` children — `KillMode=control-group`
-# (the default) would SIGTERM those out from under an in-progress cleanup. With
-# `mixed`, only the daemon gets the signal; it drives the teardown itself, and
-# systemd SIGKILLs anything still in the cgroup only at the final timeout.
-KillMode=mixed
-# Give the abort path room to tear down every in-flight VM before systemd
-# escalates to SIGKILL — a few virsh/LVM ops per concurrent job. Bump this if
-# you raise [runner].max_concurrent_jobs substantially.
-TimeoutStopSec=120s
+# SIGINT requests a graceful fleet drain; SIGTERM is the bounded abort path.
+KillSignal=SIGINT
+FinalKillSignal=SIGKILL
+KillMode=control-group
+TimeoutStopSec=180s
 
-# Logs go to journald — view with:
-#   journalctl -u sbgh-daemon -f
-#   journalctl -u sbgh-daemon -p info --since '1h ago'
+RuntimeDirectory=sbgh
+RuntimeDirectoryPreserve=yes
+UMask=0077
 StandardOutput=journal
 StandardError=journal
-
-# Default RUST_LOG. Override per-host in /etc/systemd/system/sbgh-daemon.service.d/override.conf
-# (use `systemctl edit sbgh-daemon` to create it).
 Environment=RUST_LOG=info,sbgh_daemon=info,sqlx=warn
-
-# Env-only secrets that must NOT live in the world-readable config.toml —
-# chiefly SBGH_API_INGEST_TOKEN (the shared `ingest`-scope token the handler
-# presents to /api; must match the handler's secrets.env). Optional (`-`) so
-# the unit still starts during bring-up before the file exists. Create it
-# mode 0600, owned by `sbgh`.
 EnvironmentFile=-/etc/sbgh/daemon/secrets.env
 
-# ─── Hardening ──────────────────────────────────────────────────────────
-#
-# Effectively no systemd-level hardening — see the long story below.
-#
-# Why: we share state with libvirtd (per-job tmpfs at /run/sbgh/jobs/<id>/
-# is created by the daemon and consumed by libvirtd's virtiofsd to
-# serve it to the VM). ANY systemd directive that puts the unit in a
-# private mount namespace breaks that share — the daemon's mounts
-# are invisible to libvirtd, so virtiofsd serves the underlying empty
-# directory, the VM writes its phase log into a void, and the
-# daemon never sees it. End result: 10-minute build VM finishes
-# cleanly, daemon reports "VM powered off before reporting
-# phase=done", we tear our hair out.
-#
-# The full list of directives that implicitly enable PrivateMounts=yes
-# (per the systemd.exec(5) man page — search "MountFlags= and
-# PrivateMounts= are implied"):
-#   ProtectSystem=, ProtectHome=, PrivateTmp=, PrivateDevices=,
-#   ReadWritePaths=, ReadOnlyPaths=, InaccessiblePaths=, BindPaths=,
-#   BindReadOnlyPaths=, ProtectKernelTunables=, ProtectKernelModules=,
-#   ProtectControlGroups=, ProtectKernelLogs=, ProtectClock=,
-#   ProtectHostname=, ProtectProc=, ProcSubset=
-#
-# So the hardening defaults to: filesystem ownership (sbgh is uid 902,
-# can only write to its own dirs), narrow sudoers allowlist (per-binary
-# NOPASSWD in /etc/sudoers.d/sbgh — see docs/host-bringup.md §3), and
-# the fact that the daemon's network surface is internal (DB +
-# GitHub API, both initiated outbound).
-#
-# When we want to add more layers, look at:
-#   CapabilityBoundingSet=   (drops capabilities — doesn't touch mounts)
-#   SystemCallFilter=        (seccomp — doesn't touch mounts; careful
-#                             with sudo)
-#   RestrictAddressFamilies= (block exotic socket families)
-#   LimitNOFILE= LimitNPROC= (resource limits)
-
-# NoNewPrivileges MUST stay false: sudo is a setuid binary, and our
-# daemon->sudo->lvcreate chain depends on the privilege change.
-# RestrictSUIDSGID also stays off for the same reason — restricting
-# SUID would block sudo's privilege gain even with NoNewPrivileges=false.
-NoNewPrivileges=false
-RestrictSUIDSGID=false
-
-# Resource ceiling. The daemon process itself is tiny (~30 MB
-# typical); these limits are a tripwire for a runaway leak, not a
-# sizing knob. The per-job VMs are libvirt-managed separately and
-# unaffected by these.
-MemoryHigh=256M
-MemoryMax=512M
+# v25 moved all recipe/driver execution into sbgh-worker. The orchestrator no
+# longer needs sudo, libvirt, LVM, device access, or a shared mount namespace.
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Unix ownership still protects the root-owned configuration/private key.
+# The daemon needs this directory writable only for its boot-scoped 0600
+# operator cookie (the documented default remains under /etc/sbgh/daemon).
+ReadWritePaths=/var/lib/sbgh /run/sbgh /etc/sbgh/daemon
+ReadOnlyPaths=/etc/sbgh/fleet
+MemoryHigh=512M
+MemoryMax=1G
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

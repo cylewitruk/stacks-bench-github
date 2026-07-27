@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sbgh_driver::{PhaseLabel, ProgressUpdate};
+use sbgh_core::db::fleet::{ProjectedReportMutation, ReportProjectionSeed};
 use sbgh_slack::{
     COMPLETED_REACTION, FAILED_REACTION, MessageIdentityStore, PublishUrgency, QUEUED_REACTION,
     RUNNING_REACTION, ReportingIdentity, RunPosition, SlackClient, SlackMessageTarget,
@@ -20,6 +20,7 @@ use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::{
     CompletionReport, ReportSurface, parsed_run, short_pr_error, signed_db_url, signed_group_db_url,
 };
+use crate::report_event::{PhaseLabel, ProgressUpdate};
 
 const RUN_VERSION_STRIDE: u64 = 1_000_000;
 
@@ -91,16 +92,17 @@ impl SnapshotSession {
         Ok(true)
     }
 
-    async fn mutate(&self, urgency: PublishUrgency, update: impl FnOnce(&mut SlackProgressView)) {
-        if let Err(error) = self
-            .try_mutate(urgency, |view| {
-                update(view);
-                true
-            })
-            .await
-        {
-            tracing::warn!(error = ?error, "slack: snapshot publication failed (non-fatal)");
-        }
+    async fn mutate(
+        &self,
+        urgency: PublishUrgency,
+        update: impl FnOnce(&mut SlackProgressView),
+    ) -> sbgh_slack::Result<()> {
+        self.try_mutate(urgency, |view| {
+            update(view);
+            true
+        })
+        .await?;
+        Ok(())
     }
 }
 
@@ -155,6 +157,7 @@ impl SlackSessionRegistry {
         stale.len()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.sessions
             .lock()
@@ -162,6 +165,7 @@ impl SlackSessionRegistry {
             .len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -302,7 +306,7 @@ impl SlackReportSurface {
         details: Vec<String>,
         links: Vec<(String, String)>,
         reaction: &str,
-    ) {
+    ) -> anyhow::Result<()> {
         self.session
             .mutate(PublishUrgency::Immediate, |view| {
                 view.status = status;
@@ -311,11 +315,13 @@ impl SlackReportSurface {
                 view.details = details;
                 view.links = links;
             })
-            .await;
+            .await
+            .map_err(anyhow::Error::new)?;
         self.react(RUNNING_REACTION, reaction)
             .await;
         self.sessions
             .reap(self.job.benchmark_group_id, &self.target);
+        Ok(())
     }
 
     async fn repeat_details(&self) -> Vec<String> {
@@ -368,7 +374,48 @@ impl SlackReportSurface {
 
 #[async_trait]
 impl ReportSurface for SlackReportSurface {
-    async fn started(&self) {
+    async fn restore(&self, seed: &ReportProjectionSeed) {
+        let mut view = self.session.view.lock().await;
+        *view = initial_view(&self.job, view.identity.clone());
+        view.version = run_version_base(&self.job).saturating_add(seed.mutation_count);
+        match &seed.latest {
+            ProjectedReportMutation::Phase(sbgh_proto::ReliableEventPayload::Phase {
+                label,
+                ..
+            }) if label == "accepted" => {
+                view.status = SlackStatus::Preparing;
+                view.phase = Some("preparing execution".into());
+                view.progress = None;
+            }
+            ProjectedReportMutation::Phase(sbgh_proto::ReliableEventPayload::Phase {
+                label,
+                ..
+            }) => {
+                view.status = SlackStatus::Running;
+                view.phase = Some(human_phase(&PhaseLabel::new(label.clone(), false)));
+                view.progress = None;
+            }
+            ProjectedReportMutation::Phase(sbgh_proto::ReliableEventPayload::Terminal {
+                ..
+            }) => {
+                tracing::warn!(
+                    job_id = %self.job.id,
+                    "terminal event unexpectedly appeared in non-terminal projection seed"
+                );
+            }
+            ProjectedReportMutation::Progress(progress) => {
+                view.status = SlackStatus::Running;
+                view.phase = None;
+                view.progress = Some(SlackProgress {
+                    label: progress.phase.clone(),
+                    current: progress.progress,
+                    total: progress.total,
+                });
+            }
+        }
+    }
+
+    async fn started(&self) -> anyhow::Result<()> {
         let job = &self.job;
         self.session
             .mutate(PublishUrgency::Immediate, |view| {
@@ -377,12 +424,14 @@ impl ReportSurface for SlackReportSurface {
                 view.status = SlackStatus::Preparing;
                 view.phase = Some("preparing execution".into());
             })
-            .await;
+            .await
+            .map_err(anyhow::Error::new)?;
         self.react(QUEUED_REACTION, RUNNING_REACTION)
             .await;
+        Ok(())
     }
 
-    async fn phase(&self, label: &PhaseLabel, _elapsed: Duration) {
+    async fn phase(&self, label: &PhaseLabel, _elapsed: Duration) -> anyhow::Result<()> {
         let phase = human_phase(label);
         self.session
             .mutate(PublishUrgency::Immediate, |view| {
@@ -390,34 +439,41 @@ impl ReportSurface for SlackReportSurface {
                 view.phase = Some(phase);
                 view.progress = None;
             })
-            .await;
+            .await
+            .map_err(anyhow::Error::new)
     }
 
-    async fn heartbeat(&self, label: &PhaseLabel, _elapsed: Duration) {
+    #[cfg(test)]
+    async fn heartbeat(&self, label: &PhaseLabel, _elapsed: Duration) -> anyhow::Result<()> {
         let phase = human_phase(label);
         self.session
             .mutate(PublishUrgency::Debounced, |view| {
                 view.phase = Some(phase);
             })
-            .await;
+            .await
+            .map_err(anyhow::Error::new)
     }
 
-    async fn progress(&self, progress: &ProgressUpdate) {
+    async fn progress(&self, progress: &ProgressUpdate) -> anyhow::Result<()> {
         let progress = SlackProgress {
             label: progress.phase.clone(),
             current: progress.progress,
             total: progress.total,
         };
         self.session
+            // Fine progress is explicitly best-effort and may coalesce behind
+            // the bounded Slack update interval. Reliable lifecycle phases
+            // and terminals use Immediate and propagate transport failure.
             .mutate(PublishUrgency::Debounced, |view| {
                 view.status = SlackStatus::Running;
                 view.phase = None;
                 view.progress = Some(progress);
             })
-            .await;
+            .await
+            .map_err(anyhow::Error::new)
     }
 
-    async fn completed(&self, report: CompletionReport<'_>) {
+    async fn completed(&self, report: CompletionReport<'_>) -> anyhow::Result<()> {
         if !self.final_run() {
             self.session
                 .mutate(PublishUrgency::Immediate, |view| {
@@ -425,8 +481,9 @@ impl ReportSurface for SlackReportSurface {
                     view.phase = Some("run complete; scheduling next run".into());
                     view.progress = None;
                 })
-                .await;
-            return;
+                .await
+                .map_err(anyhow::Error::new)?;
+            return Ok(());
         }
 
         let mut details = if let Some(comparison) = report.group_comparison {
@@ -462,10 +519,10 @@ impl ReportSurface for SlackReportSurface {
             links.push(("Download profiler data".into(), url));
         }
         self.terminal(SlackStatus::Completed, details, links, COMPLETED_REACTION)
-            .await;
+            .await
     }
 
-    async fn failed(&self, error: &str) {
+    async fn failed(&self, error: &str) -> anyhow::Result<()> {
         let mut details = vec![short_pr_error(error)];
         if self
             .job
@@ -475,17 +532,17 @@ impl ReportSurface for SlackReportSurface {
             details.extend(self.repeat_details().await);
         }
         self.terminal(SlackStatus::Failed, details, Vec::new(), FAILED_REACTION)
-            .await;
+            .await
     }
 
-    async fn cancelled(&self, reason: &str) {
+    async fn cancelled(&self, reason: &str) -> anyhow::Result<()> {
         self.terminal(
             SlackStatus::Cancelled,
             vec![short_pr_error(reason)],
             Vec::new(),
             FAILED_REACTION,
         )
-        .await;
+        .await
     }
 }
 

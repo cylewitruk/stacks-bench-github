@@ -3,10 +3,12 @@ use std::time::Duration;
 
 use crate::dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
-    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, GrantRoleResult,
-    HealthResponse, InstallationView, InstallerView, JobView, PinTriggerRequest, PolicyView,
-    RepoRootView, ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView,
-    WebhookSubmitResponse, WebhookSummary, WhoamiResponse,
+    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest,
+    EnqueueBlockValidationRequest, EnqueueJobResponse, FleetCancellationResponse, FleetOverview,
+    FleetRecoveryRequest, FleetRecoveryResponse, FleetWorkerView, GrantRoleResult, HealthResponse,
+    InstallationView, InstallerView, JobView, PinTriggerRequest, PolicyView, RepoRootView,
+    ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse,
+    WebhookSummary, WhoamiResponse, WorkerDrainRequest,
 };
 use crate::error::ApiError;
 
@@ -286,6 +288,51 @@ impl Client {
             q.push(("limit", l.to_string()));
         }
         self.get_query("/api/jobs", &q)
+            .await
+    }
+
+    pub async fn enqueue_block_validation(
+        &self,
+        request: &EnqueueBlockValidationRequest,
+    ) -> Result<EnqueueJobResponse, ClientError> {
+        self.post_json("/api/jobs/block-validation", request)
+            .await
+    }
+
+    pub async fn fleet_overview(&self) -> Result<FleetOverview, ClientError> {
+        self.get("/api/fleet").await
+    }
+
+    pub async fn set_worker_draining(
+        &self,
+        worker_id: &str,
+        draining: bool,
+    ) -> Result<FleetWorkerView, ClientError> {
+        self.post_json(
+            &format!("/api/fleet/workers/{worker_id}/drain"),
+            &WorkerDrainRequest { draining },
+        )
+        .await
+    }
+
+    pub async fn recover_fleet_group(
+        &self,
+        group_id: &str,
+        worker_id: Option<String>,
+        reason: String,
+    ) -> Result<FleetRecoveryResponse, ClientError> {
+        self.post_json(
+            &format!("/api/fleet/groups/{group_id}/recover"),
+            &FleetRecoveryRequest { reason, worker_id },
+        )
+        .await
+    }
+
+    pub async fn cancel_fleet_job(
+        &self,
+        job_id: &str,
+    ) -> Result<FleetCancellationResponse, ClientError> {
+        self.post_json(&format!("/api/fleet/jobs/{job_id}/cancel"), &())
             .await
     }
 

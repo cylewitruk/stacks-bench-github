@@ -10,6 +10,7 @@ mod auth;
 mod conv;
 mod error;
 mod extract;
+mod fleet;
 mod health;
 mod installations;
 mod installers;
@@ -67,7 +68,9 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/policies/triggers", get(policies::list_triggers))
             .route("/api/users", get(users::list_users))
             .route("/api/roles", get(users::list_roles))
-            .route("/api/jobs", get(jobs::list)),
+            .route("/api/jobs", get(jobs::list))
+            .route("/api/fleet", get(fleet::overview))
+            .route("/api/fleet/metrics", get(fleet::metrics)),
         tokens.clone(),
         Scope::Read,
     );
@@ -85,7 +88,11 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/policies/triggers/{id}/disable", post(policies::disable_trigger))
             .route("/api/policies/triggers/{id}/pin", post(policies::pin_trigger))
             .route("/api/roles", post(users::grant))
-            .route("/api/roles/revoke", post(users::revoke)),
+            .route("/api/roles/revoke", post(users::revoke))
+            .route("/api/jobs/block-validation", post(jobs::enqueue_block_validation))
+            .route("/api/fleet/workers/{id}/drain", post(fleet::set_drain))
+            .route("/api/fleet/jobs/{id}/cancel", post(fleet::cancel_job))
+            .route("/api/fleet/groups/{id}/recover", post(fleet::recover_group)),
         tokens,
         Scope::Admin,
     );

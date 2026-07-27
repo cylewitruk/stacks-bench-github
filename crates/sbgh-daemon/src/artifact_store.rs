@@ -32,9 +32,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use base64::Engine as _;
 use futures::StreamExt;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
+#[cfg(test)]
 use sbgh_driver::ArtifactSink;
+use sbgh_proto::{ArtifactDescriptor, ArtifactGrantResponse, HeaderValue};
 use tokio::io::AsyncWriteExt;
 
 /// TTL for the short-lived presigned URLs the store mints for its **own**
@@ -155,15 +158,52 @@ pub trait ArtifactStore: Send + Sync {
 
     /// Whether `key` exists in the store (local mirror **or** the bucket).
     async fn exists(&self, key: &str) -> bool;
+
+    /// Mint a worker-scoped exact-key PUT. Local storage deliberately cannot
+    /// implement this: fleet mode requires a remotely reachable object store.
+    fn fleet_put_grant(
+        &self,
+        _key: &str,
+        _size: u64,
+        _sha256: &str,
+        _ttl: Duration,
+    ) -> Result<ArtifactGrantResponse, ArtifactUrlError> {
+        Err(ArtifactUrlError::Unsupported)
+    }
+
+    fn fleet_get_grant(
+        &self,
+        _key: &str,
+        _ttl: Duration,
+    ) -> Result<ArtifactGrantResponse, ArtifactUrlError> {
+        Err(ArtifactUrlError::Unsupported)
+    }
+
+    /// Verify the immutable metadata signed into a fleet upload grant.
+    async fn verify_fleet_upload(&self, _artifact: &ArtifactDescriptor) -> bool {
+        false
+    }
+
+    async fn promote_fleet_upload(&self, _artifact: &ArtifactDescriptor) -> bool {
+        false
+    }
+
+    /// Delete unaccepted attempt staging. Accepted result objects are never
+    /// passed to this operation.
+    async fn delete_fleet_staging(&self, _key: &str) -> bool {
+        false
+    }
 }
 
 /// Restricts the full orchestrator-owned store to the operations execution is
 /// allowed to perform.
+#[cfg(test)]
 struct ExecutionArtifactSink {
     store: Arc<dyn ArtifactStore>,
 }
 
 #[async_trait::async_trait]
+#[cfg(test)]
 impl ArtifactSink for ExecutionArtifactSink {
     async fn put(&self, key: &str, src: &Path) -> Option<u64> {
         self.store.put(key, src).await
@@ -184,6 +224,7 @@ impl ArtifactSink for ExecutionArtifactSink {
     }
 }
 
+#[cfg(test)]
 pub fn execution_sink(store: Arc<dyn ArtifactStore>) -> Arc<dyn ArtifactSink> {
     Arc::new(ExecutionArtifactSink { store })
 }
@@ -446,6 +487,43 @@ impl S3Store {
             Err(_) => false,
         }
     }
+
+    async fn fleet_object_matches(&self, key: &str, size: u64, sha256: &str) -> bool {
+        if self
+            .local
+            .checked_path(key)
+            .is_none()
+        {
+            return false;
+        }
+        let url = self
+            .bucket
+            .head_object(Some(&self.credentials), key)
+            .sign(INTERNAL_SIGN_TTL);
+        let Ok(response) = self
+            .http
+            .head(url)
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        let size_matches = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(size);
+        let digest_matches = response
+            .headers()
+            .get("x-amz-meta-sbgh-sha256")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case(sha256));
+        size_matches && digest_matches
+    }
 }
 
 #[async_trait::async_trait]
@@ -564,6 +642,162 @@ impl ArtifactStore for S3Store {
 
     async fn exists(&self, key: &str) -> bool {
         self.local.exists(key).await || self.head_in_bucket(key).await
+    }
+
+    fn fleet_put_grant(
+        &self,
+        key: &str,
+        size: u64,
+        sha256: &str,
+        ttl: Duration,
+    ) -> Result<ArtifactGrantResponse, ArtifactUrlError> {
+        if self
+            .local
+            .checked_path(key)
+            .is_none()
+        {
+            return Err(ArtifactUrlError::Backend(format!("unsafe artifact key: {key}")));
+        }
+        let mut action = self
+            .bucket
+            .put_object(Some(&self.credentials), key);
+        let size_string = size.to_string();
+        let checksum = hex::decode(sha256)
+            .map_err(|error| ArtifactUrlError::Backend(format!("invalid SHA-256: {error}")))?;
+        let checksum = base64::engine::general_purpose::STANDARD.encode(checksum);
+        action
+            .headers_mut()
+            .insert("content-length", size_string.clone());
+        action
+            .headers_mut()
+            .insert("x-amz-checksum-sha256", checksum.clone());
+        action
+            .headers_mut()
+            .insert("x-amz-meta-sbgh-sha256", sha256.to_ascii_lowercase());
+        let url = action.sign(ttl);
+        Ok(ArtifactGrantResponse {
+            method: "PUT".into(),
+            key: key.into(),
+            url: url.to_string(),
+            headers: vec![
+                HeaderValue {
+                    name: "content-length".into(),
+                    value: size_string,
+                },
+                HeaderValue {
+                    name: "x-amz-checksum-sha256".into(),
+                    value: checksum,
+                },
+                HeaderValue {
+                    name: "x-amz-meta-sbgh-sha256".into(),
+                    value: sha256.to_ascii_lowercase(),
+                },
+            ],
+            expires_at_ms: (chrono::Utc::now()
+                + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::minutes(5)))
+            .timestamp_millis(),
+        })
+    }
+
+    fn fleet_get_grant(
+        &self,
+        key: &str,
+        ttl: Duration,
+    ) -> Result<ArtifactGrantResponse, ArtifactUrlError> {
+        if self
+            .local
+            .checked_path(key)
+            .is_none()
+        {
+            return Err(ArtifactUrlError::Backend(format!("unsafe artifact key: {key}")));
+        }
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), key)
+            .sign(ttl);
+        Ok(ArtifactGrantResponse {
+            method: "GET".into(),
+            key: key.into(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            expires_at_ms: (chrono::Utc::now()
+                + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::minutes(5)))
+            .timestamp_millis(),
+        })
+    }
+
+    async fn verify_fleet_upload(&self, artifact: &ArtifactDescriptor) -> bool {
+        self.fleet_object_matches(&artifact.key, artifact.size, &artifact.sha256)
+            .await
+    }
+
+    async fn promote_fleet_upload(&self, artifact: &ArtifactDescriptor) -> bool {
+        let staging_key = &artifact.key;
+        let logical_key = &artifact.logical_key;
+        if self
+            .local
+            .checked_path(staging_key)
+            .is_none()
+            || self
+                .local
+                .checked_path(logical_key)
+                .is_none()
+        {
+            return false;
+        }
+        if !self
+            .head_in_bucket(staging_key)
+            .await
+        {
+            return self
+                .fleet_object_matches(logical_key, artifact.size, &artifact.sha256)
+                .await;
+        }
+        let copy_source = format!("/{}/{}", self.bucket.name(), staging_key);
+        let mut action = self
+            .bucket
+            .put_object(Some(&self.credentials), logical_key);
+        action
+            .headers_mut()
+            .insert("x-amz-copy-source", copy_source.clone());
+        let url = action.sign(INTERNAL_SIGN_TTL);
+        let copied = self
+            .http
+            .put(url)
+            .header("x-amz-copy-source", copy_source)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        if !copied {
+            return false;
+        }
+        if !self
+            .fleet_object_matches(logical_key, artifact.size, &artifact.sha256)
+            .await
+        {
+            return false;
+        }
+        self.delete_fleet_staging(staging_key)
+            .await
+    }
+
+    async fn delete_fleet_staging(&self, key: &str) -> bool {
+        if self
+            .local
+            .checked_path(key)
+            .is_none()
+        {
+            return false;
+        }
+        let url = self
+            .bucket
+            .delete_object(Some(&self.credentials), key)
+            .sign(INTERNAL_SIGN_TTL);
+        self.http
+            .delete(url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
     }
 }
 
@@ -730,6 +964,67 @@ mod tests {
             .signed_url("../escape", Duration::from_secs(60))
             .unwrap_err();
         assert!(matches!(err, ArtifactUrlError::Backend(_)));
+    }
+
+    #[test]
+    fn fleet_put_grant_is_exact_key_size_and_checksum_bound() {
+        let tmp = TempDir::new().unwrap();
+        let s = s3_store(&tmp, "https://fsn1.example.com");
+        let key = "staging/attempt/nonce/job/run.json";
+        let digest = "00".repeat(32);
+        let grant = s
+            .fleet_put_grant(key, 17, &digest, Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(grant.method, "PUT");
+        assert_eq!(grant.key, key);
+        assert!(
+            grant
+                .url
+                .contains("staging/attempt/nonce/job/run.json")
+        );
+        assert!(
+            grant
+                .url
+                .contains("X-Amz-Signature")
+        );
+        assert_eq!(
+            grant
+                .headers
+                .iter()
+                .find(|header| header.name == "content-length")
+                .map(|header| header.value.as_str()),
+            Some("17")
+        );
+        assert_eq!(
+            grant
+                .headers
+                .iter()
+                .find(|header| header.name == "x-amz-meta-sbgh-sha256")
+                .map(|header| header.value.as_str()),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            grant
+                .headers
+                .iter()
+                .find(|header| header.name == "x-amz-checksum-sha256")
+                .map(|header| header.value.as_str()),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        );
+    }
+
+    #[test]
+    fn local_store_never_mints_fleet_credentials() {
+        let tmp = TempDir::new().unwrap();
+        assert!(matches!(
+            store(&tmp).fleet_put_grant(
+                "staging/attempt/object",
+                1,
+                &"00".repeat(32),
+                Duration::from_secs(60),
+            ),
+            Err(ArtifactUrlError::Unsupported)
+        ));
     }
 
     /// Decision 0003: an S3 upload failure must NOT fail the put — the local

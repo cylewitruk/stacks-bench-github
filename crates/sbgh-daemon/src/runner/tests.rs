@@ -297,6 +297,7 @@ impl RunnableJobStore for FakeSource {
     }
     async fn find_baseline(
         &self,
+        _subject_job_id: Uuid,
         _merge_base_sha: &str,
         _base_ref: &str,
         _at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1415,6 +1416,81 @@ async fn check_reconcile_reuses_existing_run() {
     );
 }
 
+/// A create that reached GitHub before its id was persisted is reconciled by
+/// the stable App-authored marker rather than duplicated on reclaim.
+#[tokio::test]
+async fn comment_reconcile_closes_create_persist_crash_window() {
+    let tmp = TempDir::new().unwrap();
+    let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+    let job = pr_job("abc123", None);
+    let marker = crate::report::pr_report_marker(job.benchmark_group_id);
+    let source = Arc::new(FakeSource::new(job));
+    let gh = Arc::new(FakeGitHub::new());
+    gh.set_existing_comment("acme/widgets", 7, 4242, &marker, 8765);
+    let shell = Arc::new(RecordingShell::new());
+    shell.reply(PreparedReply::fail(b"boom"));
+
+    Runner::new(config, source.clone(), gh.clone(), shell)
+        .run_once()
+        .await
+        .unwrap();
+
+    let calls = gh.calls();
+    assert!(calls.iter().any(
+        |call| matches!(call, FakeCall::FindComment { marker: found, .. } if found == &marker)
+    ));
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, FakeCall::CreateComment { .. })),
+        "replay must not create a second PR comment"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, FakeCall::UpdateComment {
+                comment_id: 8765,
+                body,
+                ..
+            } if body.lines().any(|line| line.trim() == marker))),
+        "the reconciled comment remains the reporting target and retains its marker"
+    );
+    assert!(
+        source
+            .calls()
+            .contains(&"set_comment_id")
+    );
+}
+
+#[tokio::test]
+async fn comment_reconcile_failure_is_not_treated_as_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
+    let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
+    let gh = Arc::new(FakeGitHub::new());
+    gh.fail_find_comment();
+    let shell = Arc::new(RecordingShell::new());
+    shell.reply(PreparedReply::fail(b"boom"));
+
+    Runner::new(config, source, gh.clone(), shell)
+        .run_once()
+        .await
+        .unwrap();
+
+    let calls = gh.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, FakeCall::FindComment { .. }))
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, FakeCall::CreateComment { .. })),
+        "lookup failure must not authorize a potentially duplicate comment"
+    );
+}
+
 /// Non-fatal reporting: if BOTH `create_check_run` and `create_pr_comment`
 /// error, the benchmark still runs to a terminal state.
 #[tokio::test]
@@ -1668,6 +1744,7 @@ impl RunnableJobStore for BlockingSource {
     }
     async fn find_baseline(
         &self,
+        _subject_job_id: Uuid,
         _merge_base_sha: &str,
         _base_ref: &str,
         _at: Option<chrono::DateTime<chrono::Utc>>,
@@ -2366,7 +2443,10 @@ async fn queued_position_cannot_regress_a_started_slack_snapshot() {
             .clone(),
         &job,
     );
-    surface.started().await;
+    surface
+        .started()
+        .await
+        .unwrap();
     assert_eq!(
         slack
             .updates
@@ -2419,7 +2499,10 @@ async fn started_snapshot_advances_beyond_a_prior_queue_position() {
             .clone(),
         &job,
     );
-    surface.started().await;
+    surface
+        .started()
+        .await
+        .unwrap();
 
     let updates = slack.updates.lock().unwrap();
     assert_eq!(updates.len(), 2);

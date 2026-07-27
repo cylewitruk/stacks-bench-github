@@ -19,8 +19,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use sbgh_api::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest, Client,
-    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest, PinTriggerRequest,
-    RoleRequest, TriggerView, read_cookie,
+    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest,
+    EnqueueBlockValidationRequest, PinTriggerRequest, RoleRequest, TriggerView, read_cookie,
 };
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -103,6 +103,12 @@ enum Command {
     Jobs {
         #[command(subcommand)]
         action: JobsAction,
+    },
+
+    /// Inspect, drain, and deliberately recover worker-fleet placement.
+    Fleet {
+        #[command(subcommand)]
+        action: FleetAction,
     },
 
     /// Probe the daemon `/api`: health + the scope the cookie resolves to.
@@ -385,6 +391,62 @@ enum JobsAction {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Enqueue block validation on a fleet worker with the matching dataset.
+    ValidateBlocks {
+        #[arg(long)]
+        install_id: i64,
+        #[arg(long)]
+        repo_id: i64,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        worker_id: String,
+        #[arg(long, default_value = "mainnet")]
+        dataset_network: String,
+        #[arg(long, default_value = "nakamoto")]
+        epoch: String,
+        #[arg(long)]
+        range_start: u64,
+        #[arg(long)]
+        range_end: u64,
+        #[arg(long)]
+        shards: u32,
+        #[arg(long)]
+        concurrency: u32,
+        #[arg(long, default_value_t = 21_600)]
+        timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FleetAction {
+    /// Show worker/session/attempt status and fleet health counters.
+    Status,
+    /// Stop a worker from claiming new work after its active attempt.
+    Drain {
+        #[arg(long)]
+        worker_id: String,
+    },
+    /// Permit a drained worker to claim work again.
+    Undrain {
+        #[arg(long)]
+        worker_id: String,
+    },
+    /// Request cancellation of an active fleet attempt.
+    Cancel {
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Create a fresh comparison generation from a group's first spec/run.
+    RecoverGroup {
+        #[arg(long)]
+        group_id: String,
+        /// Place the fresh generation on this compatible worker.
+        #[arg(long)]
+        worker_id: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[tokio::main]
@@ -413,6 +475,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Installation { action } => run_installation(&mk_client()?, action).await,
         Command::Webhook { action } => run_webhook(&mk_client()?, action).await,
         Command::Jobs { action } => run_jobs(&mk_client()?, action).await,
+        Command::Fleet { action } => run_fleet(&mk_client()?, action).await,
         Command::Status => run_status(&mk_client()?).await,
     }
 }
@@ -1014,6 +1077,37 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
                 );
             }
         }
+        JobsAction::ValidateBlocks {
+            install_id,
+            repo_id,
+            commit,
+            worker_id,
+            dataset_network,
+            epoch,
+            range_start,
+            range_end,
+            shards,
+            concurrency,
+            timeout_secs,
+        } => {
+            let response = client
+                .enqueue_block_validation(&EnqueueBlockValidationRequest {
+                    install_id,
+                    repo_id,
+                    commit,
+                    worker_id,
+                    dataset_network,
+                    epoch,
+                    range_start,
+                    range_end,
+                    requested_shards: shards,
+                    max_concurrency: concurrency,
+                    timeout_secs,
+                })
+                .await
+                .context("enqueue block validation")?;
+            println!("{}", response.job_id);
+        }
     }
     Ok(())
 }
@@ -1028,6 +1122,94 @@ async fn run_status(client: &Client) -> anyhow::Result<()> {
         .await
         .context("GET /api/whoami (is the cookie valid?)")?;
     println!("api: {}   scope: {}", health.status, who.scope);
+    Ok(())
+}
+
+async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
+    match action {
+        FleetAction::Status => {
+            let fleet = client
+                .fleet_overview()
+                .await
+                .context("fleet status")?;
+            println!(
+                "workers={} online={} draining={} attempts={} cleanup={} gaps={} staged_bytes={}",
+                fleet
+                    .summary
+                    .registered_workers,
+                fleet.summary.online_workers,
+                fleet.summary.draining_workers,
+                fleet.summary.active_attempts,
+                fleet.summary.pending_cleanup,
+                fleet
+                    .summary
+                    .reliable_event_gap_attempts,
+                fleet
+                    .summary
+                    .staged_artifact_bytes,
+            );
+            for worker in fleet.workers {
+                println!(
+                    "{}  {:<20} enabled={} draining={} status={} capabilities={} profile={} job={} heartbeat={}",
+                    worker.worker_id,
+                    worker.display_name,
+                    worker.enabled,
+                    worker.draining,
+                    worker
+                        .session_status
+                        .as_deref()
+                        .unwrap_or("offline"),
+                    worker.capabilities.join(","),
+                    worker
+                        .measurement_profile
+                        .as_deref()
+                        .unwrap_or("-"),
+                    worker
+                        .job_id
+                        .as_deref()
+                        .unwrap_or("-"),
+                    worker
+                        .last_heartbeat_at
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+            }
+        }
+        FleetAction::Drain { worker_id } => {
+            let worker = client
+                .set_worker_draining(&worker_id, true)
+                .await
+                .with_context(|| format!("drain worker {worker_id}"))?;
+            println!("{} draining={}", worker.worker_id, worker.draining);
+        }
+        FleetAction::Undrain { worker_id } => {
+            let worker = client
+                .set_worker_draining(&worker_id, false)
+                .await
+                .with_context(|| format!("undrain worker {worker_id}"))?;
+            println!("{} draining={}", worker.worker_id, worker.draining);
+        }
+        FleetAction::Cancel { job_id } => {
+            let response = client
+                .cancel_fleet_job(&job_id)
+                .await
+                .with_context(|| format!("cancel fleet job {job_id}"))?;
+            println!("{} cancel_requested={}", response.job_id, response.cancel_requested);
+        }
+        FleetAction::RecoverGroup { group_id, worker_id, reason } => {
+            let recovery = client
+                .recover_fleet_group(&group_id, worker_id, reason)
+                .await
+                .with_context(|| format!("recover group {group_id}"))?;
+            println!(
+                "prior_group={} new_group={} first_job={} generation={}",
+                recovery.prior_group_id,
+                recovery.new_group_id,
+                recovery.first_job_id,
+                recovery.execution_generation,
+            );
+        }
+    }
     Ok(())
 }
 

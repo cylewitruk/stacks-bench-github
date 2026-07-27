@@ -1,13 +1,13 @@
-# Design 0019: Block-validation recipe (second task kind)
+# 0019: Block-Validation Recipe (Second Task Kind)
 
 - **id:** `0019-block-validation-recipe`
-- **status:** `planned` (`v25-worker-fleet-block-validation`)
+- **status:** `shipped` (`v25-worker-fleet-block-validation`, 2026-07-27)
 - **depends_on:** `0005-task-kind-platform` (shipped),
   `0055-execution-boundary-preparation` (v24),
   `0056-compiler-enforced-execution-boundaries` (v24.1)
 - **relates_to:** `0004-worker-fleet`, `0037-benchmark-group-run-model`
-- **iteration:**
-  [`v25-worker-fleet-block-validation`](../iterations/v25-worker-fleet-block-validation.md)
+- **iteration:** `v25-worker-fleet-block-validation` (shipped)
+- **review:** Codex implementation and Opus review signed off
 - **source:** roadmap-v6 Phase 3 + the `block-validation-taskspec` sketch +
   v25 dedicated Hetzner worker
 
@@ -125,3 +125,17 @@ positive or negative correctness result.
 - **Substrate scope** (v6 OQ2): confirmed — block-val does **not** share bench's
   chainstate-provisioning shape; it needs full-chainstate + N CoW workspaces + a
   probe-driven partition.
+
+## Shipped Outcome
+
+v25 shipped block validation as the second registered task kind, with immutable
+dataset generations, verified copy-on-write shard workspaces, inclusive
+gap-free partitioning, strict diagnostic parsing, and fail-closed reduction.
+The generic fleet scheduler leases the task by authorized capability; its
+driver owns only worker-local execution and never gains orchestrator database,
+GitHub, or Slack authority.
+
+The recipe, parser, partition, reduction, cancellation, and protocol paths are
+covered by the green v25 workspace suite. Physical dataset hydration and
+long-running validation on the dedicated host remain rollout checks in the
+[worker-fleet operations guide](../../../docs/worker-fleet-operations.md).

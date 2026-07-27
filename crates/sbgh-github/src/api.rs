@@ -164,6 +164,18 @@ pub trait GitHubApi: Send + Sync + 'static {
         body: &str,
     ) -> Result<PostedComment>;
 
+    /// Find the App-authored PR comment carrying `marker`. This closes the
+    /// create-response/persistence crash window without trusting a marker
+    /// copied into a user-authored comment. Multiple matches fail closed.
+    async fn find_pr_comment_by_marker(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        pr_number: u64,
+        app_id: i64,
+        marker: &str,
+    ) -> Result<Option<PostedComment>>;
+
     /// Return the head commit SHA of an open PR.
     async fn pr_head_sha(
         &self,

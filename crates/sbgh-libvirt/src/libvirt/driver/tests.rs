@@ -24,6 +24,7 @@ fn ctx_of(job: &TestJob) -> TaskContext<'_> {
         job_id: job.id,
         repository: &job.repository,
         commit: &job.commit,
+        repository_credential: None,
     }
 }
 

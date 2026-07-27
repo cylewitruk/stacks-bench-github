@@ -32,6 +32,13 @@ pub enum FakeCall {
         comment_id: i64,
         body: String,
     },
+    FindComment {
+        installation_id: i64,
+        repository: String,
+        pr_number: u64,
+        app_id: i64,
+        marker: String,
+    },
     HeadSha {
         installation_id: i64,
         repository: String,
@@ -115,10 +122,14 @@ struct FakeState {
     /// `(repository, head_sha, name, external_id)` — scoped tightly so a
     /// runner test can't reconcile against the wrong repo/check name.
     existing_check_runs: HashMap<(String, String, String, String), PostedCheckRun>,
+    existing_comments: HashMap<(String, u64, i64, String), PostedComment>,
     /// Force `create_check_run` / `create_pr_comment` to error — for testing
     /// the non-fatal reporting policy. The call is still recorded.
     fail_create_check_run: bool,
     fail_create_comment: bool,
+    fail_update_check_run: bool,
+    fail_update_comment: bool,
+    fail_find_comment: bool,
     /// Force `current_app_id` (`GET /app`) to error — for testing the
     /// reconcile-skip + self-heal path.
     fail_current_app_id: bool,
@@ -150,6 +161,44 @@ impl FakeGitHub {
             .lock()
             .unwrap()
             .fail_create_comment = true;
+    }
+
+    /// Make `update_check_run` error (the call is still recorded).
+    pub fn fail_update_check_run(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_update_check_run = true;
+    }
+
+    /// Make `update_pr_comment` error (the call is still recorded).
+    pub fn fail_update_comment(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_update_comment = true;
+    }
+
+    pub fn fail_find_comment(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_find_comment = true;
+    }
+
+    pub fn set_existing_comment(
+        &self,
+        repository: &str,
+        pr_number: u64,
+        app_id: i64,
+        marker: &str,
+        id: i64,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .existing_comments
+            .insert((repository.into(), pr_number, app_id, marker.into()), PostedComment { id });
     }
 
     /// Make `current_app_id` (`GET /app`) error.
@@ -382,7 +431,41 @@ impl GitHubApi for FakeGitHub {
                 comment_id,
                 body: body.into(),
             });
+        if s.fail_update_comment {
+            return Err(crate::GitHubError::Config(
+                "FakeGitHub: forced update_comment failure".into(),
+            ));
+        }
         Ok(PostedComment { id: comment_id })
+    }
+
+    async fn find_pr_comment_by_marker(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        pr_number: u64,
+        app_id: i64,
+        marker: &str,
+    ) -> Result<Option<PostedComment>> {
+        let mut state = self.inner.lock().unwrap();
+        state
+            .calls
+            .push(FakeCall::FindComment {
+                installation_id,
+                repository: repository.into(),
+                pr_number,
+                app_id,
+                marker: marker.into(),
+            });
+        if state.fail_find_comment {
+            return Err(crate::GitHubError::Config(
+                "FakeGitHub: forced comment lookup failure".into(),
+            ));
+        }
+        Ok(state
+            .existing_comments
+            .get(&(repository.into(), pr_number, app_id, marker.into()))
+            .cloned())
     }
 
     async fn pr_head_sha(
@@ -552,6 +635,11 @@ impl GitHubApi for FakeGitHub {
                 state,
                 output,
             });
+        if s.fail_update_check_run {
+            return Err(crate::GitHubError::Config(
+                "FakeGitHub: forced update_check_run failure".into(),
+            ));
+        }
         Ok(PostedCheckRun {
             id: check_run_id,
             html_url: Some(format!("https://github.test/checks/{check_run_id}")),

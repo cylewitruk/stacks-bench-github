@@ -311,6 +311,16 @@ async fn deterministic_comparison_enqueues_ordered_variants() {
             .collect::<Vec<_>>(),
         vec!["baseline", "candidate"]
     );
+    let keys = specs
+        .iter()
+        .map(|spec| {
+            spec.new_job
+                .workload_key
+                .as_deref()
+        })
+        .collect::<Vec<_>>();
+    assert!(keys[0].is_some(), "Slack enqueue must snapshot a workload key");
+    assert_eq!(keys[0], keys[1], "comparison variants share one workload");
 }
 
 #[tokio::test]

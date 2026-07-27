@@ -18,6 +18,47 @@ pub struct OctocrabClient {
     tokens: InstallationTokenCache,
 }
 
+#[derive(serde::Deserialize)]
+struct PrCommentApp {
+    id: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct PrCommentSearchItem {
+    id: u64,
+    body: Option<String>,
+    performed_via_github_app: Option<PrCommentApp>,
+}
+
+fn consider_marked_comment(
+    found: &mut Option<PostedComment>,
+    comment: &PrCommentSearchItem,
+    app_id: i64,
+    marker: &str,
+) -> Result<()> {
+    let authored_by_app = comment
+        .performed_via_github_app
+        .as_ref()
+        .is_some_and(|app| app.id == app_id);
+    let carries_marker = comment
+        .body
+        .as_deref()
+        .is_some_and(|body| {
+            body.lines()
+                .any(|line| line.trim() == marker)
+        });
+    if !authored_by_app || !carries_marker {
+        return Ok(());
+    }
+    if found.is_some() {
+        return Err(Error::Config(format!(
+            "multiple App-authored PR comments carry marker {marker}"
+        )));
+    }
+    *found = Some(PostedComment { id: comment.id as i64 });
+    Ok(())
+}
+
 impl OctocrabClient {
     pub fn new(tokens: InstallationTokenCache) -> Self {
         Self { tokens }
@@ -74,6 +115,36 @@ impl GitHubApi for OctocrabClient {
             .await
             .github()?;
         Ok(PostedComment { id: comment.id.0 as i64 })
+    }
+
+    async fn find_pr_comment_by_marker(
+        &self,
+        installation_id: i64,
+        repository: &str,
+        pr_number: u64,
+        app_id: i64,
+        marker: &str,
+    ) -> Result<Option<PostedComment>> {
+        let (owner, repo) = split_repo(repository)?;
+        let client = self
+            .installation_client(installation_id)
+            .await?;
+        let route = format!("/repos/{owner}/{repo}/issues/{pr_number}/comments");
+        let mut found = None;
+        for page in 1_u32.. {
+            let comments: Vec<PrCommentSearchItem> = client
+                .get(&route, Some(&[("per_page", 100_u32), ("page", page)]))
+                .await
+                .github()?;
+            let count = comments.len();
+            for comment in &comments {
+                consider_marked_comment(&mut found, comment, app_id, marker)?;
+            }
+            if count < 100 {
+                break;
+            }
+        }
+        Ok(found)
     }
 
     async fn pr_head_sha(
@@ -516,7 +587,10 @@ fn split_repo(full_name: &str) -> Result<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckRunWriteResp, compare_basehead, encode_ref_path};
+    use super::{
+        CheckRunWriteResp, PrCommentSearchItem, compare_basehead, consider_marked_comment,
+        encode_ref_path,
+    };
 
     /// roadmap-v7: the compare basehead keeps `...`/`:` literal, preserves
     /// slashy refs, and percent-encodes unsafe chars — the cross-fork form the
@@ -554,6 +628,45 @@ mod tests {
         let parsed: CheckRunWriteResp = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.id, 12345);
         assert_eq!(parsed.html_url.as_deref(), Some("https://github.com/o/r/runs/12345"));
+    }
+
+    #[test]
+    fn comment_marker_reconciliation_requires_one_current_app_author() {
+        let marker = "<!-- sbgh-report:group -->";
+        let comments: Vec<PrCommentSearchItem> = serde_json::from_str(&format!(
+            r#"[
+                {{"id": 1, "body": "{marker}", "performed_via_github_app": null}},
+                {{"id": 2, "body": "prefix {marker} suffix",
+                  "performed_via_github_app": {{"id": 42}}}},
+                {{"id": 3, "body": "{marker}",
+                  "performed_via_github_app": {{"id": 7}}}},
+                {{"id": 4, "body": "status\n{marker}",
+                  "performed_via_github_app": {{"id": 42}}}}
+            ]"#
+        ))
+        .unwrap();
+        let mut found = None;
+        for comment in &comments {
+            consider_marked_comment(&mut found, comment, 42, marker).unwrap();
+        }
+        assert_eq!(found.unwrap().id, 4);
+    }
+
+    #[test]
+    fn multiple_current_app_marker_matches_fail_closed() {
+        let marker = "<!-- sbgh-report:group -->";
+        let comments: Vec<PrCommentSearchItem> = serde_json::from_str(&format!(
+            r#"[
+                {{"id": 1, "body": "{marker}",
+                  "performed_via_github_app": {{"id": 42}}}},
+                {{"id": 2, "body": "{marker}",
+                  "performed_via_github_app": {{"id": 42}}}}
+            ]"#
+        ))
+        .unwrap();
+        let mut found = None;
+        consider_marked_comment(&mut found, &comments[0], 42, marker).unwrap();
+        assert!(consider_marked_comment(&mut found, &comments[1], 42, marker).is_err());
     }
 
     #[test]

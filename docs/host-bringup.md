@@ -1,8 +1,16 @@
-# Host bringup
+# Benchmark host bringup
 
-Step-by-step for going from a fresh Linux host with libvirt installed to a working `/benchmark` flow on a real PR. Assumes you've already read [architecture.md](./architecture.md).
+Step-by-step for going from a fresh Linux host with libvirt installed to a
+working `/benchmark` flow on a real PR. The v25 deployment runs
+`sbgh-daemon` as an orchestrator and a separate loopback `sbgh-worker` as the
+libvirt executor. Read [architecture.md](./architecture.md) and complete the
+PKI, fleet configuration, worker service, and cutover steps in
+[worker-fleet-operations.md](./worker-fleet-operations.md) alongside this
+benchmark-host playbook.
 
-> This doc brings a **fresh** host up directly on v3 (the current API-fronted-daemon architecture). Upgrading an **existing** deployment instead? Use [v2-to-v3-upgrade.md](./v2-to-v3-upgrade.md) (from a v2 host) — or, if you're still on the legacy `jobs` queue (v1), run [v1-to-v2-upgrade.md](./v1-to-v2-upgrade.md) first, then v2→v3. For the v3 → v4 artifact-store upgrade (opt-in S3), see [v3-to-v4-upgrade.md](./v3-to-v4-upgrade.md); for v4 → v5 (Slack ad-hoc profiling, opt-in), see [v4-to-v5-upgrade.md](./v4-to-v5-upgrade.md).
+> Older upgrade guides describe their historical milestones. A current
+> installation must also complete the v25 worker-fleet cutover; the daemon no
+> longer has an inline execution fallback.
 
 ## 0. Prerequisites
 
@@ -12,7 +20,7 @@ Step-by-step for going from a fresh Linux host with libvirt installed to a worki
 | Kernel | KVM available (`grep -E 'vmx\|svm' /proc/cpuinfo`) |
 | libvirt | 9.x or newer, daemon running |
 | qemu | 8.x or newer (virtio-fs requires this) |
-| LVM2 | with a thin-pool already created (see [architecture.md](./architecture.md#lvm-layout)) |
+| LVM2 | with a thin-pool already created (see [architecture.md](./architecture.md#operations)) |
 | Postgres | local Docker is fine (`docker compose -f docker/docker-compose.yml up -d`) |
 
 Sanity check the host can run KVM domains at all:
@@ -167,7 +175,8 @@ matters:
 | ---- | ---- | ---- | ---- |
 | postgres (container) | 900/900 | Owns `/var/lib/sbgh/postgres` on the host. | DB on disk |
 | `sbgh-handler` (host) | 901/901 | Owns `/etc/sbgh/handler` on the host. The handler container is built with this uid so the bind-mounted config is readable. | webhook HMAC secret only |
-| `sbgh` (host) | 902/902 | Runs the daemon on the host (libvirt, LVM, sudoers). Owns `/etc/sbgh/daemon`. | GitHub App private key |
+| `sbgh` (host) | 902/902 | Runs the orchestrator. Owns `/etc/sbgh/daemon` and the fleet server/CA trust configuration. | DB, GitHub App, Slack, object-store, worker-listener secrets |
+| `sbgh-worker` (host) | choose a free system uid/gid | Runs the loopback benchmark worker and owns its job/cache paths. | mTLS client key; no DB or reporting credentials |
 | smee (container only) | 903/903 | No host user, no bind mounts, no secrets. Distinct uid only for defense-in-depth against a future container escape. | — |
 
 All four are in the system uid range (100–999) so `useradd --system`
@@ -196,30 +205,34 @@ sudo groupadd --system --gid 901 sbgh-handler
 sudo useradd  --system --uid 901 --gid 901 \
               --shell /usr/sbin/nologin sbgh-handler
 
-# Daemon service user. Runs the actual binary on the host.
+# Daemon service user. It does not receive libvirt/LVM/sudo access.
 sudo groupadd --system --gid 902 sbgh
 sudo useradd  --system --uid 902 --gid 902 \
               --shell /usr/sbin/nologin sbgh
-sudo usermod -a -G libvirt sbgh        # virsh access without sudo for read-only ops
 
-# Per-job subdirs on the XFS metadata LV (mounted at /var/lib/sbgh in §2)
-# and the tmpfs root on /run. All sbgh-owned — handler never touches
-# these.
-sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/jobs
-sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/results
-sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/git
+# Benchmark worker service user. Grant this identity only the narrow
+# libvirt/LVM permissions required by the worker configuration.
+sudo groupadd --system sbgh-worker
+sudo useradd --system --gid sbgh-worker --create-home \
+             --home-dir /var/lib/sbgh-worker --shell /usr/sbin/nologin sbgh-worker
+sudo usermod -a -G libvirt sbgh-worker
+
+# Per-job execution paths belong to the worker, never the daemon or handler.
+sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /var/lib/sbgh-worker/jobs
+sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /var/lib/sbgh-worker/results
+sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /var/lib/sbgh-worker/git
 # Persistent sccache cache, bind-mounted into every job VM via virtio-fs.
 # sccache self-caps at 20 GiB (SCCACHE_CACHE_SIZE inside the VM), so this
 # dir can't run away. Hot cache is what turns a ~35-min cold build into a
 # ~5-min warm build for subsequent jobs against similar PRs.
-sudo install -d -m 0755 -o sbgh -g sbgh /var/lib/sbgh/sccache
+sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /var/lib/sbgh-worker/sccache
 # /run/sbgh below is on a tmpfs the kernel wipes every reboot. This install -d
 # only seeds it for the CURRENT boot — the daemon unit's `RuntimeDirectory=sbgh`
 # recreates /run/sbgh (owned sbgh:sbgh) on every start, so it's durable across
 # reboots once the unit is installed. The manual seed is just for first bring-up
 # before the unit exists.
 sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh
-sudo install -d -m 0755 -o sbgh -g sbgh /run/sbgh/jobs
+sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /run/sbgh-worker/jobs
 ```
 
 The in-container postgres uid (900) doesn't need a matching host user —
@@ -354,7 +367,8 @@ sudo chown sbgh-handler:sbgh-handler /etc/sbgh/handler/secrets.env
 # Directory (uid 998 from §3). The PEM from step 4.8 already lives here.
 sudo install -d -m 0700 -o sbgh -g sbgh /etc/sbgh/daemon
 
-# config.toml: App credentials, LVM/libvirt knobs, etc.
+# config.toml: orchestrator/API/reporting configuration. Libvirt/LVM settings
+# belong in /etc/sbgh/worker/benchmark.toml (from the checked-in worker example).
 sudo install -m 0600 -o sbgh -g sbgh \
   config.example.daemon.toml /etc/sbgh/daemon/config.toml
 sudo -u sbgh $EDITOR /etc/sbgh/daemon/config.toml
@@ -367,9 +381,8 @@ sudo -u sbgh $EDITOR /etc/sbgh/daemon/config.toml
 #   [api].listen                = ["127.0.0.1:8787", "172.17.0.1:8787"]
 #                                 (loopback for the CLI; the docker host-gateway IP so the
 #                                  handler container can reach /api — see config example)
-#   [lvm].vg_name               = "vg0"
-#   [lvm].thinpool              = "thinpool"
-#   [vm].golden_image           = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
+# Configure [artifacts] as S3; fleet mode deliberately has no local-only
+# artifact backend.
 
 # secrets.env: env-only secrets for the host daemon unit (read via
 # the unit's EnvironmentFile). SBGH_API_INGEST_TOKEN must be the SAME value
@@ -377,6 +390,9 @@ sudo -u sbgh $EDITOR /etc/sbgh/daemon/config.toml
 # the daemon uses to authenticate the handler's webhook submissions.
 sudo tee /etc/sbgh/daemon/secrets.env >/dev/null <<EOF
 SBGH_API_INGEST_TOKEN=<same value as the handler's SBGH_API_INGEST_TOKEN>
+SBGH_FLEET_CONFIG=/etc/sbgh/fleet/config.toml
+SBGH_ARTIFACTS_S3_ACCESS_KEY_ID=<object-store access key>
+SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY=<object-store secret key>
 EOF
 sudo chmod 0600 /etc/sbgh/daemon/secrets.env
 sudo chown sbgh:sbgh /etc/sbgh/daemon/secrets.env
@@ -393,7 +409,8 @@ sudo chown sbgh:sbgh /etc/sbgh/daemon/secrets.env
 
 The handler, smee, and Postgres run in containers via
 [docker/docker-compose.yml](../docker/docker-compose.yml). The daemon
-stays on the host (it needs LVM + libvirt + the golden image).
+stays on the host as the trusted orchestrator. The separate loopback worker
+owns LVM, libvirt, and golden-image access.
 
 ### One DB role (the owner)
 

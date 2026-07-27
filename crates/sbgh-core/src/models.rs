@@ -708,6 +708,10 @@ pub enum JobEventKind {
     PhaseBuildFinished,
     PhaseBenchStarted,
     PhaseBenchFinished,
+    /// v25 task-neutral durable phase entry.
+    PhaseStarted,
+    /// v25 task-neutral durable phase exit.
+    PhaseFinished,
     TeardownStarted,
     TeardownFinished,
     CommentPosted,
@@ -816,6 +820,16 @@ pub enum QueuedEventDetail {
         commit: String,
         /// Which artifact binary is produced (`stacks_bench` today).
         build_target: BuildTarget,
+    },
+    /// Operator/API-requested block validation. The execution payload is
+    /// persisted separately in the fleet contract; this remains audit
+    /// provenance for why the job exists.
+    BlockValidation {
+        dataset_generation: String,
+        range_start: u64,
+        range_end: u64,
+        requested_shards: u32,
+        max_concurrency: u32,
     },
 }
 

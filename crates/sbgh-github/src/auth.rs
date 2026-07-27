@@ -226,6 +226,62 @@ impl InstallationTokenCache {
         Ok(token)
     }
 
+    /// Mint an uncached, repository-scoped token for a live fleet attempt.
+    ///
+    /// The caller keeps this token in memory only. Restricting it to one
+    /// repository and read-only contents avoids handing a worker the broader
+    /// installation token used by the orchestrator's reporting clients.
+    pub async fn mint_repository_read_token(
+        &self,
+        installation_id: i64,
+        github_repository_id: i64,
+    ) -> GitHubResult<InstallationToken> {
+        let jwt = self.creds.mint_jwt()?;
+        let url = format!(
+            "{}/app/installations/{}/access_tokens",
+            self.api_base_url
+                .trim_end_matches('/'),
+            installation_id
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {jwt}")).map_err(GitHubError::from)?,
+        );
+        headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("sbgh-worker-broker"));
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&serde_json::json!({
+                "repository_ids": [github_repository_id],
+                "permissions": { "contents": "read" }
+            }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_default();
+            return Err(GitHubError::Api(format!(
+                "repository-scoped token mint failed: {status}: {body}"
+            )));
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            token: String,
+            expires_at: DateTime<Utc>,
+        }
+        let response: Response = response.json().await?;
+        Ok(InstallationToken {
+            token: response.token,
+            expires_at: response.expires_at,
+        })
+    }
+
     async fn mint(&self, installation_id: i64) -> GitHubResult<InstallationToken> {
         let jwt = self.creds.mint_jwt()?;
         let url = format!(

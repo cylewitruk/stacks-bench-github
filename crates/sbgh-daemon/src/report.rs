@@ -12,8 +12,10 @@
 //! state is rendered through `sbgh-slack`; no Slack message is ever parsed or
 //! incrementally patched.
 //!
-//! Every method is **non-fatal**: an impl logs and swallows its own transport
-//! errors (a reporting failure never fails the benchmark) — hence `()` returns.
+//! Projection methods report transport failures to their caller. The fleet
+//! projector only acknowledges durable input after the external snapshot
+//! converges; legacy inline callers may deliberately log and ignore the error
+//! after the benchmark lifecycle has already been persisted.
 //!
 //! Wired from [`Reporter::run`](crate::reporter) (the lifecycle + the drain
 //! loop) and the runner's orphan recovery — both build their surface via
@@ -23,7 +25,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
+use sbgh_core::db::fleet::ReportProjectionSeed;
 use sbgh_github::{CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use tokio::sync::Mutex;
 
@@ -32,8 +36,8 @@ use crate::bench_summary::{self, RunResult, thousands};
 use crate::comparison::{BaselineComparison, GroupComparison};
 use crate::duration::format_elapsed;
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
+use crate::report_event::{PhaseLabel, ProgressUpdate};
 use crate::slack_report::{SlackSessionRegistry, build_slack_surface};
-use sbgh_driver::{PhaseLabel, ProgressUpdate};
 use sbgh_slack::SlackClient;
 
 /// Lifetime of the presigned `stacks-bench.db` download link in a Slack report.
@@ -46,6 +50,22 @@ const DB_LINK_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// bypass it so the final state shows immediately. The first edit after pickup
 /// is always allowed through.
 const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+pub(crate) fn pr_report_marker(group_id: uuid::Uuid) -> String {
+    format!("<!-- sbgh-report:{group_id} -->")
+}
+
+pub(crate) fn marked_pr_comment(group_id: uuid::Uuid, body: &str) -> String {
+    let marker = pr_report_marker(group_id);
+    if body
+        .lines()
+        .any(|line| line.trim() == marker)
+    {
+        body.to_owned()
+    } else {
+        format!("{body}\n\n{marker}")
+    }
+}
 
 /// Successful-run report data passed to surfaces at terminal completion.
 /// Surfaces consume only the fields they own: GitHub uses the PR baseline
@@ -61,26 +81,40 @@ pub struct CompletionReport<'a> {
 /// once per job by [`build_report_surface`]; the reporter drives it (`started`
 /// → `phase`/`heartbeat` → one of `completed`/`failed`/`cancelled`).
 ///
-/// Every method is **non-fatal**: an impl logs and swallows its own transport
-/// errors (a reporting failure never fails the benchmark). Hence `()` returns,
-/// not `Result`.
+/// Projection errors never change the benchmark outcome. They are returned so
+/// a durable projector can leave its input unacknowledged and retry the
+/// idempotent snapshot.
 #[async_trait]
 pub trait ReportSurface: Send + Sync {
+    /// Seed in-memory renderer state from already-projected durable history.
+    /// Implementations must not emit an external side effect here.
+    async fn restore(&self, _seed: &ReportProjectionSeed) {}
     /// Claimed → running.
-    async fn started(&self);
+    async fn started(&self) -> anyhow::Result<()>;
     /// A worker phase transition (`label.is_terminal()` bypasses any debounce).
-    async fn phase(&self, label: &PhaseLabel, elapsed: Duration);
+    async fn phase(&self, label: &PhaseLabel, elapsed: Duration) -> anyhow::Result<()>;
     /// A periodic "still alive" tick within the current phase (best-effort).
-    async fn heartbeat(&self, label: &PhaseLabel, elapsed: Duration);
+    #[cfg(test)]
+    async fn heartbeat(&self, label: &PhaseLabel, elapsed: Duration) -> anyhow::Result<()>;
     /// Fine-grained task progress (best-effort).
-    async fn progress(&self, progress: &ProgressUpdate);
+    async fn progress(&self, progress: &ProgressUpdate) -> anyhow::Result<()>;
     /// Terminal success — the run produced results.
-    async fn completed(&self, report: CompletionReport<'_>);
+    async fn completed(&self, report: CompletionReport<'_>) -> anyhow::Result<()>;
     /// Terminal failure — the run couldn't run / produce results.
-    async fn failed(&self, error: &str);
+    async fn failed(&self, error: &str) -> anyhow::Result<()>;
     /// Terminal cancellation — deliberately stopped (shutdown / orphan
     /// recovery).
-    async fn cancelled(&self, reason: &str);
+    async fn cancelled(&self, reason: &str) -> anyhow::Result<()>;
+}
+
+/// Legacy inline execution persists lifecycle state independently of provider
+/// reporting. Keep that policy explicit at its call sites while fleet
+/// projection propagates the same error for durable retry.
+#[cfg(test)]
+pub(crate) fn log_nonfatal_projection(job_id: uuid::Uuid, result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        tracing::warn!(%job_id, error = ?error, "report projection failed (non-fatal)");
+    }
 }
 
 /// Build the one reporting surface for `job`: the Slack snapshot for a Slack
@@ -180,6 +214,31 @@ impl GitHubReportSurface {
         summary: &serde_json::Value,
         comparison: Option<&BaselineComparison>,
     ) -> String {
+        if summary
+            .get("task")
+            .and_then(|value| value.as_str())
+            == Some("block_validation")
+        {
+            let valid = summary
+                .get("valid")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let checked = summary
+                .get("checked_blocks")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let invalid = summary
+                .get("invalid_block_count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let result = if valid { "passed" } else { "found invalid blocks" };
+            return format!(
+                "{} block validation **{result}** for commit `{}` — checked `{checked}` blocks, \
+                 `{invalid}` invalid.",
+                if valid { ":white_check_mark:" } else { ":x:" },
+                self.job.commit,
+            );
+        }
         let archive_dir = summary
             .get("archive_dir")
             .and_then(|v| v.as_str())
@@ -194,32 +253,39 @@ impl GitHubReportSurface {
         )
     }
 
-    /// Edit the PR comment if this job has one. Non-fatal.
-    async fn update_comment(&self, body: &str) {
+    /// Edit the PR comment if this job has one.
+    async fn update_comment(&self, body: &str) -> anyhow::Result<()> {
         let ProgressTarget::PullRequest {
             comment_id: Some(comment_id), ..
         } = self.job.progress
         else {
             tracing::debug!(job_id = %self.job.id, "progress (no comment surface)");
-            return;
+            return Ok(());
         };
-        if let Err(e) = self
-            .gh
-            .update_pr_comment(self.job.installation_id, &self.job.repository, comment_id, body)
+        self.update_comment_id(comment_id, body)
             .await
-        {
-            tracing::warn!(job_id = %self.job.id, error = ?e, "update PR comment failed (non-fatal)");
-        }
+    }
+
+    async fn update_comment_id(&self, comment_id: i64, body: &str) -> anyhow::Result<()> {
+        let body = marked_pr_comment(self.job.benchmark_group_id, body);
+        self.gh
+            .update_pr_comment(self.job.installation_id, &self.job.repository, comment_id, &body)
+            .await
+            .map_err(anyhow::Error::new)
+            .context("updating GitHub PR comment")
+            .map(|_| ())
     }
 
     /// Complete this job's Check Run with `conclusion` if it has one.
-    /// Non-fatal.
-    async fn complete_check(&self, conclusion: CheckRunConclusion, output: CheckRunOutput) {
+    async fn complete_check(
+        &self,
+        conclusion: CheckRunConclusion,
+        output: CheckRunOutput,
+    ) -> anyhow::Result<()> {
         let Some(check_run_id) = self.check_run_id() else {
-            return;
+            return Ok(());
         };
-        if let Err(e) = self
-            .gh
+        self.gh
             .update_check_run(
                 self.job.installation_id,
                 &self.job.repository,
@@ -230,35 +296,40 @@ impl GitHubReportSurface {
                 },
             )
             .await
-        {
-            tracing::warn!(job_id = %self.job.id, error = ?e, "update Check Run failed (non-fatal)");
-        }
+            .map_err(anyhow::Error::new)
+            .context("updating GitHub Check Run")
+            .map(|_| ())
     }
 
     /// Per-phase comment + check update, debounced (from `ProgressSink`). The
     /// reporter owns the check's terminal state, so a terminal phase skips the
     /// check here (no flicker / redundant PATCH).
-    async fn try_update(&self, label: &PhaseLabel, elapsed: Duration, force: bool) {
+    async fn try_update(
+        &self,
+        label: &PhaseLabel,
+        elapsed: Duration,
+        force: bool,
+    ) -> anyhow::Result<()> {
         let comment_id = self.comment_id();
         let check_run_id = if label.is_terminal() { None } else { self.check_run_id() };
         if comment_id.is_none() && check_run_id.is_none() {
             tracing::debug!(job_id = %self.job.id, phase = %label, "phase (no reporting surface)");
-            return;
+            return Ok(());
         }
 
         // Shared debounce. Brief lock — not held across the network calls.
         {
-            let mut state = self.phase_state.lock().await;
+            let state = self.phase_state.lock().await;
             if !force
                 && let Some(last) = state.last_update_at
                 && last.elapsed() < PR_UPDATE_MIN_INTERVAL
             {
                 tracing::trace!(phase = %label, since_last = ?last.elapsed(), "phase update debounced");
-                return;
+                return Ok(());
             }
-            state.last_update_at = Some(Instant::now());
         }
 
+        let mut first_error = None;
         if let Some(comment_id) = comment_id {
             let body = format!(
                 ":construction: benchmark `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
@@ -267,17 +338,11 @@ impl GitHubReportSurface {
                 elapsed = format_elapsed(elapsed),
                 sha = self.job.commit,
             );
-            if let Err(e) = self
-                .gh
-                .update_pr_comment(
-                    self.job.installation_id,
-                    &self.job.repository,
-                    comment_id,
-                    &body,
-                )
+            if let Err(error) = self
+                .update_comment_id(comment_id, &body)
                 .await
             {
-                tracing::warn!(error = ?e, "phase comment update failed (non-fatal)");
+                first_error = Some(error.context("updating GitHub phase comment"));
             }
         }
 
@@ -292,7 +357,7 @@ impl GitHubReportSurface {
                 ),
                 text: None,
             };
-            if let Err(e) = self
+            if let Err(error) = self
                 .gh
                 .update_check_run(
                     self.job.installation_id,
@@ -305,44 +370,71 @@ impl GitHubReportSurface {
                 )
                 .await
             {
-                tracing::warn!(error = ?e, "phase check update failed (non-fatal)");
+                let error = anyhow::Error::new(error).context("updating GitHub phase Check Run");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                } else {
+                    tracing::warn!(error = ?error, "additional report projection failure");
+                }
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.phase_state
+            .lock()
+            .await
+            .last_update_at = Some(Instant::now());
+        Ok(())
+    }
+}
+
+fn combine_projection_results(
+    primary: anyhow::Result<()>,
+    secondary: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match (primary, secondary) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        (Err(primary), Err(secondary)) => {
+            tracing::warn!(error = ?secondary, "additional report projection failure");
+            Err(primary)
         }
     }
 }
 
 #[async_trait]
 impl ReportSurface for GitHubReportSurface {
-    async fn started(&self) {
+    async fn started(&self) -> anyhow::Result<()> {
         self.update_comment(&format!(
             ":rocket: benchmark `{id}` is running on commit `{sha}`.",
             id = self.job.id,
             sha = self.job.commit,
         ))
-        .await;
+        .await
     }
 
-    async fn phase(&self, label: &PhaseLabel, elapsed: Duration) {
+    async fn phase(&self, label: &PhaseLabel, elapsed: Duration) -> anyhow::Result<()> {
         let force = label.is_terminal();
         self.try_update(label, elapsed, force)
-            .await;
+            .await
     }
 
-    async fn heartbeat(&self, label: &PhaseLabel, elapsed: Duration) {
+    #[cfg(test)]
+    async fn heartbeat(&self, label: &PhaseLabel, elapsed: Duration) -> anyhow::Result<()> {
         self.try_update(label, elapsed, false)
-            .await;
+            .await
     }
 
-    async fn progress(&self, progress: &ProgressUpdate) {
+    async fn progress(&self, progress: &ProgressUpdate) -> anyhow::Result<()> {
         let comment_id = self.comment_id();
         let check_run_id = self.check_run_id();
         if comment_id.is_none() && check_run_id.is_none() {
             tracing::debug!(job_id = %self.job.id, phase = %progress.phase, "progress (no reporting surface)");
-            return;
+            return Ok(());
         }
 
         {
-            let mut state = self.phase_state.lock().await;
+            let state = self.phase_state.lock().await;
             if let Some(last) = state.last_update_at
                 && last.elapsed() < PR_UPDATE_MIN_INTERVAL
             {
@@ -351,29 +443,23 @@ impl ReportSurface for GitHubReportSurface {
                     since_last = ?last.elapsed(),
                     "progress update debounced",
                 );
-                return;
+                return Ok(());
             }
-            state.last_update_at = Some(Instant::now());
         }
 
         let summary = format_progress_summary(progress);
+        let mut first_error = None;
         if let Some(comment_id) = comment_id {
             let body = format!(
                 ":construction: benchmark `{id}` — {summary} (commit `{sha}`)",
                 id = self.job.id,
                 sha = self.job.commit,
             );
-            if let Err(e) = self
-                .gh
-                .update_pr_comment(
-                    self.job.installation_id,
-                    &self.job.repository,
-                    comment_id,
-                    &body,
-                )
+            if let Err(error) = self
+                .update_comment_id(comment_id, &body)
                 .await
             {
-                tracing::warn!(error = ?e, "progress comment update failed (non-fatal)");
+                first_error = Some(error.context("updating GitHub progress comment"));
             }
         }
 
@@ -383,7 +469,7 @@ impl ReportSurface for GitHubReportSurface {
                 summary: format!("{summary} — commit `{}`", self.job.commit),
                 text: None,
             };
-            if let Err(e) = self
+            if let Err(error) = self
                 .gh
                 .update_check_run(
                     self.job.installation_id,
@@ -396,65 +482,109 @@ impl ReportSurface for GitHubReportSurface {
                 )
                 .await
             {
-                tracing::warn!(error = ?e, "progress check update failed (non-fatal)");
+                let error = anyhow::Error::new(error).context("updating GitHub progress Check Run");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                } else {
+                    tracing::warn!(error = ?error, "additional report projection failure");
+                }
             }
         }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.phase_state
+            .lock()
+            .await
+            .last_update_at = Some(Instant::now());
+        Ok(())
     }
 
-    async fn completed(&self, report: CompletionReport<'_>) {
+    async fn completed(&self, report: CompletionReport<'_>) -> anyhow::Result<()> {
         let body = self
             .completed_body(report.summary, report.baseline_comparison)
             .await;
-        self.update_comment(&body)
+        let comment_result = self
+            .update_comment(&body)
             .await;
         let pointer = if self.has_comment() { "see comment / details" } else { "see details" };
-        // The benchmark RAN and produced results → success (perf is data, not a
-        // gate — a regression doesn't flip this).
-        self.complete_check(
-            CheckRunConclusion::Success,
-            CheckRunOutput {
-                title: format!("benchmark {} — complete", self.job.id),
-                summary: format!("commit `{}` — {pointer}", self.job.commit),
-                text: Some(body),
-            },
-        )
-        .await;
+        let block_validation = report
+            .summary
+            .get("task")
+            .and_then(|value| value.as_str())
+            == Some("block_validation");
+        let conclusion = if block_validation
+            && !report
+                .summary
+                .get("valid")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        {
+            CheckRunConclusion::Failure
+        } else {
+            // A benchmark ran and produced results. Performance is data, not a
+            // gate; block validation is a correctness result and can be red.
+            CheckRunConclusion::Success
+        };
+        let check_result = self
+            .complete_check(
+                conclusion,
+                CheckRunOutput {
+                    title: format!(
+                        "{} {} — complete",
+                        if block_validation { "block validation" } else { "benchmark" },
+                        self.job.id
+                    ),
+                    summary: format!("commit `{}` — {pointer}", self.job.commit),
+                    text: Some(body),
+                },
+            )
+            .await;
+        combine_projection_results(comment_result, check_result)
     }
 
-    async fn failed(&self, error: &str) {
+    async fn failed(&self, error: &str) -> anyhow::Result<()> {
         let snippet = short_pr_error(error);
-        self.update_comment(&format!(
-            ":x: benchmark `{id}` failed: `{snippet}`\n\n_(full details in the daemon logs)_",
-            id = self.job.id,
-        ))
-        .await;
-        self.complete_check(
-            CheckRunConclusion::Failure,
-            CheckRunOutput {
-                title: format!("benchmark {} — failed", self.job.id),
-                summary: format!("commit `{}` failed", self.job.commit),
-                text: Some(format!("```\n{snippet}\n```\n\n_(full details in the daemon logs)_")),
-            },
-        )
-        .await;
+        let comment_result = self
+            .update_comment(&format!(
+                ":x: benchmark `{id}` failed: `{snippet}`\n\n_(full details in the daemon logs)_",
+                id = self.job.id,
+            ))
+            .await;
+        let check_result = self
+            .complete_check(
+                CheckRunConclusion::Failure,
+                CheckRunOutput {
+                    title: format!("benchmark {} — failed", self.job.id),
+                    summary: format!("commit `{}` failed", self.job.commit),
+                    text: Some(format!(
+                        "```\n{snippet}\n```\n\n_(full details in the daemon logs)_"
+                    )),
+                },
+            )
+            .await;
+        combine_projection_results(comment_result, check_result)
     }
 
-    async fn cancelled(&self, reason: &str) {
-        self.update_comment(&format!(
-            ":no_entry_sign: benchmark `{id}` cancelled: {reason}. Re-run with `/benchmark`.",
-            id = self.job.id,
-        ))
-        .await;
+    async fn cancelled(&self, reason: &str) -> anyhow::Result<()> {
+        let comment_result = self
+            .update_comment(&format!(
+                ":no_entry_sign: benchmark `{id}` cancelled: {reason}. Re-run with `/benchmark`.",
+                id = self.job.id,
+            ))
+            .await;
         let hint = self.retrigger_hint();
-        self.complete_check(
-            CheckRunConclusion::Cancelled,
-            CheckRunOutput {
-                title: format!("benchmark {} — cancelled", self.job.id),
-                summary: format!("commit `{}` — {reason}", self.job.commit),
-                text: Some(format!("Cancelled: {reason}. {hint}")),
-            },
-        )
-        .await;
+        let check_result = self
+            .complete_check(
+                CheckRunConclusion::Cancelled,
+                CheckRunOutput {
+                    title: format!("benchmark {} — cancelled", self.job.id),
+                    summary: format!("commit `{}` — {reason}", self.job.commit),
+                    text: Some(format!("Cancelled: {reason}. {hint}")),
+                },
+            )
+            .await;
+        combine_projection_results(comment_result, check_result)
     }
 }
 
@@ -466,13 +596,28 @@ pub struct NoopReportSurface;
 
 #[async_trait]
 impl ReportSurface for NoopReportSurface {
-    async fn started(&self) {}
-    async fn phase(&self, _label: &PhaseLabel, _elapsed: Duration) {}
-    async fn heartbeat(&self, _label: &PhaseLabel, _elapsed: Duration) {}
-    async fn progress(&self, _progress: &ProgressUpdate) {}
-    async fn completed(&self, _report: CompletionReport<'_>) {}
-    async fn failed(&self, _error: &str) {}
-    async fn cancelled(&self, _reason: &str) {}
+    async fn started(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn phase(&self, _label: &PhaseLabel, _elapsed: Duration) -> anyhow::Result<()> {
+        Ok(())
+    }
+    #[cfg(test)]
+    async fn heartbeat(&self, _label: &PhaseLabel, _elapsed: Duration) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn progress(&self, _progress: &ProgressUpdate) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn completed(&self, _report: CompletionReport<'_>) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn failed(&self, _error: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn cancelled(&self, _reason: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ─────────────────────── shared helpers ───────────────────────
@@ -659,6 +804,21 @@ mod tests {
             })
     }
 
+    #[test]
+    fn pr_report_marker_is_preserved_exactly_once() {
+        let group_id = Uuid::new_v4();
+        let marked = marked_pr_comment(group_id, "snapshot");
+        let marker = pr_report_marker(group_id);
+        assert_eq!(
+            marked
+                .lines()
+                .filter(|line| line.trim() == marker)
+                .count(),
+            1
+        );
+        assert_eq!(marked_pr_comment(group_id, &marked), marked);
+    }
+
     // ── GitHub lifecycle (ported from progress.rs) ──
 
     #[tokio::test]
@@ -667,7 +827,8 @@ mod tests {
         let summary = serde_json::json!({});
         github(&gh, check_job(11))
             .completed(completion_report(&summary))
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             concluded_state(&gh),
             Some(CheckRunState::Completed(CheckRunConclusion::Success))
@@ -679,7 +840,8 @@ mod tests {
         let gh = Arc::new(FakeGitHub::new());
         github(&gh, check_job(11))
             .failed("boom: VM died")
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             concluded_state(&gh),
             Some(CheckRunState::Completed(CheckRunConclusion::Failure))
@@ -691,7 +853,8 @@ mod tests {
         let gh = Arc::new(FakeGitHub::new());
         github(&gh, check_job(11))
             .cancelled("aborted by shutdown")
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             concluded_state(&gh),
             Some(CheckRunState::Completed(CheckRunConclusion::Cancelled))
@@ -716,7 +879,8 @@ mod tests {
         let gh = Arc::new(FakeGitHub::new());
         github(&gh, check_job(11))
             .cancelled("aborted by shutdown")
-            .await;
+            .await
+            .unwrap();
         let baseline = check_text(&gh);
         assert!(!baseline.contains("/benchmark"), "baseline must not say /benchmark: {baseline}");
         assert!(baseline.contains("push"), "baseline hint mentions pushing: {baseline}");
@@ -730,7 +894,8 @@ mod tests {
         });
         github(&gh_pr, pr)
             .cancelled("aborted by shutdown")
-            .await;
+            .await
+            .unwrap();
         assert!(check_text(&gh_pr).contains("/benchmark"), "PR job re-runs via /benchmark");
     }
 
@@ -741,7 +906,8 @@ mod tests {
         let gh = Arc::new(FakeGitHub::new());
         github(&gh, check_job(777))
             .phase(&PhaseLabel::new("building", false), Duration::ZERO)
-            .await;
+            .await
+            .unwrap();
         let title = gh
             .calls()
             .into_iter()
@@ -762,21 +928,59 @@ mod tests {
             check_run_id: Some(900),
             check_run_url: None,
         });
+        let marker = pr_report_marker(job.benchmark_group_id);
         github(&gh, job)
             .phase(&PhaseLabel::new("running", false), Duration::ZERO)
-            .await;
+            .await
+            .unwrap();
         let calls = gh.calls();
         assert!(
             calls
                 .iter()
-                .any(|c| matches!(c, FakeCall::UpdateComment { .. })),
-            "comment updated"
+                .any(|c| matches!(c, FakeCall::UpdateComment { body, .. }
+                    if body.lines().any(|line| line.trim() == marker))),
+            "every full-body comment update retains the reconciliation marker"
         );
         assert!(
             calls
                 .iter()
                 .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
             "check updated"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_projection_propagates_transport_failure_after_attempting_both_surfaces() {
+        let gh = Arc::new(FakeGitHub::new());
+        gh.fail_update_comment();
+        let job = job_with(ProgressTarget::PullRequest {
+            pr_number: 7,
+            comment_id: Some(800),
+            check_run_id: Some(900),
+            check_run_url: None,
+        });
+
+        let error = github(&gh, job)
+            .phase(&PhaseLabel::new("running", false), Duration::ZERO)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("phase comment")
+        );
+        let calls = gh.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, FakeCall::UpdateComment { .. }))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, FakeCall::UpdateCheckRun { .. })),
+            "a comment failure must not prevent the independently idempotent check update"
         );
     }
 
@@ -791,7 +995,7 @@ mod tests {
         });
         github(&gh, job)
             .progress(&ProgressUpdate {
-                workflow_step: sbgh_driver::WorkflowStep::Run,
+                workflow_step: crate::report_event::WorkflowStep::Run,
                 run_index: 0,
                 requested_run_count: 1,
                 phase: "replay".into(),
@@ -799,7 +1003,8 @@ mod tests {
                 total: Some(100),
                 message: Some("Replaying measured entries".into()),
             })
-            .await;
+            .await
+            .unwrap();
 
         let calls = gh.calls();
         assert!(
@@ -821,7 +1026,8 @@ mod tests {
         let gh = Arc::new(FakeGitHub::new());
         github(&gh, check_job(5))
             .phase(&PhaseLabel::new("done", true), Duration::ZERO)
-            .await;
+            .await
+            .unwrap();
         assert!(
             !gh.calls()
                 .iter()
@@ -870,6 +1076,7 @@ mod tests {
         }
         async fn find_baseline(
             &self,
+            _subject_job_id: Uuid,
             _m: &str,
             _b: &str,
             _at: Option<chrono::DateTime<chrono::Utc>>,
@@ -933,7 +1140,8 @@ mod tests {
         let summary = serde_json::json!({});
         surface
             .completed(completion_report(&summary))
-            .await;
+            .await
+            .unwrap();
         assert!(
             gh.calls()
                 .iter()

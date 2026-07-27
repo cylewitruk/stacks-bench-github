@@ -1,3 +1,4 @@
+pub mod fleet;
 pub mod ingest;
 pub mod installation;
 pub mod jobs;
