@@ -120,11 +120,12 @@ positive or negative correctness result.
   capacity, CPU/NUMA, and NVMe behavior before selecting N/K/concurrency or the
   final disk layout.
 
-## Resolved substrate scope
+## v25 Substrate Scope
 
-- **Substrate scope** (v6 OQ2): confirmed — block-val does **not** share bench's
-  chainstate-provisioning shape; it needs full-chainstate + N CoW workspaces + a
-  probe-driven partition.
+- v25 did not share benchmark's chainstate-provisioning shape: it used a
+  full-chainstate directory plus N filesystem CoW workspaces and a probe-driven
+  partition. This records the shipped v25 implementation, not a permanent
+  storage decision.
 
 ## Shipped Outcome
 
@@ -139,3 +140,9 @@ The recipe, parser, partition, reduction, cancellation, and protocol paths are
 covered by the green v25 workspace suite. Physical dataset hydration and
 long-running validation on the dedicated host remain rollout checks in the
 [worker-fleet operations guide](../../../docs/worker-fleet-operations.md).
+
+[v26](../../iterations/v26-sandboxed-worker-execution.md) supersedes the v25
+substrate detail: it moves the recipe into one resource-profiled libvirt VM,
+reuses benchmark's LVM-thin snapshot provider with K snapshots of an exact
+sealed origin generation, and forbids repository-built payloads from executing
+directly on the worker host.

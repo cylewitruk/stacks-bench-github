@@ -605,3 +605,8 @@ Deployment-specific host characterization, certificate rotation, failure
 injection, rollback, and soak checks remain operational rollout work tracked in
 the [worker-fleet operations guide](../../../docs/worker-fleet-operations.md);
 they are not recorded here as locally executed.
+
+Execution isolation continues in
+[v26](../../iterations/v26-sandboxed-worker-execution.md), which removes block
+validation's direct-host execution exception without changing the fleet
+protocol.
