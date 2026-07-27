@@ -204,12 +204,6 @@ pub struct PathsConfig {
     pub results_tmpfs_root: PathBuf,
     /// Persistent destination for `run.sqlite` after a job completes.
     pub results_archive_dir: PathBuf,
-    /// Host-side directory bind-mounted into every job's VM via virtio-fs
-    /// as the sccache compiler cache. Persistent across jobs — that's the
-    /// whole point. sccache enforces its own size cap (`SCCACHE_CACHE_SIZE`,
-    /// see template) so this dir grows to at most ~20 GiB even if you
-    /// never clean it manually.
-    pub sccache_dir: PathBuf,
     pub virsh_binary: PathBuf,
     pub sudo_binary: PathBuf,
     pub qemu_img_binary: PathBuf,
@@ -228,6 +222,10 @@ pub struct LvmConfig {
     /// - `None` (default): no `-L` — thin snapshot in the pool.
     /// - `Some(n)`: thick snapshot with an `n GiB` COW exception store.
     pub chainstate_snapshot_size_gib: Option<u32>,
+    /// Fixed setup-health floor shared by thin-snapshot workloads.
+    pub min_data_free_percent: f64,
+    /// Fixed setup-health floor for the thin-pool metadata LV.
+    pub min_metadata_free_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,7 +584,6 @@ struct RawPaths {
     git_mirror: Option<PathBuf>,
     results_tmpfs_root: Option<PathBuf>,
     results_archive_dir: Option<PathBuf>,
-    sccache_dir: Option<PathBuf>,
     virsh_binary: Option<PathBuf>,
     sudo_binary: Option<PathBuf>,
     qemu_img_binary: Option<PathBuf>,
@@ -601,6 +598,8 @@ struct RawLvm {
     thinpool: Option<String>,
     chainstate_base_prefix: Option<String>,
     chainstate_snapshot_size_gib: Option<u32>,
+    min_data_free_percent: Option<f64>,
+    min_metadata_free_percent: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -682,7 +681,6 @@ impl RawDaemon {
                 .paths
                 .results_archive_dir,
         );
-        merge_opt(&mut self.paths.sccache_dir, other.paths.sccache_dir);
         merge_opt(&mut self.paths.virsh_binary, other.paths.virsh_binary);
         merge_opt(&mut self.paths.sudo_binary, other.paths.sudo_binary);
         merge_opt(&mut self.paths.qemu_img_binary, other.paths.qemu_img_binary);
@@ -713,6 +711,20 @@ impl RawDaemon {
             other
                 .lvm
                 .chainstate_snapshot_size_gib,
+        );
+        merge_opt(
+            &mut self.lvm.min_data_free_percent,
+            other
+                .lvm
+                .min_data_free_percent,
+        );
+        merge_opt(
+            &mut self
+                .lvm
+                .min_metadata_free_percent,
+            other
+                .lvm
+                .min_metadata_free_percent,
         );
 
         merge_opt(
@@ -814,7 +826,6 @@ impl RawDaemon {
         env_path_into(&mut self.paths.git_mirror, "SBGH_GIT_MIRROR");
         env_path_into(&mut self.paths.results_tmpfs_root, "SBGH_RESULTS_TMPFS_ROOT");
         env_path_into(&mut self.paths.results_archive_dir, "SBGH_RESULTS_ARCHIVE_DIR");
-        env_path_into(&mut self.paths.sccache_dir, "SBGH_SCCACHE_DIR");
         env_path_into(&mut self.paths.virsh_binary, "SBGH_VIRSH_BIN");
         env_path_into(&mut self.paths.sudo_binary, "SBGH_SUDO_BIN");
         env_path_into(&mut self.paths.qemu_img_binary, "SBGH_QEMU_IMG_BIN");
@@ -839,6 +850,13 @@ impl RawDaemon {
                 .lvm
                 .chainstate_snapshot_size_gib,
             "SBGH_LVM_SNAPSHOT_GIB",
+        );
+        env_parse_into(&mut self.lvm.min_data_free_percent, "SBGH_LVM_MIN_DATA_FREE_PERCENT");
+        env_parse_into(
+            &mut self
+                .lvm
+                .min_metadata_free_percent,
+            "SBGH_LVM_MIN_METADATA_FREE_PERCENT",
         );
 
         env_into(&mut self.stacks_bench.default_args, "SBGH_STACKS_BENCH_ARGS");
@@ -1017,10 +1035,6 @@ impl RawDaemon {
                     .paths
                     .results_archive_dir
                     .unwrap_or_else(|| PathBuf::from("/var/lib/sbgh/results")),
-                sccache_dir: self
-                    .paths
-                    .sccache_dir
-                    .unwrap_or_else(|| PathBuf::from("/var/lib/sbgh/sccache")),
                 virsh_binary: self
                     .paths
                     .virsh_binary
@@ -1052,6 +1066,14 @@ impl RawDaemon {
                 chainstate_snapshot_size_gib: self
                     .lvm
                     .chainstate_snapshot_size_gib,
+                min_data_free_percent: self
+                    .lvm
+                    .min_data_free_percent
+                    .unwrap_or(5.0),
+                min_metadata_free_percent: self
+                    .lvm
+                    .min_metadata_free_percent
+                    .unwrap_or(5.0),
             },
             stacks_bench: StacksBenchConfig {
                 default_args: self

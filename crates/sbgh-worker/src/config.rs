@@ -21,21 +21,6 @@ pub struct WorkerConfig {
     pub resources: ResourceFacts,
     pub libvirt: Option<LibvirtConfig>,
     pub binary_cache: Option<BinaryCacheConfig>,
-    pub block_validation: Option<BlockValidationConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BlockValidationConfig {
-    pub canonical_dataset: PathBuf,
-    pub workspace_root: PathBuf,
-    pub source_cache: PathBuf,
-    pub binary_cache: PathBuf,
-    pub chain_config: PathBuf,
-    #[serde(default = "default_git")]
-    pub git_binary: PathBuf,
-    #[serde(default = "default_cargo")]
-    pub cargo_binary: PathBuf,
 }
 
 impl WorkerConfig {
@@ -88,10 +73,14 @@ impl WorkerConfig {
             .capabilities
             .contains(&WorkerCapability::BlockValidation)
         {
-            let block = self
+            let libvirt = self
+                .libvirt
+                .as_ref()
+                .context("block_validation capability requires [libvirt]")?;
+            let block = libvirt
                 .block_validation
                 .as_ref()
-                .context("block_validation capability requires [block_validation]")?;
+                .context("block_validation capability requires [libvirt.block_validation]")?;
             let dataset = self
                 .resources
                 .dataset
@@ -99,29 +88,40 @@ impl WorkerConfig {
                 .context("block_validation capability requires resources.dataset")?;
             validate_dataset(dataset)?;
             for (name, path) in [
-                ("canonical_dataset", &block.canonical_dataset),
-                ("workspace_root", &block.workspace_root),
-                ("source_cache", &block.source_cache),
-                ("binary_cache", &block.binary_cache),
                 ("chain_config", &block.chain_config),
-                ("git_binary", &block.git_binary),
-                ("cargo_binary", &block.cargo_binary),
+                ("dataset.manifest_path", &block.dataset.manifest_path),
             ] {
                 ensure!(path.is_absolute(), "{name} must be an absolute path");
             }
             ensure!(
-                block.canonical_dataset != block.workspace_root
-                    && !block
-                        .canonical_dataset
-                        .starts_with(&block.workspace_root)
-                    && !block
-                        .workspace_root
-                        .starts_with(&block.canonical_dataset),
-                "canonical_dataset and workspace_root must be disjoint"
+                block.vcpus > 0
+                    && block.vcpus <= self.resources.logical_cpus
+                    && block.memory_bytes > 0
+                    && u64::from(block.results_tmpfs_mib)
+                        .checked_mul(1024 * 1024)
+                        .and_then(|tmpfs| block
+                            .memory_bytes
+                            .checked_add(tmpfs))
+                        .is_some_and(|reserved| reserved <= self.resources.memory_bytes),
+                "block-validation profile exceeds registered CPU or memory"
             );
             ensure!(
-                block.source_cache != block.binary_cache,
-                "source_cache and binary_cache must be distinct"
+                block.max_shards > 0
+                    && block.max_concurrency > 0
+                    && block.max_concurrency <= block.max_shards,
+                "invalid block-validation shard/concurrency limits"
+            );
+            ensure!(
+                block.dataset.generation == dataset.generation
+                    && block.dataset.network == dataset.network
+                    && block.dataset.format_version == dataset.format_version
+                    && block.dataset.covered_start == dataset.covered_start
+                    && block.dataset.covered_end == dataset.covered_end
+                    && block
+                        .dataset
+                        .manifest_sha256
+                        .eq_ignore_ascii_case(&dataset.manifest_sha256),
+                "libvirt block dataset must exactly match resources.dataset"
             );
         }
         Ok(())
@@ -133,14 +133,6 @@ fn validate_dataset(dataset: &DatasetIdentity) -> anyhow::Result<()> {
     dataset
         .validate()
         .map_err(anyhow::Error::new)
-}
-
-fn default_git() -> PathBuf {
-    "/usr/bin/git".into()
-}
-
-fn default_cargo() -> PathBuf {
-    "/usr/bin/cargo".into()
 }
 
 #[cfg(test)]

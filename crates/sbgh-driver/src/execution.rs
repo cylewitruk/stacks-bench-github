@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use crate::BenchmarkRunContext;
+use crate::{BenchmarkRunContext, BlockValidationOutput, BlockValidationTaskSpec};
 
 #[derive(Debug, Clone)]
 pub struct ExecutionRequest {
@@ -14,6 +14,8 @@ pub struct ExecutionRequest {
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     pub job_id: Uuid,
+    pub attempt_id: Uuid,
+    pub fencing_generation: u64,
     pub repository: String,
     pub commit: String,
     pub repository_credential: Option<RepositoryCredential>,
@@ -42,6 +44,7 @@ impl std::fmt::Debug for RepositoryCredential {
 pub enum ExecutionTask {
     Benchmark(BenchmarkTask),
     BuildOnly,
+    BlockValidation(BlockValidationTaskSpec),
     Unsupported { combination: String },
 }
 
@@ -70,4 +73,5 @@ pub enum TaskStatus {
 pub struct ExecutionOutcome {
     pub status: TaskStatus,
     pub summary: serde_json::Value,
+    pub block_validation: Option<BlockValidationOutput>,
 }

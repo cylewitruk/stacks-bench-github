@@ -221,6 +221,7 @@ impl Driver for CompletedDriver {
         Ok(DriverOutcome {
             status: DriverStatus::Completed,
             summary: serde_json::json!({ "finish_reason": "test" }),
+            output: sbgh_driver::DriverTaskOutput::None,
         })
     }
 
@@ -244,6 +245,7 @@ impl Driver for FailedDriver {
         Ok(DriverOutcome {
             status: DriverStatus::Failed("bench failed".into()),
             summary: serde_json::json!({ "finish_reason": "bench_failed" }),
+            output: sbgh_driver::DriverTaskOutput::None,
         })
     }
 
@@ -402,7 +404,6 @@ fn test_config(tmp: &TempDir) -> DaemonConfig {
             git_mirror: p.join("mirror.git"),
             results_tmpfs_root: p.join("tmpfs"),
             results_archive_dir: p.join("archive"),
-            sccache_dir: p.join("sccache"),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -414,6 +415,8 @@ fn test_config(tmp: &TempDir) -> DaemonConfig {
             thinpool: "thinpool".into(),
             chainstate_base_prefix: "mainnet-".into(),
             chainstate_snapshot_size_gib: None,
+            min_data_free_percent: 5.0,
+            min_metadata_free_percent: 5.0,
         },
         stacks_bench: StacksBenchConfig { default_args: String::new() },
         api: ApiConfig {
@@ -497,10 +500,6 @@ fn test_libvirt_driver(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Arc<
                     .paths
                     .results_archive_dir
                     .clone(),
-                sccache_dir: config
-                    .paths
-                    .sccache_dir
-                    .clone(),
                 virsh_binary: config
                     .paths
                     .virsh_binary
@@ -532,6 +531,12 @@ fn test_libvirt_driver(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Arc<
                 chainstate_snapshot_size_gib: config
                     .lvm
                     .chainstate_snapshot_size_gib,
+                min_data_free_percent: config
+                    .lvm
+                    .min_data_free_percent,
+                min_metadata_free_percent: config
+                    .lvm
+                    .min_metadata_free_percent,
             },
             service_user: config
                 .server
@@ -541,6 +546,7 @@ fn test_libvirt_driver(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Arc<
                 .runner
                 .host_cpus
                 .clone(),
+            block_validation: None,
         },
         shell,
         execution_sink(artifact_store),
@@ -1927,11 +1933,11 @@ async fn startup_recovers_orphaned_running_job() {
     let source = Arc::new(FakeSource::new(pr_job("abc123", None)));
     source.add_orphan(Uuid::new_v4());
 
-    // `cleanup_by_job_id` for an orphan with no loop attached issues seven
-    // shell calls: destroy, undefine, umount(tmpfs), umount(source.mnt),
-    // losetup -j (empty), lvremove, git prune.
+    // Cleanup first proves the domain state, then destroys/undefines it before
+    // touching any backing resource.
     let shell = Arc::new(RecordingShell::new());
     shell
+        .reply(PreparedReply::with_stdout("running\n")) // virsh domstate
         .expect_ok(1) // virsh destroy
         .expect_ok(1) // virsh undefine
         .expect_ok(1) // umount tmpfs
@@ -1983,6 +1989,7 @@ async fn startup_leaves_orphan_running_when_cleanup_incomplete() {
     // `losetup -j` lists a device whose `-d` FAILS → cleanup reports incomplete.
     let shell = Arc::new(RecordingShell::new());
     shell
+        .reply(PreparedReply::with_stdout("running\n")) // virsh domstate
         .expect_ok(1) // virsh destroy
         .expect_ok(1) // virsh undefine
         .expect_ok(1) // umount tmpfs

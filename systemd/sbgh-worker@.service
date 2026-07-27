@@ -22,8 +22,9 @@ Environment=RUST_LOG=info,sbgh_worker=info
 EnvironmentFile=-/etc/sbgh/worker/secrets.env
 
 # The worker has no database, Slack, GitHub App, or object-store credentials.
-# Benchmark profiles may need the documented narrow sudo/libvirt permissions;
-# block-validation profiles should not grant sudo at all.
+# Execution profiles need the documented narrow sudo/libvirt permissions for
+# fixed VM/LVM lifecycle commands. Untrusted payloads never receive that host
+# authority.
 NoNewPrivileges=false
 RestrictSUIDSGID=false
 PrivateDevices=false

@@ -63,41 +63,89 @@ attempts; rotation invalidates every outstanding lease token.
    intended worker profile. Use `systemctl enable --now sbgh-daemon.service`
    followed by `systemctl enable --now sbgh-worker@<profile>.service`.
 
-The benchmark worker alone receives the narrow sudo/libvirt permissions
-documented in [host-bringup.md](host-bringup.md). The block-validation worker
-must not receive sudo.
+Every execution worker receives only the narrow sudo/libvirt permissions
+documented in [host-bringup.md](host-bringup.md). Repository builds and produced
+executables run in disposable VMs; sudo is used only by the trusted libvirt/LVM
+adapter for fixed infrastructure commands.
 
-## Host and dataset qualification
+v26 does not mount a persistent sccache directory into guests. After draining
+all pre-v26 workers, an operator may remove the obsolete
+`/var/lib/sbgh-worker/sccache`; compiler-cache state is guest-local and the
+fingerprinted binary cache remains the cross-attempt reuse mechanism.
 
-Run the non-destructive characterization before choosing shard counts:
+Use a dedicated, guest-safe `stacks-inspect` chain configuration for block
+validation. The worker copies it into the VM, so it must not be a production
+follower configuration containing RPC passwords, node keys, seed material, or
+other reusable credentials.
+
+## Host and dataset validation
+
+Block validation consumes a read-only, sealed LVM-thin origin generation. The
+configured manifest path must be on a read-only mount whose source resolves to
+that exact LV; startup rejects a copied or unrelated manifest, a writable
+origin, missing provenance tags, an identity/digest mismatch, or a
+`.sbgh-dataset-files.sha256` digest that does not match the sealed manifest.
+The guest repeats both manifest checks after mounting its snapshots. The origin
+is never attached to a guest.
+
+Before enabling the capability, run the worker preflight and record:
 
 ```bash
-sudo -u sbgh-worker ./scripts/characterize-worker-host.sh \
-  /var/lib/sbgh-worker/host-characterization.md /srv/sbgh/workspaces
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/block-validation.toml \
+  --preflight-only
+sudo lvs -o vg_name,lv_name,lv_attr,lv_tags,lv_size,data_percent,metadata_percent
+sudo ./scripts/characterize-worker-host.sh \
+  /var/lib/sbgh-worker/host-characterization.md /var/lib/sbgh-worker
 ```
 
-Archive the report with the deployment record. It captures CPU/NUMA, memory,
-NVMe/mount layout, capacity, a bounded `fio` sample when available, and an
-actual reflink mutation-isolation proof. Choose `requested_shards` and
-`max_concurrency` from this data and a bounded validation run, not the
-advertised CPU count alone.
+`--preflight-only` verifies the golden image, fixed command binaries, writable
+runtime directories, selected libvirt network, exact origin,
+manifest/file-list, tags, read-only mount, and the shared fixed Data%/Meta%
+health floor. The floor rejects an already near-full or mis-provisioned pool;
+it does not predict assignment writes and never scales with K. Registration
+and block-offer admission run the same checks; the standalone command opens no
+fleet session. Block validation rolls each block's processing writes back; its
+MB-scale WAL/SHM divergence is not reserved as if every shard were a
+write-heavy workload.
 
-Create a generation with
-[prepare-dataset-generation.sh](../scripts/prepare-dataset-generation.sh).
-The command rejects symlinks, creates a manifest, removes write permissions,
-verifies every copied file against the generated SHA-256 list before
-publication, and atomically advances an operator `current` pointer. Worker
-startup revalidates the manifest identity and file-list digest and proves the
-configured reflink mechanism; the publication-time full-file verification is
-the integrity gate for the immutable generation. Worker configuration
-must pin the real generation directory—not the pointer—and its manifest
-digest. Never mutate a published generation. Refresh into a new generation,
-verify it, update registry/worker configuration, drain, restart, and retain old
-generations while any attempt, result, or cleanup obligation references them.
+Run the checked-in two-snapshot isolation smoke once for each host/storage
+setup. It defaults to a dry run:
 
-At startup a block worker verifies the exact identity/range/digest, rejects
-symlinks, performs an actual reflink clone, mutates the clone, and proves the
-canonical manifest did not change before advertising the capability.
+```bash
+sudo ./scripts/qualify-block-validation-lvm.sh \
+  /var/lib/sbgh-worker/v26-lvm-isolation.md \
+  vg0 mainnet-full-2026-07-26 \
+  /srv/sbgh/datasets/mainnet-2026-07-26
+
+# After reviewing the resolved values and draining the worker:
+sudo ./scripts/qualify-block-validation-lvm.sh --execute \
+  /var/lib/sbgh-worker/v26-lvm-isolation.md \
+  vg0 mainnet-full-2026-07-26 \
+  /srv/sbgh/datasets/mainnet-2026-07-26
+```
+
+The smoke refuses to overwrite prior evidence, requires the exact read-only
+origin and mandatory provenance tags, verifies the sealed manifest contract,
+creates two explicitly writable snapshots, mounts them with the production XFS
+safety options, proves bidirectional peer/origin write isolation, and fails on
+a cleanup residue.
+
+Then run one end-to-end canary at the intended K and compare its logical result
+and artifacts with the established manual validation. The canary itself
+exercises all K devices and exposes an unsuitable K through runtime, timeout,
+attachment, or cleanup behavior. Start conservatively and tune K from real job
+duration and host telemetry; synthetic throughput measurement is optional
+capacity planning, not a release gate.
+
+The future
+[0052 managed-node producer](../planning/design/0052-managed-stacks-node-chainstate-producer.md)
+is the canonical generation producer. Until it ships, manually minted
+generations must follow the same contract: quiesced source, read-only origin
+LV, `sbgh_sealed` and `sbgh_validated` tags, exact identity manifest, immutable
+publication, and a new LV for every update. Update worker/registry
+configuration under drain and retain old origins while any attempt, result, or
+cleanup obligation references them.
 
 ## Normal operation
 
@@ -111,9 +159,9 @@ sbgh-cli fleet recover-group --group-id <group-uuid> \
   --reason "operator-approved recovery"
 ```
 
-Cancellation is durable: the active attempt sees it on heartbeat, terminates
-its local process group, and may submit only a cancelled terminal. A completed
-terminal that won the database race remains immutable.
+Cancellation is durable: the active attempt sees it on heartbeat, stops the
+VM through the common teardown lifecycle, and may submit only a cancelled
+terminal. A completed terminal that won the database race remains immutable.
 
 Cross-worker movement of a partial benchmark group is never automatic.
 `recover-group` creates a new execution generation and reruns from the first
@@ -139,7 +187,10 @@ silently requeueing.
 
 ## Upgrade, maintenance, and restart
 
-v25 requires exact protocol-version equality:
+The fleet requires exact protocol-version equality. v26 uses wire version 2,
+which adds a bounded offer-requirements summary so dataset, shard, concurrency,
+and current thin-pool health are checked before lease acceptance. Upgrade
+under a full drain; a v1 worker cannot register with a v2 daemon:
 
 1. Drain all workers and wait for active attempts and cleanup obligations to
    reach zero.
@@ -171,13 +222,18 @@ Before production cutover, record the run/job/attempt/trace IDs for:
   provider recomputes `x-amz-checksum-sha256` rather than merely echoing
   client-supplied metadata.
 - known-good and deliberately invalid block ranges;
+- block VM cache miss followed by a cache hit, with no host-side
+  `stacks-inspect` process;
+- exact K virtio-scsi devices and serials, XFS `nouuid` mounts, origin
+  immutability, shared thin-pool health rejection, partial allocation rollback,
+  and attempt-scoped restart cleanup;
 - graceful drain and certificate rotation/revocation.
 
 Expected invariants: one current attempt per scheduling unit, one accepted
 terminal per attempt, no stale mutation after fencing, no artifact visibility
 before terminal acceptance, no negative validation result unless every shard
-exited normally in `{0,1}`, and honest pending cleanup when a worker never
-returns.
+exited normally in `{0,1}`, no repository-produced host process, and honest
+pending cleanup when a worker never returns.
 
 ## Rollback
 

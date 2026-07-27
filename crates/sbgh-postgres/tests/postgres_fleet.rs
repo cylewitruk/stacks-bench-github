@@ -1201,6 +1201,7 @@ async fn capability_and_dataset_identity_route_only_to_a_compatible_worker() {
         .unwrap();
     assert_eq!(offered.offer.job_id, job_id);
     assert_eq!(offered.offer.capability, WorkerCapability::BlockValidation);
+    assert_eq!(offered.offer.requirements, sbgh_proto::OfferRequirements::from(&payload));
 }
 
 #[tokio::test]

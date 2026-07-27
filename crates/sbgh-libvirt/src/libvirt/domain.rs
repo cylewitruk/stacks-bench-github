@@ -12,7 +12,6 @@
 //!       <disk vdc source.raw raw>
 //!       <disk sda cidata.iso cdrom readonly>
 //!       <filesystem virtiofs results_share_dir -> tag>
-//!       <filesystem virtiofs sccache_share_dir -> sccache_tag>
 //!       <interface type='network' source=network/>
 //!       <serial/console type='file' path=console.log>
 //!       <channel virtio org.qemu.guest_agent.0>
@@ -48,18 +47,15 @@ pub struct DomainSpec<'a> {
     /// libvirt but KiB is the safe portable choice.
     pub memory_bytes: u64,
     pub boot_disk_path: &'a Path,
-    pub chainstate_dev_path: &'a Path,
+    /// The benchmark's behavior-preserving single virtio chainstate disk.
+    pub chainstate_dev_path: Option<&'a Path>,
+    /// Additional raw devices. Block validation uses one virtio-scsi disk per
+    /// shard with an explicit stable serial.
+    pub block_devices: &'a [BlockDeviceSpec<'a>],
     pub source_disk_path: &'a Path,
     pub cidata_iso_path: &'a Path,
     pub results_share_dir: &'a Path,
     pub results_share_tag: &'a str,
-    /// Host-side persistent sccache cache directory, shared rw across
-    /// jobs via a virtio-fs mount. The in-VM script exports
-    /// `SCCACHE_DIR` pointing at the mount + `RUSTC_WRAPPER=sccache`
-    /// so `cargo build` transparently hits the cache. See
-    /// `PathsConfig::sccache_dir`.
-    pub sccache_share_dir: &'a Path,
-    pub sccache_share_tag: &'a str,
     pub console_log_path: &'a Path,
     pub network: &'a str,
     /// Optional CPU pinning (roadmap-v5 Phase 5): the libvirt cpuset this VM's
@@ -70,6 +66,12 @@ pub struct DomainSpec<'a> {
     /// host_cpus`), pinned off the bench cores. Only emitted when `vcpu_cpuset`
     /// is set.
     pub emulator_cpuset: Option<&'a str>,
+}
+
+pub struct BlockDeviceSpec<'a> {
+    pub path: &'a Path,
+    pub target_dev: &'a str,
+    pub serial: &'a str,
 }
 
 pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
@@ -146,12 +148,23 @@ pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
                     emulator(w, "/usr/bin/qemu-system-x86_64")?;
 
                     file_disk(w, spec.boot_disk_path, "qcow2", "vda", false)?;
-                    block_disk(w, spec.chainstate_dev_path, "vdb")?;
+                    if let Some(chainstate) = spec.chainstate_dev_path {
+                        block_disk(w, chainstate, "vdb")?;
+                    }
+                    if !spec.block_devices.is_empty() {
+                        empty(
+                            w,
+                            "controller",
+                            &[("type", "scsi"), ("model", "virtio-scsi"), ("index", "0")],
+                        )?;
+                        for device in spec.block_devices {
+                            scsi_block_disk(w, device)?;
+                        }
+                    }
                     file_disk(w, spec.source_disk_path, "raw", "vdc", false)?;
                     file_disk(w, spec.cidata_iso_path, "raw", "sda", true)?;
 
                     virtiofs_filesystem(w, spec.results_share_dir, spec.results_share_tag)?;
-                    virtiofs_filesystem(w, spec.sccache_share_dir, spec.sccache_share_tag)?;
                     interface_network(w, spec.network)?;
                     serial_console_file(w, spec.console_log_path)?;
                     guest_agent_channel(w)?;
@@ -232,6 +245,34 @@ fn block_disk(w: &mut W, dev: &Path, target_dev: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn scsi_block_disk(w: &mut W, spec: &BlockDeviceSpec<'_>) -> std::io::Result<()> {
+    w.create_element("disk")
+        .with_attribute(("type", "block"))
+        .with_attribute(("device", "disk"))
+        .write_inner_content(|w| {
+            empty(
+                w,
+                "driver",
+                &[("name", "qemu"), ("type", "raw"), ("cache", "none"), ("io", "native")],
+            )?;
+            empty(
+                w,
+                "source",
+                &[(
+                    "dev",
+                    &spec
+                        .path
+                        .display()
+                        .to_string(),
+                )],
+            )?;
+            empty(w, "target", &[("dev", spec.target_dev), ("bus", "scsi")])?;
+            text(w, "serial", spec.serial)?;
+            Ok(())
+        })?;
+    Ok(())
+}
+
 fn virtiofs_filesystem(w: &mut W, dir: &Path, tag: &str) -> std::io::Result<()> {
     w.create_element("filesystem")
         .with_attribute(("type", "mount"))
@@ -298,13 +339,12 @@ mod tests {
             vcpus: 4,
             memory_bytes: 8u64 * 1024 * 1024 * 1024, // 8 GiB
             boot_disk_path: Path::new("/var/lib/sbgh/jobs/job1/boot.qcow2"),
-            chainstate_dev_path: Path::new("/dev/sbgh-vg/sbgh-job1-chainstate"),
+            chainstate_dev_path: Some(Path::new("/dev/sbgh-vg/sbgh-job1-chainstate")),
+            block_devices: &[],
             source_disk_path: Path::new("/var/lib/sbgh/jobs/job1/source.raw"),
             cidata_iso_path: Path::new("/var/lib/sbgh/jobs/job1/cidata.iso"),
             results_share_dir: Path::new("/run/sbgh/jobs/job1"),
             results_share_tag: "results",
-            sccache_share_dir: Path::new("/var/lib/sbgh/sccache"),
-            sccache_share_tag: "sccache",
             console_log_path: Path::new("/var/lib/sbgh/jobs/job1/console.log"),
             network: "default",
             vcpu_cpuset: None,
@@ -335,6 +375,12 @@ mod tests {
         assert!(xml.contains("type=\"virtiofs\""));
         assert!(xml.contains("dir=\"results\""));
         assert!(xml.contains("/run/sbgh/jobs/job1"));
+        assert_eq!(
+            xml.matches("<filesystem")
+                .count(),
+            1
+        );
+        assert!(!xml.contains("sccache"));
         // memoryBacking shared (virtio-fs requirement)
         assert!(xml.contains("<memoryBacking>"));
         assert!(xml.contains("mode=\"shared\""));
@@ -342,6 +388,45 @@ mod tests {
         assert!(xml.contains("network=\"default\""));
         assert!(xml.contains("/var/lib/sbgh/jobs/job1/console.log"));
         assert!(xml.contains("org.qemu.guest_agent.0"));
+    }
+
+    #[test]
+    fn block_validation_renders_only_explicit_stable_scsi_snapshots() {
+        let devices = [
+            BlockDeviceSpec {
+                path: Path::new("/dev/vg0/attempt-shard-0"),
+                target_dev: "sdd",
+                serial: "sbgh-block-0000",
+            },
+            BlockDeviceSpec {
+                path: Path::new("/dev/vg0/attempt-shard-1"),
+                target_dev: "sde",
+                serial: "sbgh-block-0001",
+            },
+        ];
+        let spec = DomainSpec {
+            chainstate_dev_path: None,
+            block_devices: &devices,
+            vcpus: 48,
+            memory_bytes: 192 * 1024 * 1024 * 1024,
+            network: "restricted-build",
+            vcpu_cpuset: Some("0-47"),
+            emulator_cpuset: Some("48-63"),
+            ..sample()
+        };
+        let xml = render(&spec).unwrap();
+        assert!(xml.contains("model=\"virtio-scsi\""));
+        assert!(xml.contains("dev=\"sdd\" bus=\"scsi\""));
+        assert!(xml.contains("<serial>sbgh-block-0000</serial>"));
+        assert!(xml.contains("/dev/vg0/attempt-shard-1"));
+        assert!(xml.contains("network=\"restricted-build\""));
+        assert!(xml.contains("cpuset=\"0-47\""));
+        assert!(!xml.contains("sbgh-job1-chainstate"));
+        assert_eq!(
+            xml.matches("type=\"block\" device=\"disk\"")
+                .count(),
+            2
+        );
     }
 
     /// No pinning by default: plain `<vcpu>`, no `<cputune>` (Phase 5).

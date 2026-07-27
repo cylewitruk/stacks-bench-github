@@ -1,6 +1,6 @@
 //! Per-job source disk: a sparse raw file, ext4-formatted on the host. The
 //! normal path checks out `stacks-core` at the job SHA; the cache-hit path
-//! creates a minimal disk containing only `target/release/stacks-bench`.
+//! creates a minimal disk containing only the fingerprint-selected executable.
 //! Attached to the VM as `vdc`.
 //!
 //! Steps:
@@ -101,16 +101,22 @@ impl SourceDisk {
         }
     }
 
-    /// Build a minimal source disk for a binary-cache hit: format the raw disk
-    /// and seed only `target/release/stacks-bench`. No git checkout is needed
-    /// because the bench VM only execs the binary from `$SRC`.
-    pub async fn provision_minimal(
+    /// Build a minimal source disk containing one cache-selected executable.
+    pub async fn provision_minimal_for(
         shell: &dyn Shell,
         job_dir: &Path,
         mount_dir: &Path,
         binary: &Path,
+        executable_name: &str,
         service_user: &str,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !executable_name.is_empty()
+                && executable_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "invalid cached executable name"
+        );
         let raw = job_dir.join("source.raw");
         let raw_s = raw.display().to_string();
         std::fs::create_dir_all(mount_dir)?;
@@ -136,8 +142,15 @@ impl SourceDisk {
             anyhow::bail!("losetup returned empty loop device");
         }
 
-        let seed_result =
-            mount_and_seed_minimal(shell, &loop_dev, mount_dir, binary, service_user).await;
+        let seed_result = mount_and_seed_minimal(
+            shell,
+            &loop_dev,
+            mount_dir,
+            binary,
+            executable_name,
+            service_user,
+        )
+        .await;
         let detach_result = detach_loop(shell, &loop_dev).await;
 
         match (seed_result, detach_result) {
@@ -266,6 +279,7 @@ async fn mount_and_seed_minimal(
     loop_dev: &str,
     mount_dir: &Path,
     binary: &Path,
+    executable_name: &str,
     service_user: &str,
 ) -> anyhow::Result<()> {
     let mount_s = mount_dir
@@ -282,7 +296,7 @@ async fn mount_and_seed_minimal(
     // checkout tree yet.
     let chown_result = chown_mount(shell, &mount_s, service_user).await;
     let inner = match chown_result {
-        Ok(()) => seed_into_mount(shell, mount_dir, binary).await,
+        Ok(()) => seed_into_mount(shell, mount_dir, binary, executable_name).await,
         Err(e) => Err(e),
     };
     let unmount_result = unmount(shell, &mount_s).await;
@@ -299,13 +313,20 @@ async fn mount_and_seed_minimal(
     }
 }
 
-/// Copy `binary` to `<mount>/target/release/stacks-bench` (creating the dir),
-/// then chown the mounted tree to root so the root bench VM gets the same
-/// hand-off state the build VM's `chown` produces.
-async fn seed_into_mount(shell: &dyn Shell, mount_dir: &Path, binary: &Path) -> anyhow::Result<()> {
+/// Copy `binary` to `<mount>/target/release/<executable>` (creating the dir),
+/// then chown the mounted tree to root so the guest gets the same hand-off
+/// state as a built checkout.
+async fn seed_into_mount(
+    shell: &dyn Shell,
+    mount_dir: &Path,
+    binary: &Path,
+    executable_name: &str,
+) -> anyhow::Result<()> {
     // The mount is owned by the service user from provisioning, so the daemon can
     // create dirs + copy before the root chown.
-    let dest = mount_dir.join("target/release/stacks-bench");
+    let dest = mount_dir
+        .join("target/release")
+        .join(executable_name);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -360,7 +381,6 @@ mod tests {
             git_mirror: dir.path().join("mirror.git"),
             results_tmpfs_root: dir.path().join("results"),
             results_archive_dir: dir.path().join("archive"),
-            sccache_dir: dir.path().join("sccache"),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -492,9 +512,16 @@ mod tests {
             .expect_ok(1) // umount
             .expect_ok(1); // losetup -d
 
-        let disk = SourceDisk::provision_minimal(&shell, &job_dir, &mount_dir, &binary, "sbgh")
-            .await
-            .unwrap();
+        let disk = SourceDisk::provision_minimal_for(
+            &shell,
+            &job_dir,
+            &mount_dir,
+            &binary,
+            "stacks-bench",
+            "sbgh",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(disk.path, job_dir.join("source.raw"));
         assert_eq!(

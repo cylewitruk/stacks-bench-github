@@ -18,12 +18,72 @@ covered_start = 0
 covered_end = 8020465
 manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # replace
 
-[block_validation]
-# Point to the immutable generation directory, never a mutable shared dataset.
-canonical_dataset = "/srv/sbgh/datasets/mainnet-2026-07-26"
-workspace_root = "/srv/sbgh/workspaces"
-source_cache = "/var/lib/sbgh-worker/stacks-core"
-binary_cache = "/var/lib/sbgh-worker/stacks-inspect"
-chain_config = "/etc/sbgh/worker/mainnet-follower-conf.toml"
+[binary_cache]
+enabled = true
+max_bytes = 53687091200
+dir = "/var/lib/sbgh-worker/binary-cache"
+
+[libvirt]
+service_user = "sbgh-worker"
+host_cpus = "48-63"
+
+[libvirt.vm]
+golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
+build_vcpus = 16
+bench_vcpus = 8
+build_memory_bytes = 34359738368
+bench_memory_bytes = 17179869184
+boot_disk_gib = 64
+job_timeout_secs = 43200
+network = "restricted-build"
+poll_interval_secs = 5
+heartbeat_interval_secs = 60
+
+[libvirt.paths]
+jobs_dir = "/var/lib/sbgh-worker/jobs"
+git_mirror = "/var/lib/sbgh-worker/git/stacks-core.git"
+results_tmpfs_root = "/run/sbgh-worker/jobs"
+results_archive_dir = "/var/lib/sbgh-worker/results"
+virsh_binary = "/usr/bin/virsh"
+sudo_binary = "/usr/bin/sudo"
+qemu_img_binary = "/usr/bin/qemu-img"
+cloud_localds_binary = "/usr/bin/cloud-localds"
 git_binary = "/usr/bin/git"
-cargo_binary = "/usr/bin/cargo"
+
+[libvirt.lvm]
+vg_name = "vg0"
+thinpool = "thinpool"
+chainstate_base_prefix = "mainnet-"
+# Shared setup-health guard for every thin-snapshot workload. These fixed
+# floors reject an already near-full/mis-provisioned pool; they do not scale
+# with shard count.
+min_data_free_percent = 5.0
+min_metadata_free_percent = 5.0
+
+[libvirt.block_validation]
+vcpus = 48
+memory_bytes = 206158430208
+cpu_set = "0-47"
+max_shards = 48
+max_concurrency = 48
+max_parallel_jobs = 1
+results_tmpfs_mib = 5120
+network = "restricted-build"
+# This file is copied into the guest. It must contain no reusable worker,
+# fleet, database, object-store, or repository credentials.
+chain_config = "/etc/sbgh/worker/stacks-inspect-mainnet.toml"
+
+[libvirt.block_validation.dataset]
+generation = "mainnet-2026-07-26"
+network = "mainnet"
+format_version = "stacks-core-v3"
+covered_start = 0
+covered_end = 8020465
+manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # replace
+origin_lv = "mainnet-full-2026-07-26"
+manifest_path = "/srv/sbgh/datasets/mainnet-2026-07-26/.sbgh-dataset-manifest.json"
+# The same read-only origin mount must also contain
+# .sbgh-dataset-files.sha256; its digest is bound by the manifest.
+snapshot_prefix = "sbgh-block"
+mount_options = ["nouuid", "noatime"]
+required_origin_tags = ["sbgh_sealed", "sbgh_validated"]

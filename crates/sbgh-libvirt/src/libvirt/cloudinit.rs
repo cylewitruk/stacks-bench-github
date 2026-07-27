@@ -28,13 +28,9 @@ pub struct CloudInitCommon<'a> {
     pub results_share_tag: &'a str,
     /// Mountpoint inside the VM for the results share.
     pub results_mount: &'a str,
-    /// Virtio-fs tag for the persistent sccache cache share. Only the
-    /// build phase mounts it.
-    pub sccache_share_tag: &'a str,
-    /// Mountpoint inside the VM for the sccache cache.
+    /// Guest-local sccache directory on the disposable boot overlay.
     pub sccache_mount: &'a str,
-    /// Cache-size cap to pass to sccache (`SCCACHE_CACHE_SIZE`).
-    /// Bytes-with-unit format, e.g. `"20G"`.
+    /// Advisory cache-size target inside the overlay's hard virtual-size cap.
     pub sccache_max_size: &'a str,
 }
 
@@ -58,6 +54,7 @@ pub struct CloudInitArtifacts {
 const BUILD_SCRIPT: &str = include_str!("templates/sbgh-build.sh.tmpl");
 const CALIBRATE_SCRIPT: &str = include_str!("templates/sbgh-calibrate.sh.tmpl");
 const BENCH_SCRIPT: &str = include_str!("templates/sbgh-bench.sh.tmpl");
+const BLOCK_VALIDATION_SCRIPT: &str = include_str!("templates/sbgh-block-validation.sh.tmpl");
 
 impl CloudInitArtifacts {
     pub async fn build(
@@ -112,6 +109,23 @@ impl CloudInitArtifacts {
     }
 }
 
+pub async fn build_block_validation_iso(
+    shell: &dyn Shell,
+    paths: &PathsConfig,
+    job_dir: &Path,
+    attempt_id: &str,
+) -> anyhow::Result<PathBuf> {
+    pack_iso(
+        shell,
+        paths,
+        job_dir,
+        "block-validation",
+        &wrap_in_cloud_config(BLOCK_VALIDATION_SCRIPT, "sbgh-block-validation.sh"),
+        &meta_data_for_phase(attempt_id, "block-validation"),
+    )
+    .await
+}
+
 /// Write user-data + meta-data + invoke cloud-localds to produce a
 /// NoCloud seed ISO. Suffix gives us per-phase filenames in the per-job
 /// dir (`user-data.build` / `cidata.build.iso` vs `.bench`).
@@ -164,7 +178,6 @@ fn render_build_user_data(c: &CloudInitCommon<'_>) -> String {
         .replace("{{ source_mount }}", c.source_mount)
         .replace("{{ results_share_tag }}", c.results_share_tag)
         .replace("{{ results_mount }}", c.results_mount)
-        .replace("{{ sccache_share_tag }}", c.sccache_share_tag)
         .replace("{{ sccache_mount }}", c.sccache_mount)
         .replace("{{ sccache_max_size }}", c.sccache_max_size);
     wrap_in_cloud_config(&script, "sbgh-build.sh")
@@ -236,7 +249,6 @@ mod tests {
             git_mirror: dir.path().join("mirror.git"),
             results_tmpfs_root: dir.path().join("results"),
             results_archive_dir: dir.path().join("archive"),
-            sccache_dir: dir.path().join("sccache"),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -253,7 +265,6 @@ mod tests {
             source_mount: "/opt/stacks-core",
             results_share_tag: "results",
             results_mount: "/results",
-            sccache_share_tag: "sccache",
             sccache_mount: "/var/cache/sccache",
             sccache_max_size: "20G",
         }
@@ -300,6 +311,8 @@ mod tests {
         // Phase-appropriate scripts embedded.
         assert!(build_user.contains("sbgh-build.sh"));
         assert!(build_user.contains("phase \"build_done\""));
+        assert!(build_user.contains("guest-local compiler cache"));
+        assert!(!build_user.contains("mount -t virtiofs sccache"));
         assert!(!build_user.contains("stacks-bench bench run"));
 
         assert!(bench_user.contains("sbgh-bench.sh"));
@@ -320,6 +333,25 @@ mod tests {
             );
             assert_eq!(c.args.len(), 3);
         }
+    }
+
+    #[test]
+    fn block_validation_guest_script_enforces_the_sandbox_contract() {
+        let rendered = wrap_in_cloud_config(BLOCK_VALIDATION_SCRIPT, "sbgh-block-validation.sh");
+        assert!(rendered.contains("cargo build --locked --release --package stacks-inspect"));
+        assert!(rendered.contains("/dev/disk/by-id/"));
+        assert!(rendered.contains("[\"mount\", \"-t\", \"xfs\""));
+        assert!(rendered.contains(".sbgh-dataset-files.sha256"));
+        assert!(rendered.contains("block-validation-result.json"));
+        assert!(rendered.contains("os.replace"));
+        assert!(rendered.contains("start_new_session=True"));
+        assert!(rendered.contains("cursor - epoch_offset"));
+        assert!(rendered.contains("(index, global_start, global_end, stdout_name, stderr_name)"));
+        assert!(!rendered.contains("\"effective_range\""));
+        assert!(!rendered.contains("mount -t virtiofs sccache"));
+        assert!(!rendered.contains("lease_token"));
+        assert!(!rendered.contains("client_private_key"));
+        assert!(!rendered.contains("/dev/vg0/"));
     }
 
     #[test]

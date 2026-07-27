@@ -75,6 +75,7 @@ lint *args:
 
     python3 scripts/check-docs.py
     python3 scripts/check-package-dag.py
+    for script in scripts/*.sh; do bash -n "$script"; done
     cargo machete --with-metadata
     RUST_LOG=warn cargo --locked clippy --all-targets -- -D warnings
     cargo --locked fmt --all -- --check

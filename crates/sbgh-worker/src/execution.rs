@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::bench_recipe::BenchRecipe;
+use crate::block_validation_recipe::BlockValidationRecipe;
 use crate::build_recipe::BuildOnlyRecipe;
 use crate::recipe::{Recipe, TaskOutcome, UnsupportedRecipe};
 use sbgh_driver::{
@@ -28,6 +29,10 @@ pub async fn execute(
 ) -> anyhow::Result<ExecutionOutcome> {
     let context = TaskContext {
         job_id: request.context.job_id,
+        attempt_id: request.context.attempt_id,
+        fencing_generation: request
+            .context
+            .fencing_generation,
         repository: &request.context.repository,
         commit: &request.context.commit,
         repository_credential: request
@@ -53,6 +58,14 @@ pub async fn execute(
             let recipe = BuildOnlyRecipe::new(dependencies.driver, request.placement.vcpu_cpuset);
             execute_recipe(&recipe, &context, sink, cancel).await
         }
+        ExecutionTask::BlockValidation(spec) => {
+            let recipe = BlockValidationRecipe::new(
+                dependencies.driver,
+                spec,
+                request.placement.vcpu_cpuset,
+            );
+            execute_recipe(&recipe, &context, sink, cancel).await
+        }
         ExecutionTask::Unsupported { combination } => {
             let recipe = UnsupportedRecipe::new(combination);
             execute_recipe(&recipe, &context, sink, cancel).await
@@ -72,19 +85,23 @@ async fn execute_recipe<R: Recipe>(
     Ok(ExecutionOutcome {
         status: outcome.status(),
         summary: outcome.summary().clone(),
+        block_validation: outcome
+            .block_validation()
+            .cloned(),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use async_trait::async_trait;
 
     use super::*;
     use sbgh_driver::{
-        DriverOutcome, ExecutionContext, ExecutionPlacement, PhaseLabel, Placement, SinkResult,
-        TaskSpec, TaskStatus,
+        BlockValidationTaskSpec, DriverOutcome, ExecutionContext, ExecutionPlacement, PhaseLabel,
+        Placement, SinkResult, TaskSpec, TaskStatus,
     };
     use uuid::Uuid;
 
@@ -119,11 +136,75 @@ mod tests {
         }
     }
 
+    struct RecordingBlockDriver {
+        seen: Mutex<Option<(Uuid, u64, BlockValidationTaskSpec)>>,
+    }
+
+    struct MissingBlockOutputDriver;
+
+    #[async_trait]
+    impl Driver for MissingBlockOutputDriver {
+        async fn run_task(
+            &self,
+            _context: &TaskContext<'_>,
+            _task: &TaskSpec,
+            _sink: &dyn EventSink,
+            _cancel: &CancellationToken,
+            _placement: &Placement,
+        ) -> anyhow::Result<DriverOutcome> {
+            Ok(DriverOutcome {
+                status: sbgh_driver::DriverStatus::Completed,
+                summary: serde_json::json!({}),
+                output: sbgh_driver::DriverTaskOutput::None,
+            })
+        }
+
+        async fn cleanup_by_job_id(&self, _job_id: &str) -> bool {
+            true
+        }
+    }
+
+    #[async_trait]
+    impl Driver for RecordingBlockDriver {
+        async fn run_task(
+            &self,
+            context: &TaskContext<'_>,
+            task: &TaskSpec,
+            _sink: &dyn EventSink,
+            _cancel: &CancellationToken,
+            _placement: &Placement,
+        ) -> anyhow::Result<DriverOutcome> {
+            let TaskSpec::BlockValidation(spec) = task else {
+                panic!("block request was routed as the wrong driver task");
+            };
+            *self.seen.lock().unwrap() =
+                Some((context.attempt_id, context.fencing_generation, spec.clone()));
+            Ok(DriverOutcome {
+                status: sbgh_driver::DriverStatus::Completed,
+                summary: serde_json::json!({"sandbox": "libvirt"}),
+                output: sbgh_driver::DriverTaskOutput::BlockValidation(
+                    sbgh_driver::BlockValidationOutput {
+                        valid: true,
+                        checked_blocks: 3,
+                        invalid_blocks: Vec::new(),
+                        dataset: spec.dataset.clone(),
+                    },
+                ),
+            })
+        }
+
+        async fn cleanup_by_job_id(&self, _job_id: &str) -> bool {
+            true
+        }
+    }
+
     #[tokio::test]
     async fn unsupported_task_fails_closed_without_backend_access() {
         let request = ExecutionRequest {
             context: ExecutionContext {
                 job_id: Uuid::nil(),
+                attempt_id: Uuid::nil(),
+                fencing_generation: 0,
                 repository: "octo/core".into(),
                 commit: "abc123".into(),
                 repository_credential: None,
@@ -142,5 +223,109 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(outcome.status, TaskStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn block_validation_uses_the_common_driver_boundary_with_attempt_identity() {
+        let attempt_id = Uuid::new_v4();
+        let spec = BlockValidationTaskSpec {
+            dataset: sbgh_driver::DatasetIdentity {
+                generation: "mainnet-1".into(),
+                network: "mainnet".into(),
+                format_version: "v3".into(),
+                covered_start: 0,
+                covered_end: 100,
+                manifest_sha256: "a".repeat(64),
+            },
+            epoch: sbgh_driver::ValidationEpoch::Nakamoto,
+            range: sbgh_driver::InclusiveRange { start: 10, end: 12 },
+            requested_shards: 3,
+            max_concurrency: 2,
+            timeout_secs: 60,
+        };
+        let driver = Arc::new(RecordingBlockDriver { seen: Mutex::new(None) });
+        let outcome = execute(
+            ExecutionRequest {
+                context: ExecutionContext {
+                    job_id: Uuid::new_v4(),
+                    attempt_id,
+                    fencing_generation: 7,
+                    repository: "stacks-network/stacks-core".into(),
+                    commit: "abc123".into(),
+                    repository_credential: None,
+                },
+                task: ExecutionTask::BlockValidation(spec.clone()),
+                placement: ExecutionPlacement::default(),
+            },
+            ExecutionDependencies { driver: driver.clone() },
+            &NoopSink,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            driver
+                .seen
+                .lock()
+                .unwrap()
+                .as_ref(),
+            Some(&(attempt_id, 7, spec))
+        );
+        assert_eq!(
+            outcome
+                .block_validation
+                .as_ref()
+                .map(|output| output.checked_blocks),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn block_validation_cannot_complete_without_a_typed_result() {
+        let outcome = execute(
+            ExecutionRequest {
+                context: ExecutionContext {
+                    job_id: Uuid::new_v4(),
+                    attempt_id: Uuid::new_v4(),
+                    fencing_generation: 1,
+                    repository: "stacks-network/stacks-core".into(),
+                    commit: "abc123".into(),
+                    repository_credential: None,
+                },
+                task: ExecutionTask::BlockValidation(BlockValidationTaskSpec {
+                    dataset: sbgh_driver::DatasetIdentity {
+                        generation: "mainnet-1".into(),
+                        network: "mainnet".into(),
+                        format_version: "v3".into(),
+                        covered_start: 0,
+                        covered_end: 100,
+                        manifest_sha256: "a".repeat(64),
+                    },
+                    epoch: sbgh_driver::ValidationEpoch::Nakamoto,
+                    range: sbgh_driver::InclusiveRange { start: 10, end: 12 },
+                    requested_shards: 3,
+                    max_concurrency: 2,
+                    timeout_secs: 60,
+                }),
+                placement: ExecutionPlacement::default(),
+            },
+            ExecutionDependencies {
+                driver: Arc::new(MissingBlockOutputDriver),
+            },
+            &NoopSink,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.status,
+            TaskStatus::Failed(ref error) if error.contains("without a typed result")
+        ));
+        assert!(
+            outcome
+                .block_validation
+                .is_none()
+        );
     }
 }

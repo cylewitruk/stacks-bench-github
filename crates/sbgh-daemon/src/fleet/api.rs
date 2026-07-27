@@ -341,7 +341,7 @@ async fn poll(
                 trace_id = %offered.offer.trace_id,
                 "work offered"
             );
-            return Ok(Json(PollResponse::Offer { offer: offered.offer }));
+            return Ok(Json(PollResponse::Offer { offer: Box::new(offered.offer) }));
         }
         if state
             .store

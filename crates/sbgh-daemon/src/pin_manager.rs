@@ -451,6 +451,7 @@ mod tests {
 
     fn test_env() -> CacheEnvironment {
         CacheEnvironment {
+            artifact: sbgh_driver::BuildArtifact::StacksBench,
             profile: "release".into(),
             features: String::new(),
             rustflags: String::new(),

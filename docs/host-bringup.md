@@ -67,7 +67,7 @@ What it does:
 1. Downloads `noble-server-cloudimg-amd64.img` from cloud-images.ubuntu.com.
 2. Resizes to 32 GiB.
 3. Uses `virt-customize` to:
-   - install `qemu-guest-agent`, `xfsprogs`, build toolchain (`git build-essential pkg-config libssl-dev libclang-dev cmake clang zstd`), and **`sccache`** (caches rustc output across jobs via a persistent host-side dir bind-mounted into every VM at `/var/cache/sccache`)
+   - install `qemu-guest-agent`, `xfsprogs`, build toolchain (`git build-essential pkg-config libssl-dev libclang-dev cmake clang zstd`), and **`sccache`** (uses only the disposable guest-local boot overlay; cross-attempt reuse goes through the host-mediated binary cache)
    - install rustup → `/opt/{rustup,cargo}` system-wide, with symlinks in `/usr/local/bin`
    - enable `qemu-guest-agent` to start on boot
    - truncate `/etc/machine-id` and `/var/lib/dbus/machine-id` so each VM gets a unique id on first boot
@@ -221,11 +221,6 @@ sudo usermod -a -G libvirt sbgh-worker
 sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /var/lib/sbgh-worker/jobs
 sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /var/lib/sbgh-worker/results
 sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /var/lib/sbgh-worker/git
-# Persistent sccache cache, bind-mounted into every job VM via virtio-fs.
-# sccache self-caps at 20 GiB (SCCACHE_CACHE_SIZE inside the VM), so this
-# dir can't run away. Hot cache is what turns a ~35-min cold build into a
-# ~5-min warm build for subsequent jobs against similar PRs.
-sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker /var/lib/sbgh-worker/sccache
 # /run/sbgh below is on a tmpfs the kernel wipes every reboot. This install -d
 # only seeds it for the CURRENT boot — the daemon unit's `RuntimeDirectory=sbgh`
 # recreates /run/sbgh (owned sbgh:sbgh) on every start, so it's durable across
@@ -239,17 +234,18 @@ The in-container postgres uid (900) doesn't need a matching host user —
 it's only used as a numeric owner for `/var/lib/sbgh/postgres` (created
 in §6).
 
-Install the sudoers fragment. Only the daemon user needs sudo;
-`sbgh-handler` runs entirely inside an unprivileged container.
+Install the sudoers fragment. The orchestrator needs no execution authority;
+only `sbgh-worker` receives this fixed infrastructure allowlist.
 
 ```bash
 sudo tee /etc/sudoers.d/sbgh >/dev/null <<'EOF'
-# Daemon (per-job VM provisioning).
-sbgh ALL=(root) NOPASSWD: /usr/sbin/lvcreate, /usr/sbin/lvremove, /usr/sbin/lvs
-sbgh ALL=(root) NOPASSWD: /usr/sbin/mkfs.ext4, /usr/sbin/losetup
-sbgh ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/chown
-sbgh ALL=(root) NOPASSWD: /usr/bin/rmdir
-sbgh ALL=(root) NOPASSWD: /usr/bin/virsh
+# Worker sandbox provisioning. Repository payloads never execute with this
+# authority; only the fixed sbgh-libvirt adapter issues these commands.
+sbgh-worker ALL=(root) NOPASSWD: /usr/sbin/lvcreate, /usr/sbin/lvremove, /usr/sbin/lvs
+sbgh-worker ALL=(root) NOPASSWD: /usr/sbin/mkfs.ext4, /usr/sbin/losetup
+sbgh-worker ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/chown
+sbgh-worker ALL=(root) NOPASSWD: /usr/bin/rmdir
+sbgh-worker ALL=(root) NOPASSWD: /usr/bin/virsh
 # Chainstate refresh (download-chainstate.sh, runs as the systemd timer
 # `sbgh-chainstate-refresh.service`). The XFS format + tar/zstd extract
 # both need root, and the LV (de)activation flips an attribute that
@@ -525,13 +521,12 @@ code that adds a SQL migration takes effect the next time the daemon
 restarts (`sudo systemctl restart sbgh-daemon`, or the
 `install-daemon.sh` re-run that does it for you).
 
-### Why not the daemon too?
+### Why the worker stays on the host
 
-Three reasons it stays on the host:
-
-- It calls `lvcreate`/`lvremove` via sudo — easy to wire from host, awkward from inside a container.
-- It calls `virsh` — same, plus the libvirt socket is host-side.
-- It needs read access to `/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2` and write access under `/var/lib/sbgh/jobs/`, both of which are host paths the libvirt-qemu apparmor profile already knows about.
+The worker's trusted adapter calls `lvcreate`/`lvremove` and `virsh`, reads the
+golden image, and owns attempt directories. The daemon remains a credentialed
+orchestrator with none of those permissions. Repository builds and produced
+binaries still run only inside disposable worker VMs.
 
 ### Build + run the daemon (host-side)
 

@@ -14,11 +14,16 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::block_validation::{BlockValidationOutput, BlockValidationTaskSpec};
 use crate::events::EventSink;
 
 /// Platform-neutral identity handed to an execution backend.
 pub struct TaskContext<'a> {
     pub job_id: Uuid,
+    /// The concrete execution attempt. Resource names and normal cleanup use
+    /// this identity so stale cleanup cannot address a newer attempt.
+    pub attempt_id: Uuid,
+    pub fencing_generation: u64,
     pub repository: &'a str,
     pub commit: &'a str,
     pub repository_credential: Option<&'a str>,
@@ -30,6 +35,7 @@ pub struct TaskContext<'a> {
 pub enum TaskSpec {
     Benchmark(BenchmarkTaskSpec),
     BuildOnly,
+    BlockValidation(BlockValidationTaskSpec),
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +89,14 @@ pub enum DriverStatus {
 pub struct DriverOutcome {
     pub status: DriverStatus,
     pub summary: serde_json::Value,
+    pub output: DriverTaskOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DriverTaskOutput {
+    #[default]
+    None,
+    BlockValidation(BlockValidationOutput),
 }
 
 /// One execution backend. `LibvirtDriver` is the sole impl today.
@@ -110,4 +124,14 @@ pub trait Driver: Send + Sync {
     /// with no live handle. Returns `false` if cleanup could not be verified,
     /// so the caller leaves the row `running` to retry on the next boot.
     async fn cleanup_by_job_id(&self, job_id: &str) -> bool;
+
+    /// Best-effort, idempotent teardown scoped to one concrete attempt.
+    ///
+    /// Backends should override this when resources are attempt-addressable.
+    /// The default preserves compatibility for backends that only support a
+    /// proven-safe job-wide recovery sweep.
+    async fn cleanup_attempt(&self, job_id: &str, _attempt_id: &str) -> bool {
+        self.cleanup_by_job_id(job_id)
+            .await
+    }
 }

@@ -123,6 +123,7 @@ mod tests {
                 summary: serde_json::json!({
                     "build_only": matches!(spec, TaskSpec::BuildOnly),
                 }),
+                output: sbgh_driver::DriverTaskOutput::None,
             })
         }
         async fn cleanup_by_job_id(&self, _job_id: &str) -> bool {
@@ -142,6 +143,8 @@ mod tests {
         let recipe = BuildOnlyRecipe::new(driver.clone(), Some("2-3".into()));
         let ctx = TaskContext {
             job_id: Uuid::nil(),
+            attempt_id: Uuid::nil(),
+            fencing_generation: 0,
             repository: "octo/core",
             commit: "deadbeef",
             repository_credential: None,

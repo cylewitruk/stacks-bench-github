@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -7,8 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 use sbgh_driver::{
-    ArtifactSink, BenchmarkRunContext, BenchmarkTask, ExecutionContext, ExecutionPlacement,
-    ExecutionRequest, ExecutionTask, RepositoryCredential, Terminal, WorkerEvent,
+    ArtifactSink, BenchmarkRunContext, BenchmarkTask, BlockValidationTaskSpec, DatasetIdentity,
+    ExecutionContext, ExecutionPlacement, ExecutionRequest, ExecutionTask, InclusiveRange,
+    RepositoryCredential, Terminal, ValidationEpoch, WorkerEvent,
 };
 use sbgh_libvirt::SystemShell;
 use sbgh_proto::{
@@ -21,7 +21,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::block_validation;
 use crate::config::WorkerConfig;
 use crate::remote_artifacts::RemoteArtifactSink;
 use crate::transport::{FleetApiError, FleetClient};
@@ -29,24 +28,81 @@ use crate::{WorkerRuntime, build_binary_cache};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
 
-pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> anyhow::Result<()> {
-    if config
+/// Validate the local block-validation sandbox, sealed dataset, and current
+/// thin-pool admission without registering a worker session.
+pub async fn preflight_local_execution(config: &WorkerConfig) -> anyhow::Result<()> {
+    if !config
         .capabilities
         .contains(&sbgh_proto::WorkerCapability::BlockValidation)
     {
-        let block = config
-            .block_validation
-            .as_ref()
-            .context("validated block-validation config is absent")?;
-        let dataset = config
-            .resources
-            .dataset
-            .as_ref()
-            .context("validated block-validation dataset is absent")?;
-        block_validation::verify_host(block, dataset)
-            .await
-            .context("proving block-validation dataset and CoW isolation")?;
+        return Ok(());
     }
+    let libvirt = config
+        .libvirt
+        .clone()
+        .context("block_validation capability requires [libvirt]")?;
+    let dataset = config
+        .resources
+        .dataset
+        .as_ref()
+        .context("block_validation capability requires resources.dataset")?;
+    let driver = sbgh_libvirt::LibvirtDriver::new(
+        libvirt.clone(),
+        Arc::new(SystemShell::new(&libvirt.paths.sudo_binary)),
+        Arc::new(CleanupArtifactSink),
+        config
+            .binary_cache
+            .as_ref()
+            .and_then(build_binary_cache)
+            .map(|cache| cache as Arc<dyn sbgh_driver::BinaryCacheStore>),
+    );
+    driver
+        .preflight_block_validation(&driver_dataset_identity(dataset))
+        .await
+        .context("validating libvirt block-validation profile and sealed dataset")
+}
+
+fn driver_dataset_identity(dataset: &sbgh_proto::DatasetIdentity) -> DatasetIdentity {
+    DatasetIdentity {
+        generation: dataset.generation.clone(),
+        network: dataset.network.clone(),
+        format_version: dataset.format_version.clone(),
+        covered_start: dataset.covered_start,
+        covered_end: dataset.covered_end,
+        manifest_sha256: dataset
+            .manifest_sha256
+            .clone(),
+    }
+}
+
+fn driver_block_result_to_wire(
+    result: sbgh_driver::BlockValidationOutput,
+) -> sbgh_proto::BlockValidationResult {
+    sbgh_proto::BlockValidationResult {
+        valid: result.valid,
+        checked_blocks: result.checked_blocks,
+        invalid_blocks: result
+            .invalid_blocks
+            .into_iter()
+            .map(|invalid| sbgh_proto::InvalidBlock {
+                shard: invalid.shard,
+                block: invalid.block,
+                reason: invalid.reason,
+            })
+            .collect(),
+        dataset: sbgh_proto::DatasetIdentity {
+            generation: result.dataset.generation,
+            network: result.dataset.network,
+            format_version: result.dataset.format_version,
+            covered_start: result.dataset.covered_start,
+            covered_end: result.dataset.covered_end,
+            manifest_sha256: result.dataset.manifest_sha256,
+        },
+    }
+}
+
+pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> anyhow::Result<()> {
+    preflight_local_execution(&config).await?;
     let client = FleetClient::build(
         &config.orchestrator_url,
         &config.client_certificate,
@@ -108,6 +164,7 @@ pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> anyhow::R
                 draining = true;
             }
             PollResponse::Offer { offer } => {
+                admit_offer(&config, &offer).await?;
                 let accepted = match client
                     .accept(&AcceptOfferRequest {
                         protocol_version: PROTOCOL_VERSION,
@@ -133,7 +190,9 @@ pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> anyhow::R
                         .assignment
                         .payload_hash
                         == offer.payload_hash
-                        && accepted.assignment.trace_id == offer.trace_id,
+                        && accepted.assignment.trace_id == offer.trace_id
+                        && sbgh_proto::OfferRequirements::from(&accepted.assignment.payload)
+                            == offer.requirements,
                     "accepted assignment does not match its offer"
                 );
                 draining = execute_assignment(
@@ -157,6 +216,68 @@ pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> anyhow::R
     Ok(())
 }
 
+async fn admit_offer(config: &WorkerConfig, offer: &sbgh_proto::WorkOffer) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config
+            .capabilities
+            .contains(&offer.capability),
+        "orchestrator offered an unadvertised capability"
+    );
+    match &offer.requirements {
+        sbgh_proto::OfferRequirements::Benchmark => {
+            anyhow::ensure!(
+                offer.capability == sbgh_proto::WorkerCapability::Benchmark,
+                "offer capability/requirements mismatch"
+            );
+        }
+        sbgh_proto::OfferRequirements::BuildOnly => {
+            anyhow::ensure!(
+                offer.capability == sbgh_proto::WorkerCapability::BuildOnly,
+                "offer capability/requirements mismatch"
+            );
+        }
+        sbgh_proto::OfferRequirements::BlockValidation {
+            dataset,
+            requested_shards,
+            max_concurrency,
+        } => {
+            anyhow::ensure!(
+                offer.capability == sbgh_proto::WorkerCapability::BlockValidation,
+                "offer capability/requirements mismatch"
+            );
+            let profile = config
+                .libvirt
+                .as_ref()
+                .and_then(|libvirt| {
+                    libvirt
+                        .block_validation
+                        .as_ref()
+                })
+                .context("block-validation offer has no local sandbox profile")?;
+            anyhow::ensure!(
+                config
+                    .resources
+                    .dataset
+                    .as_ref()
+                    == Some(dataset),
+                "block-validation offer requests a different dataset generation"
+            );
+            anyhow::ensure!(
+                *requested_shards > 0 && *requested_shards <= profile.max_shards,
+                "block-validation offer exceeds local shard limit"
+            );
+            anyhow::ensure!(
+                *max_concurrency > 0 && *max_concurrency <= profile.max_concurrency,
+                "block-validation offer exceeds local concurrency limit"
+            );
+            // Re-check sealed origin and current Data%/Meta% immediately before
+            // acceptance; registration-time health is not a durable lease.
+            preflight_local_execution(config).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn execute_assignment(
     config: &WorkerConfig,
     client: &FleetClient,
@@ -166,21 +287,13 @@ async fn execute_assignment(
     shutdown: &CancellationToken,
 ) -> anyhow::Result<bool> {
     let attempt_cancel = shutdown.child_token();
-    let local_artifact_root = match &assignment.payload {
-        TaskPayload::Benchmark(_) | TaskPayload::BuildOnly => config
-            .libvirt
-            .as_ref()
-            .context("benchmark/build assignment received without local libvirt config")?
-            .paths
-            .results_archive_dir
-            .join("fleet"),
-        TaskPayload::BlockValidation(_) => config
-            .block_validation
-            .as_ref()
-            .context("block-validation assignment received without local config")?
-            .workspace_root
-            .join("artifacts"),
-    };
+    let local_artifact_root = config
+        .libvirt
+        .as_ref()
+        .context("sandboxed assignment received without local libvirt config")?
+        .paths
+        .results_archive_dir
+        .join("fleet");
     let artifacts =
         RemoteArtifactSink::new(client.clone(), assignment.identity.clone(), local_artifact_root);
     let lease_lost = Arc::new(AtomicBool::new(false));
@@ -213,118 +326,18 @@ async fn execute_assignment(
         CredentialFetch::Cancelled => TerminalOutcome::Cancelled {
             reason: "orchestrator requested cancellation".into(),
         },
-        CredentialFetch::Ready(repository_token) => match &assignment.payload {
-            TaskPayload::Benchmark(_) | TaskPayload::BuildOnly => {
-                execute_driver(
-                    config,
-                    &assignment,
-                    &repository_token,
-                    artifacts.clone(),
-                    client,
-                    &attempt_cancel,
-                    &reliable,
-                )
-                .await?
-            }
-            TaskPayload::BlockValidation(payload) => {
-                reliable
-                    .phase("dataset_verified", started.elapsed())
-                    .await?;
-                ensure!(
-                    config
-                        .resources
-                        .dataset
-                        .as_ref()
-                        == Some(&payload.dataset),
-                    "assignment dataset identity differs from registered worker dataset"
-                );
-                let block_config = config
-                    .block_validation
-                    .as_ref()
-                    .context("block-validation assignment received without local config")?;
-                reliable
-                    .phase("probe", started.elapsed())
-                    .await?;
-                let (block_progress_tx, block_progress_rx) = mpsc::unbounded_channel();
-                let block_request = block_validation::BlockExecutionRequest {
-                    repository: &assignment.context.repository,
-                    commit: &assignment.context.commit,
-                    repository_token: Some(repository_token.0.as_str()),
-                    payload,
-                    job_id: assignment.context.job_id,
-                };
-                let execution = block_validation::execute(
-                    block_config,
-                    &block_request,
-                    &attempt_cancel,
-                    block_progress_tx,
-                );
-                let result = drive_block_execution(
-                    client,
-                    &assignment,
-                    &attempt_cancel,
-                    block_progress_rx,
-                    execution,
-                )
-                .await?;
-                match result {
-                    Driven::Finished(Ok(execution)) => {
-                        let archive = archive_block_artifacts(
-                            assignment.context.job_id,
-                            artifacts.as_ref(),
-                            &execution.artifacts,
-                        )
-                        .await;
-                        match archive {
-                            Ok(()) => {
-                                let result = execution.result;
-                                reliable
-                                    .phase("reduced", started.elapsed())
-                                    .await?;
-                                TerminalOutcome::Completed {
-                                    summary: serde_json::json!({
-                                        "task": "block_validation",
-                                        "valid": result.valid,
-                                        "checked_blocks": result.checked_blocks,
-                                        "invalid_block_count": result.invalid_blocks.len(),
-                                    }),
-                                    block_validation: Some(result),
-                                }
-                            }
-                            Err(error) => TerminalOutcome::Failed {
-                                error: format!("{error:#}"),
-                                summary: None,
-                                retryable: true,
-                            },
-                        }
-                    }
-                    Driven::Finished(Err(error)) => {
-                        let mut message = format!("{error:#}");
-                        let diagnostics =
-                            block_diagnostic_paths(block_config, assignment.context.job_id).await;
-                        if let Err(archive_error) = archive_block_artifacts(
-                            assignment.context.job_id,
-                            artifacts.as_ref(),
-                            &diagnostics,
-                        )
-                        .await
-                        {
-                            message.push_str(&format!(
-                                "; diagnostic upload also failed: {archive_error:#}"
-                            ));
-                        }
-                        TerminalOutcome::Failed {
-                            error: message,
-                            summary: None,
-                            retryable: true,
-                        }
-                    }
-                    Driven::Cancelled => TerminalOutcome::Cancelled {
-                        reason: "orchestrator requested cancellation".into(),
-                    },
-                }
-            }
-        },
+        CredentialFetch::Ready(repository_token) => {
+            execute_driver(
+                config,
+                &assignment,
+                &repository_token,
+                artifacts.clone(),
+                client,
+                &attempt_cancel,
+                &reliable,
+            )
+            .await?
+        }
     };
     let outcome_digest = sbgh_proto::payload_digest(&terminal)?;
     let terminal_event = reliable
@@ -344,19 +357,6 @@ async fn execute_assignment(
     let response = retry_terminal(client, &completion, shutdown).await?;
     ensure!(response.accepted, "orchestrator rejected terminal outcome");
     heartbeat.stop().await?;
-    if matches!(assignment.payload, TaskPayload::BlockValidation(_)) {
-        let block = config
-            .block_validation
-            .as_ref()
-            .context("block-validation assignment lost its local config")?;
-        if !block_validation::cleanup(block, assignment.context.job_id).await {
-            tracing::warn!(
-                job_id = %assignment.context.job_id,
-                attempt_id = %assignment.identity.attempt_id,
-                "accepted block-validation attempt left local diagnostic files for operator cleanup"
-            );
-        }
-    }
     Ok(drain_requested.load(Ordering::Acquire))
 }
 
@@ -502,50 +502,6 @@ impl Drop for HeartbeatSupervisor {
     }
 }
 
-async fn archive_block_artifacts(
-    job_id: Uuid,
-    sink: &dyn ArtifactSink,
-    paths: &[PathBuf],
-) -> anyhow::Result<()> {
-    for path in paths {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("block-validation artifact has no UTF-8 filename")?;
-        let key = format!("{job_id}/block-validation/{name}");
-        sink.put(&key, path)
-            .await
-            .with_context(|| format!("uploading block-validation artifact {name}"))?;
-    }
-    Ok(())
-}
-
-async fn block_diagnostic_paths(
-    config: &crate::config::BlockValidationConfig,
-    job_id: Uuid,
-) -> Vec<PathBuf> {
-    let root = config
-        .workspace_root
-        .join(job_id.to_string());
-    let Ok(mut entries) = tokio::fs::read_dir(root).await else {
-        return Vec::new();
-    };
-    let mut paths = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("shard-") && name.ends_with(".log"))
-        {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    paths
-}
-
 async fn execute_driver(
     config: &WorkerConfig,
     assignment: &sbgh_proto::Assignment,
@@ -558,7 +514,7 @@ async fn execute_driver(
     let libvirt = config
         .libvirt
         .clone()
-        .context("benchmark/build assignment received without [libvirt]")?;
+        .context("sandboxed assignment received without [libvirt]")?;
     let cache = config
         .binary_cache
         .as_ref()
@@ -568,9 +524,10 @@ async fn execute_driver(
     let request = execution_request(assignment, repository_token)?;
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let runtime = built.runtime;
+    let execution_runtime = runtime.clone();
     let execution_cancel = cancel.clone();
     let execution = tokio::spawn(async move {
-        runtime
+        execution_runtime
             .run(request, events_tx, execution_cancel)
             .await;
     });
@@ -609,10 +566,22 @@ async fn execute_driver(
                 }
                 Some(WorkerEvent::Finished(terminal)) => {
                     execution.await.context("joining local execution task")?;
+                    if !runtime
+                        .cleanup_attempt(
+                            &assignment.context.job_id.to_string(),
+                            &assignment.identity.attempt_id.to_string(),
+                        )
+                        .await
+                    {
+                        anyhow::bail!(
+                            "attempt cleanup could not be verified; withholding terminal outcome \
+                             so lease recovery can retry"
+                        );
+                    }
                     let outcome = match terminal {
-                        Terminal::Completed { summary } => TerminalOutcome::Completed {
+                        Terminal::Completed { summary, block_validation } => TerminalOutcome::Completed {
                             summary,
-                            block_validation: None,
+                            block_validation: block_validation.map(driver_block_result_to_wire),
                         },
                         Terminal::Failed { error, summary } => TerminalOutcome::Failed {
                             error,
@@ -654,11 +623,30 @@ fn execution_request(
             },
         }),
         TaskPayload::BuildOnly => ExecutionTask::BuildOnly,
-        TaskPayload::BlockValidation(_) => anyhow::bail!("block validation is not a driver task"),
+        TaskPayload::BlockValidation(payload) => {
+            ExecutionTask::BlockValidation(BlockValidationTaskSpec {
+                dataset: driver_dataset_identity(&payload.dataset),
+                epoch: match payload.epoch {
+                    sbgh_proto::ValidationEpoch::PreNakamoto => ValidationEpoch::PreNakamoto,
+                    sbgh_proto::ValidationEpoch::Nakamoto => ValidationEpoch::Nakamoto,
+                },
+                range: InclusiveRange {
+                    start: payload.range.start,
+                    end: payload.range.end,
+                },
+                requested_shards: payload.requested_shards,
+                max_concurrency: payload.max_concurrency,
+                timeout_secs: payload.timeout_secs,
+            })
+        }
     };
     Ok(ExecutionRequest {
         context: ExecutionContext {
             job_id: assignment.context.job_id,
+            attempt_id: assignment.identity.attempt_id,
+            fencing_generation: assignment
+                .identity
+                .fencing_generation,
             repository: assignment
                 .context
                 .repository
@@ -674,58 +662,6 @@ fn execution_request(
             vcpu_cpuset: assignment.vcpu_cpuset.clone(),
         },
     })
-}
-
-enum Driven<T> {
-    Finished(T),
-    Cancelled,
-}
-
-async fn drive_block_execution<F, T>(
-    client: &FleetClient,
-    assignment: &sbgh_proto::Assignment,
-    cancel: &CancellationToken,
-    mut progress: mpsc::UnboundedReceiver<block_validation::BlockProgress>,
-    future: F,
-) -> anyhow::Result<Driven<T>>
-where
-    F: Future<Output = T>,
-{
-    tokio::pin!(future);
-    let mut cancelling = false;
-    let mut progress_seq = 0_u64;
-    loop {
-        tokio::select! {
-            result = &mut future => {
-                return Ok(if cancelling || cancel.is_cancelled() {
-                    Driven::Cancelled
-                } else {
-                    Driven::Finished(result)
-                });
-            }
-            () = cancel.cancelled(), if !cancelling => {
-                cancelling = true;
-            }
-            Some(update) = progress.recv() => {
-                progress_seq = progress_seq.saturating_add(1);
-                let _ = client.progress(&ProgressRequest {
-                    protocol_version: PROTOCOL_VERSION,
-                    identity: assignment.identity.clone(),
-                    trace_id: assignment.trace_id,
-                    progress_seq,
-                    update: ProgressUpdate {
-                        workflow_step: "run".into(),
-                        run_index: 0,
-                        requested_run_count: 1,
-                        phase: "validate".into(),
-                        progress: update.completed_shards,
-                        total: Some(update.total_shards),
-                        message: Some(format!("{} blocks checked", update.checked_blocks)),
-                    },
-                }).await;
-            }
-        }
-    }
 }
 
 struct ReliableSender {
@@ -902,11 +838,13 @@ async fn cleanup_obligations(
             )
             .runtime;
             cleaned &= runtime
-                .cleanup_by_job_id(&obligation.job_id.to_string())
+                .cleanup_attempt(
+                    &obligation.job_id.to_string(),
+                    &obligation
+                        .attempt_id
+                        .to_string(),
+                )
                 .await;
-        }
-        if let Some(block) = &config.block_validation {
-            cleaned &= block_validation::cleanup(block, obligation.job_id).await;
         }
         if cleaned {
             client
@@ -977,9 +915,13 @@ fn retry_delay(error: &anyhow::Error, fallback: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_api_code, is_non_retryable, retry_delay};
+    use super::{admit_offer, has_api_code, is_non_retryable, retry_delay};
+    use crate::WorkerConfig;
     use crate::transport::FleetApiError;
+    use sbgh_proto::{AttemptIdentity, LeaseToken, OfferRequirements, WorkOffer, WorkerCapability};
+    use std::path::Path;
     use std::time::Duration;
+    use uuid::Uuid;
 
     fn api_error(code: &str, retryable: bool, retry_after: Option<Duration>) -> anyhow::Error {
         anyhow::Error::new(FleetApiError {
@@ -1013,6 +955,44 @@ mod tests {
                 Duration::from_millis(10),
             ),
             Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_block_offer_is_rejected_before_sandbox_preflight_or_acceptance() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config =
+            WorkerConfig::load(&root.join("config.example.worker-block-validation.toml")).unwrap();
+        let dataset = config
+            .resources
+            .dataset
+            .clone()
+            .unwrap();
+        let offer = WorkOffer {
+            identity: AttemptIdentity {
+                worker_session_id: Uuid::new_v4(),
+                attempt_id: Uuid::new_v4(),
+                fencing_generation: 1,
+                lease_token: LeaseToken("a".repeat(64)),
+            },
+            job_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            capability: WorkerCapability::BlockValidation,
+            requirements: OfferRequirements::BlockValidation {
+                dataset,
+                requested_shards: 49,
+                max_concurrency: 48,
+            },
+            payload_hash: "ab".repeat(32),
+            offer_expires_at_ms: i64::MAX,
+        };
+        let error = admit_offer(&config, &offer)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shard limit")
         );
     }
 }

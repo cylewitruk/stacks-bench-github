@@ -11,6 +11,10 @@ use tracing_subscriber::{EnvFilter, fmt};
 struct Args {
     #[arg(long)]
     config: PathBuf,
+    /// Validate the local execution profile and sealed dataset without
+    /// connecting to the orchestrator.
+    #[arg(long)]
+    preflight_only: bool,
 }
 
 #[tokio::main]
@@ -23,6 +27,13 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config =
         sbgh_worker::WorkerConfig::load(&args.config).context("loading worker configuration")?;
+    if args.preflight_only {
+        sbgh_worker::preflight_local_execution(&config)
+            .await
+            .context("preflighting local worker execution")?;
+        tracing::info!("local worker execution preflight passed");
+        return Ok(());
+    }
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();
     tokio::spawn(async move {

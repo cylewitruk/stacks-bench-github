@@ -24,10 +24,11 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use async_trait::async_trait;
 use sbgh_driver::artifact::{ArtifactSink, artifact_key};
-use sbgh_driver::cache::{BinaryCacheStore, BuildFingerprint, CacheEnvironment};
+use sbgh_driver::cache::{BinaryCacheStore, BuildArtifact, BuildFingerprint, CacheEnvironment};
 use sbgh_driver::{
-    BenchmarkRunContext, BenchmarkTaskSpec, Driver, DriverOutcome, DriverStatus, EventSink,
-    PhaseLabel, Placement, ProgressUpdate, TaskContext, TaskSpec, WorkflowStep,
+    BenchmarkRunContext, BenchmarkTaskSpec, BlockValidationTaskSpec, Driver, DriverOutcome,
+    DriverStatus, DriverTaskOutput, EventSink, PhaseLabel, Placement, ProgressUpdate, TaskContext,
+    TaskSpec, WorkflowStep,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -35,13 +36,17 @@ use tokio_util::sync::CancellationToken;
 use crate::LibvirtConfig;
 use crate::bench_progress::parse_progress_line;
 use crate::fingerprint;
+use crate::libvirt::block_validation::{BlockGuestPlan, reduce_result};
 use crate::libvirt::boot::BootDisk;
-use crate::libvirt::cloudinit::{BenchPhaseParams, CloudInitArtifacts, CloudInitCommon};
-use crate::libvirt::domain::{self, DomainSpec};
-use crate::libvirt::lvm::ChainstateSnapshot;
+use crate::libvirt::cloudinit::{
+    BenchPhaseParams, CloudInitArtifacts, CloudInitCommon, build_block_validation_iso,
+};
+use crate::libvirt::domain::{self, BlockDeviceSpec, DomainSpec};
+use crate::libvirt::guest_file;
+use crate::libvirt::lvm::{ChainstateSnapshot, ChainstateSnapshotSet};
 use crate::libvirt::phase::{self, Phase, PollMode};
 use crate::libvirt::progress::ProgressTailer;
-use crate::libvirt::shell::{Shell, spec, spec_priv};
+use crate::libvirt::shell::{Shell, check, spec, spec_priv};
 use crate::libvirt::source::SourceDisk;
 use crate::libvirt::tmpfs::ResultsTmpfs;
 use crate::libvirt::virsh::{self, DomState};
@@ -99,17 +104,23 @@ impl BaselineCalibrationResult {
 /// one job concurrently.
 const RESULTS_TMPFS_MIB: u32 = 5120;
 const RESULTS_SHARE_TAG: &str = "results";
-/// Virtio-fs tag for the persistent sccache cache share. Must match
-/// the `<target dir>` element of the second `<filesystem>` block in
-/// the rendered domain XML and the in-VM mount in `sbgh-run.sh.tmpl`.
-const SCCACHE_SHARE_TAG: &str = "sccache";
-/// In-VM mountpoint for the sccache cache share.
+/// Guest-local compiler cache on the disposable boot overlay.
 const SCCACHE_MOUNT: &str = "/var/cache/sccache";
-/// `SCCACHE_CACHE_SIZE` value handed to sccache inside the VM. sccache
-/// LRU-evicts to keep the cache dir under this ceiling; the host
-/// `paths.sccache_dir` won't grow past this regardless of how many
-/// jobs run against it.
+/// Advisory sccache LRU target inside the overlay's hard virtual-size cap.
 const SCCACHE_MAX_SIZE: &str = "20G";
+const MAX_CALIBRATION_RESULT_BYTES: u64 = 1024 * 1024;
+const MAX_BASELINE_ID_BYTES: u64 = 4096;
+const MAX_GUEST_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn safe_resource_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'.' | b'-'))
+}
 
 // ── Binary-cache build fingerprint constants ──
 // The repo-pinned `[profile.release]` (lto/codegen-units) is commit-determined;
@@ -120,6 +131,8 @@ const BUILD_PROFILE: &str = "release";
 const BUILD_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 /// Bump on any binary-affecting change to `sbgh-build.sh.tmpl`.
 const BUILD_RECIPE_VERSION: u32 = 2;
+/// Bump on binary-affecting changes to the block-validation guest build.
+const BLOCK_BUILD_RECIPE_VERSION: u32 = 1;
 /// Until `0027`'s profiler-protocol versioning lands.
 const BUILD_PROTOCOL_VERSION: &str = "v1";
 
@@ -129,6 +142,21 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn scsi_target_dev(index: u32) -> String {
+    // Reserve sda for the SATA cloud-init CD-ROM. Linux/libvirt target names
+    // continue as sdz, sdaa, sdab, … for larger shard sets.
+    let mut value = index + 3;
+    let mut suffix = String::new();
+    loop {
+        suffix.insert(0, char::from(b'a' + (value % 26) as u8));
+        if value < 26 {
+            break;
+        }
+        value = value / 26 - 1;
+    }
+    format!("sd{suffix}")
 }
 
 /// Assemble the build fingerprint for `commit`. Reads
@@ -142,11 +170,15 @@ async fn assemble_fingerprint(
     git_binary: &Path,
     mirror: &Path,
     golden_image: &Path,
+    repository: Option<&str>,
     commit: &str,
+    artifact: BuildArtifact,
 ) -> Option<BuildFingerprint> {
     let toolchain = read_declared_toolchain(shell, git_binary, mirror, commit).await?;
-    let env = current_cache_environment(golden_image)?;
-    Some(env.fingerprint(commit.to_string(), toolchain))
+    let env = current_cache_environment_for(golden_image, artifact)?;
+    let mut fingerprint = env.fingerprint(commit.to_string(), toolchain);
+    fingerprint.repository = repository.map(str::to_owned);
+    Some(fingerprint)
 }
 
 async fn read_declared_toolchain(
@@ -175,13 +207,24 @@ async fn read_declared_toolchain(
 /// entry's stored env and the daemon's current env are compared on identical
 /// terms.
 pub fn current_cache_environment(golden_image: &Path) -> Option<CacheEnvironment> {
+    current_cache_environment_for(golden_image, BuildArtifact::StacksBench)
+}
+
+fn current_cache_environment_for(
+    golden_image: &Path,
+    artifact: BuildArtifact,
+) -> Option<CacheEnvironment> {
     let image_id = fingerprint::image_proxy_id(golden_image).ok()?;
     Some(CacheEnvironment {
+        artifact,
         profile: BUILD_PROFILE.to_string(),
         features: String::new(),
         rustflags: String::new(),
         target_triple: BUILD_TARGET_TRIPLE.to_string(),
-        recipe_version: BUILD_RECIPE_VERSION,
+        recipe_version: match artifact {
+            BuildArtifact::StacksBench => BUILD_RECIPE_VERSION,
+            BuildArtifact::StacksInspect => BLOCK_BUILD_RECIPE_VERSION,
+        },
         image_id,
         protocol_version: BUILD_PROTOCOL_VERSION.to_string(),
     })
@@ -277,6 +320,12 @@ struct ProgressContext {
     requested_run_count: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PollPolicy {
+    mode: PollMode,
+    timeout: Duration,
+}
+
 /// Aggregates the host-side artifacts so cleanup can run unconditionally even
 /// if provisioning aborts mid-way.
 #[derive(Default)]
@@ -284,6 +333,7 @@ struct JobArtifacts {
     boot: Option<BootDisk>,
     source: Option<SourceDisk>,
     chainstate: Option<ChainstateSnapshot>,
+    block_snapshots: Option<ChainstateSnapshotSet>,
     tmpfs: Option<ResultsTmpfs>,
     domain_defined: bool,
     domain_started: bool,
@@ -311,6 +361,7 @@ struct RunInputs<'a> {
     /// Build-only mode stops after the build VM publishes the artifact and
     /// skips the bench phase.
     build_only: bool,
+    artifact: BuildArtifact,
 }
 
 pub struct LibvirtDriver {
@@ -338,6 +389,148 @@ impl LibvirtDriver {
         }
     }
 
+    /// Validate the configured block-validation profile before the worker
+    /// advertises the capability.
+    pub async fn preflight_block_validation(
+        &self,
+        identity: &sbgh_driver::DatasetIdentity,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let profile = self
+            .config
+            .block_validation
+            .as_ref()
+            .context("block-validation libvirt profile is absent")?;
+        anyhow::ensure!(profile.vcpus > 0, "block-validation vcpus must be non-zero");
+        anyhow::ensure!(profile.memory_bytes > 0, "block-validation memory_bytes must be non-zero");
+        anyhow::ensure!(
+            profile.results_tmpfs_mib > 0,
+            "block-validation results_tmpfs_mib must be non-zero"
+        );
+        anyhow::ensure!(
+            profile.max_shards > 0
+                && profile.max_concurrency > 0
+                && profile.max_concurrency <= profile.max_shards,
+            "invalid block-validation shard/concurrency limits"
+        );
+        anyhow::ensure!(
+            profile.max_parallel_jobs == 1,
+            "v26 supports exactly one block-validation assignment per worker"
+        );
+        anyhow::ensure!(
+            profile.max_shards <= 64,
+            "v26 supports at most 64 virtio-scsi shard devices per VM"
+        );
+        anyhow::ensure!(
+            safe_resource_component(
+                &profile
+                    .dataset
+                    .snapshot_prefix
+            ),
+            "block-validation snapshot_prefix is not a valid LVM name component"
+        );
+        self.config
+            .lvm
+            .validate_pool_health_policy()?;
+        anyhow::ensure!(
+            profile
+                .chain_config
+                .is_absolute(),
+            "block-validation chain_config must be absolute"
+        );
+        for (name, path) in [
+            ("golden image", &self.config.vm.golden_image),
+            ("block-validation chain config", &profile.chain_config),
+        ] {
+            anyhow::ensure!(path.is_file(), "{name} is not a regular file: {}", path.display());
+            std::fs::File::open(path)
+                .with_context(|| format!("{name} is not readable: {}", path.display()))?;
+        }
+        for (name, path) in [
+            ("sudo", &self.config.paths.sudo_binary),
+            ("virsh", &self.config.paths.virsh_binary),
+            (
+                "qemu-img",
+                &self
+                    .config
+                    .paths
+                    .qemu_img_binary,
+            ),
+            (
+                "cloud-localds",
+                &self
+                    .config
+                    .paths
+                    .cloud_localds_binary,
+            ),
+            ("git", &self.config.paths.git_binary),
+        ] {
+            let metadata = std::fs::metadata(path)
+                .with_context(|| format!("{name} binary is unavailable: {}", path.display()))?;
+            anyhow::ensure!(
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+                "{name} path is not an executable file: {}",
+                path.display()
+            );
+        }
+        for directory in [
+            &self.config.paths.jobs_dir,
+            &self
+                .config
+                .paths
+                .results_tmpfs_root,
+            &self
+                .config
+                .paths
+                .results_archive_dir,
+        ] {
+            std::fs::create_dir_all(directory).with_context(|| {
+                format!("creating block-validation runtime directory {}", directory.display())
+            })?;
+        }
+        if let Some(parent) = self
+            .config
+            .paths
+            .git_mirror
+            .parent()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating git-mirror parent directory {}", parent.display())
+            })?;
+        }
+
+        let golden = self
+            .config
+            .vm
+            .golden_image
+            .display()
+            .to_string();
+        let output = self
+            .shell
+            .run(spec(
+                &self
+                    .config
+                    .paths
+                    .qemu_img_binary,
+                &["info", "--output=json", &golden],
+            ))
+            .await?;
+        check(&output, "qemu-img info for block-validation golden image")?;
+        let output = self
+            .shell
+            .run(spec_priv(&self.config.paths.virsh_binary, &["net-info", &profile.network]))
+            .await?;
+        check(&output, &format!("virsh net-info {}", profile.network))?;
+        crate::libvirt::lvm::validate_exact_generation(
+            self.shell.as_ref(),
+            &self.config.lvm,
+            &profile.dataset,
+            identity,
+        )
+        .await
+    }
+
     /// Run one libvirt job to a terminal outcome. The shared
     /// provision → build → publish path, then either the bench phase
     /// (`build_only = false`) or a stop after publish (`build_only = true`).
@@ -353,12 +546,13 @@ impl LibvirtDriver {
         vcpu_cpuset: Option<&str>,
     ) -> anyhow::Result<BenchmarkOutcome> {
         let job_id = ctx.job_id.to_string();
-        let domain_name = format!("sbgh-{job_id}");
+        let resource_id = ctx.attempt_id.to_string();
+        let domain_name = format!("sbgh-{resource_id}");
         let job_dir = self
             .config
             .paths
             .jobs_dir
-            .join(&job_id);
+            .join(&resource_id);
         std::fs::create_dir_all(&job_dir)?;
 
         let mut arts = JobArtifacts::default();
@@ -388,6 +582,9 @@ impl LibvirtDriver {
             TaskSpec::BuildOnly => {
                 (&[][..], None, false, None, BenchmarkRunContext::default(), true)
             }
+            TaskSpec::BlockValidation(_) => {
+                anyhow::bail!("block validation must use the block-validation sandbox plan")
+            }
         };
         let inputs = RunInputs {
             repository: ctx.repository,
@@ -399,6 +596,7 @@ impl LibvirtDriver {
             baseline_calibration_id,
             benchmark_run,
             build_only,
+            artifact: BuildArtifact::StacksBench,
         };
 
         // Run the inner pipeline. Any error becomes a Failed outcome with
@@ -406,7 +604,7 @@ impl LibvirtDriver {
         let inner_result: anyhow::Result<FinishReason> = self
             .provision_define_start_poll(
                 &inputs,
-                &job_id,
+                &resource_id,
                 &job_dir,
                 &domain_name,
                 &mut arts,
@@ -535,13 +733,16 @@ impl LibvirtDriver {
         let (console_tail, console_size_bytes) = forensics::console_tail(&console_log);
 
         // --- teardown -----------------------------------------------------
-        self.teardown(arts, &domain_name, &job_id, &job_dir)
+        let cleanup_verified = self
+            .teardown(arts, &domain_name, &resource_id, &job_dir)
             .await;
 
         // --- build summary ------------------------------------------------
         let duration_secs = started.elapsed().as_secs();
         let summary = serde_json::json!({
             "job_id": ctx.job_id,
+            "attempt_id": ctx.attempt_id,
+            "fencing_generation": ctx.fencing_generation,
             "head_sha": ctx.commit,
             "repository": ctx.repository,
             "duration_secs": duration_secs,
@@ -568,6 +769,7 @@ impl LibvirtDriver {
             "baseline_calibration_id": baseline_calibration_id,
             "phase_log_archived_path": phase_log_archived_path,
             "phase_log_size_bytes": phase_log_size_bytes,
+            "cleanup_verified": cleanup_verified,
         });
 
         // Only an explicit phase=done counts as success. A `shut off` domain
@@ -577,6 +779,9 @@ impl LibvirtDriver {
         let missing_shared_calibration =
             inputs.shared_baseline_calibration && baseline_calibration_id.is_none();
         let status = match inner_result {
+            _ if !cleanup_verified => OutcomeStatus::Failed(
+                "sandbox cleanup could not be verified; recovery must retry".into(),
+            ),
             _ if missing_shared_calibration => OutcomeStatus::Failed(
                 "shared baseline calibration did not produce a baseline id".into(),
             ),
@@ -603,6 +808,249 @@ impl LibvirtDriver {
         };
 
         Ok(BenchmarkOutcome { status, summary })
+    }
+
+    /// Execute one block-validation assignment in a single disposable VM.
+    /// Source preparation and LVM allocation are trusted host operations;
+    /// repository builds and `stacks-inspect` execute only in the guest.
+    async fn run_block_validation(
+        &self,
+        ctx: &TaskContext<'_>,
+        spec: &BlockValidationTaskSpec,
+        listener: &dyn PhaseListener,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<DriverOutcome> {
+        let profile = self
+            .config
+            .block_validation
+            .as_ref()
+            .context("block validation requires a configured libvirt profile")?;
+        anyhow::ensure!(spec.range.start <= spec.range.end, "validation range is reversed");
+        anyhow::ensure!(
+            spec.range.start >= spec.dataset.covered_start
+                && spec.range.end <= spec.dataset.covered_end,
+            "validation range is outside the pinned dataset generation"
+        );
+        anyhow::ensure!(
+            spec.requested_shards > 0 && spec.requested_shards <= profile.max_shards,
+            "requested shard count exceeds the local block-validation profile"
+        );
+        anyhow::ensure!(
+            spec.max_concurrency > 0 && spec.max_concurrency <= profile.max_concurrency,
+            "requested concurrency exceeds the local block-validation profile"
+        );
+        let job_id = ctx.job_id.to_string();
+        let attempt_id = ctx.attempt_id.to_string();
+        let domain_name = format!("sbgh-{attempt_id}");
+        let job_dir = self
+            .config
+            .paths
+            .jobs_dir
+            .join(&attempt_id);
+        std::fs::create_dir_all(&job_dir)?;
+        let started = Instant::now();
+        let mut arts = JobArtifacts::default();
+        let inputs = RunInputs {
+            repository: ctx.repository,
+            commit: ctx.commit,
+            repository_credential: ctx.repository_credential,
+            bench_args: &[],
+            sqlite_seed_key: None,
+            shared_baseline_calibration: false,
+            baseline_calibration_id: None,
+            benchmark_run: BenchmarkRunContext::default(),
+            build_only: false,
+            artifact: BuildArtifact::StacksInspect,
+        };
+
+        let inner: anyhow::Result<(FinishReason, Option<sbgh_driver::BlockValidationOutput>)> =
+            async {
+                self.prepare_git_mirror(&inputs, &attempt_id)
+                    .await?;
+                let cache_plan = self
+                    .resolve_build_plan(&inputs)
+                    .await;
+                let cache_plan = self
+                    .provision_boot_and_source(&inputs, &job_dir, &mut arts, cache_plan)
+                    .await?;
+                arts.block_snapshots = Some(
+                    ChainstateSnapshotSet::provision_exact(
+                        self.shell.as_ref(),
+                        &self.config.lvm,
+                        &profile.dataset,
+                        &spec.dataset,
+                        &job_id,
+                        &attempt_id,
+                        ctx.fencing_generation,
+                        spec.requested_shards,
+                    )
+                    .await?,
+                );
+                self.provision_results_share(&attempt_id, profile.results_tmpfs_mib, &mut arts)
+                    .await?;
+                let tmpfs = arts
+                    .tmpfs
+                    .as_ref()
+                    .expect("block-validation tmpfs was just provisioned");
+                if let BuildPlan::CacheHit { binary, .. } = &cache_plan {
+                    std::fs::copy(
+                        binary,
+                        tmpfs.binary(BuildArtifact::StacksInspect.executable_name()),
+                    )?;
+                }
+                std::fs::copy(&profile.chain_config, tmpfs.chain_config())
+                    .context("staging block-validation chain config")?;
+                let plan = BlockGuestPlan::new(
+                    &job_id,
+                    &attempt_id,
+                    ctx.fencing_generation,
+                    ctx.commit,
+                    spec,
+                    arts.block_snapshots
+                        .as_ref()
+                        .expect("snapshot set was just provisioned"),
+                    profile
+                        .dataset
+                        .mount_options
+                        .clone(),
+                )?;
+                std::fs::write(
+                    tmpfs
+                        .mount_dir
+                        .join("block-plan.json"),
+                    serde_json::to_vec(&plan)?,
+                )?;
+                let results_dir = tmpfs.mount_dir.clone();
+                let result_manifest = tmpfs.block_result_manifest();
+                let cidata = build_block_validation_iso(
+                    self.shell.as_ref(),
+                    &self.config.paths,
+                    &job_dir,
+                    &attempt_id,
+                )
+                .await?;
+                let reason = self
+                    .run_phase(
+                        "block-validation",
+                        PollMode::Bench,
+                        profile.vcpus,
+                        profile.memory_bytes,
+                        &cidata,
+                        &job_dir,
+                        &domain_name,
+                        &mut arts,
+                        listener,
+                        cancel,
+                        profile.cpu_set.as_deref(),
+                        Some(ProgressContext {
+                            workflow_step: WorkflowStep::Run,
+                            run_index: 0,
+                            requested_run_count: 1,
+                        }),
+                        Some(&profile.network),
+                        Some(Duration::from_secs(spec.timeout_secs)),
+                    )
+                    .await?;
+                if reason != FinishReason::PhaseDone {
+                    return Ok((reason, None));
+                }
+                if matches!(cache_plan, BuildPlan::Miss) {
+                    let _ = self
+                        .publish_built_binary(&inputs, &arts)
+                        .await;
+                }
+                let diagnostics = block_diagnostic_paths(&results_dir)?;
+                archive_block_paths(self.artifact_store.as_ref(), &job_id, &diagnostics).await?;
+                let reduced = reduce_result(&result_manifest, &results_dir, &plan)?;
+                let remaining = reduced
+                    .artifacts
+                    .iter()
+                    .filter(|path| !diagnostics.contains(path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                archive_block_paths(self.artifact_store.as_ref(), &job_id, &remaining).await?;
+                Ok((reason, Some(reduced.output)))
+            }
+            .await;
+
+        let last_phase = arts
+            .tmpfs
+            .as_ref()
+            .and_then(|tmpfs| phase::read_last(&tmpfs.phase_log()))
+            .map(|phase| phase.label().to_string());
+        let snapshot_origin = arts
+            .block_snapshots
+            .as_ref()
+            .map(|set| set.origin.clone());
+        let snapshot_devices = arts
+            .block_snapshots
+            .as_ref()
+            .map(|set| {
+                set.snapshots
+                    .iter()
+                    .map(|snapshot| {
+                        serde_json::json!({
+                            "shard": snapshot.shard,
+                            "lv": snapshot.name,
+                            "serial": snapshot.serial,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let logical_output = inner
+            .as_ref()
+            .ok()
+            .and_then(|(_, output)| output.as_ref());
+        let mut summary = serde_json::json!({
+            "task": "block_validation",
+            "job_id": ctx.job_id,
+            "attempt_id": ctx.attempt_id,
+            "fencing_generation": ctx.fencing_generation,
+            "repository": ctx.repository,
+            "head_sha": ctx.commit,
+            "dataset_generation": spec.dataset.generation,
+            "dataset_origin": snapshot_origin,
+            "snapshot_devices": snapshot_devices,
+            "shards": spec.requested_shards,
+            "max_concurrency": spec.max_concurrency,
+            "valid": logical_output.map(|output| output.valid),
+            "checked_blocks": logical_output.map(|output| output.checked_blocks),
+            "invalid_block_count": logical_output.map(|output| output.invalid_blocks.len()),
+            "duration_secs": started.elapsed().as_secs(),
+            "finish_reason": match &inner {
+                Ok((reason, _)) => reason.label(),
+                Err(_) => "setup_error",
+            },
+            "last_phase": last_phase,
+        });
+        let cleanup_verified = self
+            .teardown(arts, &domain_name, &attempt_id, &job_dir)
+            .await;
+        summary["cleanup_verified"] = serde_json::Value::Bool(cleanup_verified);
+        let (status, output) = match inner {
+            _ if !cleanup_verified => (
+                DriverStatus::Failed(
+                    "sandbox cleanup could not be verified; recovery must retry".into(),
+                ),
+                DriverTaskOutput::None,
+            ),
+            Ok((FinishReason::PhaseDone, Some(output))) => {
+                (DriverStatus::Completed, DriverTaskOutput::BlockValidation(output))
+            }
+            Ok((FinishReason::Cancelled, _)) => {
+                (DriverStatus::Failed("run cancelled by shutdown".into()), DriverTaskOutput::None)
+            }
+            Ok((reason, _)) => (
+                DriverStatus::Failed(format!(
+                    "block-validation VM did not complete ({})",
+                    reason.label()
+                )),
+                DriverTaskOutput::None,
+            ),
+            Err(error) => (DriverStatus::Failed(format!("{error:#}")), DriverTaskOutput::None),
+        };
+        Ok(DriverOutcome { status, summary, output })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -660,6 +1108,8 @@ impl LibvirtDriver {
                     cancel,
                     vcpu_cpuset,
                     None,
+                    None,
+                    None,
                 )
                 .await?;
             match build_reason {
@@ -716,6 +1166,8 @@ impl LibvirtDriver {
                             .benchmark_run
                             .requested_run_count,
                     }),
+                    None,
+                    None,
                 )
                 .await?;
             match calibrate_reason {
@@ -732,7 +1184,7 @@ impl LibvirtDriver {
 
         // ── phase 2: bench VM ─────────────────────────────────────────
         // Same domain name, redefined at bench memory + cidata. The
-        // existing boot/source/chainstate/tmpfs/sccache stay attached
+        // existing boot/source/chainstate/tmpfs stay attached
         // by virtue of being referenced in the new XML.
         let bench_reason = self
             .run_phase(
@@ -756,6 +1208,8 @@ impl LibvirtDriver {
                         .benchmark_run
                         .requested_run_count,
                 }),
+                None,
+                None,
             )
             .await?;
         Ok(bench_reason)
@@ -788,7 +1242,7 @@ impl LibvirtDriver {
             return BuildPlan::Miss;
         };
         let Some(fp) = self
-            .fingerprint_for(inputs.commit)
+            .fingerprint_for(inputs.repository, inputs.commit, inputs.artifact)
             .await
         else {
             tracing::info!(
@@ -822,7 +1276,8 @@ impl LibvirtDriver {
         tracing::info!(
             commit = inputs.commit,
             digest = %digest,
-            "binary cache: reusing cached stacks-bench binary; skipping the build VM"
+            artifact = ?inputs.artifact,
+            "binary cache: reusing cached binary; skipping the build VM"
         );
         // Drive the reporter with a single opaque `build_cached:<digest>`
         // phase. Each surface interprets it; the build VM that normally emits
@@ -847,12 +1302,32 @@ impl LibvirtDriver {
         let Some(t) = arts.tmpfs.as_ref() else {
             return false;
         };
-        let binary = t.stacks_bench_binary();
-        if !binary.exists() {
+        let binary = t.binary(
+            inputs
+                .artifact
+                .executable_name(),
+        );
+        if let Err(error) = guest_file::verify_beneath(&t.mount_dir, &binary) {
+            tracing::warn!(
+                %error,
+                path = %binary.display(),
+                "binary cache: refusing non-regular guest output"
+            );
+            return false;
+        }
+        if std::fs::metadata(&binary)
+            .map(|metadata| metadata.len() > MAX_GUEST_BINARY_BYTES)
+            .unwrap_or(true)
+        {
+            tracing::warn!(
+                path = %binary.display(),
+                max_bytes = MAX_GUEST_BINARY_BYTES,
+                "binary cache: refusing oversized guest output"
+            );
             return false;
         }
         let Some(fp) = self
-            .fingerprint_for(inputs.commit)
+            .fingerprint_for(inputs.repository, inputs.commit, inputs.artifact)
             .await
         else {
             return false;
@@ -871,65 +1346,63 @@ impl LibvirtDriver {
 
     /// This run's build fingerprint — a config-bound wrapper over the free
     /// [`assemble_fingerprint`] (reads the toolchain from the bare git mirror).
-    async fn fingerprint_for(&self, commit: &str) -> Option<BuildFingerprint> {
+    async fn fingerprint_for(
+        &self,
+        repository: &str,
+        commit: &str,
+        artifact: BuildArtifact,
+    ) -> Option<BuildFingerprint> {
         assemble_fingerprint(
             self.shell.as_ref(),
             &self.config.paths.git_binary,
             &self.config.paths.git_mirror,
             &self.config.vm.golden_image,
+            (artifact == BuildArtifact::StacksInspect).then_some(repository),
             commit,
+            artifact,
         )
         .await
     }
 
-    /// One-time provisioning: artifacts that live across both VM
-    /// lifecycles (boot disk, source disk, chainstate snapshot, results
-    /// tmpfs) + the two cidata ISOs.
-    async fn provision_artifacts(
+    /// Provision the task-neutral disposable boot overlay and source disk.
+    /// Cache hits seed only the selected executable; a failed minimal seed
+    /// falls back to an exact checkout and guest build.
+    async fn provision_boot_and_source(
         &self,
         inputs: &RunInputs<'_>,
-        job_id: &str,
         job_dir: &Path,
         arts: &mut JobArtifacts,
         plan: BuildPlan,
-        listener: &dyn PhaseListener,
-    ) -> anyhow::Result<(CloudInitArtifacts, BuildPlan)> {
-        // Boot disk — single qcow2 overlay reused across both phases.
-        // The bench VM boots from the same disk the build VM left
-        // behind; cloud-init's per-instance-id re-run is the mechanism
-        // that gets a different script executed on the second boot.
+    ) -> anyhow::Result<BuildPlan> {
         arts.boot = Some(
             BootDisk::provision(self.shell.as_ref(), &self.config.paths, &self.config.vm, job_dir)
                 .await?,
         );
-
-        // Source disk — persists across both phases. A miss provisions the full
-        // checkout for the build VM. A cache hit provisions only the binary the
-        // bench VM execs, avoiding checkout + full-tree chown.
         let source_mount = job_dir.join("source.mnt");
-        let plan = match plan {
+        match plan {
             BuildPlan::CacheHit { binary, digest } => {
-                let short = &digest[..digest.len().min(12)];
-                listener
-                    .on_phase(&Phase::Other(format!("build_cache_staging:{short}")))
-                    .await;
-                match SourceDisk::provision_minimal(
+                match SourceDisk::provision_minimal_for(
                     self.shell.as_ref(),
                     job_dir,
                     &source_mount,
                     &binary,
+                    inputs
+                        .artifact
+                        .executable_name(),
                     &self.config.service_user,
                 )
                 .await
                 {
                     Ok(source) => {
                         arts.source = Some(source);
-                        BuildPlan::CacheHit { binary, digest }
+                        Ok(BuildPlan::CacheHit { binary, digest })
                     }
-                    Err(e) => {
+                    Err(error) => {
                         tracing::warn!(
-                            error = %e,
-                            "binary cache: minimal source-disk seed failed; falling back to full checkout + build"
+                            %error,
+                            artifact = inputs.artifact.executable_name(),
+                            "binary cache: minimal source-disk seed failed; falling back to exact \
+                             checkout and guest build"
                         );
                         arts.source = Some(
                             SourceDisk::provision(
@@ -942,7 +1415,7 @@ impl LibvirtDriver {
                             )
                             .await?,
                         );
-                        BuildPlan::Miss
+                        Ok(BuildPlan::Miss)
                     }
                 }
             }
@@ -958,9 +1431,51 @@ impl LibvirtDriver {
                     )
                     .await?,
                 );
-                BuildPlan::Miss
+                Ok(BuildPlan::Miss)
             }
-        };
+        }
+    }
+
+    async fn provision_results_share(
+        &self,
+        resource_id: &str,
+        size_mib: u32,
+        arts: &mut JobArtifacts,
+    ) -> anyhow::Result<()> {
+        arts.tmpfs = Some(
+            ResultsTmpfs::mount(
+                self.shell.as_ref(),
+                &self.config.paths,
+                resource_id,
+                size_mib,
+                &self.config.service_user,
+            )
+            .await?,
+        );
+        Ok(())
+    }
+
+    /// One-time provisioning: artifacts that live across both VM
+    /// lifecycles (boot disk, source disk, chainstate snapshot, results
+    /// tmpfs) + the two cidata ISOs.
+    async fn provision_artifacts(
+        &self,
+        inputs: &RunInputs<'_>,
+        job_id: &str,
+        job_dir: &Path,
+        arts: &mut JobArtifacts,
+        plan: BuildPlan,
+        listener: &dyn PhaseListener,
+    ) -> anyhow::Result<(CloudInitArtifacts, BuildPlan)> {
+        if let BuildPlan::CacheHit { digest, .. } = &plan {
+            let short = &digest[..digest.len().min(12)];
+            listener
+                .on_phase(&Phase::Other(format!("build_cache_staging:{short}")))
+                .await;
+        }
+        let plan = self
+            .provision_boot_and_source(inputs, job_dir, arts, plan)
+            .await?;
 
         // Chainstate snapshot — only the bench phase mounts it, but
         // the device is attached to the domain in both phases (build
@@ -971,21 +1486,20 @@ impl LibvirtDriver {
 
         // Results tmpfs — shared between phases. Phase journal lives
         // here, so both VMs append to the same `.phase-log`.
-        arts.tmpfs = Some(
-            ResultsTmpfs::mount(
-                self.shell.as_ref(),
-                &self.config.paths,
-                job_id,
-                RESULTS_TMPFS_MIB,
-                &self.config.service_user,
-            )
-            .await?,
-        );
+        self.provision_results_share(job_id, RESULTS_TMPFS_MIB, arts)
+            .await?;
         if let (Some(seed_key), Some(tmpfs)) = (inputs.sqlite_seed_key, arts.tmpfs.as_ref()) {
             seed_sqlite_from_store(self.artifact_store.as_ref(), seed_key, tmpfs).await?;
         }
         if let (BuildPlan::CacheHit { binary, .. }, Some(tmpfs)) = (&plan, arts.tmpfs.as_ref()) {
-            let _ = std::fs::copy(binary, tmpfs.stacks_bench_binary());
+            let _ = std::fs::copy(
+                binary,
+                tmpfs.binary(
+                    inputs
+                        .artifact
+                        .executable_name(),
+                ),
+            );
         }
 
         // Cloud-init: two ISOs, one per phase, distinct instance-ids
@@ -1002,7 +1516,6 @@ impl LibvirtDriver {
                 source_mount: "/opt/stacks-core",
                 results_share_tag: RESULTS_SHARE_TAG,
                 results_mount: "/results",
-                sccache_share_tag: SCCACHE_SHARE_TAG,
                 sccache_mount: SCCACHE_MOUNT,
                 sccache_max_size: SCCACHE_MAX_SIZE,
             },
@@ -1042,6 +1555,8 @@ impl LibvirtDriver {
         cancel: &CancellationToken,
         vcpu_cpuset: Option<&str>,
         progress_context: Option<ProgressContext>,
+        network_override: Option<&str>,
+        timeout_override: Option<Duration>,
     ) -> anyhow::Result<FinishReason> {
         tracing::info!(domain = domain_name, phase_lifecycle = phase_label, "starting phase");
 
@@ -1049,10 +1564,6 @@ impl LibvirtDriver {
             .tmpfs
             .as_ref()
             .expect("tmpfs provisioned before run_phase");
-        let chainstate_ref = arts
-            .chainstate
-            .as_ref()
-            .expect("chainstate provisioned before run_phase");
         let boot_ref = arts
             .boot
             .as_ref()
@@ -1071,21 +1582,48 @@ impl LibvirtDriver {
         let job_uuid = domain_name
             .strip_prefix("sbgh-")
             .unwrap_or(domain_name);
+        let target_names = arts
+            .block_snapshots
+            .as_ref()
+            .map(|set| {
+                set.snapshots
+                    .iter()
+                    .map(|snapshot| scsi_target_dev(snapshot.shard))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let block_devices = arts
+            .block_snapshots
+            .as_ref()
+            .map(|set| {
+                set.snapshots
+                    .iter()
+                    .zip(&target_names)
+                    .map(|(snapshot, target)| BlockDeviceSpec {
+                        path: snapshot.device.as_path(),
+                        target_dev: target,
+                        serial: &snapshot.serial,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let xml = domain::render(&DomainSpec {
             name: domain_name,
             uuid: job_uuid,
             vcpus,
             memory_bytes,
             boot_disk_path: &boot_ref.path,
-            chainstate_dev_path: &chainstate_ref.device,
+            chainstate_dev_path: arts
+                .chainstate
+                .as_ref()
+                .map(|snapshot| snapshot.device.as_path()),
+            block_devices: &block_devices,
             source_disk_path: &source_ref.path,
             cidata_iso_path,
             results_share_dir: &tmpfs_ref.mount_dir,
             results_share_tag: RESULTS_SHARE_TAG,
-            sccache_share_dir: &self.config.paths.sccache_dir,
-            sccache_share_tag: SCCACHE_SHARE_TAG,
             console_log_path: &console_log,
-            network: &self.config.vm.network,
+            network: network_override.unwrap_or(&self.config.vm.network),
             vcpu_cpuset,
             // Emulator threads pin to the host cores only when this job's vCPUs
             // are pinned (`[runner].host_cpus`); meaningless otherwise.
@@ -1116,8 +1654,17 @@ impl LibvirtDriver {
                 &phase_log,
                 progress_tailer.as_mut(),
                 listener,
-                mode,
                 cancel,
+                PollPolicy {
+                    mode,
+                    timeout: timeout_override.unwrap_or_else(|| {
+                        Duration::from_secs(
+                            self.config
+                                .vm
+                                .job_timeout_secs,
+                        )
+                    }),
+                },
             )
             .await;
         Ok(reason)
@@ -1129,15 +1676,10 @@ impl LibvirtDriver {
         phase_log: &Path,
         mut progress_tailer: Option<&mut (ProgressTailer, ProgressContext)>,
         listener: &dyn PhaseListener,
-        mode: PollMode,
         cancel: &CancellationToken,
+        policy: PollPolicy,
     ) -> FinishReason {
         let started = Instant::now();
-        let timeout = Duration::from_secs(
-            self.config
-                .vm
-                .job_timeout_secs,
-        );
         let poll_interval = Duration::from_secs(
             self.config
                 .vm
@@ -1199,7 +1741,7 @@ impl LibvirtDriver {
                         .await;
                     return FinishReason::PhaseError;
                 }
-                if p.is_success_for(mode) {
+                if p.is_success_for(policy.mode) {
                     success_phase_seen = true;
                     // We DON'T return immediately on success — the VM
                     // is still powering off (cloud-init's poweroff
@@ -1251,7 +1793,7 @@ impl LibvirtDriver {
                 Err(e) => tracing::warn!(error = %e, "domstate poll failed"),
             }
 
-            if started.elapsed() > timeout {
+            if started.elapsed() > policy.timeout {
                 Self::drain_progress_tailer(domain_name, &mut progress_tailer, listener, true)
                     .await;
                 return FinishReason::Timeout;
@@ -1310,12 +1852,22 @@ impl LibvirtDriver {
         }
     }
 
-    async fn teardown(&self, arts: JobArtifacts, domain_name: &str, job_id: &str, job_dir: &Path) {
+    /// Release resources in dependency order. If the domain cannot be
+    /// conclusively stopped and undefined, retain every backing resource so
+    /// authoritative cleanup can retry without racing a live QEMU process.
+    async fn teardown(
+        &self,
+        arts: JobArtifacts,
+        domain_name: &str,
+        job_id: &str,
+        job_dir: &Path,
+    ) -> bool {
         if arts.domain_started || arts.domain_defined {
             if let Err(e) =
                 virsh::destroy(self.shell.as_ref(), &self.config.paths, domain_name).await
             {
                 tracing::warn!(error = %e, "virsh destroy failed");
+                return false;
             }
         }
         if arts.domain_defined
@@ -1323,13 +1875,16 @@ impl LibvirtDriver {
                 virsh::undefine(self.shell.as_ref(), &self.config.paths, domain_name).await
         {
             tracing::warn!(error = %e, "virsh undefine failed");
+            return false;
         }
+        let mut verified = true;
         if let Some(t) = arts.tmpfs
             && let Err(e) = t
                 .unmount(self.shell.as_ref())
                 .await
         {
             tracing::warn!(error = %e, "tmpfs unmount failed");
+            verified = false;
         }
         if let Some(c) = arts.chainstate
             && let Err(e) = c
@@ -1337,21 +1892,34 @@ impl LibvirtDriver {
                 .await
         {
             tracing::warn!(error = %e, "lvm teardown failed");
+            verified = false;
+        }
+        if let Some(set) = arts.block_snapshots
+            && let Err(e) = set
+                .teardown(self.shell.as_ref())
+                .await
+        {
+            tracing::warn!(error = %e, "block snapshot-set teardown failed");
+            verified = false;
         }
         if let Some(s) = arts.source
             && let Err(e) = s.teardown()
         {
             tracing::warn!(error = %e, "source disk delete failed");
+            verified = false;
         }
         if let Some(b) = arts.boot
             && let Err(e) = b.teardown()
         {
             tracing::warn!(error = %e, "boot disk delete failed");
+            verified = false;
         }
         git_mirror::prune(self.shell.as_ref(), &self.config.paths, job_id).await;
         if let Err(e) = std::fs::remove_dir_all(job_dir) {
             tracing::warn!(error = %e, "job dir cleanup failed");
+            verified = false;
         }
+        verified
     }
 
     /// Best-effort, idempotent teardown of every per-job artifact addressed
@@ -1367,13 +1935,9 @@ impl LibvirtDriver {
     /// dynamically-named loop device is found via `losetup -j <source.raw>` and
     /// detached **before** the job dir (with the backing file) is removed.
     ///
-    /// The return value tracks **only the source loop device** — *not* whether
-    /// every artifact was removed. `true` means the loop is verified gone, so
-    /// deleting the job dir (with `source.raw`) and failing the row are safe;
-    /// `false` means it couldn't be verified-gone, so the job dir — hence
-    /// `source.raw`, the only handle to re-find the loop — is **preserved** and
-    /// the caller MUST leave the row `running` for the next boot to retry
-    /// (else failing it would strand a leaked loop with no way back to it).
+    /// `false` means either the domain could not be proven absent or the source
+    /// loop could not be proven detached. In either case dependencies are
+    /// preserved and the caller must leave cleanup outstanding for retry.
     ///
     /// The loop is singled out because it's the one artifact whose recovery
     /// *needs* the backing file: every other step (domain destroy/undefine,
@@ -1383,6 +1947,10 @@ impl LibvirtDriver {
     /// job lifecycle on a flaky `lvremove`/`virsh`; the next op or an
     /// operator reclaims the stray resource).
     pub async fn cleanup_by_job_id(&self, job_id: &str) -> bool {
+        if !safe_resource_component(job_id) {
+            tracing::error!(job_id, "refusing cleanup for an unsafe resource identity");
+            return false;
+        }
         let domain_name = format!("sbgh-{job_id}");
         let job_dir = self
             .config
@@ -1391,16 +1959,43 @@ impl LibvirtDriver {
             .join(job_id);
         tracing::info!(job_id, domain = domain_name, "orphan cleanup: starting");
 
-        // 1. Domain: destroy a still-running VM, then drop its inactive definition.
-        //    Both are unconditional — a destroy/undefine of an already-off/absent
-        //    domain is a harmless non-zero we just log.
-        if let Err(e) = virsh::destroy(self.shell.as_ref(), &self.config.paths, &domain_name).await
-        {
-            tracing::warn!(error = %e, domain = domain_name, "orphan cleanup: virsh destroy failed");
-        }
-        if let Err(e) = virsh::undefine(self.shell.as_ref(), &self.config.paths, &domain_name).await
-        {
-            tracing::warn!(error = %e, domain = domain_name, "orphan cleanup: virsh undefine failed");
+        // 1. Prove the domain is stopped and undefined before touching any
+        // backing mount, LV, loop device, or file. A transport/libvirt error
+        // is not evidence that the domain is absent.
+        let state =
+            match virsh::domstate(self.shell.as_ref(), &self.config.paths, &domain_name).await {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        domain = domain_name,
+                        "orphan cleanup: domain state could not be verified"
+                    );
+                    return false;
+                }
+            };
+        if state != DomState::Undefined {
+            if state != DomState::ShutOff
+                && let Err(error) =
+                    virsh::destroy(self.shell.as_ref(), &self.config.paths, &domain_name).await
+            {
+                tracing::warn!(
+                    %error,
+                    domain = domain_name,
+                    "orphan cleanup: virsh destroy failed; preserving dependencies"
+                );
+                return false;
+            }
+            if let Err(error) =
+                virsh::undefine(self.shell.as_ref(), &self.config.paths, &domain_name).await
+            {
+                tracing::warn!(
+                    %error,
+                    domain = domain_name,
+                    "orphan cleanup: virsh undefine failed; preserving dependencies"
+                );
+                return false;
+            }
         }
 
         // 2. Results tmpfs (lives under results_tmpfs_root/<job-id>, OUTSIDE the job
@@ -1463,6 +2058,99 @@ impl LibvirtDriver {
             Err(e) => tracing::warn!(error = %e, "orphan cleanup: job dir removal failed"),
         }
         true
+    }
+
+    pub async fn cleanup_attempt(&self, job_id: &str, attempt_id: &str) -> bool {
+        if !safe_resource_component(job_id) || !safe_resource_component(attempt_id) {
+            tracing::error!(job_id, attempt_id, "refusing cleanup for unsafe attempt identity");
+            return false;
+        }
+        // All non-block resources are keyed by attempt_id in v26. This call
+        // proves the domain absent before any attached block snapshot may be
+        // removed.
+        if !self
+            .cleanup_by_job_id(attempt_id)
+            .await
+        {
+            return false;
+        }
+        self.cleanup_block_snapshot_set(job_id, attempt_id)
+            .await
+    }
+
+    async fn cleanup_block_snapshot_set(&self, job_id: &str, attempt_id: &str) -> bool {
+        let Some(profile) = self
+            .config
+            .block_validation
+            .as_ref()
+        else {
+            return true;
+        };
+        let prefix = format!(
+            "{}-{job_id}-{attempt_id}-",
+            profile
+                .dataset
+                .snapshot_prefix
+        );
+        let selection = format!("vg_name={} && lv_name=~^{}", self.config.lvm.vg_name, prefix);
+        let output = self
+            .shell
+            .run(spec_priv(
+                Path::new("/usr/sbin/lvs"),
+                &["--noheadings", "--options", "lv_name", "--select", &selection],
+            ))
+            .await;
+        let output = match output {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                tracing::warn!(
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "attempt cleanup could not enumerate block snapshots"
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "attempt cleanup could not enumerate block snapshots");
+                return false;
+            }
+        };
+        let mut clear = true;
+        for name in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if !name.starts_with(&prefix)
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'.' | b'-')
+                })
+            {
+                tracing::error!(name, "refusing to remove unexpected LVM name during cleanup");
+                clear = false;
+                continue;
+            }
+            let target = format!("{}/{name}", self.config.lvm.vg_name);
+            match self
+                .shell
+                .run(spec_priv(Path::new("/usr/sbin/lvremove"), &["--force", &target]))
+                .await
+            {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    tracing::warn!(
+                        target,
+                        stderr = %String::from_utf8_lossy(&output.stderr),
+                        "attempt block-snapshot cleanup returned non-zero"
+                    );
+                    clear = false;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, target, "attempt block-snapshot cleanup failed");
+                    clear = false;
+                }
+            }
+        }
+        clear
     }
 
     /// `umount <path>` best-effort. A non-zero exit ("not mounted") is the
@@ -1564,12 +2252,13 @@ impl LibvirtDriver {
 }
 
 fn baseline_calibration_id_from_tmpfs(tmpfs: &ResultsTmpfs) -> Option<i64> {
-    let from_json = std::fs::read(tmpfs.calibration_json())
-        .ok()
-        .and_then(|bytes| BaselineCalibrationResult::from_bytes(&bytes))
-        .and_then(|result| result.calibration_id());
+    let from_json =
+        guest_file::read_bounded(&tmpfs.calibration_json(), MAX_CALIBRATION_RESULT_BYTES)
+            .ok()
+            .and_then(|bytes| BaselineCalibrationResult::from_bytes(&bytes))
+            .and_then(|result| result.calibration_id());
     from_json.or_else(|| {
-        std::fs::read_to_string(tmpfs.baseline_id_file())
+        guest_file::read_to_string_bounded(&tmpfs.baseline_id_file(), MAX_BASELINE_ID_BYTES)
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
     })
@@ -1584,14 +2273,74 @@ async fn archive_optional(
 ) -> (Option<String>, Option<u64>) {
     let key = artifact_key(job_id, relative);
     let size = match tmpfs {
-        Some(tmpfs) => {
-            store
-                .put(&key, &path(tmpfs))
-                .await
-        }
+        Some(tmpfs) => match path(tmpfs) {
+            path if guest_file::verify_beneath(&tmpfs.mount_dir, &path).is_ok() => {
+                store.put(&key, &path).await
+            }
+            path => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "refusing to archive missing or unsafe guest output"
+                );
+                None
+            }
+        },
         None => None,
     };
     (size.as_ref().map(|_| key), size)
+}
+
+/// Enumerate only the bounded, direct diagnostic filenames produced by the
+/// block guest. A matching symlink/device is an ingestion error, not something
+/// the host follows or silently ignores.
+fn block_diagnostic_paths(results_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(results_dir)
+        .with_context(|| format!("reading block diagnostics {}", results_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("block diagnostic filename is not UTF-8"))?;
+        let diagnostic = name == "block-validation-result.json"
+            || (name.starts_with("shard-")
+                && (name.ends_with(".stdout.log")
+                    || name.ends_with(".stderr.log")
+                    || name.ends_with(".error.log")));
+        if !diagnostic {
+            continue;
+        }
+        anyhow::ensure!(
+            entry.file_type()?.is_file(),
+            "block diagnostic is not a regular file: {name}"
+        );
+        guest_file::verify_beneath(results_dir, &entry.path()).with_context(|| {
+            format!("opening block diagnostic {name} without symlink traversal")
+        })?;
+        paths.push(entry.path());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+async fn archive_block_paths(
+    store: &dyn ArtifactSink,
+    job_id: &str,
+    paths: &[PathBuf],
+) -> anyhow::Result<()> {
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("block-validation artifact has no UTF-8 filename")?;
+        let key = format!("{job_id}/block-validation/{name}");
+        store
+            .put(&key, path)
+            .await
+            .with_context(|| format!("archiving block-validation artifact {name}"))?;
+    }
+    Ok(())
 }
 
 /// Bridges the libvirt driver's `Phase` callbacks to recipe-neutral
@@ -1697,6 +2446,11 @@ impl Driver for LibvirtDriver {
         placement: &Placement,
     ) -> anyhow::Result<DriverOutcome> {
         let adapter = SinkAdapter { sink };
+        if let TaskSpec::BlockValidation(spec) = spec {
+            return self
+                .run_block_validation(ctx, spec, &adapter, cancel)
+                .await;
+        }
         let outcome = self
             .run_benchmark(
                 ctx,
@@ -1715,6 +2469,7 @@ impl Driver for LibvirtDriver {
         Ok(DriverOutcome {
             status,
             summary: outcome.summary,
+            output: DriverTaskOutput::None,
         })
     }
 
@@ -1723,6 +2478,10 @@ impl Driver for LibvirtDriver {
         // in path resolution, so this is unambiguously the inherent impl — not a
         // recursive trait call.
         LibvirtDriver::cleanup_by_job_id(self, job_id).await
+    }
+
+    async fn cleanup_attempt(&self, job_id: &str, attempt_id: &str) -> bool {
+        LibvirtDriver::cleanup_attempt(self, job_id, attempt_id).await
     }
 }
 

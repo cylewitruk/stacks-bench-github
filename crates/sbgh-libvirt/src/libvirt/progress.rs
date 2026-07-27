@@ -6,6 +6,10 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::libvirt::guest_file;
+
+const MAX_PROGRESS_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct ProgressTailer {
     path: PathBuf,
@@ -29,13 +33,22 @@ impl ProgressTailer {
     /// Return newly completed lines. Missing files are normal during VM startup
     /// and for older `stacks-bench` builds that do not emit progress JSONL.
     pub fn drain(&mut self, final_drain: bool) -> std::io::Result<Vec<String>> {
-        let mut file = match std::fs::File::open(&self.path) {
+        let mut file = match guest_file::open_regular(&self.path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
 
         let len = file.metadata()?.len();
+        if len > MAX_PROGRESS_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "guest progress file exceeds {MAX_PROGRESS_FILE_BYTES} bytes: {}",
+                    self.path.display()
+                ),
+            ));
+        }
         if len < self.offset {
             self.offset = 0;
             self.pending.clear();

@@ -91,7 +91,7 @@ pub enum PollResponse {
     /// cleanup, and deregister.
     Drain,
     Offer {
-        offer: WorkOffer,
+        offer: Box<WorkOffer>,
     },
 }
 
@@ -119,8 +119,33 @@ pub struct WorkOffer {
     pub job_id: Uuid,
     pub trace_id: Uuid,
     pub capability: WorkerCapability,
+    /// Bounded task requirements needed for local admission before the worker
+    /// accepts the lease. Backend paths and implementation details stay local.
+    pub requirements: OfferRequirements,
     pub payload_hash: String,
     pub offer_expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OfferRequirements {
+    Benchmark,
+    BuildOnly,
+    BlockValidation { dataset: DatasetIdentity, requested_shards: u32, max_concurrency: u32 },
+}
+
+impl From<&TaskPayload> for OfferRequirements {
+    fn from(payload: &TaskPayload) -> Self {
+        match payload {
+            TaskPayload::Benchmark(_) => Self::Benchmark,
+            TaskPayload::BuildOnly => Self::BuildOnly,
+            TaskPayload::BlockValidation(payload) => Self::BlockValidation {
+                dataset: payload.dataset.clone(),
+                requested_shards: payload.requested_shards,
+                max_concurrency: payload.max_concurrency,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,4 +402,48 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_offer_requirements_are_a_bounded_projection_of_the_payload() {
+        let payload = TaskPayload::BlockValidation(BlockValidationPayload {
+            dataset: DatasetIdentity {
+                generation: "mainnet-2026-07".into(),
+                network: "mainnet".into(),
+                format_version: "stacks-core-v3".into(),
+                covered_start: 0,
+                covered_end: 99,
+                manifest_sha256: "ab".repeat(32),
+            },
+            epoch: ValidationEpoch::Nakamoto,
+            range: InclusiveRange { start: 10, end: 20 },
+            requested_shards: 8,
+            max_concurrency: 4,
+            timeout_secs: 60,
+        });
+
+        assert_eq!(
+            OfferRequirements::from(&payload),
+            OfferRequirements::BlockValidation {
+                dataset: match payload {
+                    TaskPayload::BlockValidation(ref payload) => payload.dataset.clone(),
+                    _ => unreachable!(),
+                },
+                requested_shards: 8,
+                max_concurrency: 4,
+            }
+        );
+        let encoded = serde_json::to_value(OfferRequirements::from(&payload)).unwrap();
+        assert_eq!(encoded["kind"], "block_validation");
+        assert!(encoded.get("range").is_none());
+        assert!(
+            encoded
+                .get("timeout_secs")
+                .is_none()
+        );
+    }
 }

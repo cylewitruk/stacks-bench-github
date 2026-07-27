@@ -58,7 +58,10 @@ pub async fn run_execution(
     } else {
         match outcome {
             Ok(outcome) => match outcome.status {
-                TaskStatus::Completed => Terminal::Completed { summary: outcome.summary },
+                TaskStatus::Completed => Terminal::Completed {
+                    summary: outcome.summary,
+                    block_validation: outcome.block_validation,
+                },
                 TaskStatus::Failed(error) => Terminal::Failed {
                     error,
                     summary: outcome.summary,

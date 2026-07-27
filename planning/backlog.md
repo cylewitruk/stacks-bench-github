@@ -23,8 +23,10 @@ Its live-timeline follow-on `0021-slack-live-timeline` shipped (iteration v6) â†
 [events](archive/completed/0017-generic-phase-events.md), and
 [block validation](archive/completed/0019-block-validation-recipe.md).*
 
-*`0062-sandboxed-worker-execution` and `0063-libvirt-block-validation` are
-planned in [v26](iterations/v26-sandboxed-worker-execution.md).*
+*`0062-sandboxed-worker-execution` and `0063-libvirt-block-validation` are in
+progress in [v26](iterations/v26-sandboxed-worker-execution.md); implementation
+is locally complete, with independent review and dedicated-host qualification
+remaining.*
 
 *`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
 model: source / intent / task_kind / build_target / derived report; build-only

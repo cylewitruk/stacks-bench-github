@@ -4,7 +4,8 @@
 - **status:** `backlog`
 - **depends_on:** `0015-resource-aware-admission`
 - **relates_to:** `0026-central-block-index-cache`,
-  `0039-multi-variant-benchmark-comparisons`
+  `0039-multi-variant-benchmark-comparisons`,
+  `0063-libvirt-block-validation`
 - **source:** chainstate freshness/provenance design discussion (2026-06)
 
 Run a real `stacks-node` under sbgh control so chainstate freshness, snapshot
@@ -73,6 +74,13 @@ managed writable node LV
 
 The snapshots are not full chainstate copies. Storage growth is primarily the
 changed extents retained by old checkpoints, plus thinpool metadata.
+
+[v26](../iterations/v26-sandboxed-worker-execution.md) is the current consumer
+contract: a published generation is a read-only origin LV with mandatory
+`sbgh_sealed`/`sbgh_validated` tags, an identity-bound
+`.sbgh-dataset-manifest.json`, and a manifest-bound
+`.sbgh-dataset-files.sha256`. This producer must mint that format rather than a
+second snapshot/provenance shape.
 
 ### Cut Plan
 

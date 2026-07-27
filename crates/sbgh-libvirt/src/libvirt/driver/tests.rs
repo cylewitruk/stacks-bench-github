@@ -2,13 +2,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use sbgh_driver::{ArtifactSink, BinaryCacheStore, CachedBinary};
+use sbgh_driver::{
+    ArtifactSink, BinaryCacheStore, BlockValidationTaskSpec, CachedBinary, DatasetIdentity,
+    DriverStatus, DriverTaskOutput, InclusiveRange, ValidationEpoch,
+};
 use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
 use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
-use crate::{LibvirtConfig, LvmConfig, PathsConfig, VmConfig};
+use crate::{
+    BlockDatasetConfig, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
+};
 
 struct TestJob {
     id: Uuid,
@@ -22,6 +27,8 @@ struct TestJob {
 fn ctx_of(job: &TestJob) -> TaskContext<'_> {
     TaskContext {
         job_id: job.id,
+        attempt_id: job.id,
+        fencing_generation: 0,
         repository: &job.repository,
         commit: &job.commit,
         repository_credential: None,
@@ -157,7 +164,9 @@ async fn assemble_fingerprint_reads_toolchain_from_the_mirror() {
         std::path::Path::new("/usr/bin/git"),
         std::path::Path::new("/var/lib/sbgh/mirror.git"),
         &golden,
+        None,
         "deadbeef",
+        BuildArtifact::StacksBench,
     )
     .await
     .expect("declared toolchain → Some fingerprint");
@@ -209,7 +218,9 @@ async fn assemble_fingerprint_falls_back_to_legacy_toolchain_file() {
         std::path::Path::new("/usr/bin/git"),
         std::path::Path::new("/var/lib/sbgh/mirror.git"),
         &golden,
+        None,
         "deadbeef",
+        BuildArtifact::StacksBench,
     )
     .await
     .expect("legacy rust-toolchain → Some fingerprint");
@@ -246,7 +257,9 @@ async fn assemble_fingerprint_keys_floating_channel_and_none_when_missing() {
         std::path::Path::new("/git"),
         std::path::Path::new("/m"),
         &golden,
+        None,
         "sha",
+        BuildArtifact::StacksBench,
     )
     .await
     .expect("floating channel still keys");
@@ -262,7 +275,9 @@ async fn assemble_fingerprint_keys_floating_channel_and_none_when_missing() {
             std::path::Path::new("/git"),
             std::path::Path::new("/m"),
             &golden,
+            None,
             "sha",
+            BuildArtifact::StacksBench,
         )
         .await
         .is_none(),
@@ -308,6 +323,8 @@ async fn enabled_cache_hit_uses_minimal_source_disk_and_skips_build_vm() {
     // cached binary published under it.
     let toolchain = "[toolchain]\nchannel = \"1.95.0\"\n";
     let fp = BuildFingerprint {
+        artifact: BuildArtifact::StacksBench,
+        repository: None,
         commit: "abc123def456".into(),
         toolchain: fingerprint::toolchain_channel(toolchain).unwrap(),
         profile: BUILD_PROFILE.into(),
@@ -350,6 +367,7 @@ async fn enabled_cache_hit_uses_minimal_source_disk_and_skips_build_vm() {
         .expect_ok(1) // umount
         .expect_ok(1) // losetup -d
         .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+        .reply(PreparedReply::with_stdout("10|5\n")) // shared pool health
         .expect_ok(1) // lvcreate snapshot
         .expect_ok(1) // mount tmpfs
         .expect_ok(1) // cloud-localds (build ISO, optional but still rendered)
@@ -457,6 +475,54 @@ async fn sqlite_seed_key_copies_group_db_into_results_tmpfs() {
 }
 
 #[test]
+fn block_diagnostic_collection_is_bounded_and_rejects_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("shard-0.stdout.log"),
+        b"diagnostic",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("block-validation-result.json"),
+        b"{}",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("unrelated-secret"),
+        b"ignored",
+    )
+    .unwrap();
+
+    let paths = block_diagnostic_paths(tmp.path()).unwrap();
+    assert_eq!(paths.len(), 2);
+    assert!(
+        paths
+            .iter()
+            .all(|path| path.file_name().unwrap() != "unrelated-secret")
+    );
+
+    let outside = tmp.path().join("outside");
+    std::fs::write(&outside, b"host data").unwrap();
+    symlink(
+        &outside,
+        tmp.path()
+            .join("shard-1.stderr.log"),
+    )
+    .unwrap();
+    assert!(
+        block_diagnostic_paths(tmp.path())
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file")
+    );
+}
+
+#[test]
 fn baseline_calibration_id_reads_json_or_handoff_file() {
     let tmp = TempDir::new().unwrap();
     let tmpfs = ResultsTmpfs {
@@ -498,7 +564,6 @@ fn test_config(tmp: &TempDir) -> LibvirtConfig {
             git_mirror: p.join("mirror.git"),
             results_tmpfs_root: p.join("tmpfs"),
             results_archive_dir: p.join("archive"),
-            sccache_dir: p.join("sccache"),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -510,10 +575,496 @@ fn test_config(tmp: &TempDir) -> LibvirtConfig {
             thinpool: "thinpool".into(),
             chainstate_base_prefix: "mainnet-".into(),
             chainstate_snapshot_size_gib: None,
+            min_data_free_percent: 5.0,
+            min_metadata_free_percent: 5.0,
         },
         service_user: "sbgh".into(),
         host_cpus: None,
+        block_validation: None,
     }
+}
+
+fn enable_block_profile(config: &mut LibvirtConfig, tmp: &TempDir) {
+    config.block_validation = Some(BlockValidationProfile {
+        vcpus: 4,
+        memory_bytes: 8 * 1024 * 1024 * 1024,
+        cpu_set: Some("0-3".into()),
+        max_shards: 4,
+        max_concurrency: 4,
+        max_parallel_jobs: 1,
+        results_tmpfs_mib: 512,
+        network: "restricted-build".into(),
+        chain_config: tmp.path().join("chain.toml"),
+        dataset: BlockDatasetConfig {
+            generation: "g1".into(),
+            network: "mainnet".into(),
+            format_version: "v3".into(),
+            covered_start: 0,
+            covered_end: 100,
+            manifest_sha256: "a".repeat(64),
+            origin_lv: "origin".into(),
+            manifest_path: tmp
+                .path()
+                .join(".sbgh-dataset-manifest.json"),
+            snapshot_prefix: "sbgh-block".into(),
+            mount_options: vec!["nouuid".into()],
+            required_origin_tags: vec!["sbgh_sealed".into(), "sbgh_validated".into()],
+        },
+    });
+}
+
+#[tokio::test]
+async fn block_validation_preflight_proves_fixed_sandbox_dependencies() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    enable_block_profile(&mut config, &tmp);
+    std::fs::write(&config.vm.golden_image, b"golden").unwrap();
+    let profile = config
+        .block_validation
+        .as_ref()
+        .unwrap();
+    std::fs::write(&profile.chain_config, b"[node]\nnetwork = \"mainnet\"\n").unwrap();
+    std::fs::write(
+        &profile.dataset.manifest_path,
+        format!(
+            r#"{{"generation":"g1","network":"mainnet","format_version":"v3","covered_start":0,"covered_end":100,"files_sha256":"{}"}}"#,
+            "b".repeat(64),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        profile
+            .dataset
+            .manifest_path
+            .with_file_name(".sbgh-dataset-files.sha256"),
+        b"fixture digest list\n",
+    )
+    .unwrap();
+    for (name, path) in [
+        ("sudo", &mut config.paths.sudo_binary),
+        ("virsh", &mut config.paths.virsh_binary),
+        ("qemu-img", &mut config.paths.qemu_img_binary),
+        (
+            "cloud-localds",
+            &mut config
+                .paths
+                .cloud_localds_binary,
+        ),
+        ("git", &mut config.paths.git_binary),
+    ] {
+        *path = tmp.path().join(name);
+        std::fs::write(&*path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&*path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let shell = RecordingShell::new();
+    shell
+        .expect_ok(1) // qemu-img info
+        .expect_ok(1) // virsh net-info
+        .reply(PreparedReply::with_stdout("origin|Vri---tz-k|sbgh_sealed,sbgh_validated\n"))
+        .reply(PreparedReply::with_stdout("/dev/mapper/sbgh--vg-origin ro,nouuid\n"))
+        .reply(PreparedReply::with_stdout("/dev/dm-7\n"))
+        .reply(PreparedReply::with_stdout("/dev/dm-7\n"))
+        .reply(PreparedReply::with_stdout(format!("{}  manifest\n", "a".repeat(64))))
+        .reply(PreparedReply::with_stdout(format!("{}  file-list\n", "b".repeat(64))))
+        .reply(PreparedReply::with_stdout("10.0|5.0\n"));
+    let shell = Arc::new(shell);
+    let driver = test_driver(&config, shell.clone());
+    let identity = DatasetIdentity {
+        generation: "g1".into(),
+        network: "mainnet".into(),
+        format_version: "v3".into(),
+        covered_start: 0,
+        covered_end: 100,
+        manifest_sha256: "a".repeat(64),
+    };
+
+    driver
+        .preflight_block_validation(&identity)
+        .await
+        .unwrap();
+
+    assert!(config.paths.jobs_dir.is_dir());
+    assert!(
+        config
+            .paths
+            .results_tmpfs_root
+            .is_dir()
+    );
+    assert!(
+        config
+            .paths
+            .results_archive_dir
+            .is_dir()
+    );
+    let calls = shell.calls();
+    assert!(
+        calls[0]
+            .args
+            .iter()
+            .any(|arg| arg == "info")
+    );
+    assert!(
+        calls[1]
+            .args
+            .iter()
+            .any(|arg| arg == "net-info")
+            && calls[1]
+                .args
+                .iter()
+                .any(|arg| arg == "restricted-build")
+    );
+    assert!(calls[1].privileged);
+}
+
+#[tokio::test]
+async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    enable_block_profile(&mut config, &tmp);
+    std::fs::write(&config.vm.golden_image, b"golden").unwrap();
+    std::fs::create_dir_all(&config.paths.git_mirror).unwrap();
+
+    let profile = config
+        .block_validation
+        .as_ref()
+        .unwrap();
+    std::fs::write(&profile.chain_config, b"[node]\nnetwork = \"mainnet\"\n").unwrap();
+    std::fs::write(
+        &profile.dataset.manifest_path,
+        format!(
+            r#"{{"generation":"g1","network":"mainnet","format_version":"v3","covered_start":0,"covered_end":100,"files_sha256":"{}"}}"#,
+            "b".repeat(64),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        profile
+            .dataset
+            .manifest_path
+            .with_file_name(".sbgh-dataset-files.sha256"),
+        b"fixture digest list\n",
+    )
+    .unwrap();
+
+    let job = fake_job();
+    let toolchain = "[toolchain]\nchannel = \"1.95.0\"\n";
+    let fingerprint = BuildFingerprint {
+        artifact: BuildArtifact::StacksInspect,
+        repository: Some(job.repository.clone()),
+        commit: job.commit.clone(),
+        toolchain: "1.95.0".into(),
+        profile: BUILD_PROFILE.into(),
+        features: String::new(),
+        rustflags: String::new(),
+        target_triple: BUILD_TARGET_TRIPLE.into(),
+        recipe_version: BLOCK_BUILD_RECIPE_VERSION,
+        image_id: fingerprint::image_proxy_id(&config.vm.golden_image).unwrap(),
+        protocol_version: BUILD_PROTOCOL_VERSION.into(),
+    };
+    let cached_binary = tmp
+        .path()
+        .join("cached-stacks-inspect");
+    std::fs::write(&cached_binary, b"CACHED STACKS INSPECT").unwrap();
+    let cache = Arc::new(TestCache::default());
+    cache
+        .publish(&fingerprint, &cached_binary, 1, false)
+        .unwrap();
+
+    let results = config
+        .paths
+        .results_tmpfs_root
+        .join(job.id.to_string());
+    std::fs::create_dir_all(&results).unwrap();
+    std::fs::write(
+        results.join(".phase-log"),
+        b"1700000000 starting\n\
+          1700000001 build_cached\n\
+          1700000002 dataset_verified\n\
+          1700000003 probe\n\
+          1700000004 validating\n\
+          1700000005 reduced\n\
+          1700000006 done\n",
+    )
+    .unwrap();
+    std::fs::write(
+        results.join("run.progress.jsonl"),
+        br#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":1,"total":2,"message":"checked 2 blocks"}}
+{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":2,"total":2,"message":"checked 3 blocks"}}
+"#,
+    )
+    .unwrap();
+    for shard in 0..2 {
+        std::fs::write(results.join(format!("shard-{shard}.stdout.log")), b"").unwrap();
+        std::fs::write(results.join(format!("shard-{shard}.stderr.log")), b"").unwrap();
+    }
+    std::fs::write(
+        results.join("block-validation-result.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "job_id": job.id,
+            "attempt_id": job.id,
+            "fencing_generation": 0,
+            "dataset": {
+                "generation": "g1",
+                "network": "mainnet",
+                "format_version": "v3",
+                "covered_start": 0,
+                "covered_end": 100,
+                "manifest_sha256": "a".repeat(64),
+            },
+            "epoch": "pre_nakamoto",
+            "requested_range": {"start": 10, "end": 12},
+            "shards": [
+                {
+                    "index": 0,
+                    "start": 10,
+                    "end": 11,
+                    "exit_code": 0,
+                    "stdout_file": "shard-0.stdout.log",
+                    "stderr_file": "shard-0.stderr.log",
+                },
+                {
+                    "index": 1,
+                    "start": 12,
+                    "end": 12,
+                    "exit_code": 0,
+                    "stdout_file": "shard-1.stdout.log",
+                    "stderr_file": "shard-1.stderr.log",
+                },
+            ],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let shell = RecordingShell::new();
+    shell
+        .expect_ok(1) // git fetch exact commit into the existing mirror
+        .reply(PreparedReply::with_stdout(toolchain)) // fingerprint toolchain
+        .expect_ok(1) // qemu-img boot overlay
+        .expect_ok(1) // truncate minimal source disk
+        .expect_ok(1) // mkfs.ext4
+        .reply(PreparedReply::with_stdout("/dev/loop9\n")) // losetup
+        .expect_ok(1) // mount source disk
+        .expect_ok(1) // chown empty source disk
+        .expect_ok(1) // chown cached-binary tree to root
+        .expect_ok(1) // unmount source disk
+        .expect_ok(1) // detach source loop
+        .reply(PreparedReply::with_stdout("origin|Vri---tz-k|sbgh_sealed,sbgh_validated\n")) // exact sealed origin
+        .reply(PreparedReply::with_stdout("/dev/mapper/sbgh--vg-origin ro,nouuid\n")) // origin mount
+        .reply(PreparedReply::with_stdout("/dev/dm-7\n")) // mounted origin canonical device
+        .reply(PreparedReply::with_stdout("/dev/dm-7\n")) // configured origin canonical device
+        .reply(PreparedReply::with_stdout(format!("{}  manifest\n", "a".repeat(64))))
+        .reply(PreparedReply::with_stdout(format!("{}  file-list\n", "b".repeat(64))))
+        .reply(PreparedReply::with_stdout("10.0|5.0\n")) // pool health
+        .expect_ok(2) // K=2 thin snapshots
+        .expect_ok(1) // results tmpfs
+        .expect_ok(1) // block-validation cidata
+        .expect_ok(1) // virsh define
+        .expect_ok(1) // virsh start
+        .reply(PreparedReply::with_stdout("shut off\n")) // phase=done + clean poweroff
+        .expect_ok(1) // virsh destroy
+        .expect_ok(1) // virsh undefine
+        .expect_ok(1) // results tmpfs unmount
+        .expect_ok(2) // reverse-order K snapshot cleanup
+        .expect_ok(1); // git ref prune
+    let shell = Arc::new(shell);
+    let driver = test_driver_with_cache(&config, shell.clone(), Some(cache));
+    let listener = RecordingListener::default();
+    let spec = BlockValidationTaskSpec {
+        dataset: DatasetIdentity {
+            generation: "g1".into(),
+            network: "mainnet".into(),
+            format_version: "v3".into(),
+            covered_start: 0,
+            covered_end: 100,
+            manifest_sha256: "a".repeat(64),
+        },
+        epoch: ValidationEpoch::PreNakamoto,
+        range: InclusiveRange { start: 10, end: 12 },
+        requested_shards: 2,
+        max_concurrency: 2,
+        timeout_secs: 30,
+    };
+
+    let outcome = driver
+        .run_block_validation(&ctx_of(&job), &spec, &listener, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, DriverStatus::Completed);
+    let DriverTaskOutput::BlockValidation(output) = outcome.output else {
+        panic!("expected typed block-validation output");
+    };
+    assert!(output.valid);
+    assert_eq!(output.checked_blocks, 3);
+    assert!(
+        output
+            .invalid_blocks
+            .is_empty()
+    );
+    assert_eq!(output.dataset, spec.dataset);
+    assert_eq!(outcome.summary["dataset_origin"], "sbgh-vg/origin");
+    assert_eq!(
+        *listener
+            .progresses
+            .lock()
+            .unwrap(),
+        vec![
+            ProgressUpdate {
+                workflow_step: WorkflowStep::Run,
+                run_index: 0,
+                requested_run_count: 1,
+                phase: "validate".into(),
+                progress: 1,
+                total: Some(2),
+                message: Some("checked 2 blocks".into()),
+            },
+            ProgressUpdate {
+                workflow_step: WorkflowStep::Run,
+                run_index: 0,
+                requested_run_count: 1,
+                phase: "validate".into(),
+                progress: 2,
+                total: Some(2),
+                message: Some("checked 3 blocks".into()),
+            },
+        ]
+    );
+
+    let calls = shell.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call
+                .program
+                .ends_with("lvcreate"))
+            .count(),
+        2,
+    );
+    assert!(
+        calls
+            .iter()
+            .filter(|call| call
+                .program
+                .ends_with("lvcreate"))
+            .all(|call| call
+                .args
+                .iter()
+                .any(|arg| arg == "sbgh-vg/origin"))
+    );
+    assert!(
+        calls.iter().all(|call| !call
+            .program
+            .ends_with("cargo")
+            && !call
+                .program
+                .ends_with("stacks-inspect")),
+        "repository build and executable must never run on the host"
+    );
+    assert!(
+        !calls.iter().any(|call| {
+            call.program.ends_with("git")
+                && call
+                    .args
+                    .iter()
+                    .any(|arg| arg == "clone" || arg == "checkout")
+        }),
+        "cache hit must not provision a source checkout"
+    );
+    let removed: Vec<_> = calls
+        .iter()
+        .filter(|call| {
+            call.program
+                .ends_with("lvremove")
+        })
+        .flat_map(|call| call.args.iter())
+        .filter(|arg| arg.starts_with("sbgh-vg/sbgh-block-"))
+        .cloned()
+        .collect();
+    assert_eq!(removed.len(), 2);
+    assert!(removed[0].ends_with("-s0001"));
+    assert!(removed[1].ends_with("-s0000"));
+
+    for name in [
+        "shard-0.stdout.log",
+        "shard-0.stderr.log",
+        "shard-1.stdout.log",
+        "shard-1.stderr.log",
+        "block-validation-result.json",
+        "invalid-blocks.json",
+    ] {
+        assert!(
+            config
+                .paths
+                .results_archive_dir
+                .join(job.id.to_string())
+                .join("block-validation")
+                .join(name)
+                .is_file(),
+            "missing archived block-validation artifact {name}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn attempt_cleanup_refuses_to_address_a_newer_attempt_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    enable_block_profile(&mut config, &tmp);
+    let shell = Arc::new(RecordingShell::new());
+    shell.reply(PreparedReply::with_stdout(
+        "sbgh-block-job-old-g1-s0000\nsbgh-block-job-new-g2-s0000\n",
+    ));
+    shell.expect_ok(1);
+    let driver = test_driver(&config, shell.clone());
+
+    assert!(
+        !driver
+            .cleanup_block_snapshot_set("job", "old")
+            .await,
+        "unexpected newer-attempt row must fail cleanup closed"
+    );
+    let calls = shell.calls();
+    let removes: Vec<_> = calls
+        .iter()
+        .filter(|call| {
+            call.program
+                .ends_with("lvremove")
+        })
+        .collect();
+    assert_eq!(removes.len(), 1);
+    assert!(
+        removes[0]
+            .args
+            .iter()
+            .any(|arg| arg.contains("job-old"))
+    );
+    assert!(
+        removes[0]
+            .args
+            .iter()
+            .all(|arg| !arg.contains("job-new"))
+    );
+}
+
+#[tokio::test]
+async fn attempt_cleanup_rejects_unsafe_identity_before_host_commands() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    enable_block_profile(&mut config, &tmp);
+    let shell = Arc::new(RecordingShell::new());
+    let driver = test_driver(&config, shell.clone());
+
+    assert!(
+        !driver
+            .cleanup_attempt("job", "../newer-attempt")
+            .await
+    );
+    assert!(shell.calls().is_empty());
 }
 
 fn test_driver(config: &LibvirtConfig, shell: Arc<dyn Shell>) -> LibvirtDriver {
@@ -583,6 +1134,7 @@ fn happy_path_shell() -> RecordingShell {
         .expect_ok(1) // umount source
         .expect_ok(1) // losetup -d
         .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+        .reply(PreparedReply::with_stdout("10|5\n")) // shared pool health
         .expect_ok(1) // lvcreate snapshot
         .expect_ok(1) // mount tmpfs
         // Two cloud-localds calls — one per cidata ISO (build, bench).
@@ -623,6 +1175,7 @@ fn build_only_shell() -> RecordingShell {
         .expect_ok(1) // umount source
         .expect_ok(1) // losetup -d
         .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+        .reply(PreparedReply::with_stdout("10|5\n")) // shared pool health
         .expect_ok(1) // lvcreate snapshot
         .expect_ok(1) // mount tmpfs
         // Both cidata ISOs are still provisioned upfront (provision is shared).
@@ -713,6 +1266,7 @@ async fn build_only_skips_bench_and_fails_closed_without_cache() {
         "git",
         "umount",
         "losetup",
+        "lvs",
         "lvs",
         "lvcreate",
         "mount",
@@ -840,6 +1394,7 @@ async fn end_to_end_happy_path_with_recording_shell() {
         "umount",        // source: unmount
         "losetup",       // source: detach loop
         "lvs",           // chainstate: pick base
+        "lvs",           // shared thin-pool health
         "lvcreate",      // chainstate: snapshot
         "mount",         // tmpfs mount
         "cloud-localds", // cidata ISO (build)
@@ -919,6 +1474,7 @@ async fn vm_shutoff_without_phase_done_is_failure() {
         .expect_ok(1) // umount source
         .expect_ok(1) // losetup -d
         .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+        .reply(PreparedReply::with_stdout("10|5\n")) // shared pool health
         .expect_ok(1) // lvcreate snapshot
         .expect_ok(1) // mount tmpfs
         .expect_ok(1) // cloud-localds
@@ -1098,6 +1654,7 @@ async fn cleanup_by_job_id_reconstructs_full_teardown_from_id() {
     // reports one association so a `losetup -d` must follow.
     let shell = Arc::new(RecordingShell::new());
     shell
+        .reply(PreparedReply::with_stdout("running\n")) // virsh domstate
         .expect_ok(1) // virsh destroy
         .expect_ok(1) // virsh undefine
         .expect_ok(1) // umount results tmpfs
@@ -1128,6 +1685,7 @@ async fn cleanup_by_job_id_reconstructs_full_teardown_from_id() {
     assert_eq!(
         programs,
         [
+            "virsh",    // domstate
             "virsh",    // destroy
             "virsh",    // undefine
             "umount",   // results tmpfs
@@ -1141,17 +1699,17 @@ async fn cleanup_by_job_id_reconstructs_full_teardown_from_id() {
     );
     // The detach targeted the exact device `losetup -j` reported.
     assert!(
-        calls[5]
+        calls[6]
             .args
             .contains(&"-d".to_string())
-            && calls[5]
+            && calls[6]
                 .args
                 .contains(&"/dev/loop42".to_string()),
         "losetup -d must detach the device losetup -j surfaced",
     );
     // lvremove targets the job-id-named snapshot.
     assert!(
-        calls[6]
+        calls[7]
             .args
             .iter()
             .any(|a| a == "sbgh-vg/sbgh-orphan-123-chainstate"),
@@ -1159,6 +1717,59 @@ async fn cleanup_by_job_id_reconstructs_full_teardown_from_id() {
     );
     // The job dir (and its source.raw) is gone.
     assert!(!job_dir.exists(), "job dir removed");
+}
+
+#[tokio::test]
+async fn cleanup_preserves_every_dependency_when_domain_destroy_fails() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    enable_block_profile(&mut config, &tmp);
+    let cfg = Arc::new(config);
+    let job_id = "orphan-live-domain";
+    let job_dir = cfg
+        .paths
+        .jobs_dir
+        .join(job_id);
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("source.raw"), b"raw").unwrap();
+
+    let shell = Arc::new(RecordingShell::new());
+    shell
+        .reply(PreparedReply::with_stdout("running\n"))
+        .reply(PreparedReply::fail("libvirt transport failed"));
+
+    let driver = test_driver(&cfg, shell.clone());
+    assert!(
+        !driver
+            .cleanup_attempt("job", job_id)
+            .await
+    );
+    assert!(
+        job_dir
+            .join("source.raw")
+            .exists()
+    );
+    let calls = shell.calls();
+    assert_eq!(calls.len(), 2, "cleanup must stop after failed destroy");
+    assert!(
+        calls[0]
+            .args
+            .contains(&"domstate".into())
+    );
+    assert!(
+        calls[1]
+            .args
+            .contains(&"destroy".into())
+    );
+    assert!(
+        calls.iter().all(|call| {
+            !call
+                .program
+                .ends_with("lvremove")
+                && !call.program.ends_with("lvs")
+        }),
+        "a live domain's snapshots must not even be enumerated for removal"
+    );
 }
 
 /// `losetup -j` with no association (the source disk was already torn down,
@@ -1173,6 +1784,7 @@ async fn cleanup_by_job_id_skips_loop_detach_when_none_attached() {
 
     let shell = Arc::new(RecordingShell::new());
     shell
+        .reply(PreparedReply::with_stdout("running\n")) // virsh domstate
         .expect_ok(1) // virsh destroy
         .expect_ok(1) // virsh undefine
         .expect_ok(1) // umount results tmpfs
@@ -1225,6 +1837,7 @@ async fn cleanup_by_job_id_preserves_backing_file_when_loop_detach_fails() {
 
     let shell = Arc::new(RecordingShell::new());
     shell
+        .reply(PreparedReply::with_stdout("running\n")) // virsh domstate
         .expect_ok(1) // virsh destroy
         .expect_ok(1) // virsh undefine
         .expect_ok(1) // umount tmpfs
@@ -1271,6 +1884,7 @@ async fn cleanup_by_job_id_preserves_backing_file_when_losetup_query_fails() {
 
     let shell = Arc::new(RecordingShell::new());
     shell
+        .reply(PreparedReply::with_stdout("running\n")) // virsh domstate
         .expect_ok(1) // virsh destroy
         .expect_ok(1) // virsh undefine
         .expect_ok(1) // umount tmpfs

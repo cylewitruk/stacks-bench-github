@@ -1,4 +1,4 @@
-//! Fingerprint-keyed local cache of built `stacks-bench` binaries.
+//! Fingerprint-keyed local cache of guest-built executables.
 //!
 //! A `stacks-bench` build is ~5–7 min; the binary is deterministic per
 //! `(source commit, build environment)`, so it's cacheable. This module owns
@@ -30,7 +30,9 @@ use sbgh_driver::cache::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Filename of the cached binary inside an entry dir.
+/// Opaque legacy filename inside an entry. The fingerprint's `artifact`
+/// discriminator identifies whether the bytes are `stacks-bench` or
+/// `stacks-inspect`; retaining this name preserves existing benchmark entries.
 const BINARY_NAME: &str = "stacks-bench";
 /// Filename of the per-entry metadata sidecar.
 const META_NAME: &str = "meta.json";
@@ -71,7 +73,7 @@ pub struct CacheMeta {
 }
 
 /// On-disk, size-bounded, fingerprint-keyed cache of built binaries. Layout:
-/// `<root>/<digest>/{stacks-bench, meta.json}`.
+/// `<root>/<digest>/{stacks-bench, meta.json}` (the binary name is opaque).
 pub struct BinaryCache {
     root: PathBuf,
     max_bytes: u64,
@@ -360,6 +362,8 @@ mod tests {
 
     fn fp(commit: &str) -> BuildFingerprint {
         BuildFingerprint {
+            artifact: sbgh_driver::BuildArtifact::StacksBench,
+            repository: None,
             commit: commit.into(),
             toolchain: "1.95.0".into(),
             profile: "release;lto=thin;codegen-units=1".into(),

@@ -36,7 +36,6 @@ jobs_dir = "/var/lib/sbgh-worker/jobs"
 git_mirror = "/var/lib/sbgh-worker/git/stacks-core.git"
 results_tmpfs_root = "/run/sbgh-worker/jobs"
 results_archive_dir = "/var/lib/sbgh-worker/results"
-sccache_dir = "/var/lib/sbgh-worker/sccache"
 virsh_binary = "/usr/bin/virsh"
 sudo_binary = "/usr/bin/sudo"
 qemu_img_binary = "/usr/bin/qemu-img"
@@ -47,3 +46,8 @@ git_binary = "/usr/bin/git"
 vg_name = "vg0"
 thinpool = "thinpool"
 chainstate_base_prefix = "mainnet-"
+# Shared setup-health guard for every thin-snapshot workload. These fixed
+# floors reject an already near-full/mis-provisioned pool; they do not predict
+# per-job write divergence.
+min_data_free_percent = 5.0
+min_metadata_free_percent = 5.0

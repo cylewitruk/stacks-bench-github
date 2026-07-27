@@ -2,10 +2,9 @@
 //!
 //! A [`Recipe`] is one pluggable long-running task type: it runs the task in
 //! its execution substrate (a VM, for now) and emits progress as recipe-neutral
-//! [`WorkerEvent`](crate::events::WorkerEvent)s. The engine (the runner today,
-//! the coordinator/worker later) is generic over this trait so adding a task
-//! kind — block validation next — is a new `Recipe` impl rather than an engine
-//! change.
+//! [`WorkerEvent`](crate::events::WorkerEvent)s. The worker engine is generic
+//! over this trait so adding a task kind is a new `Recipe` implementation and
+//! composition entry rather than a second execution lifecycle.
 //!
 //! **Scope of this slice:** establish `execute` + the neutral event/outcome
 //! seam. The terminal `render` (outcome → PR-comment/check body) and
@@ -14,7 +13,7 @@
 //! its rendering, so behavior is unchanged.
 
 use async_trait::async_trait;
-use sbgh_driver::{EventSink, TaskContext, TaskStatus};
+use sbgh_driver::{BlockValidationOutput, EventSink, TaskContext, TaskStatus};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -24,9 +23,14 @@ use tokio_util::sync::CancellationToken;
 pub trait TaskOutcome: Send {
     fn status(&self) -> TaskStatus;
     fn summary(&self) -> &serde_json::Value;
+
+    fn block_validation(&self) -> Option<&BlockValidationOutput> {
+        None
+    }
 }
 
-/// One long-running task kind. `BenchRecipe` is the sole impl today.
+/// One long-running task kind. Benchmark, build-only, and block validation all
+/// implement this boundary.
 #[async_trait]
 pub trait Recipe: Send + Sync {
     /// The recipe's terminal outcome (see [`TaskOutcome`]).
@@ -49,11 +53,9 @@ pub trait Recipe: Send + Sync {
     ) -> anyhow::Result<Self::Outcome>;
 }
 
-/// A recipe for an unsupported `(task_kind, build_target)` combination (today:
-/// any `block_validation`, or a `stacks_inspect` target — items 0019 / 0031).
-/// No creation path produces such a job, so this is purely defensive — it fails
-/// the job fast with a clear reason rather than silently routing it to the
-/// wrong recipe. Touches no execution backend.
+/// A recipe for an unknown future `(task_kind, build_target)` combination.
+/// No current creation path produces one, so this is purely defensive: fail
+/// closed rather than silently routing it to the wrong backend.
 pub struct UnsupportedRecipe {
     combo: String,
 }
@@ -126,6 +128,8 @@ mod tests {
         let recipe = UnsupportedRecipe::new("block_validation");
         let ctx = TaskContext {
             job_id: Uuid::nil(),
+            attempt_id: Uuid::nil(),
+            fencing_generation: 0,
             repository: "octo/core",
             commit: "abc",
             repository_credential: None,

@@ -124,6 +124,7 @@ qemu-img resize "$DEST" "$IMAGE_SIZE"
 PACKAGES=(
     qemu-guest-agent
     xfsprogs
+    python3
     git
     build-essential
     pkg-config
@@ -134,12 +135,8 @@ PACKAGES=(
     clang
     zstd
     protobuf-compiler
-    # sccache caches rustc output to a persistent per-host dir bind-
-    # mounted from the daemon via virtio-fs (tag=`sccache`,
-    # mount=/var/cache/sccache). RUSTC_WRAPPER=sccache + SCCACHE_DIR
-    # are exported by sbgh-run.sh.tmpl before `cargo build`, so cold
-    # builds in subsequent jobs hit the cache and finish in single-
-    # digit minutes instead of ~35.
+    # sccache is guest-local on each disposable boot overlay. Persistent
+    # cross-attempt reuse is limited to the host-mediated binary cache.
     sccache
 )
 

@@ -346,6 +346,7 @@ fn offer_from_row(row: &sqlx::postgres::PgRow) -> sbgh_core::Result<OfferedAssig
                 .try_get("trace_id")
                 .core()?,
             capability: capability(&capability_text)?,
+            requirements: sbgh_proto::OfferRequirements::from(&payload),
             payload_hash: row
                 .try_get("payload_hash")
                 .core()?,
@@ -1275,6 +1276,7 @@ impl FleetStore for PostgresFleetStore {
                 job_id,
                 trace_id,
                 capability: task_capability,
+                requirements: sbgh_proto::OfferRequirements::from(&payload),
                 payload_hash: row
                     .try_get("execution_payload_hash")
                     .core()?,

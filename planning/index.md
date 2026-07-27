@@ -79,8 +79,8 @@ need editing when an item's status or location changes.
 | `0059-intent-resolution-boundary` | Provider-backed request intent boundary | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
 | `0060-slack-snapshot-reporting` | Single-message Slack snapshot reporting | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
 | `0061-slack-integration-boundary` | Extracted Slack integration boundary | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
-| `0062-sandboxed-worker-execution` | Sandboxed worker execution invariant | `planned` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
-| `0063-libvirt-block-validation` | Libvirt-isolated block validation | `planned` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
+| `0062-sandboxed-worker-execution` | Sandboxed worker execution invariant | `in_progress` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
+| `0063-libvirt-block-validation` | Libvirt-isolated block validation | `in_progress` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
 
 ## Iterations
 
@@ -111,7 +111,7 @@ need editing when an item's status or location changes.
 | `v24.2-github-intent-boundaries` | GitHub and intent integration boundaries | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
 | `v24.3-slack-snapshot-reporting` | Slack snapshot reporting and integration boundary | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
 | `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `shipped` | [archive/completed/0004-worker-fleet.md](archive/completed/0004-worker-fleet.md) |
-| `v26-sandboxed-worker-execution` | Sandboxed worker execution and block validation | `planned` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
+| `v26-sandboxed-worker-execution` | Sandboxed worker execution and block validation | `in_progress` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
 
 ## Decisions
 

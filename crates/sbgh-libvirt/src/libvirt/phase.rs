@@ -16,6 +16,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::libvirt::guest_file;
+
+const MAX_PHASE_LOG_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Phase {
     Starting,
@@ -109,8 +113,8 @@ impl fmt::Display for Phase {
 /// Read the entire journal and return the last (most-recent) phase.
 /// Used by post-mortem forensics to record `last_phase` after teardown.
 pub fn read_last(phase_log: &Path) -> Option<Phase> {
-    let body = match std::fs::read_to_string(phase_log) {
-        Ok(s) => s,
+    let body = match guest_file::read_to_string_bounded(phase_log, MAX_PHASE_LOG_BYTES) {
+        Ok(body) => body,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             tracing::warn!(error = %e, path = %phase_log.display(), "failed to read phase log");
@@ -131,7 +135,7 @@ pub fn read_last(phase_log: &Path) -> Option<Phase> {
 /// `*offset` past lines we successfully consumed (so a partial final
 /// line gets re-read whole next time, not split mid-write).
 pub fn read_since(phase_log: &Path, offset: &mut u64) -> Vec<(SystemTime, Phase)> {
-    let mut file = match std::fs::File::open(phase_log) {
+    let mut file = match guest_file::open_regular(phase_log) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
@@ -147,6 +151,15 @@ pub fn read_since(phase_log: &Path, offset: &mut u64) -> Vec<(SystemTime, Phase)
             return Vec::new();
         }
     };
+    if file_len > MAX_PHASE_LOG_BYTES {
+        tracing::warn!(
+            path = %phase_log.display(),
+            file_len,
+            max_bytes = MAX_PHASE_LOG_BYTES,
+            "phase log exceeds ingestion limit"
+        );
+        return Vec::new();
+    }
 
     // The journal is append-only, so the file should never shrink. If
     // it does (corruption, deleted-and-recreated), reset to read from

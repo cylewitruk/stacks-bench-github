@@ -19,7 +19,7 @@ crates/
   sbgh-github/       GitHub contracts, webhook DTOs, auth, Octocrab adapter
   sbgh-intent/       request-intent contract and OpenAI adapter
   sbgh-slack/        Slack intake, snapshot renderer, transport
-  sbgh-libvirt/      concrete benchmark execution adapter
+  sbgh-libvirt/      concrete libvirt sandbox and LVM snapshot adapter
   sbgh-postgres/     SQLx stores, migrations, row mappings, admin queries
   sbgh-worker/       worker binary, transport, recipes, local execution
   sbgh-handler/      webhook signature-verification/forwarding binary
@@ -48,8 +48,8 @@ sbgh-daemon
           ▼                               ▼
 sbgh-worker                         sbgh-worker
 benchmark + build-only              block-validation
-sbgh-libvirt                        immutable dataset
-loopback benchmark host             K local CoW shards
+sbgh-libvirt sandbox                sbgh-libvirt sandbox
+one LVM snapshot                    K attempt-scoped LVM snapshots
           │                               │
           └── exact-key presigned S3 ─────┘
 ```
@@ -64,7 +64,9 @@ Every mutation is bound to worker identity, process session, attempt UUID,
 monotonic fencing generation, and an HMAC-authenticated lease token. Lost
 poll/accept/event/terminal responses are idempotent. A new worker process gets a
 new session and cannot resume its predecessor; cleanup is acknowledged before
-safe requeue.
+safe requeue. Wire protocol v2 includes a bounded, payload-derived requirement
+summary in each offer, allowing local dataset/resource/LVM admission before
+lease acceptance without exposing backend paths to the orchestrator.
 
 Task-neutral reliable events are persisted before acknowledgement and projected
 only across their contiguous sequence prefix. Fine progress has an independent
@@ -102,14 +104,30 @@ The daemon has no production dependency on `sbgh-worker`, `sbgh-driver`, or
 The worker owns transport reconnect/resend, active-attempt heartbeat and
 cancellation, local recipes, cache/artifact ports, and cleanup. It consumes
 `sbgh-proto` DTOs and never sees database rows. A private-repository assignment
-may include a short-lived repository-read token; the value is held in memory,
-redacted from debug output, and passed only through the child environment.
+may include a short-lived repository-read token. The worker uses it only while
+preparing a source disk on the trusted host; it is never mounted into the guest
+or written to artifacts.
 
-Benchmark/build workers compose `sbgh-driver` with the concrete
-`sbgh-libvirt` adapter. Block-validation workers build `stacks-inspect`, probe
-the provisioned dataset for epoch totals, translate the requested inclusive
-global range to epoch-local indices, create one verified reflink workspace per
-shard, execute with bounded concurrency, and reduce fail-closed.
+Every repository-built or otherwise untrusted payload enters `sbgh-driver` and
+the concrete `sbgh-libvirt` adapter. Benchmark/build jobs use one writable
+thin snapshot. A block-validation assignment uses one resource-profiled VM and
+K attempt-scoped thin snapshots of one exact sealed generation, exposed by
+stable virtio-scsi serials and mounted with XFS `nouuid`. The origin LV is
+read-only and never guest-attached. Both snapshot paths use the same fixed
+near-full thin-pool health guard; K remains a compute/device policy rather than
+a predicted write-space reservation. The guest builds or reuses
+`stacks-inspect` through the shared binary cache (scoped by executable,
+repository, commit, toolchain, build recipe, target, and image), probes epoch
+totals, partitions the inclusive range, runs bounded shards, and atomically
+writes a typed result. The host partitions and counts the assignment's global
+range; only the guest's CLI arguments use epoch-local coordinates. The host
+reducer rejects partial, stale, malformed,
+identity-mismatched, or ambiguous negative output. Guest-controlled result
+files are opened without following final symlinks and must resolve beneath the
+results share before parsing, cache publication, or artifact upload; structured
+control/diagnostic reads are size-bounded. There is no direct host-process
+fallback. Compiler-cache state lives only on the disposable boot overlay; the
+fingerprinted binary cache is the sole cross-attempt build-reuse channel.
 
 ### Integration crates
 
@@ -149,8 +167,8 @@ The fleet lifecycle is additive across task kinds:
 - `benchmark`: comparison-bearing group pinned to one worker and measurement
   profile for every variant/repeat/calibration/carried job;
 - `build_only`: cache production through the same lease/event/artifact path;
-- `block_validation`: one fleet job pinned to one dataset host, with K local
-  shards and its own typed result table;
+- `block_validation`: one fleet job pinned to one dataset host, with one VM,
+  K private snapshot devices, and its own typed result table;
 - future tasks: add a protocol payload, capability, worker recipe, task-specific
   persistence/rendering, and composition registration without changing the
   scheduler/lease/event/terminal state machine.
@@ -176,5 +194,5 @@ immutable dataset refresh, metrics/alerts, drain/upgrade, failure injection,
 and rollback are defined in
 [worker-fleet-operations.md](worker-fleet-operations.md). The daemon API is
 documented in [daemon-api.md](daemon-api.md); initial host prerequisites remain
-in [host-bringup.md](host-bringup.md), with libvirt/LVM permissions applying to
-the benchmark worker rather than the orchestrator.
+in [host-bringup.md](host-bringup.md), with narrow libvirt/LVM permissions
+applying to every execution worker rather than the orchestrator.

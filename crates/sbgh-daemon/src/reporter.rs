@@ -570,7 +570,7 @@ impl Reporter {
         terminal: Terminal,
     ) -> Option<anyhow::Error> {
         match terminal {
-            Terminal::Completed { summary } => {
+            Terminal::Completed { summary, .. } => {
                 tracing::info!(
                     job_id = %self.job.id,
                     repo = %self.job.repository,
@@ -1184,7 +1184,6 @@ mod tests {
                 git_mirror: p.join("mirror.git"),
                 results_tmpfs_root: p.join("tmpfs"),
                 results_archive_dir: p.join("archive"),
-                sccache_dir: p.join("sccache"),
                 virsh_binary: "/usr/bin/virsh".into(),
                 sudo_binary: "/usr/bin/sudo".into(),
                 qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -1196,6 +1195,8 @@ mod tests {
                 thinpool: "thinpool".into(),
                 chainstate_base_prefix: "mainnet-".into(),
                 chainstate_snapshot_size_gib: None,
+                min_data_free_percent: 5.0,
+                min_metadata_free_percent: 5.0,
             },
             stacks_bench: StacksBenchConfig { default_args: String::new() },
             api: ApiConfig {
@@ -1421,7 +1422,10 @@ mod tests {
             .await
             .unwrap();
         events_tx
-            .send(WorkerEvent::Finished(Terminal::Completed { summary: serde_json::json!({}) }))
+            .send(WorkerEvent::Finished(Terminal::Completed {
+                summary: serde_json::json!({}),
+                block_validation: None,
+            }))
             .await
             .unwrap();
         drop(events_tx);

@@ -86,8 +86,22 @@ impl ResultsTmpfs {
     /// the canonical reader of the DB schema is always paired with the
     /// data it produced.
     pub fn stacks_bench_binary(&self) -> PathBuf {
+        self.binary("stacks-bench")
+    }
+
+    pub fn binary(&self, executable_name: &str) -> PathBuf {
         self.mount_dir
-            .join("stacks-bench")
+            .join(executable_name)
+    }
+
+    pub fn block_result_manifest(&self) -> PathBuf {
+        self.mount_dir
+            .join("block-validation-result.json")
+    }
+
+    pub fn chain_config(&self) -> PathBuf {
+        self.mount_dir
+            .join("chain-config.toml")
     }
 
     /// Path to the JSON stdout capture of `stacks-bench bench run --json`.
@@ -138,7 +152,6 @@ mod tests {
             git_mirror: dir.path().join("mirror.git"),
             results_tmpfs_root: dir.path().join("results"),
             results_archive_dir: dir.path().join("archive"),
-            sccache_dir: dir.path().join("sccache"),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),

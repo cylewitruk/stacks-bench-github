@@ -5,7 +5,9 @@ mod config;
 mod fingerprint;
 mod libvirt;
 
-pub use config::{LibvirtConfig, LvmConfig, PathsConfig, VmConfig};
+pub use config::{
+    BlockDatasetConfig, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
+};
 pub use libvirt::driver::{LibvirtDriver, current_cache_environment};
 #[cfg(any(test, feature = "testing"))]
 pub use libvirt::forensics::SQLITE_RELATIVE;

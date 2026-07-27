@@ -10,7 +10,7 @@
 # two-phase lifecycle.
 #
 # What this phase does:
-#   - mount source disk + sccache + results (NOT chainstate)
+#   - mount source disk + results (NOT chainstate)
 #   - cargo build stacks-bench (sccache-accelerated)
 #   - snapshot the resulting binary to $RESULTS
 #   - write phase=build_done; poweroff
@@ -50,12 +50,11 @@ mount /dev/disk/by-label/sbgh-src "$SRC" || die "failed to mount source disk"
 # persists).
 chown -R root:root "$SRC" || die "chown $SRC to root failed"
 
-# --- mount the persistent sccache cache share ---------------------------------------
+# --- guest-local compiler cache ------------------------------------------------------
+# This lives on the disposable, size-bounded boot overlay. Never mount a
+# persistent host-writable cache into repository-controlled build guests.
 SCCACHE_MOUNT="{{ sccache_mount }}"
-SCCACHE_SHARE_TAG="{{ sccache_share_tag }}"
 mkdir -p "$SCCACHE_MOUNT"
-mount -t virtiofs "$SCCACHE_SHARE_TAG" "$SCCACHE_MOUNT" \
-    || die "failed to mount virtio-fs $SCCACHE_SHARE_TAG"
 export SCCACHE_DIR="$SCCACHE_MOUNT"
 export SCCACHE_CACHE_SIZE="{{ sccache_max_size }}"
 export RUSTC_WRAPPER=sccache

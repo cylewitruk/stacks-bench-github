@@ -119,7 +119,7 @@ pub trait EventSink: Send + Sync {
 #[derive(Debug)]
 pub enum Terminal {
     /// The task ran and produced results.
-    Completed { summary: serde_json::Value },
+    Completed { summary: serde_json::Value, block_validation: Option<crate::BlockValidationOutput> },
     /// The task ran but failed (VM died, timeout, …); `summary` is the
     /// forensics blob.
     Failed { error: String, summary: serde_json::Value },

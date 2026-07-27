@@ -73,8 +73,14 @@ pub async fn domstate(
         .run(spec_priv(&paths.virsh_binary, &["domstate", name]))
         .await?;
     if !out.status.success() {
-        // Domain not defined yet (or already undefined).
-        return Ok(DomState::Undefined);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+        if stderr.contains("failed to get domain")
+            || stderr.contains("domain not found")
+            || stderr.contains("no domain with matching name")
+        {
+            return Ok(DomState::Undefined);
+        }
+        check(&out, &format!("virsh domstate {name}"))?;
     }
     Ok(DomState::parse(&String::from_utf8_lossy(&out.stdout)))
 }
@@ -90,7 +96,6 @@ mod tests {
             git_mirror: "/tmp".into(),
             results_tmpfs_root: "/tmp".into(),
             results_archive_dir: "/tmp".into(),
-            sccache_dir: "/tmp".into(),
             virsh_binary: "/usr/bin/virsh".into(),
             sudo_binary: "/usr/bin/sudo".into(),
             qemu_img_binary: "/usr/bin/qemu-img".into(),
@@ -115,6 +120,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s, DomState::ShutOff);
+    }
+
+    #[tokio::test]
+    async fn domstate_distinguishes_absence_from_transport_failure() {
+        let absent = RecordingShell::new();
+        absent.reply(PreparedReply::fail("error: failed to get domain 'sbgh-job1'"));
+        assert_eq!(
+            domstate(&absent, &paths(), "sbgh-job1")
+                .await
+                .unwrap(),
+            DomState::Undefined
+        );
+
+        let unavailable = RecordingShell::new();
+        unavailable.reply(PreparedReply::fail("error: failed to connect to the hypervisor"));
+        assert!(
+            domstate(&unavailable, &paths(), "sbgh-job1")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

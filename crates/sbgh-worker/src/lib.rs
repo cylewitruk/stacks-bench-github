@@ -2,7 +2,7 @@
 
 mod bench_recipe;
 pub mod binary_cache;
-mod block_validation;
+mod block_validation_recipe;
 mod build_recipe;
 mod config;
 mod events;
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 pub use binary_cache::{BinaryCache, BinaryCacheConfig, build_binary_cache};
 pub use config::WorkerConfig;
 pub use execution::execute;
+pub use fleet::preflight_local_execution;
 pub use fleet::run as run_fleet;
 pub use sbgh_driver::{
     BenchmarkRunContext, BenchmarkTask, ExecutionContext, ExecutionPlacement, ExecutionRequest,
@@ -84,6 +85,12 @@ impl WorkerRuntime {
     pub async fn cleanup_by_job_id(&self, job_id: &str) -> bool {
         self.driver
             .cleanup_by_job_id(job_id)
+            .await
+    }
+
+    pub async fn cleanup_attempt(&self, job_id: &str, attempt_id: &str) -> bool {
+        self.driver
+            .cleanup_attempt(job_id, attempt_id)
             .await
     }
 }

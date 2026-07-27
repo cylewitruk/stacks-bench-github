@@ -1,0 +1,250 @@
+#!/bin/bash
+# Runs repository build scripts and stacks-inspect only inside this disposable
+# VM. The host supplies a typed plan and attempt-scoped snapshot devices.
+set -euo pipefail
+
+RESULTS=/results
+SRC=/opt/stacks-core
+SCCACHE=/var/cache/sccache
+PHASE_LOG="$RESULTS/.phase-log"
+phase() { printf '%s %s\n' "$(date +%s)" "$1" >> "$PHASE_LOG"; sync; }
+die() { phase error; echo "ERROR: $*" >&2; exit 1; }
+
+mkdir -p "$RESULTS" "$SRC" "$SCCACHE"
+mount -t virtiofs results "$RESULTS" || die "failed to mount results share"
+phase starting
+mount /dev/disk/by-label/sbgh-src "$SRC" || die "failed to mount source disk"
+# This cache is guest-local on the disposable boot overlay.
+export SCCACHE_DIR="$SCCACHE"
+export SCCACHE_CACHE_SIZE=20G
+export RUSTC_WRAPPER=sccache
+sccache --start-server >/dev/null 2>&1 || true
+
+BIN="$SRC/target/release/stacks-inspect"
+if [ ! -x "$BIN" ]; then
+  phase building
+  cd "$SRC"
+  EXPECTED_COMMIT="$(python3 -c 'import json; print(json.load(open("/results/block-plan.json"))["commit"])')"
+  git rev-parse HEAD | grep -qx "$EXPECTED_COMMIT" || die "checkout sha mismatch"
+  cargo build --locked --release --package stacks-inspect || die "cargo build failed"
+  strip --strip-debug "$BIN" || die "strip stacks-inspect failed"
+  cp -f "$BIN" "$RESULTS/stacks-inspect" || die "failed to stage stacks-inspect"
+  sync
+  phase build_done
+else
+  cp -f "$BIN" "$RESULTS/stacks-inspect" || die "failed to stage cached stacks-inspect"
+  phase build_cached
+fi
+
+phase dataset_verified
+phase probe
+python3 - <<'PY' || die "block-validation guest runner failed"
+import glob
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import time
+
+RESULTS = "/results"
+PLAN_PATH = RESULTS + "/block-plan.json"
+CONFIG = RESULTS + "/chain-config.toml"
+BIN = "/opt/stacks-core/target/release/stacks-inspect"
+with open(PLAN_PATH, encoding="utf-8") as handle:
+    plan = json.load(handle)
+if plan.get("schema_version") != 1:
+    raise RuntimeError("unsupported block plan schema")
+
+def phase(name):
+    with open(RESULTS + "/.phase-log", "a", encoding="utf-8") as handle:
+        handle.write(f"{int(time.time())} {name}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+def exact_device(serial):
+    matches = {
+        os.path.realpath(path)
+        for path in glob.glob("/dev/disk/by-id/*" + serial + "*")
+        if os.path.islink(path)
+    }
+    if len(matches) != 1:
+        raise RuntimeError(f"serial {serial!r} resolved to {len(matches)} devices")
+    return matches.pop()
+
+mounts = {}
+for item in plan["devices"]:
+    shard = int(item["shard"])
+    mountpoint = item["mountpoint"]
+    os.makedirs(mountpoint, exist_ok=True)
+    subprocess.run(
+        ["mount", "-t", "xfs", "-o", ",".join(plan["mount_options"]),
+         exact_device(item["serial"]), mountpoint],
+        check=True,
+    )
+    mounts[shard] = mountpoint
+
+dataset = plan["dataset"]
+manifest_path = mounts[0] + "/.sbgh-dataset-manifest.json"
+with open(manifest_path, "rb") as handle:
+    manifest_bytes = handle.read()
+if hashlib.sha256(manifest_bytes).hexdigest().lower() != dataset["manifest_sha256"].lower():
+    raise RuntimeError("guest dataset manifest digest mismatch")
+manifest = json.loads(manifest_bytes)
+for key in ("generation", "network", "format_version", "covered_start", "covered_end"):
+    if manifest.get(key) != dataset[key]:
+        raise RuntimeError(f"guest dataset manifest field {key} mismatch")
+file_list_digest = manifest.get("files_sha256", "")
+if len(file_list_digest) != 64 or any(character not in "0123456789abcdefABCDEF"
+                                     for character in file_list_digest):
+    raise RuntimeError("guest dataset file-list digest is invalid")
+file_list_path = mounts[0] + "/.sbgh-dataset-files.sha256"
+with open(file_list_path, "rb") as handle:
+    if hashlib.sha256(handle.read()).hexdigest().lower() != file_list_digest.lower():
+        raise RuntimeError("guest dataset file list does not match its manifest")
+
+def probe(kind):
+    output = subprocess.check_output(
+        [BIN, "--config", CONFIG, "validate-block", mounts[0], kind],
+        text=True,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        return int(output.split()[-1])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(f"malformed {kind} probe output") from error
+
+pre = probe("index-range")
+if pre <= 0:
+    raise RuntimeError("dataset probe returned no pre-Nakamoto blocks")
+requested = plan["range"]
+if plan["epoch"] == "pre_nakamoto":
+    if requested["end"] >= pre:
+        raise RuntimeError("requested pre-Nakamoto range exceeds probed range")
+    epoch_offset = 0
+    range_kind = "index-range"
+elif plan["epoch"] == "nakamoto":
+    naka = probe("naka-index-range")
+    if naka <= 0:
+        raise RuntimeError("dataset probe returned no Nakamoto blocks")
+    global_end = pre + naka - 1
+    if requested["start"] < pre or requested["end"] > global_end:
+        raise RuntimeError("requested Nakamoto range is outside probed range")
+    epoch_offset = pre
+    range_kind = "naka-index-range"
+else:
+    raise RuntimeError("unsupported validation epoch")
+
+count = requested["end"] - requested["start"] + 1
+shard_count = min(int(plan["requested_shards"]), count)
+base, remainder = divmod(count, shard_count)
+ranges = []
+cursor = requested["start"]
+for index in range(shard_count):
+    length = base + (1 if index < remainder else 0)
+    global_end = cursor + length - 1
+    ranges.append((
+        index,
+        cursor,
+        global_end,
+        cursor - epoch_offset,
+        global_end - epoch_offset,
+    ))
+    cursor += length
+if cursor != requested["end"] + 1:
+    raise RuntimeError("partition did not exactly cover requested range")
+
+phase("validating")
+pending = list(ranges)
+active = {}
+finished = []
+started = time.monotonic()
+limit = min(int(plan["max_concurrency"]), len(ranges))
+if limit <= 0:
+    raise RuntimeError("max_concurrency must be non-zero")
+
+while pending or active:
+    if time.monotonic() - started > int(plan["timeout_secs"]):
+        for process, stdout_handle, stderr_handle, _ in active.values():
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout_handle.close()
+            stderr_handle.close()
+        raise RuntimeError("block validation timed out")
+    while pending and len(active) < limit:
+        index, global_start, global_end, command_start, command_end = pending.pop(0)
+        stdout_name = f"shard-{index}.stdout.log"
+        stderr_name = f"shard-{index}.stderr.log"
+        stdout_handle = open(RESULTS + "/" + stdout_name, "wb")
+        stderr_handle = open(RESULTS + "/" + stderr_name, "wb")
+        command = [
+            BIN, "--config", CONFIG, "validate-block", mounts[index],
+            range_kind, str(command_start), str(command_end + 1),
+        ]
+        process = subprocess.Popen(
+            command,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=True,
+        )
+        active[index] = (
+            process,
+            stdout_handle,
+            stderr_handle,
+            (index, global_start, global_end, stdout_name, stderr_name),
+        )
+    completed = []
+    for index, (process, stdout_handle, stderr_handle, record) in active.items():
+        exit_code = process.poll()
+        if exit_code is None:
+            continue
+        stdout_handle.close()
+        stderr_handle.close()
+        finished.append({
+            "index": record[0],
+            "start": record[1],
+            "end": record[2],
+            "exit_code": exit_code,
+            "stdout_file": record[3],
+            "stderr_file": record[4],
+        })
+        completed.append(index)
+    for index in completed:
+        del active[index]
+    if completed:
+        checked = sum(item["end"] - item["start"] + 1 for item in finished)
+        with open(RESULTS + "/run.progress.jsonl", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "schema_version": 1,
+                "event_type": "progress",
+                "event_version": 1,
+                "progress": {
+                    "phase": "validate",
+                    "current": len(finished),
+                    "total": len(ranges),
+                    "message": f"checked {checked} blocks",
+                },
+            }, separators=(",", ":")) + "\n")
+    else:
+        time.sleep(0.2)
+
+finished.sort(key=lambda item: item["index"])
+result = {
+    "schema_version": 1,
+    "job_id": plan["job_id"],
+    "attempt_id": plan["attempt_id"],
+    "fencing_generation": plan["fencing_generation"],
+    "dataset": plan["dataset"],
+    "epoch": plan["epoch"],
+    "requested_range": plan["range"],
+    "shards": finished,
+}
+temporary = RESULTS + "/.block-validation-result.json.tmp"
+with open(temporary, "w", encoding="utf-8") as handle:
+    json.dump(result, handle, sort_keys=True, separators=(",", ":"))
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(temporary, RESULTS + "/block-validation-result.json")
+phase("reduced")
+PY
+
+phase done

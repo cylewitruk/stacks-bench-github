@@ -232,10 +232,6 @@ impl Runner {
                     .paths
                     .results_archive_dir
                     .clone(),
-                sccache_dir: config
-                    .paths
-                    .sccache_dir
-                    .clone(),
                 virsh_binary: config
                     .paths
                     .virsh_binary
@@ -267,6 +263,12 @@ impl Runner {
                 chainstate_snapshot_size_gib: config
                     .lvm
                     .chainstate_snapshot_size_gib,
+                min_data_free_percent: config
+                    .lvm
+                    .min_data_free_percent,
+                min_metadata_free_percent: config
+                    .lvm
+                    .min_metadata_free_percent,
             },
             service_user: config
                 .server
@@ -276,6 +278,7 @@ impl Runner {
                 .runner
                 .host_cpus
                 .clone(),
+            block_validation: None,
         };
         let binary_cache = build_binary_cache(&BinaryCacheConfig {
             enabled: config
@@ -1446,6 +1449,8 @@ fn execution_request_for(
     ExecutionRequest {
         context: ExecutionContext {
             job_id: job.id,
+            attempt_id: job.id,
+            fencing_generation: 0,
             repository: job.repository.clone(),
             commit,
             repository_credential: None,

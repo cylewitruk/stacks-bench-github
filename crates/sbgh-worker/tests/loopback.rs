@@ -359,14 +359,15 @@ async fn cancellation_winning_before_accept_never_starts_execution() {
             lease_token: LeaseToken("a".repeat(64)),
         };
         let offer = PollResponse::Offer {
-            offer: WorkOffer {
+            offer: Box::new(WorkOffer {
                 identity: identity.clone(),
                 job_id: Uuid::new_v4(),
                 trace_id: Uuid::new_v4(),
                 capability: WorkerCapability::BuildOnly,
+                requirements: sbgh_proto::OfferRequirements::BuildOnly,
                 payload_hash: "ab".repeat(32),
                 offer_expires_at_ms: i64::MAX,
-            },
+            }),
         };
         let (mut stream, request) = accept_request(&listener, &acceptor).await;
         assert_eq!(request.path, "/v1/poll");

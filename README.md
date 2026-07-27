@@ -20,7 +20,7 @@ A single Cargo workspace (`crates/`):
 | `sbgh-github` | GitHub contracts, webhook DTOs, App authentication, and Octocrab adapter. |
 | `sbgh-intent` | Request-intent contract, structured validation, and OpenAI adapter. |
 | `sbgh-driver` | Backend-neutral task execution contracts. |
-| `sbgh-libvirt` | Concrete libvirt execution adapter. |
+| `sbgh-libvirt` | Concrete libvirt sandbox and LVM snapshot adapter. |
 | `sbgh-proto` | Dependency-light, versioned worker-fleet wire contracts and validation. |
 | `sbgh-worker` | Separately deployed pull worker for benchmark/libvirt, build-only, and block-validation capabilities. |
 | `sbgh-smee` | smee.io → handler webhook forwarder (local/dev delivery). |
