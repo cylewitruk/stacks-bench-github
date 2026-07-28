@@ -284,28 +284,28 @@ async fn scheduling_unit_sources_are_frozen_once_before_lazy_runs() {
         .unwrap();
     let store = PostgresFleetStore::new(pool.clone());
     let frozen = ResolvedSpecSource {
-        spec_id: job.benchmark_spec_id,
+        spec_id: job.task_spec_id,
         commit: "1111111111111111111111111111111111111111".into(),
     };
     assert!(
         store
-            .freeze_group_sources(job.benchmark_group_id, std::slice::from_ref(&frozen))
+            .freeze_submission_sources(job.task_submission_id, std::slice::from_ref(&frozen))
             .await
             .unwrap()
     );
     assert!(
         store
-            .freeze_group_sources(job.benchmark_group_id, std::slice::from_ref(&frozen))
+            .freeze_submission_sources(job.task_submission_id, std::slice::from_ref(&frozen))
             .await
             .unwrap(),
         "a lost response must make source freezing idempotent"
     );
     assert!(
         store
-            .freeze_group_sources(
-                job.benchmark_group_id,
+            .freeze_submission_sources(
+                job.task_submission_id,
                 &[ResolvedSpecSource {
-                    spec_id: job.benchmark_spec_id,
+                    spec_id: job.task_spec_id,
                     commit: "2222222222222222222222222222222222222222".into(),
                 }],
             )
@@ -316,8 +316,8 @@ async fn scheduling_unit_sources_are_frozen_once_before_lazy_runs() {
     let stored: (Option<String>, Option<String>) = sqlx::query_as(
         r#"
         SELECT spec.git_commit_hash, job.git_commit_hash
-          FROM benchmark_spec spec
-          JOIN job ON job.benchmark_spec_id = spec.id
+          FROM task_spec spec
+          JOIN job ON job.task_spec_id = spec.id
          WHERE job.id = $1
         "#,
     )
@@ -1269,17 +1269,18 @@ async fn capability_routes_only_to_a_compatible_worker() {
 }
 
 #[tokio::test]
-async fn explicit_group_recovery_can_target_a_compatible_worker() {
+async fn explicit_submission_recovery_can_target_a_compatible_worker() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
     let store = PostgresFleetStore::new(pool.clone());
     let job_id = Uuid::new_v4();
     enqueue_benchmark(&store, job_id).await;
-    let group_id: Uuid = sqlx::query_scalar("SELECT benchmark_group_id FROM job WHERE id = $1")
-        .bind(job_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let submission_id: Uuid =
+        sqlx::query_scalar("SELECT task_submission_id FROM job WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let incompatible_worker = Uuid::new_v4();
     store
         .upsert_worker(&registration(incompatible_worker))
@@ -1287,7 +1288,11 @@ async fn explicit_group_recovery_can_target_a_compatible_worker() {
         .unwrap();
     assert!(
         store
-            .recover_group(group_id, Some(incompatible_worker), "operator-approved host recovery",)
+            .recover_submission(
+                submission_id,
+                Some(incompatible_worker),
+                "operator-approved host recovery",
+            )
             .await
             .is_err(),
         "an explicit recovery target must be authorized for benchmark work"
@@ -1305,22 +1310,22 @@ async fn explicit_group_recovery_can_target_a_compatible_worker() {
         .await
         .unwrap();
     let recovery = store
-        .recover_group(group_id, Some(target_worker), "operator-approved host recovery")
+        .recover_submission(submission_id, Some(target_worker), "operator-approved host recovery")
         .await
         .unwrap();
-    assert_eq!(recovery.prior_group_id, group_id);
+    assert_eq!(recovery.prior_submission_id, submission_id);
     assert_eq!(recovery.execution_generation, 2);
     let row: (i64, Option<Uuid>, Uuid) = sqlx::query_as(
-        "SELECT execution_generation, worker_id, recovery_of_group_id
-           FROM benchmark_group WHERE id = $1",
+        "SELECT execution_generation, worker_id, recovery_of_submission_id
+           FROM task_submission WHERE id = $1",
     )
-    .bind(recovery.new_group_id)
+    .bind(recovery.new_submission_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(row.0, 2);
     assert_eq!(row.1, Some(target_worker));
-    assert_eq!(row.2, group_id);
+    assert_eq!(row.2, submission_id);
     let copied_hash: String =
         sqlx::query_scalar("SELECT execution_payload_hash FROM job WHERE id = $1")
             .bind(recovery.first_job_id)

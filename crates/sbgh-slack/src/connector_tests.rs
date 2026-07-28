@@ -300,7 +300,7 @@ async fn deterministic_comparison_enqueues_ordered_variants() {
         .await;
 
     let job = &queue.jobs()[0];
-    let specs = queue.requested_specs_for_group(job.benchmark_group_id);
+    let specs = queue.requested_specs_for_submission(job.task_submission_id);
     assert_eq!(
         specs
             .iter()

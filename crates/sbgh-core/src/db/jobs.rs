@@ -36,9 +36,9 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::models::{
-    BenchmarkGroup, BenchmarkSpec, GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job,
-    JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJob,
-    NewJobEvent, ResolvedCommit, TerminalJobStatus, measured_run_count,
+    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
+    JobEventKind, JobEventStatus, JobMetric, JobResult, NewJob, NewJobEvent, ResolvedCommit,
+    SubmissionSpec, TaskSubmission, TerminalJobStatus, measured_run_count,
 };
 
 /// Slice 10: atomic "the run completed" write. Bundles the terminal
@@ -58,7 +58,7 @@ pub struct JobCompletion {
     pub result: JobResult,
     pub metric: Option<JobMetric>,
     /// v19: shared stacks-bench baseline calibration id to persist on the
-    /// benchmark spec in the same transaction as run completion.
+    /// submission spec in the same transaction as run completion.
     pub baseline_calibration_id: Option<i64>,
     /// `completed` event provenance (forensics summary blob).
     pub event_detail: Option<serde_json::Value>,
@@ -146,26 +146,26 @@ pub struct BaselineMatch {
 }
 
 /// v15 Phase 4: a completed repeat run whose next run still needs to be
-/// materialized. The runner uses this to carry the group SQLite artifact
+/// materialized. The runner uses this to carry the submission SQLite artifact
 /// before calling [`JobStore::append_next_benchmark_run`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingBenchmarkRun {
     pub completed_job_id: Uuid,
-    pub benchmark_group_id: Uuid,
-    pub benchmark_spec_id: Uuid,
-    pub benchmark_run_index: i32,
+    pub task_submission_id: Uuid,
+    pub task_spec_id: Uuid,
+    pub task_run_index: i32,
     pub requested_run_count: i32,
     pub artifact_prefix: String,
 }
 
-/// Promoted metrics for one isolated run inside a benchmark spec.
+/// Promoted metrics for one isolated run inside a submission spec.
 #[derive(Debug, Clone)]
 pub struct BenchmarkRunMetric {
-    pub benchmark_run_index: i32,
+    pub task_run_index: i32,
     pub metric: JobMetric,
 }
 
-/// One requested benchmark spec inside a newly-created benchmark group.
+/// One requested submission spec inside a newly-created benchmark submission.
 ///
 /// The store API is deliberately N-shaped: v22 caps comparison requests at two
 /// variants at validation time, but the persistence layer accepts an ordered
@@ -244,17 +244,17 @@ pub trait JobStore: Send + Sync + 'static {
         plan_message_ts: Option<&str>,
     ) -> Result<Job>;
 
-    /// Create a webhook-less benchmark group with an ordered set of benchmark
+    /// Create a webhook-less benchmark submission with an ordered set of benchmark
     /// specs and enqueue only the first spec's run 0.
     ///
-    /// This is the comparison-group sibling of
+    /// This is the comparison-submission sibling of
     /// [`create_unlinked_job`](Self::create_unlinked_job). It has the same
     /// Slack-message atomicity guarantee (queued event + optional
     /// `plan_message_sent` in the creation transaction), but persists multiple
-    /// `benchmark_spec` rows up front. Later runs/specs are materialized by
+    /// `task_spec` rows up front. Later runs/specs are materialized by
     /// [`append_next_benchmark_run`](Self::append_next_benchmark_run) so the
-    /// group preserves the "at most one active run" scheduling invariant.
-    async fn create_unlinked_benchmark_group(
+    /// submission preserves the "at most one active run" scheduling invariant.
+    async fn create_unlinked_benchmark_submission(
         &self,
         first_job_id: Uuid,
         specs: &[NewBenchmarkSpec],
@@ -264,11 +264,11 @@ pub trait JobStore: Send + Sync + 'static {
 
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>>;
 
-    async fn lookup_benchmark_group(&self, group_id: Uuid) -> Result<Option<BenchmarkGroup>>;
+    async fn lookup_task_submission(&self, submission_id: Uuid) -> Result<Option<TaskSubmission>>;
 
-    async fn lookup_benchmark_spec(&self, spec_id: Uuid) -> Result<Option<BenchmarkSpec>>;
+    async fn lookup_submission_spec(&self, spec_id: Uuid) -> Result<Option<SubmissionSpec>>;
 
-    async fn lookup_benchmark_specs(&self, group_id: Uuid) -> Result<Vec<BenchmarkSpec>>;
+    async fn lookup_submission_specs(&self, submission_id: Uuid) -> Result<Vec<SubmissionSpec>>;
 
     /// The terminal completed event detail for `job_id`, if the run completed.
     /// Failed/cancelled runs intentionally return `None`, which stops a repeat
@@ -415,7 +415,7 @@ pub trait JobStore: Send + Sync + 'static {
     ///    the fork-point. Best-effort, labelled as such.
     ///
     /// Only `intent='baseline_benchmark'`, `status='completed'`,
-    /// matching-`workload_key`, and matching non-NULL group
+    /// matching-`workload_key`, and matching non-NULL submission
     /// `measurement_profile` rows are eligible; a NULL workload/profile never
     /// matches. `None` when neither step finds one. Ties (a commit
     /// benchmarked more than once, or two commits sharing a timestamp) resolve
@@ -500,20 +500,20 @@ pub trait JobStore: Send + Sync + 'static {
         Ok(())
     }
 
-    /// v15 Phase 2: append the next queued run for the same benchmark spec
+    /// v15 Phase 2: append the next queued run for the same submission spec
     /// after `completed_job_id` finishes. Returns `Ok(None)` when the job is
     /// not the latest completed run, the requested run count is already
     /// satisfied, the spec is build-only, or another run for the spec is
     /// already queued/claimed/running.
     ///
     /// This is the durable lazy-enqueue primitive: the next row is an ordinary
-    /// `job` with `benchmark_run_index = previous_max + 1`, copied subject
+    /// `job` with `task_run_index = previous_max + 1`, copied subject
     /// identity, and copied queued provenance. Callers can run it after a
     /// completion hook; startup recovery uses [`resume_pending_benchmark_runs`]
     /// to derive the same work from DB state after a restart.
     async fn append_next_benchmark_run(&self, completed_job_id: Uuid) -> Result<Option<Job>>;
 
-    /// v15 Phase 2: DB-resumable lazy-enqueue recovery. Finds benchmark specs
+    /// v15 Phase 2: DB-resumable lazy-enqueue recovery. Finds submission specs
     /// whose latest run completed, whose requested count is not yet satisfied,
     /// and that have no active run, then appends one next run per spec.
     async fn resume_pending_benchmark_runs(&self) -> Result<Vec<Job>>;
@@ -527,10 +527,7 @@ pub trait JobStore: Send + Sync + 'static {
     /// v15 Phase 5: promoted metrics for all completed runs in one spec,
     /// ordered by isolated run index. Missing/unparseable runs are absent
     /// because they never produced a `job_metric` row.
-    async fn benchmark_run_metrics(
-        &self,
-        benchmark_spec_id: Uuid,
-    ) -> Result<Vec<BenchmarkRunMetric>>;
+    async fn benchmark_run_metrics(&self, task_spec_id: Uuid) -> Result<Vec<BenchmarkRunMetric>>;
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent>;
 

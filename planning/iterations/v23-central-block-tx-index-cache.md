@@ -27,7 +27,7 @@ blocks/transactions.
 ## Why
 
 `stacks-bench` stores block/transaction discovery metadata in its SQLite app DB.
-v15/v19/v22 carry that DB across repeats and variants once a group is running,
+v15/v19/v22 carry that DB across repeats and variants once a submission is running,
 but the first measured execution for a fresh chainstate still starts with an
 empty DB. For old txids or deep ranges, that means walking millions of blocks
 from tip before any benchmark work begins.
@@ -68,7 +68,7 @@ needs.
   target chainstate before they are packed for import.
 - Add operator tooling to inspect/export/import ledger coverage before the
   daemon uses it automatically.
-- Pre-seed a fresh or carried group DB by generating a workload-scoped import
+- Pre-seed a fresh or carried submission DB by generating a workload-scoped import
   pack from Postgres and invoking `stacks-bench chainstate import`, never by
   daemon-side SQLite table surgery.
 - Import newly indexed material into Postgres as the terminal step of successful
@@ -99,8 +99,8 @@ Upstream source of truth lives in `cylewitruk/stacks-core` branch
 
 ## Design Decisions
 
-- **The carried group DB remains authoritative for a group.** If a run already
-  has a group SQLite seed, v23 may import additional compatible index rows into
+- **The carried submission DB remains authoritative for a submission.** If a run already
+  has a submission SQLite seed, v23 may import additional compatible index rows into
   that DB through `stacks-bench`, but it must never overwrite existing
   run/calibration/metric state.
 - **The schema owner owns schema semantics.** Because we control the upstream
@@ -110,7 +110,7 @@ Upstream source of truth lives in `cylewitruk/stacks-core` branch
   rules apply.
 - **Chainstate indexing is a first-class job.** Heavy indexing runs as a
   `chainstate-index` job, not as incidental benchmark setup. It is queueable by
-  cron or by an operator and is exclusive with benchmark groups so disk-heavy
+  cron or by an operator and is exclusive with benchmark submissions so disk-heavy
   indexing cannot distort benchmark measurements.
 - **sbgh chooses the indexing binary.** `chainstate-index` jobs use an
   sbgh-configured `stacks-bench` binary or build, normally the latest known-good
@@ -161,15 +161,15 @@ Upstream source of truth lives in `cylewitruk/stacks-core` branch
   overwritten.
 - **Whole-file seed first, table merge only when needed.** A fresh first run can
   start from a generated compatible index-only DB. Table-level merge is required
-  only when the destination already has app state, such as a carried group DB
+  only when the destination already has app state, such as a carried submission DB
   with calibration/run rows, and that merge should live inside `stacks-bench`.
 - **Manual tooling comes before daemon automation.** The first green checkpoint
   should let an operator export, ingest, generate, and import against a copied
   DB. Only then should the runner wire it into job execution.
-- **Exclusivity is group-scoped.** A benchmark group, including clean repeats
+- **Exclusivity is submission-scoped.** A benchmark submission, including clean repeats
   and multi-variant comparisons, is the unit of measurement isolation. A
-  chainstate-index job must not start between runs of the same group, and a
-  benchmark group must not start while chainstate indexing is active.
+  chainstate-index job must not start between runs of the same submission, and a
+  benchmark submission must not start while chainstate indexing is active.
 - **Benchmarks consume prepared coverage.** Benchmark jobs should not silently
   perform hours of missing chainstate indexing by default. Missing coverage
   should default to enqueuing a `chainstate-index` job and deferring the
@@ -181,7 +181,7 @@ Upstream source of truth lives in `cylewitruk/stacks-core` branch
 - **Compatibility with v19/v22 is required.** Pre-seeding must compose with
   shared baseline calibration, clean repetitions, and multi-variant
   comparisons. It should reduce first-run discovery time without changing the
-  group run order or calibration identity.
+  submission run order or calibration identity.
 - **The round trip must be lossless for reusable facts.** Exporting from
   `stacks-bench`, ingesting into Postgres, generating a pack, and importing back
   into a fresh app DB must preserve every reusable fact `stacks-bench` needs to
@@ -213,7 +213,7 @@ pack manifest before wiring daemon automation.
 - Pin the finality boundary used for export/import, including which canonical
   height-to-block mapping is safe to import and how far from tip export must
   stop.
-- Define the `chainstate-index` job model, benchmark-group-scoped exclusive
+- Define the `chainstate-index` job model, benchmark-submission-scoped exclusive
   scheduling semantics, missing-coverage policy (default: enqueue indexing and
   defer benchmark), and indexing-binary selection/version fields.
 - Decide the import actor for benchmark pre-seeding:
@@ -246,7 +246,7 @@ pack manifest before wiring daemon automation.
   state.
 - [ ] Export -> Postgres ingest -> generated pack -> import is specified as a
   lossless round trip for all reusable facts needed by `stacks-bench`.
-- [ ] The `chainstate-index` job model, benchmark-group-scoped exclusivity rule,
+- [ ] The `chainstate-index` job model, benchmark-submission-scoped exclusivity rule,
   indexing-binary provenance, and missing-coverage policy are specified before
   implementation.
 - [ ] The import actor is decided, including how old-ref benchmarks without
@@ -326,8 +326,8 @@ from cron or operator action.
   finalized coverage target, and configured `stacks-bench` indexing binary.
 - Add cron/manual enqueue paths for chainstate-index jobs.
 - Extend queue/admission so chainstate-index jobs are exclusive with benchmark
-  groups in both directions: no benchmark group starts while indexing is active,
-  and no indexing starts until the whole active benchmark group is terminal.
+  submissions in both directions: no benchmark submission starts while indexing is active,
+  and no indexing starts until the whole active benchmark submission is terminal.
 - Run the selected `stacks-bench` binary to index/export finalized facts and
   ingest them into Postgres.
 - Record ledger statistics: rows imported, conflicts, covered range, producer
@@ -346,15 +346,15 @@ from cron or operator action.
 
 - [ ] A chainstate-index job can be enqueued manually for an ad-hoc LV/source.
 - [ ] A cron path can enqueue the same job shape without bypassing admission.
-- [ ] Queue/admission prevents benchmark groups and chainstate-index jobs from
-  running concurrently, including between repeats or variants of one group.
+- [ ] Queue/admission prevents benchmark submissions and chainstate-index jobs from
+  running concurrently, including between repeats or variants of one submission.
 - [ ] The job uses the configured indexing `stacks-bench` binary and records its
   version/commit in ledger provenance.
 - [ ] Finalized conflicts are detected and quarantined.
 
 **Tests:**
 
-- Store/queue tests for group-scoped exclusive admission and active-job
+- Store/queue tests for submission-scoped exclusive admission and active-job
   detection.
 - Job execution tests with a fake/stub `stacks-bench` export.
 - Ingest tests proving failed chainstate-index jobs do not publish partial
@@ -373,7 +373,7 @@ without turning missing coverage into surprise indexing work.
   identity, workload target, finalized coverage, and benchmark importer
   compatibility.
 - Generate a workload-scoped import pack from Postgres into local scratch space.
-- After the results tmpfs is mounted and after any group SQLite seed is copied,
+- After the results tmpfs is mounted and after any submission SQLite seed is copied,
   pre-seed `tmpfs.sqlite_file()` using the Phase 1 import-actor decision.
 - If no compatible coverage exists, enqueue a chainstate-index job and defer the
   benchmark by default. Reject-only and live-index fallback remain explicit
@@ -397,7 +397,7 @@ without turning missing coverage into surprise indexing work.
 - [ ] An old-ref benchmark whose binary lacks `chainstate import` either uses
   the indexing-binary pre-population path or fails closed with a clear
   incompatibility reason.
-- [ ] A repeated/comparison group with an existing carried DB keeps its group
+- [ ] A repeated/comparison submission with an existing carried DB keeps its submission
   state and only receives missing compatible index rows.
 - [ ] Missing ledger coverage does not silently run heavy indexing unless
   explicit live-index fallback is enabled.
@@ -459,7 +459,7 @@ operator flow.
   confirm no benchmark runs concurrently.
 - Run an old txid/range benchmark against a fresh DB with and without a
   generated pack to confirm the first-run indexing reduction.
-- Confirm v15/v19/v22 groups still carry the DB correctly after pre-seeding.
+- Confirm v15/v19/v22 submissions still carry the DB correctly after pre-seeding.
 - Document how to list ledger coverage, export facts, ingest facts, generate
   packs, and remove/quarantine sources.
 - Document safety boundaries: provenance, finality, incompatible schemas, and
@@ -500,7 +500,7 @@ operator flow.
   `stacks-bench.db`.
 - [ ] Chainstate-index job smoke showing exclusive scheduling with benchmarks.
 - [ ] Host smoke on an ad-hoc squashed chainstate using an old txid/range.
-- [ ] Regression smoke: existing clean-repeat and two-variant comparison groups
+- [ ] Regression smoke: existing clean-repeat and two-variant comparison submissions
   still carry DB/calibration state correctly.
 
 ## Follow-Ups

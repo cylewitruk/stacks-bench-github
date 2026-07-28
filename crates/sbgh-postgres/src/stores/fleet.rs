@@ -9,9 +9,9 @@ use chrono::{DateTime, Duration, Utc};
 use sbgh_core::db::fleet::{
     ArtifactGrantRecord, AttemptHeartbeat, AuthorizedSession, CleanupObligation, EventIngest,
     FleetCompletion, FleetFailure, FleetSnapshot, FleetStore, FleetTerminalSubmission,
-    FleetTerminalWrite, GroupRecovery, OfferedAssignment, PendingArtifactPromotion,
-    PreparedExecution, ProjectedReportMutation, ReportProjectionSeed, ResolvedSpecSource,
-    StoredAttemptEvent, StoredProgress, TerminalAcceptance, WorkerRegistration,
+    FleetTerminalWrite, OfferedAssignment, PendingArtifactPromotion, PreparedExecution,
+    ProjectedReportMutation, ReportProjectionSeed, ResolvedSpecSource, StoredAttemptEvent,
+    StoredProgress, SubmissionRecovery, TerminalAcceptance, WorkerRegistration,
 };
 use sbgh_core::models::{JobEventKind, JobEventStatus, NewJob, NewPullRequestLink};
 use sbgh_proto::{
@@ -65,37 +65,37 @@ impl PostgresFleetStore {
             .begin()
             .await
             .core()?;
-        let group_id = Uuid::new_v4();
+        let submission_id = Uuid::new_v4();
         let spec_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO benchmark_group
+            INSERT INTO task_submission
                 (id, github_installation_id, github_repo_id, source, intent,
                  artifact_prefix, worker_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .bind(new.github_installation_id)
         .bind(new.github_repo_id)
         .bind(Db(new.axes.source))
         .bind(Db(new.axes.intent))
-        .bind(group_id.to_string())
+        .bind(submission_id.to_string())
         .bind(prepared.worker_id)
         .execute(&mut *tx)
         .await
         .core()?;
         sqlx::query(
             r#"
-            INSERT INTO benchmark_spec
-                (id, benchmark_group_id, spec_index, requested_run_count,
+            INSERT INTO task_spec
+                (id, task_submission_id, spec_index, requested_run_count,
                  github_repo_id, task_kind, build_target, git_ref_kind,
                  git_ref_display, git_commit_hash, git_committed_at, workload_key)
             VALUES ($1, $2, 0, 1, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(spec_id)
-        .bind(group_id)
+        .bind(submission_id)
         .bind(new.github_repo_id)
         .bind(Db(new.axes.task_kind))
         .bind(Db(new.axes.build_target))
@@ -110,12 +110,12 @@ impl PostgresFleetStore {
         for (step_kind, step_index) in [("build", 0_i32), ("run", 1_i32)] {
             sqlx::query(
                 r#"
-                INSERT INTO benchmark_workflow_step
-                    (benchmark_group_id, step_index, step_kind, benchmark_spec_id)
-                VALUES ($1, $2, $3::text::benchmark_step_kind, $4)
+                INSERT INTO task_workflow_step
+                    (task_submission_id, step_index, step_kind, task_spec_id)
+                VALUES ($1, $2, $3::text::task_step_kind, $4)
                 "#,
             )
-            .bind(group_id)
+            .bind(submission_id)
             .bind(step_index)
             .bind(step_kind)
             .bind(spec_id)
@@ -126,7 +126,7 @@ impl PostgresFleetStore {
         sqlx::query(
             r#"
             INSERT INTO job
-                (id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (id, task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind,
                  git_ref_display, git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target,
@@ -138,7 +138,7 @@ impl PostgresFleetStore {
             "#,
         )
         .bind(job_id)
-        .bind(group_id)
+        .bind(submission_id)
         .bind(spec_id)
         .bind(new.github_installation_id)
         .bind(new.github_repo_id)
@@ -332,11 +332,11 @@ const OFFER_SELECT: &str = r#"
            j.github_installation_id,
            j.github_repo_id,
            repo.owner || '/' || repo.name AS repository,
-           bg.measurement_profile
+           submission.measurement_profile
       FROM worker_attempt a
       JOIN job j ON j.id = a.job_id
       JOIN github_repo repo ON repo.id = j.github_repo_id
-      JOIN benchmark_group bg ON bg.id = a.benchmark_group_id
+      JOIN task_submission submission ON submission.id = a.task_submission_id
 "#;
 
 async fn insert_job_event(
@@ -753,9 +753,9 @@ impl FleetStore for PostgresFleetStore {
         Ok(result.rows_affected() == 1)
     }
 
-    async fn freeze_group_sources(
+    async fn freeze_submission_sources(
         &self,
-        group_id: Uuid,
+        submission_id: Uuid,
         sources: &[ResolvedSpecSource],
     ) -> sbgh_core::Result<bool> {
         let mut resolved = BTreeMap::new();
@@ -783,13 +783,13 @@ impl FleetStore for PostgresFleetStore {
         let rows = sqlx::query(
             r#"
             SELECT id, git_commit_hash
-              FROM benchmark_spec
-             WHERE benchmark_group_id = $1
+              FROM task_spec
+             WHERE task_submission_id = $1
              ORDER BY spec_index
              FOR UPDATE
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .fetch_all(&mut *tx)
         .await
         .core()?;
@@ -822,7 +822,7 @@ impl FleetStore for PostgresFleetStore {
                 SELECT EXISTS (
                     SELECT 1
                       FROM job
-                     WHERE benchmark_spec_id = $1
+                     WHERE task_spec_id = $1
                        AND git_commit_hash IS NOT NULL
                        AND lower(git_commit_hash) <> lower($2)
                 )
@@ -840,7 +840,7 @@ impl FleetStore for PostgresFleetStore {
             }
             sqlx::query(
                 r#"
-                UPDATE benchmark_spec
+                UPDATE task_spec
                    SET git_commit_hash = $2, updated_at = NOW()
                  WHERE id = $1
                 "#,
@@ -854,7 +854,7 @@ impl FleetStore for PostgresFleetStore {
                 r#"
                 UPDATE job
                    SET git_commit_hash = $2, updated_at = NOW()
-                 WHERE benchmark_spec_id = $1
+                 WHERE task_spec_id = $1
                    AND status = 'queued'
                    AND git_commit_hash IS NULL
                 "#,
@@ -886,20 +886,20 @@ impl FleetStore for PostgresFleetStore {
                AND execution_payload IS NULL
                AND EXISTS (
                    SELECT 1
-                     FROM benchmark_group compatible_group
-                    WHERE compatible_group.id = job.benchmark_group_id
+                     FROM task_submission compatible_submission
+                    WHERE compatible_submission.id = job.task_submission_id
                       AND (
                           $6::uuid IS NULL
-                          OR compatible_group.worker_id IS NULL
-                          OR compatible_group.worker_id = $6
+                          OR compatible_submission.worker_id IS NULL
+                          OR compatible_submission.worker_id = $6
                       )
                )
-             RETURNING benchmark_group_id
+             RETURNING task_submission_id
             )
-            UPDATE benchmark_group
+            UPDATE task_submission
                SET worker_id = COALESCE(worker_id, $6),
                    updated_at = NOW()
-             WHERE id = (SELECT benchmark_group_id FROM prepared_job)
+             WHERE id = (SELECT task_submission_id FROM prepared_job)
                AND ($6::uuid IS NULL OR worker_id IS NULL OR worker_id = $6)
             "#,
         )
@@ -1017,7 +1017,7 @@ impl FleetStore for PostgresFleetStore {
         let row = sqlx::query(
             r#"
             SELECT j.id AS job_id,
-                   j.benchmark_group_id,
+                   j.task_submission_id,
                    j.github_installation_id,
                    j.github_repo_id,
                    j.git_commit_hash,
@@ -1029,12 +1029,12 @@ impl FleetStore for PostgresFleetStore {
                        WHEN 'block_validation' THEN 'block_validation'
                    END AS capability,
                    repo.owner || '/' || repo.name AS repository,
-                   bg.worker_id AS placed_worker_id,
-                   bg.measurement_profile AS placed_measurement_profile,
-                   bg.execution_generation,
-                   bg.fencing_generation
+                   submission.worker_id AS placed_worker_id,
+                   submission.measurement_profile AS placed_measurement_profile,
+                   submission.execution_generation,
+                   submission.fencing_generation
               FROM job j
-              JOIN benchmark_group bg ON bg.id = j.benchmark_group_id
+              JOIN task_submission submission ON submission.id = j.task_submission_id
               JOIN github_repo repo ON repo.id = j.github_repo_id
              WHERE j.status = 'queued'
                AND j.execution_payload IS NOT NULL
@@ -1044,20 +1044,20 @@ impl FleetStore for PostgresFleetStore {
                        WHEN 'build_only' THEN 'build_only'
                        WHEN 'block_validation' THEN 'block_validation'
                    END = ANY($1::text[])
-               AND (bg.worker_id IS NULL OR bg.worker_id = $2)
+               AND (submission.worker_id IS NULL OR submission.worker_id = $2)
                AND (
                    j.task_kind <> 'benchmark'
-                   OR bg.measurement_profile IS NULL
-                   OR bg.measurement_profile IS NOT DISTINCT FROM $3
+                   OR submission.measurement_profile IS NULL
+                   OR submission.measurement_profile IS NOT DISTINCT FROM $3
                )
                AND NOT EXISTS (
                    SELECT 1
                      FROM worker_attempt active
-                    WHERE active.benchmark_group_id = bg.id
+                    WHERE active.task_submission_id = submission.id
                       AND active.status IN ('offered', 'running', 'cancel_requested')
                )
              ORDER BY j.created_at, j.id
-             FOR UPDATE OF j, bg SKIP LOCKED
+             FOR UPDATE OF j, submission SKIP LOCKED
              LIMIT 1
             "#,
         )
@@ -1082,8 +1082,8 @@ impl FleetStore for PostgresFleetStore {
         };
 
         let job_id: Uuid = row.try_get("job_id").core()?;
-        let benchmark_group_id: Uuid = row
-            .try_get("benchmark_group_id")
+        let task_submission_id: Uuid = row
+            .try_get("task_submission_id")
             .core()?;
         let capability_text: String = row
             .try_get("capability")
@@ -1101,7 +1101,7 @@ impl FleetStore for PostgresFleetStore {
         let trace_id = Uuid::new_v4();
         let offer_expires_at = Utc::now() + offer_ttl;
         let lease_expires_at = Utc::now() + lease_ttl;
-        let profile_for_group = if task_capability == WorkerCapability::Benchmark {
+        let profile_for_submission = if task_capability == WorkerCapability::Benchmark {
             measurement_profile.clone()
         } else {
             None
@@ -1109,7 +1109,7 @@ impl FleetStore for PostgresFleetStore {
 
         let placement = sqlx::query(
             r#"
-            UPDATE benchmark_group
+            UPDATE task_submission
                SET worker_id = COALESCE(worker_id, $2),
                    measurement_profile = CASE
                        WHEN measurement_profile IS NULL THEN $3
@@ -1121,9 +1121,9 @@ impl FleetStore for PostgresFleetStore {
                AND (worker_id IS NULL OR worker_id = $2)
             "#,
         )
-        .bind(benchmark_group_id)
+        .bind(task_submission_id)
         .bind(worker_id)
-        .bind(&profile_for_group)
+        .bind(&profile_for_submission)
         .bind(fence)
         .execute(&mut *tx)
         .await
@@ -1155,7 +1155,7 @@ impl FleetStore for PostgresFleetStore {
         sqlx::query(
             r#"
             INSERT INTO worker_attempt
-                (attempt_id, job_id, benchmark_group_id, worker_id,
+                (attempt_id, job_id, task_submission_id, worker_id,
                  worker_session_id, status, fencing_generation,
                  execution_generation, claim_token, trace_id, capability,
                  payload_hash, offer_expires_at, lease_expires_at)
@@ -1167,7 +1167,7 @@ impl FleetStore for PostgresFleetStore {
         )
         .bind(attempt_id)
         .bind(job_id)
-        .bind(benchmark_group_id)
+        .bind(task_submission_id)
         .bind(worker_id)
         .bind(worker_session_id)
         .bind(fence)
@@ -1230,7 +1230,7 @@ impl FleetStore for PostgresFleetStore {
                 .core()?,
             payload,
             vcpu_cpuset: None,
-            measurement_profile: profile_for_group,
+            measurement_profile: profile_for_submission,
         }))
     }
 
@@ -1707,15 +1707,15 @@ impl FleetStore for PostgresFleetStore {
         Ok(cancelled)
     }
 
-    async fn recover_group(
+    async fn recover_submission(
         &self,
-        group_id: Uuid,
+        submission_id: Uuid,
         target_worker_id: Option<Uuid>,
         reason: &str,
-    ) -> sbgh_core::Result<GroupRecovery> {
+    ) -> sbgh_core::Result<SubmissionRecovery> {
         if reason.trim().is_empty() || reason.len() > 1_024 {
             return Err(sbgh_core::Error::Config(
-                "group recovery requires a concise operator reason".into(),
+                "submission recovery requires a concise operator reason".into(),
             ));
         }
         let mut tx = self
@@ -1749,27 +1749,27 @@ impl FleetStore for PostgresFleetStore {
         let prior = sqlx::query(
             r#"
             SELECT execution_generation
-              FROM benchmark_group
+              FROM task_submission
              WHERE id = $1
                AND EXISTS (
-                   SELECT 1 FROM benchmark_spec
-                    WHERE benchmark_group_id = $1
+                   SELECT 1 FROM task_spec
+                    WHERE task_submission_id = $1
                )
                AND NOT EXISTS (
-                   SELECT 1 FROM benchmark_spec
-                    WHERE benchmark_group_id = $1
+                   SELECT 1 FROM task_spec
+                    WHERE task_submission_id = $1
                       AND task_kind <> 'benchmark'
                )
              FOR UPDATE
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .fetch_optional(&mut *tx)
         .await
         .core()?
         .ok_or_else(|| {
             sbgh_core::Error::Config(
-                "group does not exist or is not a benchmark comparison generation".into(),
+                "submission does not exist or is not a benchmark comparison generation".into(),
             )
         })?;
         let active: bool = sqlx::query_scalar(
@@ -1777,17 +1777,19 @@ impl FleetStore for PostgresFleetStore {
             SELECT EXISTS (
                 SELECT 1
                   FROM worker_attempt
-                 WHERE benchmark_group_id = $1
+                 WHERE task_submission_id = $1
                    AND status IN ('offered', 'running', 'cancel_requested')
             )
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .fetch_one(&mut *tx)
         .await
         .core()?;
         if active {
-            return Err(sbgh_core::Error::Config("benchmark group still has active work".into()));
+            return Err(sbgh_core::Error::Config(
+                "benchmark submission still has active work".into(),
+            ));
         }
         let abandoned = sqlx::query(
             r#"
@@ -1795,12 +1797,12 @@ impl FleetStore for PostgresFleetStore {
                SET status = 'abandoned', completed_at = NOW()
               FROM job
              WHERE job.id = obligation.job_id
-               AND job.benchmark_group_id = $1
+               AND job.task_submission_id = $1
                AND obligation.status = 'pending'
             RETURNING obligation.job_id
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .fetch_all(&mut *tx)
         .await
         .core()?;
@@ -1823,7 +1825,7 @@ impl FleetStore for PostgresFleetStore {
                     Some(reason),
                     Some(&serde_json::json!({
                         "recovery": "operator_abandoned_remote_cleanup",
-                        "prior_group_id": group_id,
+                        "prior_submission_id": submission_id,
                     })),
                 )
                 .await?;
@@ -1833,22 +1835,22 @@ impl FleetStore for PostgresFleetStore {
             .try_get::<i64, _>("execution_generation")
             .core()?
             + 1;
-        let new_group_id = Uuid::new_v4();
+        let new_submission_id = Uuid::new_v4();
         let inserted = sqlx::query(
             r#"
-            INSERT INTO benchmark_group
+            INSERT INTO task_submission
                 (id, github_installation_id, github_repo_id, source, intent,
-                 artifact_prefix, host_key, recovery_of_group_id,
+                 artifact_prefix, host_key, recovery_of_submission_id,
                  execution_generation, fencing_generation, worker_id)
             SELECT $2, github_installation_id, github_repo_id, source, intent,
-                   $2::text, host_key, COALESCE(recovery_of_group_id, id),
+                   $2::text, host_key, COALESCE(recovery_of_submission_id, id),
                    $3, fencing_generation + 1, $4
-              FROM benchmark_group
+              FROM task_submission
              WHERE id = $1
             "#,
         )
-        .bind(group_id)
-        .bind(new_group_id)
+        .bind(submission_id)
+        .bind(new_submission_id)
         .bind(execution_generation)
         .bind(target_worker_id)
         .execute(&mut *tx)
@@ -1856,53 +1858,53 @@ impl FleetStore for PostgresFleetStore {
         .core()?;
         if inserted.rows_affected() != 1 {
             return Err(sbgh_core::Error::Config(
-                "benchmark group disappeared during recovery".into(),
+                "benchmark submission disappeared during recovery".into(),
             ));
         }
         sqlx::query(
             r#"
-            INSERT INTO benchmark_spec
-                (benchmark_group_id, spec_index, requested_run_count,
+            INSERT INTO task_spec
+                (task_submission_id, spec_index, requested_run_count,
                  baseline_calibration_id, github_repo_id, task_kind, build_target,
                  git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
                  workload_key)
             SELECT $2, spec_index, requested_run_count, baseline_calibration_id,
                    github_repo_id, task_kind, build_target, git_ref_kind,
                    git_ref_display, git_commit_hash, git_committed_at, workload_key
-              FROM benchmark_spec
-             WHERE benchmark_group_id = $1
+              FROM task_spec
+             WHERE task_submission_id = $1
              ORDER BY spec_index
             "#,
         )
-        .bind(group_id)
-        .bind(new_group_id)
+        .bind(submission_id)
+        .bind(new_submission_id)
         .execute(&mut *tx)
         .await
         .core()?;
         sqlx::query(
             r#"
-            INSERT INTO benchmark_workflow_step
-                (benchmark_group_id, step_index, step_kind, benchmark_spec_id)
+            INSERT INTO task_workflow_step
+                (task_submission_id, step_index, step_kind, task_spec_id)
             SELECT $2, step.step_index, step.step_kind, new_spec.id
-              FROM benchmark_workflow_step step
-              LEFT JOIN benchmark_spec old_spec
-                ON old_spec.id = step.benchmark_spec_id
-              LEFT JOIN benchmark_spec new_spec
-                ON new_spec.benchmark_group_id = $2
+              FROM task_workflow_step step
+              LEFT JOIN task_spec old_spec
+                ON old_spec.id = step.task_spec_id
+              LEFT JOIN task_spec new_spec
+                ON new_spec.task_submission_id = $2
                AND new_spec.spec_index = old_spec.spec_index
-             WHERE step.benchmark_group_id = $1
+             WHERE step.task_submission_id = $1
              ORDER BY step.step_index
             "#,
         )
-        .bind(group_id)
-        .bind(new_group_id)
+        .bind(submission_id)
+        .bind(new_submission_id)
         .execute(&mut *tx)
         .await
         .core()?;
         let first_job_id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO job
-                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind,
                  git_ref_display, git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target,
@@ -1915,21 +1917,21 @@ impl FleetStore for PostgresFleetStore {
                    old_job.build_target, old_job.execution_payload_version,
                    old_job.execution_payload, old_job.execution_payload_hash
               FROM job old_job
-              JOIN benchmark_spec old_spec
-                ON old_spec.id = old_job.benchmark_spec_id
-               AND old_spec.benchmark_group_id = $1
+              JOIN task_spec old_spec
+                ON old_spec.id = old_job.task_spec_id
+               AND old_spec.task_submission_id = $1
                AND old_spec.spec_index = 0
-              JOIN benchmark_spec new_spec
-                ON new_spec.benchmark_group_id = $2
+              JOIN task_spec new_spec
+                ON new_spec.task_submission_id = $2
                AND new_spec.spec_index = 0
-             WHERE old_job.benchmark_run_index = 0
+             WHERE old_job.task_run_index = 0
              ORDER BY old_job.created_at, old_job.id
              LIMIT 1
             RETURNING id
             "#,
         )
-        .bind(group_id)
-        .bind(new_group_id)
+        .bind(submission_id)
+        .bind(new_submission_id)
         .fetch_one(&mut *tx)
         .await
         .core()?;
@@ -1944,11 +1946,11 @@ impl FleetStore for PostgresFleetStore {
              WHERE job_id = (
                  SELECT old_job.id
                    FROM job old_job
-                   JOIN benchmark_spec old_spec
-                     ON old_spec.id = old_job.benchmark_spec_id
-                  WHERE old_spec.benchmark_group_id = $1
+                   JOIN task_spec old_spec
+                     ON old_spec.id = old_job.task_spec_id
+                  WHERE old_spec.task_submission_id = $1
                     AND old_spec.spec_index = 0
-                    AND old_job.benchmark_run_index = 0
+                    AND old_job.task_run_index = 0
                   ORDER BY old_job.created_at, old_job.id
                   LIMIT 1
              )
@@ -1956,7 +1958,7 @@ impl FleetStore for PostgresFleetStore {
              ORDER BY occurred_at DESC, id DESC
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .bind(first_job_id)
         .bind(reason)
         .execute(&mut *tx)
@@ -1972,10 +1974,10 @@ impl FleetStore for PostgresFleetStore {
                       FROM github_pull_request_job
                      WHERE job_id = (
                          SELECT old_job.id FROM job old_job
-                         JOIN benchmark_spec old_spec ON old_spec.id = old_job.benchmark_spec_id
-                         WHERE old_spec.benchmark_group_id = $1
+                         JOIN task_spec old_spec ON old_spec.id = old_job.task_spec_id
+                         WHERE old_spec.task_submission_id = $1
                            AND old_spec.spec_index = 0
-                           AND old_job.benchmark_run_index = 0
+                           AND old_job.task_run_index = 0
                          ORDER BY old_job.created_at, old_job.id LIMIT 1
                      )
                     "#
@@ -1986,10 +1988,10 @@ impl FleetStore for PostgresFleetStore {
                     SELECT github_webhook_id, $2 FROM github_webhook_job
                      WHERE job_id = (
                          SELECT old_job.id FROM job old_job
-                         JOIN benchmark_spec old_spec ON old_spec.id = old_job.benchmark_spec_id
-                         WHERE old_spec.benchmark_group_id = $1
+                         JOIN task_spec old_spec ON old_spec.id = old_job.task_spec_id
+                         WHERE old_spec.task_submission_id = $1
                            AND old_spec.spec_index = 0
-                           AND old_job.benchmark_run_index = 0
+                           AND old_job.task_run_index = 0
                          ORDER BY old_job.created_at, old_job.id LIMIT 1
                      )
                     "#
@@ -2000,26 +2002,26 @@ impl FleetStore for PostgresFleetStore {
                     SELECT github_user_id, $2 FROM github_user_job
                      WHERE job_id = (
                          SELECT old_job.id FROM job old_job
-                         JOIN benchmark_spec old_spec ON old_spec.id = old_job.benchmark_spec_id
-                         WHERE old_spec.benchmark_group_id = $1
+                         JOIN task_spec old_spec ON old_spec.id = old_job.task_spec_id
+                         WHERE old_spec.task_submission_id = $1
                            AND old_spec.spec_index = 0
-                           AND old_job.benchmark_run_index = 0
+                           AND old_job.task_run_index = 0
                          ORDER BY old_job.created_at, old_job.id LIMIT 1
                      )
                     "#
                 }
             };
             sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(group_id)
+                .bind(submission_id)
                 .bind(first_job_id)
                 .execute(&mut *tx)
                 .await
                 .core()?;
         }
         tx.commit().await.core()?;
-        Ok(GroupRecovery {
-            prior_group_id: group_id,
-            new_group_id,
+        Ok(SubmissionRecovery {
+            prior_submission_id: submission_id,
+            new_submission_id,
             first_job_id,
             execution_generation: execution_generation as u64,
         })
@@ -3562,10 +3564,10 @@ async fn persist_completion(
     if let Some(calibration_id) = completion.baseline_calibration_id {
         sqlx::query(
             r#"
-            UPDATE benchmark_spec spec
+            UPDATE task_spec spec
                SET baseline_calibration_id = $2, updated_at = NOW()
               FROM job
-             WHERE job.id = $1 AND spec.id = job.benchmark_spec_id
+             WHERE job.id = $1 AND spec.id = job.task_spec_id
             "#,
         )
         .bind(job_id)

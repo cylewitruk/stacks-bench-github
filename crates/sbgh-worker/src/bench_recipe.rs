@@ -24,7 +24,7 @@ use sbgh_driver::{EventSink, TaskContext, TaskStatus};
 pub struct BenchRecipe {
     driver: Arc<dyn Driver>,
     bench_args: Vec<String>,
-    /// Optional carried group SQLite DB to seed before this run starts.
+    /// Optional carried submission SQLite DB to seed before this run starts.
     sqlite_seed_key: Option<String>,
     shared_baseline_calibration: bool,
     baseline_calibration_id: Option<i64>,

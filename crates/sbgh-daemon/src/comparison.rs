@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use sbgh_core::db::{BaselineSelection, BenchmarkRunMetric};
-use sbgh_core::models::{BenchmarkSpec, JobMetric};
+use sbgh_core::models::{JobMetric, SubmissionSpec};
 use uuid::Uuid;
 
 /// Confidence verdict for a delta, derived from how many sigmas it is against
@@ -98,7 +98,7 @@ pub fn compare(pr: &JobMetric, base: &JobMetric, noise_cv_pct: Option<f64>) -> O
     })
 }
 
-/// Per-variant run aggregate used by v22 group comparisons.
+/// Per-variant run aggregate used by multi-variant comparisons.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariantRunStats {
     pub requested: i32,
@@ -118,10 +118,10 @@ pub struct WorkloadShape {
     pub warmup_blocks: i64,
 }
 
-/// One spec/variant in a group comparison.
+/// One spec/variant in a multi-variant comparison.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComparisonVariant {
-    pub benchmark_spec_id: Uuid,
+    pub task_spec_id: Uuid,
     pub spec_index: i32,
     pub ref_display: String,
     pub commit: Option<String>,
@@ -138,7 +138,7 @@ pub enum ComparisonUnavailable {
     DegenerateBaseline,
 }
 
-/// One variant's delta against the group's baseline variant (spec 0).
+/// One variant's delta against the submission's baseline variant (spec 0).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariantDelta {
     pub variant: ComparisonVariant,
@@ -146,16 +146,16 @@ pub struct VariantDelta {
     pub unavailable: Option<ComparisonUnavailable>,
 }
 
-/// v22 group comparison: one baseline variant plus N deltas against it.
+/// Multi-variant comparison: one baseline variant plus N deltas against it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct GroupComparison {
+pub struct MultiVariantComparison {
     pub baseline: ComparisonVariant,
     pub variants: Vec<VariantDelta>,
 }
 
-impl GroupComparison {
+impl MultiVariantComparison {
     pub fn from_specs(
-        specs: &[BenchmarkSpec],
+        specs: &[SubmissionSpec],
         metrics_by_spec: &HashMap<Uuid, Vec<BenchmarkRunMetric>>,
         noise_cv_pct: Option<f64>,
     ) -> Option<Self> {
@@ -186,7 +186,7 @@ impl GroupComparison {
 }
 
 fn variant_from_spec(
-    spec: &BenchmarkSpec,
+    spec: &SubmissionSpec,
     metrics_by_spec: &HashMap<Uuid, Vec<BenchmarkRunMetric>>,
 ) -> ComparisonVariant {
     let metrics = metrics_by_spec
@@ -194,7 +194,7 @@ fn variant_from_spec(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     ComparisonVariant {
-        benchmark_spec_id: spec.id,
+        task_spec_id: spec.id,
         spec_index: spec.spec_index,
         ref_display: spec.git_ref_display.clone(),
         commit: spec.git_commit_hash.clone(),
@@ -424,10 +424,10 @@ mod tests {
         }
     }
 
-    fn spec(index: i32, rev: &str, requested: i32, calibration_id: Option<i64>) -> BenchmarkSpec {
-        BenchmarkSpec {
+    fn spec(index: i32, rev: &str, requested: i32, calibration_id: Option<i64>) -> SubmissionSpec {
+        SubmissionSpec {
             id: uuid::Uuid::from_u128((index + 1) as u128),
-            benchmark_group_id: uuid::Uuid::from_u128(99),
+            task_submission_id: uuid::Uuid::from_u128(99),
             spec_index: index,
             requested_run_count: requested,
             baseline_calibration_id: calibration_id,
@@ -445,10 +445,7 @@ mod tests {
     }
 
     fn run(index: i32, metric: JobMetric) -> BenchmarkRunMetric {
-        BenchmarkRunMetric {
-            benchmark_run_index: index,
-            metric,
-        }
+        BenchmarkRunMetric { task_run_index: index, metric }
     }
 
     fn metrics(entries: impl IntoIterator<Item = (i32, JobMetric)>) -> Vec<BenchmarkRunMetric> {
@@ -536,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn group_comparison_is_baseline_plus_variant_deltas() {
+    fn multi_variant_comparison_is_baseline_plus_variant_deltas() {
         let base = spec(0, "release/3.4.0.0.2", 1, Some(11));
         let candidate = spec(1, "release/3.4.0.0.3", 1, Some(22));
         let metrics = metric_map([
@@ -544,9 +541,12 @@ mod tests {
             (candidate.id, metrics([(0, metric(718_000, 300_000, 5000, 1000))])),
         ]);
 
-        let comparison =
-            GroupComparison::from_specs(&[candidate.clone(), base.clone()], &metrics, Some(0.37))
-                .expect("two specs yield a comparison summary");
+        let comparison = MultiVariantComparison::from_specs(
+            &[candidate.clone(), base.clone()],
+            &metrics,
+            Some(0.37),
+        )
+        .expect("two specs yield a comparison summary");
 
         assert_eq!(
             comparison
@@ -583,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_group_comparison_uses_variant_means_and_sample_noise() {
+    fn repeated_multi_variant_comparison_uses_variant_means_and_sample_noise() {
         let base = spec(0, "base", 2, Some(1));
         let candidate = spec(1, "candidate", 2, Some(2));
         let metrics = metric_map([
@@ -604,7 +604,7 @@ mod tests {
         ]);
 
         let comparison =
-            GroupComparison::from_specs(&[base.clone(), candidate.clone()], &metrics, None)
+            MultiVariantComparison::from_specs(&[base.clone(), candidate.clone()], &metrics, None)
                 .unwrap();
         let delta = comparison.variants[0]
             .comparison
@@ -619,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn group_comparison_marks_sub_noise_single_run_inconclusive() {
+    fn multi_variant_comparison_marks_sub_noise_single_run_inconclusive() {
         let base = spec(0, "base", 1, Some(1));
         let candidate = spec(1, "candidate", 1, Some(2));
         let metrics = metric_map([
@@ -628,7 +628,7 @@ mod tests {
         ]);
 
         let comparison =
-            GroupComparison::from_specs(&[base, candidate], &metrics, Some(0.37)).unwrap();
+            MultiVariantComparison::from_specs(&[base, candidate], &metrics, Some(0.37)).unwrap();
         assert_eq!(
             comparison.variants[0]
                 .comparison
@@ -640,13 +640,13 @@ mod tests {
     }
 
     #[test]
-    fn group_comparison_keeps_partial_missing_metric_data() {
+    fn multi_variant_comparison_keeps_partial_missing_metric_data() {
         let base = spec(0, "base", 1, Some(1));
         let candidate = spec(1, "candidate", 1, Some(2));
         let metrics = metric_map([(base.id, metrics([(0, metric(700_000, 300_000, 5000, 1000))]))]);
 
         let comparison =
-            GroupComparison::from_specs(&[base, candidate], &metrics, Some(0.37)).unwrap();
+            MultiVariantComparison::from_specs(&[base, candidate], &metrics, Some(0.37)).unwrap();
         let delta = &comparison.variants[0];
         assert_eq!(delta.variant.stats.completed, 0);
         assert_eq!(delta.unavailable, Some(ComparisonUnavailable::MissingVariantMetric));
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn group_comparison_preserves_workload_mismatch_guard() {
+    fn multi_variant_comparison_preserves_workload_mismatch_guard() {
         let base = spec(0, "base", 1, Some(1));
         let candidate = spec(1, "candidate", 1, Some(2));
         let metrics = metric_map([
@@ -663,7 +663,7 @@ mod tests {
         ]);
 
         let comparison =
-            GroupComparison::from_specs(&[base, candidate], &metrics, Some(0.37)).unwrap();
+            MultiVariantComparison::from_specs(&[base, candidate], &metrics, Some(0.37)).unwrap();
         assert_eq!(
             comparison.variants[0].unavailable,
             Some(ComparisonUnavailable::IncomparableWorkload),

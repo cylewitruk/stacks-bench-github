@@ -183,7 +183,7 @@ db_enums! {
     sbgh_core::models::GithubAccountType => "github_account_type",
     sbgh_core::models::TriggerKind => "trigger_kind",
     sbgh_core::models::UserRole => "user_role",
-    sbgh_core::models::BenchmarkStepKind => "benchmark_step_kind",
+    sbgh_core::models::SubmissionStepKind => "task_step_kind",
     sbgh_core::models::JobKind => "job_kind",
     sbgh_core::models::GitRefKind => "git_ref_kind",
     sbgh_core::models::JobSource => "job_source",

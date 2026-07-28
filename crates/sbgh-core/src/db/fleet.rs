@@ -192,9 +192,9 @@ pub struct FleetSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct GroupRecovery {
-    pub prior_group_id: Uuid,
-    pub new_group_id: Uuid,
+pub struct SubmissionRecovery {
+    pub prior_submission_id: Uuid,
+    pub new_submission_id: Uuid,
     pub first_job_id: Uuid,
     pub execution_generation: u64,
 }
@@ -219,9 +219,9 @@ pub trait FleetStore: Send + Sync + 'static {
     ///
     /// Lazy variants/runs then inherit enqueue-generation commits rather than
     /// resolving a mutable branch when they are materialized later.
-    async fn freeze_group_sources(
+    async fn freeze_submission_sources(
         &self,
-        group_id: Uuid,
+        submission_id: Uuid,
         sources: &[ResolvedSpecSource],
     ) -> Result<bool>;
 
@@ -277,15 +277,15 @@ pub trait FleetStore: Send + Sync + 'static {
 
     /// Start a fresh comparison generation from the first spec/run.
     ///
-    /// The prior group remains immutable and auditable. This operation is
-    /// deliberately explicit because moving a partial benchmark group across
+    /// The prior submission remains immutable and auditable. This operation is
+    /// deliberately explicit because moving a partial benchmark submission across
     /// measurement environments must never happen through normal retry.
-    async fn recover_group(
+    async fn recover_submission(
         &self,
-        group_id: Uuid,
+        submission_id: Uuid,
         target_worker_id: Option<Uuid>,
         reason: &str,
-    ) -> Result<GroupRecovery>;
+    ) -> Result<SubmissionRecovery>;
 
     async fn ingest_reliable_event(
         &self,

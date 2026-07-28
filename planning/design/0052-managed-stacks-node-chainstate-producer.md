@@ -75,10 +75,11 @@ managed writable node LV
 The snapshots are not full chainstate copies. Storage growth is primarily the
 changed extents retained by old checkpoints, plus thinpool metadata.
 
-[v26](../iterations/v26-sandboxed-worker-execution.md) is the current consumer
-contract: every published chainstate is a read-only origin LV selected locally
-by prefix. Manifests and tags remain useful inventory/provenance metadata, but
-consumers do not require them for admission; block-validation guests probe and
+[v26](../archive/completed/0062-sandboxed-worker-execution.md) is the current
+consumer contract: every published chainstate is a read-only origin LV selected
+locally by prefix. Manifests and tags remain useful inventory/provenance
+metadata, but consumers do not require them for admission; block-validation
+guests probe and
 report actual coverage.
 
 ### Cut Plan
@@ -149,8 +150,8 @@ implements this item must choose that policy deliberately.
 
 ### Benchmark / Index Admission
 
-Managed-node sync and snapshot work is exclusive with benchmark groups and
-chainstate-index jobs. A v22 comparison group or clean-repeat group is an
+Managed-node sync and snapshot work is exclusive with benchmark submissions and
+chainstate-index jobs. A v22 comparison group or clean-repeat submission is an
 indivisible host unit: the node must not restart between variants/repeats.
 
 If a job needs a fresh snapshot, sbgh stops the node and snapshots before

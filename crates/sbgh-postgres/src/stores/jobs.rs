@@ -18,10 +18,10 @@ use crate::db::jobs::{
     JobCompletion, JobCreationOutcome, JobFailure, JobStore, NewBenchmarkSpec, PendingBenchmarkRun,
 };
 use crate::models::{
-    BenchmarkGroup, BenchmarkSpec, BenchmarkStepKind, GithubPullRequestJob, GithubUserJob,
-    GithubWebhookJob, Job, JobCreationRequest, JobEvent, JobEventKind, JobEventStatus, JobMetric,
-    JobResult, JobStatus, NewJob, NewJobEvent, QueuedEventDetail, ResolvedCommit, TaskKind,
-    TerminalJobStatus, uses_shared_calibration,
+    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
+    JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, NewJob, NewJobEvent,
+    QueuedEventDetail, ResolvedCommit, SubmissionSpec, SubmissionStepKind, TaskKind,
+    TaskSubmission, TerminalJobStatus, uses_shared_calibration,
 };
 
 #[derive(Clone)]
@@ -38,7 +38,7 @@ impl PostgresJobStore {
     pub async fn all_jobs(&self) -> Vec<Job> {
         sqlx::query_as::<_, Db<Job>>(
             r#"
-            SELECT id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            SELECT id, task_submission_id, task_spec_id, task_run_index,
                    github_installation_id, github_repo_id, status,
                    source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
                    git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
@@ -90,36 +90,36 @@ impl PostgresJobStore {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn spec(&self, id: Uuid) -> Option<BenchmarkSpec> {
-        self.lookup_benchmark_spec(id)
+    pub async fn spec(&self, id: Uuid) -> Option<SubmissionSpec> {
+        self.lookup_submission_spec(id)
             .await
-            .expect("read benchmark spec")
+            .expect("read submission spec")
     }
 
     #[cfg(feature = "testing")]
-    pub async fn specs_for_group(&self, group_id: Uuid) -> Vec<BenchmarkSpec> {
-        self.lookup_benchmark_specs(group_id)
+    pub async fn specs_for_submission(&self, submission_id: Uuid) -> Vec<SubmissionSpec> {
+        self.lookup_submission_specs(submission_id)
             .await
-            .expect("read benchmark specs")
+            .expect("read submission specs")
     }
 
     #[cfg(feature = "testing")]
-    pub async fn steps_for_group(
+    pub async fn steps_for_submission(
         &self,
-        group_id: Uuid,
-    ) -> Vec<crate::models::BenchmarkWorkflowStep> {
-        sqlx::query_as::<_, Db<crate::models::BenchmarkWorkflowStep>>(
-            "SELECT id, benchmark_group_id, step_index, step_kind, benchmark_spec_id, created_at \
-             FROM benchmark_workflow_step WHERE benchmark_group_id = $1 ORDER BY step_index",
+        submission_id: Uuid,
+    ) -> Vec<crate::models::SubmissionStep> {
+        sqlx::query_as::<_, Db<crate::models::SubmissionStep>>(
+            "SELECT id, task_submission_id, step_index, step_kind, task_spec_id, created_at \
+             FROM task_workflow_step WHERE task_submission_id = $1 ORDER BY step_index",
         )
-        .bind(group_id)
+        .bind(submission_id)
         .fetch_all(&self.pool)
         .await
-        .expect("read benchmark workflow steps")
+        .expect("read submission workflow steps")
         .into_domain()
     }
 
-    async fn create_group_specs(
+    async fn create_submission_specs(
         tx: &mut Transaction<'_, Postgres>,
         specs: &[NewBenchmarkSpec],
     ) -> Result<(Uuid, Vec<Uuid>)> {
@@ -129,26 +129,26 @@ impl PostgresJobStore {
             )));
         };
         let first_job = &first.new_job;
-        let group_id = Uuid::new_v4();
+        let submission_id = Uuid::new_v4();
 
         sqlx::query(
             r#"
-            INSERT INTO benchmark_group
+            INSERT INTO task_submission
                 (id, github_installation_id, github_repo_id, source, intent, artifact_prefix)
             VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .bind(first_job.github_installation_id)
         .bind(first_job.github_repo_id)
         .bind(Db(first_job.axes.source))
         .bind(Db(first_job.axes.intent))
-        .bind(group_id.to_string())
+        .bind(submission_id.to_string())
         .execute(&mut **tx)
         .await
         .core()?;
 
-        let group_measured_run_count = specs
+        let submission_measured_run_count = specs
             .iter()
             .map(NewBenchmarkSpec::measured_run_count)
             .sum::<i32>();
@@ -172,8 +172,8 @@ impl PostgresJobStore {
                 .max(1);
             sqlx::query(
                 r#"
-                INSERT INTO benchmark_spec
-                    (id, benchmark_group_id, spec_index, requested_run_count,
+                INSERT INTO task_spec
+                    (id, task_submission_id, spec_index, requested_run_count,
                      baseline_calibration_id, github_repo_id, task_kind, build_target,
                      git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
                      workload_key)
@@ -181,7 +181,7 @@ impl PostgresJobStore {
                 "#,
             )
             .bind(spec_id)
-            .bind(group_id)
+            .bind(submission_id)
             .bind(spec_index as i32)
             .bind(requested_run_count)
             .bind(spec.baseline_calibration_id)
@@ -199,14 +199,14 @@ impl PostgresJobStore {
 
             sqlx::query(
                 r#"
-                INSERT INTO benchmark_workflow_step
-                    (benchmark_group_id, step_index, step_kind, benchmark_spec_id)
+                INSERT INTO task_workflow_step
+                    (task_submission_id, step_index, step_kind, task_spec_id)
                 VALUES ($1, $2, $3, $4)
                 "#,
             )
-            .bind(group_id)
+            .bind(submission_id)
             .bind(step_index)
-            .bind(Db(BenchmarkStepKind::Build))
+            .bind(Db(SubmissionStepKind::Build))
             .bind(spec_id)
             .execute(&mut **tx)
             .await
@@ -216,18 +216,18 @@ impl PostgresJobStore {
             if uses_shared_calibration(
                 new.axes.task_kind,
                 new.axes.build_target,
-                group_measured_run_count,
+                submission_measured_run_count,
             ) {
                 sqlx::query(
                     r#"
-                    INSERT INTO benchmark_workflow_step
-                        (benchmark_group_id, step_index, step_kind, benchmark_spec_id)
+                    INSERT INTO task_workflow_step
+                        (task_submission_id, step_index, step_kind, task_spec_id)
                     VALUES ($1, $2, $3, $4)
                     "#,
                 )
-                .bind(group_id)
+                .bind(submission_id)
                 .bind(step_index)
-                .bind(Db(BenchmarkStepKind::Calibrate))
+                .bind(Db(SubmissionStepKind::Calibrate))
                 .bind(spec_id)
                 .execute(&mut **tx)
                 .await
@@ -238,14 +238,14 @@ impl PostgresJobStore {
             if new.axes.task_kind != TaskKind::BuildOnly {
                 sqlx::query(
                     r#"
-                    INSERT INTO benchmark_workflow_step
-                        (benchmark_group_id, step_index, step_kind, benchmark_spec_id)
+                    INSERT INTO task_workflow_step
+                        (task_submission_id, step_index, step_kind, task_spec_id)
                     VALUES ($1, $2, $3, $4)
                     "#,
                 )
-                .bind(group_id)
+                .bind(submission_id)
                 .bind(step_index)
-                .bind(Db(BenchmarkStepKind::Run))
+                .bind(Db(SubmissionStepKind::Run))
                 .bind(spec_id)
                 .execute(&mut **tx)
                 .await
@@ -256,23 +256,23 @@ impl PostgresJobStore {
             spec_ids.push(spec_id);
         }
 
-        Ok((group_id, spec_ids))
+        Ok((submission_id, spec_ids))
     }
 
-    async fn create_singleton_group_spec(
+    async fn create_singleton_submission_spec(
         tx: &mut Transaction<'_, Postgres>,
         new: &NewJob,
         requested_run_count: i32,
     ) -> Result<(Uuid, Uuid)> {
         let specs = [NewBenchmarkSpec::singleton(new.clone(), requested_run_count)];
-        let (group_id, spec_ids) = Self::create_group_specs(tx, &specs)
+        let (submission_id, spec_ids) = Self::create_submission_specs(tx, &specs)
             .await
             .core()?;
         let spec_id = spec_ids
             .into_iter()
             .next()
             .expect("singleton creation returns one spec id");
-        Ok((group_id, spec_id))
+        Ok((submission_id, spec_id))
     }
 
     fn requested_run_count_from_detail(detail: &serde_json::Value) -> i32 {
@@ -292,20 +292,20 @@ impl PostgresJobStore {
         let job: Db<Job> = sqlx::query_as(
             r#"
             INSERT INTO job
-                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
                       claim_token, claimed_at, created_at, updated_at
             "#,
         )
-        .bind(prior.benchmark_group_id)
-        .bind(prior.benchmark_spec_id)
+        .bind(prior.task_submission_id)
+        .bind(prior.task_spec_id)
         .bind(next_index)
         .bind(prior.github_installation_id)
         .bind(prior.github_repo_id)
@@ -330,36 +330,36 @@ impl PostgresJobStore {
 
     async fn insert_initial_run_for_spec_in_tx(
         tx: &mut Transaction<'_, Postgres>,
-        group: &BenchmarkGroup,
-        spec: &BenchmarkSpec,
+        submission: &TaskSubmission,
+        spec: &SubmissionSpec,
         prior_job_id: Uuid,
     ) -> Result<Job> {
         let job: Db<Job> = sqlx::query_as(
             r#"
             INSERT INTO job
-                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
             VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
                       claim_token, claimed_at, created_at, updated_at
             "#,
         )
-        .bind(group.id)
+        .bind(submission.id)
         .bind(spec.id)
-        .bind(group.github_installation_id)
+        .bind(submission.github_installation_id)
         .bind(spec.github_repo_id)
         .bind(Db(spec.git_ref_kind))
         .bind(&spec.git_ref_display)
         .bind(&spec.git_commit_hash)
         .bind(spec.git_committed_at)
         .bind(&spec.workload_key)
-        .bind(Db(group.source))
-        .bind(Db(group.intent))
+        .bind(Db(submission.source))
+        .bind(Db(submission.intent))
         .bind(Db(spec.task_kind))
         .bind(Db(spec.build_target))
         .fetch_one(&mut **tx)
@@ -443,7 +443,7 @@ struct BaselineRow {
 
 #[derive(sqlx::FromRow)]
 struct BenchmarkRunMetricRow {
-    benchmark_run_index: i32,
+    task_run_index: i32,
     #[sqlx(flatten)]
     metric: Db<crate::models::JobMetric>,
 }
@@ -451,7 +451,7 @@ struct BenchmarkRunMetricRow {
 impl From<BenchmarkRunMetricRow> for BenchmarkRunMetric {
     fn from(row: BenchmarkRunMetricRow) -> Self {
         Self {
-            benchmark_run_index: row.benchmark_run_index,
+            task_run_index: row.task_run_index,
             metric: row.metric.0,
         }
     }
@@ -481,7 +481,7 @@ impl JobStore for PostgresJobStore {
             .begin()
             .await
             .core()?;
-        let (group_id, spec_id) = Self::create_singleton_group_spec(&mut tx, new, 1)
+        let (submission_id, spec_id) = Self::create_singleton_submission_spec(&mut tx, new, 1)
             .await
             .core()?;
         // status defaults to 'queued'; claim_token + claimed_at stay NULL on
@@ -490,19 +490,19 @@ impl JobStore for PostgresJobStore {
         let row = sqlx::query_as::<_, Db<Job>>(
             r#"
             INSERT INTO job
-                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
             VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
                       claim_token, claimed_at, created_at, updated_at
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .bind(spec_id)
         .bind(new.github_installation_id)
         .bind(new.github_repo_id)
@@ -540,27 +540,28 @@ impl JobStore for PostgresJobStore {
             .begin()
             .await
             .core()?;
-        let (group_id, spec_id) = Self::create_singleton_group_spec(&mut tx, &request.new_job, 1)
-            .await
-            .core()?;
+        let (submission_id, spec_id) =
+            Self::create_singleton_submission_spec(&mut tx, &request.new_job, 1)
+                .await
+                .core()?;
 
         // v10 (0005): jobs carry the axes natively — set by the handler.
         let job: Db<Job> = sqlx::query_as(
             r#"
             INSERT INTO job
-                (benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
             VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
                       claim_token, claimed_at, created_at, updated_at
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .bind(spec_id)
         .bind(
             request
@@ -693,8 +694,8 @@ impl JobStore for PostgresJobStore {
             .await
             .core()?;
         let requested_run_count = Self::requested_run_count_from_detail(queued_event_detail);
-        let (group_id, spec_id) =
-            Self::create_singleton_group_spec(&mut tx, new_job, requested_run_count)
+        let (submission_id, spec_id) =
+            Self::create_singleton_submission_spec(&mut tx, new_job, requested_run_count)
                 .await
                 .core()?;
 
@@ -704,12 +705,12 @@ impl JobStore for PostgresJobStore {
         let job: Db<Job> = sqlx::query_as(
             r#"
             INSERT INTO job
-                (id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (id, task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
             VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
@@ -717,7 +718,7 @@ impl JobStore for PostgresJobStore {
             "#,
         )
         .bind(job_id)
-        .bind(group_id)
+        .bind(submission_id)
         .bind(spec_id)
         .bind(new_job.github_installation_id)
         .bind(new_job.github_repo_id)
@@ -782,7 +783,7 @@ impl JobStore for PostgresJobStore {
             .core()?;
         let row: Option<PriorRunRow> = sqlx::query_as(
             r#"
-            SELECT j.id, j.benchmark_group_id, j.benchmark_spec_id, j.benchmark_run_index,
+            SELECT j.id, j.task_submission_id, j.task_spec_id, j.task_run_index,
                    j.github_installation_id, j.github_repo_id, j.status,
                    j.source, j.intent, j.task_kind, j.build_target, j.git_ref_kind,
                    j.git_ref_display, j.git_commit_hash, j.git_committed_at, j.workload_key,
@@ -790,7 +791,7 @@ impl JobStore for PostgresJobStore {
                    s.requested_run_count,
                    s.spec_index
               FROM job j
-              JOIN benchmark_spec s ON s.id = j.benchmark_spec_id
+              JOIN task_spec s ON s.id = j.task_spec_id
              WHERE j.id = $1
              FOR UPDATE OF j
             "#,
@@ -813,10 +814,10 @@ impl JobStore for PostgresJobStore {
 
         let active: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM job
-              WHERE benchmark_group_id = $1
+              WHERE task_submission_id = $1
                 AND status IN ('queued', 'claimed', 'running')",
         )
-        .bind(prior.benchmark_group_id)
+        .bind(prior.task_submission_id)
         .fetch_one(&mut *tx)
         .await
         .core()?;
@@ -825,15 +826,14 @@ impl JobStore for PostgresJobStore {
             return Ok(None);
         }
 
-        let max_index: Option<i32> = sqlx::query_scalar(
-            "SELECT MAX(benchmark_run_index) FROM job WHERE benchmark_spec_id = $1",
-        )
-        .bind(prior.benchmark_spec_id)
-        .fetch_one(&mut *tx)
-        .await
-        .core()?;
+        let max_index: Option<i32> =
+            sqlx::query_scalar("SELECT MAX(task_run_index) FROM job WHERE task_spec_id = $1")
+                .bind(prior.task_spec_id)
+                .fetch_one(&mut *tx)
+                .await
+                .core()?;
         let max_index = max_index.unwrap_or(0);
-        if max_index != prior.benchmark_run_index {
+        if max_index != prior.task_run_index {
             tx.rollback().await.core()?;
             return Ok(None);
         }
@@ -844,20 +844,20 @@ impl JobStore for PostgresJobStore {
                 .await
                 .core()?
         } else {
-            let next_spec: Option<Db<BenchmarkSpec>> = sqlx::query_as(
+            let next_spec: Option<Db<SubmissionSpec>> = sqlx::query_as(
                 r#"
-                SELECT id, benchmark_group_id, spec_index, requested_run_count,
+                SELECT id, task_submission_id, spec_index, requested_run_count,
                        baseline_calibration_id, github_repo_id, task_kind, build_target,
                        git_ref_kind, git_ref_display, git_commit_hash, git_committed_at,
                        workload_key, created_at, updated_at
-                  FROM benchmark_spec
-                 WHERE benchmark_group_id = $1
+                  FROM task_spec
+                 WHERE task_submission_id = $1
                    AND spec_index > $2
               ORDER BY spec_index ASC
                  LIMIT 1
                 "#,
             )
-            .bind(prior.benchmark_group_id)
+            .bind(prior.task_submission_id)
             .bind(spec_index)
             .fetch_optional(&mut *tx)
             .await
@@ -868,7 +868,7 @@ impl JobStore for PostgresJobStore {
             };
 
             let existing_next_jobs: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM job WHERE benchmark_spec_id = $1")
+                sqlx::query_scalar("SELECT COUNT(*) FROM job WHERE task_spec_id = $1")
                     .bind(next_spec.id)
                     .fetch_one(&mut *tx)
                     .await
@@ -878,19 +878,19 @@ impl JobStore for PostgresJobStore {
                 return Ok(None);
             }
 
-            let group: Db<BenchmarkGroup> = sqlx::query_as(
+            let submission: Db<TaskSubmission> = sqlx::query_as(
                 r#"
                 SELECT id, github_installation_id, github_repo_id, source, intent,
                        artifact_prefix, host_key, created_at, updated_at
-                  FROM benchmark_group
+                  FROM task_submission
                  WHERE id = $1
                 "#,
             )
-            .bind(prior.benchmark_group_id)
+            .bind(prior.task_submission_id)
             .fetch_one(&mut *tx)
             .await
             .core()?;
-            Self::insert_initial_run_for_spec_in_tx(&mut tx, &group, &next_spec, prior.id)
+            Self::insert_initial_run_for_spec_in_tx(&mut tx, &submission, &next_spec, prior.id)
                 .await
                 .core()?
         };
@@ -899,7 +899,7 @@ impl JobStore for PostgresJobStore {
         Ok(Some(job))
     }
 
-    async fn create_unlinked_benchmark_group(
+    async fn create_unlinked_benchmark_submission(
         &self,
         first_job_id: Uuid,
         specs: &[NewBenchmarkSpec],
@@ -911,7 +911,7 @@ impl JobStore for PostgresJobStore {
             .begin()
             .await
             .core()?;
-        let (group_id, spec_ids) = Self::create_group_specs(&mut tx, specs)
+        let (submission_id, spec_ids) = Self::create_submission_specs(&mut tx, specs)
             .await
             .core()?;
         let Some(first) = specs.first() else {
@@ -925,12 +925,12 @@ impl JobStore for PostgresJobStore {
         let job: Db<Job> = sqlx::query_as(
             r#"
             INSERT INTO job
-                (id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+                (id, task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target)
             VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
                       git_ref_display, git_commit_hash, git_committed_at, workload_key,
@@ -938,7 +938,7 @@ impl JobStore for PostgresJobStore {
             "#,
         )
         .bind(first_job_id)
-        .bind(group_id)
+        .bind(submission_id)
         .bind(first_spec_id)
         .bind(new_job.github_installation_id)
         .bind(new_job.github_repo_id)
@@ -1015,46 +1015,46 @@ impl JobStore for PostgresJobStore {
         let rows = sqlx::query_as::<_, Db<PendingBenchmarkRun>>(
             r#"
             WITH latest AS (
-                SELECT DISTINCT ON (j.benchmark_group_id)
+                SELECT DISTINCT ON (j.task_submission_id)
                        j.id,
-                       j.benchmark_group_id,
-                       j.benchmark_spec_id,
-                       j.benchmark_run_index,
+                       j.task_submission_id,
+                       j.task_spec_id,
+                       j.task_run_index,
                        j.status,
                        s.spec_index,
                        s.requested_run_count,
                        s.task_kind
                   FROM job j
-                  JOIN benchmark_spec s ON s.id = j.benchmark_spec_id
-              ORDER BY j.benchmark_group_id, s.spec_index DESC, j.benchmark_run_index DESC
+                  JOIN task_spec s ON s.id = j.task_spec_id
+              ORDER BY j.task_submission_id, s.spec_index DESC, j.task_run_index DESC
             )
             SELECT latest.id AS completed_job_id,
-                   latest.benchmark_group_id,
-                   latest.benchmark_spec_id,
-                   latest.benchmark_run_index,
+                   latest.task_submission_id,
+                   latest.task_spec_id,
+                   latest.task_run_index,
                    latest.requested_run_count,
                    g.artifact_prefix
               FROM latest
-              JOIN benchmark_group g ON g.id = latest.benchmark_group_id
+              JOIN task_submission g ON g.id = latest.task_submission_id
              WHERE latest.status = 'completed'
                AND latest.task_kind <> 'build_only'
                AND NOT EXISTS (
                     SELECT 1
                       FROM job active
-                     WHERE active.benchmark_group_id = latest.benchmark_group_id
+                     WHERE active.task_submission_id = latest.task_submission_id
                        AND active.status IN ('queued', 'claimed', 'running')
                )
                AND (
-                    latest.benchmark_run_index + 1 < latest.requested_run_count
+                    latest.task_run_index + 1 < latest.requested_run_count
                     OR EXISTS (
                         SELECT 1
-                          FROM benchmark_spec next_spec
-                         WHERE next_spec.benchmark_group_id = latest.benchmark_group_id
+                          FROM task_spec next_spec
+                         WHERE next_spec.task_submission_id = latest.task_submission_id
                            AND next_spec.spec_index > latest.spec_index
                            AND NOT EXISTS (
                                 SELECT 1
                                   FROM job next_job
-                                 WHERE next_job.benchmark_spec_id = next_spec.id
+                                 WHERE next_job.task_spec_id = next_spec.id
                            )
                     )
                )
@@ -1067,13 +1067,10 @@ impl JobStore for PostgresJobStore {
         Ok(rows.into_domain())
     }
 
-    async fn benchmark_run_metrics(
-        &self,
-        benchmark_spec_id: Uuid,
-    ) -> Result<Vec<BenchmarkRunMetric>> {
+    async fn benchmark_run_metrics(&self, task_spec_id: Uuid) -> Result<Vec<BenchmarkRunMetric>> {
         let rows = sqlx::query_as::<_, BenchmarkRunMetricRow>(
             r#"
-            SELECT j.benchmark_run_index,
+            SELECT j.task_run_index,
                    m.job_id, m.envelope_duration_us, m.replay_duration_us,
                    m.total_duration_us, m.setup_duration_us, m.execution_duration_us,
                    m.commit_duration_us, m.clarity_runtime, m.transactions,
@@ -1081,11 +1078,11 @@ impl JobStore for PostgresJobStore {
                    m.warmup_blocks, m.created_at
               FROM job j
               JOIN job_metric m ON m.job_id = j.id
-             WHERE j.benchmark_spec_id = $1
-          ORDER BY j.benchmark_run_index ASC
+             WHERE j.task_spec_id = $1
+          ORDER BY j.task_run_index ASC
             "#,
         )
-        .bind(benchmark_spec_id)
+        .bind(task_spec_id)
         .fetch_all(&self.pool)
         .await
         .core()?;
@@ -1098,7 +1095,7 @@ impl JobStore for PostgresJobStore {
     async fn lookup_job(&self, job_id: Uuid) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, Db<Job>>(
             r#"
-            SELECT id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            SELECT id, task_submission_id, task_spec_id, task_run_index,
                    github_installation_id, github_repo_id, status,
                    source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
                    git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
@@ -1114,31 +1111,31 @@ impl JobStore for PostgresJobStore {
         Ok(row.into_domain())
     }
 
-    async fn lookup_benchmark_group(&self, group_id: Uuid) -> Result<Option<BenchmarkGroup>> {
-        let row = sqlx::query_as::<_, Db<BenchmarkGroup>>(
+    async fn lookup_task_submission(&self, submission_id: Uuid) -> Result<Option<TaskSubmission>> {
+        let row = sqlx::query_as::<_, Db<TaskSubmission>>(
             r#"
             SELECT id, github_installation_id, github_repo_id, source, intent,
                    artifact_prefix, host_key, created_at, updated_at
-              FROM benchmark_group
+              FROM task_submission
              WHERE id = $1
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .fetch_optional(&self.pool)
         .await
         .core()?;
         Ok(row.into_domain())
     }
 
-    async fn lookup_benchmark_spec(&self, spec_id: Uuid) -> Result<Option<BenchmarkSpec>> {
-        let row = sqlx::query_as::<_, Db<BenchmarkSpec>>(
+    async fn lookup_submission_spec(&self, spec_id: Uuid) -> Result<Option<SubmissionSpec>> {
+        let row = sqlx::query_as::<_, Db<SubmissionSpec>>(
             r#"
-            SELECT id, benchmark_group_id, spec_index, requested_run_count,
+            SELECT id, task_submission_id, spec_index, requested_run_count,
                    baseline_calibration_id,
                    github_repo_id, task_kind, build_target, git_ref_kind,
                    git_ref_display, git_commit_hash, git_committed_at,
                    workload_key, created_at, updated_at
-              FROM benchmark_spec
+              FROM task_spec
              WHERE id = $1
             "#,
         )
@@ -1149,20 +1146,20 @@ impl JobStore for PostgresJobStore {
         Ok(row.into_domain())
     }
 
-    async fn lookup_benchmark_specs(&self, group_id: Uuid) -> Result<Vec<BenchmarkSpec>> {
-        let rows = sqlx::query_as::<_, Db<BenchmarkSpec>>(
+    async fn lookup_submission_specs(&self, submission_id: Uuid) -> Result<Vec<SubmissionSpec>> {
+        let rows = sqlx::query_as::<_, Db<SubmissionSpec>>(
             r#"
-            SELECT id, benchmark_group_id, spec_index, requested_run_count,
+            SELECT id, task_submission_id, spec_index, requested_run_count,
                    baseline_calibration_id,
                    github_repo_id, task_kind, build_target, git_ref_kind,
                    git_ref_display, git_commit_hash, git_committed_at,
                    workload_key, created_at, updated_at
-              FROM benchmark_spec
-             WHERE benchmark_group_id = $1
+              FROM task_spec
+             WHERE task_submission_id = $1
           ORDER BY spec_index ASC
             "#,
         )
-        .bind(group_id)
+        .bind(submission_id)
         .fetch_all(&self.pool)
         .await
         .core()?;
@@ -1207,7 +1204,7 @@ impl JobStore for PostgresJobStore {
                   FOR UPDATE SKIP LOCKED
                   LIMIT 1
              )
-         RETURNING id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+         RETURNING id, task_submission_id, task_spec_id, task_run_index,
                    github_installation_id, github_repo_id, status,
                    source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
                    git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,
@@ -1385,11 +1382,11 @@ impl JobStore for PostgresJobStore {
         if let Some(calibration_id) = completion.baseline_calibration_id {
             sqlx::query(
                 r#"
-                UPDATE benchmark_spec spec
+                UPDATE task_spec spec
                    SET baseline_calibration_id = $2,
                        updated_at = NOW()
                   FROM job j
-                 WHERE spec.id = j.benchmark_spec_id
+                 WHERE spec.id = j.task_spec_id
                    AND j.id = $1
                 "#,
             )
@@ -1602,11 +1599,11 @@ impl JobStore for PostgresJobStore {
         let exact: Option<BaselineRow> = sqlx::query_as(
             r#"
             WITH subject AS (
-                SELECT bg.measurement_profile
+                SELECT submission.measurement_profile
                   FROM job subject_job
-                  JOIN benchmark_group bg ON bg.id = subject_job.benchmark_group_id
+                  JOIN task_submission submission ON submission.id = subject_job.task_submission_id
                  WHERE subject_job.id = $1
-                   AND bg.measurement_profile IS NOT NULL
+                   AND submission.measurement_profile IS NOT NULL
             )
             SELECT j.github_repo_id,
                    j.git_commit_hash AS commit,
@@ -1618,8 +1615,8 @@ impl JobStore for PostgresJobStore {
                    m.read_length, m.write_length, m.measured_blocks,
                    m.warmup_blocks, m.created_at
               FROM job j
-              JOIN benchmark_group bg ON bg.id = j.benchmark_group_id
-              JOIN subject ON subject.measurement_profile = bg.measurement_profile
+              JOIN task_submission submission ON submission.id = j.task_submission_id
+              JOIN subject ON subject.measurement_profile = submission.measurement_profile
               JOIN job_metric m ON m.job_id = j.id
              WHERE j.git_commit_hash = $2
                AND j.workload_key = $3
@@ -1649,11 +1646,11 @@ impl JobStore for PostgresJobStore {
         let nearest: Option<BaselineRow> = sqlx::query_as(
             r#"
             WITH subject AS (
-                SELECT bg.measurement_profile
+                SELECT submission.measurement_profile
                   FROM job subject_job
-                  JOIN benchmark_group bg ON bg.id = subject_job.benchmark_group_id
+                  JOIN task_submission submission ON submission.id = subject_job.task_submission_id
                  WHERE subject_job.id = $1
-                   AND bg.measurement_profile IS NOT NULL
+                   AND submission.measurement_profile IS NOT NULL
             )
             SELECT j.github_repo_id,
                    j.git_commit_hash AS commit,
@@ -1665,8 +1662,8 @@ impl JobStore for PostgresJobStore {
                    m.read_length, m.write_length, m.measured_blocks,
                    m.warmup_blocks, m.created_at
               FROM job j
-              JOIN benchmark_group bg ON bg.id = j.benchmark_group_id
-              JOIN subject ON subject.measurement_profile = bg.measurement_profile
+              JOIN task_submission submission ON submission.id = j.task_submission_id
+              JOIN subject ON subject.measurement_profile = submission.measurement_profile
               JOIN job_metric m ON m.job_id = j.id
              WHERE j.git_ref_display = $2
                AND j.workload_key = $3
@@ -1694,7 +1691,7 @@ impl JobStore for PostgresJobStore {
         // the order jobs are actually claimed.
         let rows = sqlx::query_as::<_, Db<Job>>(
             r#"
-            SELECT id, benchmark_group_id, benchmark_spec_id, benchmark_run_index,
+            SELECT id, task_submission_id, task_spec_id, task_run_index,
                    github_installation_id, github_repo_id, status,
                    source, intent, task_kind, build_target, git_ref_kind, git_ref_display,
                    git_commit_hash, git_committed_at, workload_key, claim_token, claimed_at,

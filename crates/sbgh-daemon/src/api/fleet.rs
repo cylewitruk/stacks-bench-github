@@ -293,9 +293,9 @@ pub async fn set_drain(
     Ok(Json(worker))
 }
 
-pub async fn recover_group(
+pub async fn recover_submission(
     State(state): State<ApiState>,
-    Path(group_id): Path<Uuid>,
+    Path(submission_id): Path<Uuid>,
     Json(request): Json<FleetRecoveryRequest>,
 ) -> Result<Json<FleetRecoveryResponse>, ApiErr> {
     let target_worker_id = request
@@ -306,14 +306,14 @@ pub async fn recover_group(
         .map_err(|_| ApiErr::bad_request("worker_id must be a UUID"))?;
     let store = sbgh_postgres::PostgresFleetStore::new(state.pool);
     let recovery = store
-        .recover_group(group_id, target_worker_id, request.reason.trim())
+        .recover_submission(submission_id, target_worker_id, request.reason.trim())
         .await?;
     Ok(Json(FleetRecoveryResponse {
-        prior_group_id: recovery
-            .prior_group_id
+        prior_submission_id: recovery
+            .prior_submission_id
             .to_string(),
-        new_group_id: recovery
-            .new_group_id
+        new_submission_id: recovery
+            .new_submission_id
             .to_string(),
         first_job_id: recovery
             .first_job_id

@@ -109,7 +109,7 @@ pub struct SlackConnector {
 /// store.
 #[async_trait]
 pub trait BenchmarkQueue: Send + Sync + 'static {
-    async fn create_unlinked_benchmark_group(
+    async fn create_unlinked_benchmark_submission(
         &self,
         first_job_id: Uuid,
         specs: &[NewBenchmarkSpec],
@@ -233,7 +233,7 @@ impl SlackConnector {
             .await;
             return;
         }
-        // 3. Enqueue an ad-hoc benchmark group. A singleton request creates one spec; a
+        // 3. Enqueue an ad-hoc benchmark submission. A singleton request creates one spec; a
         //    comparison request creates one ordered spec per variant and queues only
         //    spec 0/run 0. Later specs are materialized by the DB-backed lazy chain.
         let (rev_label, bench_args, clean_repetitions, specs) = match request {
@@ -324,7 +324,7 @@ impl SlackConnector {
         //     claimable without its plan `ts`.
         if let Err(e) = self
             .jobs
-            .create_unlinked_benchmark_group(job_id, &specs, &detail, posted.as_deref())
+            .create_unlinked_benchmark_submission(job_id, &specs, &detail, posted.as_deref())
             .await
         {
             tracing::error!(error = %e, "slack: enqueue failed");

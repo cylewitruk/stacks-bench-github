@@ -29,8 +29,8 @@ use sbgh_core::db::{
     RepoStore,
 };
 use sbgh_core::models::{
-    BenchmarkSpec, GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult,
-    NewJobEvent, QueuedEventDetail, ResolvedCommit,
+    GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent,
+    QueuedEventDetail, ResolvedCommit, SubmissionSpec,
 };
 use uuid::Uuid;
 
@@ -86,26 +86,26 @@ pub enum ProgressTarget {
 pub struct RunnableJob {
     pub id: Uuid,
     /// 0037: user-facing benchmark request this run belongs to.
-    pub benchmark_group_id: Uuid,
-    /// 0037: concrete workload/rev variant within the group.
-    pub benchmark_spec_id: Uuid,
+    pub task_submission_id: Uuid,
+    /// 0037: concrete workload/rev variant within the submission.
+    pub task_spec_id: Uuid,
     /// 0037/0038: isolated execution number for this spec. Singleton jobs are
     /// 0.
-    pub benchmark_run_index: i32,
+    pub task_run_index: i32,
     /// Requested isolated run count for this spec. Singleton jobs store 1.
     pub requested_run_count: i32,
-    /// Total measured executions in this benchmark group across all specs.
-    /// Build-only groups store 0.
-    pub group_requested_run_count: i32,
-    /// Zero-based measured-execution index across the whole group. For a
-    /// two-variant, one-repeat comparison, spec 1 run 0 is group run 1.
-    pub group_run_index: i32,
-    /// Shared stacks-bench baseline calibration id for repeat groups, once run
+    /// Total measured executions in this benchmark submission across all specs.
+    /// Build-only submissions store 0.
+    pub submission_requested_run_count: i32,
+    /// Zero-based measured-execution index across the whole submission. For a
+    /// two-variant, one-repeat comparison, spec 1 run 0 is submission run 1.
+    pub submission_run_index: i32,
+    /// Shared stacks-bench baseline calibration id for repeat submissions, once run
     /// 0 has produced it.
     pub baseline_calibration_id: Option<i64>,
-    /// Group-scoped artifact prefix. Repeat runs use it for the carried SQLite
+    /// Submission-scoped artifact prefix. Repeat runs use it for the carried SQLite
     /// DB.
-    pub group_artifact_prefix: String,
+    pub submission_artifact_prefix: String,
     /// `owner/name`. Drives the git clone URL.
     pub repository: String,
     /// Resolved commit/SHA to benchmark. Empty when unresolved at claim
@@ -215,21 +215,21 @@ pub trait RunnableJobStore: Send + Sync + 'static {
     ) -> anyhow::Result<Option<BaselineRef>>;
 
     /// v15 Phase 5: promoted metrics for all completed isolated runs in the
-    /// same benchmark spec. Used by group-level reporting to render aggregate
+    /// same submission spec. Used by submission-level reporting to render aggregate
     /// repeat statistics from durable `job_metric` rows.
     async fn benchmark_run_metrics(
         &self,
-        benchmark_spec_id: Uuid,
+        task_spec_id: Uuid,
     ) -> anyhow::Result<Vec<BenchmarkRunMetric>> {
-        let _ = benchmark_spec_id;
+        let _ = task_spec_id;
         Ok(Vec::new())
     }
 
-    async fn benchmark_group_specs(
+    async fn submission_specs(
         &self,
-        benchmark_group_id: Uuid,
-    ) -> anyhow::Result<Vec<BenchmarkSpec>> {
-        let _ = benchmark_group_id;
+        task_submission_id: Uuid,
+    ) -> anyhow::Result<Vec<SubmissionSpec>> {
+        let _ = task_submission_id;
         Ok(Vec::new())
     }
 
@@ -450,21 +450,21 @@ impl RunnableJobStore for JobSource {
 
     async fn benchmark_run_metrics(
         &self,
-        benchmark_spec_id: Uuid,
+        task_spec_id: Uuid,
     ) -> anyhow::Result<Vec<BenchmarkRunMetric>> {
         Ok(self
             .jobs
-            .benchmark_run_metrics(benchmark_spec_id)
+            .benchmark_run_metrics(task_spec_id)
             .await?)
     }
 
-    async fn benchmark_group_specs(
+    async fn submission_specs(
         &self,
-        benchmark_group_id: Uuid,
-    ) -> anyhow::Result<Vec<BenchmarkSpec>> {
+        task_submission_id: Uuid,
+    ) -> anyhow::Result<Vec<SubmissionSpec>> {
         Ok(self
             .jobs
-            .lookup_benchmark_specs(benchmark_group_id)
+            .lookup_submission_specs(task_submission_id)
             .await?)
     }
 
@@ -629,42 +629,38 @@ impl JobSource {
                     job.github_repo_id
                 )
             })?;
-        let group = self
+        let submission = self
             .jobs
-            .lookup_benchmark_group(job.benchmark_group_id)
+            .lookup_task_submission(job.task_submission_id)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "job {} references unknown benchmark_group {}",
+                    "job {} references unknown task_submission {}",
                     job.id,
-                    job.benchmark_group_id
+                    job.task_submission_id
                 )
             })?;
         let spec = self
             .jobs
-            .lookup_benchmark_spec(job.benchmark_spec_id)
+            .lookup_submission_spec(job.task_spec_id)
             .await?
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "job {} references unknown benchmark_spec {}",
-                    job.id,
-                    job.benchmark_spec_id
-                )
+                anyhow::anyhow!("job {} references unknown task_spec {}", job.id, job.task_spec_id)
             })?;
         let specs = self
             .jobs
-            .lookup_benchmark_specs(job.benchmark_group_id)
+            .lookup_submission_specs(job.task_submission_id)
             .await?;
-        let group_requested_run_count = specs
+        let submission_requested_run_count = specs
             .iter()
             .map(|spec| spec.measured_run_count())
             .sum::<i32>();
-        let prior_group_run_count = specs
+        let prior_submission_run_count = specs
             .iter()
             .filter(|candidate| candidate.spec_index < spec.spec_index)
             .map(|spec| spec.measured_run_count())
             .sum::<i32>();
-        let group_run_index = prior_group_run_count + job.benchmark_run_index;
+        let submission_run_index = prior_submission_run_count + job.task_run_index;
 
         // bench_args live in the queued event's provenance detail.
         let queued = self
@@ -773,14 +769,14 @@ impl JobSource {
 
         Ok(RunnableJob {
             id: job.id,
-            benchmark_group_id: job.benchmark_group_id,
-            benchmark_spec_id: job.benchmark_spec_id,
-            benchmark_run_index: job.benchmark_run_index,
+            task_submission_id: job.task_submission_id,
+            task_spec_id: job.task_spec_id,
+            task_run_index: job.task_run_index,
             requested_run_count: spec.requested_run_count,
-            group_requested_run_count,
-            group_run_index,
+            submission_requested_run_count,
+            submission_run_index,
             baseline_calibration_id: spec.baseline_calibration_id,
-            group_artifact_prefix: group.artifact_prefix,
+            submission_artifact_prefix: submission.artifact_prefix,
             repository: format!("{}/{}", repo.owner, repo.name),
             commit: job
                 .git_commit_hash

@@ -1,14 +1,19 @@
 # v26: Sandboxed Worker Execution and Block Validation
 
-Continuation of [v25](../archive/completed/0004-worker-fleet.md). Establish one
+Continuation of [v25](0004-worker-fleet.md). Establish one
 execution model for fleet jobs: trusted worker control-plane operations stay on
 the host, while every repository-built or otherwise untrusted job payload runs
 inside a disposable sandbox. Libvirt is the sole production sandbox backend in
 v26, and block validation moves from direct host processes into one
 resource-bounded VM per assignment.
 
-> **Status:** in_progress — implementation is complete and locally validated;
-> independent review and the dedicated-host Phase 3/6 canary validation remain.
+> **Status:** shipped — implementation, local validation, and independent review
+> completed on 2026-07-28. Continued in
+> [v27.1](0073-task-neutral-submission-model.md).
+>
+> The dedicated-host Phase 3/6 ceremonies remain mandatory deployment gates
+> before enabling block-validation capability on a production worker. They are
+> operational qualification of the shipped host integration, not v27 scope.
 >
 > v25 shipped the fleet, durable attempt lifecycle, and block validation as a
 > second task kind. It intentionally left block validation on a worker-local
@@ -22,8 +27,8 @@ resource-bounded VM per assignment.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0062-sandboxed-worker-execution` | primary: enforce the worker sandbox invariant | in progress |
-| `0063-libvirt-block-validation` | co-primary: run block validation in a resource-profiled VM | in progress |
+| `0062-sandboxed-worker-execution` | primary: enforce the worker sandbox invariant | shipped |
+| `0063-libvirt-block-validation` | co-primary: run block validation in a resource-profiled VM | shipped |
 
 ## Why
 
@@ -290,7 +295,7 @@ runs.
 
 - [x] Contract implementation
 - [x] Unit and composition tests
-- [ ] Reviewed
+- [x] Reviewed (Opus)
 - [x] Validated locally
 
 **Acceptance & Validation:**
@@ -332,7 +337,7 @@ changing existing benchmark behavior.
 
 - [x] Lifecycle refactor
 - [x] Existing behavior tests remain green
-- [ ] Reviewed
+- [x] Reviewed (Opus)
 - [x] Validated locally
 
 **Acceptance & Validation:**
@@ -359,7 +364,7 @@ shard its own writable snapshot of the newest local immutable origin.
   snapshot; block validation requests K.
 - Use the same latest-prefix resolver for benchmark and block validation.
   Require the selected origin LV to be read-only before allocating any
-  snapshot. [`0052`](../design/0052-managed-stacks-node-chainstate-producer.md)
+  snapshot. [`0052`](../../design/0052-managed-stacks-node-chainstate-producer.md)
   remains the natural future updater, but manifests and tags are optional
   provenance rather than runtime admission.
 - Provision all K thin snapshots before domain start, with names containing
@@ -388,8 +393,8 @@ shard its own writable snapshot of the newest local immutable origin.
 - [x] Multi-device domain/guest mounting
 - [ ] One-time real-host read-write/isolation smoke
 - [x] Failure and cleanup tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Reviewed (Opus)
+- [x] Validated locally; real-host checks remain below
 
 **Acceptance & Validation:**
 
@@ -429,8 +434,8 @@ VM.
 - Reuse the trusted source-disk preparation path; do not execute repository
   hooks, build scripts, or produced binaries on the host.
 - Reuse the shipped
-  [`0025`](../archive/completed/0025-baseline-binary-cache.md) /
-  [`0031`](../archive/completed/0031-reusable-build-jobs.md)
+  [`0025`](0025-baseline-binary-cache.md) /
+  [`0031`](0031-reusable-build-jobs.md)
   `BinaryCacheStore` and `BuildFingerprint` mechanism. Add an executable-kind
   and target discriminator so `stacks-inspect` cannot collide with
   `stacks-node`.
@@ -451,8 +456,8 @@ VM.
 - [x] Guest plan and runner
 - [x] Typed result/progress reader
 - [x] Parser/reducer regression coverage
-- [ ] Reviewed
-- [ ] Validated
+- [x] Reviewed (Opus)
+- [x] Validated locally; real-host checks remain in Phase 6
 
 **Acceptance & Validation:**
 
@@ -502,8 +507,8 @@ VM.
 - [x] Dead path removed
 - [x] Boundary ratchets
 - [x] Documentation
-- [ ] Reviewed
-- [ ] Validated
+- [x] Reviewed (Opus)
+- [x] Validated locally; real-host checks remain in Phase 6
 
 **Acceptance & Validation:**
 
@@ -555,7 +560,7 @@ VM.
 - [ ] Failure injection
 - [ ] Resource characterization
 - [ ] Canary and rollback rehearsal
-- [ ] Reviewed
+- [x] Reviewed (Opus)
 - [ ] Validated
 
 **Acceptance & Validation:**
@@ -654,9 +659,8 @@ VM.
 - Production `sbgh-worker` has no process-spawn implementation or Tokio
   `process` feature; all three shipped task kinds compose through `Driver`.
 - The dedicated-host libvirt/LVM isolation smoke, real `stacks-inspect`
-  parser-fixture, failure-injection, and canary checks remain
-  the explicit Phase 3/6 gate before this iteration can be reviewed, validated,
-  archived, and marked shipped.
+  parser-fixture, failure-injection, and canary checks remain the explicit
+  Phase 3/6 deployment gate before enabling the capability in production.
 - `sbgh-worker --preflight-only` and
   `scripts/qualify-block-validation-lvm.sh` provide the executable host-side
   preflight and two-snapshot isolation smoke; neither was executed

@@ -209,7 +209,7 @@ churn.
 - For Slack, project compact bounded progress into the canonical
   `SlackProgressView`; the full snapshot renderer owns the update.
 - For GitHub/checks, update a throttled latest-progress summary.
-- Keep Slack projection order group-scoped and reset run-local progress when
+- Keep Slack projection order submission-scoped and reset run-local progress when
   run *K+1* begins.
 
 **Status:**
@@ -237,8 +237,8 @@ churn.
 **Scope:**
 
 - Confirm calibration progress appears under the calibration workflow step.
-- Confirm repeat groups show progress for the active repeat only, on the single
-  group surface.
+- Confirm repeat submissions show progress for the active repeat only, on the single
+  submission surface.
 - Confirm progress tailing stops at terminal and archived JSONL is retained.
 - Confirm the v19 calibration command and the measured `bench run` command write
   distinct progress files when both execute in run 0's libvirt lifecycle.
@@ -252,7 +252,7 @@ churn.
 
 **Acceptance & Validation:**
 
-- [ ] Host smoke: a calibrated two-repeat group displays calibration progress, then
+- [ ] Host smoke: a calibrated two-repeat submission displays calibration progress, then
   measured-run progress, without duplicate cards or per-repeat fan-out.
 - [ ] Host smoke confirms total-less progress phases are low-volume enough for
   the fixed raw-count bucket, or records a follow-up to scale that path.

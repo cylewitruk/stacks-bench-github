@@ -205,7 +205,7 @@ sbgh-cli fleet status
 sbgh-cli fleet drain --worker-id <worker-uuid>
 sbgh-cli fleet undrain --worker-id <worker-uuid>
 sbgh-cli fleet cancel --job-id <job-uuid>
-sbgh-cli fleet recover-group --group-id <group-uuid> \
+sbgh-cli fleet recover-submission --submission-id <submission-uuid> \
   --worker-id <replacement-worker-uuid> \
   --reason "operator-approved recovery"
 ```
@@ -214,8 +214,8 @@ Cancellation is durable: the active attempt sees it on heartbeat, stops the
 VM through the common teardown lifecycle, and may submit only a cancelled
 terminal. A completed terminal that won the database race remains immutable.
 
-Cross-worker movement of a partial benchmark group is never automatic.
-`recover-group` creates a new execution generation and reruns from the first
+Cross-worker movement of a partial benchmark submission is never automatic.
+`recover-submission` creates a new execution generation and reruns from the first
 spec/run; older results remain auditable and are excluded from the new
 comparison. `--worker-id` optionally pins the new generation to an enabled,
 non-draining worker authorized for benchmark work; omit it to let normal

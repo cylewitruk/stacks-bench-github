@@ -315,14 +315,14 @@ impl Client {
         .await
     }
 
-    pub async fn recover_fleet_group(
+    pub async fn recover_fleet_submission(
         &self,
-        group_id: &str,
+        submission_id: &str,
         worker_id: Option<String>,
         reason: String,
     ) -> Result<FleetRecoveryResponse, ClientError> {
         self.post_json(
-            &format!("/api/fleet/groups/{group_id}/recover"),
+            &format!("/api/fleet/submissions/{submission_id}/recover"),
             &FleetRecoveryRequest { reason, worker_id },
         )
         .await

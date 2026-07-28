@@ -14,7 +14,7 @@ use sbgh_slack::SlackClient;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
-use crate::artifact_store::{ArtifactStore, GROUP_SQLITE_RELATIVE, group_artifact_key};
+use crate::artifact_store::{ArtifactStore, SUBMISSION_SQLITE_RELATIVE, submission_artifact_key};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::{ReportSurface, build_report_surface};
 use crate::report_event::PhaseLabel;
@@ -137,7 +137,7 @@ impl FleetCoordinator {
 
     async fn prepare_job(&self, mut job: RunnableJob) -> anyhow::Result<()> {
         let commit = self
-            .freeze_group_sources(&job)
+            .freeze_submission_sources(&job)
             .await?;
         job.commit.clone_from(&commit);
         let reporter = Reporter::new_with_dependencies(
@@ -193,7 +193,7 @@ impl FleetCoordinator {
             let ProgressTarget::Slack { plan_message_ts: Some(_), .. } = &job.progress else {
                 continue;
             };
-            if job.benchmark_run_index != 0 {
+            if job.task_run_index != 0 {
                 continue;
             }
             let ahead = in_flight + index;
@@ -231,9 +231,9 @@ impl FleetCoordinator {
             .await
             .retain(|job_id, _| seen.contains(job_id));
 
-        let mut active_groups = queued
+        let mut active_submissions = queued
             .iter()
-            .map(|job| job.benchmark_group_id)
+            .map(|job| job.task_submission_id)
             .collect::<HashSet<_>>();
         match self
             .jobs
@@ -248,7 +248,7 @@ impl FleetCoordinator {
                         .await
                     {
                         Ok(Some(job)) => {
-                            active_groups.insert(job.benchmark_group_id);
+                            active_submissions.insert(job.task_submission_id);
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -264,20 +264,20 @@ impl FleetCoordinator {
             }
         }
         self.slack_sessions
-            .sweep_abandoned(Duration::from_secs(300), &active_groups);
+            .sweep_abandoned(Duration::from_secs(300), &active_submissions);
     }
 
-    async fn freeze_group_sources(&self, job: &RunnableJob) -> anyhow::Result<String> {
+    async fn freeze_submission_sources(&self, job: &RunnableJob) -> anyhow::Result<String> {
         let specs = self
             .jobs
-            .benchmark_group_specs(job.benchmark_group_id)
+            .submission_specs(job.task_submission_id)
             .await?;
         anyhow::ensure!(!specs.is_empty(), "job {} has no benchmark specs", job.id);
         let mut sources = Vec::with_capacity(specs.len());
         for spec in specs {
             let commit = if let Some(commit) = spec.git_commit_hash {
                 commit
-            } else if spec.id == job.benchmark_spec_id
+            } else if spec.id == job.task_spec_id
                 && let ProgressTarget::PullRequest { pr_number, .. } = &job.progress
             {
                 self.gh
@@ -305,14 +305,14 @@ impl FleetCoordinator {
         }
         anyhow::ensure!(
             self.fleet
-                .freeze_group_sources(job.benchmark_group_id, &sources)
+                .freeze_submission_sources(job.task_submission_id, &sources)
                 .await?,
             "benchmark group {} changed while source refs were being frozen",
-            job.benchmark_group_id
+            job.task_submission_id
         );
         sources
             .into_iter()
-            .find(|source| source.spec_id == job.benchmark_spec_id)
+            .find(|source| source.spec_id == job.task_spec_id)
             .map(|source| source.commit)
             .context("current job's benchmark spec was not frozen")
     }
@@ -491,8 +491,11 @@ impl FleetCoordinator {
         job: &RunnableJob,
         outcome: &sbgh_proto::TerminalOutcome,
     ) -> anyhow::Result<()> {
-        if !uses_shared_calibration(job.task_kind, job.build_target, job.group_requested_run_count)
-        {
+        if !uses_shared_calibration(
+            job.task_kind,
+            job.build_target,
+            job.submission_requested_run_count,
+        ) {
             return Ok(());
         }
         let sbgh_proto::TerminalOutcome::Completed { summary, .. } = outcome else {
@@ -511,9 +514,10 @@ impl FleetCoordinator {
             .await?
             .len();
         anyhow::ensure!(size > 0, "completed repeat SQLite artifact is empty");
-        let group_key = group_artifact_key(&job.group_artifact_prefix, GROUP_SQLITE_RELATIVE);
+        let submission_key =
+            submission_artifact_key(&job.submission_artifact_prefix, SUBMISSION_SQLITE_RELATIVE);
         self.artifacts
-            .put(&group_key, &source)
+            .put(&submission_key, &source)
             .await
             .context("promoting carried repeat SQLite")?;
         self.repeat_jobs
@@ -580,10 +584,10 @@ fn payload_for(job: &RunnableJob, default_args: &str) -> anyhow::Result<TaskPayl
                 shared_baseline_calibration: uses_shared_calibration(
                     job.task_kind,
                     job.build_target,
-                    job.group_requested_run_count,
+                    job.submission_requested_run_count,
                 ),
                 baseline_calibration_id: job.baseline_calibration_id,
-                run_index: job.benchmark_run_index,
+                run_index: job.task_run_index,
                 requested_run_count: job.requested_run_count,
             }))
         }
@@ -595,10 +599,10 @@ fn payload_for(job: &RunnableJob, default_args: &str) -> anyhow::Result<TaskPayl
 }
 
 fn sqlite_seed_key(job: &RunnableJob) -> Option<String> {
-    if uses_shared_calibration(job.task_kind, job.build_target, job.group_requested_run_count)
-        && job.group_run_index > 0
+    if uses_shared_calibration(job.task_kind, job.build_target, job.submission_requested_run_count)
+        && job.submission_run_index > 0
     {
-        Some(group_artifact_key(&job.group_artifact_prefix, GROUP_SQLITE_RELATIVE))
+        Some(submission_artifact_key(&job.submission_artifact_prefix, SUBMISSION_SQLITE_RELATIVE))
     } else {
         None
     }

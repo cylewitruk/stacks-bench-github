@@ -435,10 +435,10 @@ enum FleetAction {
         #[arg(long)]
         job_id: String,
     },
-    /// Create a fresh comparison generation from a group's first spec/run.
-    RecoverGroup {
+    /// Create a fresh comparison generation from a submission's first spec/run.
+    RecoverSubmission {
         #[arg(long)]
-        group_id: String,
+        submission_id: String,
         /// Place the fresh generation on this compatible worker.
         #[arg(long)]
         worker_id: Option<String>,
@@ -1192,15 +1192,19 @@ async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
                 .with_context(|| format!("cancel fleet job {job_id}"))?;
             println!("{} cancel_requested={}", response.job_id, response.cancel_requested);
         }
-        FleetAction::RecoverGroup { group_id, worker_id, reason } => {
+        FleetAction::RecoverSubmission {
+            submission_id,
+            worker_id,
+            reason,
+        } => {
             let recovery = client
-                .recover_fleet_group(&group_id, worker_id, reason)
+                .recover_fleet_submission(&submission_id, worker_id, reason)
                 .await
-                .with_context(|| format!("recover group {group_id}"))?;
+                .with_context(|| format!("recover submission {submission_id}"))?;
             println!(
-                "prior_group={} new_group={} first_job={} generation={}",
-                recovery.prior_group_id,
-                recovery.new_group_id,
+                "prior_submission={} new_submission={} first_job={} generation={}",
+                recovery.prior_submission_id,
+                recovery.new_submission_id,
                 recovery.first_job_id,
                 recovery.execution_generation,
             );
@@ -1241,6 +1245,47 @@ mod tests {
         // commands), and would panic on a typo'd id.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn fleet_recovery_uses_submission_vocabulary_without_group_alias() {
+        let parsed = Cli::try_parse_from([
+            "sbgh-cli",
+            "fleet",
+            "recover-submission",
+            "--submission-id",
+            "018f7f24-2c9d-7e31-8f9c-5d8f39b7ad11",
+            "--reason",
+            "operator recovery",
+        ])
+        .unwrap();
+        let Command::Fleet {
+            action:
+                FleetAction::RecoverSubmission {
+                    submission_id,
+                    worker_id,
+                    reason,
+                },
+        } = parsed.command
+        else {
+            panic!("expected recover-submission command");
+        };
+        assert_eq!(submission_id, "018f7f24-2c9d-7e31-8f9c-5d8f39b7ad11");
+        assert_eq!(worker_id, None);
+        assert_eq!(reason, "operator recovery");
+
+        assert!(
+            Cli::try_parse_from([
+                "sbgh-cli",
+                "fleet",
+                "recover-group",
+                "--group-id",
+                "018f7f24-2c9d-7e31-8f9c-5d8f39b7ad11",
+                "--reason",
+                "operator recovery",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

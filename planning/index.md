@@ -31,7 +31,7 @@ need editing when an item's status or location changes.
 | `0011-job-pipeline-cutover` | Job pipeline + v2 cutover | `shipped` | [archive/completed/0011-job-pipeline-cutover.md](archive/completed/0011-job-pipeline-cutover.md) |
 | `0012-api-fronted-daemon` | API-fronted daemon | `shipped` | [archive/completed/0012-api-fronted-daemon.md](archive/completed/0012-api-fronted-daemon.md) |
 | `0013-drop-legacy-jobs-table` | Drop legacy `jobs` table | `backlog` | [backlog.md](backlog.md) |
-| `0014-preclaim-placeholder-checks` | Pre-claim placeholder checks | `backlog` | [backlog.md](backlog.md) |
+| `0014-preclaim-placeholder-checks` | PR placeholder and skipped checks | `backlog` | [backlog.md](backlog.md) |
 | `0015-resource-aware-admission` | Resource-aware admission | `backlog` | [backlog.md](backlog.md) |
 | `0016-db-enforced-same-sha-dedup` | DB-enforced same-SHA dedup | `parked` | [backlog.md](backlog.md) |
 | `0017-generic-phase-events` | Task-neutral durable worker events | `shipped` | [archive/completed/0017-generic-phase-events.md](archive/completed/0017-generic-phase-events.md) |
@@ -49,11 +49,11 @@ need editing when an item's status or location changes.
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
 | `0031-reusable-build-jobs` | Reusable build jobs (artifact + target axis) | `shipped` | [archive/completed/0031-reusable-build-jobs.md](archive/completed/0031-reusable-build-jobs.md) |
-| `0032-supersede-stale-pr-head-runs` | Supersede stale PR-head benchmarks | `backlog` | [backlog.md](backlog.md) |
+| `0032-supersede-stale-pr-head-runs` | Supersede stale PR-head runs | `backlog` | [backlog.md](backlog.md) |
 | `0033-slack-streamed-plan-updates` | Slack streamed plan updates | `shipped` | [archive/completed/0033-slack-streamed-plan-updates.md](archive/completed/0033-slack-streamed-plan-updates.md) |
 | `0034-historical-stable-toolchain` | Historical stable toolchain resolution | `backlog` | [backlog.md](backlog.md) |
 | `0035-slack-app-home-status` | Slack App Home status dashboard | `backlog` | [backlog.md](backlog.md) |
-| `0036-pr-comment-llm-intent` | PR-comment LLM intent resolution | `backlog` | [backlog.md](backlog.md) |
+| `0036-pr-comment-llm-intent` | PR-comment task-intent resolution | `backlog` | [backlog.md](backlog.md) |
 | `0037-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 | `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
 | `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `parked` | [iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md) |
@@ -79,8 +79,18 @@ need editing when an item's status or location changes.
 | `0059-intent-resolution-boundary` | Provider-backed request intent boundary | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
 | `0060-slack-snapshot-reporting` | Single-message Slack snapshot reporting | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
 | `0061-slack-integration-boundary` | Extracted Slack integration boundary | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
-| `0062-sandboxed-worker-execution` | Sandboxed worker execution invariant | `in_progress` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
-| `0063-libvirt-block-validation` | Libvirt-isolated block validation | `in_progress` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
+| `0062-sandboxed-worker-execution` | Sandboxed worker execution invariant | `shipped` | [archive/completed/0062-sandboxed-worker-execution.md](archive/completed/0062-sandboxed-worker-execution.md) |
+| `0063-libvirt-block-validation` | Libvirt-isolated block validation | `shipped` | [archive/completed/0062-sandboxed-worker-execution.md](archive/completed/0062-sandboxed-worker-execution.md) |
+| `0064-task-submission-kernel` | Task-submission kernel | `planned` | [iterations/v27.2-task-submission-kernel.md](iterations/v27.2-task-submission-kernel.md) |
+| `0065-job-lifecycle-controls` | Task-neutral job lifecycle controls | `candidate` | [backlog.md](backlog.md) |
+| `0066-task-aware-reporting` | Task-aware reporting and validation results | `candidate` | [backlog.md](backlog.md) |
+| `0067-github-block-validation-submission` | GitHub block-validation submission | `candidate` | [backlog.md](backlog.md) |
+| `0068-watched-ref-task-actions` | Watched-ref task actions and webhook fan-out | `candidate` | [backlog.md](backlog.md) |
+| `0069-task-aware-intent-resolution` | Task-aware intent resolution | `candidate` | [backlog.md](backlog.md) |
+| `0070-slack-block-validation-controls` | Slack block-validation and lifecycle controls | `candidate` | [backlog.md](backlog.md) |
+| `0071-github-job-lifecycle-controls` | GitHub job lifecycle controls | `candidate` | [backlog.md](backlog.md) |
+| `0072-pre-attempt-terminal-projection` | Pre-attempt terminal projection | `candidate` | [backlog.md](backlog.md) |
+| `0073-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
 
 ## Iterations
 
@@ -111,7 +121,9 @@ need editing when an item's status or location changes.
 | `v24.2-github-intent-boundaries` | GitHub and intent integration boundaries | `shipped` | [archive/completed/0058-github-intent-boundaries.md](archive/completed/0058-github-intent-boundaries.md) |
 | `v24.3-slack-snapshot-reporting` | Slack snapshot reporting and integration boundary | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
 | `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `shipped` | [archive/completed/0004-worker-fleet.md](archive/completed/0004-worker-fleet.md) |
-| `v26-sandboxed-worker-execution` | Sandboxed worker execution and block validation | `in_progress` | [iterations/v26-sandboxed-worker-execution.md](iterations/v26-sandboxed-worker-execution.md) |
+| `v26-sandboxed-worker-execution` | Sandboxed worker execution and block validation | `shipped` | [archive/completed/0062-sandboxed-worker-execution.md](archive/completed/0062-sandboxed-worker-execution.md) |
+| `v27.1-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
+| `v27.2-task-submission-kernel` | Task-submission kernel | `planned` | [iterations/v27.2-task-submission-kernel.md](iterations/v27.2-task-submission-kernel.md) |
 
 ## Decisions
 

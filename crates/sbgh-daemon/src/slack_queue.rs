@@ -23,7 +23,7 @@ impl SlackBenchmarkQueue {
 
 #[async_trait]
 impl BenchmarkQueue for SlackBenchmarkQueue {
-    async fn create_unlinked_benchmark_group(
+    async fn create_unlinked_benchmark_submission(
         &self,
         first_job_id: Uuid,
         specs: &[NewBenchmarkSpec],
@@ -31,7 +31,7 @@ impl BenchmarkQueue for SlackBenchmarkQueue {
         plan_message_ts: Option<&str>,
     ) -> sbgh_core::Result<Job> {
         self.jobs
-            .create_unlinked_benchmark_group(
+            .create_unlinked_benchmark_submission(
                 first_job_id,
                 specs,
                 queued_event_detail,

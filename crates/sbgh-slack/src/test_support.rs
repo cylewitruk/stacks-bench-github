@@ -272,12 +272,12 @@ impl RecordingBenchmarkQueue {
             .collect()
     }
 
-    pub fn requested_specs_for_group(&self, group_id: Uuid) -> Vec<NewBenchmarkSpec> {
+    pub fn requested_specs_for_submission(&self, submission_id: Uuid) -> Vec<NewBenchmarkSpec> {
         self.calls
             .lock()
             .unwrap()
             .iter()
-            .find(|call| call.job.benchmark_group_id == group_id)
+            .find(|call| call.job.task_submission_id == submission_id)
             .map(|call| call.specs.clone())
             .unwrap_or_default()
     }
@@ -306,7 +306,7 @@ impl RecordingBenchmarkQueue {
 
 #[async_trait]
 impl BenchmarkQueue for RecordingBenchmarkQueue {
-    async fn create_unlinked_benchmark_group(
+    async fn create_unlinked_benchmark_submission(
         &self,
         first_job_id: Uuid,
         requested_specs: &[NewBenchmarkSpec],
@@ -321,15 +321,15 @@ impl BenchmarkQueue for RecordingBenchmarkQueue {
         }
         let first = requested_specs
             .first()
-            .ok_or_else(|| std::io::Error::other("benchmark group needs at least one spec"))?;
+            .ok_or_else(|| std::io::Error::other("benchmark submission needs at least one spec"))?;
         let now = Utc::now();
-        let group_id = Uuid::new_v4();
+        let submission_id = Uuid::new_v4();
         let new = &first.new_job;
         let job = Job {
             id: first_job_id,
-            benchmark_group_id: group_id,
-            benchmark_spec_id: Uuid::new_v4(),
-            benchmark_run_index: 0,
+            task_submission_id: submission_id,
+            task_spec_id: Uuid::new_v4(),
+            task_run_index: 0,
             github_installation_id: new.github_installation_id,
             github_repo_id: new.github_repo_id,
             status: JobStatus::Queued,

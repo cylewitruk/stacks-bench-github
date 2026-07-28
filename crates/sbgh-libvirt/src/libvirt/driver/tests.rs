@@ -444,16 +444,16 @@ async fn enabled_cache_hit_uses_minimal_source_disk_and_skips_build_vm() {
 }
 
 #[tokio::test]
-async fn sqlite_seed_key_copies_group_db_into_results_tmpfs() {
+async fn sqlite_seed_key_copies_submission_db_into_results_tmpfs() {
     let tmp = TempDir::new().unwrap();
     let cfg = test_config(&tmp);
-    let seed_key = "group1/shared/stacks-bench.db".to_string();
+    let seed_key = "submission1/shared/stacks-bench.db".to_string();
     let seed_path = cfg
         .paths
         .results_archive_dir
         .join(&seed_key);
     std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
-    std::fs::write(&seed_path, b"group sqlite").unwrap();
+    std::fs::write(&seed_path, b"submission sqlite").unwrap();
 
     let tmpfs = ResultsTmpfs {
         mount_dir: tmp.path().join("results"),
@@ -471,7 +471,7 @@ async fn sqlite_seed_key_copies_group_db_into_results_tmpfs() {
         .await
         .unwrap();
 
-    assert_eq!(std::fs::read(tmpfs.sqlite_file()).unwrap(), b"group sqlite");
+    assert_eq!(std::fs::read(tmpfs.sqlite_file()).unwrap(), b"submission sqlite");
 }
 
 #[test]

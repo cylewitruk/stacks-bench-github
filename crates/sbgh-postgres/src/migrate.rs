@@ -15,3 +15,11 @@ pub async fn migrate(pool: &Pool) -> PersistenceResult<()> {
         .await
         .map_err(Into::into)
 }
+
+#[cfg(any(test, feature = "testing"))]
+pub(super) async fn migrate_to(pool: &Pool, target: i64) -> PersistenceResult<()> {
+    MIGRATOR
+        .run_to(target, pool)
+        .await
+        .map_err(Into::into)
+}

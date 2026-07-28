@@ -1010,8 +1010,8 @@ async fn complete_job_writes_status_result_metric_and_event_atomically() {
 
     let calibration_id: Option<i64> = sqlx::query_scalar(
         "SELECT s.baseline_calibration_id
-           FROM benchmark_spec s
-           JOIN job j ON j.benchmark_spec_id = s.id
+           FROM task_spec s
+           JOIN job j ON j.task_spec_id = s.id
           WHERE j.id = $1",
     )
     .bind(job_id)
@@ -1510,9 +1510,9 @@ async fn seed_completed_baseline(
         .await
         .unwrap();
     sqlx::query(
-        "UPDATE benchmark_group
+        "UPDATE task_submission
             SET measurement_profile = 'test-profile'
-          WHERE id = (SELECT benchmark_group_id FROM job WHERE id = $1)",
+          WHERE id = (SELECT task_submission_id FROM job WHERE id = $1)",
     )
     .bind(job.id)
     .execute(pool)
@@ -1598,9 +1598,9 @@ async fn find_baseline_for_requires_the_subject_measurement_profile() {
         seed_completed_baseline(&pool, 100, 10, "subject", "feature", ts(1_500), Some("wk1"), 222)
             .await;
     sqlx::query(
-        "UPDATE benchmark_group
+        "UPDATE task_submission
             SET measurement_profile = 'different-profile'
-          WHERE id = (SELECT benchmark_group_id FROM job WHERE id = $1)",
+          WHERE id = (SELECT task_submission_id FROM job WHERE id = $1)",
     )
     .bind(subject)
     .execute(&pool)
@@ -1617,9 +1617,9 @@ async fn find_baseline_for_requires_the_subject_measurement_profile() {
     );
 
     sqlx::query(
-        "UPDATE benchmark_group
+        "UPDATE task_submission
             SET measurement_profile = 'test-profile'
-          WHERE id = (SELECT benchmark_group_id FROM job WHERE id = $1)",
+          WHERE id = (SELECT task_submission_id FROM job WHERE id = $1)",
     )
     .bind(subject)
     .execute(&pool)
@@ -1637,9 +1637,9 @@ async fn find_baseline_for_requires_the_subject_measurement_profile() {
     );
 
     sqlx::query(
-        "UPDATE benchmark_group
+        "UPDATE task_submission
             SET measurement_profile = NULL
-          WHERE id = (SELECT benchmark_group_id FROM job WHERE id = $1)",
+          WHERE id = (SELECT task_submission_id FROM job WHERE id = $1)",
     )
     .bind(subject)
     .execute(&pool)

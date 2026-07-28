@@ -396,11 +396,11 @@ pub struct GithubPullRequest {
 pub struct Job {
     pub id: Uuid,
     /// 0037: user-facing benchmark request this claimable run belongs to.
-    pub benchmark_group_id: Uuid,
-    /// 0037: concrete workload/rev variant within the group.
-    pub benchmark_spec_id: Uuid,
+    pub task_submission_id: Uuid,
+    /// 0037: concrete workload/rev variant within the submission.
+    pub task_spec_id: Uuid,
     /// 0037: isolated execution number for this spec. Singleton jobs are `0`.
-    pub benchmark_run_index: i32,
+    pub task_run_index: i32,
     pub github_installation_id: i64,
     pub github_repo_id: i64,
     pub status: JobStatus,
@@ -450,17 +450,18 @@ pub struct NewJob {
     pub workload_key: Option<String>,
 }
 
-/// 0037: user-facing benchmark request boundary. A group owns reporting,
-/// shared artifact identity, and future multi-run/multi-variant summaries.
+/// 0037: user-facing task-request boundary. A submission owns reporting,
+/// shared artifact identity, and multi-run/multi-variant summaries where the
+/// task shape needs them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkGroup {
+pub struct TaskSubmission {
     pub id: Uuid,
     pub github_installation_id: i64,
     pub github_repo_id: i64,
     pub source: JobSource,
     pub intent: JobIntent,
-    /// Store-key prefix for group-scoped artifacts. Singleton runs keep using
-    /// `<job_id>/...`; later group-aware artifacts use `<artifact_prefix>/...`.
+    /// Store-key prefix for submission-scoped artifacts. Singleton runs keep using
+    /// `<job_id>/...`; later submission-aware artifacts use `<artifact_prefix>/...`.
     pub artifact_prefix: String,
     /// Future worker-fleet host pin. `None` on the current single-host daemon.
     pub host_key: Option<String>,
@@ -468,17 +469,17 @@ pub struct BenchmarkGroup {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 0037: one concrete variant in a benchmark group: workload + ref + target.
-/// Groups can model multiple specs now, while current creation paths cap at
+/// 0037: one concrete variant in a benchmark submission: workload + ref + target.
+/// Submissions can model multiple specs now, while current creation paths cap at
 /// one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkSpec {
+pub struct SubmissionSpec {
     pub id: Uuid,
-    pub benchmark_group_id: Uuid,
+    pub task_submission_id: Uuid,
     pub spec_index: i32,
     /// v15: requested daemon-level clean VM executions for this spec.
-    /// Singleton jobs store `1`; repeat groups store the requested count and
-    /// lazily enqueue run rows in `benchmark_run_index` order.
+    /// Singleton jobs store `1`; repeat submissions store the requested count and
+    /// lazily enqueue run rows in `task_run_index` order.
     pub requested_run_count: i32,
     /// v19: baseline calibration id produced by `stacks-bench bench baseline
     /// calibrate` and reused by all measured repeat runs in this spec.
@@ -495,9 +496,12 @@ pub struct BenchmarkSpec {
     pub updated_at: DateTime<Utc>,
 }
 
-impl BenchmarkSpec {
-    pub fn uses_shared_calibration_for_group(&self, group_measured_run_count: i32) -> bool {
-        uses_shared_calibration(self.task_kind, self.build_target, group_measured_run_count)
+impl SubmissionSpec {
+    pub fn uses_shared_calibration_for_submission(
+        &self,
+        submission_measured_run_count: i32,
+    ) -> bool {
+        uses_shared_calibration(self.task_kind, self.build_target, submission_measured_run_count)
     }
 
     pub fn measured_run_count(&self) -> i32 {
@@ -523,21 +527,21 @@ pub fn measured_run_count(task_kind: TaskKind, requested_run_count: i32) -> i32 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum BenchmarkStepKind {
+pub enum SubmissionStepKind {
     Build,
     Calibrate,
     Run,
 }
 
-/// 0037: inert ordered workflow model for a group. Runtime execution still
+/// 0037: inert ordered workflow model for a submission. Runtime execution still
 /// follows today's job path; later slices attach behavior to these steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkWorkflowStep {
+pub struct SubmissionStep {
     pub id: Uuid,
-    pub benchmark_group_id: Uuid,
+    pub task_submission_id: Uuid,
     pub step_index: i32,
-    pub step_kind: BenchmarkStepKind,
-    pub benchmark_spec_id: Option<Uuid>,
+    pub step_kind: SubmissionStepKind,
+    pub task_spec_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 

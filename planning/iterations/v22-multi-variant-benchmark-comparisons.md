@@ -7,7 +7,7 @@ one workload against two refs and report one noise-aware delta summary (`0039`).
 > review. Validation and any reporting refactor will resume after v24.
 >
 > v21 remains parked. Comparison benchmarks are the next
-> operational need, and they can build on the already-shipped group/run,
+> operational need, and they can build on the already-shipped submission/run,
 > repetition, calibration, and Slack-session work without waiting for the native
 > schema-v1 parser cleanup.
 
@@ -29,10 +29,10 @@ Today the daemon can compare PR runs against a configured baseline, but it does
 not have a first-class ad-hoc shape for "same workload, two explicit refs, one
 summary." The v14/v15/v19 model now gives us the right foundation:
 
-- a benchmark group owns the user-facing surface and artifact prefix;
-- each `BenchmarkSpec` represents one concrete workload/ref variant;
-- runs remain isolated VMs and are ordered by the group runner;
-- the carried group DB and per-variant calibration can cover multiple measured
+- a benchmark submission owns the user-facing surface and artifact prefix;
+- each `SubmissionSpec` represents one concrete workload/ref variant;
+- runs remain isolated VMs and are ordered by the submission runner;
+- the carried submission DB and per-variant calibration can cover multiple measured
   executions on the same host.
 
 This iteration turns that foundation into a narrow, useful comparison feature
@@ -47,15 +47,15 @@ deterministic parser.
 - Support natural-language Slack comparison requests through the LLM intent
   resolver, mapped into the same daemon-owned request model as the deterministic
   syntax.
-- Create one `BenchmarkGroup` with multiple `BenchmarkSpec` variants.
+- Create one `TaskSubmission` with multiple `SubmissionSpec` variants.
 - Execute variants serially on the same host, with at most one run in flight for
-  the group.
-- Reuse the same group `stacks-bench.db` carry-forward path across variants.
+  the submission.
+- Reuse the same submission `stacks-bench.db` carry-forward path across variants.
 - Calibrate once per variant by default, then reuse that variant's calibration
   across its clean repeats.
 - Build/resolve each variant independently through the existing build cache and
   commit-resolution path.
-- Render one comparison summary on the group reporting surface.
+- Render one comparison summary on the submission reporting surface.
 
 **Non-goals:** no variant matrix, no automatic baseline selection, no parallel
 variant execution, no worker-fleet scheduling, no portal UI, and no dependency
@@ -86,9 +86,9 @@ on the v21 native schema-v1 cleanup.
   `max_variants = 2` at request validation for this iteration. That keeps future
   "compare many refs" work to cap/policy/reporting changes rather than a model
   retrofit.
-- **Variant identity lives in `BenchmarkSpec`.** The shared SQLite DB remains
+- **Variant identity lives in `SubmissionSpec`.** The shared SQLite DB remains
   the raw benchmark artifact; daemon rows map run metrics back to variant/ref.
-- **Serial group execution.** A comparison group is host-pinned and executes in a
+- **Serial submission execution.** A comparison submission is host-pinned and executes in a
   deterministic order: all runs for `spec_index = 0`, then all runs for
   `spec_index = 1`. That preserves the carried DB/calibration invariants and
   avoids concurrent SQLite writers.
@@ -98,14 +98,14 @@ on the v21 native schema-v1 cleanup.
   that variant's `baseline_calibration_id` across repeats of that same variant.
   Do not share one calibration across different refs unless a future explicit
   policy opts into that tradeoff.
-- **The group DB remains shared.** Per-variant calibration rows live in the same
-  carried group SQLite DB. Cross-spec carry-forward is still required so variant
+- **The submission DB remains shared.** Per-variant calibration rows live in the same
+  carried submission SQLite DB. Cross-spec carry-forward is still required so variant
   1 sees variant 0's indexed state and prior artifacts, but variant 1 should
   produce and use its own baseline row before measured runs.
 - **Calibration provenance is part of comparison provenance.** The final summary
   should record which calibration id each variant used. If baseline performance
   differs meaningfully between refs, that is signal worth preserving rather than
-  hiding behind a group-shared baseline.
+  hiding behind a submission-shared baseline.
 - **The primary variant is the comparison baseline.** Initial reporting compares
   variant 1 against variant 0. Labels should say "baseline" and "candidate" (or
   the explicit refs) rather than declaring a winner.
@@ -124,7 +124,7 @@ on the v21 native schema-v1 cleanup.
 - **Carry and calibration predicates are related but distinct.** Today
   `uses_shared_calibration` and `job_should_carry_sqlite` are effectively
   per-spec repeat predicates. v22 should generalize DB carry-forward to the
-  group sequence, while calibration remains per variant/spec. Update every Rust
+  submission sequence, while calibration remains per variant/spec. Update every Rust
   caller and the matching SQL/migration comments together so calibration steps,
   carried DB seeding, and workflow-step rows cannot diverge.
 
@@ -167,7 +167,7 @@ on the v21 native schema-v1 cleanup.
 - [x] Txid, block selector, and block-range comparison requests all flow through
   the same request model and validation path.
 - [x] Requests exceeding variant or total-lifecycle caps are rejected before any
-  job/group rows are created.
+  job/submission rows are created.
 
 **Tests:**
 
@@ -179,25 +179,25 @@ on the v21 native schema-v1 cleanup.
 - Connector rejection tests for over-cap, duplicate-ref, and ambiguous requests.
 - Config tests for the new caps and env overrides.
 
-### Phase 2: Multi-Spec Group Planning
+### Phase 2: Multi-Spec Submission Planning
 
-**Goal:** Create comparison groups atomically and make the run chain
+**Goal:** Create comparison submissions atomically and make the run chain
 DB-resumable across multiple specs.
 
 **Scope:**
 
-- Add store APIs to create one group from a `Vec` of spec requests and the first
+- Add store APIs to create one submission from a `Vec` of spec requests and the first
   queued run. Phase 1 caps the vec at two variants, but the store API should not
   be a two-tuple.
-- Keep `baseline_calibration_id` variant-scoped on `BenchmarkSpec`, and ensure
+- Keep `baseline_calibration_id` variant-scoped on `SubmissionSpec`, and ensure
   the store can persist one calibration id per spec. Do not hoist it to
-  `benchmark_group` in this iteration.
+  `task_submission` in this iteration.
 - Insert ordered workflow-step rows for both specs, with global `step_index`
   values that reflect the serial lifecycle.
 - Extend append/resume logic so completion of the final run for spec K enqueues
-  run 0 for spec K+1, and completion of the final spec terminates the group.
+  run 0 for spec K+1, and completion of the final spec terminates the submission.
 - Preserve the invariant: at most one queued/claimed/running job per comparison
-  group, independent of daemon `max_concurrent_jobs`.
+  submission, independent of daemon `max_concurrent_jobs`.
 - Cover persistence semantics against the production Postgres stores. Use
   narrow caller-level fakes only for orchestration behavior that does not
   depend on persistence.
@@ -211,52 +211,52 @@ DB-resumable across multiple specs.
 
 **Acceptance & Validation:**
 
-- [x] Creating a comparison group is atomic: failures leave no orphan specs,
+- [x] Creating a comparison submission is atomic: failures leave no orphan specs,
   steps, or jobs.
 - [x] The store creation API accepts an ordered spec collection and persists
   `spec_index` from that order, even though request validation currently caps it
   at two variants.
 - [x] Each variant has its own explicit persisted calibration id and resume can
   derive the next action without guessing from spec 0.
-- [x] Startup resume can continue a partially completed comparison group from
+- [x] Startup resume can continue a partially completed comparison submission from
   persisted DB state.
 - [x] Concurrent append/resume attempts cannot enqueue two active runs for the
-  same group.
+  same submission.
 
 **Tests:**
 
-- Postgres store tests for two-spec group creation.
+- Postgres store tests for two-spec submission creation.
 - Append/resume tests for spec0-final → spec1-run0 and final-spec terminal.
 - Race/backstop tests for duplicate active-run prevention.
 
 ### Phase 3: Execution, Carry-Forward, and Per-Variant Calibration
 
 **Goal:** Run both variants through the existing build/cache/libvirt path while
-preserving one carried group DB and one calibration per variant.
+preserving one carried submission DB and one calibration per variant.
 
 **Scope:**
 
 - Resolve/build/cache each variant independently.
 - Carry the SQLite DB from every completed run into the next run, even when the
   next run belongs to a different spec.
-- Fix the carry-seed gate: seed from the prior group DB for every run except the
-  group's very first measured run. The old v15/v19 shape (`run_index > 0`) is
+- Fix the carry-seed gate: seed from the prior submission DB for every run except the
+  submission's very first measured run. The old v15/v19 shape (`run_index > 0`) is
   insufficient for two variants with one repeat each, because variant 1's first
-  run has `benchmark_run_index = 0` but must still receive the carried DB and
+  run has `task_run_index = 0` but must still receive the carried DB and
   calibration row.
-- Generalize DB carry-forward from "spec has repeats" to "group has a next
+- Generalize DB carry-forward from "spec has repeats" to "submission has a next
   measured execution."
 - Run calibration before each variant's first measured execution and persist the
   resulting `baseline_id` on that variant's spec.
 - Fix the calibration trigger gate: calibrate a spec when its
-  `baseline_calibration_id` is absent and the containing group has more than
+  `baseline_calibration_id` is absent and the containing submission has more than
   one total measured execution. The old v19 predicate
   (`requested_run_count > 1`) is insufficient for two variants with one repeat
   each, because each spec has `requested_run_count = 1` but still needs its own
   calibration.
 - Update the descriptive workflow-step insertion in Postgres in lockstep with
   the runtime calibration trigger, so the inert `calibrate` step rows
-  accurately reflect per-variant calibration for comparison groups.
+  accurately reflect per-variant calibration for comparison submissions.
 - Reuse a variant's persisted `baseline_id` across clean repeats of that same
   variant.
 - Fail closed if carry-forward or `--baseline-id` validation fails; do not
@@ -271,17 +271,17 @@ preserving one carried group DB and one calibration per variant.
 
 **Acceptance & Validation:**
 
-- [ ] A two-variant/one-repeat group runs one calibration per variant, then one
+- [ ] A two-variant/one-repeat submission runs one calibration per variant, then one
   measured VM per variant.
 - [ ] Variant 1 run 0 receives the carried DB from variant 0 rather than a fresh
   empty DB.
-- [ ] A two-variant/N-repeat group runs each repeat in a fresh VM and carries the
-  same group DB through every run.
+- [ ] A two-variant/N-repeat submission runs each repeat in a fresh VM and carries the
+  same submission DB through every run.
 - [ ] Repeats of the same variant reuse that variant's calibration id; different
   variants do not share a calibration id by default.
-- [ ] A two-variant/one-repeat group calibrates both specs even though each spec
+- [ ] A two-variant/one-repeat submission calibrates both specs even though each spec
   has `requested_run_count = 1`.
-- [ ] A carry-forward or baseline-id failure marks the group failed with visible
+- [ ] A carry-forward or baseline-id failure marks the submission failed with visible
   partial data rather than continuing with a different DB/calibration.
 
 **Tests:**
@@ -296,7 +296,7 @@ preserving one carried group DB and one calibration per variant.
 
 **Scope:**
 
-- Load `job_metric` rows by `benchmark_spec_id` and `benchmark_run_index`.
+- Load `job_metric` rows by `task_spec_id` and `task_run_index`.
 - Aggregate repeated runs per variant using Execution+Commit as the headline
   metric.
 - Model the result as one baseline spec plus a `Vec` of variant deltas against
@@ -330,7 +330,7 @@ preserving one carried group DB and one calibration per variant.
 - [ ] A same-workload two-ref comparison is not incorrectly marked
   incomparable by the existing `measured_blocks`/`warmup_blocks` guard.
 - [ ] Sub-noise deltas are rendered as inconclusive/provisional, not as wins.
-- [ ] Partial groups render available completed-run data and clearly mark what is
+- [ ] Partial submissions render available completed-run data and clearly mark what is
   missing.
 
 **Tests:**
@@ -341,11 +341,11 @@ preserving one carried group DB and one calibration per variant.
 
 ### Phase 5: Reporting Surface and Slack UX
 
-**Goal:** Render comparison progress and results on one group-owned surface.
+**Goal:** Render comparison progress and results on one submission-owned surface.
 
 **Scope:**
 
-- Show the active variant/ref and repeat position while the group runs.
+- Show the active variant/ref and repeat position while the submission runs.
 - Avoid per-run or per-variant Slack message/comment/check fan-out.
 - Render one final comparison summary with artifact links and refs.
 - Keep current PR baseline reporting unchanged.
@@ -380,7 +380,7 @@ preserving one carried group DB and one calibration per variant.
 - Run one Slack comparison between two explicit refs over a small tx/block
   workload.
 - Run one natural-language Slack comparison over the same class of workload.
-- Confirm the group is serial, host-pinned, uses one shared DB, and calibrates
+- Confirm the submission is serial, host-pinned, uses one shared DB, and calibrates
   each variant separately.
 - Capture logs/artifacts needed to debug comparison failures.
 - Update docs/help text for the supported comparison syntax and current
@@ -413,8 +413,8 @@ preserving one carried group DB and one calibration per variant.
 - [ ] `just build`
 - [ ] `just lint`
 - [ ] `just test`
-- [ ] Slack smoke: two explicit refs over one tx/block workload produce one group
-  card, one group DB, one calibration per variant, two measured variant runs,
+- [ ] Slack smoke: two explicit refs over one tx/block workload produce one submission
+  card, one submission DB, one calibration per variant, two measured variant runs,
   and one delta summary.
 - [ ] Slack smoke: natural-language comparison request resolves through the LLM
   and produces the same bounded two-variant request.
@@ -424,7 +424,7 @@ preserving one carried group DB and one calibration per variant.
 ## Follow-Ups
 
 - Lift the two-variant cap only after `0015-resource-aware-admission` can budget
-  full group lifecycles.
+  full submission lifecycles.
 - Add ref-expansion for requests like "all release tags in the last 3 months"
   before accepting dynamic multi-ref comparison requests.
 - `0028-results-summary-restructure` should make comparison summaries richer and

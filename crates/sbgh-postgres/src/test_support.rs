@@ -92,6 +92,18 @@ impl Drop for TestDb {
 /// server is up, so an unreachable server is a misconfiguration that should
 /// fail loudly, not a skip.
 pub async fn setup_pg_db() -> TestPgDb {
+    setup_pg_db_inner(None).await
+}
+
+/// Create a fresh database migrated only through `target`.
+///
+/// This is reserved for upgrade tests that must seed the immediately preceding
+/// schema before applying a newer migration.
+pub async fn setup_pg_db_to(target: i64) -> TestPgDb {
+    setup_pg_db_inner(Some(target)).await
+}
+
+async fn setup_pg_db_inner(target: Option<i64>) -> TestPgDb {
     let admin = connect_when_ready(COMPOSE_ADMIN_DSN)
         .await
         .unwrap_or_else(|e| {
@@ -142,9 +154,14 @@ pub async fn setup_pg_db() -> TestPgDb {
     let pool = connect_when_ready(&url)
         .await
         .unwrap_or_else(|e| panic!("connecting to test database {db_name}: {e}"));
-    db::migrate(&pool)
-        .await
-        .expect("running migrations against the test database");
+    match target {
+        Some(target) => crate::migrate::migrate_to(&pool, target)
+            .await
+            .unwrap_or_else(|e| panic!("running migrations through {target}: {e}")),
+        None => db::migrate(&pool)
+            .await
+            .expect("running migrations against the test database"),
+    }
     (TestDb { db_name }, pool)
 }
 

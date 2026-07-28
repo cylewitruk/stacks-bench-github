@@ -84,15 +84,15 @@ pub fn artifact_key(job_id: &str, relative: &str) -> String {
     format!("{job_id}/{relative}")
 }
 
-/// Build the store key for a future group-scoped artifact:
-/// `<group_prefix>/<relative>`. Singleton run artifacts keep using
-/// [`artifact_key`]; this reserves the shared namespace for grouped outputs.
-pub fn group_artifact_key(group_prefix: &str, relative: &str) -> String {
-    format!("{group_prefix}/{relative}")
+/// Build the store key for a submission-scoped artifact:
+/// `<submission_prefix>/<relative>`. Singleton run artifacts keep using
+/// [`artifact_key`]; this reserves the shared namespace for submission outputs.
+pub fn submission_artifact_key(submission_prefix: &str, relative: &str) -> String {
+    format!("{submission_prefix}/{relative}")
 }
 
-/// Group-scoped SQLite DB carried between isolated repeat VMs.
-pub const GROUP_SQLITE_RELATIVE: &str = "shared/stacks-bench.db";
+/// Submission-scoped SQLite DB carried between isolated repeat VMs.
+pub const SUBMISSION_SQLITE_RELATIVE: &str = "shared/stacks-bench.db";
 
 /// Sibling temp path for a streamed download (`<dest>.<token>.part`), renamed
 /// to `dest` on completion so a partial transfer never lands at the key path.
@@ -823,10 +823,10 @@ mod tests {
     }
 
     #[test]
-    fn group_artifact_key_is_group_prefix_slash_relative() {
+    fn submission_artifact_key_is_submission_prefix_slash_relative() {
         assert_eq!(
-            group_artifact_key("group1", "shared/stacks-bench.db"),
-            "group1/shared/stacks-bench.db"
+            submission_artifact_key("submission1", "shared/stacks-bench.db"),
+            "submission1/shared/stacks-bench.db"
         );
     }
 

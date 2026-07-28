@@ -8,7 +8,7 @@
 //! `ProgressReporter` (lifecycle) and `ProgressSink` (worker-event drain),
 //! which each re-interpreted the `ProgressTarget` separately.
 //!
-//! Slack benchmark groups share a daemon-owned projection session whose full
+//! Slack benchmark submissions share a daemon-owned projection session whose full
 //! state is rendered through `sbgh-slack`; no Slack message is ever parsed or
 //! incrementally patched.
 //!
@@ -31,9 +31,9 @@ use sbgh_core::db::fleet::ReportProjectionSeed;
 use sbgh_github::{CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use tokio::sync::Mutex;
 
-use crate::artifact_store::{ArtifactStore, GROUP_SQLITE_RELATIVE, group_artifact_key};
+use crate::artifact_store::{ArtifactStore, SUBMISSION_SQLITE_RELATIVE, submission_artifact_key};
 use crate::bench_summary::{self, RunResult, thousands};
-use crate::comparison::{BaselineComparison, GroupComparison};
+use crate::comparison::{BaselineComparison, MultiVariantComparison};
 use crate::duration::format_elapsed;
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report_event::{PhaseLabel, ProgressUpdate};
@@ -51,12 +51,12 @@ const DB_LINK_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// is always allowed through.
 const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
-pub(crate) fn pr_report_marker(group_id: uuid::Uuid) -> String {
-    format!("<!-- sbgh-report:{group_id} -->")
+pub(crate) fn pr_report_marker(submission_id: uuid::Uuid) -> String {
+    format!("<!-- sbgh-report:{submission_id} -->")
 }
 
-pub(crate) fn marked_pr_comment(group_id: uuid::Uuid, body: &str) -> String {
-    let marker = pr_report_marker(group_id);
+pub(crate) fn marked_pr_comment(submission_id: uuid::Uuid, body: &str) -> String {
+    let marker = pr_report_marker(submission_id);
     if body
         .lines()
         .any(|line| line.trim() == marker)
@@ -69,12 +69,12 @@ pub(crate) fn marked_pr_comment(group_id: uuid::Uuid, body: &str) -> String {
 
 /// Successful-run report data passed to surfaces at terminal completion.
 /// Surfaces consume only the fields they own: GitHub uses the PR baseline
-/// comparison, while Slack uses the group comparison for v22 ad-hoc
-/// comparison groups.
+/// comparison, while Slack uses the multi-variant comparison for v22 ad-hoc
+/// comparison submissions.
 pub struct CompletionReport<'a> {
     pub summary: &'a serde_json::Value,
     pub baseline_comparison: Option<&'a BaselineComparison>,
-    pub group_comparison: Option<&'a GroupComparison>,
+    pub multi_variant_comparison: Option<&'a MultiVariantComparison>,
 }
 
 /// A job's reporting surface — the whole lifecycle on one target family. Built
@@ -267,7 +267,7 @@ impl GitHubReportSurface {
     }
 
     async fn update_comment_id(&self, comment_id: i64, body: &str) -> anyhow::Result<()> {
-        let body = marked_pr_comment(self.job.benchmark_group_id, body);
+        let body = marked_pr_comment(self.job.task_submission_id, body);
         self.gh
             .update_pr_comment(self.job.installation_id, &self.job.repository, comment_id, &body)
             .await
@@ -656,11 +656,11 @@ pub(crate) async fn signed_db_url(
         .await
 }
 
-pub(crate) async fn signed_group_db_url(
+pub(crate) async fn signed_submission_db_url(
     store: &dyn ArtifactStore,
-    group_prefix: &str,
+    submission_prefix: &str,
 ) -> Option<String> {
-    let key = group_artifact_key(group_prefix, GROUP_SQLITE_RELATIVE);
+    let key = submission_artifact_key(submission_prefix, SUBMISSION_SQLITE_RELATIVE);
     store
         .signed_url_if_fetchable(&key, DB_LINK_TTL)
         .await
@@ -756,21 +756,21 @@ mod tests {
         CompletionReport {
             summary,
             baseline_comparison: None,
-            group_comparison: None,
+            multi_variant_comparison: None,
         }
     }
 
     fn job_with(progress: ProgressTarget) -> RunnableJob {
         RunnableJob {
             id: Uuid::new_v4(),
-            benchmark_group_id: Uuid::new_v4(),
-            benchmark_spec_id: Uuid::new_v4(),
-            benchmark_run_index: 0,
+            task_submission_id: Uuid::new_v4(),
+            task_spec_id: Uuid::new_v4(),
+            task_run_index: 0,
             requested_run_count: 1,
-            group_requested_run_count: 1,
-            group_run_index: 0,
+            submission_requested_run_count: 1,
+            submission_run_index: 0,
             baseline_calibration_id: None,
-            group_artifact_prefix: Uuid::new_v4().to_string(),
+            submission_artifact_prefix: Uuid::new_v4().to_string(),
             repository: "acme/widgets".into(),
             commit: "abc123".into(),
             git_ref_display: "develop".into(),
@@ -806,9 +806,9 @@ mod tests {
 
     #[test]
     fn pr_report_marker_is_preserved_exactly_once() {
-        let group_id = Uuid::new_v4();
-        let marked = marked_pr_comment(group_id, "snapshot");
-        let marker = pr_report_marker(group_id);
+        let submission_id = Uuid::new_v4();
+        let marked = marked_pr_comment(submission_id, "snapshot");
+        let marker = pr_report_marker(submission_id);
         assert_eq!(
             marked
                 .lines()
@@ -816,7 +816,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(marked_pr_comment(group_id, &marked), marked);
+        assert_eq!(marked_pr_comment(submission_id, &marked), marked);
     }
 
     // ── GitHub lifecycle (ported from progress.rs) ──
@@ -928,7 +928,7 @@ mod tests {
             check_run_id: Some(900),
             check_run_url: None,
         });
-        let marker = pr_report_marker(job.benchmark_group_id);
+        let marker = pr_report_marker(job.task_submission_id);
         github(&gh, job)
             .phase(&PhaseLabel::new("running", false), Duration::ZERO)
             .await
@@ -1086,7 +1086,7 @@ mod tests {
         }
         async fn benchmark_run_metrics(
             &self,
-            _benchmark_spec_id: Uuid,
+            _task_spec_id: Uuid,
         ) -> anyhow::Result<Vec<BenchmarkRunMetric>> {
             Ok(self
                 .metrics

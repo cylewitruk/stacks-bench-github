@@ -223,7 +223,7 @@ listener. Workers cannot call the cookie-authenticated operator API.
 | `POST` | `/api/jobs/block-validation` | `admin` | Enqueue a fully specified block-validation job |
 | `POST` | `/api/fleet/workers/{id}/drain` | `admin` | Set/clear durable drain |
 | `POST` | `/api/fleet/jobs/{id}/cancel` | `admin` | Durably request cancellation of a running fleet attempt |
-| `POST` | `/api/fleet/groups/{id}/recover` | `admin` | Start a new generation from the first spec/run, optionally pinned to a compatible `worker_id` |
+| `POST` | `/api/fleet/submissions/{id}/recover` | `admin` | Start a new generation from the first spec/run, optionally pinned to a compatible `worker_id` |
 
 The bounded GitHub command `/validate-blocks <epoch> <start> <end>` uses the
 same PR-role and target/source policy checks as `/benchmark`. Shard,

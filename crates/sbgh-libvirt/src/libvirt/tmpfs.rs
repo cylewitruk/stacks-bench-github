@@ -132,7 +132,7 @@ impl ResultsTmpfs {
     }
 
     /// Small handoff file written by the calibration phase and read by the
-    /// measured run phase in the same repeat-group job.
+    /// measured run phase in the same repeat-submission job.
     pub fn baseline_id_file(&self) -> PathBuf {
         self.mount_dir
             .join("baseline-id")

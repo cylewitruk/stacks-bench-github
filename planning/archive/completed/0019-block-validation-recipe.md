@@ -141,7 +141,7 @@ covered by the green v25 workspace suite. Physical dataset hydration and
 long-running validation on the dedicated host remain rollout checks in the
 [worker-fleet operations guide](../../../docs/worker-fleet-operations.md).
 
-[v26](../../iterations/v26-sandboxed-worker-execution.md) supersedes the v25
+[v26](0062-sandboxed-worker-execution.md) supersedes the v25
 substrate detail: it moves the recipe into one resource-profiled libvirt VM,
 reuses benchmark's LVM-thin snapshot provider with K snapshots of an exact
 sealed origin generation, and forbids repository-built payloads from executing

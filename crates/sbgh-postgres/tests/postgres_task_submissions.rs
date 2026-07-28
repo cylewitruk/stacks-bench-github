@@ -1,9 +1,9 @@
-//! 0037: every current job is a singleton `benchmark_group -> benchmark_spec
-//! -> job(run)` without changing creation behavior.
+//! Every current job belongs to a `task_submission -> task_spec -> job(run)`
+//! aggregate without changing creation behavior.
 
 use sbgh_core::models::{
-    BenchmarkStepKind, BuildTarget, GitRefKind, JobAxes, JobCreationRequest, JobIntent, JobKind,
-    JobSource, JobStatus, NewJob, QueuedEventDetail, TaskKind, TriggerKind,
+    BuildTarget, GitRefKind, JobAxes, JobCreationRequest, JobIntent, JobKind, JobSource, JobStatus,
+    NewJob, QueuedEventDetail, SubmissionStepKind, TaskKind, TriggerKind,
 };
 use sbgh_postgres::Db;
 use sbgh_postgres::db::{
@@ -57,7 +57,7 @@ async fn seed_install_repo(pool: &Pool) {
 async fn assert_singleton_model(
     pool: &Pool,
     job_id: Uuid,
-    group_id: Uuid,
+    submission_id: Uuid,
     spec_id: Uuid,
     expected_axes: JobAxes,
 ) {
@@ -79,19 +79,19 @@ async fn assert_singleton_model(
         String,
         Option<String>,
     ) = sqlx::query_as(
-        "SELECT source, intent, artifact_prefix, host_key FROM benchmark_group WHERE id = $1",
+        "SELECT source, intent, artifact_prefix, host_key FROM task_submission WHERE id = $1",
     )
-    .bind(group_id)
+    .bind(submission_id)
     .fetch_one(pool)
     .await
     .unwrap();
     assert_eq!(source.0, expected_axes.source);
     assert_eq!(intent.0, expected_axes.intent);
-    assert_eq!(artifact_prefix, group_id.to_string());
+    assert_eq!(artifact_prefix, submission_id.to_string());
     assert_eq!(host_key, None);
 
     let (
-        spec_group_id,
+        spec_submission_id,
         spec_index,
         requested_run_count,
         task_kind,
@@ -101,15 +101,15 @@ async fn assert_singleton_model(
         commit,
         workload_key,
     ): PersistedSpec = sqlx::query_as(
-        "SELECT benchmark_group_id, spec_index, requested_run_count, task_kind, build_target, \
-         git_ref_kind, git_ref_display, git_commit_hash, workload_key FROM benchmark_spec WHERE \
+        "SELECT task_submission_id, spec_index, requested_run_count, task_kind, build_target, \
+         git_ref_kind, git_ref_display, git_commit_hash, workload_key FROM task_spec WHERE \
          id = $1",
     )
     .bind(spec_id)
     .fetch_one(pool)
     .await
     .unwrap();
-    assert_eq!(spec_group_id, group_id);
+    assert_eq!(spec_submission_id, submission_id);
     assert_eq!(spec_index, 0);
     assert_eq!(requested_run_count, 1);
     assert_eq!(task_kind.0, expected_axes.task_kind);
@@ -119,29 +119,32 @@ async fn assert_singleton_model(
     assert_eq!(commit.as_deref(), Some("0123456789abcdef0123456789abcdef01234567"));
     assert_eq!(workload_key.as_deref(), Some("workload-key"));
 
-    let (run_group_id, run_spec_id, run_index): (Uuid, Uuid, i32) = sqlx::query_as(
-        "SELECT benchmark_group_id, benchmark_spec_id, benchmark_run_index FROM job WHERE id = $1",
+    let (run_submission_id, run_spec_id, run_index): (Uuid, Uuid, i32) = sqlx::query_as(
+        "SELECT task_submission_id, task_spec_id, task_run_index FROM job WHERE id = $1",
     )
     .bind(job_id)
     .fetch_one(pool)
     .await
     .unwrap();
-    assert_eq!(run_group_id, group_id);
+    assert_eq!(run_submission_id, submission_id);
     assert_eq!(run_spec_id, spec_id);
     assert_eq!(run_index, 0);
 
-    let steps: Vec<(i32, Db<BenchmarkStepKind>)> = sqlx::query_as(
-        "SELECT step_index, step_kind FROM benchmark_workflow_step WHERE benchmark_group_id = $1 \
+    let steps: Vec<(i32, Db<SubmissionStepKind>)> = sqlx::query_as(
+        "SELECT step_index, step_kind FROM task_workflow_step WHERE task_submission_id = $1 \
          ORDER BY step_index",
     )
-    .bind(group_id)
+    .bind(submission_id)
     .fetch_all(pool)
     .await
     .unwrap();
     if expected_axes.task_kind == TaskKind::BuildOnly {
-        assert_eq!(steps, vec![(0, Db(BenchmarkStepKind::Build))]);
+        assert_eq!(steps, vec![(0, Db(SubmissionStepKind::Build))]);
     } else {
-        assert_eq!(steps, vec![(0, Db(BenchmarkStepKind::Build)), (1, Db(BenchmarkStepKind::Run))]);
+        assert_eq!(
+            steps,
+            vec![(0, Db(SubmissionStepKind::Build)), (1, Db(SubmissionStepKind::Run))]
+        );
     }
 }
 
@@ -166,27 +169,27 @@ async fn slack_unlinked_job_persists_requested_clean_repetitions_on_spec() {
         .unwrap();
 
     let requested: i32 =
-        sqlx::query_scalar("SELECT requested_run_count FROM benchmark_spec WHERE id = $1")
-            .bind(job.benchmark_spec_id)
+        sqlx::query_scalar("SELECT requested_run_count FROM task_spec WHERE id = $1")
+            .bind(job.task_spec_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(requested, 4);
 
-    let steps: Vec<(i32, Db<BenchmarkStepKind>)> = sqlx::query_as(
-        "SELECT step_index, step_kind FROM benchmark_workflow_step WHERE benchmark_group_id = $1 \
+    let steps: Vec<(i32, Db<SubmissionStepKind>)> = sqlx::query_as(
+        "SELECT step_index, step_kind FROM task_workflow_step WHERE task_submission_id = $1 \
          ORDER BY step_index",
     )
-    .bind(job.benchmark_group_id)
+    .bind(job.task_submission_id)
     .fetch_all(&pool)
     .await
     .unwrap();
     assert_eq!(
         steps,
         vec![
-            (0, Db(BenchmarkStepKind::Build)),
-            (1, Db(BenchmarkStepKind::Calibrate)),
-            (2, Db(BenchmarkStepKind::Run)),
+            (0, Db(SubmissionStepKind::Build)),
+            (1, Db(SubmissionStepKind::Calibrate)),
+            (2, Db(SubmissionStepKind::Run)),
         ]
     );
 }
@@ -228,9 +231,9 @@ async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
         .await
         .unwrap()
         .expect("run 1 is queued");
-    assert_eq!(second.benchmark_group_id, first.benchmark_group_id);
-    assert_eq!(second.benchmark_spec_id, first.benchmark_spec_id);
-    assert_eq!(second.benchmark_run_index, 1);
+    assert_eq!(second.task_submission_id, first.task_submission_id);
+    assert_eq!(second.task_spec_id, first.task_spec_id);
+    assert_eq!(second.task_run_index, 1);
     assert_eq!(second.status, JobStatus::Queued);
     assert_eq!(
         store
@@ -239,7 +242,7 @@ async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
             .unwrap()
             .as_deref(),
         Some("1700000000.000200"),
-        "repeat run reuses the group's Slack message",
+        "repeat run reuses the submission's Slack message",
     );
     assert!(
         store
@@ -260,7 +263,7 @@ async fn append_next_benchmark_run_is_ordered_and_blocks_on_active_sibling() {
         .await
         .unwrap()
         .expect("run 2 is queued");
-    assert_eq!(third.benchmark_run_index, 2);
+    assert_eq!(third.task_run_index, 2);
 
     sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
         .bind(third.id)
@@ -310,8 +313,8 @@ async fn resume_pending_benchmark_runs_derives_next_run_from_db_state() {
         .await
         .unwrap();
     assert_eq!(resumed.len(), 1);
-    assert_eq!(resumed[0].benchmark_spec_id, first.benchmark_spec_id);
-    assert_eq!(resumed[0].benchmark_run_index, 1);
+    assert_eq!(resumed[0].task_spec_id, first.task_spec_id);
+    assert_eq!(resumed[0].task_run_index, 1);
 
     assert!(
         store
@@ -324,7 +327,7 @@ async fn resume_pending_benchmark_runs_derives_next_run_from_db_state() {
 }
 
 #[tokio::test]
-async fn create_unlinked_benchmark_group_persists_ordered_specs_and_first_run() {
+async fn create_unlinked_benchmark_submission_persists_ordered_specs_and_first_run() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool).await;
     let store = PostgresJobStore::new(pool.clone());
@@ -342,7 +345,7 @@ async fn create_unlinked_benchmark_group_persists_ordered_specs_and_first_run() 
     candidate.git_ref_display = "release/3.4.0.0.3".into();
 
     let first = store
-        .create_unlinked_benchmark_group(
+        .create_unlinked_benchmark_submission(
             Uuid::new_v4(),
             &[
                 NewBenchmarkSpec::singleton(baseline, 1),
@@ -358,7 +361,7 @@ async fn create_unlinked_benchmark_group_persists_ordered_specs_and_first_run() 
         .await
         .unwrap();
 
-    assert_eq!(first.benchmark_run_index, 0);
+    assert_eq!(first.task_run_index, 0);
     assert_eq!(first.git_ref_display, "release/3.4.0.0.2");
     assert_eq!(
         store
@@ -371,11 +374,11 @@ async fn create_unlinked_benchmark_group_persists_ordered_specs_and_first_run() 
 
     let specs: Vec<(Uuid, i32, String, Option<i64>)> = sqlx::query_as(
         "SELECT id, spec_index, git_ref_display, baseline_calibration_id
-           FROM benchmark_spec
-          WHERE benchmark_group_id = $1
+           FROM task_spec
+          WHERE task_submission_id = $1
        ORDER BY spec_index",
     )
-    .bind(first.benchmark_group_id)
+    .bind(first.task_submission_id)
     .fetch_all(&pool)
     .await
     .unwrap();
@@ -388,42 +391,42 @@ async fn create_unlinked_benchmark_group_persists_ordered_specs_and_first_run() 
     assert_eq!(specs[1].3, Some(42));
 
     let jobs: Vec<(Uuid, Uuid, i32)> = sqlx::query_as(
-        "SELECT id, benchmark_spec_id, benchmark_run_index
+        "SELECT id, task_spec_id, task_run_index
            FROM job
-          WHERE benchmark_group_id = $1
+          WHERE task_submission_id = $1
        ORDER BY created_at, id",
     )
-    .bind(first.benchmark_group_id)
+    .bind(first.task_submission_id)
     .fetch_all(&pool)
     .await
     .unwrap();
     assert_eq!(jobs, vec![(first.id, specs[0].0, 0)]);
 
-    let steps: Vec<(i32, Db<BenchmarkStepKind>, Option<Uuid>)> = sqlx::query_as(
-        "SELECT step_index, step_kind, benchmark_spec_id
-           FROM benchmark_workflow_step
-          WHERE benchmark_group_id = $1
+    let steps: Vec<(i32, Db<SubmissionStepKind>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT step_index, step_kind, task_spec_id
+           FROM task_workflow_step
+          WHERE task_submission_id = $1
        ORDER BY step_index",
     )
-    .bind(first.benchmark_group_id)
+    .bind(first.task_submission_id)
     .fetch_all(&pool)
     .await
     .unwrap();
     assert_eq!(
         steps,
         vec![
-            (0, Db(BenchmarkStepKind::Build), Some(specs[0].0)),
-            (1, Db(BenchmarkStepKind::Calibrate), Some(specs[0].0)),
-            (2, Db(BenchmarkStepKind::Run), Some(specs[0].0)),
-            (3, Db(BenchmarkStepKind::Build), Some(specs[1].0)),
-            (4, Db(BenchmarkStepKind::Calibrate), Some(specs[1].0)),
-            (5, Db(BenchmarkStepKind::Run), Some(specs[1].0)),
+            (0, Db(SubmissionStepKind::Build), Some(specs[0].0)),
+            (1, Db(SubmissionStepKind::Calibrate), Some(specs[0].0)),
+            (2, Db(SubmissionStepKind::Run), Some(specs[0].0)),
+            (3, Db(SubmissionStepKind::Build), Some(specs[1].0)),
+            (4, Db(SubmissionStepKind::Calibrate), Some(specs[1].0)),
+            (5, Db(SubmissionStepKind::Run), Some(specs[1].0)),
         ],
     );
 }
 
 #[tokio::test]
-async fn create_unlinked_benchmark_group_rolls_back_on_invalid_spec_collection() {
+async fn create_unlinked_benchmark_submission_rolls_back_on_invalid_spec_collection() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool).await;
     let store = PostgresJobStore::new(pool.clone());
@@ -439,7 +442,7 @@ async fn create_unlinked_benchmark_group_rolls_back_on_invalid_spec_collection()
     let github = new_job(TriggerKind::BranchPush, JobKind::Baseline);
 
     let err = store
-        .create_unlinked_benchmark_group(
+        .create_unlinked_benchmark_submission(
             Uuid::new_v4(),
             &[NewBenchmarkSpec::singleton(slack, 1), NewBenchmarkSpec::singleton(github, 1)],
             &detail,
@@ -453,15 +456,15 @@ async fn create_unlinked_benchmark_group_rolls_back_on_invalid_spec_collection()
         "{err}",
     );
 
-    let groups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM benchmark_group")
+    let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_submission")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let specs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM benchmark_spec")
+    let specs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_spec")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let steps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM benchmark_workflow_step")
+    let steps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_workflow_step")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -469,7 +472,7 @@ async fn create_unlinked_benchmark_group_rolls_back_on_invalid_spec_collection()
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!((groups, specs, steps, jobs), (0, 0, 0, 0));
+    assert_eq!((submissions, specs, steps, jobs), (0, 0, 0, 0));
 }
 
 #[tokio::test]
@@ -490,7 +493,7 @@ async fn append_next_benchmark_run_moves_from_final_run_to_next_spec() {
     let mut candidate = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
     candidate.git_ref_display = "candidate".into();
     let first = store
-        .create_unlinked_benchmark_group(
+        .create_unlinked_benchmark_submission(
             Uuid::new_v4(),
             &[NewBenchmarkSpec::singleton(baseline, 1), NewBenchmarkSpec::singleton(candidate, 1)],
             &detail,
@@ -509,9 +512,9 @@ async fn append_next_benchmark_run_moves_from_final_run_to_next_spec() {
         .await
         .unwrap()
         .expect("candidate spec run 0 is queued");
-    assert_eq!(second.benchmark_group_id, first.benchmark_group_id);
-    assert_ne!(second.benchmark_spec_id, first.benchmark_spec_id);
-    assert_eq!(second.benchmark_run_index, 0);
+    assert_eq!(second.task_submission_id, first.task_submission_id);
+    assert_ne!(second.task_spec_id, first.task_spec_id);
+    assert_eq!(second.task_run_index, 0);
     assert_eq!(second.git_ref_display, "candidate");
     assert_eq!(second.status, JobStatus::Queued);
     assert_eq!(
@@ -542,7 +545,7 @@ async fn append_next_benchmark_run_moves_from_final_run_to_next_spec() {
             .await
             .unwrap()
             .is_none(),
-        "final spec completion terminates the group",
+        "final spec completion terminates the submission",
     );
 }
 
@@ -564,7 +567,7 @@ async fn resume_pending_benchmark_runs_continues_across_specs() {
     let mut candidate = new_job(TriggerKind::SlackAdhoc, JobKind::AdHoc);
     candidate.git_ref_display = "candidate".into();
     let first = store
-        .create_unlinked_benchmark_group(
+        .create_unlinked_benchmark_submission(
             Uuid::new_v4(),
             &[NewBenchmarkSpec::singleton(baseline, 1), NewBenchmarkSpec::singleton(candidate, 1)],
             &detail,
@@ -584,12 +587,12 @@ async fn resume_pending_benchmark_runs_continues_across_specs() {
         .unwrap();
     assert_eq!(resumed.len(), 1);
     assert_eq!(resumed[0].git_ref_display, "candidate");
-    assert_eq!(resumed[0].benchmark_run_index, 0);
-    assert_ne!(resumed[0].benchmark_spec_id, first.benchmark_spec_id);
+    assert_eq!(resumed[0].task_run_index, 0);
+    assert_ne!(resumed[0].task_spec_id, first.task_spec_id);
 }
 
 #[tokio::test]
-async fn insert_job_creates_singleton_group_spec_and_run() {
+async fn insert_job_creates_singleton_submission_spec_and_run() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool).await;
     let store = PostgresJobStore::new(pool.clone());
@@ -600,18 +603,17 @@ async fn insert_job_creates_singleton_group_spec_and_run() {
         .await
         .unwrap();
 
-    assert_singleton_model(&pool, job.id, job.benchmark_group_id, job.benchmark_spec_id, new.axes)
-        .await;
+    assert_singleton_model(&pool, job.id, job.task_submission_id, job.task_spec_id, new.axes).await;
 }
 
 #[tokio::test]
-async fn create_job_with_links_creates_singleton_group_spec_and_run() {
+async fn create_job_with_links_creates_singleton_submission_spec_and_run() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool).await;
     let store = PostgresJobStore::new(pool.clone());
     let webhook_id: i64 = sqlx::query_scalar(
         "INSERT INTO github_webhook (delivery_id, event_type, payload_size_bytes) VALUES \
-         ('group-links-1', 'issue_comment', 0) RETURNING id",
+         ('submission-links-1', 'issue_comment', 0) RETURNING id",
     )
     .fetch_one(&pool)
     .await
@@ -635,15 +637,15 @@ async fn create_job_with_links_creates_singleton_group_spec_and_run() {
     assert_singleton_model(
         &pool,
         created.job.id,
-        created.job.benchmark_group_id,
-        created.job.benchmark_spec_id,
+        created.job.task_submission_id,
+        created.job.task_spec_id,
         new.axes,
     )
     .await;
 }
 
 #[tokio::test]
-async fn create_unlinked_build_only_job_creates_build_only_singleton_group() {
+async fn create_unlinked_build_only_job_creates_build_only_singleton_submission() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool).await;
     let store = PostgresJobStore::new(pool.clone());
@@ -675,6 +677,5 @@ async fn create_unlinked_build_only_job_creates_build_only_singleton_group() {
         .await
         .unwrap();
 
-    assert_singleton_model(&pool, job.id, job.benchmark_group_id, job.benchmark_spec_id, new.axes)
-        .await;
+    assert_singleton_model(&pool, job.id, job.task_submission_id, job.task_spec_id, new.axes).await;
 }

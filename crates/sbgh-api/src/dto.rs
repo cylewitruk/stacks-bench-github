@@ -225,8 +225,8 @@ pub struct FleetRecoveryRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetRecoveryResponse {
-    pub prior_group_id: String,
-    pub new_group_id: String,
+    pub prior_submission_id: String,
+    pub new_submission_id: String,
     pub first_job_id: String,
     pub execution_generation: u64,
 }
@@ -350,4 +350,33 @@ pub struct GrantRoleResult {
     pub role: RoleView,
     /// `true` if a new grant was created (vs. reactivated/already-active).
     pub created: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FleetRecoveryResponse;
+
+    #[test]
+    fn fleet_recovery_response_uses_submission_identity_fields() {
+        let value = serde_json::to_value(FleetRecoveryResponse {
+            prior_submission_id: "prior".into(),
+            new_submission_id: "new".into(),
+            first_job_id: "job".into(),
+            execution_generation: 2,
+        })
+        .unwrap();
+
+        assert_eq!(value["prior_submission_id"], "prior");
+        assert_eq!(value["new_submission_id"], "new");
+        assert!(
+            value
+                .get("prior_group_id")
+                .is_none()
+        );
+        assert!(
+            value
+                .get("new_group_id")
+                .is_none()
+        );
+    }
 }

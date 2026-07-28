@@ -15,10 +15,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::artifact_store::ArtifactStore;
-use crate::comparison::{ComparisonUnavailable, GroupComparison, VariantDelta, Verdict};
+use crate::comparison::{ComparisonUnavailable, MultiVariantComparison, VariantDelta, Verdict};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::{
-    CompletionReport, ReportSurface, parsed_run, short_pr_error, signed_db_url, signed_group_db_url,
+    CompletionReport, ReportSurface, parsed_run, short_pr_error, signed_db_url,
+    signed_submission_db_url,
 };
 use crate::report_event::{PhaseLabel, ProgressUpdate};
 
@@ -106,7 +107,7 @@ impl SnapshotSession {
     }
 }
 
-/// Group-scoped snapshot sessions. Groups execute serially, so a session is
+/// Submission-scoped snapshot sessions. Submissions execute serially, so a session is
 /// the single projection owner across all variants and repetitions.
 #[derive(Default)]
 pub struct SlackSessionRegistry {
@@ -120,7 +121,7 @@ impl SlackSessionRegistry {
 
     fn get_or_create(
         &self,
-        group_id: Uuid,
+        submission_id: Uuid,
         target: SlackMessageTarget,
         create: impl FnOnce() -> SnapshotSession,
     ) -> Arc<SnapshotSession> {
@@ -128,26 +129,26 @@ impl SlackSessionRegistry {
             .sessions
             .lock()
             .unwrap()
-            .entry((group_id, target))
+            .entry((submission_id, target))
             .or_insert_with(|| Arc::new(create()))
             .clone();
         session.touch();
         session
     }
 
-    fn reap(&self, group_id: Uuid, target: &SlackMessageTarget) {
+    fn reap(&self, submission_id: Uuid, target: &SlackMessageTarget) {
         self.sessions
             .lock()
             .unwrap()
-            .remove(&(group_id, target.clone()));
+            .remove(&(submission_id, target.clone()));
     }
 
-    pub fn sweep_abandoned(&self, grace: Duration, active_groups: &HashSet<Uuid>) -> usize {
+    pub fn sweep_abandoned(&self, grace: Duration, active_submissions: &HashSet<Uuid>) -> usize {
         let mut sessions = self.sessions.lock().unwrap();
         let stale: Vec<_> = sessions
             .iter()
-            .filter(|((group, _), session)| {
-                !active_groups.contains(group) && session.idle_for() > grace
+            .filter(|((submission, _), session)| {
+                !active_submissions.contains(submission) && session.idle_for() > grace
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -198,7 +199,7 @@ pub fn build_slack_surface(
         job: job.clone(),
     });
     let initial = initial_view(job, identity.clone());
-    let session = sessions.get_or_create(job.benchmark_group_id, target.clone(), || {
+    let session = sessions.get_or_create(job.task_submission_id, target.clone(), || {
         SnapshotSession::new(
             SlackSnapshotPublisher::new(
                 client.clone(),
@@ -224,10 +225,10 @@ pub fn build_slack_surface(
 fn initial_view(job: &RunnableJob, identity: ReportingIdentity) -> SlackProgressView {
     let mut view = SlackProgressView::queued(identity, "Benchmark", &job.git_ref_display);
     view.commit = (!job.commit.is_empty()).then(|| job.commit.clone());
-    view.run = (job.group_requested_run_count > 1).then_some(RunPosition {
-        current: (job.group_run_index + 1).max(1) as u32,
+    view.run = (job.submission_requested_run_count > 1).then_some(RunPosition {
+        current: (job.submission_run_index + 1).max(1) as u32,
         total: job
-            .group_requested_run_count
+            .submission_requested_run_count
             .max(1) as u32,
     });
     view.version = run_version_base(job);
@@ -235,7 +236,10 @@ fn initial_view(job: &RunnableJob, identity: ReportingIdentity) -> SlackProgress
 }
 
 fn run_version_base(job: &RunnableJob) -> u64 {
-    (job.group_run_index.max(0) as u64 + 1).saturating_mul(RUN_VERSION_STRIDE)
+    (job.submission_run_index
+        .max(0) as u64
+        + 1)
+    .saturating_mul(RUN_VERSION_STRIDE)
 }
 
 pub struct SlackReportSurface {
@@ -294,10 +298,10 @@ impl SlackReportSurface {
     }
 
     fn final_run(&self) -> bool {
-        self.job.group_run_index + 1
+        self.job.submission_run_index + 1
             >= self
                 .job
-                .group_requested_run_count
+                .submission_requested_run_count
     }
 
     async fn terminal(
@@ -320,14 +324,14 @@ impl SlackReportSurface {
         self.react(RUNNING_REACTION, reaction)
             .await;
         self.sessions
-            .reap(self.job.benchmark_group_id, &self.target);
+            .reap(self.job.task_submission_id, &self.target);
         Ok(())
     }
 
     async fn repeat_details(&self) -> Vec<String> {
         match self
             .jobs
-            .benchmark_run_metrics(self.job.benchmark_spec_id)
+            .benchmark_run_metrics(self.job.task_spec_id)
             .await
         {
             Ok(metrics) => {
@@ -486,7 +490,7 @@ impl ReportSurface for SlackReportSurface {
             return Ok(());
         }
 
-        let mut details = if let Some(comparison) = report.group_comparison {
+        let mut details = if let Some(comparison) = report.multi_variant_comparison {
             comparison_details(comparison)
         } else if self.job.requested_run_count > 1 {
             self.repeat_details().await
@@ -508,10 +512,16 @@ impl ReportSurface for SlackReportSurface {
             Some(url) => Some(url),
             None if self
                 .job
-                .group_requested_run_count
+                .submission_requested_run_count
                 > 1 =>
             {
-                signed_group_db_url(self.store.as_ref(), &self.job.group_artifact_prefix).await
+                signed_submission_db_url(
+                    self.store.as_ref(),
+                    &self
+                        .job
+                        .submission_artifact_prefix,
+                )
+                .await
             }
             None => None,
         };
@@ -526,7 +536,7 @@ impl ReportSurface for SlackReportSurface {
         let mut details = vec![short_pr_error(error)];
         if self
             .job
-            .group_requested_run_count
+            .submission_requested_run_count
             > 1
         {
             details.extend(self.repeat_details().await);
@@ -581,7 +591,7 @@ fn run_details(result: &crate::bench_summary::RunResult) -> Vec<String> {
     details
 }
 
-fn comparison_details(comparison: &GroupComparison) -> Vec<String> {
+fn comparison_details(comparison: &MultiVariantComparison) -> Vec<String> {
     let mut details = vec![format!(
         "Baseline {}: {}/{} samples{}",
         comparison
@@ -675,16 +685,16 @@ mod tests {
     use crate::comparison::{Comparison, ComparisonVariant, VariantRunStats};
 
     #[test]
-    fn registry_reaps_only_inactive_stale_groups() {
+    fn registry_reaps_only_inactive_stale_submissions() {
         let registry = SlackSessionRegistry::new();
-        let group = Uuid::new_v4();
+        let submission = Uuid::new_v4();
         let target = SlackMessageTarget {
             channel: "C1".into(),
             thread_ts: "1.2".into(),
         };
         let identity = ReportingIdentity::for_request("T1", "C1", "1.2");
         let client = Arc::new(sbgh_slack::test_support::FakeSlackClient::default());
-        let session = registry.get_or_create(group, target.clone(), || {
+        let session = registry.get_or_create(submission, target.clone(), || {
             SnapshotSession::new(
                 SlackSnapshotPublisher::new(client, target, identity.clone(), None, None),
                 SlackProgressView::queued(identity, "Benchmark", "main"),
@@ -701,7 +711,7 @@ mod tests {
             .lock()
             .unwrap() = Instant::now() - Duration::from_secs(120);
         assert_eq!(
-            registry.sweep_abandoned(Duration::from_secs(60), &HashSet::from([group])),
+            registry.sweep_abandoned(Duration::from_secs(60), &HashSet::from([submission])),
             0,
             "active stale sessions remain"
         );
@@ -715,7 +725,7 @@ mod tests {
 
     fn variant(name: &str, completed: usize, mean: f64) -> ComparisonVariant {
         ComparisonVariant {
-            benchmark_spec_id: Uuid::new_v4(),
+            task_spec_id: Uuid::new_v4(),
             spec_index: 0,
             ref_display: name.into(),
             commit: None,
@@ -736,7 +746,7 @@ mod tests {
 
     #[test]
     fn compact_comparison_details_preserve_samples_delta_and_verdict() {
-        let comparison = GroupComparison {
+        let comparison = MultiVariantComparison {
             baseline: variant("main", 3, 1_000.0),
             variants: vec![VariantDelta {
                 variant: variant("candidate", 2, 1_125.0),

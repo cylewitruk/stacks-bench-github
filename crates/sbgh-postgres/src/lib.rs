@@ -23,7 +23,7 @@ pub use stores::repo::PostgresRepoStore;
 pub use stores::user::PostgresUserStore;
 pub use stores::webhook::PostgresWebhookInbox;
 #[cfg(any(test, feature = "testing"))]
-pub use test_support::{TestDb, TestPgDb, setup_pg_db};
+pub use test_support::{TestDb, TestPgDb, setup_pg_db, setup_pg_db_to};
 
 pub use sbgh_core::{Error, Result, models};
 
@@ -49,5 +49,5 @@ pub mod db {
         PostgresWebhookInbox, connect, migrate,
     };
     #[cfg(any(test, feature = "testing"))]
-    pub use crate::{TestDb, TestPgDb, setup_pg_db};
+    pub use crate::{TestDb, TestPgDb, setup_pg_db, setup_pg_db_to};
 }

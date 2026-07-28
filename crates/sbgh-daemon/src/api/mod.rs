@@ -92,7 +92,7 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/jobs/block-validation", post(jobs::enqueue_block_validation))
             .route("/api/fleet/workers/{id}/drain", post(fleet::set_drain))
             .route("/api/fleet/jobs/{id}/cancel", post(fleet::cancel_job))
-            .route("/api/fleet/groups/{id}/recover", post(fleet::recover_group)),
+            .route("/api/fleet/submissions/{id}/recover", post(fleet::recover_submission)),
         tokens,
         Scope::Admin,
     );
@@ -251,6 +251,39 @@ mod tests {
             .to_bytes();
         let parsed: sbgh_api::WhoamiResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.scope, "admin");
+    }
+
+    #[tokio::test]
+    async fn fleet_recovery_route_uses_submission_vocabulary_without_group_alias() {
+        let tokens = Arc::new(ApiTokens::new("admintok".into(), None, None).unwrap());
+        let body = Body::from(r#"{"reason":"operator recovery","worker_id":null}"#);
+        let renamed = build_router(test_state(), tokens.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fleet/submissions/not-a-uuid/recover")
+                    .header("authorization", "Bearer admintok")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.status(), StatusCode::BAD_REQUEST);
+
+        let legacy = build_router(test_state(), tokens)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fleet/groups/not-a-uuid/recover")
+                    .header("authorization", "Bearer admintok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"operator recovery","worker_id":null}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

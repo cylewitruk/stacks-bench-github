@@ -94,7 +94,7 @@ The daemon owns:
 - exact-key artifact grants, manifest verification, promotion, and staging GC;
 - GitHub/Slack reporting, debounce/rate limiting, comparison, and report
   identity reconciliation;
-- authenticated operator visibility, drain, and explicit group recovery.
+- authenticated operator visibility, drain, and explicit submission recovery.
 
 The daemon has no production dependency on `sbgh-worker`, `sbgh-driver`, or
 `sbgh-libvirt`, and contains no inline execution path.
@@ -178,9 +178,15 @@ GitHub credentials remain layered:
 
 ## Task model
 
+`sbgh_core::SubmissionSpec` is the persisted requested variant inside a
+`TaskSubmission`; it may still contain unresolved workflow state. In contrast,
+`sbgh_driver::TaskSpec` is the fully resolved instruction handed to an
+execution backend. The distinct names preserve the persistence/execution
+boundary and avoid conflating durable planning with one concrete attempt.
+
 The fleet lifecycle is additive across task kinds:
 
-- `benchmark`: comparison-bearing group pinned to one worker and measurement
+- `benchmark`: comparison-bearing submission pinned to one worker and measurement
   profile for every variant/repeat/calibration/carried job;
 - `build_only`: cache production through the same lease/event/artifact path;
 - `block_validation`: one fleet job pinned to one capable worker, with one VM,
@@ -190,7 +196,7 @@ The fleet lifecycle is additive across task kinds:
   persistence/rendering, and composition registration without changing the
   scheduler/lease/event/terminal state machine.
 
-Moving a partial benchmark group between workers is never automatic. Explicit
+Moving a partial benchmark submission between workers is never automatic. Explicit
 recovery creates a new execution generation and reruns from its first
 specification so comparison results never mix measurement environments.
 

@@ -33,7 +33,7 @@ use sbgh_libvirt::{BenchmarkProfile, LibvirtConfig, LvmConfig, PathsConfig, Shel
 use sbgh_worker::{BinaryCacheConfig, WorkerRuntime, build_binary_cache};
 
 use crate::artifact_store::{
-    ArtifactStore, GROUP_SQLITE_RELATIVE, execution_sink, group_artifact_key,
+    ArtifactStore, SUBMISSION_SQLITE_RELATIVE, execution_sink, submission_artifact_key,
 };
 #[cfg(test)]
 use crate::artifact_store::{ArtifactStoreConfig, build_store_or_local};
@@ -56,10 +56,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// without leaving a crashed claim stuck for long.
 const CLAIM_LEASE_MINUTES: i64 = 5;
 
-/// Grace before a Slack reporting session whose group has no active (queued /
+/// Grace before a Slack reporting session whose submission has no active (queued /
 /// running) run is reaped as abandoned. Comfortably exceeds a
-/// repeat group's inter-run carry-forward + provisioning gap, so the sweep
-/// never reaps a healthy group mid-handoff; with the daemon's reaping otherwise
+/// repeat submission's inter-run carry-forward + provisioning gap, so the sweep
+/// never reaps a healthy submission mid-handoff; with the daemon's reaping otherwise
 /// comprehensive, this is a backstop for the rare stranded session.
 const SESSION_ABANDON_GRACE: Duration = Duration::from_secs(10 * 60);
 
@@ -163,8 +163,8 @@ struct JobDeps {
     /// from [`RunnableJobStore`] so the execution view
     /// stays focused on claim/run lifecycle.
     repeat_planner: Option<Arc<dyn RepeatRunPlanner>>,
-    /// Group-scoped Slack reporting sessions, shared into every reporter so a
-    /// repeat group's runs reuse one snapshot projection.
+    /// Submission-scoped Slack reporting sessions, shared into every reporter so a
+    /// repeat submission's runs reuse one snapshot projection.
     slack_sessions: Arc<SlackSessionRegistry>,
 }
 
@@ -372,7 +372,7 @@ impl Runner {
 
     /// Enable repeat-run lazy chaining. The planner appends the next run
     /// only after the prior run has terminally completed and resumes any
-    /// completed-but-not-appended groups at startup from persisted DB state.
+    /// completed-but-not-appended submissions at startup from persisted DB state.
     pub fn with_repeat_planning(mut self, jobs: Arc<dyn JobStore>) -> Self {
         self.deps.repeat_planner = Some(Arc::new(JobStoreRepeatRunPlanner { jobs }));
         self
@@ -635,9 +635,9 @@ impl Coordinator {
                         Err(e) => {
                             tracing::warn!(
                                 completed_job_id = %completed_job_id,
-                                benchmark_group_id = %item.benchmark_group_id,
-                                benchmark_spec_id = %item.benchmark_spec_id,
-                                benchmark_run_index = item.benchmark_run_index,
+                                task_submission_id = %item.task_submission_id,
+                                task_spec_id = %item.task_spec_id,
+                                task_run_index = item.task_run_index,
                                 requested_run_count = item.requested_run_count,
                                 error = ?e,
                                 "repeat planner: startup resume skipped pending run",
@@ -648,9 +648,9 @@ impl Coordinator {
                     if !promoted {
                         tracing::warn!(
                             completed_job_id = %completed_job_id,
-                            benchmark_group_id = %item.benchmark_group_id,
-                            benchmark_spec_id = %item.benchmark_spec_id,
-                            benchmark_run_index = item.benchmark_run_index,
+                            task_submission_id = %item.task_submission_id,
+                            task_spec_id = %item.task_spec_id,
+                            task_run_index = item.task_run_index,
                             requested_run_count = item.requested_run_count,
                             "repeat planner: startup resume found completed run without detail",
                         );
@@ -665,7 +665,7 @@ impl Coordinator {
                             tracing::info!(
                                 completed_job_id = %completed_job_id,
                                 next_job_id = %job.id,
-                                benchmark_run_index = job.benchmark_run_index,
+                                task_run_index = job.task_run_index,
                                 "repeat planner: resumed pending benchmark run",
                             );
                         }
@@ -777,7 +777,7 @@ impl Coordinator {
             // only at claim).
             let reportable = match &job.progress {
                 ProgressTarget::Slack { plan_message_ts, .. } => {
-                    job.benchmark_run_index == 0 && plan_message_ts.is_some()
+                    job.task_run_index == 0 && plan_message_ts.is_some()
                 }
                 _ => {
                     !job.commit.is_empty() && wants_position_check(&self.deps.config.reporting, job)
@@ -983,9 +983,9 @@ impl Coordinator {
         }
     }
 
-    /// Reap Slack reporting sessions abandoned mid-group: idle past
-    /// [`SESSION_ABANDON_GRACE`] **and** whose group has no active (queued /
-    /// running) run. DB-progress-aware so a healthy group in its inter-run
+    /// Reap Slack reporting sessions abandoned mid-submission: idle past
+    /// [`SESSION_ABANDON_GRACE`] **and** whose submission has no active (queued /
+    /// running) run. DB-progress-aware so a healthy submission in its inter-run
     /// carry-forward gap is never reaped early. Best-effort — a DB read error
     /// skips this sweep (we never reap on uncertainty).
     async fn sweep_abandoned_sessions(&self) {
@@ -1005,7 +1005,7 @@ impl Coordinator {
         {
             Ok(jobs) => active.extend(
                 jobs.iter()
-                    .map(|j| j.benchmark_group_id),
+                    .map(|j| j.task_submission_id),
             ),
             Err(e) => {
                 tracing::warn!(error = ?e, "slack: session sweep skipped (queued read failed)");
@@ -1032,7 +1032,7 @@ impl Coordinator {
                 .await
             {
                 Ok(Some(job)) => {
-                    active.insert(job.benchmark_group_id);
+                    active.insert(job.task_submission_id);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1194,9 +1194,9 @@ impl JobDeps {
             },
             task_kind = ?job.task_kind,
             build_target = ?job.build_target,
-            benchmark_group_id = %job.benchmark_group_id,
-            benchmark_spec_id = %job.benchmark_spec_id,
-            benchmark_run_index = job.benchmark_run_index,
+            task_submission_id = %job.task_submission_id,
+            task_spec_id = %job.task_spec_id,
+            task_run_index = job.task_run_index,
             requested_run_count = job.requested_run_count,
             "claimed job; starting",
         );
@@ -1282,7 +1282,7 @@ impl JobDeps {
         let promoted = match self
             .promote_completed_repeat_sqlite(
                 completed_job_id,
-                &job.group_artifact_prefix,
+                &job.submission_artifact_prefix,
                 "repeat planner: carry-forward after terminal completion failed",
             )
             .await
@@ -1291,13 +1291,13 @@ impl JobDeps {
             Err(e) => {
                 tracing::warn!(
                     completed_job_id = %completed_job_id,
-                    benchmark_run_index = job.benchmark_run_index,
+                    task_run_index = job.task_run_index,
                     requested_run_count = job.requested_run_count,
                     error = ?e,
                     "repeat planner: will not enqueue next run until carried SQLite DB is available",
                 );
-                if !job_is_final_group_run(job) {
-                    self.fail_repeat_group_surface(
+                if !job_is_final_submission_run(job) {
+                    self.fail_repeat_submission_surface(
                         job,
                         "repeat group stalled: carrying the shared SQLite DB to the next run \
                          failed",
@@ -1308,8 +1308,8 @@ impl JobDeps {
             }
         };
         if !promoted {
-            if !job_is_final_group_run(job) {
-                self.fail_repeat_group_surface(
+            if !job_is_final_submission_run(job) {
+                self.fail_repeat_submission_surface(
                     job,
                     "repeat group stalled: the completed run did not produce a SQLite DB to carry \
                      forward",
@@ -1326,7 +1326,7 @@ impl JobDeps {
                 tracing::info!(
                     completed_job_id = %completed_job_id,
                     next_job_id = %job.id,
-                    benchmark_run_index = job.benchmark_run_index,
+                    task_run_index = job.task_run_index,
                     "repeat planner: enqueued next benchmark run",
                 );
             }
@@ -1372,25 +1372,25 @@ impl JobDeps {
             .len();
         anyhow::ensure!(len > 0, "{context}: archived SQLite {} is empty", src.display());
 
-        let group_key = group_sqlite_key(artifact_prefix);
+        let submission_key = submission_sqlite_key(artifact_prefix);
         let Some(bytes) = self
             .artifact_store
-            .put(&group_key, &src)
+            .put(&submission_key, &src)
             .await
         else {
-            anyhow::bail!("{context}: failed to store carried SQLite at {group_key}");
+            anyhow::bail!("{context}: failed to store carried SQLite at {submission_key}");
         };
         tracing::info!(
             completed_job_id = %completed_job_id,
             sqlite_archived_path = sqlite_key,
-            group_sqlite_key = group_key,
+            submission_sqlite_key = submission_key,
             bytes,
             "repeat planner: carried benchmark SQLite DB",
         );
         Ok(true)
     }
 
-    async fn fail_repeat_group_surface(&self, job: &RunnableJob, reason: &str) {
+    async fn fail_repeat_submission_surface(&self, job: &RunnableJob, reason: &str) {
         let surface = build_report_surface(
             self.gh.clone(),
             self.jobs.clone(),
@@ -1403,21 +1403,21 @@ impl JobDeps {
     }
 }
 
-fn group_sqlite_key(artifact_prefix: &str) -> String {
-    group_artifact_key(artifact_prefix, GROUP_SQLITE_RELATIVE)
+fn submission_sqlite_key(artifact_prefix: &str) -> String {
+    submission_artifact_key(artifact_prefix, SUBMISSION_SQLITE_RELATIVE)
 }
 
 fn job_should_carry_sqlite(job: &RunnableJob) -> bool {
-    uses_shared_calibration(job.task_kind, job.build_target, job.group_requested_run_count)
+    uses_shared_calibration(job.task_kind, job.build_target, job.submission_requested_run_count)
 }
 
-fn job_is_final_group_run(job: &RunnableJob) -> bool {
-    job.group_run_index + 1 >= job.group_requested_run_count
+fn job_is_final_submission_run(job: &RunnableJob) -> bool {
+    job.submission_run_index + 1 >= job.submission_requested_run_count
 }
 
 fn sqlite_seed_key_for(job: &RunnableJob) -> Option<String> {
-    if job_should_carry_sqlite(job) && job.group_run_index > 0 {
-        Some(group_sqlite_key(&job.group_artifact_prefix))
+    if job_should_carry_sqlite(job) && job.submission_run_index > 0 {
+        Some(submission_sqlite_key(&job.submission_artifact_prefix))
     } else {
         None
     }
@@ -1438,7 +1438,7 @@ fn execution_request_for(
                 shared_baseline_calibration: job_should_carry_sqlite(job),
                 baseline_calibration_id: job.baseline_calibration_id,
                 run: BenchmarkRunContext {
-                    run_index: job.benchmark_run_index,
+                    run_index: job.task_run_index,
                     requested_run_count: job.requested_run_count,
                 },
             })

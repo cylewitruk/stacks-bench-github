@@ -557,21 +557,21 @@ fn test_libvirt_driver(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Arc<
 }
 
 fn benchmark_job(
-    benchmark_run_index: i32,
+    task_run_index: i32,
     requested_run_count: i32,
-    group_run_index: i32,
-    group_requested_run_count: i32,
+    submission_run_index: i32,
+    submission_requested_run_count: i32,
 ) -> RunnableJob {
     RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index,
         requested_run_count,
-        group_requested_run_count,
-        group_run_index,
+        submission_requested_run_count,
+        submission_run_index,
         baseline_calibration_id: None,
-        group_artifact_prefix: "group-a".into(),
+        submission_artifact_prefix: "submission-a".into(),
         repository: "acme/widgets".into(),
         commit: "abc123".into(),
         git_ref_display: "develop".into(),
@@ -649,7 +649,7 @@ fn stale_workload_key_does_not_add_a_runtime_failure_path() {
 }
 
 #[test]
-fn sqlite_carry_uses_group_sequence_not_spec_run_index() {
+fn sqlite_carry_uses_submission_sequence_not_spec_run_index() {
     let first = benchmark_job(0, 1, 0, 2);
     assert!(job_should_carry_sqlite(&first));
     assert_eq!(sqlite_seed_key_for(&first), None);
@@ -658,11 +658,11 @@ fn sqlite_carry_uses_group_sequence_not_spec_run_index() {
     assert!(job_should_carry_sqlite(&second_spec_first_run));
     assert_eq!(
         sqlite_seed_key_for(&second_spec_first_run),
-        Some(group_sqlite_key(&second_spec_first_run.group_artifact_prefix)),
+        Some(submission_sqlite_key(&second_spec_first_run.submission_artifact_prefix)),
     );
     assert!(
-        job_is_final_group_run(&second_spec_first_run),
-        "spec 1 run 0 is the final group run in a two-variant comparison"
+        job_is_final_submission_run(&second_spec_first_run),
+        "spec 1 run 0 is the final submission run in a two-variant comparison"
     );
 }
 
@@ -678,14 +678,14 @@ async fn run_once_drives_unreported_baseline_job_to_terminal_fail() {
 
     let job = RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 2,
-        group_requested_run_count: 2,
-        group_run_index: 0,
+        submission_requested_run_count: 2,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: "group-a".into(),
+        submission_artifact_prefix: "submission-a".into(),
         repository: "acme/widgets".into(),
         commit: "abc123".into(), // pre-resolved → preflight is a no-op
         git_ref_display: "develop".into(),
@@ -743,14 +743,14 @@ async fn run_once_build_only_job_is_silent() {
 
     let job = RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 2,
-        group_requested_run_count: 2,
-        group_run_index: 0,
+        submission_requested_run_count: 2,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: "group-a".into(),
+        submission_artifact_prefix: "submission-a".into(),
         repository: "acme/widgets".into(),
         commit: "abc123".into(), // pre-resolved → preflight is a no-op
         git_ref_display: "develop".into(),
@@ -792,14 +792,14 @@ async fn completed_run_appends_next_repeat_after_terminal_persist() {
     let config = Arc::new(test_config(&tmp));
     let job = RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 2,
-        group_requested_run_count: 2,
-        group_run_index: 0,
+        submission_requested_run_count: 2,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: "group-a".into(),
+        submission_artifact_prefix: "submission-a".into(),
         repository: "acme/widgets".into(),
         commit: "abc123".into(),
         git_ref_display: "develop".into(),
@@ -843,11 +843,11 @@ async fn completed_run_appends_next_repeat_after_terminal_persist() {
 
     assert_eq!(source.calls(), vec!["start_running", "complete"]);
     assert_eq!(planner.appended(), vec![job.id]);
-    let group_sqlite = tmp
+    let submission_sqlite = tmp
         .path()
         .join("archive")
-        .join(group_sqlite_key(&job.group_artifact_prefix));
-    assert_eq!(std::fs::read(group_sqlite).unwrap(), b"sqlite bytes");
+        .join(submission_sqlite_key(&job.submission_artifact_prefix));
+    assert_eq!(std::fs::read(submission_sqlite).unwrap(), b"sqlite bytes");
 }
 
 #[tokio::test]
@@ -856,14 +856,14 @@ async fn repeat_append_failure_is_nonfatal_to_completed_run() {
     let config = Arc::new(test_config(&tmp));
     let job = RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 2,
-        group_requested_run_count: 2,
-        group_run_index: 0,
+        submission_requested_run_count: 2,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: "group-b".into(),
+        submission_artifact_prefix: "submission-b".into(),
         repository: "acme/widgets".into(),
         commit: "abc123".into(),
         git_ref_display: "develop".into(),
@@ -916,14 +916,14 @@ async fn failed_repeat_does_not_try_to_carry_or_append_next_run() {
     let config = Arc::new(test_config(&tmp));
     let job = RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 2,
-        group_requested_run_count: 2,
-        group_run_index: 0,
+        submission_requested_run_count: 2,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: "group-failed".into(),
+        submission_artifact_prefix: "submission-failed".into(),
         repository: "acme/widgets".into(),
         commit: "abc123".into(),
         git_ref_display: "develop".into(),
@@ -972,14 +972,14 @@ async fn missing_carried_sqlite_blocks_next_repeat_append() {
     let config = Arc::new(test_config(&tmp));
     let job = RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 2,
-        group_requested_run_count: 2,
-        group_run_index: 0,
+        submission_requested_run_count: 2,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: "group-missing".into(),
+        submission_artifact_prefix: "submission-missing".into(),
         repository: "acme/widgets".into(),
         commit: "abc123".into(),
         git_ref_display: "develop".into(),
@@ -998,7 +998,7 @@ async fn missing_carried_sqlite_blocks_next_repeat_append() {
         claim_token: Some(Uuid::new_v4()),
     };
     let source = Arc::new(FakeSource::new(job.clone()));
-    assert!(!job_is_final_group_run(&job), "fixture must be an intermediate group run");
+    assert!(!job_is_final_submission_run(&job), "fixture must be an intermediate submission run");
     let planner = Arc::new(FakeRepeatPlanner::default());
     planner.set_completed_detail(
         job.id,
@@ -1067,11 +1067,11 @@ async fn coordinator_resumes_pending_repeats_on_startup() {
     );
     planner.set_pending(vec![sbgh_core::db::jobs::PendingBenchmarkRun {
         completed_job_id,
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 2,
-        artifact_prefix: "startup-group".into(),
+        artifact_prefix: "startup-submission".into(),
     }]);
     let deps = JobDeps {
         artifact_store: build_test_artifact_store(config.as_ref()),
@@ -1094,11 +1094,11 @@ async fn coordinator_resumes_pending_repeats_on_startup() {
 
     assert_eq!(planner.resume_calls(), 1);
     assert_eq!(planner.appended(), vec![completed_job_id]);
-    let group_sqlite = tmp
+    let submission_sqlite = tmp
         .path()
         .join("archive")
-        .join(group_sqlite_key("startup-group"));
-    assert_eq!(std::fs::read(group_sqlite).unwrap(), b"startup sqlite");
+        .join(submission_sqlite_key("startup-submission"));
+    assert_eq!(std::fs::read(submission_sqlite).unwrap(), b"startup sqlite");
 }
 
 /// A `tag_created` job is enqueued with no commit; the runner
@@ -1112,14 +1112,14 @@ async fn run_once_resolves_tag_commit_in_preflight() {
 
     let job = RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 1,
-        group_requested_run_count: 1,
-        group_run_index: 0,
+        submission_requested_run_count: 1,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: Uuid::new_v4().to_string(),
+        submission_artifact_prefix: Uuid::new_v4().to_string(),
         repository: "octo/core".into(),
         commit: String::new(), // unresolved — a tag job
         git_ref_display: "release/1.2".into(),
@@ -1181,14 +1181,14 @@ async fn run_once_resolves_slack_rev_commit_in_preflight() {
 
     let job = RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 1,
-        group_requested_run_count: 1,
-        group_run_index: 0,
+        submission_requested_run_count: 1,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: Uuid::new_v4().to_string(),
+        submission_artifact_prefix: Uuid::new_v4().to_string(),
         repository: "octo/core".into(),
         commit: String::new(), // unresolved — a Slack ad-hoc job
         git_ref_display: "develop".into(),
@@ -1269,14 +1269,14 @@ async fn run_to_fail(config: DaemonConfig, job: RunnableJob) -> (Vec<FakeCall>, 
 fn pr_job(commit: &str, check_run_id: Option<i64>) -> RunnableJob {
     RunnableJob {
         id: Uuid::new_v4(),
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 1,
-        group_requested_run_count: 1,
-        group_run_index: 0,
+        submission_requested_run_count: 1,
+        submission_run_index: 0,
         baseline_calibration_id: None,
-        group_artifact_prefix: Uuid::new_v4().to_string(),
+        submission_artifact_prefix: Uuid::new_v4().to_string(),
         repository: "acme/widgets".into(),
         commit: commit.into(),
         git_ref_display: "feature".into(),
@@ -1431,7 +1431,7 @@ async fn comment_reconcile_closes_create_persist_crash_window() {
     let tmp = TempDir::new().unwrap();
     let config = config_with(&tmp, PrReport::Comment, BaselineReport::None);
     let job = pr_job("abc123", None);
-    let marker = crate::report::pr_report_marker(job.benchmark_group_id);
+    let marker = crate::report::pr_report_marker(job.task_submission_id);
     let source = Arc::new(FakeSource::new(job));
     let gh = Arc::new(FakeGitHub::new());
     gh.set_existing_comment("acme/widgets", 7, 4242, &marker, 8765);
@@ -2064,12 +2064,12 @@ async fn startup_concludes_orphan_check_as_cancelled() {
     // The reconstructed orphan view carries a commit check (id 555) to conclude.
     source.set_orphan_runnable(RunnableJob {
         id: orphan_id,
-        benchmark_group_id: Uuid::new_v4(),
-        benchmark_spec_id: Uuid::new_v4(),
-        benchmark_run_index: 0,
+        task_submission_id: Uuid::new_v4(),
+        task_spec_id: Uuid::new_v4(),
+        task_run_index: 0,
         requested_run_count: 1,
         baseline_calibration_id: None,
-        group_artifact_prefix: Uuid::new_v4().to_string(),
+        submission_artifact_prefix: Uuid::new_v4().to_string(),
         progress: ProgressTarget::CommitCheck { check_run_id: Some(555) },
         ..pr_job("abc123", None)
     });
@@ -2538,10 +2538,10 @@ async fn coordinator_skips_queue_position_for_appended_repeat_slack_runs() {
     let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
     let source = Arc::new(FakeSource::new(pr_job("unused", None)));
     let mut repeat = slack_job(Some("PLAN_TS"));
-    repeat.benchmark_run_index = 1;
+    repeat.task_run_index = 1;
     repeat.requested_run_count = 2;
-    repeat.group_requested_run_count = 2;
-    repeat.group_run_index = 1;
+    repeat.submission_requested_run_count = 2;
+    repeat.submission_run_index = 1;
     source.set_queued(vec![repeat]);
     let slack = Arc::new(FakePositionSlack::default());
     let mut coord = position_coord_with_slack(config, source.clone(), slack.clone());
@@ -2556,7 +2556,7 @@ async fn coordinator_skips_queue_position_for_appended_repeat_slack_runs() {
             .lock()
             .unwrap()
             .is_empty(),
-        "later repeat runs inherit the group message but must not overwrite it with queue \
+        "later repeat runs inherit the submission message but must not overwrite it with queue \
              position",
     );
 }
