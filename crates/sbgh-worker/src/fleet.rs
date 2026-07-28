@@ -6,16 +6,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 use sbgh_driver::{
-    ArtifactSink, BenchmarkRunContext, BenchmarkTask, BlockValidationTaskSpec, DatasetIdentity,
-    ExecutionContext, ExecutionPlacement, ExecutionRequest, ExecutionTask, InclusiveRange,
-    RepositoryCredential, Terminal, ValidationEpoch, WorkerEvent,
+    ArtifactSink, BenchmarkRunContext, BenchmarkTask, BlockValidationTaskSpec, ExecutionContext,
+    ExecutionPlacement, ExecutionRequest, ExecutionTask, InclusiveRange, RepositoryCredential,
+    Terminal, ValidationEpoch, WorkerEvent,
 };
 use sbgh_libvirt::SystemShell;
 use sbgh_proto::{
     AcceptOfferRequest, CompleteAttemptRequest, DesiredState, HeartbeatRequest, PROTOCOL_VERSION,
     PollRequest, PollResponse, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
     ReliableEventEnvelope, ReliableEventPayload, RepositoryCredentialRequest, RepositoryToken,
-    TaskPayload, TerminalOutcome, Validate,
+    ResourceFacts, TaskPayload, TerminalOutcome, Validate,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -28,25 +28,42 @@ use crate::{WorkerRuntime, build_binary_cache};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
 
-/// Validate the local block-validation sandbox, sealed dataset, and current
-/// thin-pool admission without registering a worker session.
+/// Validate every advertised local sandbox recipe before registering a worker
+/// session.
 pub async fn preflight_local_execution(config: &WorkerConfig) -> anyhow::Result<()> {
-    if !config
+    let driver = preflight_driver(config)?;
+    if config
+        .capabilities
+        .contains(&sbgh_proto::WorkerCapability::Benchmark)
+    {
+        driver
+            .preflight_benchmark()
+            .await
+            .context("validating benchmark sandbox and immutable origin")?;
+    } else if config
+        .capabilities
+        .contains(&sbgh_proto::WorkerCapability::BuildOnly)
+    {
+        driver
+            .preflight_build()
+            .await
+            .context("validating build-only sandbox")?;
+    }
+    if config
         .capabilities
         .contains(&sbgh_proto::WorkerCapability::BlockValidation)
     {
-        return Ok(());
+        preflight_block_validation(&driver).await?;
     }
+    Ok(())
+}
+
+fn preflight_driver(config: &WorkerConfig) -> anyhow::Result<sbgh_libvirt::LibvirtDriver> {
     let libvirt = config
         .libvirt
         .clone()
-        .context("block_validation capability requires [libvirt]")?;
-    let dataset = config
-        .resources
-        .dataset
-        .as_ref()
-        .context("block_validation capability requires resources.dataset")?;
-    let driver = sbgh_libvirt::LibvirtDriver::new(
+        .context("execution capabilities require [libvirt]")?;
+    Ok(sbgh_libvirt::LibvirtDriver::new(
         libvirt.clone(),
         Arc::new(SystemShell::new(&libvirt.paths.sudo_binary)),
         Arc::new(CleanupArtifactSink),
@@ -55,24 +72,14 @@ pub async fn preflight_local_execution(config: &WorkerConfig) -> anyhow::Result<
             .as_ref()
             .and_then(build_binary_cache)
             .map(|cache| cache as Arc<dyn sbgh_driver::BinaryCacheStore>),
-    );
-    driver
-        .preflight_block_validation(&driver_dataset_identity(dataset))
-        .await
-        .context("validating libvirt block-validation profile and sealed dataset")
+    ))
 }
 
-fn driver_dataset_identity(dataset: &sbgh_proto::DatasetIdentity) -> DatasetIdentity {
-    DatasetIdentity {
-        generation: dataset.generation.clone(),
-        network: dataset.network.clone(),
-        format_version: dataset.format_version.clone(),
-        covered_start: dataset.covered_start,
-        covered_end: dataset.covered_end,
-        manifest_sha256: dataset
-            .manifest_sha256
-            .clone(),
-    }
+async fn preflight_block_validation(driver: &sbgh_libvirt::LibvirtDriver) -> anyhow::Result<()> {
+    driver
+        .preflight_block_validation()
+        .await
+        .context("validating block-validation sandbox and local read-only origin")
 }
 
 fn driver_block_result_to_wire(
@@ -90,18 +97,22 @@ fn driver_block_result_to_wire(
                 reason: invalid.reason,
             })
             .collect(),
-        dataset: sbgh_proto::DatasetIdentity {
-            generation: result.dataset.generation,
-            network: result.dataset.network,
-            format_version: result.dataset.format_version,
-            covered_start: result.dataset.covered_start,
-            covered_end: result.dataset.covered_end,
-            manifest_sha256: result.dataset.manifest_sha256,
+        chainstate_origin: result.chainstate_origin,
+        observed_range: sbgh_proto::InclusiveRange {
+            start: result.observed_range.start,
+            end: result.observed_range.end,
         },
     }
 }
 
-pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> anyhow::Result<()> {
+pub async fn run(
+    config: WorkerConfig,
+    resources: ResourceFacts,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    config
+        .validate_host_resources(&resources)
+        .context("validating execution profiles against discovered host resources")?;
     preflight_local_execution(&config).await?;
     let client = FleetClient::build(
         &config.orchestrator_url,
@@ -117,7 +128,7 @@ pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> anyhow::R
             worker_session_id: session_id,
             software_version: env!("CARGO_PKG_VERSION").into(),
             advertised_capabilities: config.capabilities.clone(),
-            resources: config.resources.clone(),
+            resources,
         })
         .await
         .context("registering worker session")?;
@@ -237,7 +248,6 @@ async fn admit_offer(config: &WorkerConfig, offer: &sbgh_proto::WorkOffer) -> an
             );
         }
         sbgh_proto::OfferRequirements::BlockValidation {
-            dataset,
             requested_shards,
             max_concurrency,
         } => {
@@ -255,14 +265,6 @@ async fn admit_offer(config: &WorkerConfig, offer: &sbgh_proto::WorkOffer) -> an
                 })
                 .context("block-validation offer has no local sandbox profile")?;
             anyhow::ensure!(
-                config
-                    .resources
-                    .dataset
-                    .as_ref()
-                    == Some(dataset),
-                "block-validation offer requests a different dataset generation"
-            );
-            anyhow::ensure!(
                 *requested_shards > 0 && *requested_shards <= profile.max_shards,
                 "block-validation offer exceeds local shard limit"
             );
@@ -270,9 +272,11 @@ async fn admit_offer(config: &WorkerConfig, offer: &sbgh_proto::WorkOffer) -> an
                 *max_concurrency > 0 && *max_concurrency <= profile.max_concurrency,
                 "block-validation offer exceeds local concurrency limit"
             );
-            // Re-check sealed origin and current Data%/Meta% immediately before
-            // acceptance; registration-time health is not a durable lease.
-            preflight_local_execution(config).await?;
+            // Re-check the immutable local origin and current pool health
+            // immediately before acceptance;
+            // registration-time health is not a durable lease.
+            let driver = preflight_driver(config)?;
+            preflight_block_validation(&driver).await?;
         }
     }
     Ok(())
@@ -625,7 +629,6 @@ fn execution_request(
         TaskPayload::BuildOnly => ExecutionTask::BuildOnly,
         TaskPayload::BlockValidation(payload) => {
             ExecutionTask::BlockValidation(BlockValidationTaskSpec {
-                dataset: driver_dataset_identity(&payload.dataset),
                 epoch: match payload.epoch {
                     sbgh_proto::ValidationEpoch::PreNakamoto => ValidationEpoch::PreNakamoto,
                     sbgh_proto::ValidationEpoch::Nakamoto => ValidationEpoch::Nakamoto,
@@ -963,11 +966,6 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let config =
             WorkerConfig::load(&root.join("config.example.worker-block-validation.toml")).unwrap();
-        let dataset = config
-            .resources
-            .dataset
-            .clone()
-            .unwrap();
         let offer = WorkOffer {
             identity: AttemptIdentity {
                 worker_session_id: Uuid::new_v4(),
@@ -979,7 +977,6 @@ mod tests {
             trace_id: Uuid::new_v4(),
             capability: WorkerCapability::BlockValidation,
             requirements: OfferRequirements::BlockValidation {
-                dataset,
                 requested_shards: 49,
                 max_concurrency: 48,
             },

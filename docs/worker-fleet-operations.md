@@ -42,6 +42,15 @@ The lease-HMAC key must contain at least 32 random bytes and be mode `0600`.
 Rotate it only after draining all workers and confirming there are no active
 attempts; rotation invalidates every outstanding lease token.
 
+Every execution profile uses the checked-in `sandbox-egress` XML and nftables
+policy for all guest phases. The policy permits dependency fetches but denies
+the host, private/link-local and metadata destinations, IPv6 fallback, and
+operator-listed public infrastructure CIDRs. Worker preflight rejects alternate
+network names and invokes the root-owned structural verifier. Each domain
+requests libvirt port isolation. Because dependency egress is still egress,
+this boundary is not DLP; deployments handling confidential source should put
+an allowlisted dependency proxy behind the same contract.
+
 ## Installation
 
 1. Install the release binaries and units with
@@ -53,13 +62,21 @@ attempts; rotation invalidates every outstanding lease token.
 3. Install the daemon fleet config at a root-controlled path and set
    `SBGH_FLEET_CONFIG` in `/etc/sbgh/daemon/secrets.env`.
 4. Install worker profiles as `/etc/sbgh/worker/<profile>.toml` from the
-   benchmark and block-validation examples.
-5. Enable `sbgh-worker@benchmark.service` locally and
+   benchmark and block-validation examples. CPU and RAM are discovered at
+   process startup; do not copy host-capacity totals into these profiles.
+5. Install the network policy with `sudo
+   ./scripts/install-sandbox-network.sh --install-only`, add
+   environment-specific protected public CIDRs, then apply it with `sudo
+   ./scripts/install-sandbox-network.sh`.
+6. Add the exact root-owned
+   `/usr/local/libexec/sbgh-check-sandbox-network` command to the worker sudo
+   allowlist.
+7. Enable `sbgh-worker@benchmark.service` locally and
    `sbgh-worker@block-validation.service` on the dedicated host.
-6. Install
+8. Install
    [sbgh-worker-block-validation-hardening.conf](../systemd/sbgh-worker-block-validation-hardening.conf)
    as the block worker's systemd drop-in after adjusting its paths.
-7. Start the daemon only after its complete preflight passes, then enable the
+9. Start the daemon only after its complete preflight passes, then enable the
    intended worker profile. Use `systemctl enable --now sbgh-daemon.service`
    followed by `systemctl enable --now sbgh-worker@<profile>.service`.
 
@@ -78,19 +95,33 @@ validation. The worker copies it into the VM, so it must not be a production
 follower configuration containing RPC passwords, node keys, seed material, or
 other reusable credentials.
 
-## Host and dataset validation
+## Host and chainstate validation
 
-Block validation consumes a read-only, sealed LVM-thin origin generation. The
-configured manifest path must be on a read-only mount whose source resolves to
-that exact LV; startup rejects a copied or unrelated manifest, a writable
-origin, missing provenance tags, an identity/digest mismatch, or a
-`.sbgh-dataset-files.sha256` digest that does not match the sealed manifest.
-The guest repeats both manifest checks after mounting its snapshots. The origin
-is never attached to a guest.
+Every benchmark and block-validation chainstate origin must be read-only. The
+worker never attaches an origin to a guest; it creates an explicitly writable
+attempt snapshot instead. Benchmark and block-validation preflight resolve the
+newest LV matching the worker-local `chainstate_base_prefix`, reject a writable
+origin, and apply the same fixed thin-pool health floor. Build-only preflight
+does not require or allocate chainstate. Every worker is expected to run the
+same nightly/on-demand updater and have a sufficiently recent local origin.
+Block-validation guests probe the selected snapshot and fail as infrastructure
+when the requested range is absent; successful results record the exact origin
+and observed range. Manifests and LVM tags are optional provenance only.
 
-Before enabling the capability, run the worker preflight and record:
+At startup, the worker discovers its available logical CPU count and Linux
+`MemTotal`, validates every advertised execution profile against that capacity,
+and registers those measured facts for fleet observability. Guest vCPU, memory,
+CPU placement, shard, and concurrency values remain operator policy in the
+profile. Storage is validated by the component that owns it (thin-pool health,
+binary-cache limit, and required filesystem paths); the worker does not publish
+an ambiguous aggregate storage total.
+
+Before enabling an execution capability, run its worker preflight and record:
 
 ```bash
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/benchmark.toml \
+  --preflight-only
 sudo -u sbgh-worker sbgh-worker \
   --config /etc/sbgh/worker/block-validation.toml \
   --preflight-only
@@ -100,14 +131,37 @@ sudo ./scripts/characterize-worker-host.sh \
 ```
 
 `--preflight-only` verifies the golden image, fixed command binaries, writable
-runtime directories, selected libvirt network, exact origin,
-manifest/file-list, tags, read-only mount, and the shared fixed Data%/Meta%
-health floor. The floor rejects an already near-full or mis-provisioned pool;
-it does not predict assignment writes and never scales with K. Registration
-and block-offer admission run the same checks; the standalone command opens no
+runtime directories, fixed `sandbox-egress` name, root-owned structural
+policy, read-only origin, and the shared fixed Data%/Meta% health floor.
+The floor rejects an already near-full or mis-provisioned pool; it does not
+predict assignment writes and never scales with K. Registration and
+block-offer admission run the same checks; the standalone command opens no
 fleet session. Block validation rolls each block's processing writes back; its
 MB-scale WAL/SHM divergence is not reserved as if every shard were a
 write-heavy workload.
+
+Structural verification proves the intended policy is loaded, but not packet
+behavior. Before enabling either execution profile—and after any firewall,
+routing, libvirt, or protected-CIDR change—run:
+
+```bash
+sudo ./scripts/qualify-sandbox-network.sh --execute \
+  /var/lib/sbgh-worker/v26-sandbox-egress.md \
+  /var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2
+```
+
+The disposable VM must fetch `https://index.crates.io/config.json` (or an
+operator-supplied HTTPS dependency canary) while controlled host, RFC1918, and
+metadata-like endpoints remain unreachable. Retain the report with the host
+qualification evidence.
+Use repeatable `--deny-tcp IP:PORT` arguments for safe listening endpoints on
+operator-protected public control-plane addresses. The ceremony rejects
+addresses outside `protected-ipv4.conf` and first proves each endpoint is
+reachable from the host. It repeats that host control after the guest probe, so
+an offline or disappearing service cannot produce a vacuous pass.
+After any firewall-service reload, restart
+`sbgh-sandbox-egress.service`, rerun this ceremony, and only then restart
+workers.
 
 Run the checked-in two-snapshot isolation smoke once for each host/storage
 setup. It defaults to a dry run:
@@ -116,20 +170,19 @@ setup. It defaults to a dry run:
 sudo ./scripts/qualify-block-validation-lvm.sh \
   /var/lib/sbgh-worker/v26-lvm-isolation.md \
   vg0 mainnet-full-2026-07-26 \
-  /srv/sbgh/datasets/mainnet-2026-07-26
+  /mnt/sbgh-chainstate-origin
 
 # After reviewing the resolved values and draining the worker:
 sudo ./scripts/qualify-block-validation-lvm.sh --execute \
   /var/lib/sbgh-worker/v26-lvm-isolation.md \
   vg0 mainnet-full-2026-07-26 \
-  /srv/sbgh/datasets/mainnet-2026-07-26
+  /mnt/sbgh-chainstate-origin
 ```
 
-The smoke refuses to overwrite prior evidence, requires the exact read-only
-origin and mandatory provenance tags, verifies the sealed manifest contract,
-creates two explicitly writable snapshots, mounts them with the production XFS
-safety options, proves bidirectional peer/origin write isolation, and fails on
-a cleanup residue.
+The smoke refuses to overwrite prior evidence, requires the selected origin to
+be read-only and mounted from the named LV, creates two explicitly writable
+snapshots, mounts them with the production XFS safety options, proves
+bidirectional peer/origin write isolation, and fails on a cleanup residue.
 
 Then run one end-to-end canary at the intended K and compare its logical result
 and artifacts with the established manual validation. The canary itself
@@ -140,12 +193,10 @@ capacity planning, not a release gate.
 
 The future
 [0052 managed-node producer](../planning/design/0052-managed-stacks-node-chainstate-producer.md)
-is the canonical generation producer. Until it ships, manually minted
-generations must follow the same contract: quiesced source, read-only origin
-LV, `sbgh_sealed` and `sbgh_validated` tags, exact identity manifest, immutable
-publication, and a new LV for every update. Update worker/registry
-configuration under drain and retain old origins while any attempt, result, or
-cleanup obligation references them.
+may replace the downloader. Until then, each worker independently refreshes
+under the same naming prefix, publishes a new read-only LV, and retains old
+origins while active snapshots reference them. Distributed generation
+registration/promotion/bootstrap is deliberately deferred.
 
 ## Normal operation
 
@@ -170,7 +221,7 @@ comparison. `--worker-id` optionally pins the new generation to an enabled,
 non-draining worker authorized for benchmark work; omit it to let normal
 compatible-worker placement choose.
 
-The authenticated `/api/fleet` view shows registry/session/resource/dataset,
+The authenticated `/api/fleet` view shows registry/session/resource,
 lease, attempt, trace, and cleanup state. `/api/fleet/metrics` exports
 Prometheus text. Alert initially on:
 
@@ -187,18 +238,39 @@ silently requeueing.
 
 ## Upgrade, maintenance, and restart
 
-The fleet requires exact protocol-version equality. v26 uses wire version 2,
-which adds a bounded offer-requirements summary so dataset, shard, concurrency,
-and current thin-pool health are checked before lease acceptance. Upgrade
-under a full drain; a v1 worker cannot register with a v2 daemon:
+The fleet requires exact protocol-version equality. v26 uses wire version 3,
+which keeps block offers limited to shard/concurrency requirements while
+chainstate selection stays local. Upgrade under a full drain; older workers
+cannot register with a v3 daemon:
 
 1. Drain all workers and wait for active attempts and cleanup obligations to
    reach zero.
 2. Stop workers.
 3. Upgrade/restart the daemon and apply its forward-only migration.
 4. Upgrade workers to the identical release.
-5. Start workers, verify mTLS registration/version/capabilities/dataset, then
+5. Start workers, verify mTLS registration/version/capabilities, then
    undrain.
+
+Treat nftables, libvirt firewall, and host firewall upgrades as network-policy
+maintenance, even when no sbgh release changes. The supported nftables version
+is the distro-maintained package on Debian 12 or Ubuntu 24.04 whose rendered
+rules pass the exact live verifier. Because that verifier intentionally fails
+closed on output drift, perform these steps under drain:
+
+1. Stop workers and record `nft --version`.
+2. Apply the package or firewall change.
+3. Run `systemd-analyze verify
+   /etc/systemd/system/sbgh-sandbox-egress.service` for syntax.
+4. Restart `sbgh-sandbox-egress.service` and require `systemctl is-active
+   --quiet sbgh-sandbox-egress.service` to succeed.
+5. Inspect `journalctl -u sbgh-sandbox-egress.service -n 50 --no-pager` and
+   require the `sandbox-egress structural policy check passed` message.
+6. Run `/usr/local/libexec/sbgh-check-sandbox-network`, then repeat the active
+   disposable-guest ceremony, including configured operator TCP probes.
+7. Restart and undrain workers only after every check passes.
+
+`systemd-analyze verify` cannot prove runtime sandbox behavior; the actual unit
+start and `ExecStartPost` result are the load-bearing gate.
 
 A same-process network reconnect resends unacknowledged reliable envelopes from
 memory. A worker-process restart creates a new session; the daemon fences the
@@ -227,6 +299,8 @@ Before production cutover, record the run/job/attempt/trace IDs for:
 - exact K virtio-scsi devices and serials, XFS `nouuid` mounts, origin
   immutability, shared thin-pool health rejection, partial allocation rollback,
   and attempt-scoped restart cleanup;
+- sandbox network structural verification plus the disposable-guest positive
+  dependency and negative host/private/metadata/operator-endpoint probes;
 - graceful drain and certificate rotation/revocation.
 
 Expected invariants: one current attempt per scheduling unit, one accepted

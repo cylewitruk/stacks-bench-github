@@ -111,6 +111,8 @@ const SCCACHE_MAX_SIZE: &str = "20G";
 const MAX_CALIBRATION_RESULT_BYTES: u64 = 1024 * 1024;
 const MAX_BASELINE_ID_BYTES: u64 = 4096;
 const MAX_GUEST_BINARY_BYTES: u64 = 1024 * 1024 * 1024;
+const SANDBOX_NETWORK: &str = "sandbox-egress";
+const SANDBOX_NETWORK_POLICY_CHECK: &str = "/usr/local/libexec/sbgh-check-sandbox-network";
 
 fn safe_resource_component(value: &str) -> bool {
     !value.is_empty()
@@ -389,64 +391,25 @@ impl LibvirtDriver {
         }
     }
 
-    /// Validate the configured block-validation profile before the worker
-    /// advertises the capability.
-    pub async fn preflight_block_validation(
-        &self,
-        identity: &sbgh_driver::DatasetIdentity,
-    ) -> anyhow::Result<()> {
+    /// Validate host-side sandbox dependencies shared by every task recipe.
+    async fn preflight_sandbox(&self) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let profile = self
-            .config
-            .block_validation
-            .as_ref()
-            .context("block-validation libvirt profile is absent")?;
-        anyhow::ensure!(profile.vcpus > 0, "block-validation vcpus must be non-zero");
-        anyhow::ensure!(profile.memory_bytes > 0, "block-validation memory_bytes must be non-zero");
         anyhow::ensure!(
-            profile.results_tmpfs_mib > 0,
-            "block-validation results_tmpfs_mib must be non-zero"
-        );
-        anyhow::ensure!(
-            profile.max_shards > 0
-                && profile.max_concurrency > 0
-                && profile.max_concurrency <= profile.max_shards,
-            "invalid block-validation shard/concurrency limits"
-        );
-        anyhow::ensure!(
-            profile.max_parallel_jobs == 1,
-            "v26 supports exactly one block-validation assignment per worker"
-        );
-        anyhow::ensure!(
-            profile.max_shards <= 64,
-            "v26 supports at most 64 virtio-scsi shard devices per VM"
-        );
-        anyhow::ensure!(
-            safe_resource_component(
-                &profile
-                    .dataset
-                    .snapshot_prefix
-            ),
-            "block-validation snapshot_prefix is not a valid LVM name component"
+            self.config.vm.network == SANDBOX_NETWORK,
+            "execution network must be the policy-managed `{SANDBOX_NETWORK}` network"
         );
         self.config
             .lvm
             .validate_pool_health_policy()?;
+        let golden = &self.config.vm.golden_image;
         anyhow::ensure!(
-            profile
-                .chain_config
-                .is_absolute(),
-            "block-validation chain_config must be absolute"
+            golden.is_file(),
+            "golden image is not a regular file: {}",
+            golden.display()
         );
-        for (name, path) in [
-            ("golden image", &self.config.vm.golden_image),
-            ("block-validation chain config", &profile.chain_config),
-        ] {
-            anyhow::ensure!(path.is_file(), "{name} is not a regular file: {}", path.display());
-            std::fs::File::open(path)
-                .with_context(|| format!("{name} is not readable: {}", path.display()))?;
-        }
+        std::fs::File::open(golden)
+            .with_context(|| format!("golden image is not readable: {}", golden.display()))?;
         for (name, path) in [
             ("sudo", &self.config.paths.sudo_binary),
             ("virsh", &self.config.paths.virsh_binary),
@@ -486,7 +449,7 @@ impl LibvirtDriver {
                 .results_archive_dir,
         ] {
             std::fs::create_dir_all(directory).with_context(|| {
-                format!("creating block-validation runtime directory {}", directory.display())
+                format!("creating sandbox runtime directory {}", directory.display())
             })?;
         }
         if let Some(parent) = self
@@ -500,12 +463,7 @@ impl LibvirtDriver {
             })?;
         }
 
-        let golden = self
-            .config
-            .vm
-            .golden_image
-            .display()
-            .to_string();
+        let golden = golden.display().to_string();
         let output = self
             .shell
             .run(spec(
@@ -516,19 +474,94 @@ impl LibvirtDriver {
                 &["info", "--output=json", &golden],
             ))
             .await?;
-        check(&output, "qemu-img info for block-validation golden image")?;
+        check(&output, "qemu-img info for sandbox golden image")?;
         let output = self
             .shell
-            .run(spec_priv(&self.config.paths.virsh_binary, &["net-info", &profile.network]))
+            .run(spec_priv(&self.config.paths.virsh_binary, &["net-info", &self.config.vm.network]))
             .await?;
-        check(&output, &format!("virsh net-info {}", profile.network))?;
-        crate::libvirt::lvm::validate_exact_generation(
-            self.shell.as_ref(),
-            &self.config.lvm,
-            &profile.dataset,
-            identity,
-        )
-        .await
+        check(&output, &format!("virsh net-info {}", self.config.vm.network))?;
+        let output = self
+            .shell
+            .run(spec_priv(Path::new(SANDBOX_NETWORK_POLICY_CHECK), &[]))
+            .await?;
+        check(&output, "sandbox-egress structural policy verification")?;
+        Ok(())
+    }
+
+    /// Validate the benchmark/build recipe before advertising either
+    /// capability.
+    pub async fn preflight_benchmark(&self) -> anyhow::Result<()> {
+        self.preflight_sandbox()
+            .await?;
+        crate::libvirt::lvm::validate_latest_origin(self.shell.as_ref(), &self.config.lvm).await?;
+        Ok(())
+    }
+
+    /// Validate build-only sandbox dependencies without requiring chainstate.
+    pub async fn preflight_build(&self) -> anyhow::Result<()> {
+        self.preflight_sandbox().await
+    }
+
+    /// Validate the block-validation recipe before advertising the
+    /// capability.
+    pub async fn preflight_block_validation(&self) -> anyhow::Result<()> {
+        let profile = self
+            .config
+            .block_validation
+            .as_ref()
+            .context("block-validation libvirt profile is absent")?;
+        anyhow::ensure!(profile.vcpus > 0, "block-validation vcpus must be non-zero");
+        anyhow::ensure!(profile.memory_bytes > 0, "block-validation memory_bytes must be non-zero");
+        anyhow::ensure!(
+            profile.results_tmpfs_mib > 0,
+            "block-validation results_tmpfs_mib must be non-zero"
+        );
+        anyhow::ensure!(
+            profile.max_shards > 0
+                && profile.max_concurrency > 0
+                && profile.max_concurrency <= profile.max_shards,
+            "invalid block-validation shard/concurrency limits"
+        );
+        anyhow::ensure!(
+            profile.max_parallel_jobs == 1,
+            "v26 supports exactly one block-validation assignment per worker"
+        );
+        anyhow::ensure!(
+            profile.max_shards <= 64,
+            "v26 supports at most 64 virtio-scsi shard devices per VM"
+        );
+        anyhow::ensure!(
+            safe_resource_component(&profile.snapshot_prefix),
+            "block-validation snapshot_prefix is not a valid LVM name component"
+        );
+        anyhow::ensure!(
+            profile
+                .mount_options
+                .iter()
+                .any(|option| option == "nouuid"),
+            "block-validation mount_options must include `nouuid` for XFS snapshots"
+        );
+        anyhow::ensure!(
+            profile
+                .chain_config
+                .is_absolute(),
+            "block-validation chain_config must be absolute"
+        );
+        anyhow::ensure!(
+            profile.chain_config.is_file(),
+            "block-validation chain config is not a regular file: {}",
+            profile.chain_config.display()
+        );
+        std::fs::File::open(&profile.chain_config).with_context(|| {
+            format!(
+                "block-validation chain config is not readable: {}",
+                profile.chain_config.display()
+            )
+        })?;
+        self.preflight_sandbox()
+            .await?;
+        crate::libvirt::lvm::validate_latest_origin(self.shell.as_ref(), &self.config.lvm).await?;
+        Ok(())
     }
 
     /// Run one libvirt job to a terminal outcome. The shared
@@ -731,6 +764,10 @@ impl LibvirtDriver {
         }
 
         let (console_tail, console_size_bytes) = forensics::console_tail(&console_log);
+        let chainstate_origin = arts
+            .chainstate
+            .as_ref()
+            .map(|snapshot| snapshot.origin.clone());
 
         // --- teardown -----------------------------------------------------
         let cleanup_verified = self
@@ -745,6 +782,7 @@ impl LibvirtDriver {
             "fencing_generation": ctx.fencing_generation,
             "head_sha": ctx.commit,
             "repository": ctx.repository,
+            "chainstate_origin": chainstate_origin,
             "duration_secs": duration_secs,
             "finish_reason": match &inner_result {
                 Ok(r) => r.label(),
@@ -796,7 +834,7 @@ impl LibvirtDriver {
             Ok(FinishReason::Timeout) => OutcomeStatus::Failed(format!(
                 "VM exceeded job_timeout_secs={}",
                 self.config
-                    .vm
+                    .benchmark
                     .job_timeout_secs
             )),
             // The worker overrides this to `Aborted` via the token; `Failed` is
@@ -826,11 +864,6 @@ impl LibvirtDriver {
             .as_ref()
             .context("block validation requires a configured libvirt profile")?;
         anyhow::ensure!(spec.range.start <= spec.range.end, "validation range is reversed");
-        anyhow::ensure!(
-            spec.range.start >= spec.dataset.covered_start
-                && spec.range.end <= spec.dataset.covered_end,
-            "validation range is outside the pinned dataset generation"
-        );
         anyhow::ensure!(
             spec.requested_shards > 0 && spec.requested_shards <= profile.max_shards,
             "requested shard count exceeds the local block-validation profile"
@@ -874,11 +907,10 @@ impl LibvirtDriver {
                     .provision_boot_and_source(&inputs, &job_dir, &mut arts, cache_plan)
                     .await?;
                 arts.block_snapshots = Some(
-                    ChainstateSnapshotSet::provision_exact(
+                    ChainstateSnapshotSet::provision_latest(
                         self.shell.as_ref(),
                         &self.config.lvm,
-                        &profile.dataset,
-                        &spec.dataset,
+                        &profile.snapshot_prefix,
                         &job_id,
                         &attempt_id,
                         ctx.fencing_generation,
@@ -909,10 +941,7 @@ impl LibvirtDriver {
                     arts.block_snapshots
                         .as_ref()
                         .expect("snapshot set was just provisioned"),
-                    profile
-                        .dataset
-                        .mount_options
-                        .clone(),
+                    profile.mount_options.clone(),
                 )?;
                 std::fs::write(
                     tmpfs
@@ -947,7 +976,6 @@ impl LibvirtDriver {
                             run_index: 0,
                             requested_run_count: 1,
                         }),
-                        Some(&profile.network),
                         Some(Duration::from_secs(spec.timeout_secs)),
                     )
                     .await?;
@@ -1009,8 +1037,11 @@ impl LibvirtDriver {
             "fencing_generation": ctx.fencing_generation,
             "repository": ctx.repository,
             "head_sha": ctx.commit,
-            "dataset_generation": spec.dataset.generation,
-            "dataset_origin": snapshot_origin,
+            "chainstate_origin": snapshot_origin,
+            "observed_range": logical_output.map(|output| serde_json::json!({
+                "start": output.observed_range.start,
+                "end": output.observed_range.end,
+            })),
             "snapshot_devices": snapshot_devices,
             "shards": spec.requested_shards,
             "max_concurrency": spec.max_concurrency,
@@ -1096,9 +1127,11 @@ impl LibvirtDriver {
                 .run_phase(
                     "build",
                     PollMode::Build,
-                    self.config.vm.build_vcpus,
                     self.config
-                        .vm
+                        .benchmark
+                        .build_vcpus,
+                    self.config
+                        .benchmark
                         .build_memory_bytes,
                     &cidata.build_iso_path,
                     job_dir,
@@ -1107,7 +1140,6 @@ impl LibvirtDriver {
                     listener,
                     cancel,
                     vcpu_cpuset,
-                    None,
                     None,
                     None,
                 )
@@ -1148,9 +1180,11 @@ impl LibvirtDriver {
                 .run_phase(
                     "calibrate",
                     PollMode::Bench,
-                    self.config.vm.bench_vcpus,
                     self.config
-                        .vm
+                        .benchmark
+                        .bench_vcpus,
+                    self.config
+                        .benchmark
                         .bench_memory_bytes,
                     calibrate_iso_path,
                     job_dir,
@@ -1166,7 +1200,6 @@ impl LibvirtDriver {
                             .benchmark_run
                             .requested_run_count,
                     }),
-                    None,
                     None,
                 )
                 .await?;
@@ -1190,9 +1223,11 @@ impl LibvirtDriver {
             .run_phase(
                 "bench",
                 PollMode::Bench,
-                self.config.vm.bench_vcpus,
                 self.config
-                    .vm
+                    .benchmark
+                    .bench_vcpus,
+                self.config
+                    .benchmark
                     .bench_memory_bytes,
                 &cidata.bench_iso_path,
                 job_dir,
@@ -1208,7 +1243,6 @@ impl LibvirtDriver {
                         .benchmark_run
                         .requested_run_count,
                 }),
-                None,
                 None,
             )
             .await?;
@@ -1477,12 +1511,12 @@ impl LibvirtDriver {
             .provision_boot_and_source(inputs, job_dir, arts, plan)
             .await?;
 
-        // Chainstate snapshot — only the bench phase mounts it, but
-        // the device is attached to the domain in both phases (build
-        // phase ignores it). Saves a domain-XML difference.
-        arts.chainstate = Some(
-            ChainstateSnapshot::provision(self.shell.as_ref(), &self.config.lvm, job_id).await?,
-        );
+        if !inputs.build_only {
+            arts.chainstate = Some(
+                ChainstateSnapshot::provision(self.shell.as_ref(), &self.config.lvm, job_id)
+                    .await?,
+            );
+        }
 
         // Results tmpfs — shared between phases. Phase journal lives
         // here, so both VMs append to the same `.phase-log`.
@@ -1555,7 +1589,6 @@ impl LibvirtDriver {
         cancel: &CancellationToken,
         vcpu_cpuset: Option<&str>,
         progress_context: Option<ProgressContext>,
-        network_override: Option<&str>,
         timeout_override: Option<Duration>,
     ) -> anyhow::Result<FinishReason> {
         tracing::info!(domain = domain_name, phase_lifecycle = phase_label, "starting phase");
@@ -1623,7 +1656,7 @@ impl LibvirtDriver {
             results_share_dir: &tmpfs_ref.mount_dir,
             results_share_tag: RESULTS_SHARE_TAG,
             console_log_path: &console_log,
-            network: network_override.unwrap_or(&self.config.vm.network),
+            network: &self.config.vm.network,
             vcpu_cpuset,
             // Emulator threads pin to the host cores only when this job's vCPUs
             // are pinned (`[runner].host_cpus`); meaningless otherwise.
@@ -1660,7 +1693,7 @@ impl LibvirtDriver {
                     timeout: timeout_override.unwrap_or_else(|| {
                         Duration::from_secs(
                             self.config
-                                .vm
+                                .benchmark
                                 .job_timeout_secs,
                         )
                     }),
@@ -2086,12 +2119,7 @@ impl LibvirtDriver {
         else {
             return true;
         };
-        let prefix = format!(
-            "{}-{job_id}-{attempt_id}-",
-            profile
-                .dataset
-                .snapshot_prefix
-        );
+        let prefix = format!("{}-{job_id}-{attempt_id}-", profile.snapshot_prefix);
         let selection = format!("vg_name={} && lv_name=~^{}", self.config.lvm.vg_name, prefix);
         let output = self
             .shell

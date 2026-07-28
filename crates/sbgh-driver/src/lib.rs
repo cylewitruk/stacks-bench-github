@@ -9,8 +9,7 @@ pub mod execution;
 
 pub use artifact::ArtifactSink;
 pub use block_validation::{
-    BlockValidationOutput, BlockValidationTaskSpec, DatasetIdentity, InclusiveRange, InvalidBlock,
-    ValidationEpoch,
+    BlockValidationOutput, BlockValidationTaskSpec, InclusiveRange, InvalidBlock, ValidationEpoch,
 };
 pub use cache::{
     BinaryCacheStore, BuildArtifact, BuildFingerprint, CacheControl, CacheEnvironment, CachedBinary,

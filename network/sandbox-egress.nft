@@ -1,0 +1,38 @@
+table inet sbgh_sandbox_egress {
+    set protected_ipv4 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            0.0.0.0/8,
+            10.0.0.0/8,
+            100.64.0.0/10,
+            127.0.0.0/8,
+            169.254.0.0/16,
+            172.16.0.0/12,
+            192.0.0.0/24,
+            192.168.0.0/16,
+            198.18.0.0/15,
+            224.0.0.0/4,
+            240.0.0.0/4
+        }
+    }
+
+    set operator_protected_ipv4 {
+        type ipv4_addr
+        flags interval
+    }
+
+    chain input_guard {
+        type filter hook input priority -20; policy accept;
+        iifname "virbr-sbgh" udp dport { 53, 67 } counter accept comment "sbgh:allow-dhcp-dns-v1"
+        iifname "virbr-sbgh" tcp dport 53 counter accept comment "sbgh:allow-dns-tcp-v1"
+        iifname "virbr-sbgh" counter drop comment "sbgh:deny-host-v1"
+    }
+
+    chain forward_guard {
+        type filter hook forward priority -20; policy accept;
+        iifname "virbr-sbgh" meta nfproto ipv6 counter drop comment "sbgh:deny-all-ipv6-v1"
+        iifname "virbr-sbgh" ip daddr @protected_ipv4 counter drop comment "sbgh:deny-protected-ipv4-v1"
+        iifname "virbr-sbgh" ip daddr @operator_protected_ipv4 counter drop comment "sbgh:deny-operator-ipv4-v1"
+    }
+}

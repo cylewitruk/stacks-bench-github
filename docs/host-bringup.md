@@ -20,6 +20,7 @@ benchmark-host playbook.
 | Kernel | KVM available (`grep -E 'vmx\|svm' /proc/cpuinfo`) |
 | libvirt | 9.x or newer, daemon running |
 | qemu | 8.x or newer (virtio-fs requires this) |
+| nftables | Distribution-supported Debian 12 or Ubuntu 24.04 package; requalification is mandatory after upgrades |
 | LVM2 | with a thin-pool already created (see [architecture.md](./architecture.md#operations)) |
 | Postgres | local Docker is fine (`docker compose -f docker/docker-compose.yml up -d`) |
 
@@ -28,14 +29,7 @@ Sanity check the host can run KVM domains at all:
 ```bash
 sudo systemctl status libvirtd
 virsh list --all
-virsh net-list --all      # 'default' should be active
-```
-
-If `default` is missing or inactive:
-
-```bash
-sudo virsh net-start default
-sudo virsh net-autostart default
+virsh net-list --all      # 'sandbox-egress' should be active
 ```
 
 Required packages (Debian/Ubuntu):
@@ -45,12 +39,44 @@ sudo apt update
 sudo apt install -y \
   qemu-system-x86 qemu-utils libvirt-daemon-system virtinst virtiofsd \
   cloud-image-utils libguestfs-tools \
-  git lvm2 util-linux e2fsprogs xfsprogs
+  git lvm2 util-linux e2fsprogs xfsprogs nftables iproute2
 ```
 
 `virtiofsd` is the userspace daemon libvirt spawns to back the virtio-fs
 results share. It ships in its own apt package on Debian/Ubuntu; without
 it `virsh start` aborts with "Unable to find a satisfying virtiofsd".
+
+Install the checked-in network definition, nftables policy, root-owned
+apply/check helpers, and systemd unit without starting it:
+
+```bash
+sudo ./scripts/install-sandbox-network.sh --install-only
+sudoedit /etc/sbgh/network/protected-ipv4.conf
+sudo ./scripts/install-sandbox-network.sh
+sudo systemd-analyze verify /etc/systemd/system/sbgh-sandbox-egress.service
+sudo systemctl restart sbgh-sandbox-egress.service
+sudo systemctl is-active --quiet sbgh-sandbox-egress.service
+sudo journalctl -u sbgh-sandbox-egress.service -n 50 --no-pager
+sudo /usr/local/libexec/sbgh-check-sandbox-network
+```
+
+Add every environment-specific public worker-control-plane, orchestrator, VPN,
+and infrastructure CIDR to `protected-ipv4.conf`; built-in policy already
+denies private, carrier-grade NAT, link-local/metadata, loopback, multicast,
+benchmark, reserved IPv4, all guest IPv6 forwarding, and all non-DNS/DHCP
+access to the host bridge. Existing files under `/etc/sbgh/network` are
+preserved; use `--refresh` only under drain after reviewing the new reference
+policy. The apply service refuses to replace an active network whose live XML
+does not match the versioned contract.
+
+The unit loads the firewall before workers and checks the live XML, nftables
+markers, operator CIDRs, forwarding, autostart, and active state. A renamed
+libvirt `default` network cannot pass worker preflight. This policy allows
+public dependency egress and therefore is containment, not DLP; use an
+allowlisted dependency proxy if source confidentiality requires it.
+`systemd-analyze verify` checks unit syntax only; a successful unit start,
+`active` state, successful `ExecStartPost` log, and direct verifier invocation
+are the required runtime gate.
 
 ## 1. Build the golden Ubuntu 24 image
 
@@ -84,15 +110,52 @@ sudo virt-customize -a /var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2 \
 
 You should see `cargo 1.x` and `rustc 1.x`.
 
+After the golden image exists and workers are drained, run the active network
+ceremony:
+
+```bash
+sudo ./scripts/qualify-sandbox-network.sh --execute \
+  /var/lib/sbgh-worker/v26-sandbox-egress.md \
+  /var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2
+```
+
+The disposable VM must fetch the configured HTTPS dependency URL while failing
+to reach controlled listeners on the host bridge, an RFC1918 namespace, and
+`169.254.169.254`. The report includes live nftables counters. Structural
+preflight cannot replace this behavioral proof; repeat it after changes to
+libvirt, nftables/firewalld, routing, or the protected-CIDR list.
+
+For each important public control-plane address in
+`protected-ipv4.conf`, optionally add a safe, listening endpoint:
+
+```bash
+CONTROL_PLANE_IP=192.0.2.10 # replace with the protected public address
+sudo ./scripts/qualify-sandbox-network.sh --execute \
+  --deny-tcp "$CONTROL_PLANE_IP:443" \
+  /var/lib/sbgh-worker/v26-sandbox-egress.md \
+  /var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2
+```
+
+The ceremony requires the endpoint to accept a TCP connection from the host
+both before and after the guest probe, while the guest connection must fail.
+This prevents an offline or disappearing endpoint from producing a vacuous
+pass.
+After any firewall-service reload, first run `sudo systemctl restart
+sbgh-sandbox-egress.service` so the managed table is restored, then repeat the
+active ceremony before restarting workers.
+
 ## 2. Configure the host LVM layout
 
-The daemon needs three things from LVM, all of which usually live inside the **existing OS volume group** (typically `vg0` or one named after the hostname — whatever `sudo vgs` shows). You do **not** need a dedicated VG; renaming the OS VG is invasive (GRUB + initramfs + reboot) and not worth it.
+The execution host needs three things from LVM, all of which usually live inside
+the **existing OS volume group** (typically `vg0` or one named after the
+hostname — whatever `sudo vgs` shows). You do **not** need a dedicated VG;
+renaming the OS VG is invasive (GRUB + initramfs + reboot) and not worth it.
 
 | Inside the VG | Purpose | Notes |
 | ---- | ---- | ---- |
 | `sbgh-meta` | Linear XFS LV mounted at `/var/lib/sbgh` | Per-job artifacts, archived SQLite results, bare git mirror. ~50–150 GiB is plenty. |
 | `thinpool` | Thin pool | Holds base chainstate LVs and per-job snapshots. Size = total chainstate baselines you want to keep × ~2–3×. |
-| `mainnet-YYYY-MM-DD` | Thin LV, XFS | One per chainstate baseline. The daemon snapshots whichever is lexicographically newest. |
+| `mainnet-YYYY-MM-DD` | Read-only thin LV, XFS | One per immutable chainstate origin. The worker snapshots whichever is lexicographically newest. |
 
 ### Playbook
 
@@ -136,11 +199,12 @@ Manual equivalent (skip if you ran the script):
 sudo lvcreate -V 500G --thin --name mainnet-2026-05-23 "$VG/thinpool"
 sudo mkfs.xfs "/dev/$VG/mainnet-2026-05-23"
 
-# Populate it (mount, write chainstate, unmount, deactivate so snapshots can
-# be created against it).
+# Populate it, then publish it read-only. Jobs receive only writable
+# descendants; the origin is never guest-attached.
 sudo mount "/dev/$VG/mainnet-2026-05-23" /mnt
 # ... rsync / curl / extract ...
 sudo umount /mnt
+sudo lvchange --permission r "$VG/mainnet-2026-05-23"
 sudo lvchange -an "$VG/mainnet-2026-05-23"
 ```
 
@@ -148,9 +212,22 @@ sudo lvchange -an "$VG/mainnet-2026-05-23"
 
 The script is idempotent across days: just rerun `sudo ./scripts/download-chainstate.sh` whenever you want a fresher baseline. It picks today's date for the new LV name, and by default rotates out the previous one (with `--keep-old` to retain history). Active benchmark runs against the old LV are protected — the rotation step skips any LV with active snapshots.
 
+For a pre-v26 host, drain the worker and convert every retained benchmark
+origin before restart:
+
+```bash
+sudo lvchange --permission r vg0/mainnet-YYYY-MM-DD
+sudo lvs -o vg_name,lv_name,lv_attr,origin
+```
+
+The permission character in `lv_attr` must be `r`. Worker preflight fails
+closed if the newest matching origin is writable; it does not silently select
+an older one.
+
 ### Thin vs thick snapshots
 
-The daemon creates per-job snapshots of the base chainstate LV. Two modes, controlled by `[lvm].chainstate_snapshot_size_gib` in `config.toml`:
+The worker creates per-job snapshots of the base chainstate LV. Two modes are
+controlled by `[libvirt.lvm].chainstate_snapshot_size_gib` in its profile:
 
 - **Thin (default, leave the field unset)**: `lvcreate --snapshot` runs without `-L`, so the snapshot lives in the thin pool and grows on demand. This is what you want when the base LV is itself thin (the playbook above). Cheap, fast, no upfront allocation.
 - **Thick (set the field to a GiB value)**: `lvcreate --snapshot -L NG` allocates a fixed COW exception store outside the pool. Use only if your base chainstate LV is a thick (non-thin) volume — otherwise the result is a thick snapshot of a thin volume, which loses the cheap-snapshot property and (on some lvm2 versions) errors out.
@@ -246,6 +323,7 @@ sbgh-worker ALL=(root) NOPASSWD: /usr/sbin/mkfs.ext4, /usr/sbin/losetup
 sbgh-worker ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/chown
 sbgh-worker ALL=(root) NOPASSWD: /usr/bin/rmdir
 sbgh-worker ALL=(root) NOPASSWD: /usr/bin/virsh
+sbgh-worker ALL=(root) NOPASSWD: /usr/local/libexec/sbgh-check-sandbox-network
 # Chainstate refresh (download-chainstate.sh, runs as the systemd timer
 # `sbgh-chainstate-refresh.service`). The XFS format + tar/zstd extract
 # both need root, and the LV (de)activation flips an attribute that
@@ -263,6 +341,7 @@ Verify as `sbgh`:
 ```bash
 sudo -u sbgh sudo -n /usr/sbin/lvs --version
 sudo -u sbgh sudo -n /usr/bin/virsh --version
+sudo -u sbgh-worker sudo -n /usr/local/libexec/sbgh-check-sandbox-network
 ```
 
 ## 4. Register a dev GitHub App
@@ -715,7 +794,7 @@ sudo systemctl restart sbgh-daemon
 ### `no base chainstate LV found in VG ... matching prefix mainnet-`
 
 - `sudo lvs` — confirm at least one LV exists in your VG (whatever `[lvm].vg_name` is set to) with a name starting with `mainnet-`.
-- The daemon uses `lvs --select 'lv_name=~^mainnet-'` (regex). If your LV is in a different VG or named differently, override `chainstate_base_prefix` in the config.
+- The worker uses `lvs --select 'lv_name=~^mainnet-'` (regex). If your LV is in a different VG or named differently, override `chainstate_base_prefix` in the config.
 
 ### `lvcreate` fails with "Snapshots of snapshots are not supported"
 

@@ -5,11 +5,6 @@ client_private_key = "/etc/sbgh/worker/client.key"
 server_ca_certificate = "/etc/sbgh/worker/orchestrator-ca.crt"
 capabilities = ["benchmark", "build_only"]
 
-[resources]
-logical_cpus = 8
-memory_bytes = 34359738368
-storage_bytes = 536870912000
-
 [binary_cache]
 enabled = true
 max_bytes = 53687091200
@@ -21,15 +16,20 @@ host_cpus = "6-7"
 
 [libvirt.vm]
 golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
+boot_disk_gib = 64
+# The versioned, policy-managed network used by every adversarial guest phase.
+# Install it with scripts/install-sandbox-network.sh; other names fail
+# preflight.
+network = "sandbox-egress"
+poll_interval_secs = 5
+heartbeat_interval_secs = 60
+
+[libvirt.benchmark]
 build_vcpus = 4
 bench_vcpus = 2
 build_memory_bytes = 17179869184
 bench_memory_bytes = 8589934592
-boot_disk_gib = 64
 job_timeout_secs = 21600
-network = "default"
-poll_interval_secs = 5
-heartbeat_interval_secs = 60
 
 [libvirt.paths]
 jobs_dir = "/var/lib/sbgh-worker/jobs"

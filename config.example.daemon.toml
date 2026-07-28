@@ -56,7 +56,10 @@ bench_memory = "8G"
 
 boot_disk_gib = 64
 job_timeout_secs = 21600   # 6 hours
-network = "default"
+# The versioned, policy-managed network used by every adversarial guest phase.
+# Install it with scripts/install-sandbox-network.sh; other names fail worker
+# preflight.
+network = "sandbox-egress"
 # How often the daemon polls the in-VM phase journal + virsh
 # domstate. Each poll runs a `virsh domstate` subprocess (~50–100ms),
 # so smaller values = more host CPU. 5s is the sensible floor for

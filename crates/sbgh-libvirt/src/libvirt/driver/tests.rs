@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use sbgh_driver::{
-    ArtifactSink, BinaryCacheStore, BlockValidationTaskSpec, CachedBinary, DatasetIdentity,
-    DriverStatus, DriverTaskOutput, InclusiveRange, ValidationEpoch,
+    ArtifactSink, BinaryCacheStore, BlockValidationTaskSpec, CachedBinary, DriverStatus,
+    DriverTaskOutput, InclusiveRange, ValidationEpoch,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::*;
 use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
 use crate::{
-    BlockDatasetConfig, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
+    BenchmarkProfile, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
 };
 
 struct TestJob {
@@ -366,7 +366,7 @@ async fn enabled_cache_hit_uses_minimal_source_disk_and_skips_build_vm() {
         .expect_ok(1) // chown seeded binary tree to root
         .expect_ok(1) // umount
         .expect_ok(1) // losetup -d
-        .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+        .reply(PreparedReply::with_stdout("mainnet-2026-05-21|Vri---tz-k\n")) // immutable origin
         .reply(PreparedReply::with_stdout("10|5\n")) // shared pool health
         .expect_ok(1) // lvcreate snapshot
         .expect_ok(1) // mount tmpfs
@@ -546,18 +546,20 @@ fn test_config(tmp: &TempDir) -> LibvirtConfig {
     LibvirtConfig {
         vm: VmConfig {
             golden_image: p.join("golden.qcow2"),
-            build_vcpus: 4,
-            bench_vcpus: 2,
-            build_memory_bytes: 16 * 1024 * 1024 * 1024,
-            bench_memory_bytes: 8 * 1024 * 1024 * 1024,
             boot_disk_gib: 64,
-            // Big enough that we never reach the timeout in the test.
-            job_timeout_secs: 30,
-            network: "default".into(),
+            network: "sandbox-egress".into(),
             // Tight intervals so the test driver doesn't sleep for
             // multiple seconds between poll iterations.
             poll_interval_secs: 1,
             heartbeat_interval_secs: 60,
+        },
+        benchmark: BenchmarkProfile {
+            build_vcpus: 4,
+            bench_vcpus: 2,
+            build_memory_bytes: 16 * 1024 * 1024 * 1024,
+            bench_memory_bytes: 8 * 1024 * 1024 * 1024,
+            // Big enough that we never reach the timeout in the test.
+            job_timeout_secs: 30,
         },
         paths: PathsConfig {
             jobs_dir: p.join("jobs"),
@@ -593,55 +595,16 @@ fn enable_block_profile(config: &mut LibvirtConfig, tmp: &TempDir) {
         max_concurrency: 4,
         max_parallel_jobs: 1,
         results_tmpfs_mib: 512,
-        network: "restricted-build".into(),
         chain_config: tmp.path().join("chain.toml"),
-        dataset: BlockDatasetConfig {
-            generation: "g1".into(),
-            network: "mainnet".into(),
-            format_version: "v3".into(),
-            covered_start: 0,
-            covered_end: 100,
-            manifest_sha256: "a".repeat(64),
-            origin_lv: "origin".into(),
-            manifest_path: tmp
-                .path()
-                .join(".sbgh-dataset-manifest.json"),
-            snapshot_prefix: "sbgh-block".into(),
-            mount_options: vec!["nouuid".into()],
-            required_origin_tags: vec!["sbgh_sealed".into(), "sbgh_validated".into()],
-        },
+        snapshot_prefix: "sbgh-block".into(),
+        mount_options: vec!["nouuid".into()],
     });
 }
 
-#[tokio::test]
-async fn block_validation_preflight_proves_fixed_sandbox_dependencies() {
+fn prepare_sandbox_preflight_files(config: &mut LibvirtConfig, tmp: &TempDir) {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = TempDir::new().unwrap();
-    let mut config = test_config(&tmp);
-    enable_block_profile(&mut config, &tmp);
     std::fs::write(&config.vm.golden_image, b"golden").unwrap();
-    let profile = config
-        .block_validation
-        .as_ref()
-        .unwrap();
-    std::fs::write(&profile.chain_config, b"[node]\nnetwork = \"mainnet\"\n").unwrap();
-    std::fs::write(
-        &profile.dataset.manifest_path,
-        format!(
-            r#"{{"generation":"g1","network":"mainnet","format_version":"v3","covered_start":0,"covered_end":100,"files_sha256":"{}"}}"#,
-            "b".repeat(64),
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        profile
-            .dataset
-            .manifest_path
-            .with_file_name(".sbgh-dataset-files.sha256"),
-        b"fixture digest list\n",
-    )
-    .unwrap();
     for (name, path) in [
         ("sudo", &mut config.paths.sudo_binary),
         ("virsh", &mut config.paths.virsh_binary),
@@ -658,31 +621,87 @@ async fn block_validation_preflight_proves_fixed_sandbox_dependencies() {
         std::fs::write(&*path, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&*path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+#[tokio::test]
+async fn benchmark_preflight_proves_shared_sandbox_and_immutable_origin() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    prepare_sandbox_preflight_files(&mut config, &tmp);
+    let shell = RecordingShell::new();
+    shell
+        .expect_ok(1) // qemu-img info
+        .expect_ok(1) // virsh net-info
+        .expect_ok(1) // root-owned sandbox policy check
+        .reply(PreparedReply::with_stdout("mainnet-2026-05-21|Vri---tz-k\n"))
+        .reply(PreparedReply::with_stdout("10.0|5.0\n"));
+    let shell = Arc::new(shell);
+    let driver = test_driver(&config, shell.clone());
+
+    driver
+        .preflight_benchmark()
+        .await
+        .unwrap();
+
+    assert!(config.paths.jobs_dir.is_dir());
+    let calls = shell.calls();
+    assert_eq!(calls.len(), 5);
+    assert!(
+        calls[1]
+            .args
+            .iter()
+            .any(|arg| arg == "sandbox-egress")
+    );
+    assert!(
+        calls[3]
+            .args
+            .iter()
+            .any(|arg| arg == "lv_name,lv_attr")
+    );
+    assert_eq!(calls[2].program, "/usr/local/libexec/sbgh-check-sandbox-network");
+    assert!(calls[2].privileged);
+}
+
+#[tokio::test]
+async fn sandbox_preflight_rejects_an_unmanaged_network_before_host_commands() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    config.vm.network = "renamed-default".into();
+    let shell = Arc::new(RecordingShell::new());
+    let driver = test_driver(&config, shell.clone());
+
+    let error = driver
+        .preflight_benchmark()
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("policy-managed `sandbox-egress`"));
+    assert!(shell.calls().is_empty());
+}
+
+#[tokio::test]
+async fn block_validation_preflight_proves_fixed_sandbox_dependencies() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    enable_block_profile(&mut config, &tmp);
+    prepare_sandbox_preflight_files(&mut config, &tmp);
+    let profile = config
+        .block_validation
+        .as_ref()
+        .unwrap();
+    std::fs::write(&profile.chain_config, b"[node]\nnetwork = \"mainnet\"\n").unwrap();
 
     let shell = RecordingShell::new();
     shell
         .expect_ok(1) // qemu-img info
         .expect_ok(1) // virsh net-info
-        .reply(PreparedReply::with_stdout("origin|Vri---tz-k|sbgh_sealed,sbgh_validated\n"))
-        .reply(PreparedReply::with_stdout("/dev/mapper/sbgh--vg-origin ro,nouuid\n"))
-        .reply(PreparedReply::with_stdout("/dev/dm-7\n"))
-        .reply(PreparedReply::with_stdout("/dev/dm-7\n"))
-        .reply(PreparedReply::with_stdout(format!("{}  manifest\n", "a".repeat(64))))
-        .reply(PreparedReply::with_stdout(format!("{}  file-list\n", "b".repeat(64))))
+        .expect_ok(1) // root-owned sandbox policy check
+        .reply(PreparedReply::with_stdout("mainnet-origin|Vri---tz-k\n"))
         .reply(PreparedReply::with_stdout("10.0|5.0\n"));
     let shell = Arc::new(shell);
     let driver = test_driver(&config, shell.clone());
-    let identity = DatasetIdentity {
-        generation: "g1".into(),
-        network: "mainnet".into(),
-        format_version: "v3".into(),
-        covered_start: 0,
-        covered_end: 100,
-        manifest_sha256: "a".repeat(64),
-    };
-
     driver
-        .preflight_block_validation(&identity)
+        .preflight_block_validation()
         .await
         .unwrap();
 
@@ -714,9 +733,11 @@ async fn block_validation_preflight_proves_fixed_sandbox_dependencies() {
             && calls[1]
                 .args
                 .iter()
-                .any(|arg| arg == "restricted-build")
+                .any(|arg| arg == "sandbox-egress")
     );
     assert!(calls[1].privileged);
+    assert_eq!(calls[2].program, "/usr/local/libexec/sbgh-check-sandbox-network");
+    assert!(calls[2].privileged);
 }
 
 #[tokio::test]
@@ -732,22 +753,6 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
         .as_ref()
         .unwrap();
     std::fs::write(&profile.chain_config, b"[node]\nnetwork = \"mainnet\"\n").unwrap();
-    std::fs::write(
-        &profile.dataset.manifest_path,
-        format!(
-            r#"{{"generation":"g1","network":"mainnet","format_version":"v3","covered_start":0,"covered_end":100,"files_sha256":"{}"}}"#,
-            "b".repeat(64),
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        profile
-            .dataset
-            .manifest_path
-            .with_file_name(".sbgh-dataset-files.sha256"),
-        b"fixture digest list\n",
-    )
-    .unwrap();
 
     let job = fake_job();
     let toolchain = "[toolchain]\nchannel = \"1.95.0\"\n";
@@ -782,11 +787,10 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
         results.join(".phase-log"),
         b"1700000000 starting\n\
           1700000001 build_cached\n\
-          1700000002 dataset_verified\n\
-          1700000003 probe\n\
-          1700000004 validating\n\
-          1700000005 reduced\n\
-          1700000006 done\n",
+          1700000002 probe\n\
+          1700000003 validating\n\
+          1700000004 reduced\n\
+          1700000005 done\n",
     )
     .unwrap();
     std::fs::write(
@@ -807,16 +811,10 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
             "job_id": job.id,
             "attempt_id": job.id,
             "fencing_generation": 0,
-            "dataset": {
-                "generation": "g1",
-                "network": "mainnet",
-                "format_version": "v3",
-                "covered_start": 0,
-                "covered_end": 100,
-                "manifest_sha256": "a".repeat(64),
-            },
+            "chainstate_origin": "sbgh-vg/mainnet-origin",
             "epoch": "pre_nakamoto",
             "requested_range": {"start": 10, "end": 12},
+            "observed_range": {"start": 0, "end": 100},
             "shards": [
                 {
                     "index": 0,
@@ -853,12 +851,7 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
         .expect_ok(1) // chown cached-binary tree to root
         .expect_ok(1) // unmount source disk
         .expect_ok(1) // detach source loop
-        .reply(PreparedReply::with_stdout("origin|Vri---tz-k|sbgh_sealed,sbgh_validated\n")) // exact sealed origin
-        .reply(PreparedReply::with_stdout("/dev/mapper/sbgh--vg-origin ro,nouuid\n")) // origin mount
-        .reply(PreparedReply::with_stdout("/dev/dm-7\n")) // mounted origin canonical device
-        .reply(PreparedReply::with_stdout("/dev/dm-7\n")) // configured origin canonical device
-        .reply(PreparedReply::with_stdout(format!("{}  manifest\n", "a".repeat(64))))
-        .reply(PreparedReply::with_stdout(format!("{}  file-list\n", "b".repeat(64))))
+        .reply(PreparedReply::with_stdout("mainnet-origin|Vri---tz-k\n")) // latest immutable origin
         .reply(PreparedReply::with_stdout("10.0|5.0\n")) // pool health
         .expect_ok(2) // K=2 thin snapshots
         .expect_ok(1) // results tmpfs
@@ -875,14 +868,6 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     let driver = test_driver_with_cache(&config, shell.clone(), Some(cache));
     let listener = RecordingListener::default();
     let spec = BlockValidationTaskSpec {
-        dataset: DatasetIdentity {
-            generation: "g1".into(),
-            network: "mainnet".into(),
-            format_version: "v3".into(),
-            covered_start: 0,
-            covered_end: 100,
-            manifest_sha256: "a".repeat(64),
-        },
         epoch: ValidationEpoch::PreNakamoto,
         range: InclusiveRange { start: 10, end: 12 },
         requested_shards: 2,
@@ -906,8 +891,9 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
             .invalid_blocks
             .is_empty()
     );
-    assert_eq!(output.dataset, spec.dataset);
-    assert_eq!(outcome.summary["dataset_origin"], "sbgh-vg/origin");
+    assert_eq!(output.chainstate_origin, "sbgh-vg/mainnet-origin");
+    assert_eq!(output.observed_range, InclusiveRange { start: 0, end: 100 });
+    assert_eq!(outcome.summary["chainstate_origin"], "sbgh-vg/mainnet-origin");
     assert_eq!(
         *listener
             .progresses
@@ -954,7 +940,7 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
             .all(|call| call
                 .args
                 .iter()
-                .any(|arg| arg == "sbgh-vg/origin"))
+                .any(|arg| arg == "sbgh-vg/mainnet-origin"))
     );
     assert!(
         calls.iter().all(|call| !call
@@ -1133,7 +1119,7 @@ fn happy_path_shell() -> RecordingShell {
         .expect_ok(1) // git checkout
         .expect_ok(1) // umount source
         .expect_ok(1) // losetup -d
-        .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+        .reply(PreparedReply::with_stdout("mainnet-2026-05-21|Vri---tz-k\n")) // immutable origin
         .reply(PreparedReply::with_stdout("10|5\n")) // shared pool health
         .expect_ok(1) // lvcreate snapshot
         .expect_ok(1) // mount tmpfs
@@ -1174,7 +1160,7 @@ fn build_only_shell() -> RecordingShell {
         .expect_ok(1) // git checkout
         .expect_ok(1) // umount source
         .expect_ok(1) // losetup -d
-        .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+        .reply(PreparedReply::with_stdout("mainnet-2026-05-21|Vri---tz-k\n")) // immutable origin
         .reply(PreparedReply::with_stdout("10|5\n")) // shared pool health
         .expect_ok(1) // lvcreate snapshot
         .expect_ok(1) // mount tmpfs
@@ -1266,9 +1252,6 @@ async fn build_only_skips_bench_and_fails_closed_without_cache() {
         "git",
         "umount",
         "losetup",
-        "lvs",
-        "lvs",
-        "lvcreate",
         "mount",
         "cloud-localds", // build ISO
         "cloud-localds", // bench ISO (still provisioned)
@@ -1276,11 +1259,10 @@ async fn build_only_skips_bench_and_fails_closed_without_cache() {
         "virsh",         // start (build)
         "virsh",         // domstate poll → ShutOff after BuildDone
         // no bench define/start/poll
-        "virsh",    // destroy
-        "virsh",    // undefine
-        "umount",   // tmpfs
-        "lvremove", // chainstate
-        "git",      // mirror prune
+        "virsh",  // destroy
+        "virsh",  // undefine
+        "umount", // tmpfs
+        "git",    // mirror prune
     ];
     assert_eq!(programs, expected, "build-only must skip the bench VM lifecycle");
 }
@@ -1332,6 +1314,7 @@ async fn end_to_end_happy_path_with_recording_shell() {
     assert_eq!(outcome.summary["last_phase"], "done");
     assert_eq!(outcome.summary["head_sha"], "abc123def456");
     assert_eq!(outcome.summary["repository"], "acme/widgets");
+    assert_eq!(outcome.summary["chainstate_origin"], "sbgh-vg/mainnet-2026-05-21");
     assert_eq!(
         outcome.summary["run_progress_archived_path"]
             .as_str()
@@ -1473,7 +1456,7 @@ async fn vm_shutoff_without_phase_done_is_failure() {
         .expect_ok(1) // git checkout
         .expect_ok(1) // umount source
         .expect_ok(1) // losetup -d
-        .reply(PreparedReply::with_stdout("  mainnet-2026-05-21\n")) // lvs
+        .reply(PreparedReply::with_stdout("mainnet-2026-05-21|Vri---tz-k\n")) // immutable origin
         .reply(PreparedReply::with_stdout("10|5\n")) // shared pool health
         .expect_ok(1) // lvcreate snapshot
         .expect_ok(1) // mount tmpfs

@@ -6,15 +6,21 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct VmConfig {
     pub golden_image: PathBuf,
+    pub boot_disk_gib: u32,
+    pub network: String,
+    pub poll_interval_secs: u64,
+    pub heartbeat_interval_secs: u64,
+}
+
+/// Resources used only by benchmark and build-only recipes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkProfile {
     pub build_vcpus: u32,
     pub bench_vcpus: u32,
     pub build_memory_bytes: u64,
     pub bench_memory_bytes: u64,
-    pub boot_disk_gib: u32,
     pub job_timeout_secs: u64,
-    pub network: String,
-    pub poll_interval_secs: u64,
-    pub heartbeat_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +78,8 @@ impl LvmConfig {
 #[serde(deny_unknown_fields)]
 pub struct LibvirtConfig {
     pub vm: VmConfig,
+    #[serde(default)]
+    pub benchmark: BenchmarkProfile,
     pub paths: PathsConfig,
     pub lvm: LvmConfig,
     pub service_user: String,
@@ -93,9 +101,11 @@ pub struct BlockValidationProfile {
     pub max_parallel_jobs: u32,
     #[serde(default = "default_block_results_tmpfs_mib")]
     pub results_tmpfs_mib: u32,
-    pub network: String,
     pub chain_config: PathBuf,
-    pub dataset: BlockDatasetConfig,
+    #[serde(default = "default_snapshot_prefix")]
+    pub snapshot_prefix: String,
+    #[serde(default = "default_mount_options")]
+    pub mount_options: Vec<String>,
 }
 
 fn default_max_parallel_jobs() -> u32 {
@@ -106,34 +116,10 @@ fn default_block_results_tmpfs_mib() -> u32 {
     5_120
 }
 
-/// Exact sealed LVM generation consumed by block validation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BlockDatasetConfig {
-    pub generation: String,
-    pub network: String,
-    pub format_version: String,
-    pub covered_start: u64,
-    pub covered_end: u64,
-    pub manifest_sha256: String,
-    pub origin_lv: String,
-    pub manifest_path: PathBuf,
-    #[serde(default = "default_snapshot_prefix")]
-    pub snapshot_prefix: String,
-    #[serde(default = "default_mount_options")]
-    pub mount_options: Vec<String>,
-    #[serde(default = "default_required_tags")]
-    pub required_origin_tags: Vec<String>,
-}
-
 fn default_snapshot_prefix() -> String {
     "sbgh-block".into()
 }
 
 fn default_mount_options() -> Vec<String> {
     vec!["nouuid".into(), "noatime".into()]
-}
-
-fn default_required_tags() -> Vec<String> {
-    vec!["sbgh_sealed".into(), "sbgh_validated".into()]
 }

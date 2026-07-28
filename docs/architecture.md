@@ -64,9 +64,9 @@ Every mutation is bound to worker identity, process session, attempt UUID,
 monotonic fencing generation, and an HMAC-authenticated lease token. Lost
 poll/accept/event/terminal responses are idempotent. A new worker process gets a
 new session and cannot resume its predecessor; cleanup is acknowledged before
-safe requeue. Wire protocol v2 includes a bounded, payload-derived requirement
-summary in each offer, allowing local dataset/resource/LVM admission before
-lease acceptance without exposing backend paths to the orchestrator.
+safe requeue. Wire protocol v3 includes a bounded, payload-derived requirement
+summary in each offer, allowing local resource/LVM admission before lease
+acceptance without exposing backend paths to the orchestrator.
 
 Task-neutral reliable events are persisted before acknowledgement and projected
 only across their contiguous sequence prefix. Fine progress has an independent
@@ -108,14 +108,17 @@ may include a short-lived repository-read token. The worker uses it only while
 preparing a source disk on the trusted host; it is never mounted into the guest
 or written to artifacts.
 
-Every repository-built or otherwise untrusted payload enters `sbgh-driver` and
-the concrete `sbgh-libvirt` adapter. Benchmark/build jobs use one writable
-thin snapshot. A block-validation assignment uses one resource-profiled VM and
-K attempt-scoped thin snapshots of one exact sealed generation, exposed by
-stable virtio-scsi serials and mounted with XFS `nouuid`. The origin LV is
-read-only and never guest-attached. Both snapshot paths use the same fixed
-near-full thin-pool health guard; K remains a compute/device policy rather than
-a predicted write-space reservation. The guest builds or reuses
+Every repository revision is treated as adversarial: its build scripts and
+produced binaries enter `sbgh-driver` and the concrete `sbgh-libvirt` adapter,
+regardless of source authorization. Benchmark/build jobs use one explicitly
+writable thin snapshot of the newest read-only origin. A block-validation
+assignment uses one resource-profiled VM and K explicitly writable,
+attempt-scoped snapshots of the newest local read-only origin,
+exposed by stable virtio-scsi serials and mounted with XFS `nouuid`. Origin LVs
+are never guest-attached. Both snapshot paths use the same fixed near-full
+thin-pool health guard; K remains a compute/device policy rather than a
+predicted write-space reservation. Results record the selected origin, and
+block validation also records guest-observed coverage. The guest builds or reuses
 `stacks-inspect` through the shared binary cache (scoped by executable,
 repository, commit, toolchain, build recipe, target, and image), probes epoch
 totals, partitions the inclusive range, runs bounded shards, and atomically
@@ -128,6 +131,19 @@ results share before parsing, cache publication, or artifact upload; structured
 control/diagnostic reads are size-bounded. There is no direct host-process
 fallback. Compiler-cache state lives only on the disposable boot overlay; the
 fingerprinted binary cache is the sole cross-attempt build-reuse channel.
+
+All guest phases share the versioned `sandbox-egress` libvirt network.
+[Its XML and nftables policy](../network/sandbox-egress.xml) permit
+repository/dependency fetches while denying the host, worker control plane,
+private/link-local destinations, metadata endpoints, and IPv6 fallback.
+Environment-specific public infrastructure CIDRs join the deny set through a
+root-owned configuration file. Worker preflight accepts no alternate network
+name and invokes a fixed root-owned structural verifier; every domain also
+requests libvirt port isolation. A disposable-guest qualification proves
+positive dependency egress and negative host/private/metadata reachability.
+Optional operator TCP probes establish host reachability before and after
+proving configured public control-plane endpoints are guest-inaccessible. This
+is containment, not a data-loss-prevention guarantee.
 
 ### Integration crates
 
@@ -167,8 +183,9 @@ The fleet lifecycle is additive across task kinds:
 - `benchmark`: comparison-bearing group pinned to one worker and measurement
   profile for every variant/repeat/calibration/carried job;
 - `build_only`: cache production through the same lease/event/artifact path;
-- `block_validation`: one fleet job pinned to one dataset host, with one VM,
-  K private snapshot devices, and its own typed result table;
+- `block_validation`: one fleet job pinned to one capable worker, with one VM,
+  K private snapshots of its newest local RO chainstate origin, guest-observed
+  range verification, and its own typed result table;
 - future tasks: add a protocol payload, capability, worker recipe, task-specific
   persistence/rendering, and composition registration without changing the
   scheduler/lease/event/terminal state machine.
@@ -190,7 +207,7 @@ infrastructure failures.
 ## Operations
 
 Production layout, mTLS issuance/rotation/revocation, host characterization,
-immutable dataset refresh, metrics/alerts, drain/upgrade, failure injection,
+immutable local chainstate refresh, metrics/alerts, drain/upgrade, failure injection,
 and rollback are defined in
 [worker-fleet-operations.md](worker-fleet-operations.md). The daemon API is
 documented in [daemon-api.md](daemon-api.md); initial host prerequisites remain

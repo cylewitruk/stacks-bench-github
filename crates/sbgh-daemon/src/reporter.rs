@@ -1175,7 +1175,7 @@ mod tests {
                 bench_memory: sbgh_core::memory::MemorySize::from_gib(8),
                 boot_disk_gib: 64,
                 job_timeout_secs: 30,
-                network: "default".into(),
+                network: "sandbox-egress".into(),
                 poll_interval_secs: 1,
                 heartbeat_interval_secs: 60,
             },

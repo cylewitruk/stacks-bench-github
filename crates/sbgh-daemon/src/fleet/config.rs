@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use sbgh_proto::{
-    DatasetIdentity, MAX_LONG_POLL_SECS, MAX_VALIDATION_CONCURRENCY, MAX_VALIDATION_SHARDS,
-    MAX_VALIDATION_TIMEOUT_SECS, Validate, WorkerCapability,
+    MAX_LONG_POLL_SECS, MAX_VALIDATION_CONCURRENCY, MAX_VALIDATION_SHARDS,
+    MAX_VALIDATION_TIMEOUT_SECS, WorkerCapability,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -42,19 +42,15 @@ pub struct FleetConfig {
     #[serde(default = "default_max_attempt_artifact_bytes")]
     pub max_attempt_artifact_bytes: u64,
     /// Optional bounded `/validate-blocks <epoch> <start> <end>` PR-comment
-    /// trigger. Dataset identity remains server-owned and is never accepted
-    /// from the comment.
+    /// trigger.
     pub github_block_validation: Option<GitHubBlockValidationConfig>,
     pub workers: Vec<ConfiguredWorker>,
-    #[serde(default)]
-    pub datasets: Vec<ConfiguredDataset>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubBlockValidationConfig {
     pub worker_id: Uuid,
-    pub network: String,
     pub requested_shards: u32,
     pub max_concurrency: u32,
     pub timeout_secs: u64,
@@ -75,16 +71,6 @@ pub struct ConfiguredWorker {
     pub enabled: bool,
     #[serde(default)]
     pub draining: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfiguredDataset {
-    pub worker_id: Uuid,
-    #[serde(default)]
-    pub current: bool,
-    #[serde(flatten)]
-    pub identity: DatasetIdentity,
 }
 
 impl FleetConfig {
@@ -191,69 +177,6 @@ impl FleetConfig {
                 );
             }
         }
-        let mut generations = BTreeSet::new();
-        let mut current = BTreeSet::new();
-        for dataset in &self.datasets {
-            dataset
-                .identity
-                .validate()
-                .map_err(anyhow::Error::new)
-                .context("invalid configured dataset identity")?;
-            ensure!(
-                generations.insert(
-                    dataset
-                        .identity
-                        .generation
-                        .clone()
-                ),
-                "duplicate configured dataset generation {}",
-                dataset.identity.generation
-            );
-            let worker = self
-                .workers
-                .iter()
-                .find(|worker| worker.id == dataset.worker_id)
-                .context("configured dataset worker_id is not registered")?;
-            ensure!(
-                worker
-                    .capabilities
-                    .contains(&WorkerCapability::BlockValidation),
-                "dataset {} belongs to a worker without block_validation capability",
-                dataset.identity.generation
-            );
-            if dataset.current {
-                ensure!(
-                    current.insert((
-                        dataset.worker_id,
-                        dataset
-                            .identity
-                            .network
-                            .clone()
-                    )),
-                    "more than one current dataset is configured for worker {} network {}",
-                    dataset.worker_id,
-                    dataset.identity.network
-                );
-            }
-        }
-        for worker in self
-            .workers
-            .iter()
-            .filter(|worker| {
-                worker.enabled
-                    && worker
-                        .capabilities
-                        .contains(&WorkerCapability::BlockValidation)
-            })
-        {
-            ensure!(
-                self.datasets
-                    .iter()
-                    .any(|dataset| dataset.worker_id == worker.id && dataset.current),
-                "enabled block-validation worker {} requires a current configured dataset",
-                worker.id
-            );
-        }
         if let Some(trigger) = &self.github_block_validation {
             ensure!(
                 trigger.requested_shards > 0
@@ -267,13 +190,6 @@ impl FleetConfig {
                     && trigger.max_concurrency <= trigger.requested_shards
                     && trigger.timeout_secs <= MAX_VALIDATION_TIMEOUT_SECS,
                 "github_block_validation limits exceed protocol bounds"
-            );
-            ensure!(
-                !trigger
-                    .network
-                    .trim()
-                    .is_empty(),
-                "github_block_validation network must not be empty"
             );
             let worker = self
                 .workers
@@ -400,7 +316,6 @@ mod tests {
                 enabled: true,
                 draining: false,
             }],
-            datasets: Vec::new(),
         };
         assert!(config.validate().is_err());
     }
@@ -439,7 +354,6 @@ mod tests {
                 enabled: true,
                 draining: false,
             }],
-            datasets: Vec::new(),
         };
         assert!(config.validate().is_err());
         config.long_poll_seconds = MAX_LONG_POLL_SECS;

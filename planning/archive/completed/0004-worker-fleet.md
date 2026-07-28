@@ -58,7 +58,7 @@ one-or-more local Drivers }**, and the orchestrator becomes a
 
 | GitHub self-hosted runners | stacks-github fleet |
 | ---- | ---- |
-| labels (`runs-on: [self-hosted, gpu]`) | worker **capabilities** + resource facts (cores, RAM, has-local-nvme, reflink-fs) |
+| labels (`runs-on: [self-hosted, gpu]`) | server-authorized worker **capabilities** + discovered CPU/RAM facts |
 | runner **polls** control plane (pull) | worker **long-polls** the orchestrator, capability-filtered |
 | one job/runner; logs streamed back | worker runs one job via its local Driver; streams `WorkerEvent`s back |
 | registered runner identity; online/offline/busy | pre-provisioned mTLS worker identity + **heartbeat/lease**; drain/deregister |
@@ -73,7 +73,8 @@ provisioner** — *who* spawns the worker host — orthogonal to this protocol.
 
 ```text
 worker daemon starts
-  → opens mTLS session / heartbeats with { session, resources, dataset, version }
+  → discovers host CPU/RAM
+  → opens mTLS session / heartbeats with { session, resources, version }
   → long-polls: "give me compatible work"
   → receives TaskSpec + lease token
   → runs local Driver (v8 Phase 1)
@@ -332,8 +333,8 @@ any network/firewall concerns.
 **Scope:**
 
 - Add the `sbgh-worker` binary around the existing worker library: config =
-  `{ worker identity/certificate, resource facts, orchestrator URL }`;
-  registers + long-polls.
+  `{ worker identity/certificate, orchestrator URL, execution policy }`;
+  discovers CPU/RAM, registers, and long-polls.
 - Orchestrator-side **worker registry** (a `worker` table — orchestrator-owned, so
   the sole-DB-client rule holds) tracking `{ id, capabilities, resources, version,
   measurement profile, active session, last_seen, status }`.

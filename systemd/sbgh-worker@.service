@@ -1,8 +1,9 @@
 [Unit]
 Description=stacks-bench-github fleet worker (%i)
 Documentation=https://github.com/cylewitruk/stacks-bench-github
-After=network-online.target
+After=network-online.target sbgh-sandbox-egress.service
 Wants=network-online.target
+Requires=sbgh-sandbox-egress.service
 
 [Service]
 Type=simple

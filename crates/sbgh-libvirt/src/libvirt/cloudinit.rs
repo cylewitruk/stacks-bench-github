@@ -341,7 +341,9 @@ mod tests {
         assert!(rendered.contains("cargo build --locked --release --package stacks-inspect"));
         assert!(rendered.contains("/dev/disk/by-id/"));
         assert!(rendered.contains("[\"mount\", \"-t\", \"xfs\""));
-        assert!(rendered.contains(".sbgh-dataset-files.sha256"));
+        assert!(rendered.contains("observed_range"));
+        assert!(rendered.contains("chainstate_origin"));
+        assert!(!rendered.contains(".sbgh-dataset-manifest.json"));
         assert!(rendered.contains("block-validation-result.json"));
         assert!(rendered.contains("os.replace"));
         assert!(rendered.contains("start_new_session=True"));

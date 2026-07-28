@@ -6,9 +6,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use sbgh_proto::{
-    ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DatasetIdentity, DesiredState,
-    ProgressRequest, RegisterSessionRequest, ReliableEventEnvelope, ResourceFacts, TaskPayload,
-    TerminalOutcome, WorkOffer, WorkerCapability,
+    ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DesiredState, ProgressRequest,
+    RegisterSessionRequest, ReliableEventEnvelope, TaskPayload, TerminalOutcome, WorkOffer,
+    WorkerCapability,
 };
 use uuid::Uuid;
 
@@ -368,19 +368,5 @@ pub trait FleetStore: Send + Sync + 'static {
     /// Record external deletion only after the object store confirms it.
     async fn mark_staged_artifact_reaped(&self, object_key: &str) -> Result<bool>;
 
-    async fn record_dataset(
-        &self,
-        worker_id: Uuid,
-        dataset: &DatasetIdentity,
-        verified_at: DateTime<Utc>,
-        make_current: bool,
-    ) -> Result<()>;
-
     async fn fleet_snapshot(&self) -> Result<FleetSnapshot>;
-
-    async fn session_resources(
-        &self,
-        worker_id: Uuid,
-        worker_session_id: Uuid,
-    ) -> Result<Option<ResourceFacts>>;
 }

@@ -1,16 +1,5 @@
 //! Backend-neutral block-validation task contracts.
 
-/// One immutable chainstate generation selected by the orchestrator.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DatasetIdentity {
-    pub generation: String,
-    pub network: String,
-    pub format_version: String,
-    pub covered_start: u64,
-    pub covered_end: u64,
-    pub manifest_sha256: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationEpoch {
@@ -28,7 +17,6 @@ pub struct InclusiveRange {
 /// intentionally absent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockValidationTaskSpec {
-    pub dataset: DatasetIdentity,
     pub epoch: ValidationEpoch,
     pub range: InclusiveRange,
     pub requested_shards: u32,
@@ -49,5 +37,6 @@ pub struct BlockValidationOutput {
     pub valid: bool,
     pub checked_blocks: u64,
     pub invalid_blocks: Vec<InvalidBlock>,
-    pub dataset: DatasetIdentity,
+    pub chainstate_origin: String,
+    pub observed_range: InclusiveRange,
 }

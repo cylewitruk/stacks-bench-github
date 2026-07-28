@@ -22,8 +22,8 @@ use sbgh_driver::{
 };
 use sbgh_libvirt::shell_test_support::{PreparedReply, RecordingShell};
 use sbgh_libvirt::{
-    LibvirtDriver, LvmConfig as LibvirtLvmConfig, PathsConfig as LibvirtPathsConfig,
-    VmConfig as LibvirtVmConfig,
+    BenchmarkProfile as LibvirtBenchmarkProfile, LibvirtDriver, LvmConfig as LibvirtLvmConfig,
+    PathsConfig as LibvirtPathsConfig, VmConfig as LibvirtVmConfig,
 };
 
 /// A [`RunnableJobStore`] fake that hands out a single pre-staged job
@@ -395,7 +395,7 @@ fn test_config(tmp: &TempDir) -> DaemonConfig {
             bench_memory: sbgh_core::memory::MemorySize::from_gib(8),
             boot_disk_gib: 64,
             job_timeout_secs: 30,
-            network: "default".into(),
+            network: "sandbox-egress".into(),
             poll_interval_secs: 1,
             heartbeat_interval_secs: 60,
         },
@@ -468,6 +468,14 @@ fn test_libvirt_driver(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Arc<
         LibvirtConfig {
             vm: LibvirtVmConfig {
                 golden_image: config.vm.golden_image.clone(),
+                boot_disk_gib: config.vm.boot_disk_gib,
+                network: config.vm.network.clone(),
+                poll_interval_secs: config.vm.poll_interval_secs,
+                heartbeat_interval_secs: config
+                    .vm
+                    .heartbeat_interval_secs,
+            },
+            benchmark: LibvirtBenchmarkProfile {
                 build_vcpus: config.vm.build_vcpus,
                 bench_vcpus: config.vm.bench_vcpus,
                 build_memory_bytes: config
@@ -478,13 +486,7 @@ fn test_libvirt_driver(config: Arc<DaemonConfig>, shell: Arc<dyn Shell>) -> Arc<
                     .vm
                     .bench_memory
                     .as_bytes(),
-                boot_disk_gib: config.vm.boot_disk_gib,
                 job_timeout_secs: config.vm.job_timeout_secs,
-                network: config.vm.network.clone(),
-                poll_interval_secs: config.vm.poll_interval_secs,
-                heartbeat_interval_secs: config
-                    .vm
-                    .heartbeat_interval_secs,
             },
             paths: LibvirtPathsConfig {
                 jobs_dir: config.paths.jobs_dir.clone(),

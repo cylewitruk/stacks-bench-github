@@ -36,11 +36,9 @@ else
   phase build_cached
 fi
 
-phase dataset_verified
 phase probe
 python3 - <<'PY' || die "block-validation guest runner failed"
 import glob
-import hashlib
 import json
 import os
 import signal
@@ -84,25 +82,6 @@ for item in plan["devices"]:
     )
     mounts[shard] = mountpoint
 
-dataset = plan["dataset"]
-manifest_path = mounts[0] + "/.sbgh-dataset-manifest.json"
-with open(manifest_path, "rb") as handle:
-    manifest_bytes = handle.read()
-if hashlib.sha256(manifest_bytes).hexdigest().lower() != dataset["manifest_sha256"].lower():
-    raise RuntimeError("guest dataset manifest digest mismatch")
-manifest = json.loads(manifest_bytes)
-for key in ("generation", "network", "format_version", "covered_start", "covered_end"):
-    if manifest.get(key) != dataset[key]:
-        raise RuntimeError(f"guest dataset manifest field {key} mismatch")
-file_list_digest = manifest.get("files_sha256", "")
-if len(file_list_digest) != 64 or any(character not in "0123456789abcdefABCDEF"
-                                     for character in file_list_digest):
-    raise RuntimeError("guest dataset file-list digest is invalid")
-file_list_path = mounts[0] + "/.sbgh-dataset-files.sha256"
-with open(file_list_path, "rb") as handle:
-    if hashlib.sha256(handle.read()).hexdigest().lower() != file_list_digest.lower():
-        raise RuntimeError("guest dataset file list does not match its manifest")
-
 def probe(kind):
     output = subprocess.check_output(
         [BIN, "--config", CONFIG, "validate-block", mounts[0], kind],
@@ -116,22 +95,24 @@ def probe(kind):
 
 pre = probe("index-range")
 if pre <= 0:
-    raise RuntimeError("dataset probe returned no pre-Nakamoto blocks")
+    raise RuntimeError("chainstate probe returned no pre-Nakamoto blocks")
 requested = plan["range"]
 if plan["epoch"] == "pre_nakamoto":
     if requested["end"] >= pre:
         raise RuntimeError("requested pre-Nakamoto range exceeds probed range")
     epoch_offset = 0
     range_kind = "index-range"
+    observed = {"start": 0, "end": pre - 1}
 elif plan["epoch"] == "nakamoto":
     naka = probe("naka-index-range")
     if naka <= 0:
-        raise RuntimeError("dataset probe returned no Nakamoto blocks")
+        raise RuntimeError("chainstate probe returned no Nakamoto blocks")
     global_end = pre + naka - 1
     if requested["start"] < pre or requested["end"] > global_end:
         raise RuntimeError("requested Nakamoto range is outside probed range")
     epoch_offset = pre
     range_kind = "naka-index-range"
+    observed = {"start": pre, "end": global_end}
 else:
     raise RuntimeError("unsupported validation epoch")
 
@@ -233,9 +214,10 @@ result = {
     "job_id": plan["job_id"],
     "attempt_id": plan["attempt_id"],
     "fencing_generation": plan["fencing_generation"],
-    "dataset": plan["dataset"],
+    "chainstate_origin": plan["chainstate_origin"],
     "epoch": plan["epoch"],
     "requested_range": plan["range"],
+    "observed_range": observed,
     "shards": finished,
 }
 temporary = RESULTS + "/.block-validation-result.json.tmp"

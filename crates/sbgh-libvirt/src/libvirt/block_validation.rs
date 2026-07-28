@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
 use sbgh_driver::{
-    BlockValidationOutput, BlockValidationTaskSpec, DatasetIdentity, InclusiveRange, InvalidBlock,
-    ValidationEpoch,
+    BlockValidationOutput, BlockValidationTaskSpec, InclusiveRange, InvalidBlock, ValidationEpoch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +23,7 @@ pub struct BlockGuestPlan {
     pub attempt_id: String,
     pub fencing_generation: u64,
     pub commit: String,
-    pub dataset: PlanDataset,
+    pub chainstate_origin: String,
     pub epoch: &'static str,
     pub range: PlanRange,
     pub requested_shards: u32,
@@ -32,16 +31,6 @@ pub struct BlockGuestPlan {
     pub timeout_secs: u64,
     pub mount_options: Vec<String>,
     pub devices: Vec<PlanDevice>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanDataset {
-    pub generation: String,
-    pub network: String,
-    pub format_version: String,
-    pub covered_start: u64,
-    pub covered_end: u64,
-    pub manifest_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,7 +67,7 @@ impl BlockGuestPlan {
             attempt_id: attempt_id.into(),
             fencing_generation,
             commit: commit.into(),
-            dataset: PlanDataset::from(&spec.dataset),
+            chainstate_origin: snapshots.origin.clone(),
             epoch: match spec.epoch {
                 ValidationEpoch::PreNakamoto => "pre_nakamoto",
                 ValidationEpoch::Nakamoto => "nakamoto",
@@ -101,19 +90,6 @@ impl BlockGuestPlan {
     }
 }
 
-impl From<&DatasetIdentity> for PlanDataset {
-    fn from(value: &DatasetIdentity) -> Self {
-        Self {
-            generation: value.generation.clone(),
-            network: value.network.clone(),
-            format_version: value.format_version.clone(),
-            covered_start: value.covered_start,
-            covered_end: value.covered_end,
-            manifest_sha256: value.manifest_sha256.clone(),
-        }
-    }
-}
-
 impl From<InclusiveRange> for PlanRange {
     fn from(value: InclusiveRange) -> Self {
         Self {
@@ -130,9 +106,10 @@ struct GuestResult {
     job_id: String,
     attempt_id: String,
     fencing_generation: u64,
-    dataset: PlanDataset,
+    chainstate_origin: String,
     epoch: String,
     requested_range: PlanRange,
+    observed_range: PlanRange,
     shards: Vec<GuestShard>,
 }
 
@@ -172,12 +149,17 @@ pub fn reduce_result(
         "guest result attempt identity mismatch"
     );
     ensure!(
-        result.dataset == plan.dataset
+        result.chainstate_origin == plan.chainstate_origin
             && result.epoch == plan.epoch
             && result.requested_range == plan.range,
         "guest result task identity mismatch"
     );
-    // Coverage is anchored to the host-authored plan. The guest may translate
+    ensure!(
+        result.observed_range.start <= plan.range.start
+            && result.observed_range.end >= plan.range.end,
+        "guest-observed chainstate does not cover the requested range"
+    );
+    // The guest may translate
     // global Nakamoto indices into epoch-local CLI arguments, but terminal
     // accounting always remains in the trusted global coordinate system.
     let expected = partition(
@@ -269,22 +251,10 @@ pub fn reduce_result(
             valid: !negative,
             checked_blocks,
             invalid_blocks,
-            dataset: DatasetIdentity {
-                generation: plan
-                    .dataset
-                    .generation
-                    .clone(),
-                network: plan.dataset.network.clone(),
-                format_version: plan
-                    .dataset
-                    .format_version
-                    .clone(),
-                covered_start: plan.dataset.covered_start,
-                covered_end: plan.dataset.covered_end,
-                manifest_sha256: plan
-                    .dataset
-                    .manifest_sha256
-                    .clone(),
+            chainstate_origin: plan.chainstate_origin.clone(),
+            observed_range: InclusiveRange {
+                start: result.observed_range.start,
+                end: result.observed_range.end,
             },
         },
         artifacts,
@@ -392,14 +362,6 @@ mod tests {
 
     fn plan() -> BlockGuestPlan {
         let spec = BlockValidationTaskSpec {
-            dataset: DatasetIdentity {
-                generation: "g1".into(),
-                network: "mainnet".into(),
-                format_version: "v3".into(),
-                covered_start: 0,
-                covered_end: 100,
-                manifest_sha256: "a".repeat(64),
-            },
             epoch: ValidationEpoch::PreNakamoto,
             range: InclusiveRange { start: 10, end: 12 },
             requested_shards: 2,
@@ -441,16 +403,10 @@ mod tests {
                 "job_id": "job",
                 "attempt_id": "attempt",
                 "fencing_generation": 4,
-                "dataset": {
-                    "generation": "g1",
-                    "network": "mainnet",
-                    "format_version": "v3",
-                    "covered_start": 0,
-                    "covered_end": 100,
-                    "manifest_sha256": "a".repeat(64),
-                },
+                "chainstate_origin": "vg/origin",
                 "epoch": "pre_nakamoto",
                 "requested_range": {"start": 10, "end": 12},
+                "observed_range": {"start": 0, "end": 100},
                 "shards": shards,
             }))
             .unwrap(),

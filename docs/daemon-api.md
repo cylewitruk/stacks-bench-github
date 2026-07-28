@@ -218,7 +218,7 @@ listener. Workers cannot call the cookie-authenticated operator API.
 
 | Method | Path | Scope | Purpose |
 | ---- | ---- | ---- | ---- |
-| `GET` | `/api/fleet` | `read` | Registry/session/resource/dataset, active attempt, trace, and cleanup summary |
+| `GET` | `/api/fleet` | `read` | Registry/session/resource, active attempt, trace, and cleanup summary |
 | `GET` | `/api/fleet/metrics` | `read` | Prometheus text for heartbeat/lease, wait, ACK lag, resend pressure, staging, cleanup |
 | `POST` | `/api/jobs/block-validation` | `admin` | Enqueue a fully specified block-validation job |
 | `POST` | `/api/fleet/workers/{id}/drain` | `admin` | Set/clear durable drain |
@@ -227,8 +227,8 @@ listener. Workers cannot call the cookie-authenticated operator API.
 
 The bounded GitHub command `/validate-blocks <epoch> <start> <end>` uses the
 same PR-role and target/source policy checks as `/benchmark`. Shard,
-concurrency, timeout, worker, and current verified dataset identity are
-server-owned fleet configuration, never comment input.
+concurrency, timeout, and worker are server-owned fleet configuration, never
+comment input. The selected read-only chainstate origin is worker-local.
 
 ### Not an endpoint
 

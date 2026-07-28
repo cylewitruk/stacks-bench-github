@@ -153,7 +153,6 @@ pub struct EnqueueBlockValidationRequest {
     pub repo_id: i64,
     pub commit: String,
     pub worker_id: String,
-    pub dataset_network: String,
     /// `pre_nakamoto` or `nakamoto`.
     pub epoch: String,
     pub range_start: u64,

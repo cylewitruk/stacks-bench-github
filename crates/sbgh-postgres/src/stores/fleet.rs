@@ -15,9 +15,9 @@ use sbgh_core::db::fleet::{
 };
 use sbgh_core::models::{JobEventKind, JobEventStatus, NewJob, NewPullRequestLink};
 use sbgh_proto::{
-    ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DatasetIdentity, DesiredState,
-    ProgressRequest, RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload,
-    ResourceFacts, TaskPayload, TerminalOutcome, WorkOffer, WorkerCapability,
+    ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DesiredState, ProgressRequest,
+    RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload, TaskPayload,
+    TerminalOutcome, WorkOffer, WorkerCapability,
 };
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -39,56 +39,6 @@ pub struct PreparedJobProvenance {
 impl PostgresFleetStore {
     pub fn new(pool: Pool) -> Self {
         Self { pool }
-    }
-
-    /// Resolve the operator-verified current dataset for one authorized host.
-    ///
-    /// GitHub-triggered validation deliberately accepts only a range; all
-    /// dataset identity fields come from this server-owned record.
-    pub async fn current_dataset(
-        &self,
-        worker_id: Uuid,
-        network: &str,
-    ) -> sbgh_core::Result<Option<DatasetIdentity>> {
-        let row = sqlx::query(
-            r#"
-            SELECT generation, network, format_version, covered_start,
-                   covered_end, manifest_sha256
-              FROM block_validation_dataset
-             WHERE worker_id = $1
-               AND network = $2
-               AND is_current
-               AND retired_at IS NULL
-            "#,
-        )
-        .bind(worker_id)
-        .bind(network)
-        .fetch_optional(&self.pool)
-        .await
-        .core()?;
-        row.map(|row| {
-            Ok(DatasetIdentity {
-                generation: row
-                    .try_get("generation")
-                    .core()?,
-                network: row
-                    .try_get("network")
-                    .core()?,
-                format_version: row
-                    .try_get("format_version")
-                    .core()?,
-                covered_start: row
-                    .try_get::<i64, _>("covered_start")
-                    .core()? as u64,
-                covered_end: row
-                    .try_get::<i64, _>("covered_end")
-                    .core()? as u64,
-                manifest_sha256: row
-                    .try_get("manifest_sha256")
-                    .core()?,
-            })
-        })
-        .transpose()
     }
 
     /// Atomically create and prepare a singleton fleet task.
@@ -301,11 +251,6 @@ fn duration_seconds(duration: Duration) -> f64 {
 }
 
 fn parse_payload(value: serde_json::Value) -> sbgh_core::Result<TaskPayload> {
-    serde_json::from_value(value)
-        .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))
-}
-
-fn parse_resources(value: serde_json::Value) -> sbgh_core::Result<ResourceFacts> {
     serde_json::from_value(value)
         .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))
 }
@@ -1105,16 +1050,6 @@ impl FleetStore for PostgresFleetStore {
                    OR bg.measurement_profile IS NULL
                    OR bg.measurement_profile IS NOT DISTINCT FROM $3
                )
-               AND (
-                   j.task_kind <> 'block_validation'
-                   OR EXISTS (
-                       SELECT 1
-                         FROM worker_session dataset_session
-                        WHERE dataset_session.worker_session_id = $4
-                          AND dataset_session.resource_facts -> 'dataset'
-                              = j.execution_payload -> 'dataset'
-                   )
-               )
                AND NOT EXISTS (
                    SELECT 1
                      FROM worker_attempt active
@@ -1129,7 +1064,6 @@ impl FleetStore for PostgresFleetStore {
         .bind(&capabilities)
         .bind(worker_id)
         .bind(&measurement_profile)
-        .bind(worker_session_id)
         .fetch_optional(&mut *tx)
         .await
         .core()?;
@@ -3473,71 +3407,6 @@ impl FleetStore for PostgresFleetStore {
         Ok(result.rows_affected() == 1)
     }
 
-    async fn record_dataset(
-        &self,
-        worker_id: Uuid,
-        dataset: &DatasetIdentity,
-        verified_at: DateTime<Utc>,
-        make_current: bool,
-    ) -> sbgh_core::Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .core()?;
-        if make_current {
-            sqlx::query(
-                r#"
-                UPDATE block_validation_dataset
-                   SET is_current = FALSE
-                 WHERE worker_id = $1 AND network = $2 AND is_current
-                "#,
-            )
-            .bind(worker_id)
-            .bind(&dataset.network)
-            .execute(&mut *tx)
-            .await
-            .core()?;
-        }
-        let recorded = sqlx::query(
-            r#"
-            INSERT INTO block_validation_dataset
-                (generation, worker_id, network, format_version, covered_start,
-                 covered_end, manifest_sha256, is_current, verified_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (generation) DO UPDATE
-                SET is_current = EXCLUDED.is_current,
-                    verified_at = EXCLUDED.verified_at
-              WHERE block_validation_dataset.worker_id = EXCLUDED.worker_id
-                AND block_validation_dataset.network = EXCLUDED.network
-                AND block_validation_dataset.format_version = EXCLUDED.format_version
-                AND block_validation_dataset.covered_start = EXCLUDED.covered_start
-                AND block_validation_dataset.covered_end = EXCLUDED.covered_end
-                AND block_validation_dataset.manifest_sha256 = EXCLUDED.manifest_sha256
-            "#,
-        )
-        .bind(&dataset.generation)
-        .bind(worker_id)
-        .bind(&dataset.network)
-        .bind(&dataset.format_version)
-        .bind(dataset.covered_start as i64)
-        .bind(dataset.covered_end as i64)
-        .bind(&dataset.manifest_sha256)
-        .bind(make_current)
-        .bind(verified_at)
-        .execute(&mut *tx)
-        .await
-        .core()?;
-        if recorded.rows_affected() != 1 {
-            return Err(sbgh_core::Error::Config(format!(
-                "dataset generation {} conflicts with its immutable registered identity",
-                dataset.generation
-            )));
-        }
-        tx.commit().await.core()?;
-        Ok(())
-    }
-
     async fn fleet_snapshot(&self) -> sbgh_core::Result<FleetSnapshot> {
         let row = sqlx::query(
             r#"
@@ -3586,28 +3455,6 @@ impl FleetStore for PostgresFleetStore {
                 .try_get::<i64, _>("staged_artifact_bytes")
                 .core()? as u64,
         })
-    }
-
-    async fn session_resources(
-        &self,
-        worker_id: Uuid,
-        worker_session_id: Uuid,
-    ) -> sbgh_core::Result<Option<ResourceFacts>> {
-        let value: Option<serde_json::Value> = sqlx::query_scalar(
-            r#"
-            SELECT resource_facts
-              FROM worker_session
-             WHERE worker_id = $1 AND worker_session_id = $2
-            "#,
-        )
-        .bind(worker_id)
-        .bind(worker_session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .core()?;
-        value
-            .map(parse_resources)
-            .transpose()
     }
 }
 
@@ -3785,14 +3632,16 @@ async fn persist_block_result(
     sqlx::query(
         r#"
         INSERT INTO block_validation_result
-            (job_id, attempt_id, dataset_generation, valid, checked_blocks,
-             invalid_blocks, artifact_manifest)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (job_id, attempt_id, chainstate_origin, observed_start, observed_end,
+             valid, checked_blocks, invalid_blocks, artifact_manifest)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         "#,
     )
     .bind(job_id)
     .bind(attempt_id)
-    .bind(&result.dataset.generation)
+    .bind(&result.chainstate_origin)
+    .bind(result.observed_range.start as i64)
+    .bind(result.observed_range.end as i64)
     .bind(result.valid)
     .bind(result.checked_blocks as i64)
     .bind(invalid_blocks)

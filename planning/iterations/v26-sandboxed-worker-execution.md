@@ -12,11 +12,11 @@ resource-bounded VM per assignment.
 >
 > v25 shipped the fleet, durable attempt lifecycle, and block validation as a
 > second task kind. It intentionally left block validation on a worker-local
-> process path. v26 removes that exception without changing fleet scheduling,
-> task payloads, result meaning, or orchestrator ownership. Fleet wire protocol
-> v2 adds only a bounded, payload-derived offer-requirements projection so the
-> worker can enforce local storage/resource admission before accepting a lease;
-> the lease/event state machine is unchanged.
+> process path. v26 removes that exception and simplifies chainstate selection:
+> every worker selects its newest local read-only origin and the guest proves
+> that origin covers the requested range. Fleet wire protocol v3 removes
+> orchestrator-coordinated dataset identities and reports the selected origin
+> plus guest-observed coverage; the lease/event state machine is unchanged.
 
 ## Items
 
@@ -43,11 +43,11 @@ worker host. That has three problems:
 A single sandbox lifecycle gives operators and maintainers one mental model for
 execution, cancellation, forensics, artifact collection, and cleanup. The
 invariant is about **untrusted payload execution**, not about moving the trusted
-worker daemon or dataset allocator into a guest.
+worker daemon or local LVM allocator into a guest.
 
-Until v26 cuts over, the v25 direct-host path is not exposed to untrusted or
-fork-supplied revisions. Operators either keep `block_validation` disabled or
-restrict it to explicitly trusted, reviewed commits.
+All repository revisions are treated as adversarial. Source authorization and
+worker placement still decide which assignment may run, but neither creates a
+"trusted build" execution mode.
 
 ## Target Shape
 
@@ -62,7 +62,7 @@ sbgh-driver TaskSpec + attempt identity             backend-neutral contract
         |
         v
 sbgh-libvirt sandbox lifecycle                      trusted host adapter
-  ├── resolve one sealed dataset-generation LV
+  ├── resolve one immutable read-only origin LV
   ├── create K per-attempt LVM-thin snapshots
   ├── define one resource-profiled VM
   ├── attach the K snapshots as raw block devices
@@ -81,16 +81,17 @@ One block-validation **assignment owns one VM**. Its K validation shards run as
 processes inside that VM and share the VM's resource ceiling. v26 does not turn
 shards into fleet-scheduled jobs or create one VM per shard.
 
-The storage model reuses the benchmark substrate rather than the same physical
-baseline: benchmarks request one thin snapshot of their selected measurement
-origin; block validation requests K snapshots of an exact full-chainstate
-generation. Both use the same LVM provision/attach/teardown abstraction.
+The storage model is deliberately uniform: every worker is provisioned by the
+same nightly/on-demand chainstate updater, and every local origin matching
+`chainstate_base_prefix` is read-only. Benchmarks request one thin snapshot of
+the newest local origin; block validation requests K. Both use the same
+resolve/provision/attach/teardown abstraction.
 
 ## Design Rules
 
-- **Sandbox every untrusted payload.** Repository builds, build scripts, and
+- **Treat every build as adversarial.** Repository builds, build scripts, and
   produced binaries never execute in the worker process or directly on the
-  worker host.
+  worker host. Source authorization does not relax this invariant.
 - **No unsafe compatibility fallback.** A missing/unhealthy sandbox disables
   block-validation admission; it never routes the assignment back to v25's
   direct-host executor.
@@ -99,31 +100,27 @@ generation. Both use the same LVM provision/attach/teardown abstraction.
   VM image details. Libvirt is the only supported production backend in v26,
   not a permanent protocol constraint.
 - **Keep the trusted host surface narrow.** The worker/libvirt adapter may
-  perform fixed infrastructure operations: dataset verification, LVM-thin
+  perform fixed infrastructure operations: local RO-origin selection, LVM-thin
   snapshot allocation, domain definition, block-device attachment, artifact
   staging, and cleanup. It must not accept arbitrary host commands from an
   assignment.
 - **One assignment, one sandbox.** A block-validation attempt has one disposable
   domain and one aggregate resource profile. Shard parallelism is bounded
   inside that domain.
-- **One LVM-thin snapshot per shard.** The host creates K writable snapshots
-  from one sealed full-chainstate origin and attaches those snapshots to the
-  assignment VM. A shard receives one snapshot; no shard writes another
-  shard's filesystem.
-- **Canonical data is never guest-attached.** A published dataset generation
-  maps to one exact, immutable origin LV. Only its attempt-scoped snapshots are
-  attached to the VM. Updates create and publish a new generation; they never
-  mutate a published origin in place.
-- **One generation contract, one eventual producer.** v26 consumes sealed
-  generations compatible with
-  [`0052-managed-stacks-node-chainstate-producer`](../design/0052-managed-stacks-node-chainstate-producer.md).
-  Until `0052` ships, operators may mint them manually, but must use the same
-  LV tags, immutability, manifest, coverage, and identity contract. v26 does
-  not create a competing producer format.
-- **Shared mechanism does not imply shared baseline.** Benchmark and
-  block-validation profiles may select different chainstate origins, sizes,
-  freshness, and retention. They share snapshot lifecycle code and safety
-  invariants.
+- **One LVM-thin snapshot per shard.** The host creates K explicitly writable
+  snapshots from one read-only full-chainstate origin and attaches those
+  snapshots to the assignment VM. A shard receives one snapshot; no shard
+  writes another shard's filesystem.
+- **Canonical data is never guest-attached.** Only attempt-scoped writable
+  snapshots are attached. The local updater creates a new origin, marks it
+  read-only, and never mutates it in place.
+- **Local freshness is an operational assumption.** v26 assumes each worker's
+  updater has produced a sufficiently recent origin containing requested
+  benchmark/replay blocks. Cross-worker generation coordination, bootstrap,
+  and promotion are follow-up work after the simple model is proven.
+- **Coverage is observed, not advertised.** The guest probes the selected
+  snapshot before executing. Missing requested blocks fail as infrastructure;
+  successful results record the selected origin and observed range.
 - **Identity is attempt-scoped.** Domain names, directories, attachments, and
   normal cleanup include `job_id`, `attempt_id`, and fencing generation where
   relevant. Stale cleanup must not destroy a newer attempt's sandbox.
@@ -131,8 +128,10 @@ generation. Both use the same LVM provision/attach/teardown abstraction.
   block-validation vCPU, memory, CPU placement, maximum shard concurrency, and
   maximum concurrent assignments, plus storage/I/O controls where the selected
   host attachment can enforce them. Unsupported controls fail configuration
-  rather than becoming advisory. An assignment outside those limits is declined
-  before acceptance; it is never silently clamped after leasing.
+  rather than becoming advisory. CPU and RAM capacity are discovered at worker
+  startup, and every advertised execution profile is checked against those
+  measured facts. An assignment outside local policy is declined before
+  acceptance; it is never silently clamped after leasing.
 - **Pool health and assignment capacity are separate.** One fixed
   data/metadata floor shared with benchmark snapshots rejects an already
   near-full or mis-provisioned thin pool. It is not per-assignment write
@@ -150,7 +149,7 @@ generation. Both use the same LVM provision/attach/teardown abstraction.
   wire DTOs and driver types; `sbgh-driver` does not gain a protocol dependency.
 - **Results fail closed.** Missing, malformed, identity-mismatched, partial, or
   contradictory guest output is infrastructure failure—not a successful or
-  negative validation result. The host partitions and counts the trusted
+  negative validation result. The host partitions and counts the host-authored
   assignment range in global coordinates; guest epoch-local command
   translation never controls terminal coverage. Host ingestion follows no
   guest-controlled final symlink and verifies terminal files resolve beneath
@@ -164,10 +163,18 @@ generation. Both use the same LVM provision/attach/teardown abstraction.
   the trusted libvirt source-disk path. Worker mTLS material and fleet lease
   tokens are never mounted into the VM. Any unavoidable guest credential is
   short-lived, least-privilege, and excluded from logs and artifacts.
-- **Network access is explicit.** The block-validation profile defaults to no
-  general guest egress during validation. Build-time dependency access, if
-  required, uses an explicit restricted profile and is not inherited from the
-  worker control plane.
+- **One sandbox network policy.** Every guest phase uses the checked-in,
+  versioned `sandbox-egress` XML and nftables policy. It permits
+  repository/dependency fetches while denying the host, private/link-local
+  destinations, metadata endpoints, IPv6 fallback, and operator-listed public
+  infrastructure CIDRs. Worker preflight accepts no alternate name and invokes
+  a fixed root-owned structural verifier; domain XML requests port isolation.
+  A disposable-guest ceremony proves positive dependency egress and negative
+  host/private/metadata reachability before deployment. Optional operator TCP
+  probes require host reachability before and after proving configured public
+  control-plane endpoints are guest-inaccessible. A dedicated dependency
+  proxy may narrow egress later without creating a second execution mode. This
+  policy is containment, not a data-loss-prevention guarantee.
 - **Reuse the build cache.** `stacks-inspect` uses the shipped benchmark
   `BinaryCacheStore`/`BuildFingerprint` flow, with an executable-kind/target
   discriminator. Cache hits are attached for guest execution; cache misses are
@@ -191,8 +198,7 @@ generation. Both use the same LVM provision/attach/teardown abstraction.
 - Generalize the existing benchmark `ChainstateSnapshot` lifecycle into an
   attempt-scoped snapshot set: one snapshot for benchmark, K for block
   validation.
-- Resolve a pinned block-validation dataset generation to one exact sealed
-  full-chainstate origin LV and attach only its K snapshots.
+- Resolve the newest local read-only origin and attach only its K snapshots.
 - Build and execute `stacks-inspect` inside the guest.
 - Reuse the existing binary-cache mechanism for `stacks-inspect` hits,
   guest-built misses, and publication.
@@ -204,14 +210,14 @@ generation. Both use the same LVM provision/attach/teardown abstraction.
 - Update example worker configuration, architecture docs, operations runbooks,
   and package-DAG enforcement.
 
-**Non-goals:** changing the fleet lease/event state machine beyond the additive
-v2 offer-admission summary; distributing one validation across workers; one VM
+**Non-goals:** changing the fleet lease/event state machine; distributing one
+validation across workers; one VM
 per shard; adding containers, Firecracker, or Kubernetes; making libvirt part
 of the orchestrator API; copying the multi-TB dataset into every boot image;
 exposing the canonical dataset read-write; running the worker daemon in a VM;
 arbitrary command execution supplied by the orchestrator; changing benchmark
-measurement semantics; synchronizing or producing chainstate generations
-across workers; multi-orchestrator HA.
+measurement semantics; synchronizing, registering, promoting, or bootstrapping
+chainstate generations across workers; multi-orchestrator HA.
 
 ## Configuration and Admission
 
@@ -222,6 +228,10 @@ The implemented TOML ownership is explicit:
 min_data_free_percent = 5
 min_metadata_free_percent = 5
 
+[libvirt.vm]
+# Shared by benchmark, build-only, and block-validation guests.
+network = "sandbox-egress"
+
 [libvirt.block_validation]
 vcpus = 48
 memory_bytes = 206158430208
@@ -230,33 +240,24 @@ max_shards = 48
 max_concurrency = 48
 max_parallel_jobs = 1
 results_tmpfs_mib = 5120
-network = "restricted-build"
 chain_config = "/etc/sbgh/worker/stacks-inspect-mainnet.toml"
-
-[libvirt.block_validation.dataset]
-generation = "mainnet-2026-07"
-network = "mainnet"
-format_version = "stacks-core-v3"
-covered_start = 0
-covered_end = 8020465
-manifest_sha256 = "<sha256>"
-origin_lv = "mainnet-full-2026-07"
-manifest_path = "/srv/sbgh/datasets/mainnet-2026-07/.sbgh-dataset-manifest.json"
 snapshot_prefix = "sbgh-block"
 mount_options = ["nouuid", "noatime"]
-required_origin_tags = ["sbgh_sealed", "sbgh_validated"]
 ```
 
-Paths and libvirt details remain worker-local. Registration advertises logical
-capability and resource facts; server authorization remains authoritative.
-Fleet protocol v2 puts only `task kind + dataset identity + requested shard
-count + concurrency` on `WorkOffer`; the worker verifies that bounded summary
-before acceptance, then verifies the accepted payload projects to the same
-requirements. Before accepting an offer, the worker verifies that:
+Paths and libvirt details remain worker-local. There is no manually maintained
+host-capacity stanza: registration advertises logical capability plus CPU and
+RAM facts discovered at startup, while server authorization remains
+authoritative. Storage admission remains backend-specific rather than using an
+aggregate host byte estimate.
+Fleet protocol v3 puts only `task kind + requested shard count + concurrency`
+on `WorkOffer`; the worker verifies that bounded summary before acceptance,
+then verifies the accepted payload projects to the same requirements. Before
+accepting an offer, the worker verifies that:
 
 - the configured backend supports the task;
 - the task has a matching local execution profile;
-- the pinned dataset identity maps to the exact configured, sealed origin LV;
+- the newest matching local origin is read-only;
 - requested shards/concurrency fit the local profile; and
 - the shared fixed pool-health floor passes and the host can attach the
   requested snapshot count within its configured device ceiling.
@@ -272,7 +273,7 @@ runs.
 
 **Scope:**
 
-- Add pure `BlockValidationTaskSpec`, range/epoch/dataset identity, and typed
+- Add pure `BlockValidationTaskSpec`, range/epoch, and typed
   block-validation output types to `sbgh-driver`.
 - Add `TaskSpec::BlockValidation` and a typed task-output field to
   `DriverOutcome`; retain the backend forensics summary separately.
@@ -313,8 +314,13 @@ changing existing benchmark behavior.
   domain XML, start/poll/cancel, forensics, and teardown into an internal
   sandbox lifecycle.
 - Keep benchmark and build-only plans as typed users of that lifecycle.
-- Make CPU, memory, CPU-set, network, block-device set, timeout, and artifact
+- Make CPU, memory, CPU-set, block-device set, timeout, and artifact
   policy inputs explicit and validated.
+- Use the single VM-level `sandbox-egress` network for every task and guest
+  phase.
+- Install its versioned XML/firewall through a root-owned system service, make
+  worker startup depend on that service, and fail preflight if the live
+  structural policy differs.
 - Generalize domain XML from one hard-coded chainstate disk to a typed list of
   snapshot devices with deterministic per-shard serials. Use a scalable
   virtio-scsi controller for the K-device block-validation case.
@@ -335,6 +341,8 @@ changing existing benchmark behavior.
   cleanup tests are unchanged or have byte-equivalent expectations.
 - [x] Domain XML tests prove the requested vCPU, memory, CPU-set, network, and
   exact block-device attachment policy.
+- [x] Every guest interface requests libvirt port isolation; alternate or
+  merely renamed networks fail before host commands.
 - [x] Every domain/resource name is attempt-scoped and deterministic.
 - [x] A setup failure and a cancellation both pass through the same idempotent
   teardown state machine.
@@ -342,23 +350,18 @@ changing existing benchmark behavior.
 ### Phase 3: Shared LVM-Thin Snapshot Substrate
 
 **Goal:** Reuse benchmark chainstate provisioning while giving each validation
-shard its own writable snapshot of one exact, immutable dataset generation.
+shard its own writable snapshot of the newest local immutable origin.
 
 **Scope:**
 
 - Generalize the existing benchmark `ChainstateSnapshot` into an
   attempt-scoped `ChainstateSnapshotSet`/provider. Benchmark requests one
   snapshot; block validation requests K.
-- Resolve `DatasetIdentity.generation` to one exact configured full-chainstate
-  origin LV. Do not use "lexicographically latest prefix" selection for a
-  pinned block-validation assignment.
-- Require the origin to be a sealed, verified generation: LVM permission/tags
-  and the read-only mounted manifest must agree with the registered dataset
-  identity, covered range, and digest before capability advertisement.
-  [`0052`](../design/0052-managed-stacks-node-chainstate-producer.md) is the
-  canonical future producer; manually provisioned origins use that same
-  contract until it ships. In-place mutation of a published origin is
-  forbidden now.
+- Use the same latest-prefix resolver for benchmark and block validation.
+  Require the selected origin LV to be read-only before allocating any
+  snapshot. [`0052`](../design/0052-managed-stacks-node-chainstate-producer.md)
+  remains the natural future updater, but manifests and tags are optional
+  provenance rather than runtime admission.
 - Provision all K thin snapshots before domain start, with names containing
   attempt identity and shard index. A partial failure removes the successful
   prefix before returning.
@@ -375,13 +378,13 @@ shard its own writable snapshot of one exact, immutable dataset generation.
   use an end-to-end canary at the intended K to validate attachment and choose
   a conservative initial resource profile. Treat throughput telemetry as
   operational tuning, not a correctness or release gate.
-- Record origin generation, origin LV, snapshot identities, and shard/device
-  mapping in forensics without leaking host paths into the fleet protocol.
+- Record the selected origin LV, guest-observed coverage, snapshot identities,
+  and shard/device mapping in forensics.
 
 **Status:**
 
 - [x] Shared snapshot-set provider
-- [x] Exact-generation resolution and shared pool-health admission
+- [x] Shared latest-RO-origin resolution and pool-health admission
 - [x] Multi-device domain/guest mounting
 - [ ] One-time real-host read-write/isolation smoke
 - [x] Failure and cleanup tests
@@ -392,26 +395,26 @@ shard its own writable snapshot of one exact, immutable dataset generation.
 
 - [x] Existing benchmark execution still provisions one thin snapshot with
   unchanged base selection/teardown and the shared pre-allocation pool-health
-  guard.
+  guard; selection now fails closed when the newest origin is writable.
+- [x] Benchmark summaries record the selected origin LV so results remain
+  attributable after a newer baseline is published.
 - [x] A block assignment provisions exactly K distinct snapshots from the
-  payload's exact generation LV; no "latest" fallback is possible.
+  newest local read-only origin.
 - [x] The guest sees stable shard-to-device mappings, mounts all K XFS
   snapshots concurrently, and never sees the origin LV.
 - [ ] Writes to one shard snapshot change neither the origin nor another shard
   snapshot.
-- [ ] Startup refuses the capability when the origin is missing/unverified,
+- [ ] Startup refuses the capability when the origin is missing/writable,
   the shared thin-pool health floor is not met, XFS duplicate-UUID mounting is
   unsupported, or K devices cannot be attached safely.
-- [x] Origin permission/tags and its read-only manifest bind the advertised
-  dataset generation, covered range, and digest to that exact LV.
-- [ ] A manually provisioned generation and a `0052`-produced fixture satisfy
-  the same dataset-generation validator and resolve to the same runtime model.
+- [x] Guest probes fail closed when the selected local origin does not contain
+  the requested epoch/range.
 - [ ] Partial snapshot/attach/domain failures leave no accepted job with
   untracked LVs or devices.
 - [x] Cleanup is idempotent across worker restart and an already-removed
   domain/snapshot set.
 - [ ] Two explicit read-write snapshots mount with `nouuid`; writing either
-  changes neither the sealed origin nor its peer, and cleanup leaves no LV.
+  changes neither the immutable origin nor its peer, and cleanup leaves no LV.
 - [ ] One canary at the configured K completes within the task timeout; K is
   reduced if real runtime or host telemetry shows an unsuitable initial
   resource profile.
@@ -489,6 +492,9 @@ VM.
 - Preserve existing protocol payloads, artifact names, result persistence,
   reports, cancellation precedence, and retry/recovery behavior.
 - Update configuration examples and operator migration/rollback instructions.
+- Ship the `sandbox-egress` XML/nftables policy, root-owned apply/check
+  helpers, systemd ordering, static asset validation, and active
+  disposable-guest qualification.
 
 **Status:**
 
@@ -507,11 +513,15 @@ VM.
   direct host execution.
 - [x] Package metadata and the documented crate DAG agree under all features.
 - [x] A worker cannot register `block_validation` without a usable sandbox
-  backend, resource profile, exact sealed dataset-generation LV, a passing
-  shared thin-pool health check, and successful preflight.
+  backend, resource profile, a local read-only origin, a passing shared
+  thin-pool health check, and successful preflight.
+- [x] A benchmark worker cannot register without the same sandbox preflight
+  and a read-only origin. Build-only preflight does not require chainstate.
 - [x] Existing benchmark and build-only end-to-end tests remain green.
 - [x] Existing v25 block-validation API, queue, fleet, persistence, report, and
   artifact tests remain green.
+- [x] Worker startup requires the network policy service; preflight verifies
+  the live policy through an exact no-argument sudo command.
 
 ### Phase 6: Real-Host Security and Recovery Validation
 
@@ -519,9 +529,14 @@ VM.
 
 **Scope:**
 
-- Validate the block-validation execution profile, exact origin resolution,
+- Validate the block-validation execution profile, local origin resolution,
   K-snapshot attachment/mounting, and shared binary-cache hit/miss paths on the
   actual libvirt host.
+- Run the sandbox-network ceremony: dependency HTTPS succeeds while controlled
+  host, RFC1918, metadata, and configured operator control-plane endpoints
+  remain unreachable. Operator endpoint probes require successful host-side
+  TCP controls before and after the guest probe. Retain rule counters and the
+  generated report.
 - Exercise success, typed invalid-block failure, infrastructure failure,
   timeout, cancellation, worker loss, and orchestrator reconnect.
 - Verify domain, block-device, mount, snapshot-LV, cache, and artifact cleanup.
@@ -548,15 +563,20 @@ VM.
 - [ ] `virsh`/domain inspection confirms the configured vCPU, memory, CPU-set,
   network, virtio-scsi controller, stable shard serials, and exact K snapshot
   devices.
+- [ ] The live `sandbox-egress` XML/nftables policy passes structural
+  verification; the policy unit starts successfully and its `ExecStartPost`
+  check passes; every guest interface is port-isolated; and the active canary
+  proves positive dependency egress plus negative host/private/metadata and
+  configured operator-endpoint reachability.
 - [ ] No scenario leaves a running domain, mounted shard, or attempt snapshot
   LV after cleanup completes.
-- [ ] The sealed origin LV remains unchanged before and after every smoke.
+- [ ] The immutable origin LV remains unchanged before and after every smoke.
 - [ ] The shared near-full pool guard passes, the two-snapshot smoke proves
   read-write isolation, and the configured-K canary completes without an
   attachment, timeout, or cleanup failure.
 - [ ] Cancellation and lease loss cannot publish a successful terminal result.
-- [ ] A successful real validation produces the same logical result and
-  artifact set as the v25 implementation for the same commit/dataset/range.
+- [ ] A successful real validation produces the same logical verdict and
+  artifact set as the v25 implementation for the same commit/range.
 - [ ] Real positive output and a controlled real invalid-block output are saved
   as parser fixtures; the latter becomes a completed negative result, while
   malformed or non-validation failures remain infrastructure errors.
@@ -577,20 +597,21 @@ VM.
 - Property tests cover partitioning and reduction invariants.
 - Docker-backed persistence/protocol/reporting tests remain green.
 - A libvirt-host smoke proves successful and negative block validation,
-  cache miss/hit, cancellation, timeout, restart cleanup, exact-generation
+  cache miss/hit, cancellation, timeout, restart cleanup, latest-local-origin
   selection, origin immutability, two-snapshot isolation, configured-K
-  attachment, shared thin-pool health, and resource enforcement.
+  attachment, shared thin-pool health, resource enforcement, and active
+  sandbox-network containment.
 - Real `stacks-inspect` output closes the parser-validation gate deferred from
   v25.
 - Documentation and example configurations contain no direct-host
   block-validation execution path.
 
-### Local implementation record (2026-07-27)
+### Local implementation record (2026-07-28)
 
 - `just build --no-sccache` — passed.
 - `just lint --no-sccache` — passed, including docs/registry, package DAG,
   cargo-machete, Clippy, and rustfmt.
-- `just test --summary --no-sccache` — 854 passed, 1 environment-gated test
+- `just test --summary --no-sccache` — 858 passed, 1 environment-gated test
   skipped.
 - No persistent writable compiler-cache directory is exposed to guests.
   sccache is confined to the disposable boot overlay; the host-mediated binary
@@ -599,22 +620,37 @@ VM.
   global assignment range; epoch-local guest CLI translation cannot reduce the
   accepted coverage.
 - Snapshot creation explicitly requests read-write permission, benchmark and
-  block-validation snapshots share a fixed near-full pool guard, and teardown
-  retains all backing resources whenever domain stop/undefine cannot be
-  proven.
+  block-validation snapshots reject writable origins and share a fixed
+  near-full pool guard. Teardown retains all backing resources whenever domain
+  stop/undefine cannot be proven.
+- Benchmark/build and block-validation guests share the operator-owned
+  `sandbox-egress` network; the block-validation profile has no second network
+  override. Current examples and preflight tests pin that single contract.
+- Dataset identity, manifest-digest admission, and the daemon dataset registry
+  were removed. Manifests/tags remain optional provenance; read-only origin
+  permission is the universal isolation invariant, and the guest reports the
+  coverage it actually observes.
+- Benchmark forensics record the selected origin LV, and the checked-in
+  chainstate producer publishes new benchmark origins read-only.
 - K-scaled metadata/write-divergence reserves and synthetic `fio`
   qualification were removed after confirming validation's rollback-based,
   MB-scale write profile. The host gate is now one two-snapshot isolation smoke
   plus a real configured-K canary; throughput remains operational tuning.
 - The libvirt composition suite covers a warm `stacks-inspect` cache entry,
-  exact sealed-origin admission, two attempt snapshots, VM-only execution,
+  latest immutable-origin admission, two attempt snapshots, VM-only execution,
   monotonic progress, typed reduction, artifact archival, and reverse cleanup.
 - Guest-controlled terminal files are opened without following symlinks,
   confined beneath the result share, bounded before parsing or archival, and
   covered by escape and oversized-output regression tests.
-- Block-validation preflight verifies the fixed host executables, golden-image
-  readability, configured libvirt network, runtime directories, exact sealed
-  origin, and shared thin-pool health before capability registration.
+- Common preflight verifies the fixed host executables, golden-image
+  readability, single configured libvirt network, and runtime directories.
+  Benchmark and block-validation preflight additionally verify the latest
+  local read-only origin and shared thin-pool health; build-only does not
+  allocate or require chainstate.
+- The versioned network assets are statically validated by `just lint`.
+  Systemd applies them before workers, Rust preflight invokes the root-owned
+  structural checker, and `qualify-sandbox-network.sh` provides the active
+  deployment gate.
 - Production `sbgh-worker` has no process-spawn implementation or Tokio
   `process` feature; all three shipped task kinds compose through `Driver`.
 - The dedicated-host libvirt/LVM isolation smoke, real `stacks-inspect`
@@ -631,15 +667,20 @@ VM.
 Roll out to the dedicated block-validation worker first:
 
 1. Drain the worker and complete outstanding cleanup obligations.
-2. Install/verify the v26 golden image, sealed full-chainstate origin LV,
-   virtio-scsi/XFS mount support, and shared thin-pool health floor.
-3. Keep the worker stopped/drained and run `sbgh-worker --config
+2. Install the checked-in `sandbox-egress` policy, configure the
+   operator-protected CIDRs, start the policy unit, require its active state
+   and successful `ExecStartPost` check, then run the disposable-guest network
+   ceremony with non-vacuous operator endpoint probes where available.
+3. Install/verify the v26 golden image, nightly/on-demand local chainstate
+   updater, latest immutable origin LV, virtio-scsi/XFS mount support, and
+   shared thin-pool health floor.
+4. Keep the worker stopped/drained and run `sbgh-worker --config
    /etc/sbgh/worker/block-validation.toml --preflight-only`; do not register
    the capability until it passes.
-4. Enable the capability for a bounded canary range.
-5. Exercise cancellation and cleanup, then run a representative full task.
-6. Expand only after origin immutability, pool health, cache, and resource
-   checks remain clean.
+5. Enable the capability for a bounded canary range.
+6. Exercise cancellation and cleanup, then run a representative full task.
+7. Expand only after network containment, origin immutability, pool health,
+   cache, and resource checks remain clean.
 
 Rollback drains the worker, disables the capability, cleans v26
 attempt-scoped resources, and may restore the prior worker binary/config with
@@ -648,12 +689,12 @@ direct host execution.
 
 ## Follow-Ups
 
-- `0052-managed-stacks-node-chainstate-producer` replaces manual generation
-  provisioning when it ships; v26 already consumes its tags/manifest/identity
-  contract.
+- `0052-managed-stacks-node-chainstate-producer` may replace the simple local
+  downloader when it ships. A future iteration may add distributed
+  generation/bootstrap coordination after the local model is proven.
 - Other sandbox backends may implement the same driver contract later; v26 does
   not pre-design or require them.
 - Cross-worker shard scheduling remains a separate scale-out item if one
   resource-profiled VM on the dedicated host proves insufficient.
 - Stronger guest egress isolation or a dedicated dependency proxy may be
-  extracted after measuring the initial restricted-build profile.
+  added behind the single sandbox-network contract.

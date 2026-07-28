@@ -825,7 +825,6 @@ pub enum QueuedEventDetail {
     /// persisted separately in the fleet contract; this remains audit
     /// provenance for why the job exists.
     BlockValidation {
-        dataset_generation: String,
         range_start: u64,
         range_end: u64,
         requested_shards: u32,

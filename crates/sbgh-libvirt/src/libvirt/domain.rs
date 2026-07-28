@@ -41,7 +41,7 @@ pub struct DomainSpec<'a> {
     /// production deployment shape.
     pub vcpus: u32,
     /// Memory allocated to the VM, in bytes. Set per render call from
-    /// `vm.build_memory_bytes` or `vm.bench_memory_bytes`.
+    /// `benchmark.build_memory_bytes` or `benchmark.bench_memory_bytes`.
     /// We emit `<memory unit='KiB'>` because libvirt's smallest
     /// guaranteed-supported unit is KiB; bytes would work on modern
     /// libvirt but KiB is the safe portable choice.
@@ -292,6 +292,7 @@ fn interface_network(w: &mut W, network: &str) -> std::io::Result<()> {
         .write_inner_content(|w| {
             empty(w, "source", &[("network", network)])?;
             empty(w, "model", &[("type", "virtio")])?;
+            empty(w, "port", &[("isolated", "yes")])?;
             Ok(())
         })?;
     Ok(())
@@ -346,7 +347,7 @@ mod tests {
             results_share_dir: Path::new("/run/sbgh/jobs/job1"),
             results_share_tag: "results",
             console_log_path: Path::new("/var/lib/sbgh/jobs/job1/console.log"),
-            network: "default",
+            network: "sandbox-egress",
             vcpu_cpuset: None,
             emulator_cpuset: None,
         }
@@ -385,7 +386,8 @@ mod tests {
         assert!(xml.contains("<memoryBacking>"));
         assert!(xml.contains("mode=\"shared\""));
         // network + console + guest agent
-        assert!(xml.contains("network=\"default\""));
+        assert!(xml.contains("network=\"sandbox-egress\""));
+        assert!(xml.contains("<port isolated=\"yes\"/>"));
         assert!(xml.contains("/var/lib/sbgh/jobs/job1/console.log"));
         assert!(xml.contains("org.qemu.guest_agent.0"));
     }
@@ -409,7 +411,7 @@ mod tests {
             block_devices: &devices,
             vcpus: 48,
             memory_bytes: 192 * 1024 * 1024 * 1024,
-            network: "restricted-build",
+            network: "sandbox-egress",
             vcpu_cpuset: Some("0-47"),
             emulator_cpuset: Some("48-63"),
             ..sample()
@@ -419,7 +421,7 @@ mod tests {
         assert!(xml.contains("dev=\"sdd\" bus=\"scsi\""));
         assert!(xml.contains("<serial>sbgh-block-0000</serial>"));
         assert!(xml.contains("/dev/vg0/attempt-shard-1"));
-        assert!(xml.contains("network=\"restricted-build\""));
+        assert!(xml.contains("network=\"sandbox-egress\""));
         assert!(xml.contains("cpuset=\"0-47\""));
         assert!(!xml.contains("sbgh-job1-chainstate"));
         assert_eq!(

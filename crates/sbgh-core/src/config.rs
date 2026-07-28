@@ -180,7 +180,8 @@ pub struct VmConfig {
     pub bench_memory: MemorySize,
     pub boot_disk_gib: u32,
     pub job_timeout_secs: u64,
-    /// libvirt network to attach to the VM (default: `default`, NAT outbound).
+    /// Versioned, policy-managed network shared by every adversarial guest
+    /// phase. Only `sandbox-egress` is supported.
     pub network: String,
     /// How often the daemon polls the in-VM phase log + virsh
     /// domstate. Each poll runs a `virsh domstate` subprocess (~50–
@@ -1008,7 +1009,7 @@ impl RawDaemon {
                 network: self
                     .vm
                     .network
-                    .unwrap_or_else(|| "default".into()),
+                    .unwrap_or_else(|| "sandbox-egress".into()),
                 poll_interval_secs: self
                     .vm
                     .poll_interval_secs

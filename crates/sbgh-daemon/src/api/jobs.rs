@@ -87,18 +87,7 @@ pub async fn enqueue_block_validation(
         .worker_id
         .parse::<uuid::Uuid>()
         .map_err(|_| ApiErr::bad_request("worker_id must be a UUID"))?;
-    let fleet = sbgh_postgres::PostgresFleetStore::new(state.pool);
-    let dataset = fleet
-        .current_dataset(worker_id, &request.dataset_network)
-        .await?
-        .ok_or_else(|| {
-            ApiErr::bad_request(format!(
-                "worker {worker_id} has no current configured {} dataset",
-                request.dataset_network
-            ))
-        })?;
     let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-        dataset: dataset.clone(),
         epoch,
         range: InclusiveRange {
             start: request.range_start,
@@ -113,7 +102,6 @@ pub async fn enqueue_block_validation(
         .map_err(|error| ApiErr::bad_request(error.to_string()))?;
     let job_id = uuid::Uuid::new_v4();
     let detail = serde_json::to_value(QueuedEventDetail::BlockValidation {
-        dataset_generation: dataset.generation,
         range_start: request.range_start,
         range_end: request.range_end,
         requested_shards: request.requested_shards,
@@ -150,6 +138,7 @@ pub async fn enqueue_block_validation(
             "could not enqueue block validation",
         )
     })?;
+    let fleet = sbgh_postgres::PostgresFleetStore::new(state.pool);
     fleet
         .enqueue_prepared_job(
             job_id,

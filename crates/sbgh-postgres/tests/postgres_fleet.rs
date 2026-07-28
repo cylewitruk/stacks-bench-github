@@ -3,12 +3,12 @@ use std::collections::BTreeSet;
 use chrono::{Duration, Utc};
 use sbgh_core::db::JobStore;
 use sbgh_core::db::fleet::{
-    ArtifactGrantRecord, EventIngest, FleetStore, FleetTerminalSubmission, FleetTerminalWrite,
-    PreparedExecution, ProjectedReportMutation, ResolvedSpecSource, TerminalAcceptance,
-    WorkerRegistration,
+    ArtifactGrantRecord, EventIngest, FleetCompletion, FleetStore, FleetTerminalSubmission,
+    FleetTerminalWrite, PreparedExecution, ProjectedReportMutation, ResolvedSpecSource,
+    TerminalAcceptance, WorkerRegistration,
 };
 use sbgh_core::models::{
-    BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobIntent, JobSource, NewJob,
+    BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobIntent, JobResult, JobSource, NewJob,
     QueuedEventDetail, TaskKind,
 };
 use sbgh_postgres::db::{
@@ -16,8 +16,8 @@ use sbgh_postgres::db::{
 };
 use sbgh_postgres::{PostgresFleetStore, PostgresJobStore, PreparedJobProvenance};
 use sbgh_proto::{
-    ArtifactDescriptor, AttemptIdentity, BlockValidationPayload, DatasetIdentity, InclusiveRange,
-    PROTOCOL_VERSION, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
+    ArtifactDescriptor, AttemptIdentity, BlockValidationPayload, BlockValidationResult,
+    InclusiveRange, PROTOCOL_VERSION, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
     ReliableEventEnvelope, ReliableEventPayload, ResourceFacts, TaskPayload, TerminalOutcome,
     ValidationEpoch, WorkerCapability,
 };
@@ -75,8 +75,6 @@ fn session(worker_id: Uuid, worker_session_id: Uuid) -> RegisterSessionRequest {
         resources: ResourceFacts {
             logical_cpus: 4,
             memory_bytes: 8 * 1024 * 1024 * 1024,
-            storage_bytes: 100 * 1024 * 1024 * 1024,
-            dataset: None,
         },
     }
 }
@@ -346,6 +344,20 @@ async fn response_loss_and_successor_session_are_safely_fenced() {
         .register_session(worker_id, &session(worker_id, first_session), Duration::minutes(5))
         .await
         .unwrap();
+    let stored_resources: serde_json::Value = sqlx::query_scalar(
+        "SELECT resource_facts FROM worker_session WHERE worker_session_id = $1",
+    )
+    .bind(first_session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_resources,
+        serde_json::json!({
+            "logical_cpus": 4,
+            "memory_bytes": 8_u64 * 1024 * 1024 * 1024,
+        })
+    );
     let job_id = Uuid::new_v4();
     enqueue_build(&store, job_id).await;
 
@@ -504,7 +516,7 @@ async fn response_loss_and_successor_session_are_safely_fenced() {
 #[tokio::test]
 async fn idle_drain_is_observable_and_stops_new_claims() {
     let (_db, pool) = setup_pg_db().await;
-    let store = PostgresFleetStore::new(pool);
+    let store = PostgresFleetStore::new(pool.clone());
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
@@ -1080,10 +1092,10 @@ async fn terminal_after_orchestrator_lease_expiry_is_fenced() {
 }
 
 #[tokio::test]
-async fn capability_and_dataset_identity_route_only_to_a_compatible_worker() {
+async fn capability_routes_only_to_a_compatible_worker() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool, 100, 10).await;
-    let store = PostgresFleetStore::new(pool);
+    let store = PostgresFleetStore::new(pool.clone());
     let build_worker = Uuid::new_v4();
     let block_worker = Uuid::new_v4();
     let build_session = Uuid::new_v4();
@@ -1103,18 +1115,6 @@ async fn capability_and_dataset_identity_route_only_to_a_compatible_worker() {
         })
         .await
         .unwrap();
-    let dataset = DatasetIdentity {
-        generation: "mainnet-g1".into(),
-        network: "mainnet".into(),
-        format_version: "v1".into(),
-        covered_start: 0,
-        covered_end: 1_000,
-        manifest_sha256: "11".repeat(32),
-    };
-    store
-        .record_dataset(block_worker, &dataset, Utc::now(), true)
-        .await
-        .unwrap();
     store
         .register_session(build_worker, &session(build_worker, build_session), Duration::minutes(5))
         .await
@@ -1131,8 +1131,6 @@ async fn capability_and_dataset_identity_route_only_to_a_compatible_worker() {
                 resources: ResourceFacts {
                     logical_cpus: 64,
                     memory_bytes: 256 * 1024 * 1024 * 1024,
-                    storage_bytes: 16_000_000_000_000,
-                    dataset: Some(dataset.clone()),
                 },
             },
             Duration::minutes(5),
@@ -1142,7 +1140,6 @@ async fn capability_and_dataset_identity_route_only_to_a_compatible_worker() {
 
     let job_id = Uuid::new_v4();
     let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-        dataset,
         epoch: ValidationEpoch::Nakamoto,
         range: InclusiveRange { start: 100, end: 199 },
         requested_shards: 8,
@@ -1168,7 +1165,6 @@ async fn capability_and_dataset_identity_route_only_to_a_compatible_worker() {
                 workload_key: None,
             },
             &serde_json::to_value(QueuedEventDetail::BlockValidation {
-                dataset_generation: "mainnet-g1".into(),
                 range_start: 100,
                 range_end: 199,
                 requested_shards: 8,
@@ -1202,6 +1198,74 @@ async fn capability_and_dataset_identity_route_only_to_a_compatible_worker() {
     assert_eq!(offered.offer.job_id, job_id);
     assert_eq!(offered.offer.capability, WorkerCapability::BlockValidation);
     assert_eq!(offered.offer.requirements, sbgh_proto::OfferRequirements::from(&payload));
+    assert!(
+        store
+            .accept_offer(block_worker, &offered.offer.identity, Duration::seconds(60))
+            .await
+            .unwrap()
+    );
+    let block_result = BlockValidationResult {
+        valid: true,
+        checked_blocks: 100,
+        invalid_blocks: Vec::new(),
+        chainstate_origin: "vg0/mainnet-2026-07-28".into(),
+        observed_range: InclusiveRange { start: 0, end: 1_000 },
+    };
+    let terminal = TerminalOutcome::Completed {
+        summary: serde_json::json!({"chainstate_origin": block_result.chainstate_origin}),
+        block_validation: Some(block_result.clone()),
+    };
+    let terminal_event = event(
+        &offered.offer.identity,
+        offered.offer.trace_id,
+        1,
+        ReliableEventPayload::Terminal {
+            outcome_digest: sbgh_proto::payload_digest(&terminal).unwrap(),
+        },
+    );
+    store
+        .ingest_reliable_event(block_worker, &terminal_event)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .accept_terminal(
+                block_worker,
+                &offered.offer.identity,
+                &FleetTerminalSubmission {
+                    reliable_seq: 1,
+                    payload_digest: &terminal_event.payload_digest,
+                    outcome: &terminal,
+                    artifacts: &[],
+                    write: &FleetTerminalWrite::Completed(Box::new(FleetCompletion {
+                        result: JobResult {
+                            job_id,
+                            run_json: None,
+                            archive_dir: "job".into(),
+                            created_at: Utc::now(),
+                        },
+                        metric: None,
+                        baseline_calibration_id: None,
+                        event_detail: None,
+                        block_validation: Some(block_result),
+                        artifact_manifest: Vec::new(),
+                    })),
+                },
+            )
+            .await
+            .unwrap(),
+        TerminalAcceptance::Accepted
+    );
+    let persisted: (String, i64, i64) = sqlx::query_as(
+        "SELECT chainstate_origin, observed_start, observed_end
+           FROM block_validation_result
+          WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, ("vg0/mainnet-2026-07-28".into(), 0, 1_000));
 }
 
 #[tokio::test]

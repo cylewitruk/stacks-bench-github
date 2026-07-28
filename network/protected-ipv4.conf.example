@@ -1,0 +1,6 @@
+# One IPv4 CIDR per line. Add public worker-control-plane, orchestrator, VPN,
+# and environment-specific infrastructure ranges not covered by the built-in
+# private/link-local deny set. Blank lines and comments are ignored.
+#
+# Example:
+# 203.0.113.18/32

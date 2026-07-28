@@ -5,19 +5,6 @@ client_private_key = "/etc/sbgh/worker/client.key"
 server_ca_certificate = "/etc/sbgh/worker/orchestrator-ca.crt"
 capabilities = ["block_validation"]
 
-[resources]
-logical_cpus = 64
-memory_bytes = 274877906944
-storage_bytes = 16000000000000
-
-[resources.dataset]
-generation = "mainnet-2026-07-26"
-network = "mainnet"
-format_version = "stacks-core-v3"
-covered_start = 0
-covered_end = 8020465
-manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # replace
-
 [binary_cache]
 enabled = true
 max_bytes = 53687091200
@@ -29,13 +16,11 @@ host_cpus = "48-63"
 
 [libvirt.vm]
 golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
-build_vcpus = 16
-bench_vcpus = 8
-build_memory_bytes = 34359738368
-bench_memory_bytes = 17179869184
 boot_disk_gib = 64
-job_timeout_secs = 43200
-network = "restricted-build"
+# The versioned, policy-managed network used by every adversarial guest phase.
+# Install it with scripts/install-sandbox-network.sh; other names fail
+# preflight.
+network = "sandbox-egress"
 poll_interval_secs = 5
 heartbeat_interval_secs = 60
 
@@ -68,22 +53,8 @@ max_shards = 48
 max_concurrency = 48
 max_parallel_jobs = 1
 results_tmpfs_mib = 5120
-network = "restricted-build"
 # This file is copied into the guest. It must contain no reusable worker,
 # fleet, database, object-store, or repository credentials.
 chain_config = "/etc/sbgh/worker/stacks-inspect-mainnet.toml"
-
-[libvirt.block_validation.dataset]
-generation = "mainnet-2026-07-26"
-network = "mainnet"
-format_version = "stacks-core-v3"
-covered_start = 0
-covered_end = 8020465
-manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # replace
-origin_lv = "mainnet-full-2026-07-26"
-manifest_path = "/srv/sbgh/datasets/mainnet-2026-07-26/.sbgh-dataset-manifest.json"
-# The same read-only origin mount must also contain
-# .sbgh-dataset-files.sha256; its digest is bound by the manifest.
 snapshot_prefix = "sbgh-block"
 mount_options = ["nouuid", "noatime"]
-required_origin_tags = ["sbgh_sealed", "sbgh_validated"]

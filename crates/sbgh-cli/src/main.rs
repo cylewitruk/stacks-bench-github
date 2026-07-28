@@ -391,7 +391,7 @@ enum JobsAction {
         #[arg(long)]
         limit: Option<u32>,
     },
-    /// Enqueue block validation on a fleet worker with the matching dataset.
+    /// Enqueue block validation on a fleet worker.
     ValidateBlocks {
         #[arg(long)]
         install_id: i64,
@@ -401,8 +401,6 @@ enum JobsAction {
         commit: String,
         #[arg(long)]
         worker_id: String,
-        #[arg(long, default_value = "mainnet")]
-        dataset_network: String,
         #[arg(long, default_value = "nakamoto")]
         epoch: String,
         #[arg(long)]
@@ -1082,7 +1080,6 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
             repo_id,
             commit,
             worker_id,
-            dataset_network,
             epoch,
             range_start,
             range_end,
@@ -1096,7 +1093,6 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
                     repo_id,
                     commit,
                     worker_id,
-                    dataset_network,
                     epoch,
                     range_start,
                     range_end,

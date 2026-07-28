@@ -6,7 +6,7 @@ mod fingerprint;
 mod libvirt;
 
 pub use config::{
-    BlockDatasetConfig, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
+    BenchmarkProfile, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
 };
 pub use libvirt::driver::{LibvirtDriver, current_cache_environment};
 #[cfg(any(test, feature = "testing"))]

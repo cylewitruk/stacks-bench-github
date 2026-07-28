@@ -118,11 +118,6 @@ impl FleetRuntime {
                     .collect::<Vec<_>>(),
             )
             .await?;
-        for dataset in &config.datasets {
-            store
-                .record_dataset(dataset.worker_id, &dataset.identity, Utc::now(), dataset.current)
-                .await?;
-        }
         Ok(Self {
             state: ApiState {
                 store,
@@ -209,39 +204,6 @@ async fn register(
             "worker advertises no server-authorized capability",
             false,
         ));
-    }
-    match &request.resources.dataset {
-        Some(dataset)
-            if !configured
-                .capabilities
-                .contains(&sbgh_proto::WorkerCapability::BlockValidation)
-                || !state
-                    .config
-                    .datasets
-                    .iter()
-                    .any(|registered| {
-                        registered.worker_id == peer.worker_id && registered.identity == *dataset
-                    }) =>
-        {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
-                "dataset_not_authorized",
-                "dataset telemetry does not exactly match server-owned registry policy",
-                false,
-            ));
-        }
-        None if request
-            .advertised_capabilities
-            .contains(&sbgh_proto::WorkerCapability::BlockValidation) =>
-        {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
-                "dataset_required",
-                "block_validation registration requires a configured dataset identity",
-                false,
-            ));
-        }
-        _ => {}
     }
     let session = state
         .store
@@ -597,11 +559,12 @@ fn validate_terminal_for_assignment(
     };
     match (payload, block_validation) {
         (sbgh_proto::TaskPayload::BlockValidation(payload), Some(result))
-            if result.dataset == payload.dataset
-                && result
-                    .invalid_blocks
-                    .iter()
-                    .all(|invalid| invalid.shard < payload.requested_shards)
+            if result
+                .invalid_blocks
+                .iter()
+                .all(|invalid| invalid.shard < payload.requested_shards)
+                && result.observed_range.start <= payload.range.start
+                && result.observed_range.end >= payload.range.end
                 && payload
                     .range
                     .end
@@ -1272,8 +1235,8 @@ mod tests {
     use std::sync::Arc;
 
     use sbgh_proto::{
-        ArtifactDescriptor, BlockValidationPayload, BlockValidationResult, DatasetIdentity,
-        InclusiveRange, TaskPayload, TerminalOutcome, ValidationEpoch,
+        ArtifactDescriptor, BlockValidationPayload, BlockValidationResult, InclusiveRange,
+        TaskPayload, TerminalOutcome, ValidationEpoch,
     };
 
     use super::{
@@ -1281,17 +1244,6 @@ mod tests {
         validate_terminal_for_assignment,
     };
     use sbgh_core::db::fleet::EventIngest;
-
-    fn dataset() -> DatasetIdentity {
-        DatasetIdentity {
-            generation: "mainnet-1".into(),
-            network: "mainnet".into(),
-            format_version: "v1".into(),
-            covered_start: 10,
-            covered_end: 19,
-            manifest_sha256: "00".repeat(32),
-        }
-    }
 
     #[test]
     fn one_worker_session_cannot_hold_multiple_long_polls() {
@@ -1346,9 +1298,8 @@ mod tests {
     }
 
     #[test]
-    fn block_terminal_must_match_pinned_dataset_range_and_task_kind() {
+    fn block_terminal_must_match_observed_range_and_task_kind() {
         let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-            dataset: dataset(),
             epoch: ValidationEpoch::Nakamoto,
             range: InclusiveRange { start: 10, end: 19 },
             requested_shards: 2,
@@ -1361,7 +1312,8 @@ mod tests {
                 valid: true,
                 checked_blocks: 10,
                 invalid_blocks: Vec::new(),
-                dataset: dataset(),
+                chainstate_origin: "vg/mainnet-2026-07-28".into(),
+                observed_range: InclusiveRange { start: 10, end: 30 },
             }),
         };
         assert!(validate_terminal_for_assignment(&payload, &outcome).is_ok());
@@ -1374,6 +1326,14 @@ mod tests {
             result.checked_blocks = 9;
         }
         assert!(validate_terminal_for_assignment(&payload, &wrong_count).is_err());
+        let mut missing_coverage = outcome.clone();
+        if let TerminalOutcome::Completed {
+            block_validation: Some(result), ..
+        } = &mut missing_coverage
+        {
+            result.observed_range.end = 18;
+        }
+        assert!(validate_terminal_for_assignment(&payload, &missing_coverage).is_err());
         assert!(validate_terminal_for_assignment(&TaskPayload::BuildOnly, &outcome).is_err());
     }
 

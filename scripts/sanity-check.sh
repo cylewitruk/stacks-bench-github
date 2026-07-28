@@ -103,7 +103,7 @@ vars = {
     "CFG_THINPOOL":      g("lvm.thinpool", "thinpool"),
     "CFG_PREFIX":        g("lvm.chainstate_base_prefix", "mainnet-"),
     "CFG_GOLDEN":        g("vm.golden_image"),
-    "CFG_NETWORK":       g("vm.network", "default"),
+    "CFG_NETWORK":       g("vm.network", "sandbox-egress"),
     "CFG_VM_VCPUS":      g("vm.vcpus", 2),
     "CFG_VM_MEMORY":     g("vm.memory_gib", 8),
     "CFG_JOBS_DIR":      g("paths.jobs_dir", "/var/lib/sbgh/jobs"),
@@ -196,6 +196,15 @@ if virsh net-info "$CFG_NETWORK" >/dev/null 2>&1; then
     fi
 else
     fail "network '$CFG_NETWORK' not defined  → virsh net-define + virsh net-start"
+fi
+if [[ $CFG_NETWORK != sandbox-egress ]]; then
+    fail "execution network must be sandbox-egress, not '$CFG_NETWORK'"
+elif [[ ! -x /usr/local/libexec/sbgh-check-sandbox-network ]]; then
+    fail "sandbox policy verifier is not installed  → scripts/install-sandbox-network.sh"
+elif /usr/local/libexec/sbgh-check-sandbox-network >/dev/null 2>&1; then
+    pass "sandbox-egress XML, nftables policy, protected CIDRs, and forwarding are active"
+else
+    fail "sandbox-egress structural policy verification failed"
 fi
 
 # ─── 4. LVM layout ─────────────────────────────────────────────────────
@@ -394,6 +403,15 @@ if ! id "$CFG_SERVICE_USER" >/dev/null 2>&1; then
 else
     for c in "${daemon_cmds[@]}"; do check_sudo "daemon" "$c"; done
     for c in "${chainstate_cmds[@]}";    do check_sudo "chainstate" "$c"; done
+fi
+if ! id sbgh-worker >/dev/null 2>&1; then
+    warn "sbgh-worker user missing — skipping sandbox policy sudo check"
+elif sudo -u sbgh-worker sudo -n -l \
+    /usr/local/libexec/sbgh-check-sandbox-network >/dev/null 2>&1
+then
+    pass "worker: /usr/local/libexec/sbgh-check-sandbox-network"
+else
+    fail "worker: sandbox policy verifier  → add exact command to /etc/sudoers.d/sbgh"
 fi
 
 # ─── 8. Golden image ───────────────────────────────────────────────────

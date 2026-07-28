@@ -76,11 +76,10 @@ The snapshots are not full chainstate copies. Storage growth is primarily the
 changed extents retained by old checkpoints, plus thinpool metadata.
 
 [v26](../iterations/v26-sandboxed-worker-execution.md) is the current consumer
-contract: a published generation is a read-only origin LV with mandatory
-`sbgh_sealed`/`sbgh_validated` tags, an identity-bound
-`.sbgh-dataset-manifest.json`, and a manifest-bound
-`.sbgh-dataset-files.sha256`. This producer must mint that format rather than a
-second snapshot/provenance shape.
+contract: every published chainstate is a read-only origin LV selected locally
+by prefix. Manifests and tags remain useful inventory/provenance metadata, but
+consumers do not require them for admission; block-validation guests probe and
+report actual coverage.
 
 ### Cut Plan
 

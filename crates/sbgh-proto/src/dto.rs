@@ -12,22 +12,11 @@ pub enum WorkerCapability {
     BlockValidation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DatasetIdentity {
-    pub generation: String,
-    pub network: String,
-    pub format_version: String,
-    pub covered_start: u64,
-    pub covered_end: u64,
-    pub manifest_sha256: String,
-}
-
+/// Host capacity measured by the worker at process startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceFacts {
     pub logical_cpus: u32,
     pub memory_bytes: u64,
-    pub storage_bytes: u64,
-    pub dataset: Option<DatasetIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,7 +120,7 @@ pub struct WorkOffer {
 pub enum OfferRequirements {
     Benchmark,
     BuildOnly,
-    BlockValidation { dataset: DatasetIdentity, requested_shards: u32, max_concurrency: u32 },
+    BlockValidation { requested_shards: u32, max_concurrency: u32 },
 }
 
 impl From<&TaskPayload> for OfferRequirements {
@@ -140,7 +129,6 @@ impl From<&TaskPayload> for OfferRequirements {
             TaskPayload::Benchmark(_) => Self::Benchmark,
             TaskPayload::BuildOnly => Self::BuildOnly,
             TaskPayload::BlockValidation(payload) => Self::BlockValidation {
-                dataset: payload.dataset.clone(),
                 requested_shards: payload.requested_shards,
                 max_concurrency: payload.max_concurrency,
             },
@@ -197,7 +185,6 @@ pub struct InclusiveRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockValidationPayload {
-    pub dataset: DatasetIdentity,
     pub epoch: ValidationEpoch,
     pub range: InclusiveRange,
     pub requested_shards: u32,
@@ -370,7 +357,10 @@ pub struct BlockValidationResult {
     pub valid: bool,
     pub checked_blocks: u64,
     pub invalid_blocks: Vec<InvalidBlock>,
-    pub dataset: DatasetIdentity,
+    /// Exact local RO LVM origin selected by the worker.
+    pub chainstate_origin: String,
+    /// Coverage observed inside the guest before validation began.
+    pub observed_range: InclusiveRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -411,14 +401,6 @@ mod tests {
     #[test]
     fn block_offer_requirements_are_a_bounded_projection_of_the_payload() {
         let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-            dataset: DatasetIdentity {
-                generation: "mainnet-2026-07".into(),
-                network: "mainnet".into(),
-                format_version: "stacks-core-v3".into(),
-                covered_start: 0,
-                covered_end: 99,
-                manifest_sha256: "ab".repeat(32),
-            },
             epoch: ValidationEpoch::Nakamoto,
             range: InclusiveRange { start: 10, end: 20 },
             requested_shards: 8,
@@ -429,10 +411,6 @@ mod tests {
         assert_eq!(
             OfferRequirements::from(&payload),
             OfferRequirements::BlockValidation {
-                dataset: match payload {
-                    TaskPayload::BlockValidation(ref payload) => payload.dataset.clone(),
-                    _ => unreachable!(),
-                },
                 requested_shards: 8,
                 max_concurrency: 4,
             }

@@ -21,7 +21,6 @@ max_attempt_artifact_bytes = 34359738368
 # /validate-blocks nakamoto <inclusive-global-start> <inclusive-global-end>
 [github_block_validation]
 worker_id = "22222222-2222-4222-8222-222222222222"
-network = "mainnet"
 requested_shards = 32
 max_concurrency = 24
 timeout_secs = 86400
@@ -42,15 +41,3 @@ certificate_sha256 = ["000000000000000000000000000000000000000000000000000000000
 capabilities = ["block_validation"]
 enabled = true
 draining = false
-
-# Dataset generations are daemon-owned registry policy. A worker may attest
-# only an exact identity declared here; telemetry never advances `current`.
-[[datasets]]
-worker_id = "22222222-2222-4222-8222-222222222222"
-current = true
-generation = "mainnet-2026-07-26"
-network = "mainnet"
-format_version = "stacks-core-v3"
-covered_start = 0
-covered_end = 8020465
-manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # replace

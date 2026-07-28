@@ -29,7 +29,7 @@ use sbgh_driver::{
     BenchmarkRunContext, BenchmarkTask, CacheControl, ExecutionContext, ExecutionPlacement,
     ExecutionRequest, ExecutionTask,
 };
-use sbgh_libvirt::{LibvirtConfig, LvmConfig, PathsConfig, Shell, VmConfig};
+use sbgh_libvirt::{BenchmarkProfile, LibvirtConfig, LvmConfig, PathsConfig, Shell, VmConfig};
 use sbgh_worker::{BinaryCacheConfig, WorkerRuntime, build_binary_cache};
 
 use crate::artifact_store::{
@@ -200,6 +200,14 @@ impl Runner {
         let libvirt_config = LibvirtConfig {
             vm: VmConfig {
                 golden_image: config.vm.golden_image.clone(),
+                boot_disk_gib: config.vm.boot_disk_gib,
+                network: config.vm.network.clone(),
+                poll_interval_secs: config.vm.poll_interval_secs,
+                heartbeat_interval_secs: config
+                    .vm
+                    .heartbeat_interval_secs,
+            },
+            benchmark: BenchmarkProfile {
                 build_vcpus: config.vm.build_vcpus,
                 bench_vcpus: config.vm.bench_vcpus,
                 build_memory_bytes: config
@@ -210,13 +218,7 @@ impl Runner {
                     .vm
                     .bench_memory
                     .as_bytes(),
-                boot_disk_gib: config.vm.boot_disk_gib,
                 job_timeout_secs: config.vm.job_timeout_secs,
-                network: config.vm.network.clone(),
-                poll_interval_secs: config.vm.poll_interval_secs,
-                heartbeat_interval_secs: config
-                    .vm
-                    .heartbeat_interval_secs,
             },
             paths: PathsConfig {
                 jobs_dir: config.paths.jobs_dir.clone(),

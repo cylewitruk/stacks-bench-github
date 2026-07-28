@@ -4,9 +4,9 @@
 # Approach: cloud-init driven. We seed a NoCloud ISO with apt + rustup
 # install commands, boot the cloud image as a transient libvirt VM with that
 # ISO attached, let cloud-init run, then power off. cloud-init lives inside
-# the real VM and uses libvirt's networking (the same `default` network the
-# daemon will use for benchmark VMs) — so any DNS / networking issues
-# we hit here are exactly the ones the daemon would hit, which makes
+# the real VM and uses the same sandbox-egress network as job VMs, so any DNS
+# or dependency-egress issues are the same ones execution VMs would hit. This
+# makes
 # this both more reliable and a useful smoke test of host networking.
 #
 # This replaces an earlier `virt-customize` approach that broke on hosts
@@ -15,7 +15,7 @@
 # and the appliance can't reach anything useful).
 #
 # Output: a qcow2 image at the path passed as $1, ready to be referenced by
-# `[vm].golden_image` in the daemon config.
+# `[libvirt.vm].golden_image` in the worker profile.
 #
 # Requires (on the build host): qemu-utils, cloud-image-utils,
 # libvirt-daemon-system, virtinst, libguestfs-tools (for virt-sysprep),
@@ -37,7 +37,7 @@ Env overrides:
                        (default: /var/cache/sbgh-images)
   BUILD_VM_VCPUS       cores for the build VM (default: 4)
   BUILD_VM_MEMORY_MIB  memory for the build VM (default: 4096)
-  BUILD_VM_NETWORK     libvirt network to attach (default: default)
+  BUILD_VM_NETWORK     libvirt network to attach (default: sandbox-egress)
   BUILD_TIMEOUT_SECS   max wait for the build VM to power off (default: 1800)
 EOF
     exit 2
@@ -49,10 +49,15 @@ RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-stable}"
 CACHE_DIR="${CACHE_DIR:-/var/cache/sbgh-images}"
 BUILD_VM_VCPUS="${BUILD_VM_VCPUS:-4}"
 BUILD_VM_MEMORY_MIB="${BUILD_VM_MEMORY_MIB:-4096}"
-BUILD_VM_NETWORK="${BUILD_VM_NETWORK:-default}"
+BUILD_VM_NETWORK="${BUILD_VM_NETWORK:-sandbox-egress}"
 BUILD_TIMEOUT_SECS="${BUILD_TIMEOUT_SECS:-1800}"
 
 # ─── pre-flight ────────────────────────────────────────────────────────
+[[ $EUID -eq 0 ]] || { echo "build-golden-image.sh must run as root" >&2; exit 2; }
+[[ $BUILD_VM_NETWORK == sandbox-egress ]] || {
+    echo "BUILD_VM_NETWORK must be the policy-managed sandbox-egress network" >&2
+    exit 2
+}
 for cmd in curl sha256sum qemu-img install mktemp awk \
            cloud-localds virsh virt-sysprep; do
     if ! command -v "$cmd" >/dev/null; then
@@ -77,6 +82,7 @@ if ! virsh net-info "$BUILD_VM_NETWORK" 2>/dev/null | awk '/^Active/{print $2}' 
     echo "libvirt network '$BUILD_VM_NETWORK' is not active; starting" >&2
     virsh net-start "$BUILD_VM_NETWORK" >&2 || { echo "failed to start network" >&2; exit 1; }
 fi
+/usr/local/libexec/sbgh-check-sandbox-network
 
 SRC_URL="https://cloud-images.ubuntu.com/${UBUNTU_RELEASE}/current/${UBUNTU_RELEASE}-server-cloudimg-amd64.img"
 SHA_URL="https://cloud-images.ubuntu.com/${UBUNTU_RELEASE}/current/SHA256SUMS"

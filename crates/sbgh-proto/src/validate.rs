@@ -5,10 +5,10 @@ use thiserror::Error;
 
 use crate::{
     AcceptOfferRequest, ArtifactDescriptor, ArtifactGrantRequest, Assignment, AttemptIdentity,
-    CleanupCompleteRequest, CleanupListRequest, CompleteAttemptRequest, DatasetIdentity,
-    DeregisterSessionRequest, HeartbeatRequest, InclusiveRange, PROTOCOL_VERSION, PollRequest,
-    ProgressRequest, RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload,
-    RepositoryCredentialRequest, TaskPayload, WorkerCapability,
+    CleanupCompleteRequest, CleanupListRequest, CompleteAttemptRequest, DeregisterSessionRequest,
+    HeartbeatRequest, InclusiveRange, PROTOCOL_VERSION, PollRequest, ProgressRequest,
+    RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload,
+    RepositoryCredentialRequest, TaskPayload,
 };
 
 const MAX_LABEL: usize = 96;
@@ -132,27 +132,6 @@ fn identity(identity: &AttemptIdentity) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-impl Validate for DatasetIdentity {
-    fn validate(&self) -> Result<(), ProtocolError> {
-        bounded("dataset.generation", &self.generation, MAX_LABEL, false)?;
-        bounded("dataset.network", &self.network, MAX_LABEL, false)?;
-        bounded("dataset.format_version", &self.format_version, MAX_LABEL, false)?;
-        if self.covered_start > self.covered_end {
-            return Err(ProtocolError::Invalid {
-                field: "dataset.covered_range",
-                reason: "start exceeds end".into(),
-            });
-        }
-        if self.covered_end > i64::MAX as u64 {
-            return Err(ProtocolError::Invalid {
-                field: "dataset.covered_range",
-                reason: "end exceeds the durable signed-integer range".into(),
-            });
-        }
-        sha256("dataset.manifest_sha256", &self.manifest_sha256)
-    }
-}
-
 impl Validate for InclusiveRange {
     fn validate(&self) -> Result<(), ProtocolError> {
         if self.start > self.end {
@@ -199,18 +178,6 @@ impl Validate for RegisterSessionRequest {
                 field: "resources",
                 reason: "logical_cpus and memory_bytes must be non-zero".into(),
             });
-        }
-        if let Some(dataset) = &self.resources.dataset {
-            dataset.validate()?;
-            if !self
-                .advertised_capabilities
-                .contains(&WorkerCapability::BlockValidation)
-            {
-                return Err(ProtocolError::Invalid {
-                    field: "resources.dataset",
-                    reason: "dataset requires block_validation capability".into(),
-                });
-            }
         }
         Ok(())
     }
@@ -430,7 +397,6 @@ impl Validate for TaskPayload {
             }
             Self::BuildOnly => {}
             Self::BlockValidation(payload) => {
-                payload.dataset.validate()?;
                 payload.range.validate()?;
                 if payload.requested_shards == 0
                     || payload.max_concurrency == 0
@@ -450,14 +416,6 @@ impl Validate for TaskPayload {
                         field: "block_validation",
                         reason: "shard, concurrency, or timeout limit exceeds protocol bounds"
                             .into(),
-                    });
-                }
-                if payload.range.start < payload.dataset.covered_start
-                    || payload.range.end > payload.dataset.covered_end
-                {
-                    return Err(ProtocolError::Invalid {
-                        field: "block_validation.range",
-                        reason: "range is outside the pinned dataset generation".into(),
                     });
                 }
             }
@@ -616,7 +574,15 @@ impl Validate for CompleteAttemptRequest {
         match &self.outcome {
             crate::TerminalOutcome::Completed { block_validation, .. } => {
                 if let Some(result) = block_validation {
-                    result.dataset.validate()?;
+                    bounded(
+                        "block_validation.chainstate_origin",
+                        &result.chainstate_origin,
+                        512,
+                        false,
+                    )?;
+                    result
+                        .observed_range
+                        .validate()?;
                     if result.checked_blocks > i64::MAX as u64 {
                         return Err(ProtocolError::Invalid {
                             field: "block_validation.checked_blocks",
@@ -677,11 +643,11 @@ mod tests {
     use crate::{
         AssignmentContext, BenchmarkPayload, CleanupListRequest, CompleteAttemptRequest,
         HeartbeatRequest, LeaseToken, PROTOCOL_VERSION, ResourceFacts, TaskPayload,
-        TerminalOutcome,
+        TerminalOutcome, WorkerCapability,
     };
 
     #[test]
-    fn registration_rejects_dataset_without_authorized_shape() {
+    fn registration_accepts_resource_facts_without_dataset_coordination() {
         let request = RegisterSessionRequest {
             protocol_version: PROTOCOL_VERSION,
             worker_id: Uuid::new_v4(),
@@ -691,18 +657,9 @@ mod tests {
             resources: ResourceFacts {
                 logical_cpus: 1,
                 memory_bytes: 1,
-                storage_bytes: 0,
-                dataset: Some(DatasetIdentity {
-                    generation: "g".into(),
-                    network: "mainnet".into(),
-                    format_version: "1".into(),
-                    covered_start: 0,
-                    covered_end: 1,
-                    manifest_sha256: "00".repeat(32),
-                }),
             },
         };
-        assert!(request.validate().is_err());
+        assert!(request.validate().is_ok());
     }
 
     #[test]

@@ -24,18 +24,7 @@ impl PostgresBlockValidationQueue {
 #[async_trait::async_trait]
 impl BlockValidationQueue for PostgresBlockValidationQueue {
     async fn enqueue(&self, request: BlockValidationJobRequest) -> sbgh_core::Result<()> {
-        let dataset = self
-            .store
-            .current_dataset(self.config.worker_id, &self.config.network)
-            .await?
-            .ok_or_else(|| {
-                sbgh_core::Error::Config(format!(
-                    "worker {} has no current verified {} dataset",
-                    self.config.worker_id, self.config.network
-                ))
-            })?;
         let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-            dataset,
             epoch: request.epoch,
             range: request.range.clone(),
             requested_shards: self.config.requested_shards,
@@ -63,13 +52,6 @@ impl BlockValidationQueue for PostgresBlockValidationQueue {
             workload_key: None,
         };
         let detail = serde_json::to_value(QueuedEventDetail::BlockValidation {
-            dataset_generation: match &payload {
-                TaskPayload::BlockValidation(payload) => payload
-                    .dataset
-                    .generation
-                    .clone(),
-                _ => unreachable!(),
-            },
             range_start: request.range.start,
             range_end: request.range.end,
             requested_shards: self.config.requested_shards,

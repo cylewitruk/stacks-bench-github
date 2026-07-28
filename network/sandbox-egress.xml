@@ -1,0 +1,20 @@
+<network>
+  <name>sandbox-egress</name>
+  <metadata>
+    <sbgh:network-policy xmlns:sbgh="urn:sbgh:network-policy"
+                         version="1"
+                         bridge="virbr-sbgh"
+                         ipv4-subnet="192.168.254.0/24"/>
+  </metadata>
+  <forward mode="nat">
+    <nat>
+      <port start="1024" end="65535"/>
+    </nat>
+  </forward>
+  <bridge name="virbr-sbgh" stp="on" delay="0"/>
+  <ip address="192.168.254.1" netmask="255.255.255.0">
+    <dhcp>
+      <range start="192.168.254.10" end="192.168.254.250"/>
+    </dhcp>
+  </ip>
+</network>

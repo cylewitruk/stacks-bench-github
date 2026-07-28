@@ -14,7 +14,7 @@ use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::server::WebPkiClientVerifier;
 use sbgh_proto::{
     AcceptOfferRequest, ApiError, AttemptIdentity, DeregisterSessionRequest, LeaseToken,
-    PROTOCOL_VERSION, PollRequest, PollResponse, RegisterSessionRequest, WorkOffer,
+    PROTOCOL_VERSION, PollRequest, PollResponse, RegisterSessionRequest, ResourceFacts, WorkOffer,
     WorkerCapability,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -228,8 +228,60 @@ fn worker_config(
     config.client_private_key = pki.client_key.clone();
     config.server_ca_certificate = pki.ca_certificate.clone();
     config.capabilities = BTreeSet::from([WorkerCapability::BuildOnly]);
+    configure_sandbox_preflight_fixture(&mut config, pki._directory.path());
     config.validate().unwrap();
     config
+}
+
+fn worker_resources() -> ResourceFacts {
+    ResourceFacts {
+        logical_cpus: 8,
+        memory_bytes: 32 * 1024 * 1024 * 1024,
+    }
+}
+
+fn configure_sandbox_preflight_fixture(config: &mut sbgh_worker::WorkerConfig, directory: &Path) {
+    let libvirt = config
+        .libvirt
+        .as_mut()
+        .unwrap();
+    let golden = directory.join("golden.qcow2");
+    let host_tool = directory.join("host-tool");
+    let sudo = directory.join("sudo");
+    std::fs::write(&golden, b"qcow2 fixture").unwrap();
+    std::fs::write(&host_tool, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(
+        &sudo,
+        concat!(
+            "#!/bin/sh\n",
+            "case \"$*\" in\n",
+            "  *\"lv_name,lv_attr\"*) printf 'mainnet-test|Vri---tz-k\\n' ;;\n",
+            "  *\"data_percent,metadata_percent\"*) printf '10.00|10.00\\n' ;;\n",
+            "  *) exit 0 ;;\n",
+            "esac\n",
+        ),
+    )
+    .unwrap();
+    for path in [&host_tool, &sudo] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    libvirt.vm.golden_image = golden;
+    libvirt.paths.jobs_dir = directory.join("jobs");
+    libvirt.paths.git_mirror = directory.join("git/mirror.git");
+    libvirt
+        .paths
+        .results_tmpfs_root = directory.join("results-tmpfs");
+    libvirt
+        .paths
+        .results_archive_dir = directory.join("results-archive");
+    libvirt.paths.sudo_binary = sudo;
+    libvirt.paths.virsh_binary = host_tool.clone();
+    libvirt.paths.qemu_img_binary = host_tool.clone();
+    libvirt
+        .paths
+        .cloud_localds_binary = host_tool.clone();
+    libvirt.paths.git_binary = host_tool;
 }
 
 #[tokio::test]
@@ -270,6 +322,7 @@ async fn real_worker_registers_polls_drain_and_deregisters_over_mtls_loopback() 
                     registration.advertised_capabilities,
                     BTreeSet::from([WorkerCapability::BuildOnly])
                 );
+                assert_eq!(registration.resources, worker_resources());
                 session_id = Some(registration.worker_session_id);
             } else if request
                 .path
@@ -315,9 +368,13 @@ async fn real_worker_registers_polls_drain_and_deregisters_over_mtls_loopback() 
         assert!(session_id.is_some());
     });
 
-    sbgh_worker::run_fleet(worker_config(worker_id, address, &pki), CancellationToken::new())
-        .await
-        .unwrap();
+    sbgh_worker::run_fleet(
+        worker_config(worker_id, address, &pki),
+        worker_resources(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     server.await.unwrap();
 }
 
@@ -400,8 +457,12 @@ async fn cancellation_winning_before_accept_never_starts_execution() {
         respond(&mut stream, "{}").await;
     });
 
-    sbgh_worker::run_fleet(worker_config(worker_id, address, &pki), CancellationToken::new())
-        .await
-        .unwrap();
+    sbgh_worker::run_fleet(
+        worker_config(worker_id, address, &pki),
+        worker_resources(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     server.await.unwrap();
 }

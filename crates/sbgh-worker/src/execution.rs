@@ -187,7 +187,8 @@ mod tests {
                         valid: true,
                         checked_blocks: 3,
                         invalid_blocks: Vec::new(),
-                        dataset: spec.dataset.clone(),
+                        chainstate_origin: "vg/mainnet-latest".into(),
+                        observed_range: spec.range,
                     },
                 ),
             })
@@ -229,14 +230,6 @@ mod tests {
     async fn block_validation_uses_the_common_driver_boundary_with_attempt_identity() {
         let attempt_id = Uuid::new_v4();
         let spec = BlockValidationTaskSpec {
-            dataset: sbgh_driver::DatasetIdentity {
-                generation: "mainnet-1".into(),
-                network: "mainnet".into(),
-                format_version: "v3".into(),
-                covered_start: 0,
-                covered_end: 100,
-                manifest_sha256: "a".repeat(64),
-            },
             epoch: sbgh_driver::ValidationEpoch::Nakamoto,
             range: sbgh_driver::InclusiveRange { start: 10, end: 12 },
             requested_shards: 3,
@@ -293,14 +286,6 @@ mod tests {
                     repository_credential: None,
                 },
                 task: ExecutionTask::BlockValidation(BlockValidationTaskSpec {
-                    dataset: sbgh_driver::DatasetIdentity {
-                        generation: "mainnet-1".into(),
-                        network: "mainnet".into(),
-                        format_version: "v3".into(),
-                        covered_start: 0,
-                        covered_end: 100,
-                        manifest_sha256: "a".repeat(64),
-                    },
                     epoch: sbgh_driver::ValidationEpoch::Nakamoto,
                     range: sbgh_driver::InclusiveRange { start: 10, end: 12 },
                     requested_shards: 3,

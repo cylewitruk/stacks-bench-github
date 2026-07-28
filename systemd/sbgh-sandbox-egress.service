@@ -1,0 +1,29 @@
+[Unit]
+Description=stacks-bench sandbox-egress network policy
+Documentation=https://github.com/cylewitruk/stacks-bench-github
+Wants=libvirtd.service nftables.service
+After=libvirtd.service nftables.service
+Before=sbgh-worker@.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/sbgh-apply-sandbox-network
+ExecStartPost=/usr/local/libexec/sbgh-check-sandbox-network
+RemainAfterExit=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
