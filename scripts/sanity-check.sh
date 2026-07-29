@@ -306,7 +306,7 @@ done
 
 # ─── 6. Service user + groups ──────────────────────────────────────────
 section "6. Service users"
-# Two host users, one per service. See docs/host-bringup.md §3.
+# Separate host users enforce the edge/orchestrator boundary. See docs/setup.md.
 #   - sbgh-handler (uid 997): identity for the handler container
 #   - sbgh         (uid 998): runs the daemon binary on the host
 

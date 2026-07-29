@@ -1,240 +1,251 @@
 # Architecture
 
-## Overview
+`stacks-bench-github` accepts benchmark and block-validation requests, executes
+repository revisions in isolated worker VMs, and projects durable results to
+GitHub and Slack. One active `sbgh-daemon` is the trusted orchestrator. Workers
+poll outbound and can execute only capabilities authorized by the daemon's
+registry.
 
-`stacks-bench-github` is a GitHub App and worker fleet for benchmark,
-build-only, and block-validation tasks. One active `sbgh-daemon` orchestrator
-owns durable truth and external side effects. Separately deployed
-`sbgh-worker` processes pull only work authorized for their registered
-capabilities.
-
-The Cargo workspace has fourteen crates and five binaries:
+## System topology
 
 ```text
-crates/
-  sbgh-api/          operator/ingest API DTOs and typed client
-  sbgh-proto/        versioned, task-neutral worker protocol
-  sbgh-core/         domain policy, persistence ports, configuration, models
-  sbgh-driver/       backend-neutral local execution contracts
-  sbgh-github/       GitHub contracts, webhook DTOs, auth, Octocrab adapter
-  sbgh-intent/       request-intent contract and OpenAI adapter
-  sbgh-slack/        Slack intake, snapshot renderer, transport
-  sbgh-libvirt/      concrete libvirt sandbox and LVM snapshot adapter
-  sbgh-postgres/     SQLx stores, migrations, row mappings, admin queries
-  sbgh-worker/       worker binary, transport, recipes, local execution
-  sbgh-handler/      webhook signature-verification/forwarding binary
-  sbgh-cli/          operator API-client binary
-  sbgh-daemon/       orchestrator/API/reporting binary
-  sbgh-smee/         local-development forwarding binary
+GitHub webhooks ──> sbgh-handler ──┐
+Slack Socket Mode ─────────────────┤
+operator sbgh-cli ─────────────────┤
+                                   v
+                              sbgh-daemon
+                    policy, submission, scheduling,
+                    leases, events, artifacts, reporting
+                       |       |              |
+                       v       v              v
+                   PostgreSQL GitHub/Slack    S3
+                       |
+                       | TLS 1.3 mutual X.509;
+                       | workers poll outbound
+               ┌───────┴────────┐
+               v                v
+          sbgh-worker       sbgh-worker
+          benchmark         block validation
+               └──── sbgh-libvirt ────┘
+                      disposable VM
+                   writable LVM snapshot
 ```
 
-PostgreSQL is the sole durable state store, and the daemon is its sole client.
-The handler and CLI use the authenticated daemon API. Workers have no database,
-Slack, GitHub App private-key, or object-store credentials.
+The daemon is the sole PostgreSQL client and the sole owner of GitHub App,
+Slack, and object-store credentials. The handler verifies webhook HMACs and
+forwards accepted deliveries to the daemon API. The CLI is an authenticated API
+client. Workers have no database or provider credentials.
 
-## Fleet flow
+Only one orchestrator may be active. Multi-orchestrator high availability and
+leader election are not implemented.
+
+## Workspace boundaries
+
+| Crate | Responsibility |
+| --- | --- |
+| `sbgh-api` | Operator/ingest HTTP DTOs and typed client |
+| `sbgh-core` | Domain models, policy, configuration, and persistence ports |
+| `sbgh-driver` | Backend-neutral execution contracts |
+| `sbgh-github` | GitHub contracts, webhook DTOs, authentication, and API adapter |
+| `sbgh-handler` | Webhook HMAC verification and forwarding |
+| `sbgh-intent` | Validated request-intent contract and OpenAI adapter |
+| `sbgh-libvirt` | Libvirt VM and LVM snapshot adapter |
+| `sbgh-postgres` | SQLx persistence adapters and migrations |
+| `sbgh-proto` | Versioned worker-control-plane DTOs |
+| `sbgh-slack` | Slack intake, snapshot rendering, and transport |
+| `sbgh-smee` | smee.io forwarding for the deployed webhook edge |
+| `sbgh-worker` | Worker transport, recipes, execution, and cleanup |
+| `sbgh-daemon` | Orchestration, API, scheduling, event projection, and reporting |
+| `sbgh-cli` | Local operator client |
+
+The package DAG check enforces dependency direction across all features and
+build dependencies. Provider and persistence crates implement narrow ports;
+domain code does not import SQLx, Octocrab, Slack, or libvirt.
+
+## Submission, scheduling, and execution
+
+Submission is separate from scheduling and attempt coordination.
+
+1. A GitHub, Slack, or operator adapter authorizes a request and resolves
+   mutable repository references.
+2. The submission kernel validates a typed plan, freezes executable inputs,
+   calculates a demand digest, and atomically persists the aggregate,
+   provenance, jobs, and namespaced idempotency receipt.
+3. The pull scheduler matches queued jobs to registry-authorized worker
+   capability and optional operator placement constraints.
+4. The fleet coordinator owns offers, attempts, leases, fencing,
+   cancellation, and cleanup.
+5. The worker resolves only worker-local infrastructure, executes the typed
+   request, and returns events, artifacts, and a typed terminal result.
+
+A reused idempotency key with the same executable demand returns the original
+receipt. Reusing it for different demand fails closed. Assignment never
+re-resolves daemon defaults, symbolic refs, or user input.
+
+`sbgh_core::SubmissionSpec` is durable requested state within a
+`TaskSubmission`. `sbgh_driver::TaskSpec` is the fully resolved instruction for
+one execution backend. They intentionally represent different boundaries.
+
+### Fleet state
+
+Jobs move through `queued -> offered -> running -> terminal`. Every active
+mutation is bound to:
+
+- worker identity;
+- worker process session;
+- attempt UUID;
+- monotonically increasing fencing generation;
+- HMAC-authenticated lease token.
+
+Poll, accept, event, artifact, and terminal operations are idempotent. A worker
+process restart creates a new session and cannot resume its predecessor. The
+daemon fences the old attempt, requires cleanup acknowledgement, and only then
+requeues eligible work. A same-process reconnect resends unacknowledged
+reliable events from a bounded memory buffer; there is no durable worker
+outbox.
+
+Reliable events are persisted before acknowledgement and projected only over
+their contiguous sequence prefix. Best-effort fine progress has a separate
+wire sequence. Durable leases and events let daemon restart/replay converge
+without rerunning accepted work or accepting a stale terminal.
+
+### Task kinds
+
+- **Benchmark** submissions may contain variants, repetitions, calibration,
+  and carried results. The entire comparison generation stays on one worker
+  and measurement profile.
+- **Build-only** jobs populate the same fingerprinted executable cache without
+  producing an external report.
+- **Block validation** runs one resource-profiled VM with bounded shard and
+  concurrency policy and produces a typed positive or negative verdict.
+
+Moving a partial benchmark comparison to a different worker is never
+automatic. Explicit recovery creates a new execution generation and restarts
+at the first specification so results never mix measurement environments.
+
+New task kinds add a protocol payload, capability, worker recipe,
+task-specific result persistence, and a report-detail variant. They reuse the
+submission, scheduler, lease, event, artifact, cancellation, cleanup, and
+report-projection state machines.
+
+## Execution isolation
+
+Every repository revision is adversarial, regardless of source authorization.
+Build scripts and produced binaries execute only in disposable libvirt VMs.
+There is no direct host-process fallback.
+
+All chainstate workers maintain local read-only LVM origins under a shared
+naming prefix. For each attempt, the trusted adapter:
+
+1. chooses the lexicographically newest matching read-only origin;
+2. checks the thin pool's fixed near-full Data% and Meta% floors;
+3. creates explicitly writable attempt snapshots;
+4. attaches only snapshots, never the origin;
+5. tears down the VM, mounts, loops, and LVs before acknowledging cleanup.
+
+Benchmark execution uses one snapshot. Block validation uses K private
+snapshots, stable virtio-scsi serials, and XFS `nouuid`. K is bounded by the
+worker's CPU, memory, device, shard, and concurrency policy; it is not used for
+speculative disk-write reservation.
+
+The guest builds or reuses `stacks-bench` or `stacks-inspect` through a
+worker-local cache keyed by executable kind, repository, commit, toolchain,
+recipe, target, and golden image. Persistent compiler state is not mounted into
+guests.
+
+Guest result files are size-bounded, opened without following the final
+symlink, and required to resolve beneath the attempt results share. Block
+validation verifies guest-observed coverage and rejects partial, stale,
+malformed, identity-mismatched, or ambiguous negative output. A negative
+validation verdict is accepted only when every shard exits normally with a
+defined result code.
+
+## Network and identity
+
+The worker listener is separate from the operator API and requires TLS 1.3
+mutual X.509 authentication. A client certificate must contain exactly one URI
+identity SAN:
 
 ```text
-GitHub / Slack / CLI
-          │
-          ▼
-sbgh-daemon
-  webhook policy + immutable enqueue
-  PostgreSQL scheduling/leases/events/results
-  GitHub/Slack projection and comparison
-          │
-          │ TLS 1.3 mTLS; workers poll outbound
-          ├───────────────────────────────┐
-          ▼                               ▼
-sbgh-worker                         sbgh-worker
-benchmark + build-only              block-validation
-sbgh-libvirt sandbox                sbgh-libvirt sandbox
-one LVM snapshot                    K attempt-scoped LVM snapshots
-          │                               │
-          └── exact-key presigned S3 ─────┘
+urn:sbgh:worker:<worker-uuid>
 ```
 
-Enqueue resolves symbolic refs and effective arguments once and persists a
-typed canonical payload plus SHA-256. Assignment never consults mutable daemon
-defaults. Registry policy—not worker claims—authorizes capabilities and the
-benchmark measurement profile.
+The daemon ignores Common Name and binds the UUID to configured certificate
+fingerprints, capabilities, measurement profile, enabled state, and drain
+state. Registry policy is authoritative; worker-advertised data cannot elevate
+access.
 
-The scheduling state machine is `queued → offered → running → terminal`.
-Every mutation is bound to worker identity, process session, attempt UUID,
-monotonic fencing generation, and an HMAC-authenticated lease token. Lost
-poll/accept/event/terminal responses are idempotent. A new worker process gets a
-new session and cannot resume its predecessor; cleanup is acknowledged before
-safe requeue. Wire protocol v3 includes a bounded, payload-derived requirement
-summary in each offer, allowing local resource/LVM admission before lease
-acceptance without exposing backend paths to the orchestrator.
+Every guest phase uses the checked-in
+[`sandbox-egress`](../network/sandbox-egress.xml) network. Its nftables policy:
 
-Task-neutral reliable events are persisted before acknowledgement and projected
-only across their contiguous sequence prefix. Fine progress has an independent
-best-effort wire sequence and becomes durable when accepted. The daemon can
-restart and replay projection without rerunning work or duplicating accepted
-terminals.
+- permits public dependency fetches;
+- denies the host, private, carrier-grade NAT, loopback, link-local, metadata,
+  multicast, and reserved IPv4 ranges;
+- denies configured public infrastructure CIDRs;
+- denies guest IPv6 forwarding;
+- isolates libvirt ports from other guests.
 
-## Boundaries
+Worker preflight accepts no alternate network name and invokes a fixed,
+root-owned structural verifier. A disposable-guest qualification proves both
+positive dependency egress and negative protected-destination reachability.
+The policy is containment, not data-loss prevention; confidential-source
+deployments require an allowlisted dependency proxy or a stricter no-egress
+network.
 
-### `sbgh-handler`
+## Credentials and artifacts
 
-The handler reads the raw webhook body, verifies
-`X-Hub-Signature-256` with constant-time HMAC comparison, handles `ping`, and
-forwards accepted bytes and GitHub headers to the daemon. It does not parse
-business events, authorize requests, create jobs, or access PostgreSQL.
+| Credential | Owner and lifetime |
+| --- | --- |
+| GitHub App private key | daemon-only mode-`0600` file |
+| GitHub App JWT | daemon memory, at most 10 minutes |
+| GitHub installation token | daemon memory, about one hour |
+| Repository-read token | one active worker assignment, memory only |
+| Slack tokens | daemon environment only |
+| S3 access key | daemon environment only |
+| Webhook HMAC secret | handler environment only |
+| Handler ingest token | handler and daemon environment |
+| Worker private key | one worker identity, mode-`0600` |
+| Lease HMAC key | daemon-only mode-`0600` file |
 
-### `sbgh-daemon`
+Private-repository assignments may carry a short-lived token restricted to
+read-only contents for one repository. The worker uses it only on the trusted
+host while preparing source; it is not mounted into the VM or written to
+artifacts.
 
-The daemon owns:
-
-- webhook classification, authorization, and one task-submission application
-  boundary that validates, fingerprints, and atomically persists immutable
-  demand;
-- worker registry, session, placement, lease, fence, cancellation, and
-  recovery state;
-- reliable-event/progress ingest and replayable projection;
-- exact-key artifact grants, manifest verification, promotion, and staging GC;
-- one submission-scoped report projection over durable job/attempt events and
-  typed results; GitHub/Slack rendering, debounce/rate limiting, comparison,
-  and aggregate report-identity reconciliation;
-- authenticated operator visibility, drain, and explicit submission recovery.
-
-The daemon has no production dependency on `sbgh-worker`, `sbgh-driver`, or
-`sbgh-libvirt`, and contains no inline execution path.
-
-Reporting has one provider-neutral snapshot with exhaustive benchmark,
-build-only, and block-validation detail. GitHub checks use stable per-task
-names (`stacks-bench` and `stacks-block-validation`); build-only remains
-externally silent. Child jobs and attempts are lineage, not external report
-identity. Provider output is rebuilt from durable state, and validation
-verdicts come from the accepted typed result rather than guest summary JSON.
-
-### `sbgh-worker`
-
-The worker owns transport reconnect/resend, active-attempt heartbeat and
-cancellation, local recipes, cache/artifact ports, and cleanup. It consumes
-`sbgh-proto` DTOs and never sees database rows. A private-repository assignment
-may include a short-lived repository-read token. The worker uses it only while
-preparing a source disk on the trusted host; it is never mounted into the guest
-or written to artifacts.
-
-Every repository revision is treated as adversarial: its build scripts and
-produced binaries enter `sbgh-driver` and the concrete `sbgh-libvirt` adapter,
-regardless of source authorization. Benchmark/build jobs use one explicitly
-writable thin snapshot of the newest read-only origin. A block-validation
-assignment uses one resource-profiled VM and K explicitly writable,
-attempt-scoped snapshots of the newest local read-only origin,
-exposed by stable virtio-scsi serials and mounted with XFS `nouuid`. Origin LVs
-are never guest-attached. Both snapshot paths use the same fixed near-full
-thin-pool health guard; K remains a compute/device policy rather than a
-predicted write-space reservation. Results record the selected origin, and
-block validation also records guest-observed coverage. The guest builds or reuses
-`stacks-inspect` through the shared binary cache (scoped by executable,
-repository, commit, toolchain, build recipe, target, and image), probes epoch
-totals, partitions the inclusive range, runs bounded shards, and atomically
-writes a typed result. The host partitions and counts the assignment's global
-range; only the guest's CLI arguments use epoch-local coordinates. The host
-reducer rejects partial, stale, malformed,
-identity-mismatched, or ambiguous negative output. Guest-controlled result
-files are opened without following final symlinks and must resolve beneath the
-results share before parsing, cache publication, or artifact upload; structured
-control/diagnostic reads are size-bounded. There is no direct host-process
-fallback. Compiler-cache state lives only on the disposable boot overlay; the
-fingerprinted binary cache is the sole cross-attempt build-reuse channel.
-
-All guest phases share the versioned `sandbox-egress` libvirt network.
-[Its XML and nftables policy](../network/sandbox-egress.xml) permit
-repository/dependency fetches while denying the host, worker control plane,
-private/link-local destinations, metadata endpoints, and IPv6 fallback.
-Environment-specific public infrastructure CIDRs join the deny set through a
-root-owned configuration file. Worker preflight accepts no alternate network
-name and invokes a fixed root-owned structural verifier; every domain also
-requests libvirt port isolation. A disposable-guest qualification proves
-positive dependency egress and negative host/private/metadata reachability.
-Optional operator TCP probes establish host reachability before and after
-proving configured public control-plane endpoints are guest-inaccessible. This
-is containment, not a data-loss-prevention guarantee.
-
-### Integration crates
-
-`sbgh-postgres`, `sbgh-github`, `sbgh-slack`, and `sbgh-intent` own their
-respective adapters. Core exposes narrow ports/domain types rather than SQLx,
-Octocrab, Slack, or provider-specific values. The package DAG check enforces
-these normal/build dependency boundaries across all features.
-
-## Identity and secrets
-
-The worker listener is separate from the operator/webhook API and requires TLS
-1.3 mutual X.509 authentication. A client certificate carries exactly one URI
-identity SAN, `urn:sbgh:worker:<uuid>`, and client-auth usage. Common Name is
-ignored. The daemon registry binds the UUID to allowed capability/profile and
-enabled/draining state.
-
-Attempt lease tokens are HMAC-bound to worker, session, attempt, and fence.
-Workers upload only through short-TTL presigned requests for orchestrator-
-derived staging keys with signed size/checksum metadata. A stale attempt cannot
-publish an object, and only an accepted terminal promotes verified staging to
-logical result keys.
-
-GitHub credentials remain layered:
-
-| Credential | Scope | Storage/owner |
-| ---- | ---- | ---- |
-| App private key | whole App | daemon-only mode-0600 file |
-| App JWT | App, ≤10 min | daemon memory |
-| installation token | one installation, ~1 hour | daemon cache |
-| repository-read token | one active assignment | worker memory only |
-| webhook secret | inbound HMAC | handler secret environment |
-
-## Task model
-
-`sbgh_core::SubmissionSpec` is the persisted requested variant inside a
-`TaskSubmission`; it may still contain unresolved workflow state. In contrast,
-`sbgh_driver::TaskSpec` is the fully resolved instruction handed to an
-execution backend. The distinct names preserve the persistence/execution
-boundary and avoid conflating durable planning with one concrete attempt.
-
-The fleet lifecycle is additive across task kinds:
-
-- `benchmark`: comparison-bearing submission assigned by worker pull to one
-  worker and measurement profile for every variant/repeat/calibration/carried
-  job;
-- `build_only`: cache production through the same lease/event/artifact path;
-- `block_validation`: one fleet job claimed by a capable worker, with one VM,
-  K private snapshots of its newest local RO chainstate origin, guest-observed
-  range verification, and its own typed result table;
-- future tasks: add a protocol payload, capability, worker recipe, task-specific
-  persistence/rendering, and composition registration without changing the
-  scheduler/lease/event/terminal state machine.
-
-Moving a partial benchmark submission between workers is never automatic. Explicit
-recovery creates a new execution generation and reruns from its first
-specification so comparison results never mix measurement environments.
-
-Submission is deliberately separate from scheduling and coordination. Surface
-adapters authorize and resolve mutable refs; the submission kernel records a
-versioned plan, aggregate provenance, and namespaced idempotency receipt without
-consulting live workers. The pull scheduler later matches each concrete job's
-stored capability and optional operator constraints, and only then records its
-worker/profile assignment. The fleet coordinator alone owns offers, attempts,
-leases, fencing, cancellation, and cleanup.
+Workers upload through short-TTL presigned requests for
+orchestrator-derived exact staging keys with signed size and checksum metadata.
+A stale attempt cannot choose a key or publish a result. Only an accepted
+terminal promotes verified staging objects to logical result keys.
 
 ## Reporting
 
-Workers emit events/outcomes only. The daemon is the sole GitHub/Slack
-side-effect owner. Slack uses one snapshot-rendered message per request;
-reprojection converges from durable state rather than patching previous text.
-GitHub check/comment identities use deterministic reconciliation. Block
-validation reports invalid blocks as a completed negative/red correctness
-result; timeout, process loss, setup, and transport faults remain retryable
-infrastructure failures.
+Workers emit events and typed outcomes; they never call GitHub or Slack. The
+daemon projects one provider-neutral, submission-scoped report snapshot from
+durable state:
 
-## Operations
+- aggregate lifecycle and progress;
+- exhaustive `Benchmark`, `BuildOnly`, or `BlockValidation` detail;
+- bounded, escaped untrusted diagnostics;
+- a monotonic snapshot version.
 
-Production layout, mTLS issuance/rotation/revocation, host characterization,
-immutable local chainstate refresh, metrics/alerts, drain/upgrade, failure injection,
-and rollback are defined in
-[worker-fleet-operations.md](worker-fleet-operations.md). The daemon API is
-documented in [daemon-api.md](daemon-api.md); initial host prerequisites remain
-in [host-bringup.md](host-bringup.md), with narrow libvirt/LVM permissions
-applying to every execution worker rather than the orchestrator.
+The authenticated report API and both provider renderers consume this same
+snapshot. GitHub checks use stable task names: `stacks-bench` and
+`stacks-block-validation`. Build-only remains externally silent. Child jobs and
+attempts are lineage, not report identity.
+
+GitHub check/comment and Slack message identities are reconciled
+deterministically. Renderers rebuild complete snapshots instead of patching
+previous provider text, so replay after a daemon restart is idempotent.
+Replayed older events cannot regress a newer terminal snapshot.
+
+An invalid block is a completed negative/red correctness result. Setup,
+timeout, process, transport, or incomplete-shard failures remain
+infrastructure failures and may be retried according to fleet policy.
+
+## Operator surfaces
+
+- [setup.md](setup.md) installs the current system.
+- [worker-fleet-operations.md](worker-fleet-operations.md) covers routine
+  worker, certificate, maintenance, and recovery procedures.
+- [daemon-api.md](daemon-api.md) documents the operator and ingest API.
+- [slack-setup.md](slack-setup.md) configures the optional Slack surface.

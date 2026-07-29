@@ -3,7 +3,7 @@
 - **id:** `0001-artifact-store`
 - **status:** `shipped`
 - **date:** 2026-06
-- **iteration:** v4 (deployed; see [v3-to-v4-upgrade.md](../../../docs/v3-to-v4-upgrade.md))
+- **iteration:** v4
 - **source:** `docs/roadmap-v12.md`
 
 Made run-artifact storage **pluggable** (local disk default → S3-compatible

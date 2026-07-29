@@ -9,7 +9,8 @@
 # are NOT movable via /proc (see below). Between that, `nohz_full` (timers), and
 # the daemon's `<emulatorpin>` (VM I/O threads on the host cores), the sources
 # that matter are already handled. Reach for this only if your serial-vs-
-# concurrent A/B shows jitter that tracks with I/O. See docs/host-bringup.md §9.2.
+# concurrent A/B shows jitter that tracks with I/O. Keep the chosen host CPUs
+# consistent with the worker profile's CPU placement.
 #
 # NVMe per-queue IRQs (e.g. `nvme0q1`) are kernel-MANAGED — a /proc write
 # no-ops, so --apply reports them as skipped; use `managed_irq` in isolcpus

@@ -2,25 +2,22 @@
 # (or wherever $SBGH_CONFIG points) and fill in.
 #
 # The daemon is the fleet orchestrator and sole DB/GitHub/Slack side-effect
-# owner. Worker transport policy is in config.example.fleet.toml; benchmark
-# libvirt settings are copied into config.example.worker-benchmark.toml.
-# The legacy [vm]/[paths]/[lvm] fields below remain parse-compatible during
-# the v25 rollout but are not a production execution path in the daemon.
+# owner. Worker transport policy is in config.example.fleet.toml; execution
+# settings live in the worker profile examples. Full validation still requires
+# a compatibility-only golden image, LVM volume group, and thin pool (supplied
+# below or by env); the other [vm], [paths], and [lvm] values have defaults.
+# The daemon has no execution path and does not use them to run work.
 #
 # Secret values can also come from env:
 #   DATABASE_URL                 — overrides [server].database_url
 #   SBGH_GH_PRIVATE_KEY_PATH     — overrides [github].private_key_path
 
 [server]
-# Connect as the DB **owner** (`sbgh`) — the daemon is the sole DB client.
-# roadmap-v3 Phase 3 added the `/api` admin endpoints, which write the
-# installer / repo / policy / user tables the old narrow roles had no grants
-# on, so the daemon needs owner privileges. (The `sbgh_orch`/`sbgh_handler`
-# roles were dropped in the Phase 6 collapse — there's a single role now.)
-# Compose publishes postgres on 127.0.0.1:5432; the owner password is the
-# `POSTGRES_OWNER_PASSWORD` set in docker/.env.
+# Connect as the DB owner (`sbgh`). The daemon is the sole DB client and
+# applies migrations before serving. Compose publishes PostgreSQL on
+# 127.0.0.1:5432; use the `POSTGRES_OWNER_PASSWORD` from docker/.env.
 database_url = "postgres://sbgh:CHANGE_ME@127.0.0.1:5432/sbgh"
-# OS user the daemon runs as. Used to chown the per-job source mount.
+# Compatibility field; the systemd service runs as `sbgh`.
 service_user = "sbgh"
 
 [github]
@@ -33,46 +30,24 @@ api_base_url = "https://api.github.com"
 private_key_path = "/etc/sbgh/daemon/github-app.private-key.pem"
 
 [vm]
+# Compatibility-only daemon fields. Configure live execution resources under
+# [libvirt] in each worker profile.
 golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
 
-# Each job runs the same VM in two phases — build at one size, bench at
-# another (typically smaller, matching the production deployment shape).
-# Memory accepts the IEC short form: "16G", "8192M", "1024K", or bare
-# bytes. All units are binary (G ≡ Gi = 1024³). Between phases the
-# daemon powers the VM off cleanly and redefines it at the new
-# memory + vcpus, giving the bench phase a fresh kernel boot.
-#
-# Build phase: cargo wants parallelism and rustc's `lto=fat` final
-# link of `stacks-bench` peaks at ~7.6 GiB RSS. 16 GiB is the floor;
-# lower OOM-kills the build.
+# Required compatibility values only; current VM sizing is worker-owned.
 build_vcpus = 4
 build_memory = "16G"
-
-# Bench phase: should mirror the production deployment shape so the
-# per-block timings are representative. stacks-node typically runs on
-# 2–4 cores / 8 GiB in prod.
 bench_vcpus = 2
 bench_memory = "8G"
 
 boot_disk_gib = 64
 job_timeout_secs = 21600   # 6 hours
-# The versioned, policy-managed network used by every adversarial guest phase.
-# Install it with scripts/install-sandbox-network.sh; other names fail worker
-# preflight.
 network = "sandbox-egress"
-# How often the daemon polls the in-VM phase journal + virsh
-# domstate. Each poll runs a `virsh domstate` subprocess (~50–100ms),
-# so smaller values = more host CPU. 5s is the sensible floor for
-# our workload; transitions are append-only and replayed in batches
-# so we never miss one even at multi-second polls.
 poll_interval_secs = 5
-# How often the daemon emits a heartbeat log line + (debounced)
-# PR-comment refresh showing the current phase and elapsed time
-# within it. Independent of poll interval — poll rarely, surface
-# liveness frequently.
 heartbeat_interval_secs = 60
 
 [paths]
+# Explicit compatibility defaults; current execution paths are worker-owned.
 jobs_dir = "/var/lib/sbgh/jobs"
 git_mirror = "/var/lib/sbgh/git/stacks-core.git"
 results_tmpfs_root = "/run/sbgh/jobs"
@@ -84,20 +59,12 @@ cloud_localds_binary = "/usr/bin/cloud-localds"
 git_binary = "/usr/bin/git"
 
 [lvm]
-# Most installs have a single VG that already holds root/swap (often `vg0`
-# or named after the hostname). Use whatever `vgs` shows; it does not need
-# to be dedicated.
+# Required compatibility values only; current LVM policy is worker-owned.
 vg_name = "vg0"
 thinpool = "thinpool"
 chainstate_base_prefix = "mainnet-"
-# Fixed setup-health floor shared by thin-snapshot workloads. This rejects an
-# already near-full pool; it is not per-job capacity prediction.
 min_data_free_percent = 5.0
 min_metadata_free_percent = 5.0
-# Leave commented out for the recommended thin-snapshot path (snapshot
-# lives in the same thin pool as the origin, grows on demand). Set
-# explicitly only if your base chainstate LV is a thick (non-thin) volume —
-# the value is then the COW exception-store size in GiB.
 # chainstate_snapshot_size_gib = 64
 
 [stacks_bench]
@@ -118,9 +85,8 @@ min_metadata_free_percent = 5.0
 # you're trying to measure.
 default_args = "--start-at 7800000 --count 5000 --warmup 1000 --no-profiler-kv --bench-spans-only"
 
-# The `/api` server (roadmap-v3 Phase 2). Reachable only from the local CLI
-# (loopback) and the handler container (docker bridge) — never a public
-# interface.
+# Reachable only from the local CLI (loopback) and handler container (Docker
+# bridge), never a public interface.
 [api]
 # TWO binds: loopback for the local CLI, and the docker-bridge gateway IP so
 # the handler container can reach the host daemon (a container cannot reach a
@@ -135,7 +101,7 @@ cookie_path = "/etc/sbgh/daemon/.cookie"
 # secrets.env). Unset = webhook submission via /api is disabled.
 # ingest_token = "..."
 
-# How benchmark results are surfaced on GitHub (roadmap-v4). Requires the App's
+# How benchmark results are surfaced on GitHub. Requires the App's
 # `checks:write` permission for the check surfaces; until granted, the check
 # calls 403 and degrade (PR → comment, baseline → nothing) without failing the
 # run — reporting is always non-fatal. (The numeric App id needed for the check
@@ -147,7 +113,7 @@ pr_report = "both"
 # Baseline (push/tag) jobs: "check" (a commit-level Check Run on the baseline
 # commit) or "none" (headless/DB-only). Default "check".
 baseline_report = "check"
-# roadmap-v7: the measured per-run coefficient of variation of the combined
+# The measured per-run coefficient of variation of the combined
 # Execution+Commit metric, as a PERCENT (e.g. 0.37 = 0.37% CV). Drives the
 # vs-baseline confidence: 1σ on the delta is √2·CV, and the report grades it
 # <1σ inconclusive / 1–2σ weak / 2–3σ moderate / ≥3σ likely-real. Leave it unset
@@ -158,52 +124,24 @@ baseline_report = "check"
 # noise_cv_pct = 0.37
 
 [runner]
-# Maximum benchmark jobs run concurrently. Default 1 (sequential — the
-# historical behavior). This limits daemon execution *slots*, not VM capacity:
-# raise it only when the host can actually run that many jobs at once (each is a
-# full build+bench VM today — vCPUs, memory, an LVM snapshot, and a tmpfs per
-# job). Values below 1 are clamped to 1.
+# Compatibility-only inline-runner limit. Fleet concurrency is worker-owned.
 max_concurrent_jobs = 1
 
 # Maximum user-requested clean VM repetitions. A Slack/LLM request's
 # "repetitions" value is capped here before enqueue; each isolated VM
 # invocation still receives stacks-bench --repetitions 1.
 max_clean_repetitions = 5
+max_variants = 2
+max_comparison_lifecycles = 10
 
-# CPU pinning (optional). One libvirt cpuset per concurrency slot, so each
-# concurrent benchmark runs on dedicated physical cores — removing scheduler
-# jitter and core-sharing between jobs (essential for trustworthy concurrent
-# numbers). Length must be >= max_concurrent_jobs. Omit (or leave empty) to
-# disable pinning (vCPUs float across all cores — the default).
-#
-# Example for a 6-core box (SMT off) running 2 concurrent jobs at 2 vCPUs each,
-# leaving cores 4-5 for the host/OS:
-#   max_concurrent_jobs = 2
-#   cpu_sets   = ["0-1", "2-3"]   # slot 0 → cores 0,1 ; slot 1 → cores 2,3
-#   host_cpus  = "4-5"            # pin qemu emulator/I-O threads off the bench cores
-# …and match the per-phase vCPU counts to the slot size (a VM's vCPUs are
-# CONFINED to its cpuset, so anything above the slot's core count just
-# oversubscribes that slot's own cores). For a 2-core slot:
-#   [vm]
-#   build_vcpus = 2   # the default 4 would oversubscribe a 2-core slot —
-#                     # harmless (contained + the build isn't measured) but
-#                     # pointless; it can't use more than the slot's cores.
-#   bench_vcpus = 2   # keep <= slot cores: the bench phase IS measured, so
-#                     # 1 vCPU per core (no oversubscription on the metric).
-#
-# NOTE: pinning isolates *cores*; it cannot partition the shared L3 / memory
-# bandwidth on a single socket. Measure serial-vs-concurrent before trusting
-# concurrent results. Pair with a kernel cmdline that keeps the host + managed
-# (NVMe/NIC) IRQs off the bench cores:
-#   nosmt=force isolcpus=domain,managed_irq,0-3 nohz_full=0-3 rcu_nocbs=0-3
-# See docs/host-bringup.md §9 for the full host setup.
-# cpu_sets  = ["0-1", "2-3"]
-# host_cpus = "4-5"
+# Compatibility-only inline-runner placement. Configure current CPU placement
+# in each worker profile.
+# cpu_sets = []
+# host_cpus = ""
 
-# Run-artifact storage. The parser retains `local` for old configuration
-# compatibility, but v25 fleet mode requires S3-compatible storage so remote
-# workers can use exact-key delegated transfers. Replace these placeholders or
-# provide the documented environment variables before starting the daemon.
+# Fleet operation requires S3-compatible storage so workers can use exact-key
+# delegated transfers. Replace these placeholders or use the environment
+# variables below.
 [artifacts]
 kind = "s3"
 endpoint = "https://fsn1.your-objectstorage.com"
@@ -222,7 +160,8 @@ region = "fsn1"
 #   SBGH_ARTIFACTS_KIND=s3
 #   SBGH_ARTIFACTS_S3_ENDPOINT / _BUCKET / _REGION
 
-# Local `stacks-bench` binary cache (item 0025, iteration v9). Opt-in: when
+# Daemon-side binary-cache policy used by submission and pinning surfaces.
+# Worker cache storage and limits are configured in worker profiles. When
 # enabled, a fingerprint-matched binary (commit + resolved toolchain + golden
 # image + recipe/protocol version) is reused instead of rebuilt, skipping the
 # ~5-7 min build VM. Disabled (default) keeps today's always-build behavior.
@@ -238,7 +177,7 @@ region = "fsn1"
 # Env equivalents:
 #   SBGH_ARTIFACTS_BINARY_CACHE_ENABLED / _MAX_SIZE / _DIR
 
-# Slack ad-hoc profiling connector (item 0002, iteration v5). Disabled by
+# Slack benchmark connector. Disabled by
 # default — when off, the connector never starts and the rest of this section is
 # inert. Enable it to serve `@BenchBot bench …` mention benches over Socket Mode.
 [slack]
@@ -262,7 +201,7 @@ enabled = false
 #   SBGH_SLACK_DEFAULT_REPOSITORY / _DEFAULT_REV
 #   SBGH_SLACK_ALLOWED_TEAM_IDS / _ALLOWED_USER_IDS   # comma-separated
 
-# LLM-backed intent resolution (item 0020, iteration v13). Disabled by default.
+# LLM-backed intent resolution. Disabled by default.
 # When enabled, explicit flag-shaped Slack input still takes the deterministic
 # parser fast-path; natural-language input is sent to OpenAI for strict
 # schema-filled intent JSON, then revalidated by the daemon before enqueue.

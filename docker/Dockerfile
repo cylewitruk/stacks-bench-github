@@ -42,7 +42,7 @@ FROM debian:trixie-slim AS runtime
 # defaults to 901 — the host sbgh-handler user). Deliberately distinct
 # from:
 #   - the postgres container's uid (default 900, see compose)
-#   - the host daemon's uid (default 902, see docs/host-bringup.md §3)
+#   - the host daemon's uid (default 902, see docs/setup.md)
 # so a compromised handler container can't share the daemon's or
 # postgres's on-disk identity. We pick numbers low in the system uid
 # range (100–999) to avoid the common Ubuntu allocations near the top of
@@ -66,10 +66,10 @@ WORKDIR /home/sbgh
 
 # ─── 3a. sbgh-cli image ─────────────────────────────────────────────────
 # Operator CLI: a pure `/api` client (admin + read commands like
-# `installer allow`, `jobs list`). Since roadmap-v3 Phase 6 it has no DB
-# access and no `migrate` subcommand — the daemon applies migrations
-# at startup. Not referenced by docker-compose.yml (the operator runs the
-# host-built binary); kept for ad-hoc `docker run` use.
+# `installer allow`, `jobs list`). It has no DB access or migration command;
+# the daemon applies migrations at startup. Not referenced by
+# docker-compose.yml (the operator runs the host-built binary); kept for
+# ad-hoc `docker run` use.
 FROM runtime AS cli
 COPY --from=builder /usr/local/bin/sbgh-cli /usr/local/bin/sbgh-cli
 ENTRYPOINT ["/usr/local/bin/sbgh-cli"]

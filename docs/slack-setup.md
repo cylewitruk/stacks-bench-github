@@ -1,78 +1,94 @@
-# Slack ad-hoc profiling setup
+# Slack setup
 
-How to stand up the `@BenchBot` benchmark bot (item 0002, iteration v5). The app
-definition lives in [`slack-app-manifest.yaml`](slack-app-manifest.yaml); the
-daemon-side config is the `[slack]` block in `config.example.daemon.toml`.
+Slack is an optional benchmark-submission and progress surface. The daemon
+connects through Socket Mode, so the Slack App needs no public request URL.
+The checked-in [manifest](slack-app-manifest.yaml) pins the required events and
+least-privilege bot scopes.
 
-## 1. Create the app
+## Create the App
 
-1. <https://api.slack.com/apps> → **Create New App** → **From a manifest**.
-2. Pick the workspace, paste [`slack-app-manifest.yaml`](slack-app-manifest.yaml),
-   create.
-3. **Install to Workspace** (grants the bot token).
+1. Open <https://api.slack.com/apps>.
+2. Select **Create New App**, then **From a manifest**.
+3. Choose the workspace and paste
+   [slack-app-manifest.yaml](slack-app-manifest.yaml).
+4. Create the App and select **Install to Workspace**.
 
-Existing installations must reinstall after upgrading the manifest: snapshot
-reconciliation adds `channels:history`, `groups:history`, and
-`metadata.message:read`.
+Reinstall an existing App after changing the manifest so new scopes take
+effect.
 
-## 2. Collect the two tokens
+## Create tokens
 
-Both are **env-only** secrets — never put them in the TOML (a key there is a
-hard error).
+Both tokens are environment-only secrets. A TOML token field is rejected.
 
-| Token | Where | Scope | Env var |
-| ---- | ---- | ---- | ---- |
-| Bot (`xoxb-…`) | OAuth & Permissions → Bot User OAuth Token | from manifest | `SBGH_SLACK_BOT_TOKEN` |
-| App-level (`xapp-…`) | Basic Information → App-Level Tokens → Generate | `connections:write` | `SBGH_SLACK_APP_TOKEN` |
+| Token | Location | Required scope | Environment variable |
+| --- | --- | --- | --- |
+| Bot token (`xoxb-…`) | OAuth & Permissions | Manifest bot scopes | `SBGH_SLACK_BOT_TOKEN` |
+| App token (`xapp-…`) | Basic Information, App-Level Tokens | `connections:write` | `SBGH_SLACK_APP_TOKEN` |
 
-The App-Level Token powers Socket Mode and is **not** in the manifest — generate
-it by hand with the `connections:write` scope.
+The App token opens the Socket Mode connection and is not represented in the
+manifest.
 
-## 3. Find the allowlist ids
+Add both values to `/etc/sbgh/daemon/secrets.env`, owned by `sbgh` and mode
+`0600`.
 
-Authz requires BOTH the workspace and the sender to be allowlisted.
+## Configure authorization
 
-- **Team id** (`T…`): workspace **Settings & administration → Workspace
-  settings**, or any deep link.
-- **User ids** (`U…`): a member's profile → **Copy member ID**.
+Slack requests require both an allowed workspace and an allowed user. Obtain:
 
-## 4. Configure the daemon
+- the workspace team ID (`T…`) from workspace settings or a Slack deep link;
+- each user ID (`U…`) from **Profile -> Copy member ID**.
+
+Enable the daemon connector:
 
 ```toml
 [slack]
-enabled            = true
-default_repository = "stacks-network/stacks-core"  # the constant code under test
-default_rev        = "develop"
-allowed_team_ids   = ["T0123ABCD"]
-allowed_user_ids   = ["U0123ABCD"]
+enabled = true
+default_repository = "stacks-network/stacks-core"
+default_rev = "develop"
+allowed_team_ids = ["T0123ABCD"]
+allowed_user_ids = ["U0123ABCD"]
 ```
 
-`default_repository` must already be known to the daemon (installed on it, or a
-PR opened from it) — startup fails fast otherwise.
+The default repository must already be known to the daemon. Startup fails
+closed if required IDs, repository state, or tokens are missing.
 
-## 5. Invite + smoke test
+Natural-language resolution is optional:
 
-> The bot is addressed by its **display name** (`BenchBot` in the manifest, but
-> workspace-renamable) — examples below use `@BenchBot`; substitute whatever you
-> named it. Nothing in the daemon hardcodes the name: Slack delivers mentions by
-> the bot's user id, and the daemon strips the leading `<@id>` token regardless.
+```toml
+[llm]
+enabled = true
+provider = "openai"
+model = "gpt-5-mini"
+input_max_chars = 1000
+timeout_secs = 15
+per_user_rate_limit_per_minute = 5
+```
 
-1. Invite the bot to the channel: `/invite @BenchBot` (it can only see mentions and
-   reply in channels it is a member of).
-2. Restart the daemon — the log shows `slack: socket mode connected`.
-3. From an allowlisted user: `@BenchBot bench --block <n>`.
-4. Expect: ⏳ on your message → a threaded result with the metrics → ⏳ swapped
-   for ✅ (or ❌ on failure). A denied/garbled request gets an ephemeral
-   (invoker-only) reply and no reaction.
+Set `SBGH_OPENAI_API_KEY` in the daemon environment. Explicit flag-shaped
+requests continue to use the deterministic parser; all model output is
+schema-validated and revalidated before submission.
 
-The threaded result is one ordinary message. Queue, phase, progress, and
-terminal state update that same timestamp; aligned progress rows render in a
-fenced fixed-width block. The daemon always renders the complete current
-snapshot and never parses or patches the previous message.
+## Verify
 
-For crash recovery, the message has Slack metadata containing an opaque
-request identity and monotonic snapshot version. No repository name, user
-input, token, or other secret is stored in metadata. If no timestamp was
-persisted, the daemon uses `conversations.replies` only in the originating
-thread and adopts exactly one matching message from its configured bot. A
-history lookup failure or multiple matches is retried without posting.
+1. Invite the bot to a channel with `/invite @BenchBot`.
+2. Restart `sbgh-daemon`.
+3. Confirm `slack: socket mode connected` in the daemon journal.
+4. From an allowed user, mention the bot:
+
+   ```text
+   @BenchBot bench --block <height>
+   ```
+
+The bot adds an acknowledgement reaction and creates one normal threaded
+message. Queue, phase, bounded progress, and terminal state update that same
+timestamp. The complete message is rendered from current durable state; the
+daemon never parses or incrementally patches its previous text.
+
+The message carries opaque Slack metadata containing request identity and a
+monotonic snapshot version. It contains no repository, user input, or secret.
+If the timestamp was not persisted, reconciliation searches only the
+originating thread and adopts exactly one matching message from the configured
+bot. Lookup failure or multiple matches fail closed and retry without posting a
+duplicate.
+
+Denied or malformed requests receive an ephemeral reply and create no task.

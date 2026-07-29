@@ -1,344 +1,319 @@
 # Worker fleet operations
 
-v25 runs one active `sbgh-daemon` orchestrator and one or more outbound-polling
-`sbgh-worker` processes. The daemon is the only PostgreSQL, GitHub-reporting,
-Slack, GitHub App private-key, and object-store credential holder. A worker
-receives only an attempt-scoped lease token, exact-key upload grants, and a
-short-lived repository-read token.
+This runbook covers the current worker fleet after
+[setup](setup.md). One active `sbgh-daemon` owns scheduling, leases, durable
+events, artifacts, and provider reporting. Workers poll outbound and execute
+only registry-authorized capabilities.
 
-## Network and identity
+## Routine status
 
-Expose the fleet listener only on the private worker network. Allow workers to
-initiate TCP connections to it; do not expose PostgreSQL, the operator API,
-libvirt, or worker SSH publicly. TLS 1.3 mutual authentication is mandatory,
-including for the loopback worker.
+Run operator commands as the daemon user:
 
-Use [fleet-pki.sh](../scripts/fleet-pki.sh) to create a private CA and 90-day
-server/client certificates. Keep the encrypted CA key offline. Each client
-certificate has client-auth EKU and exactly one identity URI SAN:
+```bash
+alias sbgh='sudo -u sbgh sbgh-cli'
 
-```text
-urn:sbgh:worker:<worker-uuid>
+sbgh status
+sbgh jobs list
+sbgh fleet status
+sbgh webhook tail --limit 20
 ```
 
-The same UUID must be pre-registered in
-[config.example.fleet.toml](../config.example.fleet.toml). Registry policy is
-authoritative for the currently accepted leaf-certificate SHA-256
-fingerprints, capability, measurement profile, enabled state, and drain;
-worker-advertised facts cannot elevate access. `fleet-pki.sh worker` prints the
-configuration line for the issued fingerprint.
+`fleet status` is the primary view for registered identities, current
+sessions, discovered CPU/memory, active attempts, lease state, traces, and
+pending cleanup.
 
-For certificate rotation, issue a replacement with the same worker UUID, place
-both old and new fingerprints in registry policy for the overlap, place the new
-certificate/key atomically, drain and restart the worker, then remove the old
-fingerprint and restart the daemon after registration succeeds. To revoke one
-certificate immediately, remove its fingerprint and restart the daemon. To
-revoke the identity, set its registry entry `enabled = false` and restart the
-daemon. Fingerprint and registry authorization are checked on every worker API
-request; use the network/CA layer as additional containment for a compromised
-key.
+Service logs:
 
-The lease-HMAC key must contain at least 32 random bytes and be mode `0600`.
-Rotate it only after draining all workers and confirming there are no active
-attempts; rotation invalidates every outstanding lease token.
+```bash
+journalctl -u sbgh-daemon -f
+journalctl -u 'sbgh-worker@benchmark' -f
+journalctl -u 'sbgh-worker@block-validation' -f
+docker compose -f docker/docker-compose.yml logs -f handler smee postgres
+```
 
-Every execution profile uses the checked-in `sandbox-egress` XML and nftables
-policy for all guest phases. The policy permits dependency fetches but denies
-the host, private/link-local and metadata destinations, IPv6 fallback, and
-operator-listed public infrastructure CIDRs. Worker preflight rejects alternate
-network names and invokes the root-owned structural verifier. Each domain
-requests libvirt port isolation. Because dependency egress is still egress,
-this boundary is not DLP; deployments handling confidential source should put
-an allowlisted dependency proxy behind the same contract.
+The Prometheus endpoint is `GET /api/fleet/metrics` with `read` or `admin`
+authentication. Alert on:
 
-## Installation
+- heartbeat age above 30 seconds or the configured lease TTL;
+- an active attempt with no lease time remaining;
+- scheduling wait above the task SLO while a compatible worker should exist;
+- reliable event ACK gaps lasting more than two heartbeats;
+- resend-buffer pressure above 75%;
+- staging objects older than 30 minutes or unexpected staging growth;
+- cleanup pending longer than one lease TTL.
 
-1. Install the release binaries and units with
-   `sudo ./scripts/install-daemon.sh --no-start`. First installation must not
-   start the daemon before service identities, configuration, secrets, PKI,
-   PostgreSQL, and object storage are ready.
-2. Create separate `sbgh` and `sbgh-worker` service users. A worker must not
-   have daemon secret files or database connectivity.
-3. Install the daemon fleet config at a root-controlled path and set
-   `SBGH_FLEET_CONFIG` in `/etc/sbgh/daemon/secrets.env`.
-4. Install worker profiles as `/etc/sbgh/worker/<profile>.toml` from the
-   benchmark and block-validation examples. CPU and RAM are discovered at
-   process startup; do not copy host-capacity totals into these profiles.
-5. Install the network policy with `sudo
-   ./scripts/install-sandbox-network.sh --install-only`, add
-   environment-specific protected public CIDRs, then apply it with `sudo
-   ./scripts/install-sandbox-network.sh`.
-6. Add the exact root-owned
-   `/usr/local/libexec/sbgh-check-sandbox-network` command to the worker sudo
-   allowlist.
-7. Enable `sbgh-worker@benchmark.service` locally and
-   `sbgh-worker@block-validation.service` on the dedicated host.
-8. Install
-   [sbgh-worker-block-validation-hardening.conf](../systemd/sbgh-worker-block-validation-hardening.conf)
-   as the block worker's systemd drop-in after adjusting its paths.
-9. Start the daemon only after its complete preflight passes, then enable the
-   intended worker profile. Use `systemctl enable --now sbgh-daemon.service`
-   followed by `systemctl enable --now sbgh-worker@<profile>.service`.
+Do not hide the loss of a sole-capability worker by automatically moving
+comparison work to a different measurement environment.
 
-Every execution worker receives only the narrow sudo/libvirt permissions
-documented in [host-bringup.md](host-bringup.md). Repository builds and produced
-executables run in disposable VMs; sudo is used only by the trusted libvirt/LVM
-adapter for fixed infrastructure commands.
+## Drain, cancellation, and recovery
 
-v26 does not mount a persistent sccache directory into guests. After draining
-all pre-v26 workers, an operator may remove the obsolete
-`/var/lib/sbgh-worker/sccache`; compiler-cache state is guest-local and the
-fingerprinted binary cache remains the cross-attempt reuse mechanism.
+Drain prevents new offers while allowing the active attempt to finish:
 
-Use a dedicated, guest-safe `stacks-inspect` chain configuration for block
-validation. The worker copies it into the VM, so it must not be a production
-follower configuration containing RPC passwords, node keys, seed material, or
-other reusable credentials.
+```bash
+sbgh fleet drain --worker-id <worker-uuid>
+sbgh fleet undrain --worker-id <worker-uuid>
+```
 
-## Host and chainstate validation
+Cancel active work by job ID:
 
-Every benchmark and block-validation chainstate origin must be read-only. The
-worker never attaches an origin to a guest; it creates an explicitly writable
-attempt snapshot instead. Benchmark and block-validation preflight resolve the
-newest LV matching the worker-local `chainstate_base_prefix`, reject a writable
-origin, and apply the same fixed thin-pool health floor. Build-only preflight
-does not require or allocate chainstate. Every worker is expected to run the
-same nightly/on-demand updater and have a sufficiently recent local origin.
-Block-validation guests probe the selected snapshot and fail as infrastructure
-when the requested range is absent; successful results record the exact origin
-and observed range. Manifests and LVM tags are optional provenance only.
+```bash
+sbgh fleet cancel --job-id <job-uuid>
+```
 
-At startup, the worker discovers its available logical CPU count and Linux
-`MemTotal`, validates every advertised execution profile against that capacity,
-and registers those measured facts for fleet observability. Guest vCPU, memory,
-CPU placement, shard, and concurrency values remain operator policy in the
-profile. Storage is validated by the component that owns it (thin-pool health,
-binary-cache limit, and required filesystem paths); the worker does not publish
-an ambiguous aggregate storage total.
+Cancellation is durable. The worker observes it on heartbeat, stops the VM,
+runs normal teardown, and may submit only a cancelled terminal. A success
+terminal that already won the database race remains immutable.
 
-Before enabling an execution capability, run its worker preflight and record:
+Recover a submission only after inspecting its current attempt and cleanup
+state:
+
+```bash
+sbgh fleet recover-submission \
+  --submission-id <submission-uuid> \
+  --reason "operator-approved recovery"
+```
+
+Use `--worker-id <uuid>` only to impose an intentional compatible placement.
+Recovery creates a new execution generation and restarts at the first
+specification/run. Older results remain auditable but are excluded from the
+new comparison.
+
+## Worker admission and preflight
+
+Before enabling a worker profile, run:
 
 ```bash
 sudo -u sbgh-worker sbgh-worker \
   --config /etc/sbgh/worker/benchmark.toml \
   --preflight-only
-sudo -u sbgh-worker sbgh-worker \
-  --config /etc/sbgh/worker/block-validation.toml \
-  --preflight-only
-sudo lvs -o vg_name,lv_name,lv_attr,lv_tags,lv_size,data_percent,metadata_percent
-sudo ./scripts/characterize-worker-host.sh \
-  /var/lib/sbgh-worker/host-characterization.md /var/lib/sbgh-worker
 ```
 
-`--preflight-only` verifies the golden image, fixed command binaries, writable
-runtime directories, fixed `sandbox-egress` name, root-owned structural
-policy, read-only origin, and the shared fixed Data%/Meta% health floor.
-The floor rejects an already near-full or mis-provisioned pool; it does not
-predict assignment writes and never scales with K. Registration and
-block-offer admission run the same checks; the standalone command opens no
-fleet session. Block validation rolls each block's processing writes back; its
-MB-scale WAL/SHM divergence is not reserved as if every shard were a
-write-heavy workload.
+Use the block-validation profile on that host. Preflight opens no fleet
+session and checks:
 
-Structural verification proves the intended policy is loaded, but not packet
-behavior. Before enabling either execution profile—and after any firewall,
-routing, libvirt, or protected-CIDR change—run:
+- worker config and profile resources against discovered CPU and memory;
+- certificate/key and server CA files;
+- golden image and fixed host commands;
+- job, cache, result, and runtime paths;
+- exact `sandbox-egress` network name and structural verifier;
+- newest matching read-only chainstate origin where the capability needs one;
+- the shared fixed thin-pool Data% and Meta% health floors.
+
+Build-only capability does not require a chainstate origin. The fixed pool
+floors reject an already near-full or mis-provisioned pool; they are not
+per-assignment write prediction.
+
+## Chainstate refresh
+
+Every benchmark and block-validation worker independently maintains a recent
+read-only LVM origin under the configured prefix:
 
 ```bash
+sudo ./scripts/download-chainstate.sh \
+  --vg vg0 --thinpool thinpool --prefix mainnet-
+sudo lvs -o vg_name,lv_name,lv_attr,origin,data_percent,metadata_percent
+```
+
+Run this nightly or on demand. The new LV is published only after checksum
+verification and extraction complete, then set read-only and deactivated.
+The worker selects the lexicographically newest matching name when preparing
+an attempt.
+
+The downloader removes older origins only when they have no active snapshots.
+Use `--keep-old` when retaining history or diagnosing a change. Never make a
+published origin writable. If preflight reports a writable newest origin,
+drain the worker and correct it explicitly:
+
+```bash
+sudo lvchange --permission r vg0/mainnet-YYYY-MM-DD
+```
+
+The selected origin and guest-observed coverage are recorded with block
+validation results. A worker whose local chainstate cannot cover the requested
+range fails the attempt as infrastructure; it must not fabricate a partial
+verdict.
+
+## Sandbox network
+
+All guest phases use the managed `sandbox-egress` libvirt network. The active
+unit must pass its post-start verifier before any worker can start:
+
+```bash
+systemctl is-active --quiet sbgh-sandbox-egress.service
+journalctl -u sbgh-sandbox-egress.service -n 50 --no-pager
+sudo /usr/local/libexec/sbgh-check-sandbox-network
+```
+
+The policy permits public dependency egress while denying the host,
+private/link-local/metadata destinations, configured public infrastructure
+CIDRs, and IPv6 fallback. Each VM also requests libvirt port isolation.
+Because public egress remains available, this is containment rather than DLP.
+
+After a routing, firewall, nftables, libvirt, protected-CIDR, or golden-image
+change:
+
+1. Drain and stop the worker.
+2. Apply or refresh the checked-in policy.
+3. Start `sbgh-sandbox-egress.service` and require it to remain active.
+4. Require the structural success message in its journal.
+5. Run the fixed verifier.
+6. Run the disposable-guest ceremony.
+7. Start and undrain the worker only after all checks pass.
+
+```bash
+sudo ./scripts/install-sandbox-network.sh --refresh
+sudo systemctl restart sbgh-sandbox-egress.service
+sudo /usr/local/libexec/sbgh-check-sandbox-network
 sudo ./scripts/qualify-sandbox-network.sh --execute \
-  /var/lib/sbgh-worker/v26-sandbox-egress.md \
+  /var/lib/sbgh-worker/sandbox-egress-qualification.md \
   /var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2
 ```
 
-The disposable VM must fetch `https://index.crates.io/config.json` (or an
-operator-supplied HTTPS dependency canary) while controlled host, RFC1918, and
-metadata-like endpoints remain unreachable. Retain the report with the host
-qualification evidence.
-Use repeatable `--deny-tcp IP:PORT` arguments for safe listening endpoints on
-operator-protected public control-plane addresses. The ceremony rejects
-addresses outside `protected-ipv4.conf` and first proves each endpoint is
-reachable from the host. It repeats that host control after the guest probe, so
-an offline or disappearing service cannot produce a vacuous pass.
-After any firewall-service reload, restart
-`sbgh-sandbox-egress.service`, rerun this ceremony, and only then restart
-workers.
+Use `--refresh` only after comparing local policy with the new checked-in
+assets; it preserves `protected-ipv4.conf`. Add repeatable
+`--deny-tcp IP:PORT` probes for protected public endpoints that accept a safe
+host connection. The ceremony first proves host reachability, then requires
+guest denial, then proves host reachability again so an offline service cannot
+produce a vacuous pass.
 
-Run the checked-in two-snapshot isolation smoke once for each host/storage
-setup. It defaults to a dry run:
+The structural verifier intentionally fails closed if the local nftables
+version renders a different rule shape. Treat a distro nftables upgrade as a
+maintenance event and rerun the full ceremony.
+
+## LVM isolation qualification
+
+Run the two-snapshot smoke when commissioning or changing a worker's LVM/XFS
+layout. Drain the worker and mount the selected origin read-only at the path
+passed to the script:
 
 ```bash
 sudo ./scripts/qualify-block-validation-lvm.sh \
-  /var/lib/sbgh-worker/v26-lvm-isolation.md \
-  vg0 mainnet-full-2026-07-26 \
-  /mnt/sbgh-chainstate-origin
+  /var/lib/sbgh-worker/lvm-isolation.md \
+  vg0 mainnet-YYYY-MM-DD /mnt/sbgh-chainstate-origin
 
-# After reviewing the resolved values and draining the worker:
 sudo ./scripts/qualify-block-validation-lvm.sh --execute \
-  /var/lib/sbgh-worker/v26-lvm-isolation.md \
-  vg0 mainnet-full-2026-07-26 \
-  /mnt/sbgh-chainstate-origin
+  /var/lib/sbgh-worker/lvm-isolation.md \
+  vg0 mainnet-YYYY-MM-DD /mnt/sbgh-chainstate-origin
 ```
 
-The smoke refuses to overwrite prior evidence, requires the selected origin to
-be read-only and mounted from the named LV, creates two explicitly writable
-snapshots, mounts them with the production XFS safety options, proves
-bidirectional peer/origin write isolation, and fails on a cleanup residue.
+The first command is a dry run. The execution creates two writable snapshots,
+mounts them with production XFS safety options, proves origin and peer write
+isolation, and fails if cleanup leaves an LV or mount.
 
-Then run one end-to-end canary at the intended K and compare its logical result
-and artifacts with the established manual validation. The canary itself
-exercises all K devices and exposes an unsuitable K through runtime, timeout,
-attachment, or cleanup behavior. Start conservatively and tune K from real job
-duration and host telemetry; synthetic throughput measurement is optional
-capacity planning, not a release gate.
+Then run one end-to-end canary at the intended block-validation shard count.
+Start conservatively and tune shard/concurrency policy from real duration and
+host telemetry. CPU, memory, and device count are admission limits; synthetic
+storage-throughput prediction is not a release gate.
 
-The future
-[0052 managed-node producer](../planning/design/0052-managed-stacks-node-chainstate-producer.md)
-may replace the downloader. Until then, each worker independently refreshes
-under the same naming prefix, publishes a new read-only LV, and retains old
-origins while active snapshots reference them. Distributed generation
-registration/promotion/bootstrap is deliberately deferred.
+## Certificate lifecycle
 
-## Normal operation
+Worker certificates are valid for 90 days by default. Each certificate carries
+one identity URI SAN:
+
+```text
+urn:sbgh:worker:<worker-uuid>
+```
+
+### Rotate a worker certificate
+
+1. Issue a replacement for the same UUID with
+   [fleet-pki.sh](../scripts/fleet-pki.sh).
+2. Add both old and new leaf SHA-256 fingerprints to the worker registry.
+3. Restart the daemon so it loads the overlap.
+4. Drain the worker.
+5. Atomically replace its certificate and private key.
+6. Restart the worker and confirm registration under the same UUID.
+7. Remove the old fingerprint and restart the daemon.
+8. Undrain the worker.
+
+### Revoke
+
+- Remove one fingerprint and restart the daemon to reject that certificate.
+- Set `enabled = false` in registry policy and restart the daemon to revoke the
+  worker identity.
+- Use network and CA revocation as additional containment for a compromised
+  key.
+
+The daemon rechecks fingerprint and registry authorization on every worker
+request.
+
+### Rotate the lease key
+
+The lease HMAC key must contain at least 32 random bytes and be readable only
+by the daemon. Rotate it only after all workers are drained and no attempt or
+cleanup obligation remains; replacement invalidates every outstanding lease.
+
+Keep the encrypted private CA key offline and backed up. Never copy it to the
+daemon or worker service directories.
+
+## Deploy an application update
+
+The daemon and workers require exact worker-protocol compatibility. Use a full
+drain:
+
+1. Drain all workers.
+2. Wait for active attempts and cleanup obligations to reach zero.
+3. Stop worker services.
+4. Take a database backup and retain the current binaries/configuration.
+5. Build and validate the new checkout with `just build`, `just lint`, and
+   `just test`.
+6. Install binaries with `sudo ./scripts/install-daemon.sh --no-start`.
+7. Start the daemon; it applies forward-only migrations.
+8. Start workers from the same release.
+9. Verify mTLS identity, protocol, capabilities, preflight, and fleet state.
+10. Run benchmark and block-validation canaries, then undrain.
+
+Never run an older binary against a schema it was not designed to read.
+Rollback across a schema-changing deployment means stopping traffic and
+restoring the matching database backup before starting the retained binary.
+When the newer schema is backward compatible, a binary-only rollback may be
+safe, but treat that as an explicitly verified property rather than an
+assumption.
+
+## Backup and restore
+
+The checked-in timer runs `pg_dump` inside the Postgres container, compresses
+the archive, verifies its shape, publishes it atomically, and prunes according
+to retention:
 
 ```bash
-sbgh-cli fleet status
-sbgh-cli fleet drain --worker-id <worker-uuid>
-sbgh-cli fleet undrain --worker-id <worker-uuid>
-sbgh-cli fleet cancel --job-id <job-uuid>
-sbgh-cli fleet recover-submission --submission-id <submission-uuid> \
-  --worker-id <replacement-worker-uuid> \
-  --reason "operator-approved recovery"
+systemctl status sbgh-pg-backup.timer
+journalctl -u sbgh-pg-backup.service
+sudo systemctl start sbgh-pg-backup.service
 ```
 
-Cancellation is durable: the active attempt sees it on heartbeat, stops the
-VM through the common teardown lifecycle, and may submit only a cancelled
-terminal. A completed terminal that won the database race remains immutable.
+Copy backups off-host. Periodically restore one into an isolated PostgreSQL
+instance and run the current application migrations and consistency checks
+there. Do not point rehearsal binaries at production object storage or provider
+credentials.
 
-Cross-worker movement of a partial benchmark submission is never automatic.
-`recover-submission` creates a new execution generation and reruns from the first
-spec/run; older results remain auditable and are excluded from the new
-comparison. `--worker-id` optionally pins the new generation to an enabled,
-non-draining worker authorized for benchmark work; omit it to let normal
-compatible-worker placement choose.
+Before a migration-bearing deployment, rehearse against a recently restored
+production backup. Compare submission/job/result counts and provider identity
+rows before opening the maintenance window. A migration that reports ambiguous
+historical ownership must be investigated; do not bypass its fail-closed guard.
 
-New task demand enters through the daemon's submission kernel before any worker
-is selected. A caller-stable producer key makes retries return the original
-submission receipt; reusing that key for different executable demand fails
-closed. Optional worker/profile values are immutable operator constraints.
-Scheduler-owned assignments remain empty until a compatible worker polls, so
-submitting while every worker is offline is expected and safe.
+## Failure drills
 
-The authenticated `/api/fleet` view shows registry/session/resource,
-lease, attempt, trace, and cleanup state. `/api/fleet/metrics` exports
-Prometheus text. Alert initially on:
-
-- worker heartbeat age above 30 seconds (warning) or lease TTL (critical);
-- negative active-attempt lease remaining time;
-- enqueue preparation or compatible-worker scheduling wait above the task SLO;
-- reliable ACK lag/gap above zero for more than two heartbeat intervals;
-- resend-buffer pressure above 75% of 256 envelopes;
-- staging age above 30 minutes or unexpected byte growth;
-- any cleanup obligation unresolved for more than one lease TTL.
-
-Tune thresholds from the soak; do not hide a sole-capability worker outage by
-silently requeueing.
-
-## Upgrade, maintenance, and restart
-
-The fleet requires exact protocol-version equality. v26 uses wire version 3,
-which keeps block offers limited to shard/concurrency requirements while
-chainstate selection stays local. Upgrade under a full drain; older workers
-cannot register with a v3 daemon:
-
-1. Drain all workers and wait for active attempts and cleanup obligations to
-   reach zero.
-2. Stop workers.
-3. Upgrade/restart the daemon and apply its forward-only migration.
-4. Upgrade workers to the identical release.
-5. Start workers, verify mTLS registration/version/capabilities, then
-   undrain.
-
-The v27.2 submission migration additionally requires a restored-production
-rehearsal. Queued demand may remain, but claimed/running jobs, active attempts,
-and pending cleanup obligations must be zero. Stop daemon writers, take and
-restore a production backup into isolated PostgreSQL, apply the migration
-there, and compare submission/job counts plus GitHub/Slack provenance and
-idempotency rows before touching production. Duplicate historical Slack
-reporting identities must resolve to the earliest submission. A reported
-GitHub-plus-Slack identity conflict names corrupt aggregates that must be
-investigated; never bypass the guard or discard one producer identity.
-
-The v28 report-identity migration requires the same rehearsal. It adopts only
-an unambiguous historical check/comment identity per submission and aborts on
-divergent IDs, naming the offending submission and candidates. After upgrade,
-verify an existing benchmark updates its original `stacks-bench` check and a
-block validation creates a distinct `stacks-block-validation` check. Restart
-the daemon during each canary and require it to converge on the same provider
-identity and authenticated `/api/submissions/{id}/report` snapshot.
-
-Treat nftables, libvirt firewall, and host firewall upgrades as network-policy
-maintenance, even when no sbgh release changes. The supported nftables version
-is the distro-maintained package on Debian 12 or Ubuntu 24.04 whose rendered
-rules pass the exact live verifier. Because that verifier intentionally fails
-closed on output drift, perform these steps under drain:
-
-1. Stop workers and record `nft --version`.
-2. Apply the package or firewall change.
-3. Run `systemd-analyze verify
-   /etc/systemd/system/sbgh-sandbox-egress.service` for syntax.
-4. Restart `sbgh-sandbox-egress.service` and require `systemctl is-active
-   --quiet sbgh-sandbox-egress.service` to succeed.
-5. Inspect `journalctl -u sbgh-sandbox-egress.service -n 50 --no-pager` and
-   require the `sandbox-egress structural policy check passed` message.
-6. Run `/usr/local/libexec/sbgh-check-sandbox-network`, then repeat the active
-   disposable-guest ceremony, including configured operator TCP probes.
-7. Restart and undrain workers only after every check passes.
-
-`systemd-analyze verify` cannot prove runtime sandbox behavior; the actual unit
-start and `ExecStartPost` result are the load-bearing gate.
-
-A same-process network reconnect resends unacknowledged reliable envelopes from
-memory. A worker-process restart creates a new session; the daemon fences the
-old attempt and requires local cleanup before requeue. An orchestrator restart
-keeps durable leases/events, and the worker resumes from the highest contiguous
-ACK. The system intentionally has no multi-orchestrator HA or durable worker
-outbox in v25.
-
-## Failure-injection gate
-
-Before production cutover, record the run/job/attempt/trace IDs for:
+Exercise these cases on the deployed topology:
 
 - lost poll, accept, event, artifact, and terminal responses;
-- worker kill during execution and during local cleanup;
+- worker kill during execution and during cleanup;
 - network partition shorter and longer than a lease;
-- orchestrator restart during execution and event projection;
-- cancellation racing success;
-- checksum/wrong-key/expired upload rejection and staging GC;
-- an upload with deliberately incorrect bytes but otherwise valid signed
-  headers is rejected by the deployed S3-compatible provider. This proves the
-  provider recomputes `x-amz-checksum-sha256` rather than merely echoing
-  client-supplied metadata.
-- known-good and deliberately invalid block ranges;
-- block VM cache miss followed by a cache hit, with no host-side
-  `stacks-inspect` process;
-- exact K virtio-scsi devices and serials, XFS `nouuid` mounts, origin
-  immutability, shared thin-pool health rejection, partial allocation rollback,
-  and attempt-scoped restart cleanup;
-- sandbox network structural verification plus the disposable-guest positive
-  dependency and negative host/private/metadata/operator-endpoint probes;
-- graceful drain and certificate rotation/revocation.
+- daemon restart during execution and report projection;
+- cancellation racing successful completion;
+- checksum, wrong-key, expired-grant, and staging-GC paths;
+- valid and deliberately invalid block ranges;
+- binary-cache miss followed by a hit;
+- chainstate snapshot allocation failure and partial-allocation cleanup;
+- sandbox positive-egress and protected-destination denial;
+- worker drain and certificate rotation/revocation.
 
-Expected invariants: one current attempt per scheduling unit, one accepted
-terminal per attempt, no stale mutation after fencing, no artifact visibility
-before terminal acceptance, no negative validation result unless every shard
-exited normally in `{0,1}`, no repository-produced host process, and honest
-pending cleanup when a worker never returns.
+The invariants are:
 
-## Rollback
-
-Keep the prior release binaries, configuration, and database backup until the
-two-worker soak completes. Because v25 migrations are forward-only, rollback
-means stopping v25 traffic and restoring the pre-cutover database backup before
-starting the old single-host release; never point an old binary at the migrated
-schema. Preserve fleet staging and result objects until the incident is
-resolved.
+- at most one current attempt per scheduling unit;
+- exactly one accepted terminal per attempt;
+- no mutation by a stale fence;
+- no logical artifact visibility before terminal acceptance;
+- no negative validation verdict unless every shard exited normally;
+- no repository-produced process on the worker host;
+- unresolved teardown remains visible as cleanup work and blocks unsafe requeue.

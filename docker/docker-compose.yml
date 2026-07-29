@@ -19,9 +19,8 @@
 #   - sbgh-daemon         runs ON THE HOST as uid 902, connects as the DB
 #                         owner (`sbgh` — the sole DB client: it migrates,
 #                         serves /api, and runs the processor), and holds
-#                         the GitHub App private key. Since Phase 6 there is
-#                         a single DB role (the owner); the old
-#                         `sbgh_orch`/`sbgh_handler` roles are gone.
+#                         the GitHub App private key. It is the sole DB client
+#                         and connects as the owner.
 #
 # Two config dirs on the host, never shared:
 #   ${SBGH_HANDLER_CONFIG_DIR:-/etc/sbgh/handler}      → handler container
@@ -62,7 +61,7 @@ services:
       - "127.0.0.1:5432:5432"
     # Host-bound data dir — survives `docker volume prune`. Default lives
     # on /var/lib/sbgh/postgres; MUST be pre-created owned by the same
-    # uid we run postgres as (default 900). See docs/host-bringup.md §6.
+    # uid we run postgres as (default 900). See docs/setup.md.
     #
     # Postgres 18 changed the on-disk layout to support `pg_upgrade
     # --link` across major versions: the image now expects the mount at

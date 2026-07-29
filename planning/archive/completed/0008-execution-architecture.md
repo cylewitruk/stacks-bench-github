@@ -29,7 +29,7 @@ The daemon's concurrent execution architecture: a coordinator over per-job worke
 - Queued "#N ahead" position reporting (debounced) + same-SHA `/benchmark` dedup
   (`find_active_job`).
 - Per-slot CPU pinning (`[runner].cpu_sets`/`host_cpus` → cpuset + emulatorpin);
-  host-bringup docs + `scripts/irq-affinity.sh`.
+  setup documentation + `scripts/irq-affinity.sh`.
 
 ## Validation
 

@@ -3,7 +3,7 @@
 - **id:** `0002-slack-adhoc-profiling`
 - **status:** `shipped`
 - **date:** 2026-06
-- **iteration:** v5 (deployed; see [v4-to-v5-upgrade.md](../../../docs/v4-to-v5-upgrade.md))
+- **iteration:** v5
 - **source:** `docs/roadmap-v10.md`
 
 Added **Slack** as a first-class way to trigger + read benchmarks for the
@@ -28,9 +28,10 @@ workload is the variable (`--txid`/`--block`/`--repetitions`), resolved from an
   terminal with the metrics + an S3 `stacks-bench.db` download link (presence-
   gated via `signed_url_if_fetchable`), and a ⏳→✅/❌ reaction swap.
 - **Tokens are env-only** (`SBGH_SLACK_APP_TOKEN`/`SBGH_SLACK_BOT_TOKEN`); the
-  connector stays behind `[slack].enabled` (default false). App definition,
-  setup, and upgrade docs: [slack-app-manifest.yaml](../../../docs/slack-app-manifest.yaml),
-  [slack-setup.md](../../../docs/slack-setup.md), [v4-to-v5-upgrade.md](../../../docs/v4-to-v5-upgrade.md).
+  connector stays behind `[slack].enabled` (default false). Current App
+  definition and setup:
+  [slack-app-manifest.yaml](../../../docs/slack-app-manifest.yaml) and
+  [slack-setup.md](../../../docs/slack-setup.md).
 
 ## Follow-ons
 

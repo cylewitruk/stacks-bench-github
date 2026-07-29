@@ -1422,6 +1422,31 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_daemon_example_stays_loadable() {
+        let _g = EnvGuard::set(&[
+            ("SBGH_ARTIFACTS_S3_ACCESS_KEY_ID", "example-access-key"),
+            ("SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY", "example-secret-key"),
+        ]);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        let cfg = DaemonConfig::load_layered(Some(&root.join("config.example.daemon.toml")))
+            .expect("checked-in daemon example should produce a complete DaemonConfig");
+
+        assert_eq!(cfg.artifacts.kind, ArtifactStoreKind::S3);
+        assert_eq!(
+            cfg.artifacts
+                .s3
+                .as_ref()
+                .expect("example enables S3")
+                .bucket,
+            "sbgh-artifacts"
+        );
+        assert_eq!(cfg.vm.network, "sandbox-egress");
+        assert!(!cfg.slack.enabled);
+        assert!(!cfg.llm.enabled);
+    }
+
+    #[test]
     fn daemon_loads_from_env_only() {
         let _g = EnvGuard::set(&daemon_env());
         let cfg = DaemonConfig::load_layered(None).unwrap();

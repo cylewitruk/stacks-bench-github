@@ -27,8 +27,8 @@ StandardError=journal
 Environment=RUST_LOG=info,sbgh_daemon=info,sqlx=warn
 EnvironmentFile=-/etc/sbgh/daemon/secrets.env
 
-# v25 moved all recipe/driver execution into sbgh-worker. The orchestrator no
-# longer needs sudo, libvirt, LVM, device access, or a shared mount namespace.
+# Recipe/driver execution belongs to sbgh-worker. The orchestrator needs no
+# sudo, libvirt, LVM, device access, or shared mount namespace.
 NoNewPrivileges=true
 RestrictSUIDSGID=true
 PrivateTmp=true

@@ -1,4 +1,4 @@
-# Slack app manifest for the sbgh ad-hoc profiling bot (item 0002, iteration v5).
+# Slack app manifest for the optional sbgh benchmark bot.
 #
 # Create the app from this manifest at https://api.slack.com/apps → "Create New
 # App" → "From a manifest". Keeping it in the repo pins the exact scopes/events

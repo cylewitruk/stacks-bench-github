@@ -1,12 +1,10 @@
-//! Live S3 round-trip for the artifact store (`0001`, iteration v4 Phase 2):
-//! `S3Store` against a real S3-compatible server (the compose-managed MinIO,
-//! started by the `minio` nextest setup script). This is the test the iteration
-//! deferred — it proves, end to end, that an upload actually reaches the
+//! Live `S3Store` round-trip against a real S3-compatible server (the
+//! compose-managed MinIO started by the nextest setup script). It proves,
+//! end to end, that an upload actually reaches the
 //! bucket, that `get`/`exists` resolve from S3 (not just the local mirror), and
 //! that a presigned GET fetches the object with **no credentials on the
-//! client** — i.e. our SigV4 signing is accepted by a real verifier. Until this
-//! passes, `kind = "s3"` must not be enabled on a host (see
-//! docs/v3-to-v4-upgrade.md).
+//! client**—that is, a real verifier accepts our SigV4 signing. Until this
+//! passes, `kind = "s3"` must not be enabled on a host.
 //!
 //! Requires the MinIO container (`just test` starts it). A bare `cargo test`
 //! without it will fail at `ensure_bucket`, the same contract the Postgres

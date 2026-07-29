@@ -8,9 +8,9 @@ Use `vN-short-name.md` naming. Iterations are deliverables, not item IDs; they
 reference the numbered items they implement.
 
 > **`vN` continues the project's deployment-version lineage, it does *not* reset
-> to 1.** The last deployed version was **v3** (see `docs/v2-to-v3-upgrade.md`), so
-> deliverables start at **v4** (`v4-artifact-store`). Each iteration is the next
-> version milestone; the canonical item identity is still its `NNNN` id.
+> to 1.** Archived iteration history begins at **v4** (`v4-artifact-store`).
+> Each iteration is the next version milestone; the canonical item identity is
+> still its `NNNN` id.
 > A `vN.M` iteration is a continuation that must land before the next version
 > milestone; it does not introduce an independently deployed version. It
 > normally preserves behavior. Any intentional surface migration must be
