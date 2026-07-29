@@ -90,56 +90,6 @@ surface-specific authorization grammar; GitHub/background/Slack adapters own
 those policies. Durable external projection of pre-attempt terminals is
 `0072`.
 
-### 0066 — Task-aware reporting and validation results
-
-- **id:** `0066-task-aware-reporting`
-- **status:** `candidate`
-- **priority:** `high`
-- **depends_on:** `0005-task-kind-platform`, `0017-generic-phase-events`,
-  `0019-block-validation-recipe`
-- **relates_to:** `0072-pre-attempt-terminal-projection`,
-  `0028-results-summary-restructure`,
-  `0065-job-lifecycle-controls`
-- **unblocks:** `0067-github-block-validation-submission`,
-  `0071-github-job-lifecycle-controls`,
-  `0068-watched-ref-task-actions`,
-  `0070-slack-block-validation-controls`
-- **source:** block-validation user-story audit (2026-07)
-
-**Problem:** Validation completion can turn a GitHub check red, but the shared
-reporter still names every check `stacks-bench` and labels queued, running,
-failed, cancelled, and retry guidance as benchmarking. Slack completion reads
-benchmark metrics/profiler artifacts and cannot correctly render a validation
-job. Distinct required checks and useful validation failure details are
-therefore unavailable.
-
-**Scope:** Make report projection task-aware without forking lifecycle
-transport. Introduce a compact task report view/renderer selected by
-`task_kind`, while keeping durable phase/progress/terminal delivery shared.
-Give benchmark and block validation distinct stable GitHub check names suitable
-for branch protection. Render task-correct queued/start/phase/progress/failure/
-cancel/supersede/restart text and hints on GitHub and Slack. Validation terminal
-output must show commit, requested and observed ranges, checked count, verdict,
-chainstate origin/provenance, bounded invalid-block details, and artifact/result
-links without trusting guest-controlled text. Extend job-result APIs with a
-typed validation view rather than requiring direct database access.
-
-**Acceptance:**
-
-- Benchmark rendering remains behavior-compatible while every validation
-  lifecycle state is labelled as validation.
-- A commit may have independently identifiable benchmark and validation checks,
-  and branch protection can require either name.
-- Positive, negative, infrastructure-failed, cancelled, restarted, and
-  superseded validation jobs render correctly on GitHub and Slack.
-- Projector replay converges on the same snapshot/check and never regresses a
-  newer terminal; `0072` pre-attempt terminals use the same renderer.
-- Invalid-block output is bounded and escaped; complete detail remains
-  available through the typed result/artifact view.
-
-**Deferred / non-goals:** No redesign of the durable event ledger, no new
-execution result semantics, and no benchmark metrics restructure from `0028`.
-
 ### 0067 — GitHub block-validation submission
 
 - **id:** `0067-github-block-validation-submission`
