@@ -69,6 +69,7 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/users", get(users::list_users))
             .route("/api/roles", get(users::list_roles))
             .route("/api/jobs", get(jobs::list))
+            .route("/api/submissions/{id}/report", get(jobs::report))
             .route("/api/fleet", get(fleet::overview))
             .route("/api/fleet/metrics", get(fleet::metrics)),
         tokens.clone(),

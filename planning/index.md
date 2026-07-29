@@ -83,7 +83,7 @@ need editing when an item's status or location changes.
 | `0063-libvirt-block-validation` | Libvirt-isolated block validation | `shipped` | [archive/completed/0062-sandboxed-worker-execution.md](archive/completed/0062-sandboxed-worker-execution.md) |
 | `0064-task-submission-kernel` | Task-submission kernel | `shipped` | [archive/completed/0064-task-submission-kernel.md](archive/completed/0064-task-submission-kernel.md) |
 | `0065-job-lifecycle-controls` | Task-neutral job lifecycle controls | `candidate` | [backlog.md](backlog.md) |
-| `0066-task-aware-reporting` | Task-aware reporting and validation results | `planned` | [iterations/v28-task-aware-reporting.md](iterations/v28-task-aware-reporting.md) |
+| `0066-task-aware-reporting` | Task-aware reporting and validation results | `shipped` | [archive/completed/0066-task-aware-reporting.md](archive/completed/0066-task-aware-reporting.md) |
 | `0067-github-block-validation-submission` | GitHub block-validation submission | `candidate` | [backlog.md](backlog.md) |
 | `0068-watched-ref-task-actions` | Watched-ref task actions and webhook fan-out | `candidate` | [backlog.md](backlog.md) |
 | `0069-task-aware-intent-resolution` | Task-aware intent resolution | `candidate` | [backlog.md](backlog.md) |
@@ -124,7 +124,7 @@ need editing when an item's status or location changes.
 | `v26-sandboxed-worker-execution` | Sandboxed worker execution and block validation | `shipped` | [archive/completed/0062-sandboxed-worker-execution.md](archive/completed/0062-sandboxed-worker-execution.md) |
 | `v27.1-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
 | `v27.2-task-submission-kernel` | Task-submission kernel | `shipped` | [archive/completed/0064-task-submission-kernel.md](archive/completed/0064-task-submission-kernel.md) |
-| `v28-task-aware-reporting` | Task-aware reporting and validation results | `planned` | [iterations/v28-task-aware-reporting.md](iterations/v28-task-aware-reporting.md) |
+| `v28-task-aware-reporting` | Task-aware reporting and validation results | `shipped` | [archive/completed/0066-task-aware-reporting.md](archive/completed/0066-task-aware-reporting.md) |
 
 ## Decisions
 

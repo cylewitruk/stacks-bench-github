@@ -42,6 +42,7 @@ use crate::models::{
 };
 #[cfg(feature = "testing")]
 use crate::models::{JobCreationRequest, NewJob};
+use crate::reporting::SubmissionGithubReportIdentity;
 
 /// Slice 10: atomic "the run completed" write. Bundles the terminal
 /// status transition + the write-once outcome companions + the terminal
@@ -264,6 +265,16 @@ pub trait JobStore: crate::db::SubmissionStore + Send + Sync + 'static {
 
     async fn lookup_submission_specs(&self, submission_id: Uuid) -> Result<Vec<SubmissionSpec>>;
 
+    /// Rebuild the canonical provider-neutral snapshot for one submission.
+    /// Storage implementations own durable joins; rendering and publication
+    /// remain outside this port.
+    async fn submission_report(
+        &self,
+        _submission_id: Uuid,
+    ) -> Result<Option<crate::reporting::SubmissionReportView>> {
+        Ok(None)
+    }
+
     /// The terminal completed event detail for `job_id`, if the run completed.
     /// Failed/cancelled runs intentionally return `None`, which stops a repeat
     /// chain loudly via terminal state rather than carrying stale artifacts.
@@ -461,6 +472,56 @@ pub trait JobStore: crate::db::SubmissionStore + Send + Sync + 'static {
     /// rebuild the "started, see check" comment from the stored URL) rather
     /// than creating a duplicate.
     async fn latest_check_run(&self, job_id: Uuid) -> Result<Option<(i64, Option<String>)>>;
+
+    /// Submission-owned GitHub reporting identity. Production stores override
+    /// this; the default preserves narrow orchestration fakes.
+    async fn submission_github_report_identity(
+        &self,
+        _submission_id: Uuid,
+    ) -> Result<Option<SubmissionGithubReportIdentity>> {
+        Ok(None)
+    }
+
+    /// Atomically adopt the aggregate comment identity and retain the legacy
+    /// job event as audit history.
+    async fn record_submission_comment(&self, job_id: Uuid, comment_id: i64) -> Result<()> {
+        self.insert_event(&NewJobEvent {
+            job_id,
+            event_kind: JobEventKind::CommentPosted,
+            event_status: JobEventStatus::Success,
+            github_comment_id: Some(comment_id),
+            github_check_run_id: None,
+            github_check_run_url: None,
+            remark: None,
+            detail: None,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically adopt the aggregate check identity and retain the legacy
+    /// job event as audit history.
+    async fn record_submission_check(
+        &self,
+        job_id: Uuid,
+        check_run_id: i64,
+        html_url: Option<&str>,
+        _check_name: &str,
+        _external_id: &str,
+    ) -> Result<()> {
+        self.insert_event(&NewJobEvent {
+            job_id,
+            event_kind: JobEventKind::CheckRunCreated,
+            event_status: JobEventStatus::Success,
+            github_comment_id: None,
+            github_check_run_id: Some(check_run_id),
+            github_check_run_url: html_url.map(str::to_owned),
+            remark: None,
+            detail: None,
+        })
+        .await?;
+        Ok(())
+    }
 
     /// The most-recent canonical Slack message `ts` recorded in the
     /// historical `plan_message_sent` event, from

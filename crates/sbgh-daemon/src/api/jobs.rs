@@ -1,8 +1,13 @@
 //! `/api/jobs` — benchmark run visibility.
 
 use axum::Json;
-use axum::extract::{Query, State};
-use sbgh_api::{EnqueueBlockValidationRequest, EnqueueJobResponse, JobView};
+use axum::extract::{Path, Query, State};
+use sbgh_api::{
+    BenchmarkReportDetail, BlockValidationReportDetail, BuildOnlyReportDetail,
+    EnqueueBlockValidationRequest, EnqueueJobResponse, InvalidBlockDetail, JobView,
+    ReportArtifactView, ReportIdentityView, ReportLifecycleView, ReportRange, SubmissionReportView,
+    TaskReportView,
+};
 use sbgh_core::models::{
     BuildTarget, GitRefKind, Job, JobIntent, JobSource, QueuedEventDetail, TaskKind,
 };
@@ -64,6 +69,113 @@ pub async fn list(
             .map(view)
             .collect(),
     ))
+}
+
+pub async fn report(
+    State(state): State<ApiState>,
+    Path(submission_id): Path<uuid::Uuid>,
+) -> Result<Json<SubmissionReportView>, ApiErr> {
+    let report = sbgh_postgres::application::submission_report(&state.pool, submission_id)
+        .await?
+        .ok_or_else(|| ApiErr::not_found(format!("submission {submission_id} not found")))?;
+    Ok(Json(report_view(report)))
+}
+
+fn report_view(report: sbgh_core::reporting::SubmissionReportView) -> SubmissionReportView {
+    use sbgh_core::reporting::{
+        BlockValidationVerdict, ReportIdentity, ReportLifecycle, TaskReport,
+    };
+
+    let sbgh_core::reporting::SubmissionReportView {
+        identity,
+        lifecycle,
+        task,
+        artifacts,
+    } = report;
+    let ReportIdentity {
+        submission_id,
+        current_job_id,
+        current_attempt_id,
+        task_kind,
+        source,
+        repository,
+        commit,
+    } = identity;
+    let ReportLifecycle {
+        state,
+        phase,
+        completed_jobs,
+        total_jobs,
+        failure,
+    } = lifecycle;
+    let task = match task {
+        TaskReport::Benchmark(detail) => TaskReportView::Benchmark(BenchmarkReportDetail {
+            requested_runs: detail.requested_runs,
+            completed_runs: detail.completed_runs,
+        }),
+        TaskReport::BuildOnly(detail) => TaskReportView::BuildOnly(BuildOnlyReportDetail {
+            cache_outcome: detail.cache_outcome,
+        }),
+        TaskReport::BlockValidation(detail) => {
+            TaskReportView::BlockValidation(BlockValidationReportDetail {
+                requested_range: detail
+                    .requested_range
+                    .map(|range| ReportRange {
+                        start: range.start,
+                        end: range.end,
+                    }),
+                observed_range: detail
+                    .observed_range
+                    .map(|range| ReportRange {
+                        start: range.start,
+                        end: range.end,
+                    }),
+                verdict: detail
+                    .verdict
+                    .map(|verdict| match verdict {
+                        BlockValidationVerdict::Valid => "valid".into(),
+                        BlockValidationVerdict::Invalid => "invalid".into(),
+                    }),
+                checked_blocks: detail.checked_blocks,
+                chainstate_origin: detail.chainstate_origin,
+                invalid_blocks: detail
+                    .invalid_blocks
+                    .into_iter()
+                    .map(|invalid| InvalidBlockDetail {
+                        shard: invalid.shard,
+                        block: invalid.block,
+                        reason: invalid.reason,
+                    })
+                    .collect(),
+            })
+        }
+    };
+    SubmissionReportView {
+        identity: ReportIdentityView {
+            submission_id: submission_id.to_string(),
+            current_job_id: current_job_id.map(|id| id.to_string()),
+            current_attempt_id: current_attempt_id.map(|id| id.to_string()),
+            task_kind: enum_str(&task_kind),
+            source: enum_str(&source),
+            repository,
+            commit,
+        },
+        lifecycle: ReportLifecycleView {
+            state: enum_str(&state),
+            phase,
+            completed_jobs,
+            total_jobs,
+            failure,
+        },
+        task,
+        artifacts: artifacts
+            .into_iter()
+            .map(|artifact| ReportArtifactView {
+                name: artifact.name,
+                key: artifact.key,
+            })
+            .collect(),
+    }
 }
 
 pub async fn enqueue_block_validation(

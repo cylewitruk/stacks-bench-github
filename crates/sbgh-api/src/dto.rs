@@ -172,6 +172,92 @@ pub struct EnqueueJobResponse {
     pub initial_job_ids: Vec<String>,
 }
 
+/// Authenticated, submission-scoped report snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionReportView {
+    pub identity: ReportIdentityView,
+    pub lifecycle: ReportLifecycleView,
+    pub task: TaskReportView,
+    pub artifacts: Vec<ReportArtifactView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportIdentityView {
+    pub submission_id: String,
+    pub current_job_id: Option<String>,
+    pub current_attempt_id: Option<String>,
+    pub task_kind: String,
+    pub source: String,
+    pub repository: String,
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportLifecycleView {
+    pub state: String,
+    pub phase: Option<String>,
+    pub completed_jobs: u32,
+    pub total_jobs: u32,
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub enum TaskReportView {
+    Benchmark(BenchmarkReportDetail),
+    BuildOnly(BuildOnlyReportDetail),
+    BlockValidation(BlockValidationReportDetail),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkReportDetail {
+    pub requested_runs: u32,
+    pub completed_runs: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildOnlyReportDetail {
+    pub cache_outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockValidationReportDetail {
+    pub requested_range: Option<ReportRange>,
+    pub observed_range: Option<ReportRange>,
+    pub verdict: Option<String>,
+    pub checked_blocks: Option<u64>,
+    pub chainstate_origin: Option<String>,
+    pub invalid_blocks: Vec<InvalidBlockDetail>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvalidBlockDetail {
+    pub shard: u32,
+    pub block: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportArtifactView {
+    pub name: String,
+    pub key: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetSummaryView {
     pub registered_workers: u64,

@@ -268,6 +268,14 @@ reporting identities must resolve to the earliest submission. A reported
 GitHub-plus-Slack identity conflict names corrupt aggregates that must be
 investigated; never bypass the guard or discard one producer identity.
 
+The v28 report-identity migration requires the same rehearsal. It adopts only
+an unambiguous historical check/comment identity per submission and aborts on
+divergent IDs, naming the offending submission and candidates. After upgrade,
+verify an existing benchmark updates its original `stacks-bench` check and a
+block validation creates a distinct `stacks-block-validation` check. Restart
+the daemon during each canary and require it to converge on the same provider
+identity and authenticated `/api/submissions/{id}/report` snapshot.
+
 Treat nftables, libvirt firewall, and host firewall upgrades as network-policy
 maintenance, even when no sbgh release changes. The supported nftables version
 is the distro-maintained package on Debian 12 or Ubuntu 24.04 whose rendered

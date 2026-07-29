@@ -40,7 +40,8 @@ use crate::artifact_store::{ArtifactStoreConfig, build_store_or_local};
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::pin_manager::{PinManager, RepoIdentityLookup};
 use crate::report::{build_report_surface, log_nonfatal_projection};
-use crate::reporter::{CHECK_NAME, Prepared, Reporter, ReporterDependencies, resolved_app_id};
+use crate::report::{check_name, report_external_id, task_label};
+use crate::reporter::{Prepared, Reporter, ReporterDependencies, resolved_app_id};
 use crate::shutdown::Shutdown;
 use crate::slack_report::{SlackSessionRegistry, build_slack_surface};
 use sbgh_slack::SlackClient;
@@ -730,10 +731,34 @@ impl Coordinator {
             &self.deps.slack_sessions,
             &job,
         );
+        let snapshot = match self
+            .deps
+            .jobs
+            .submission_report(job.task_submission_id)
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    task_submission_id = %job.task_submission_id,
+                    "orphan recovery: canonical report snapshot is missing",
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    error = ?error,
+                    "orphan recovery: couldn't load canonical report snapshot",
+                );
+                return;
+            }
+        };
         log_nonfatal_projection(
             job_id,
             surface
-                .cancelled(ORPHAN_CHECK_REASON)
+                .cancelled(&snapshot, ORPHAN_CHECK_REASON)
                 .await,
         );
     }
@@ -865,7 +890,7 @@ impl Coordinator {
                     id,
                     CheckRunUpdate {
                         state: CheckRunState::InProgress,
-                        output: queue_position_output(job.id, ahead),
+                        output: queue_position_output(job, ahead),
                     },
                 )
                 .await
@@ -881,55 +906,60 @@ impl Coordinator {
         // No check yet: reconcile (dedup a check stranded by a crash before its
         // id was persisted), else create — persisting the id either way so the
         // claim-time reporter adopts it.
-        let external_id = job.id.to_string();
-        if let Some(app_id) = resolved_app_id(&self.deps.app_id, gh).await
-            && let Ok(Some(found)) = gh
-                .find_check_run_by_external_id(
-                    job.installation_id,
-                    &job.repository,
-                    &job.commit,
-                    CHECK_NAME,
-                    app_id,
-                    &external_id,
-                )
-                .await
+        let Some(check_name) = check_name(job.task_kind) else {
+            return true;
+        };
+        let external_id = report_external_id(job.task_submission_id, job.task_kind);
+        let Some(app_id) = resolved_app_id(&self.deps.app_id, gh).await else {
+            return false;
+        };
+        match gh
+            .find_check_run_by_external_id(
+                job.installation_id,
+                &job.repository,
+                &job.commit,
+                check_name,
+                app_id,
+                &external_id,
+            )
+            .await
         {
-            // Persist the id FIRST. If it doesn't land, report failure so the
-            // position isn't recorded in `last_positions` — the next tick
-            // re-reconciles and retries, rather than debouncing away the only
-            // chance to record the `check_run_created` event the claim-time
-            // reporter reads back to adopt this check.
-            if let Err(e) = self
-                .deps
-                .jobs
-                .set_check_run(job, found.id, found.html_url.as_deref())
-                .await
-            {
-                tracing::warn!(job_id = %job.id, check_run_id = found.id, error = ?e, "queue-position: persisting reconciled check id failed; will retry next tick");
+            Ok(Some(found)) => {
+                // Persist the id FIRST. If it doesn't land, report failure so
+                // the next tick re-reconciles and retries.
+                if let Err(e) = self
+                    .deps
+                    .jobs
+                    .set_check_run(job, found.id, found.html_url.as_deref())
+                    .await
+                {
+                    tracing::warn!(job_id = %job.id, check_run_id = found.id, error = ?e, "queue-position: persisting reconciled check id failed; will retry next tick");
+                    return false;
+                }
+                return match gh
+                    .update_check_run(
+                        job.installation_id,
+                        &job.repository,
+                        found.id,
+                        CheckRunUpdate {
+                            state: CheckRunState::InProgress,
+                            output: queue_position_output(job, ahead),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(job_id = %job.id, check_run_id = found.id, error = ?e, "queue-position: refreshing reconciled check text failed (non-fatal); will retry");
+                        false
+                    }
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(job_id = %job.id, ?error, "queue-position: check reconcile failed closed");
                 return false;
             }
-            // Refresh the text; mirror the existing-check path — a failed update
-            // returns `false` so the stale position isn't debounced and the next
-            // tick (now via the existing-check path, the id having persisted)
-            // retries.
-            return match gh
-                .update_check_run(
-                    job.installation_id,
-                    &job.repository,
-                    found.id,
-                    CheckRunUpdate {
-                        state: CheckRunState::InProgress,
-                        output: queue_position_output(job.id, ahead),
-                    },
-                )
-                .await
-            {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::warn!(job_id = %job.id, check_run_id = found.id, error = ?e, "queue-position: refreshing reconciled check text failed (non-fatal); will retry");
-                    false
-                }
-            };
         }
 
         match gh
@@ -937,11 +967,11 @@ impl Coordinator {
                 job.installation_id,
                 &job.repository,
                 &job.commit,
-                CHECK_NAME,
+                check_name,
                 &external_id,
                 CheckRunUpdate {
                     state: CheckRunState::InProgress,
-                    output: queue_position_output(job.id, ahead),
+                    output: queue_position_output(job, ahead),
                 },
             )
             .await
@@ -1399,7 +1429,30 @@ impl JobDeps {
             &self.slack_sessions,
             job,
         );
-        log_nonfatal_projection(job.id, surface.failed(reason).await);
+        match self
+            .jobs
+            .submission_report(job.task_submission_id)
+            .await
+        {
+            Ok(Some(snapshot)) => {
+                log_nonfatal_projection(
+                    job.id,
+                    surface
+                        .failed(&snapshot, reason)
+                        .await,
+                );
+            }
+            Ok(None) => tracing::warn!(
+                job_id = %job.id,
+                task_submission_id = %job.task_submission_id,
+                "repeat planner: canonical report snapshot is missing",
+            ),
+            Err(error) => tracing::warn!(
+                job_id = %job.id,
+                error = ?error,
+                "repeat planner: couldn't load canonical report snapshot",
+            ),
+        }
     }
 }
 
@@ -1481,14 +1534,14 @@ fn wants_position_check(reporting: &sbgh_core::config::ReportingConfig, job: &Ru
 
 /// The "queued — N ahead" Check Run output. `ahead` is the number of runs that
 /// will be claimed / finish before this one starts.
-fn queue_position_output(job_id: Uuid, ahead: usize) -> CheckRunOutput {
+fn queue_position_output(job: &RunnableJob, ahead: usize) -> CheckRunOutput {
     let summary = match ahead {
         0 => "queued — next to run".to_string(),
         1 => "queued — 1 run ahead".to_string(),
         n => format!("queued — {n} runs ahead"),
     };
     CheckRunOutput {
-        title: format!("benchmark {job_id} — queued"),
+        title: format!("{} {} — queued", task_label(job.task_kind), job.task_submission_id),
         summary,
         text: Some(
             "Waiting for an execution slot; this updates as the queue advances.".to_string(),

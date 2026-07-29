@@ -75,6 +75,7 @@ lint *args:
 
     python3 scripts/check-docs.py
     python3 scripts/check-task-submission-names.py
+    python3 scripts/check-reporting-boundaries.py
     python3 scripts/check-package-dag.py
     python3 scripts/check-sandbox-network-assets.py \
         --xml network/sandbox-egress.xml \

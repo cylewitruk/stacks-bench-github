@@ -1,4 +1,4 @@
-//! Daemon-owned projection from benchmark lifecycle state into Slack snapshots.
+//! Daemon-owned projection from task lifecycle state into Slack snapshots.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sbgh_core::db::fleet::{ProjectedReportMutation, ReportProjectionSeed};
+use sbgh_core::models::TaskKind;
+use sbgh_core::reporting::{ReportLifecycleState, SubmissionReportView, TaskReport};
 use sbgh_slack::{
     COMPLETED_REACTION, FAILED_REACTION, MessageIdentityStore, PublishUrgency, QUEUED_REACTION,
     RUNNING_REACTION, ReportingIdentity, RunPosition, SlackClient, SlackMessageTarget,
@@ -223,7 +225,12 @@ pub fn build_slack_surface(
 }
 
 fn initial_view(job: &RunnableJob, identity: ReportingIdentity) -> SlackProgressView {
-    let mut view = SlackProgressView::queued(identity, "Benchmark", &job.git_ref_display);
+    let title = match job.task_kind {
+        TaskKind::Benchmark => "Benchmark",
+        TaskKind::BlockValidation => "Block validation",
+        TaskKind::BuildOnly => "Build",
+    };
+    let mut view = SlackProgressView::queued(identity, title, &job.git_ref_display);
     view.commit = (!job.commit.is_empty()).then(|| job.commit.clone());
     view.run = (job.submission_requested_run_count > 1).then_some(RunPosition {
         current: (job.submission_run_index + 1).max(1) as u32,
@@ -295,13 +302,6 @@ impl SlackReportSurface {
         {
             tracing::warn!(error = ?error, reaction = add, "slack: reaction add failed");
         }
-    }
-
-    fn final_run(&self) -> bool {
-        self.job.submission_run_index + 1
-            >= self
-                .job
-                .submission_requested_run_count
     }
 
     async fn terminal(
@@ -478,7 +478,13 @@ impl ReportSurface for SlackReportSurface {
     }
 
     async fn completed(&self, report: CompletionReport<'_>) -> anyhow::Result<()> {
-        if !self.final_run() {
+        if !matches!(
+            report
+                .snapshot
+                .lifecycle
+                .state,
+            ReportLifecycleState::Completed
+        ) {
             self.session
                 .mutate(PublishUrgency::Immediate, |view| {
                     view.status = SlackStatus::Queued;
@@ -488,6 +494,30 @@ impl ReportSurface for SlackReportSurface {
                 .await
                 .map_err(anyhow::Error::new)?;
             return Ok(());
+        }
+
+        match &report.snapshot.task {
+            TaskReport::BlockValidation(result) => {
+                let status = if result.is_valid() == Some(true) {
+                    SlackStatus::Completed
+                } else {
+                    SlackStatus::Failed
+                };
+                return self
+                    .terminal(
+                        status,
+                        block_validation_details(result),
+                        Vec::new(),
+                        if result.is_valid() == Some(true) {
+                            COMPLETED_REACTION
+                        } else {
+                            FAILED_REACTION
+                        },
+                    )
+                    .await;
+            }
+            TaskReport::BuildOnly(_) => return Ok(()),
+            TaskReport::Benchmark(_) => {}
         }
 
         let mut details = if let Some(comparison) = report.multi_variant_comparison {
@@ -532,12 +562,13 @@ impl ReportSurface for SlackReportSurface {
             .await
     }
 
-    async fn failed(&self, error: &str) -> anyhow::Result<()> {
+    async fn failed(&self, snapshot: &SubmissionReportView, error: &str) -> anyhow::Result<()> {
         let mut details = vec![short_pr_error(error)];
-        if self
-            .job
-            .submission_requested_run_count
-            > 1
+        if matches!(&snapshot.task, TaskReport::Benchmark(_))
+            && self
+                .job
+                .submission_requested_run_count
+                > 1
         {
             details.extend(self.repeat_details().await);
         }
@@ -545,7 +576,11 @@ impl ReportSurface for SlackReportSurface {
             .await
     }
 
-    async fn cancelled(&self, reason: &str) -> anyhow::Result<()> {
+    async fn cancelled(
+        &self,
+        _snapshot: &SubmissionReportView,
+        reason: &str,
+    ) -> anyhow::Result<()> {
         self.terminal(
             SlackStatus::Cancelled,
             vec![short_pr_error(reason)],
@@ -589,6 +624,84 @@ fn run_details(result: &crate::bench_summary::RunResult) -> Vec<String> {
         }
     }
     details
+}
+
+fn block_validation_details(
+    result: &sbgh_core::reporting::BlockValidationReportView,
+) -> Vec<String> {
+    let mut details = vec![
+        match result.is_valid() {
+            Some(true) => "Verdict: valid".into(),
+            Some(false) => "Verdict: invalid".into(),
+            None => "Verdict: unavailable".into(),
+        },
+        format!(
+            "Checked blocks: {}",
+            result
+                .checked_blocks
+                .unwrap_or(0)
+        ),
+        match result.requested_range {
+            Some(range) => format!("Requested range: {}..={}", range.start, range.end),
+            None => "Requested range: unavailable (legacy request)".into(),
+        },
+        match result.observed_range {
+            Some(range) => format!("Observed range: {}..={}", range.start, range.end),
+            None => "Observed range: unavailable".into(),
+        },
+        format!(
+            "Chainstate: {}",
+            slack_safe_detail(
+                result
+                    .chainstate_origin
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                160
+            )
+        ),
+    ];
+    details.extend(
+        result
+            .invalid_blocks
+            .iter()
+            .take(12)
+            .map(|invalid| {
+                format!(
+                    "Shard {} block {}: {}",
+                    invalid.shard,
+                    slack_safe_detail(&invalid.block, 96),
+                    slack_safe_detail(&invalid.reason, 180)
+                )
+            }),
+    );
+    if result.invalid_blocks.len() > 12 {
+        details.push(format!(
+            "{} more invalid blocks; use the authenticated report API for full detail",
+            result.invalid_blocks.len() - 12
+        ));
+    }
+    details
+}
+
+fn slack_safe_detail(value: &str, max_chars: usize) -> String {
+    let mut output = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect::<String>()
+        .replace("```", "ʼʼʼ")
+        .replace('<', "‹")
+        .replace('>', "›")
+        .replace('@', "＠");
+    if value
+        .chars()
+        .filter(|character| !character.is_control())
+        .count()
+        > max_chars
+    {
+        output.push('…');
+    }
+    output
 }
 
 fn comparison_details(comparison: &MultiVariantComparison) -> Vec<String> {
@@ -768,5 +881,27 @@ mod tests {
                 "candidate: 2/3 samples, +12.50% slower, strong (3.2σ)",
             ]
         );
+    }
+
+    #[test]
+    fn validation_details_bound_and_escape_block_identity() {
+        let result = sbgh_core::reporting::BlockValidationReportView {
+            requested_range: None,
+            observed_range: None,
+            verdict: Some(sbgh_core::reporting::BlockValidationVerdict::Invalid),
+            checked_blocks: Some(1),
+            chainstate_origin: Some("nightly".into()),
+            invalid_blocks: vec![sbgh_core::reporting::InvalidBlockReport {
+                shard: 0,
+                block: format!("<@team>```{}", "b".repeat(300)),
+                reason: "invalid".into(),
+            }],
+        };
+
+        let details = block_validation_details(&result).join("\n");
+        assert!(!details.contains("<@team>"));
+        assert!(!details.contains("```"));
+        assert!(!details.contains(&"b".repeat(100)));
+        assert!(details.len() < 1_000);
     }
 }

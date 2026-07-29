@@ -208,6 +208,7 @@ not a submit-time response.)
 | Method | Path | Scope | Purpose |
 | ---- | ---- | ---- | ---- |
 | `GET` | `/api/jobs` | `read` | List jobs (filter `status`, `limit`) — run visibility |
+| `GET` | `/api/submissions/{id}/report` | `read` | Typed submission report: aggregate lifecycle plus tagged benchmark, build-only, or block-validation detail |
 | `GET` | `/api/health` | none | Liveness probe |
 | `GET` | `/api/whoami` | `read` | Echo the scope the caller's token resolved to — confirm auth without a side effect (landed in Phase 2 with health + the auth layer) |
 
@@ -228,6 +229,15 @@ listener. Workers cannot call the cookie-authenticated operator API.
 The response identifies the canonical `submission_id`, whether it was
 `created` or `already_submitted`, and its `initial_job_ids`. Submission does not
 require a connected worker.
+
+The report endpoint is the full authenticated result surface. Block-validation
+responses distinguish a missing/not-yet-produced verdict, a valid verdict, an
+invalid verdict, and infrastructure failure; requested range comes from the
+frozen execution payload while observed range comes from the accepted result.
+GitHub and Slack render only bounded excerpts of invalid-block detail.
+`read` is intentionally a daemon-wide trusted-operator scope, not a
+repository/tenant credential; per-repository visibility remains deferred to
+the later external-consumer authorization work.
 
 The bounded GitHub command `/validate-blocks <epoch> <start> <end>` uses the
 same PR-role and target/source policy checks as `/benchmark`. Shard,

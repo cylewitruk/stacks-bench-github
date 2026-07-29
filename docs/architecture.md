@@ -94,12 +94,20 @@ The daemon owns:
   recovery state;
 - reliable-event/progress ingest and replayable projection;
 - exact-key artifact grants, manifest verification, promotion, and staging GC;
-- GitHub/Slack reporting, debounce/rate limiting, comparison, and report
-  identity reconciliation;
+- one submission-scoped report projection over durable job/attempt events and
+  typed results; GitHub/Slack rendering, debounce/rate limiting, comparison,
+  and aggregate report-identity reconciliation;
 - authenticated operator visibility, drain, and explicit submission recovery.
 
 The daemon has no production dependency on `sbgh-worker`, `sbgh-driver`, or
 `sbgh-libvirt`, and contains no inline execution path.
+
+Reporting has one provider-neutral snapshot with exhaustive benchmark,
+build-only, and block-validation detail. GitHub checks use stable per-task
+names (`stacks-bench` and `stacks-block-validation`); build-only remains
+externally silent. Child jobs and attempts are lineage, not external report
+identity. Provider output is rebuilt from durable state, and validation
+verdicts come from the accepted typed result rather than guest summary JSON.
 
 ### `sbgh-worker`
 

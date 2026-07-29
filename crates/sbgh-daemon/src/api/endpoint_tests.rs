@@ -108,6 +108,31 @@ async fn auth_scoping_rejects_wrong_and_missing_tokens() {
     // read endpoint with no token → 401
     let (s, _) = send(&router, "GET", "/api/installations", None, None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = send(
+        &router,
+        "GET",
+        &format!("/api/submissions/{}/report", uuid::Uuid::new_v4()),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn authenticated_submission_report_uses_not_found_envelope() {
+    let (_db, pool) = setup_pg_db().await;
+    let router = router_with(pool, "http://unused".into());
+    let (status, body) = send(
+        &router,
+        "GET",
+        &format!("/api/submissions/{}/report", uuid::Uuid::new_v4()),
+        Some("readtok"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "not_found");
 }
 
 #[tokio::test]

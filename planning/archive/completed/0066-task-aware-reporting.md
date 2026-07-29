@@ -1,12 +1,12 @@
 # v28: Task-Aware Reporting
 
 Successor to
-[v27.2](../archive/completed/0064-task-submission-kernel.md). Complete the
+[v27.2](0064-task-submission-kernel.md). Complete the
 task-neutral request-to-result path by projecting benchmark, build-only, and
 block-validation submissions through one aggregate reporting lifecycle with
 task-specific result views and renderers.
 
-> **Status:** planned
+> **Status:** shipped
 >
 > v27.2 made submission identity, provenance, and persistence task-neutral.
 > v28 preserves the durable fleet event path and makes its read/projection side
@@ -15,7 +15,7 @@ task-specific result views and renderers.
 ## Item
 
 - **id:** `0066-task-aware-reporting`
-- **status:** `planned`
+- **status:** `shipped`
 - **priority:** `high`
 - **depends_on:** `0005-task-kind-platform`, `0017-generic-phase-events`,
   `0019-block-validation-recipe`, `0064-task-submission-kernel`
@@ -26,6 +26,26 @@ task-specific result views and renderers.
   `0070-slack-block-validation-controls`
 - **source:** block-validation user-story audit and post-v27 sequencing review
   (2026-07)
+
+## Shipped
+
+Implemented one typed, provider-neutral submission report snapshot for
+benchmark, build-only, and block-validation tasks. GitHub check/comment
+identity is submission-owned, with conservative historical adoption and
+fail-loud migration conflicts; Slack retains its submission-owned canonical
+message. GitHub and Slack terminal renderers consume the same durable aggregate
+snapshot exposed by the API, dispatch task detail exhaustively, avoid
+benchmark-only reads for validation, and bound/escape every guest-controlled
+detail field.
+
+Added the authenticated `GET /api/submissions/{id}/report` contract,
+submission-aware multi-run terminal fencing, task-aware queue/progress/failure
+wording, migration/store/API/renderer regression coverage, and a reporting
+boundary lint ratchet. Local validation completed with workspace build/lint,
+895 passing tests (one environment skip), and `git diff --check`. The
+restored-production migration rehearsal and real benchmark/validation restart
+canaries remain rollout gates because they require the deployment database,
+GitHub App, Slack workspace, and fleet hosts.
 
 ## Problem
 

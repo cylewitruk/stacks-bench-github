@@ -29,8 +29,7 @@ use sbgh_core::db::{
     RepoStore,
 };
 use sbgh_core::models::{
-    GitRefKind, Job, JobEventKind, JobEventStatus, JobMetric, JobResult, NewJobEvent,
-    QueuedEventDetail, ResolvedCommit, SubmissionSpec,
+    GitRefKind, Job, JobMetric, JobResult, QueuedEventDetail, ResolvedCommit, SubmissionSpec,
 };
 use uuid::Uuid;
 
@@ -231,6 +230,14 @@ pub trait RunnableJobStore: Send + Sync + 'static {
     ) -> anyhow::Result<Vec<SubmissionSpec>> {
         let _ = task_submission_id;
         Ok(Vec::new())
+    }
+
+    /// Canonical durable snapshot consumed by live terminal renderers.
+    async fn submission_report(
+        &self,
+        _task_submission_id: Uuid,
+    ) -> anyhow::Result<Option<sbgh_core::reporting::SubmissionReportView>> {
+        Ok(None)
     }
 
     /// Terminal failure. `summary` is the same forensics blob shape when
@@ -468,6 +475,16 @@ impl RunnableJobStore for JobSource {
             .await?)
     }
 
+    async fn submission_report(
+        &self,
+        task_submission_id: Uuid,
+    ) -> anyhow::Result<Option<sbgh_core::reporting::SubmissionReportView>> {
+        Ok(self
+            .jobs
+            .submission_report(task_submission_id)
+            .await?)
+    }
+
     async fn fail(
         &self,
         job: &RunnableJob,
@@ -530,21 +547,8 @@ impl RunnableJobStore for JobSource {
     }
 
     async fn set_comment_id(&self, job: &RunnableJob, comment_id: i64) -> anyhow::Result<()> {
-        // Slice 11: the new schema has no `comment_id` column — the
-        // comment identity lives on a `comment_posted` timeline event.
-        // `latest_comment_id` reads it back on (re-)claim so a reclaimed
-        // job edits the existing comment instead of posting a duplicate.
         self.jobs
-            .insert_event(&NewJobEvent {
-                job_id: job.id,
-                event_kind: JobEventKind::CommentPosted,
-                event_status: JobEventStatus::Success,
-                github_comment_id: Some(comment_id),
-                github_check_run_id: None,
-                github_check_run_url: None,
-                remark: None,
-                detail: None,
-            })
+            .record_submission_comment(job.id, comment_id)
             .await?;
         Ok(())
     }
@@ -555,19 +559,11 @@ impl RunnableJobStore for JobSource {
         check_run_id: i64,
         html_url: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Check identity lives on a `check_run_created` timeline event;
-        // `latest_check_run` reads it back on (re-)claim for idempotency.
+        let check_name = crate::report::check_name(job.task_kind)
+            .ok_or_else(|| anyhow::anyhow!("silent task cannot own a GitHub check"))?;
+        let external_id = crate::report::report_external_id(job.task_submission_id, job.task_kind);
         self.jobs
-            .insert_event(&NewJobEvent {
-                job_id: job.id,
-                event_kind: JobEventKind::CheckRunCreated,
-                event_status: JobEventStatus::Success,
-                github_comment_id: None,
-                github_check_run_id: Some(check_run_id),
-                github_check_run_url: html_url.map(str::to_string),
-                remark: None,
-                detail: None,
-            })
+            .record_submission_check(job.id, check_run_id, html_url, check_name, &external_id)
             .await?;
         Ok(())
     }
@@ -727,10 +723,20 @@ impl JobSource {
                 plan_message_ts,
             }
         } else {
-            let check_run = self
+            let aggregate_identity = self
                 .jobs
-                .latest_check_run(job.id)
+                .submission_github_report_identity(job.task_submission_id)
                 .await?;
+            let check_run = match aggregate_identity.as_ref() {
+                Some(identity) => identity
+                    .check_run_id
+                    .map(|id| (id, identity.check_run_url.clone())),
+                None => {
+                    self.jobs
+                        .latest_check_run(job.id)
+                        .await?
+                }
+            };
             match self
                 .jobs
                 .pull_request_link(job.id)
@@ -748,10 +754,14 @@ impl JobSource {
                                 link.github_pull_request_id
                             )
                         })?;
-                    let comment_id = self
-                        .jobs
-                        .latest_comment_id(job.id)
-                        .await?;
+                    let comment_id = match aggregate_identity.as_ref() {
+                        Some(identity) => identity.comment_id,
+                        None => {
+                            self.jobs
+                                .latest_comment_id(job.id)
+                                .await?
+                        }
+                    };
                     ProgressTarget::PullRequest {
                         pr_number: pr.pr_number as i64,
                         comment_id,

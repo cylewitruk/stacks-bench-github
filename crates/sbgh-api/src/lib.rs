@@ -13,11 +13,14 @@ mod error;
 pub use client::{Client, ClientError, read_cookie};
 pub use dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
+    BenchmarkReportDetail, BlockValidationReportDetail, BuildOnlyReportDetail,
     DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest,
     EnqueueBlockValidationRequest, EnqueueJobResponse, FleetCancellationResponse, FleetOverview,
     FleetRecoveryRequest, FleetRecoveryResponse, FleetSummaryView, FleetWorkerView,
-    GrantRoleResult, HealthResponse, InstallationView, InstallerView, JobView, PinTriggerRequest,
-    PolicyView, RepoRootView, ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView,
-    WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerDrainRequest,
+    GrantRoleResult, HealthResponse, InstallationView, InstallerView, InvalidBlockDetail, JobView,
+    PinTriggerRequest, PolicyView, RepoRootView, ReportArtifactView, ReportIdentityView,
+    ReportLifecycleView, ReportRange, ResolveRepoResponse, RoleRequest, RoleView,
+    SubmissionReportView, TaskReportView, TriggerView, UserView, WebhookSubmitResponse,
+    WebhookSummary, WhoamiResponse, WorkerDrainRequest,
 };
 pub use error::{ApiError, ErrorBody};

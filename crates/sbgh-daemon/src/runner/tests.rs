@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::*;
 use crate::job_source::ProgressTarget;
 use crate::report::ReportSurface;
-use crate::reporter::CHECK_NAME;
+use crate::report::{check_name, report_external_id};
 use sbgh_driver::TaskContext;
 use sbgh_driver::{
     Driver, DriverOutcome, DriverStatus, EventSink, Placement, TaskSpec, Terminal, WorkerEvent,
@@ -32,6 +32,9 @@ use sbgh_libvirt::{
 /// abstraction (not the legacy store) to a terminal call.
 struct FakeSource {
     job: StdMutex<Option<RunnableJob>>,
+    report_jobs: StdMutex<HashMap<Uuid, RunnableJob>>,
+    report_states:
+        StdMutex<HashMap<Uuid, (sbgh_core::reporting::ReportLifecycleState, Option<String>)>>,
     calls: StdMutex<Vec<&'static str>>,
     /// The commit `start_running` was called with (for asserting
     /// claim-time tag resolution).
@@ -51,7 +54,13 @@ struct FakeSource {
 
 impl FakeSource {
     fn new(job: RunnableJob) -> Self {
+        let submission_id = job.task_submission_id;
         Self {
+            report_jobs: StdMutex::new(HashMap::from([(submission_id, job.clone())])),
+            report_states: StdMutex::new(HashMap::from([(
+                submission_id,
+                (sbgh_core::reporting::ReportLifecycleState::Queued, None),
+            )])),
             job: StdMutex::new(Some(job)),
             calls: StdMutex::new(Vec::new()),
             started_commit: StdMutex::new(None),
@@ -77,6 +86,10 @@ impl FakeSource {
     /// reconstructed reporting context, for the 4C-2 check-conclusion
     /// path).
     fn set_orphan_runnable(&self, job: RunnableJob) {
+        self.report_jobs
+            .lock()
+            .unwrap()
+            .insert(job.task_submission_id, job.clone());
         *self
             .orphan_runnable
             .lock()
@@ -291,9 +304,18 @@ impl RunnableJobStore for FakeSource {
     }
     async fn complete(
         &self,
-        _job: &RunnableJob,
+        job: &RunnableJob,
         _summary: &serde_json::Value,
     ) -> anyhow::Result<()> {
+        let state = if job.submission_run_index + 1 >= job.submission_requested_run_count {
+            sbgh_core::reporting::ReportLifecycleState::Completed
+        } else {
+            sbgh_core::reporting::ReportLifecycleState::Queued
+        };
+        self.report_states
+            .lock()
+            .unwrap()
+            .insert(job.task_submission_id, (state, None));
         self.record("complete");
         Ok(())
     }
@@ -309,16 +331,103 @@ impl RunnableJobStore for FakeSource {
     }
     async fn fail(
         &self,
-        _job: &RunnableJob,
-        _error: &str,
+        job: &RunnableJob,
+        error: &str,
         _summary: Option<&serde_json::Value>,
     ) -> anyhow::Result<()> {
+        self.report_states
+            .lock()
+            .unwrap()
+            .insert(
+                job.task_submission_id,
+                (sbgh_core::reporting::ReportLifecycleState::Failed, Some(error.into())),
+            );
         self.record("fail");
         Ok(())
     }
-    async fn cancel(&self, _job: &RunnableJob, _remark: &str) -> anyhow::Result<()> {
+    async fn cancel(&self, job: &RunnableJob, remark: &str) -> anyhow::Result<()> {
+        self.report_states
+            .lock()
+            .unwrap()
+            .insert(
+                job.task_submission_id,
+                (sbgh_core::reporting::ReportLifecycleState::Cancelled, Some(remark.into())),
+            );
         self.record("cancel");
         Ok(())
+    }
+    async fn submission_report(
+        &self,
+        submission_id: Uuid,
+    ) -> anyhow::Result<Option<sbgh_core::reporting::SubmissionReportView>> {
+        use sbgh_core::reporting::{
+            BenchmarkReportView, BlockValidationReportView, BuildOnlyReportView, ReportIdentity,
+            ReportLifecycle, SubmissionReportView, TaskReport,
+        };
+        let jobs = self
+            .report_jobs
+            .lock()
+            .unwrap();
+        let Some(job) = jobs.get(&submission_id) else {
+            return Ok(None);
+        };
+        let (state, failure) = self
+            .report_states
+            .lock()
+            .unwrap()
+            .get(&submission_id)
+            .cloned()
+            .unwrap_or((sbgh_core::reporting::ReportLifecycleState::Queued, None));
+        let completed_jobs = if self
+            .calls
+            .lock()
+            .unwrap()
+            .contains(&"complete")
+        {
+            (job.submission_run_index + 1).max(0) as u32
+        } else {
+            0
+        };
+        let total_jobs = job
+            .submission_requested_run_count
+            .max(1) as u32;
+        let task = match job.task_kind {
+            TaskKind::Benchmark => TaskReport::Benchmark(BenchmarkReportView {
+                requested_runs: total_jobs,
+                completed_runs: completed_jobs,
+            }),
+            TaskKind::BuildOnly => {
+                TaskReport::BuildOnly(BuildOnlyReportView { cache_outcome: None })
+            }
+            TaskKind::BlockValidation => TaskReport::BlockValidation(BlockValidationReportView {
+                requested_range: None,
+                observed_range: None,
+                verdict: None,
+                checked_blocks: None,
+                chainstate_origin: None,
+                invalid_blocks: Vec::new(),
+            }),
+        };
+        Ok(Some(SubmissionReportView {
+            identity: ReportIdentity {
+                submission_id,
+                current_job_id: Some(job.id),
+                current_attempt_id: None,
+                task_kind: job.task_kind,
+                source: sbgh_core::models::JobSource::Daemon,
+                repository: job.repository.clone(),
+                commit: job.commit.clone(),
+            },
+            lifecycle: ReportLifecycle {
+                state,
+                phase: None,
+                completed_jobs,
+                total_jobs,
+                failure,
+            },
+            task,
+            artifacts: Vec::new(),
+        }))
     }
     async fn set_comment_id(&self, _job: &RunnableJob, _comment_id: i64) -> anyhow::Result<()> {
         self.record("set_comment_id");
@@ -369,7 +478,22 @@ impl RunnableJobStore for FakeSource {
             .unwrap()
             .clone())
     }
-    async fn cancel_orphan(&self, _job_id: Uuid, _remark: &str) -> anyhow::Result<bool> {
+    async fn cancel_orphan(&self, job_id: Uuid, remark: &str) -> anyhow::Result<bool> {
+        if let Some(job) = self
+            .orphan_runnable
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|job| job.id == job_id)
+        {
+            self.report_states
+                .lock()
+                .unwrap()
+                .insert(
+                    job.task_submission_id,
+                    (sbgh_core::reporting::ReportLifecycleState::Cancelled, Some(remark.into())),
+                );
+        }
         self.record("cancel_orphan");
         Ok(true)
     }
@@ -1385,12 +1509,19 @@ async fn check_reconcile_reuses_existing_run() {
     let tmp = TempDir::new().unwrap();
     let config = config_with(&tmp, PrReport::Check, BaselineReport::None);
     let job = pr_job("abc123", None);
-    let job_id = job.id;
+    let submission_id = job.task_submission_id;
+    let task_kind = job.task_kind;
     let source = Arc::new(FakeSource::new(job));
     let gh = Arc::new(FakeGitHub::new());
     gh.set_head_sha("acme/widgets", 7, "abc123");
     // A prior run exists for (repo, sha, name, external_id=job id).
-    gh.set_existing_check_run("acme/widgets", "abc123", CHECK_NAME, &job_id.to_string(), 9999);
+    gh.set_existing_check_run(
+        "acme/widgets",
+        "abc123",
+        check_name(task_kind).unwrap(),
+        &report_external_id(submission_id, task_kind),
+        9999,
+    );
     let shell = Arc::new(RecordingShell::new());
     shell.reply(PreparedReply::fail(b"boom"));
     let runner = Runner::new(config, source.clone(), gh.clone(), shell);
@@ -1567,8 +1698,8 @@ async fn reporting_persistence_failure_does_not_fail_the_job() {
     );
 }
 
-/// If `GET /app` fails, the reconcile is skipped (no lookup) but the check
-/// is still created and the job terminalizes. The `OnceCell` is left empty
+/// If `GET /app` fails, reconciliation and creation fail closed while the job
+/// still terminalizes. The `OnceCell` is left empty
 /// (`get_or_try_init` doesn't cache the error), so a later job self-heals.
 #[tokio::test]
 async fn app_id_resolution_failure_skips_reconcile_but_not_the_job() {
@@ -1593,10 +1724,10 @@ async fn app_id_resolution_failure_skips_reconcile_but_not_the_job() {
         "reconcile is skipped when the App id is unknown"
     );
     assert!(
-        calls
+        !calls
             .iter()
             .any(|c| matches!(c, FakeCall::CreateCheckRun { .. })),
-        "the check is still created"
+        "creation without reconciliation could duplicate the aggregate check"
     );
     assert!(
         source
@@ -2144,13 +2275,12 @@ fn position_coord(
     Coordinator::new(deps, 1, CancellationToken::new())
 }
 
-fn create_summary_for(gh: &FakeGitHub, job_id: Uuid) -> Option<String> {
+fn create_summary_for(gh: &FakeGitHub, job: &RunnableJob) -> Option<String> {
+    let external = report_external_id(job.task_submission_id, job.task_kind);
     gh.calls()
         .into_iter()
         .find_map(|c| match c {
-            FakeCall::CreateCheckRun { external_id, output, .. }
-                if external_id == job_id.to_string() =>
-            {
+            FakeCall::CreateCheckRun { external_id, output, .. } if external_id == external => {
                 Some(output.summary)
             }
             _ => None,
@@ -2185,8 +2315,8 @@ async fn coordinator_reports_queue_positions_and_debounces() {
         .await;
 
     // in_flight = 0 → ahead = index. Position text matches claim order.
-    assert_eq!(create_summary_for(&gh, j0.id).as_deref(), Some("queued — next to run"));
-    assert_eq!(create_summary_for(&gh, j1.id).as_deref(), Some("queued — 1 run ahead"));
+    assert_eq!(create_summary_for(&gh, &j0).as_deref(), Some("queued — next to run"));
+    assert_eq!(create_summary_for(&gh, &j1).as_deref(), Some("queued — 1 run ahead"));
     assert_eq!(create_count(&gh), 2);
     // Each created check's id was persisted so a later claim adopts it.
     assert_eq!(

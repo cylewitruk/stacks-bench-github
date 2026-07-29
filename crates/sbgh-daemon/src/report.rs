@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use sbgh_core::db::fleet::ReportProjectionSeed;
+use sbgh_core::models::TaskKind;
+use sbgh_core::reporting::{ReportLifecycleState, SubmissionReportView, TaskReport};
 use sbgh_github::{CheckRunConclusion, CheckRunOutput, CheckRunState, CheckRunUpdate, GitHubApi};
 use tokio::sync::Mutex;
 
@@ -50,6 +52,29 @@ const DB_LINK_TTL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 /// bypass it so the final state shows immediately. The first edit after pickup
 /// is always allowed through.
 const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_INVALID_BLOCKS: usize = 20;
+const MAX_INVALID_BLOCK_CHARS: usize = 96;
+const MAX_INVALID_REASON_CHARS: usize = 240;
+
+pub(crate) fn check_name(task_kind: TaskKind) -> Option<&'static str> {
+    match task_kind {
+        TaskKind::Benchmark => Some("stacks-bench"),
+        TaskKind::BlockValidation => Some("stacks-block-validation"),
+        TaskKind::BuildOnly => None,
+    }
+}
+
+pub(crate) fn task_label(task_kind: TaskKind) -> &'static str {
+    match task_kind {
+        TaskKind::Benchmark => "benchmark",
+        TaskKind::BlockValidation => "block validation",
+        TaskKind::BuildOnly => "build",
+    }
+}
+
+pub(crate) fn report_external_id(submission_id: uuid::Uuid, task_kind: TaskKind) -> String {
+    format!("submission:{submission_id}:{}", check_name(task_kind).unwrap_or("silent"))
+}
 
 pub(crate) fn pr_report_marker(submission_id: uuid::Uuid) -> String {
     format!("<!-- sbgh-report:{submission_id} -->")
@@ -72,6 +97,7 @@ pub(crate) fn marked_pr_comment(submission_id: uuid::Uuid, body: &str) -> String
 /// comparison, while Slack uses the multi-variant comparison for v22 ad-hoc
 /// comparison submissions.
 pub struct CompletionReport<'a> {
+    pub snapshot: SubmissionReportView,
     pub summary: &'a serde_json::Value,
     pub baseline_comparison: Option<&'a BaselineComparison>,
     pub multi_variant_comparison: Option<&'a MultiVariantComparison>,
@@ -101,10 +127,10 @@ pub trait ReportSurface: Send + Sync {
     /// Terminal success — the run produced results.
     async fn completed(&self, report: CompletionReport<'_>) -> anyhow::Result<()>;
     /// Terminal failure — the run couldn't run / produce results.
-    async fn failed(&self, error: &str) -> anyhow::Result<()>;
+    async fn failed(&self, snapshot: &SubmissionReportView, error: &str) -> anyhow::Result<()>;
     /// Terminal cancellation — deliberately stopped (shutdown / orphan
     /// recovery).
-    async fn cancelled(&self, reason: &str) -> anyhow::Result<()>;
+    async fn cancelled(&self, snapshot: &SubmissionReportView, reason: &str) -> anyhow::Result<()>;
 }
 
 /// Legacy inline execution persists lifecycle state independently of provider
@@ -197,13 +223,24 @@ impl GitHubReportSurface {
 
     /// How this job is re-triggered, for the cancelled-check text.
     fn retrigger_hint(&self) -> &'static str {
-        match self.job.progress {
-            ProgressTarget::PullRequest { .. } => "Re-run with `/benchmark`.",
-            ProgressTarget::CommitCheck { .. } => "Re-run by pushing the branch/tag again.",
-            ProgressTarget::Slack { .. } => "Re-run by mentioning me with a new `bench …` request.",
+        match (self.job.task_kind, &self.job.progress) {
+            (TaskKind::BlockValidation, ProgressTarget::PullRequest { .. }) => {
+                "Re-run with `/validate`."
+            }
+            (TaskKind::Benchmark, ProgressTarget::PullRequest { .. }) => {
+                "Re-run with `/benchmark`."
+            }
+            (_, ProgressTarget::PullRequest { .. }) => "Re-run the task.",
+            (_, ProgressTarget::CommitCheck { .. }) => "Re-run by pushing the branch/tag again.",
+            (TaskKind::BlockValidation, ProgressTarget::Slack { .. }) => {
+                "Re-run by mentioning me with a new validation request."
+            }
+            (_, ProgressTarget::Slack { .. }) => {
+                "Re-run by mentioning me with a new `bench …` request."
+            }
             // Unreachable for a silent job (no surface renders this), but the
             // match must cover it.
-            ProgressTarget::Silent => "Re-run the build.",
+            (_, ProgressTarget::Silent) => "Re-run the build.",
         }
     }
 
@@ -211,46 +248,30 @@ impl GitHubReportSurface {
     /// the user-facing metrics) used by both the comment and the check.
     async fn completed_body(
         &self,
+        task: &TaskReport,
         summary: &serde_json::Value,
         comparison: Option<&BaselineComparison>,
     ) -> String {
-        if summary
-            .get("task")
-            .and_then(|value| value.as_str())
-            == Some("block_validation")
-        {
-            let valid = summary
-                .get("valid")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            let checked = summary
-                .get("checked_blocks")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let invalid = summary
-                .get("invalid_block_count")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let result = if valid { "passed" } else { "found invalid blocks" };
-            return format!(
-                "{} block validation **{result}** for commit `{}` — checked `{checked}` blocks, \
-                 `{invalid}` invalid.",
-                if valid { ":white_check_mark:" } else { ":x:" },
-                self.job.commit,
-            );
+        match task {
+            TaskReport::BlockValidation(result) => {
+                render_block_validation_body(self.job.task_submission_id, &self.job.commit, result)
+            }
+            TaskReport::BuildOnly(_) => String::new(),
+            TaskReport::Benchmark(_) => {
+                let archive_dir = summary
+                    .get("archive_dir")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("/var/lib/sbgh/results");
+                let parsed = parsed_run(self.store.as_ref(), summary).await;
+                bench_summary::render_pr_comment(
+                    &self.job.id.to_string(),
+                    &self.job.commit,
+                    archive_dir,
+                    parsed.as_ref(),
+                    comparison,
+                )
+            }
         }
-        let archive_dir = summary
-            .get("archive_dir")
-            .and_then(|v| v.as_str())
-            .unwrap_or("/var/lib/sbgh/results");
-        let parsed = parsed_run(self.store.as_ref(), summary).await;
-        bench_summary::render_pr_comment(
-            &self.job.id.to_string(),
-            &self.job.commit,
-            archive_dir,
-            parsed.as_ref(),
-            comparison,
-        )
     }
 
     /// Edit the PR comment if this job has one.
@@ -331,9 +352,10 @@ impl GitHubReportSurface {
 
         let mut first_error = None;
         if let Some(comment_id) = comment_id {
+            let task = task_label(self.job.task_kind);
             let body = format!(
-                ":construction: benchmark `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
-                id = self.job.id,
+                ":construction: {task} `{id}` — **{phase}** for `{elapsed}` (commit `{sha}`)",
+                id = self.job.task_submission_id,
                 phase = humanize_phase(label),
                 elapsed = format_elapsed(elapsed),
                 sha = self.job.commit,
@@ -402,12 +424,90 @@ fn combine_projection_results(
     }
 }
 
+fn render_block_validation_body(
+    submission_id: uuid::Uuid,
+    commit: &str,
+    result: &sbgh_core::reporting::BlockValidationReportView,
+) -> String {
+    let Some(valid) = result.is_valid() else {
+        return format!(
+            ":x: block validation `{submission_id}` completed without a typed verdict for commit `{commit}`."
+        );
+    };
+    let requested = result
+        .requested_range
+        .map(|range| format!("`{}..={}`", range.start, range.end))
+        .unwrap_or_else(|| "unavailable (legacy request)".into());
+    let observed = result
+        .observed_range
+        .map(|range| format!("`{}..={}`", range.start, range.end))
+        .unwrap_or_else(|| "unavailable".into());
+    let mut body = format!(
+        "{} block validation **{}** for commit `{commit}` — checked `{}` blocks, `{}` invalid.\n\
+         Requested range: {requested}. Observed range: {observed}. Chainstate: `{}`.",
+        if valid { ":white_check_mark:" } else { ":x:" },
+        if valid { "passed" } else { "found invalid blocks" },
+        result
+            .checked_blocks
+            .unwrap_or(0),
+        result.invalid_blocks.len(),
+        safe_inline(
+            result
+                .chainstate_origin
+                .as_deref()
+                .unwrap_or("unknown"),
+            160
+        ),
+    );
+    for invalid in result
+        .invalid_blocks
+        .iter()
+        .take(MAX_INVALID_BLOCKS)
+    {
+        body.push_str(&format!(
+            "\n- shard `{}` block `{}`: {}",
+            invalid.shard,
+            safe_inline(&invalid.block, MAX_INVALID_BLOCK_CHARS),
+            safe_inline(&invalid.reason, MAX_INVALID_REASON_CHARS),
+        ));
+    }
+    if result.invalid_blocks.len() > MAX_INVALID_BLOCKS {
+        body.push_str(&format!(
+            "\n- … {} more invalid blocks (full detail is available through the authenticated report API).",
+            result.invalid_blocks.len() - MAX_INVALID_BLOCKS
+        ));
+    }
+    body
+}
+
+fn safe_inline(value: &str, max_chars: usize) -> String {
+    let mut out = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect::<String>()
+        .replace('`', "ʼ")
+        .replace('<', "‹")
+        .replace('>', "›")
+        .replace('@', "＠");
+    if value
+        .chars()
+        .filter(|character| !character.is_control())
+        .count()
+        > max_chars
+    {
+        out.push('…');
+    }
+    out
+}
+
 #[async_trait]
 impl ReportSurface for GitHubReportSurface {
     async fn started(&self) -> anyhow::Result<()> {
+        let task = task_label(self.job.task_kind);
         self.update_comment(&format!(
-            ":rocket: benchmark `{id}` is running on commit `{sha}`.",
-            id = self.job.id,
+            ":rocket: {task} `{id}` is running on commit `{sha}`.",
+            id = self.job.task_submission_id,
             sha = self.job.commit,
         ))
         .await
@@ -450,9 +550,10 @@ impl ReportSurface for GitHubReportSurface {
         let summary = format_progress_summary(progress);
         let mut first_error = None;
         if let Some(comment_id) = comment_id {
+            let task = task_label(self.job.task_kind);
             let body = format!(
-                ":construction: benchmark `{id}` — {summary} (commit `{sha}`)",
-                id = self.job.id,
+                ":construction: {task} `{id}` — {summary} (commit `{sha}`)",
+                id = self.job.task_submission_id,
                 sha = self.job.commit,
             );
             if let Err(error) = self
@@ -465,7 +566,7 @@ impl ReportSurface for GitHubReportSurface {
 
         if let Some(check_run_id) = check_run_id {
             let output = CheckRunOutput {
-                title: "Benchmark progress".into(),
+                title: format!("{} progress", task_label(self.job.task_kind)),
                 summary: format!("{summary} — commit `{}`", self.job.commit),
                 text: None,
             };
@@ -501,30 +602,93 @@ impl ReportSurface for GitHubReportSurface {
     }
 
     async fn completed(&self, report: CompletionReport<'_>) -> anyhow::Result<()> {
+        if !matches!(
+            report
+                .snapshot
+                .lifecycle
+                .state,
+            ReportLifecycleState::Completed
+        ) {
+            let body = format!(
+                ":construction: {} `{}` completed run {}/{}; scheduling the next run.",
+                task_label(
+                    report
+                        .snapshot
+                        .identity
+                        .task_kind
+                ),
+                report
+                    .snapshot
+                    .identity
+                    .submission_id,
+                report
+                    .snapshot
+                    .lifecycle
+                    .completed_jobs,
+                report
+                    .snapshot
+                    .lifecycle
+                    .total_jobs,
+            );
+            let comment_result = self
+                .update_comment(&body)
+                .await;
+            let check_result = match self.check_run_id() {
+                Some(check_run_id) => self
+                    .gh
+                    .update_check_run(
+                        self.job.installation_id,
+                        &self.job.repository,
+                        check_run_id,
+                        CheckRunUpdate {
+                            state: CheckRunState::InProgress,
+                            output: CheckRunOutput {
+                                title: format!(
+                                    "{} — scheduling next run",
+                                    task_label(
+                                        report
+                                            .snapshot
+                                            .identity
+                                            .task_kind
+                                    )
+                                ),
+                                summary: format!(
+                                    "run {}/{} complete",
+                                    report
+                                        .snapshot
+                                        .lifecycle
+                                        .completed_jobs,
+                                    report
+                                        .snapshot
+                                        .lifecycle
+                                        .total_jobs
+                                ),
+                                text: Some(body),
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("updating aggregate Check Run between runs")
+                    .map(|_| ()),
+                None => Ok(()),
+            };
+            return combine_projection_results(comment_result, check_result);
+        }
         let body = self
-            .completed_body(report.summary, report.baseline_comparison)
+            .completed_body(&report.snapshot.task, report.summary, report.baseline_comparison)
             .await;
         let comment_result = self
             .update_comment(&body)
             .await;
         let pointer = if self.has_comment() { "see comment / details" } else { "see details" };
-        let block_validation = report
-            .summary
-            .get("task")
-            .and_then(|value| value.as_str())
-            == Some("block_validation");
-        let conclusion = if block_validation
-            && !report
-                .summary
-                .get("valid")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
-        {
-            CheckRunConclusion::Failure
-        } else {
-            // A benchmark ran and produced results. Performance is data, not a
-            // gate; block validation is a correctness result and can be red.
-            CheckRunConclusion::Success
+        let conclusion = match &report.snapshot.task {
+            TaskReport::Benchmark(_) => CheckRunConclusion::Success,
+            TaskReport::BlockValidation(result) => match result.is_valid() {
+                Some(true) => CheckRunConclusion::Success,
+                Some(false) | None => CheckRunConclusion::Failure,
+            },
+            TaskReport::BuildOnly(_) => return Ok(()),
         };
         let check_result = self
             .complete_check(
@@ -532,10 +696,24 @@ impl ReportSurface for GitHubReportSurface {
                 CheckRunOutput {
                     title: format!(
                         "{} {} — complete",
-                        if block_validation { "block validation" } else { "benchmark" },
-                        self.job.id
+                        task_label(
+                            report
+                                .snapshot
+                                .identity
+                                .task_kind
+                        ),
+                        report
+                            .snapshot
+                            .identity
+                            .submission_id
                     ),
-                    summary: format!("commit `{}` — {pointer}", self.job.commit),
+                    summary: format!(
+                        "commit `{}` — {pointer}",
+                        report
+                            .snapshot
+                            .identity
+                            .commit
+                    ),
                     text: Some(body),
                 },
             )
@@ -543,19 +721,20 @@ impl ReportSurface for GitHubReportSurface {
         combine_projection_results(comment_result, check_result)
     }
 
-    async fn failed(&self, error: &str) -> anyhow::Result<()> {
+    async fn failed(&self, snapshot: &SubmissionReportView, error: &str) -> anyhow::Result<()> {
         let snippet = short_pr_error(error);
+        let label = task_label(snapshot.identity.task_kind);
         let comment_result = self
             .update_comment(&format!(
-                ":x: benchmark `{id}` failed: `{snippet}`\n\n_(full details in the daemon logs)_",
-                id = self.job.id,
+                ":x: {label} `{id}` failed: `{snippet}`\n\n_(full details in the daemon logs)_",
+                id = self.job.task_submission_id,
             ))
             .await;
         let check_result = self
             .complete_check(
                 CheckRunConclusion::Failure,
                 CheckRunOutput {
-                    title: format!("benchmark {} — failed", self.job.id),
+                    title: format!("{label} {} — failed", self.job.task_submission_id),
                     summary: format!("commit `{}` failed", self.job.commit),
                     text: Some(format!(
                         "```\n{snippet}\n```\n\n_(full details in the daemon logs)_"
@@ -566,19 +745,20 @@ impl ReportSurface for GitHubReportSurface {
         combine_projection_results(comment_result, check_result)
     }
 
-    async fn cancelled(&self, reason: &str) -> anyhow::Result<()> {
+    async fn cancelled(&self, snapshot: &SubmissionReportView, reason: &str) -> anyhow::Result<()> {
+        let label = task_label(snapshot.identity.task_kind);
+        let hint = self.retrigger_hint();
         let comment_result = self
             .update_comment(&format!(
-                ":no_entry_sign: benchmark `{id}` cancelled: {reason}. Re-run with `/benchmark`.",
-                id = self.job.id,
+                ":no_entry_sign: {label} `{id}` cancelled: {reason}. {hint}",
+                id = self.job.task_submission_id,
             ))
             .await;
-        let hint = self.retrigger_hint();
         let check_result = self
             .complete_check(
                 CheckRunConclusion::Cancelled,
                 CheckRunOutput {
-                    title: format!("benchmark {} — cancelled", self.job.id),
+                    title: format!("{label} {} — cancelled", self.job.task_submission_id),
                     summary: format!("commit `{}` — {reason}", self.job.commit),
                     text: Some(format!("Cancelled: {reason}. {hint}")),
                 },
@@ -612,10 +792,14 @@ impl ReportSurface for NoopReportSurface {
     async fn completed(&self, _report: CompletionReport<'_>) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn failed(&self, _error: &str) -> anyhow::Result<()> {
+    async fn failed(&self, _snapshot: &SubmissionReportView, _error: &str) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn cancelled(&self, _reason: &str) -> anyhow::Result<()> {
+    async fn cancelled(
+        &self,
+        _snapshot: &SubmissionReportView,
+        _reason: &str,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -752,8 +936,61 @@ mod tests {
         Arc::new(LocalFsStore::new(std::env::temp_dir()))
     }
 
+    fn snapshot(
+        task: TaskReport,
+        state: ReportLifecycleState,
+        completed_jobs: u32,
+        total_jobs: u32,
+        failure: Option<&str>,
+    ) -> SubmissionReportView {
+        let task_kind = match &task {
+            TaskReport::Benchmark(_) => TaskKind::Benchmark,
+            TaskReport::BuildOnly(_) => TaskKind::BuildOnly,
+            TaskReport::BlockValidation(_) => TaskKind::BlockValidation,
+        };
+        SubmissionReportView {
+            identity: sbgh_core::reporting::ReportIdentity {
+                submission_id: Uuid::new_v4(),
+                current_job_id: Some(Uuid::new_v4()),
+                current_attempt_id: None,
+                task_kind,
+                source: sbgh_core::models::JobSource::Daemon,
+                repository: "acme/widgets".into(),
+                commit: "abc123".into(),
+            },
+            lifecycle: sbgh_core::reporting::ReportLifecycle {
+                state,
+                phase: None,
+                completed_jobs,
+                total_jobs,
+                failure: failure.map(str::to_owned),
+            },
+            task,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn benchmark_snapshot(
+        state: ReportLifecycleState,
+        completed_jobs: u32,
+        total_jobs: u32,
+        failure: Option<&str>,
+    ) -> SubmissionReportView {
+        snapshot(
+            TaskReport::Benchmark(sbgh_core::reporting::BenchmarkReportView {
+                requested_runs: total_jobs,
+                completed_runs: completed_jobs,
+            }),
+            state,
+            completed_jobs,
+            total_jobs,
+            failure,
+        )
+    }
+
     fn completion_report(summary: &serde_json::Value) -> CompletionReport<'_> {
         CompletionReport {
+            snapshot: benchmark_snapshot(ReportLifecycleState::Completed, 1, 1, None),
             summary,
             baseline_comparison: None,
             multi_variant_comparison: None,
@@ -836,10 +1073,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn intermediate_benchmark_run_keeps_aggregate_check_in_progress() {
+        let gh = Arc::new(FakeGitHub::new());
+        let summary = serde_json::json!({});
+        let mut job = check_job(11);
+        job.submission_requested_run_count = 2;
+        let mut report = completion_report(&summary);
+        report.snapshot = benchmark_snapshot(ReportLifecycleState::Queued, 1, 2, None);
+        github(&gh, job)
+            .completed(report)
+            .await
+            .unwrap();
+        assert_eq!(concluded_state(&gh), Some(CheckRunState::InProgress));
+    }
+
+    #[tokio::test]
+    async fn validation_uses_typed_verdict_not_guest_summary() {
+        let gh = Arc::new(FakeGitHub::new());
+        let mut job = check_job(12);
+        job.task_kind = TaskKind::BlockValidation;
+        job.build_target = sbgh_core::models::BuildTarget::StacksInspect;
+        let summary = serde_json::json!({
+            "task": "block_validation",
+            "valid": false,
+            "invalid_block_count": 999
+        });
+        let result = sbgh_proto::BlockValidationResult {
+            valid: true,
+            checked_blocks: 11,
+            invalid_blocks: Vec::new(),
+            chainstate_origin: "chainstate-nightly".into(),
+            observed_range: sbgh_proto::InclusiveRange { start: 10, end: 20 },
+        };
+        let view = sbgh_core::reporting::BlockValidationReportView::from_result(None, &result);
+        let snapshot = snapshot(
+            TaskReport::BlockValidation(view),
+            ReportLifecycleState::Completed,
+            1,
+            1,
+            None,
+        );
+        github(&gh, job)
+            .completed(CompletionReport {
+                snapshot,
+                summary: &summary,
+                baseline_comparison: None,
+                multi_variant_comparison: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            concluded_state(&gh),
+            Some(CheckRunState::Completed(CheckRunConclusion::Success))
+        );
+    }
+
+    #[test]
+    fn validation_detail_is_bounded_and_escaped() {
+        let result = sbgh_proto::BlockValidationResult {
+            valid: false,
+            checked_blocks: 50,
+            invalid_blocks: (0..40)
+                .map(|index| sbgh_proto::InvalidBlock {
+                    shard: index,
+                    block: if index == 0 {
+                        format!("`@team<unsafe>{}", "b".repeat(300))
+                    } else {
+                        index.to_string()
+                    },
+                    reason: format!("@team ``` <unsafe> {}", "x".repeat(400)),
+                })
+                .collect(),
+            chainstate_origin: "`origin`".into(),
+            observed_range: sbgh_proto::InclusiveRange { start: 1, end: 50 },
+        };
+        let view = sbgh_core::reporting::BlockValidationReportView::from_result(None, &result);
+        let body = render_block_validation_body(Uuid::new_v4(), "abc", &view);
+        assert!(!body.contains("```"));
+        assert!(!body.contains("<unsafe>"));
+        assert!(!body.contains("`@team"));
+        assert!(!body.contains(&"b".repeat(100)));
+        assert!(body.contains("20 more invalid blocks"));
+        assert!(body.len() < 12_000);
+    }
+
+    #[test]
+    fn missing_validation_verdict_fails_closed_without_claiming_invalid_blocks() {
+        let view = sbgh_core::reporting::BlockValidationReportView {
+            requested_range: None,
+            observed_range: None,
+            verdict: None,
+            checked_blocks: None,
+            chainstate_origin: None,
+            invalid_blocks: Vec::new(),
+        };
+        let body = render_block_validation_body(Uuid::new_v4(), "abc", &view);
+        assert!(body.contains("without a typed verdict"), "{body}");
+        assert!(!body.contains("found invalid blocks"), "{body}");
+    }
+
+    #[tokio::test]
     async fn github_failed_concludes_check_failure() {
         let gh = Arc::new(FakeGitHub::new());
+        let snapshot =
+            benchmark_snapshot(ReportLifecycleState::Failed, 0, 1, Some("boom: VM died"));
         github(&gh, check_job(11))
-            .failed("boom: VM died")
+            .failed(&snapshot, "boom: VM died")
             .await
             .unwrap();
         assert_eq!(
@@ -851,8 +1190,10 @@ mod tests {
     #[tokio::test]
     async fn github_cancelled_concludes_check_cancelled() {
         let gh = Arc::new(FakeGitHub::new());
+        let snapshot =
+            benchmark_snapshot(ReportLifecycleState::Cancelled, 0, 1, Some("aborted by shutdown"));
         github(&gh, check_job(11))
-            .cancelled("aborted by shutdown")
+            .cancelled(&snapshot, "aborted by shutdown")
             .await
             .unwrap();
         assert_eq!(
@@ -877,8 +1218,10 @@ mod tests {
         };
 
         let gh = Arc::new(FakeGitHub::new());
+        let snapshot =
+            benchmark_snapshot(ReportLifecycleState::Cancelled, 0, 1, Some("aborted by shutdown"));
         github(&gh, check_job(11))
-            .cancelled("aborted by shutdown")
+            .cancelled(&snapshot, "aborted by shutdown")
             .await
             .unwrap();
         let baseline = check_text(&gh);
@@ -892,8 +1235,10 @@ mod tests {
             check_run_id: Some(22),
             check_run_url: None,
         });
+        let snapshot =
+            benchmark_snapshot(ReportLifecycleState::Cancelled, 0, 1, Some("aborted by shutdown"));
         github(&gh_pr, pr)
-            .cancelled("aborted by shutdown")
+            .cancelled(&snapshot, "aborted by shutdown")
             .await
             .unwrap();
         assert!(check_text(&gh_pr).contains("/benchmark"), "PR job re-runs via /benchmark");

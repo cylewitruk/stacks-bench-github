@@ -535,6 +535,13 @@ impl Validate for ArtifactDescriptor {
     }
 }
 
+impl Validate for crate::InvalidBlock {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        bounded("invalid_block.block", &self.block, 512, false)?;
+        bounded("invalid_block.reason", &self.reason, 4_096, false)
+    }
+}
+
 fn validate_artifacts(artifacts: &[ArtifactDescriptor]) -> Result<(), ProtocolError> {
     if artifacts.len() > MAX_ARTIFACTS {
         return Err(ProtocolError::Invalid {
@@ -609,8 +616,7 @@ impl Validate for CompleteAttemptRequest {
                         });
                     }
                     for invalid in &result.invalid_blocks {
-                        bounded("invalid_block.block", &invalid.block, 512, false)?;
-                        bounded("invalid_block.reason", &invalid.reason, 4_096, false)?;
+                        invalid.validate()?;
                     }
                 }
             }
@@ -780,5 +786,69 @@ mod tests {
             reason: "different request".into(),
         };
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn terminal_rejects_unbounded_or_controlled_invalid_block_identity() {
+        let identity = AttemptIdentity {
+            worker_session_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            fencing_generation: 1,
+            lease_token: LeaseToken("x".repeat(64)),
+        };
+        let outcome = TerminalOutcome::Completed {
+            summary: serde_json::json!({}),
+            block_validation: Some(crate::BlockValidationResult {
+                valid: false,
+                checked_blocks: 1,
+                invalid_blocks: vec![crate::InvalidBlock {
+                    shard: 0,
+                    block: "b".repeat(513),
+                    reason: "invalid block".into(),
+                }],
+                chainstate_origin: "chainstate".into(),
+                observed_range: crate::InclusiveRange { start: 1, end: 1 },
+            }),
+        };
+        let terminal = ReliableEventPayload::Terminal {
+            outcome_digest: crate::payload_digest(&outcome).unwrap(),
+        };
+        let mut request = CompleteAttemptRequest {
+            protocol_version: PROTOCOL_VERSION,
+            identity,
+            trace_id: Uuid::new_v4(),
+            terminal_reliable_seq: 1,
+            terminal_payload_digest: crate::payload_digest(&terminal).unwrap(),
+            outcome,
+            artifacts: Vec::new(),
+        };
+        assert_eq!(
+            request
+                .validate()
+                .unwrap_err(),
+            ProtocolError::Invalid {
+                field: "invalid_block.block",
+                reason: "must be 1..=512 non-control bytes".into(),
+            }
+        );
+
+        let TerminalOutcome::Completed {
+            block_validation: Some(result), ..
+        } = &mut request.outcome
+        else {
+            unreachable!()
+        };
+        result.invalid_blocks[0].block = "bad\nblock".into();
+        let terminal = ReliableEventPayload::Terminal {
+            outcome_digest: crate::payload_digest(&request.outcome).unwrap(),
+        };
+        request.terminal_payload_digest = crate::payload_digest(&terminal).unwrap();
+        assert!(matches!(
+            request.validate(),
+            Err(ProtocolError::Invalid {
+                field: "invalid_block.block",
+                ..
+            })
+        ));
     }
 }

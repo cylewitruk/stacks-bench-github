@@ -108,6 +108,29 @@ async fn seed_submission(pool: &Pool, source: &str, created_at: &str) -> LegacyS
     LegacySubmission { submission_id, job_id }
 }
 
+async fn clone_submission_job(pool: &Pool, job_id: Uuid, task_run_index: i32) -> Uuid {
+    let clone_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO job
+            (id, task_submission_id, task_spec_id, task_run_index,
+             github_installation_id, github_repo_id, status, source, intent,
+             task_kind, build_target, git_ref_kind, git_ref_display,
+             git_commit_hash)
+         SELECT $2, task_submission_id, task_spec_id, $3,
+                github_installation_id, github_repo_id, status, source, intent,
+                task_kind, build_target, git_ref_kind, git_ref_display,
+                git_commit_hash
+           FROM job WHERE id = $1",
+    )
+    .bind(job_id)
+    .bind(clone_id)
+    .bind(task_run_index)
+    .execute(pool)
+    .await
+    .unwrap();
+    clone_id
+}
+
 async fn seed_queued_event(
     pool: &Pool,
     job_id: Uuid,
@@ -679,4 +702,225 @@ async fn v27_kernel_requires_in_flight_attempts_and_cleanup_to_be_drained() {
     assert!(error.contains("claimed/running jobs: 1"), "{error}");
     assert!(error.contains("active attempts: 1"), "{error}");
     assert!(error.contains("pending cleanup obligations: 1"), "{error}");
+}
+
+#[tokio::test]
+async fn v28_backfills_one_unambiguous_submission_report_identity() {
+    let (_db, pool) = setup_pg_db_to(V27_1_MIGRATION).await;
+    seed_tenant(&pool).await;
+    let legacy = seed_submission(&pool, "github_comment", "2026-07-10T00:00:00Z").await;
+    sqlx::query(
+        "INSERT INTO job_event
+            (job_id, event_kind, event_status, github_comment_id,
+             github_check_run_id, github_check_run_url)
+         VALUES ($1, 'check_run_created', 'success', NULL, 700,
+                 'https://example.test/check/700'),
+                ($1, 'comment_posted', 'success', 800, NULL, NULL)",
+    )
+    .bind(legacy.job_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let duplicate_job = clone_submission_job(&pool, legacy.job_id, 1).await;
+    sqlx::query(
+        "INSERT INTO job_event
+            (job_id, event_kind, event_status, github_comment_id,
+             github_check_run_id, github_check_run_url)
+         VALUES ($1, 'check_run_created', 'success', NULL, 700,
+                 'https://example.test/check/700'),
+                ($1, 'comment_updated', 'success', 800, NULL, NULL)",
+    )
+    .bind(duplicate_job)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrate(&pool).await.unwrap();
+    let row: (Option<i64>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT comment_id, check_run_id, check_name, external_id
+           FROM task_submission_github_report
+          WHERE task_submission_id = $1",
+    )
+    .bind(legacy.submission_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, Some(800));
+    assert_eq!(row.1, Some(700));
+    assert_eq!(row.2.as_deref(), Some("stacks-bench"));
+    assert_eq!(
+        row.3.as_deref(),
+        Some(
+            legacy
+                .job_id
+                .to_string()
+                .as_str()
+        )
+    );
+}
+
+#[tokio::test]
+async fn v28_leaves_history_without_external_identity_unmapped() {
+    let (_db, pool) = setup_pg_db_to(V27_1_MIGRATION).await;
+    seed_tenant(&pool).await;
+    let legacy = seed_submission(&pool, "github_comment", "2026-07-10T00:00:00Z").await;
+
+    migrate(&pool).await.unwrap();
+
+    let mapped: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM task_submission_github_report
+              WHERE task_submission_id = $1
+         )",
+    )
+    .bind(legacy.submission_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!mapped);
+}
+
+#[tokio::test]
+async fn v28_conflicting_history_fails_loudly_and_rolls_back_schema() {
+    let (_db, pool) = setup_pg_db_to(V27_1_MIGRATION).await;
+    seed_tenant(&pool).await;
+    let legacy = seed_submission(&pool, "github_comment", "2026-07-10T00:00:00Z").await;
+    let second_job = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO job
+            (id, task_submission_id, task_spec_id, task_run_index,
+             github_installation_id, github_repo_id, status, source, intent,
+             task_kind, build_target, git_ref_kind, git_ref_display,
+             git_commit_hash)
+         SELECT $2, task_submission_id, task_spec_id, 1,
+                github_installation_id, github_repo_id, status, source, intent,
+                task_kind, build_target, git_ref_kind, git_ref_display,
+                git_commit_hash
+           FROM job WHERE id = $1",
+    )
+    .bind(legacy.job_id)
+    .bind(second_job)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO job_event
+            (job_id, event_kind, event_status, github_check_run_id)
+         VALUES ($1, 'check_run_created', 'success', 700),
+                ($2, 'check_run_created', 'success', 701)",
+    )
+    .bind(legacy.job_id)
+    .bind(second_job)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = migrate(&pool)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("conflicting GitHub check ownership"), "{error}");
+    let table_exists: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public.task_submission_github_report')::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(table_exists, None, "late migration failure must roll back DDL");
+}
+
+#[tokio::test]
+async fn v28_rejects_one_external_check_owned_by_two_submissions() {
+    let (_db, pool) = setup_pg_db_to(V27_1_MIGRATION).await;
+    seed_tenant(&pool).await;
+    let first = seed_submission(&pool, "github_comment", "2026-07-10T00:00:00Z").await;
+    let second = seed_submission(&pool, "github_comment", "2026-07-11T00:00:00Z").await;
+    sqlx::query(
+        "INSERT INTO job_event
+            (job_id, event_kind, event_status, github_check_run_id)
+         VALUES ($1, 'check_run_created', 'success', 700),
+                ($2, 'check_run_created', 'success', 700)",
+    )
+    .bind(first.job_id)
+    .bind(second.job_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = migrate(&pool)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("owned by multiple submissions"), "{error}");
+    assert!(error.contains("700"), "{error}");
+}
+
+#[tokio::test]
+async fn v28_rejects_divergent_comments_within_one_submission() {
+    let (_db, pool) = setup_pg_db_to(V27_1_MIGRATION).await;
+    seed_tenant(&pool).await;
+    let legacy = seed_submission(&pool, "github_comment", "2026-07-10T00:00:00Z").await;
+    let second_job = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO job
+            (id, task_submission_id, task_spec_id, task_run_index,
+             github_installation_id, github_repo_id, status, source, intent,
+             task_kind, build_target, git_ref_kind, git_ref_display,
+             git_commit_hash)
+         SELECT $2, task_submission_id, task_spec_id, 1,
+                github_installation_id, github_repo_id, status, source, intent,
+                task_kind, build_target, git_ref_kind, git_ref_display,
+                git_commit_hash
+           FROM job WHERE id = $1",
+    )
+    .bind(legacy.job_id)
+    .bind(second_job)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO job_event
+            (job_id, event_kind, event_status, github_comment_id)
+         VALUES ($1, 'comment_posted', 'success', 800),
+                ($2, 'comment_posted', 'success', 801)",
+    )
+    .bind(legacy.job_id)
+    .bind(second_job)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = migrate(&pool)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("conflicting GitHub comment ownership"), "{error}");
+    assert!(error.contains("800"), "{error}");
+    assert!(error.contains("801"), "{error}");
+}
+
+#[tokio::test]
+async fn v28_rejects_one_external_comment_owned_by_two_submissions() {
+    let (_db, pool) = setup_pg_db_to(V27_1_MIGRATION).await;
+    seed_tenant(&pool).await;
+    let first = seed_submission(&pool, "github_comment", "2026-07-10T00:00:00Z").await;
+    let second = seed_submission(&pool, "github_comment", "2026-07-11T00:00:00Z").await;
+    sqlx::query(
+        "INSERT INTO job_event
+            (job_id, event_kind, event_status, github_comment_id)
+         VALUES ($1, 'comment_posted', 'success', 800),
+                ($2, 'comment_posted', 'success', 800)",
+    )
+    .bind(first.job_id)
+    .bind(second.job_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = migrate(&pool)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("owned by multiple submissions"), "{error}");
+    assert!(error.contains("800"), "{error}");
 }

@@ -27,6 +27,7 @@ use crate::models::{
 };
 #[cfg(feature = "testing")]
 use crate::models::{JobCreationRequest, NewJob};
+use sbgh_core::reporting::SubmissionGithubReportIdentity;
 
 #[derive(Clone)]
 pub struct PostgresJobStore {
@@ -524,6 +525,13 @@ impl BaselineRow {
 
 #[async_trait]
 impl JobStore for PostgresJobStore {
+    async fn submission_report(
+        &self,
+        submission_id: Uuid,
+    ) -> sbgh_core::Result<Option<sbgh_core::reporting::SubmissionReportView>> {
+        crate::application::submission_report(&self.pool, submission_id).await
+    }
+
     #[cfg(feature = "testing")]
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
         let mut tx = self
@@ -1908,6 +1916,153 @@ impl JobStore for PostgresJobStore {
         .await
         .core()?;
         Ok(row.map(|(id, url)| (id.unwrap_or_default(), url)))
+    }
+
+    async fn submission_github_report_identity(
+        &self,
+        submission_id: Uuid,
+    ) -> Result<Option<SubmissionGithubReportIdentity>> {
+        let row: Option<(
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT comment_id, check_run_id, check_run_url, check_name, external_id
+              FROM task_submission_github_report
+             WHERE task_submission_id = $1
+            "#,
+        )
+        .bind(submission_id)
+        .fetch_optional(&self.pool)
+        .await
+        .core()?;
+        Ok(row.map(|(comment_id, check_run_id, check_run_url, check_name, external_id)| {
+            SubmissionGithubReportIdentity {
+                comment_id,
+                check_run_id,
+                check_run_url,
+                check_name,
+                external_id,
+            }
+        }))
+    }
+
+    async fn record_submission_comment(&self, job_id: Uuid, comment_id: i64) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let updated = sqlx::query(
+            r#"
+            INSERT INTO task_submission_github_report
+                (task_submission_id, comment_id)
+            SELECT task_submission_id, $2
+              FROM job
+             WHERE id = $1
+            ON CONFLICT (task_submission_id) DO UPDATE
+                SET comment_id = EXCLUDED.comment_id,
+                    updated_at = NOW()
+              WHERE task_submission_github_report.comment_id IS NULL
+                 OR task_submission_github_report.comment_id = EXCLUDED.comment_id
+            "#,
+        )
+        .bind(job_id)
+        .bind(comment_id)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        if updated.rows_affected() != 1 {
+            return Err(sbgh_core::Error::Other(anyhow::anyhow!(
+                "submission comment identity missing or conflicts for job {job_id}"
+            )));
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO job_event
+                (job_id, event_kind, event_status, github_comment_id)
+            VALUES ($1, 'comment_posted', 'success', $2)
+            "#,
+        )
+        .bind(job_id)
+        .bind(comment_id)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        tx.commit().await.core()?;
+        Ok(())
+    }
+
+    async fn record_submission_check(
+        &self,
+        job_id: Uuid,
+        check_run_id: i64,
+        html_url: Option<&str>,
+        check_name: &str,
+        external_id: &str,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let updated = sqlx::query(
+            r#"
+            INSERT INTO task_submission_github_report
+                (task_submission_id, check_run_id, check_run_url, check_name,
+                 external_id)
+            SELECT task_submission_id, $2, $3, $4, $5
+              FROM job
+             WHERE id = $1
+            ON CONFLICT (task_submission_id) DO UPDATE
+                SET check_run_id = EXCLUDED.check_run_id,
+                    check_run_url = COALESCE(
+                        EXCLUDED.check_run_url,
+                        task_submission_github_report.check_run_url
+                    ),
+                    check_name = EXCLUDED.check_name,
+                    external_id = EXCLUDED.external_id,
+                    updated_at = NOW()
+              WHERE task_submission_github_report.check_run_id IS NULL
+                 OR (
+                     task_submission_github_report.check_run_id = EXCLUDED.check_run_id
+                     AND task_submission_github_report.check_name = EXCLUDED.check_name
+                     AND task_submission_github_report.external_id = EXCLUDED.external_id
+                 )
+            "#,
+        )
+        .bind(job_id)
+        .bind(check_run_id)
+        .bind(html_url)
+        .bind(check_name)
+        .bind(external_id)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        if updated.rows_affected() != 1 {
+            return Err(sbgh_core::Error::Other(anyhow::anyhow!(
+                "submission check identity missing or conflicts for job {job_id}"
+            )));
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO job_event
+                (job_id, event_kind, event_status, github_check_run_id,
+                 github_check_run_url)
+            VALUES ($1, 'check_run_created', 'success', $2, $3)
+            "#,
+        )
+        .bind(job_id)
+        .bind(check_run_id)
+        .bind(html_url)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        tx.commit().await.core()?;
+        Ok(())
     }
 
     async fn latest_plan_message_ts(&self, job_id: Uuid) -> Result<Option<String>> {

@@ -32,7 +32,10 @@ use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::build_report_surface;
 #[cfg(test)]
 use crate::report::log_nonfatal_projection;
-use crate::report::{CompletionReport, ReportSurface, marked_pr_comment, pr_report_marker};
+use crate::report::{
+    CompletionReport, ReportSurface, check_name, marked_pr_comment, pr_report_marker,
+    report_external_id, task_label,
+};
 use crate::slack_report::SlackSessionRegistry;
 #[cfg(test)]
 use sbgh_driver::{Terminal, WorkerEvent};
@@ -44,7 +47,9 @@ use sbgh_slack::SlackClient;
 /// for the whole process). `None` → the Check Run reconcile is skipped this
 /// time and a fresh check may still be created; PR-comment creation instead
 /// fails closed because its marker is not safe without an authenticated author
-/// id. The `OnceCell` is shared across the daemon's jobs (the fleet coordinator
+/// id. Check creation also fails closed while the App identity is unavailable:
+/// without a trustworthy lookup, “not checked” is not equivalent to “not
+/// found.” The `OnceCell` is shared across the daemon's jobs (the fleet coordinator
 /// owns it), so successful resolution happens at most once.
 pub async fn resolved_app_id(cell: &OnceCell<i64>, gh: &dyn GitHubApi) -> Option<i64> {
     match cell
@@ -65,8 +70,6 @@ pub async fn resolved_app_id(cell: &OnceCell<i64>, gh: &dyn GitHubApi) -> Option
 
 /// Display name of the Check Run the daemon posts. Stable so the
 /// reconcile filter (`check_name`) and GitHub's per-name dedup both work.
-pub const CHECK_NAME: &str = "stacks-bench";
-
 /// Test-only result passed from the legacy reporter to its in-process worker.
 #[derive(Debug)]
 #[cfg(test)]
@@ -178,35 +181,74 @@ impl Reporter {
         surface: &dyn ReportSurface,
         outcome: &sbgh_proto::TerminalOutcome,
     ) -> anyhow::Result<()> {
+        let snapshot = self
+            .jobs
+            .submission_report(self.job.task_submission_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "submission {} has no canonical report snapshot",
+                    self.job.task_submission_id
+                )
+            })?;
         match outcome {
             sbgh_proto::TerminalOutcome::Completed { summary, block_validation } => {
-                let multi_variant_comparison = self
-                    .multi_variant_comparison()
-                    .await;
-                let baseline_comparison = self
-                    .baseline_comparison(summary)
-                    .await;
-                let mut render_summary = summary.clone();
-                if let Some(result) = block_validation
-                    && let Some(object) = render_summary.as_object_mut()
-                {
-                    object.insert(
-                        "block_validation".into(),
-                        serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
-                    );
-                }
+                anyhow::ensure!(
+                    matches!(
+                        snapshot.lifecycle.state,
+                        sbgh_core::reporting::ReportLifecycleState::Queued
+                            | sbgh_core::reporting::ReportLifecycleState::Running
+                            | sbgh_core::reporting::ReportLifecycleState::Completed
+                    ),
+                    "completed terminal outcome disagrees with canonical lifecycle {:?}",
+                    snapshot.lifecycle.state
+                );
+                let (multi_variant_comparison, baseline_comparison) = match &snapshot.task {
+                    sbgh_core::reporting::TaskReport::Benchmark(_) => (
+                        self.multi_variant_comparison()
+                            .await,
+                        self.baseline_comparison(summary)
+                            .await,
+                    ),
+                    sbgh_core::reporting::TaskReport::BuildOnly(_)
+                    | sbgh_core::reporting::TaskReport::BlockValidation(_) => (None, None),
+                };
+                anyhow::ensure!(
+                    block_validation.is_some()
+                        == matches!(
+                            &snapshot.task,
+                            sbgh_core::reporting::TaskReport::BlockValidation(_)
+                        ),
+                    "terminal outcome task detail disagrees with canonical submission report"
+                );
                 surface
                     .completed(CompletionReport {
-                        summary: &render_summary,
+                        snapshot,
+                        summary,
                         baseline_comparison: baseline_comparison.as_ref(),
                         multi_variant_comparison: multi_variant_comparison.as_ref(),
                     })
                     .await
             }
-            sbgh_proto::TerminalOutcome::Failed { error, .. } => surface.failed(error).await,
-            sbgh_proto::TerminalOutcome::Cancelled { reason } => {
+            sbgh_proto::TerminalOutcome::Failed { error, .. } => {
+                anyhow::ensure!(
+                    snapshot.lifecycle.state == sbgh_core::reporting::ReportLifecycleState::Failed,
+                    "failed terminal outcome disagrees with canonical lifecycle {:?}",
+                    snapshot.lifecycle.state
+                );
                 surface
-                    .cancelled(reason)
+                    .failed(&snapshot, error)
+                    .await
+            }
+            sbgh_proto::TerminalOutcome::Cancelled { reason } => {
+                anyhow::ensure!(
+                    snapshot.lifecycle.state
+                        == sbgh_core::reporting::ReportLifecycleState::Cancelled,
+                    "cancelled terminal outcome disagrees with canonical lifecycle {:?}",
+                    snapshot.lifecycle.state
+                );
+                surface
+                    .cancelled(&snapshot, reason)
                     .await
             }
         }
@@ -282,7 +324,18 @@ impl Reporter {
                 .jobs
                 .fail(&self.job, msg, None)
                 .await;
-            log_nonfatal_projection(self.job.id, surface.failed(msg).await);
+            let snapshot = self
+                .test_report_snapshot(
+                    sbgh_core::reporting::ReportLifecycleState::Failed,
+                    Some(msg.into()),
+                )
+                .await;
+            log_nonfatal_projection(
+                self.job.id,
+                surface
+                    .failed(&snapshot, msg)
+                    .await,
+            );
             let _ = prepared_tx.send(Prepared::Abort);
             return Ok(());
         }
@@ -369,7 +422,18 @@ impl Reporter {
             .jobs
             .fail(&self.job, msg, None)
             .await;
-        log_nonfatal_projection(self.job.id, surface.failed(msg).await);
+        let snapshot = self
+            .test_report_snapshot(
+                sbgh_core::reporting::ReportLifecycleState::Failed,
+                Some(msg.into()),
+            )
+            .await;
+        log_nonfatal_projection(
+            self.job.id,
+            surface
+                .failed(&snapshot, msg)
+                .await,
+        );
         Err(anyhow::anyhow!("{msg}"))
     }
 
@@ -603,10 +667,17 @@ impl Reporter {
                 let comparison = self
                     .baseline_comparison(&summary)
                     .await;
+                let snapshot = self
+                    .test_report_snapshot(
+                        sbgh_core::reporting::ReportLifecycleState::Completed,
+                        None,
+                    )
+                    .await;
                 log_nonfatal_projection(
                     self.job.id,
                     surface
                         .completed(CompletionReport {
+                            snapshot,
                             summary: &summary,
                             baseline_comparison: comparison.as_ref(),
                             multi_variant_comparison: multi_variant_comparison.as_ref(),
@@ -635,7 +706,18 @@ impl Reporter {
                     tracing::error!(job_id = %self.job.id, error = ?e, "persisting failed result failed");
                     return Some(e);
                 }
-                log_nonfatal_projection(self.job.id, surface.failed(&error).await);
+                let snapshot = self
+                    .test_report_snapshot(
+                        sbgh_core::reporting::ReportLifecycleState::Failed,
+                        Some(error.clone()),
+                    )
+                    .await;
+                log_nonfatal_projection(
+                    self.job.id,
+                    surface
+                        .failed(&snapshot, &error)
+                        .await,
+                );
                 None
             }
             Terminal::SetupError { error } => {
@@ -646,7 +728,18 @@ impl Reporter {
                     .jobs
                     .fail(&self.job, &error, None)
                     .await;
-                log_nonfatal_projection(self.job.id, surface.failed(&error).await);
+                let snapshot = self
+                    .test_report_snapshot(
+                        sbgh_core::reporting::ReportLifecycleState::Failed,
+                        Some(error.clone()),
+                    )
+                    .await;
+                log_nonfatal_projection(
+                    self.job.id,
+                    surface
+                        .failed(&snapshot, &error)
+                        .await,
+                );
                 Some(anyhow::anyhow!("{error}"))
             }
             Terminal::Aborted => {
@@ -667,9 +760,88 @@ impl Reporter {
                     tracing::error!(job_id = %self.job.id, error = ?e, "persisting cancelled terminal failed");
                     return Some(e);
                 }
-                log_nonfatal_projection(self.job.id, surface.cancelled(msg).await);
+                let snapshot = self
+                    .test_report_snapshot(
+                        sbgh_core::reporting::ReportLifecycleState::Cancelled,
+                        Some(msg.into()),
+                    )
+                    .await;
+                log_nonfatal_projection(
+                    self.job.id,
+                    surface
+                        .cancelled(&snapshot, msg)
+                        .await,
+                );
                 None
             }
+        }
+    }
+
+    #[cfg(test)]
+    async fn test_report_snapshot(
+        &self,
+        state: sbgh_core::reporting::ReportLifecycleState,
+        failure: Option<String>,
+    ) -> sbgh_core::reporting::SubmissionReportView {
+        if let Ok(Some(snapshot)) = self
+            .jobs
+            .submission_report(self.job.task_submission_id)
+            .await
+        {
+            return snapshot;
+        }
+        use sbgh_core::reporting::{
+            BenchmarkReportView, BlockValidationReportView, BuildOnlyReportView, ReportIdentity,
+            ReportLifecycle, SubmissionReportView, TaskReport,
+        };
+        let task = match self.job.task_kind {
+            sbgh_core::models::TaskKind::Benchmark => TaskReport::Benchmark(BenchmarkReportView {
+                requested_runs: self
+                    .job
+                    .submission_requested_run_count
+                    .max(1) as u32,
+                completed_runs: u32::from(
+                    state == sbgh_core::reporting::ReportLifecycleState::Completed,
+                ),
+            }),
+            sbgh_core::models::TaskKind::BuildOnly => {
+                TaskReport::BuildOnly(BuildOnlyReportView { cache_outcome: None })
+            }
+            sbgh_core::models::TaskKind::BlockValidation => {
+                TaskReport::BlockValidation(BlockValidationReportView {
+                    requested_range: None,
+                    observed_range: None,
+                    verdict: None,
+                    checked_blocks: None,
+                    chainstate_origin: None,
+                    invalid_blocks: Vec::new(),
+                })
+            }
+        };
+        SubmissionReportView {
+            identity: ReportIdentity {
+                submission_id: self.job.task_submission_id,
+                current_job_id: Some(self.job.id),
+                current_attempt_id: None,
+                task_kind: self.job.task_kind,
+                source: sbgh_core::models::JobSource::Daemon,
+                repository: self.job.repository.clone(),
+                commit: self.job.commit.clone(),
+            },
+            lifecycle: ReportLifecycle {
+                state,
+                phase: None,
+                completed_jobs: u32::from(
+                    state == sbgh_core::reporting::ReportLifecycleState::Completed,
+                ),
+                total_jobs: self
+                    .job
+                    .submission_requested_run_count
+                    .max(1) as u32,
+                failure,
+            },
+            task,
+            artifacts: Vec::new(),
         }
     }
 
@@ -796,35 +968,38 @@ impl Reporter {
     /// reconcile (when the App id resolved via `GET /app`) reuses a run created
     /// just before a crash rather than duplicating it.
     async fn ensure_check(&self) -> Option<(i64, Option<String>)> {
-        let external_id = self.job.id.to_string();
-        if let Some(app_id) = resolved_app_id(&self.app_id, self.gh.as_ref()).await {
-            match self
-                .gh
-                .find_check_run_by_external_id(
-                    self.job.installation_id,
-                    &self.job.repository,
-                    &self.job.commit,
-                    CHECK_NAME,
-                    app_id,
-                    &external_id,
-                )
-                .await
-            {
-                Ok(Some(existing)) => {
-                    self.persist_check_id(existing.id, existing.html_url.as_deref())
-                        .await;
-                    tracing::info!(job_id = %self.job.id, check_run_id = existing.id, "reconciled existing check run");
-                    return Some((existing.id, existing.html_url));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(job_id = %self.job.id, error = ?e, "check reconcile lookup failed; creating")
-                }
+        let check_name = check_name(self.job.task_kind)?;
+        let external_id = report_external_id(self.job.task_submission_id, self.job.task_kind);
+        let app_id = resolved_app_id(&self.app_id, self.gh.as_ref()).await?;
+        match self
+            .gh
+            .find_check_run_by_external_id(
+                self.job.installation_id,
+                &self.job.repository,
+                &self.job.commit,
+                check_name,
+                app_id,
+                &external_id,
+            )
+            .await
+        {
+            Ok(Some(existing)) => {
+                self.persist_check_id(existing.id, existing.html_url.as_deref())
+                    .await;
+                tracing::info!(job_id = %self.job.id, check_run_id = existing.id, "reconciled existing check run");
+                return Some((existing.id, existing.html_url));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(job_id = %self.job.id, error = ?e, "check reconcile lookup failed; refusing to create blindly");
+                return None;
             }
         }
+
+        let label = task_label(self.job.task_kind);
         let output = CheckRunOutput {
-            title: format!("benchmark {}", self.job.id),
-            summary: format!("Benchmarking commit `{}`…", self.job.commit),
+            title: format!("{label} {}", self.job.task_submission_id),
+            summary: format!("Running {label} for commit `{}`…", self.job.commit),
             text: None,
         };
         match self
@@ -833,7 +1008,7 @@ impl Reporter {
                 self.job.installation_id,
                 &self.job.repository,
                 &self.job.commit,
-                CHECK_NAME,
+                check_name,
                 &external_id,
                 CheckRunUpdate {
                     state: CheckRunState::InProgress,
@@ -884,8 +1059,9 @@ impl Reporter {
         let body = marked_pr_comment(
             self.job.task_submission_id,
             &format!(
-                ":construction: starting benchmark `{id}` (commit `{sha}`)…{link}",
-                id = self.job.id,
+                ":construction: starting {task} `{id}` (commit `{sha}`)…{link}",
+                task = task_label(self.job.task_kind),
+                id = self.job.task_submission_id,
                 sha = self.job.commit,
             ),
         );
@@ -1033,6 +1209,8 @@ mod tests {
         baseline: Option<BaselineRef>,
         specs: Vec<SubmissionSpec>,
         metrics: HashMap<Uuid, Vec<BenchmarkRunMetric>>,
+        report: Option<sbgh_core::reporting::SubmissionReportView>,
+        submission_specs_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordingStore {
@@ -1055,6 +1233,12 @@ mod tests {
             Self {
                 specs,
                 metrics,
+                ..Self::default()
+            }
+        }
+        fn with_report(report: sbgh_core::reporting::SubmissionReportView) -> Self {
+            Self {
+                report: Some(report),
                 ..Self::default()
             }
         }
@@ -1114,7 +1298,15 @@ mod tests {
             &self,
             _task_submission_id: Uuid,
         ) -> anyhow::Result<Vec<SubmissionSpec>> {
+            self.submission_specs_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.specs.clone())
+        }
+        async fn submission_report(
+            &self,
+            _task_submission_id: Uuid,
+        ) -> anyhow::Result<Option<sbgh_core::reporting::SubmissionReportView>> {
+            Ok(self.report.clone())
         }
         async fn fail(
             &self,
@@ -1705,8 +1897,12 @@ mod tests {
             &reporter.job,
         );
         let summary = serde_json::json!({});
+        let snapshot = reporter
+            .test_report_snapshot(sbgh_core::reporting::ReportLifecycleState::Completed, None)
+            .await;
         surface
             .completed(CompletionReport {
+                snapshot,
                 summary: &summary,
                 baseline_comparison: None,
                 multi_variant_comparison: Some(&comparison),
@@ -1788,6 +1984,85 @@ mod tests {
                 .await
                 .is_none(),
             "a moved PR head must not compare across commits",
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_terminal_does_not_query_benchmark_comparison_data() {
+        use sbgh_core::reporting::{
+            BlockValidationReportView, BlockValidationVerdict, ReportIdentity, ReportLifecycle,
+            ReportLifecycleState, SubmissionReportView, TaskReport,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut job = job_with(ProgressTarget::CommitCheck { check_run_id: None });
+        job.task_kind = TaskKind::BlockValidation;
+        job.build_target = BuildTarget::StacksInspect;
+        let result = sbgh_proto::BlockValidationResult {
+            valid: true,
+            checked_blocks: 1,
+            invalid_blocks: Vec::new(),
+            chainstate_origin: "nightly".into(),
+            observed_range: sbgh_proto::InclusiveRange { start: 1, end: 1 },
+        };
+        let report = SubmissionReportView {
+            identity: ReportIdentity {
+                submission_id: job.task_submission_id,
+                current_job_id: Some(job.id),
+                current_attempt_id: None,
+                task_kind: TaskKind::BlockValidation,
+                source: sbgh_core::models::JobSource::Daemon,
+                repository: job.repository.clone(),
+                commit: job.commit.clone(),
+            },
+            lifecycle: ReportLifecycle {
+                state: ReportLifecycleState::Completed,
+                phase: None,
+                completed_jobs: 1,
+                total_jobs: 1,
+                failure: None,
+            },
+            task: TaskReport::BlockValidation(BlockValidationReportView {
+                requested_range: None,
+                observed_range: Some(sbgh_core::reporting::InclusiveReportRange {
+                    start: 1,
+                    end: 1,
+                }),
+                verdict: Some(BlockValidationVerdict::Valid),
+                checked_blocks: Some(1),
+                chainstate_origin: Some("nightly".into()),
+                invalid_blocks: Vec::new(),
+            }),
+            artifacts: Vec::new(),
+        };
+        let store = Arc::new(RecordingStore::with_report(report));
+        let reporter = Reporter::new(
+            Arc::new(no_report_config(&tmp)),
+            store.clone(),
+            Arc::new(FakeGitHub::new()),
+            Arc::new(OnceCell::new()),
+            None,
+            Default::default(),
+            job,
+        );
+
+        reporter
+            .report_fleet_terminal(
+                &crate::report::NoopReportSurface,
+                &sbgh_proto::TerminalOutcome::Completed {
+                    summary: serde_json::json!({}),
+                    block_validation: Some(result),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .submission_specs_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "validation must not enter benchmark comparison reads",
         );
     }
 }

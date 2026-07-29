@@ -7,8 +7,8 @@ use crate::dto::{
     EnqueueBlockValidationRequest, EnqueueJobResponse, FleetCancellationResponse, FleetOverview,
     FleetRecoveryRequest, FleetRecoveryResponse, FleetWorkerView, GrantRoleResult, HealthResponse,
     InstallationView, InstallerView, JobView, PinTriggerRequest, PolicyView, RepoRootView,
-    ResolveRepoResponse, RoleRequest, RoleView, TriggerView, UserView, WebhookSubmitResponse,
-    WebhookSummary, WhoamiResponse, WorkerDrainRequest,
+    ResolveRepoResponse, RoleRequest, RoleView, SubmissionReportView, TriggerView, UserView,
+    WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerDrainRequest,
 };
 use crate::error::ApiError;
 
@@ -296,6 +296,14 @@ impl Client {
         request: &EnqueueBlockValidationRequest,
     ) -> Result<EnqueueJobResponse, ClientError> {
         self.post_json("/api/jobs/block-validation", request)
+            .await
+    }
+
+    pub async fn submission_report(
+        &self,
+        submission_id: &str,
+    ) -> Result<SubmissionReportView, ClientError> {
+        self.get(&format!("/api/submissions/{submission_id}/report"))
             .await
     }
 
