@@ -50,3 +50,5 @@ into an ADR as we work the related item (skeleton phase — not yet extracted):
 *Extracted so far (from `0001-artifact-store`):* `0001-artifact-urls-s3-only`,
 `0002-artifact-refs-are-store-keys`,
 `0003-artifact-export-failure-not-benchmark-failure`.
+
+*Established for the worker fleet:* `0004-protobuf-fleet-protocol`.

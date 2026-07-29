@@ -346,6 +346,43 @@ from older generations.
 surface command, task-specific result rendering, or redesign of the worker
 event protocol.
 
+### 0075 — Rolling worker protocol compatibility
+
+- **id:** `0075-rolling-worker-protocol-compatibility`
+- **status:** `candidate`
+- **priority:** `medium`
+- **depends_on:** `0074-protobuf-fleet-protocol`
+- **source:** v29 protocol-scope simplification (2026-07)
+
+**Problem:** v29 establishes the first published protobuf/gRPC worker contract
+with exact protocol-version matching. Once independently operated workers may
+lag a protocol-changing central deployment, exact matching would make those
+workers unavailable until upgraded.
+
+**Scope:** Before the first incompatible change to the shipped protobuf
+contract, add a bounded current/previous compatibility window, protocol
+revision and additive-feature negotiation, server-first rollout policy,
+previous-worker runtime fixtures, and schema breaking-change enforcement
+against the published v29 baseline. Persist the negotiated contract on each
+worker session and require both task capability and protocol feature support
+before offering work.
+
+**Acceptance:**
+
+- The current daemon completes the compatible fleet lifecycle with the current
+  and immediately previous supported worker.
+- An older or incompatible worker is rejected before assignment with an
+  actionable non-retryable upgrade response.
+- A worker is never offered task semantics it did not advertise.
+- CI rejects field-number reuse and other wire-breaking schema changes against
+  the published baseline.
+- Operator documentation defines the support window, server-first rollout,
+  convergence check, compatibility-floor advancement, and rollback.
+
+**Deferred / non-goals:** No indefinite support for arbitrary historical
+workers, daemon-pushed scheduling, multi-orchestrator HA, or requirement for a
+second worker implementation language.
+
 *`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
 model: source / intent / task_kind / build_target / derived report; build-only
 proven) — as-built record in
