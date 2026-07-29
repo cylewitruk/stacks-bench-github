@@ -40,15 +40,7 @@ fn maps_app_mention_to_provider_neutral_event() {
 async fn dispatched_mention_enqueues_off_the_ack_path() {
     let queue = Arc::new(RecordingBenchmarkQueue::default());
     let client = Arc::new(FakeSlackClient::default());
-    let connector = Arc::new(SlackConnector::new(
-        config(),
-        SlackJobTarget {
-            installation_id: 100,
-            repo_id: 10,
-        },
-        queue.clone(),
-        client,
-    ));
+    let connector = Arc::new(SlackConnector::new(config(), queue.clone(), client));
     spawn_dispatch(Some(connector), mention_from_callback(&parse_callback()).unwrap());
     for _ in 0..1000 {
         if !queue.jobs().is_empty() {

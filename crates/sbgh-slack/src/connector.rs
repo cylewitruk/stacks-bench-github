@@ -26,13 +26,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sbgh_core::bench_args::workload_key;
-use sbgh_core::db::NewBenchmarkSpec;
-use sbgh_core::models::{
-    BuildTarget, GitRefKind, Job, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail,
-    TaskKind,
-};
+use sbgh_core::models::QueuedEventDetail;
+use sbgh_core::submission::SubmissionReceipt;
 use sbgh_intent::{IntentOutcome, IntentResolver};
-use uuid::Uuid;
 
 use crate::{
     ACK_REACTION, PublishUrgency, QUEUED_REACTION, ReportingIdentity, SlackClient,
@@ -90,7 +86,6 @@ impl SlackConnectorConfig {
 
 pub struct SlackConnector {
     cfg: SlackConnectorConfig,
-    target: SlackJobTarget,
     jobs: Arc<dyn BenchmarkQueue>,
     client: Arc<dyn SlackClient>,
     intent_resolver: Option<Arc<dyn IntentResolver>>,
@@ -109,25 +104,39 @@ pub struct SlackConnector {
 /// store.
 #[async_trait]
 pub trait BenchmarkQueue: Send + Sync + 'static {
-    async fn create_unlinked_benchmark_submission(
+    async fn submit_benchmark(
         &self,
-        first_job_id: Uuid,
-        specs: &[NewBenchmarkSpec],
+        variants: &[BenchmarkVariantRequest],
         queued_event_detail: &serde_json::Value,
         plan_message_ts: Option<&str>,
-    ) -> sbgh_core::Result<Job>;
+        actor: SlackSubmissionActor<'_>,
+    ) -> sbgh_core::Result<SubmissionReceipt>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchmarkVariantRequest {
+    pub rev: String,
+    pub workload_key: String,
+    pub requested_run_count: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SlackSubmissionActor<'a> {
+    pub team_id: &'a str,
+    pub user_id: &'a str,
+    pub channel_id: &'a str,
+    pub request_message_ts: &'a str,
+    pub reporting_identity: &'a str,
 }
 
 impl SlackConnector {
     pub fn new(
         cfg: SlackConnectorConfig,
-        target: SlackJobTarget,
         jobs: Arc<dyn BenchmarkQueue>,
         client: Arc<dyn SlackClient>,
     ) -> Self {
         Self {
             cfg,
-            target,
             jobs,
             client,
             intent_resolver: None,
@@ -174,9 +183,9 @@ impl SlackConnector {
     /// either an ephemeral reply (rejection) or a logged best-effort miss; the
     /// caller (receive loop) has already acked the envelope.
     ///
-    /// The span carries the correlation fields (`ts`, then `job_id` once the
-    /// job exists) so the whole request — including the nested LLM resolver
-    /// — is traceable on one set of fields.
+    /// The span carries the correlation fields (`ts`, then submission/job ids
+    /// once persistence succeeds) so the whole request — including the nested
+    /// LLM resolver — is traceable on one set of fields.
     #[tracing::instrument(
         level = "info",
         name = "slack_mention",
@@ -185,6 +194,7 @@ impl SlackConnector {
             channel = %event.channel,
             user = %event.user,
             ts = %event.message_ts,
+            submission_id = tracing::field::Empty,
             job_id = tracing::field::Empty,
         )
     )]
@@ -244,12 +254,16 @@ impl SlackConnector {
                     .unwrap_or_else(|| self.cfg.default_rev.clone());
                 let clean_repetitions = spec.clean_repetitions;
                 let bench_args = spec.to_bench_args();
-                let new_job = self.new_slack_benchmark_job(rev.clone(), workload_key(&bench_args));
+                let workload_key = workload_key(&bench_args);
                 (
-                    rev,
+                    rev.clone(),
                     bench_args,
                     clean_repetitions,
-                    vec![NewBenchmarkSpec::singleton(new_job, clean_repetitions as i32)],
+                    vec![BenchmarkVariantRequest {
+                        rev,
+                        workload_key,
+                        requested_run_count: clean_repetitions as i32,
+                    }],
                 )
             }
             BenchmarkRequest::Comparison(comparison) => {
@@ -268,11 +282,10 @@ impl SlackConnector {
                 let specs = revs
                     .iter()
                     .cloned()
-                    .map(|rev| {
-                        NewBenchmarkSpec::singleton(
-                            self.new_slack_benchmark_job(rev, workload_key.clone()),
-                            clean_repetitions as i32,
-                        )
+                    .map(|rev| BenchmarkVariantRequest {
+                        rev,
+                        workload_key: workload_key.clone(),
+                        requested_run_count: clean_repetitions as i32,
                     })
                     .collect();
                 (revs.join(" vs "), bench_args, clean_repetitions, specs)
@@ -310,9 +323,8 @@ impl SlackConnector {
         // 3a. Reconcile or post before creating the job. The identity is stable
         //     across Socket Mode redelivery, so a lost post response can be
         //     adopted rather than duplicated when the reporter takes over.
-        let job_id = Uuid::new_v4();
         let queued_snapshot = self
-            .post_queued_snapshot(&event, &rev_label, clean_repetitions, reporting_identity)
+            .post_queued_snapshot(&event, &rev_label, clean_repetitions, reporting_identity.clone())
             .await;
         let posted = queued_snapshot
             .publisher
@@ -322,23 +334,46 @@ impl SlackConnector {
         // 3b. Create the job, its queued event, and (when posted) the
         //     plan-message event in one transaction — so the job is never
         //     claimable without its plan `ts`.
-        if let Err(e) = self
+        let receipt = match self
             .jobs
-            .create_unlinked_benchmark_submission(job_id, &specs, &detail, posted.as_deref())
+            .submit_benchmark(
+                &specs,
+                &detail,
+                posted.as_deref(),
+                SlackSubmissionActor {
+                    team_id: &event.team_id,
+                    user_id: &event.user,
+                    channel_id: &event.channel,
+                    request_message_ts: &event.message_ts,
+                    reporting_identity: reporting_identity.as_str(),
+                },
+            )
             .await
         {
-            tracing::error!(error = %e, "slack: enqueue failed");
-            // Turn the orphaned queued snapshot into a visible failure.
-            self.fail_queued_snapshot(&queued_snapshot)
-                .await;
-            self.reject_after_ack(&event, "couldn't enqueue the benchmark — please retry")
-                .await;
-            return;
+            Ok(receipt) => receipt,
+            Err(e) => {
+                tracing::error!(error = %e, "slack: enqueue failed");
+                // Turn the orphaned queued snapshot into a visible failure.
+                self.fail_queued_snapshot(&queued_snapshot)
+                    .await;
+                self.reject_after_ack(&event, "couldn't enqueue the benchmark — please retry")
+                    .await;
+                return;
+            }
+        };
+        tracing::Span::current()
+            .record("submission_id", tracing::field::display(receipt.submission_id));
+        if let Some(job_id) = receipt
+            .initial_job_ids
+            .first()
+        {
+            tracing::Span::current().record("job_id", tracing::field::display(job_id));
         }
-        // The job now exists — pivot the span's correlation field to `job_id` so
-        // the runner/reporter lines line up.
-        tracing::Span::current().record("job_id", tracing::field::display(job_id));
-        tracing::info!(snapshot_posted = posted.is_some(), "slack: ad-hoc benchmark enqueued");
+        tracing::info!(
+            disposition = ?receipt.disposition,
+            snapshot_posted = posted.is_some(),
+            "slack: ad-hoc benchmark enqueued"
+        );
 
         // 4. Accepted: swap 👀 → ⏳; the reporter drives ⏳ → 🚀 → ✅/❌ from here.
         self.remove_ack(&event).await;
@@ -408,28 +443,6 @@ impl SlackConnector {
             self.max_variants,
             self.max_comparison_lifecycles,
         )
-    }
-
-    fn new_slack_benchmark_job(&self, rev: String, workload_key: String) -> NewJob {
-        NewJob {
-            github_installation_id: self.target.installation_id,
-            github_repo_id: self.target.repo_id,
-            axes: JobAxes {
-                source: JobSource::Slack,
-                intent: JobIntent::AdhocBenchmark,
-                task_kind: TaskKind::Benchmark,
-                build_target: BuildTarget::StacksBench,
-            },
-            // `Branch` is the neutral default for a default-rev like `develop`;
-            // `git_commit_hash` is `None`, so the fleet coordinator resolves
-            // the bare rev to an immutable commit before this job becomes
-            // schedulable.
-            git_ref_kind: GitRefKind::Branch,
-            git_ref_display: rev,
-            git_commit_hash: None,
-            git_committed_at: None,
-            workload_key: Some(workload_key),
-        }
     }
 
     async fn resolve_request_for_event(

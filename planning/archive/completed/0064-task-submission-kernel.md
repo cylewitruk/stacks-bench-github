@@ -1,12 +1,12 @@
 # v27.2: Task-Submission Kernel
 
 Continuation of
-[v27.1](../archive/completed/0073-task-neutral-submission-model.md). Replace the duplicated
+[v27.1](0073-task-neutral-submission-model.md). Replace the duplicated
 submission writers with one daemon-owned application boundary while preserving
 the existing pull scheduler and fleet coordinator.
 
-> **Status:** planned — `0064-task-submission-kernel` promoted from the backlog
-> on 2026-07-28.
+> **Status:** shipped — implementation and local validation completed on
+> 2026-07-28; focused migration hardening completed on 2026-07-29.
 >
 > v27.1 performs the independently committable, behavior-preserving
 > persistence/domain rename. v27.2 contains every intentional submission
@@ -15,7 +15,7 @@ the existing pull scheduler and fleet coordinator.
 ## Item
 
 - **id:** `0064-task-submission-kernel`
-- **status:** `planned`
+- **status:** `shipped`
 - **priority:** `high`
 - **depends_on:** `0004-worker-fleet`, `0005-task-kind-platform`,
   `0019-block-validation-recipe`, `0073-task-neutral-submission-model`
@@ -315,17 +315,55 @@ work.
 
 ## Final Validation
 
-- `just build`
-- `just lint`
-- `just test`
-- `git diff --check`
-- Fresh and v27.1-to-v27.2 migration suites pass.
-- Existing benchmark/build-only/validation regressions pass.
-- Concurrency tests cover exact replay, conflicting replay, simultaneous first
+- [x] `just build --no-sccache`
+- [x] `just lint --no-sccache`
+- [x] `just test --summary --no-sccache`
+- [x] `git diff --check`
+- [x] Fresh and v27.1-to-v27.2 migration suites pass.
+- [x] The upgrade suite exercises populated GitHub/Slack backfills,
+  deterministic first-writer Slack redelivery reconciliation, dual-source
+  rejection, and the in-flight/cleanup drain guard.
+- [x] Existing benchmark/build-only/validation regressions pass.
+- [x] Concurrency tests cover exact replay, conflicting replay, simultaneous first
   submission, and rollback at each boundary.
-- Pull-scheduler/fleet-coordinator suites prove no ownership drift.
-- Package-DAG, unused-dependency, docs/registry, target-schema, and boundary
+- [x] Pull-scheduler/fleet-coordinator suites prove no ownership drift.
+- [x] Package-DAG, unused-dependency, docs/registry, target-schema, and boundary
   checks pass.
+
+## Shipped Outcome
+
+v27.2 delivers one daemon-owned submission kernel for GitHub benchmark
+triggers, Slack requests, cache warming/build-only, admin validation, and
+GitHub validation. Surface adapters now submit typed immutable plans; one
+PostgreSQL transaction persists the complete aggregate plan, aggregate
+provenance/idempotency, and only the initial ready job.
+
+The request digest covers executable demand and operator constraints while
+excluding presentation/provenance metadata. Exact retries return the canonical
+aggregate receipt, conflicting retries fail closed, and concurrent first
+writes elect one aggregate. Scheduling reads each job's stored capability and
+separates immutable worker/profile constraints from scheduler-owned
+assignments. Pull scheduling and the attempt/lease/fence coordinator remain
+independent of submission planning.
+
+Broad creation writers remain available only behind the test-support feature;
+production adapters cannot call them. The focused boundary check rejects
+reintroduced daemon-side writer calls or persistence-shaped job construction.
+Migration tests preserve legacy identity/provenance conservatively without
+inventing request digests that history cannot reconstruct. Historical Slack
+redeliveries elect the earliest aggregate while retaining audit provenance for
+duplicates; ambiguous GitHub-plus-Slack producer ownership fails with the
+offending submission IDs. The migration also refuses to run while claimed or
+running jobs, active attempts, or pending cleanup obligations remain.
+
+Local validation covers fresh and v27.1 upgrade schemas, multi-spec benchmark
+planning and lazy continuation, singleton validation, build-only warming,
+exact/conflicting/concurrent replay, transaction rollback stages, offline
+constraints, scheduler assignment, recovery, reporting, and the existing fleet
+state machine. The final Nextest run passed 879 tests with one
+environment-gated skip. Deployment backup/restore verification plus live
+benchmark and validation canaries remain rollout gates; they are not
+represented as having run in this development environment.
 
 ## Deferred / Non-Goals
 
@@ -340,10 +378,19 @@ work.
 
 ## Rollout and Rollback
 
-Deploy only after v27.1 is running. Drain workers, stop daemon writers, verify a
-restorable backup, apply the v27.2 migration, deploy the matching daemon/CLI,
-validate idempotent submission without workers, then canary benchmark and
-validation workers before resuming producers.
+Deploy only after v27.1 is running:
+
+1. Drain workers and require zero claimed/running jobs, active attempts, and
+   pending cleanup obligations. Queued demand may remain.
+2. Stop daemon writers and create a restorable production backup.
+3. Restore that backup into isolated PostgreSQL, apply the v27.2 migration, and
+   verify submission/job counts, GitHub and Slack provenance, idempotency keys,
+   and deterministic earliest-wins handling of any duplicate Slack reporting
+   identities. Any dual-source diagnostic must be investigated rather than
+   bypassed.
+4. Only after the rehearsal passes, apply the migration to production, deploy
+   the matching daemon/CLI, validate idempotent submission without workers, and
+   canary benchmark and validation workers before resuming producers.
 
 Rollback stops v27.2 writers/workers, restores the v27.1 database backup,
 deploys v27.1 binaries, validates schema/version agreement, and resumes. No

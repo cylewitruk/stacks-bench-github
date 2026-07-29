@@ -1511,7 +1511,7 @@ async fn seed_completed_baseline(
         .unwrap();
     sqlx::query(
         "UPDATE task_submission
-            SET measurement_profile = 'test-profile'
+            SET assigned_measurement_profile = 'test-profile'
           WHERE id = (SELECT task_submission_id FROM job WHERE id = $1)",
     )
     .bind(job.id)
@@ -1599,7 +1599,7 @@ async fn find_baseline_for_requires_the_subject_measurement_profile() {
             .await;
     sqlx::query(
         "UPDATE task_submission
-            SET measurement_profile = 'different-profile'
+            SET assigned_measurement_profile = 'different-profile'
           WHERE id = (SELECT task_submission_id FROM job WHERE id = $1)",
     )
     .bind(subject)
@@ -1618,7 +1618,7 @@ async fn find_baseline_for_requires_the_subject_measurement_profile() {
 
     sqlx::query(
         "UPDATE task_submission
-            SET measurement_profile = 'test-profile'
+            SET assigned_measurement_profile = 'test-profile'
           WHERE id = (SELECT task_submission_id FROM job WHERE id = $1)",
     )
     .bind(subject)
@@ -1638,7 +1638,7 @@ async fn find_baseline_for_requires_the_subject_measurement_profile() {
 
     sqlx::query(
         "UPDATE task_submission
-            SET measurement_profile = NULL
+            SET assigned_measurement_profile = NULL
           WHERE id = (SELECT task_submission_id FROM job WHERE id = $1)",
     )
     .bind(subject)

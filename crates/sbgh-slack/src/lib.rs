@@ -21,7 +21,8 @@ pub use client::{
     RUNNING_REACTION, SlackClient,
 };
 pub use connector::{
-    BenchmarkQueue, MentionEvent, SlackConnector, SlackConnectorConfig, SlackJobTarget,
+    BenchmarkQueue, BenchmarkVariantRequest, MentionEvent, SlackConnector, SlackConnectorConfig,
+    SlackJobTarget, SlackSubmissionActor,
 };
 pub use error::{Result, SlackError};
 pub use snapshot::{

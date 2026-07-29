@@ -3,10 +3,12 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use sbgh_api::{EnqueueBlockValidationRequest, EnqueueJobResponse, JobView};
-use sbgh_core::db::fleet::PreparedExecution;
 use sbgh_core::models::{
-    BuildTarget, GitRefKind, Job, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail,
-    TaskKind,
+    BuildTarget, GitRefKind, Job, JobIntent, JobSource, QueuedEventDetail, TaskKind,
+};
+use sbgh_core::submission::{
+    BlockValidationPlan, ProducerKey, ResolvedTaskSource, SchedulingConstraints, SubmissionActor,
+    SubmissionCommand, SubmissionDisposition, SubmissionProvenance, TaskPlan,
 };
 use sbgh_proto::{BlockValidationPayload, InclusiveRange, TaskPayload, Validate, ValidationEpoch};
 use serde::Deserialize;
@@ -83,9 +85,11 @@ pub async fn enqueue_block_validation(
             "commit must be a 40- or 64-character hexadecimal object ID",
         ));
     }
-    let worker_id = request
+    let required_worker_id = request
         .worker_id
-        .parse::<uuid::Uuid>()
+        .as_deref()
+        .map(str::parse::<uuid::Uuid>)
+        .transpose()
         .map_err(|_| ApiErr::bad_request("worker_id must be a UUID"))?;
     let payload = TaskPayload::BlockValidation(BlockValidationPayload {
         epoch,
@@ -100,7 +104,6 @@ pub async fn enqueue_block_validation(
     payload
         .validate()
         .map_err(|error| ApiErr::bad_request(error.to_string()))?;
-    let job_id = uuid::Uuid::new_v4();
     let detail = serde_json::to_value(QueuedEventDetail::BlockValidation {
         range_start: request.range_start,
         range_end: request.range_end,
@@ -115,44 +118,57 @@ pub async fn enqueue_block_validation(
             "could not enqueue block validation",
         )
     })?;
-    let new_job = NewJob {
+    let source = ResolvedTaskSource {
         github_installation_id: request.install_id,
         github_repo_id: request.repo_id,
-        axes: JobAxes {
-            source: JobSource::Cli,
-            intent: JobIntent::BlockValidation,
-            task_kind: TaskKind::BlockValidation,
-            build_target: BuildTarget::StacksInspect,
-        },
+        source: JobSource::Cli,
+        intent: JobIntent::BlockValidation,
+        task_kind: TaskKind::BlockValidation,
+        build_target: BuildTarget::StacksInspect,
         git_ref_kind: GitRefKind::Commit,
         git_ref_display: request.commit.clone(),
-        git_commit_hash: Some(request.commit.clone()),
-        git_committed_at: None,
+        commit: request.commit,
+        committed_at: None,
         workload_key: None,
     };
-    let payload_hash = sbgh_proto::payload_digest(&payload).map_err(|error| {
-        tracing::error!(%error, "hashing block-validation payload failed");
-        ApiErr::new(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "could not enqueue block validation",
-        )
-    })?;
-    let fleet = sbgh_postgres::PostgresFleetStore::new(state.pool);
-    fleet
-        .enqueue_prepared_job(
-            job_id,
-            &new_job,
-            &detail,
-            &PreparedExecution {
-                job_id,
-                commit: request.commit,
-                payload,
-                payload_hash,
-                worker_id: Some(worker_id),
+    let TaskPayload::BlockValidation(validation) = payload else {
+        unreachable!("constructed as block validation")
+    };
+    let store = sbgh_postgres::PostgresJobStore::new(state.pool);
+    let receipt = crate::submission::submit(
+        &store,
+        SubmissionCommand {
+            actor: SubmissionActor::System,
+            producer_key: ProducerKey {
+                namespace: "admin_block_validation".into(),
+                key: request.idempotency_key,
             },
-            &sbgh_postgres::PreparedJobProvenance::default(),
-        )
-        .await?;
-    Ok(Json(EnqueueJobResponse { job_id: job_id.to_string() }))
+            constraints: SchedulingConstraints {
+                required_worker_id,
+                required_measurement_profile: None,
+            },
+            task: TaskPlan::BlockValidation(BlockValidationPlan { source, payload: validation }),
+            provenance: SubmissionProvenance {
+                queued_event_detail: detail,
+                github: None,
+                slack: None,
+            },
+        },
+    )
+    .await?;
+    Ok(Json(EnqueueJobResponse {
+        submission_id: receipt
+            .submission_id
+            .to_string(),
+        disposition: match receipt.disposition {
+            SubmissionDisposition::Created => "created",
+            SubmissionDisposition::AlreadySubmitted => "already_submitted",
+        }
+        .into(),
+        initial_job_ids: receipt
+            .initial_job_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+    }))
 }

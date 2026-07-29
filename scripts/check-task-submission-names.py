@@ -88,6 +88,22 @@ def main() -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
 
+    bypass = re.compile(
+        r"\.\s*(?:create_job_with_links|create_unlinked_job|"
+        r"create_unlinked_benchmark_submission|enqueue_prepared_job)\s*\("
+        r"|\b(?:NewJob|JobCreationRequest)\s*\{"
+        r"|\bNewBenchmarkSpec\s*::"
+    )
+    for absolute in sorted((ROOT / "crates/sbgh-daemon/src").rglob("*.rs")):
+        relative = absolute.relative_to(ROOT)
+        production = absolute.read_text().split("#[cfg(test)]", maxsplit=1)[0]
+        if bypass.search(production):
+            print(
+                f"task-submission kernel bypass in production module: {relative}",
+                file=sys.stderr,
+            )
+            return 1
+
     print("task-submission naming check passed")
     return 0
 

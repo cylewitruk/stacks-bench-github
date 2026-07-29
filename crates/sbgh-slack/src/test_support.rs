@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use sbgh_core::db::NewBenchmarkSpec;
-use sbgh_core::models::{Job, JobStatus};
+use sbgh_core::models::{BuildTarget, GitRefKind, Job, JobIntent, JobSource, JobStatus, TaskKind};
 use uuid::Uuid;
 
 use crate::{
-    BenchmarkQueue, FoundMessage, ReportingIdentity, Result, SlackClient, SlackError,
-    SlackMessageTarget,
+    BenchmarkQueue, BenchmarkVariantRequest, FoundMessage, ReportingIdentity, Result, SlackClient,
+    SlackError, SlackMessageTarget,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +251,7 @@ pub struct RecordingBenchmarkQueue {
 
 struct RecordedQueueCall {
     job: Job,
-    specs: Vec<NewBenchmarkSpec>,
+    variants: Vec<BenchmarkVariantRequest>,
     queued_event_detail: serde_json::Value,
     plan_message_ts: Option<String>,
 }
@@ -272,13 +271,16 @@ impl RecordingBenchmarkQueue {
             .collect()
     }
 
-    pub fn requested_specs_for_submission(&self, submission_id: Uuid) -> Vec<NewBenchmarkSpec> {
+    pub fn requested_variants_for_submission(
+        &self,
+        submission_id: Uuid,
+    ) -> Vec<BenchmarkVariantRequest> {
         self.calls
             .lock()
             .unwrap()
             .iter()
             .find(|call| call.job.task_submission_id == submission_id)
-            .map(|call| call.specs.clone())
+            .map(|call| call.variants.clone())
             .unwrap_or_default()
     }
 
@@ -306,42 +308,42 @@ impl RecordingBenchmarkQueue {
 
 #[async_trait]
 impl BenchmarkQueue for RecordingBenchmarkQueue {
-    async fn create_unlinked_benchmark_submission(
+    async fn submit_benchmark(
         &self,
-        first_job_id: Uuid,
-        requested_specs: &[NewBenchmarkSpec],
+        requested_variants: &[BenchmarkVariantRequest],
         queued_event_detail: &serde_json::Value,
         plan_message_ts: Option<&str>,
-    ) -> sbgh_core::Result<Job> {
+        _actor: crate::SlackSubmissionActor<'_>,
+    ) -> sbgh_core::Result<sbgh_core::submission::SubmissionReceipt> {
         if self
             .fail_create
             .load(Ordering::SeqCst)
         {
             return Err(std::io::Error::other("injected benchmark queue failure").into());
         }
-        let first = requested_specs
+        let first = requested_variants
             .first()
             .ok_or_else(|| std::io::Error::other("benchmark submission needs at least one spec"))?;
         let now = Utc::now();
         let submission_id = Uuid::new_v4();
-        let new = &first.new_job;
+        let first_job_id = Uuid::new_v4();
         let job = Job {
             id: first_job_id,
             task_submission_id: submission_id,
             task_spec_id: Uuid::new_v4(),
             task_run_index: 0,
-            github_installation_id: new.github_installation_id,
-            github_repo_id: new.github_repo_id,
+            github_installation_id: 100,
+            github_repo_id: 10,
             status: JobStatus::Queued,
-            source: new.axes.source,
-            intent: new.axes.intent,
-            task_kind: new.axes.task_kind,
-            build_target: new.axes.build_target,
-            git_ref_kind: new.git_ref_kind,
-            git_ref_display: new.git_ref_display.clone(),
-            git_commit_hash: new.git_commit_hash.clone(),
-            git_committed_at: new.git_committed_at,
-            workload_key: new.workload_key.clone(),
+            source: JobSource::Slack,
+            intent: JobIntent::AdhocBenchmark,
+            task_kind: TaskKind::Benchmark,
+            build_target: BuildTarget::StacksBench,
+            git_ref_kind: GitRefKind::Branch,
+            git_ref_display: first.rev.clone(),
+            git_commit_hash: None,
+            git_committed_at: None,
+            workload_key: Some(first.workload_key.clone()),
             claim_token: None,
             claimed_at: None,
             created_at: now,
@@ -352,10 +354,14 @@ impl BenchmarkQueue for RecordingBenchmarkQueue {
             .unwrap()
             .push(RecordedQueueCall {
                 job: job.clone(),
-                specs: requested_specs.to_vec(),
+                variants: requested_variants.to_vec(),
                 queued_event_detail: queued_event_detail.clone(),
                 plan_message_ts: plan_message_ts.map(str::to_owned),
             });
-        Ok(job)
+        Ok(sbgh_core::submission::SubmissionReceipt {
+            submission_id,
+            disposition: sbgh_core::submission::SubmissionDisposition::Created,
+            initial_job_ids: vec![first_job_id],
+        })
     }
 }

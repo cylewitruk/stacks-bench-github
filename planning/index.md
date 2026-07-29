@@ -81,7 +81,7 @@ need editing when an item's status or location changes.
 | `0061-slack-integration-boundary` | Extracted Slack integration boundary | `shipped` | [archive/completed/0060-slack-snapshot-reporting.md](archive/completed/0060-slack-snapshot-reporting.md) |
 | `0062-sandboxed-worker-execution` | Sandboxed worker execution invariant | `shipped` | [archive/completed/0062-sandboxed-worker-execution.md](archive/completed/0062-sandboxed-worker-execution.md) |
 | `0063-libvirt-block-validation` | Libvirt-isolated block validation | `shipped` | [archive/completed/0062-sandboxed-worker-execution.md](archive/completed/0062-sandboxed-worker-execution.md) |
-| `0064-task-submission-kernel` | Task-submission kernel | `planned` | [iterations/v27.2-task-submission-kernel.md](iterations/v27.2-task-submission-kernel.md) |
+| `0064-task-submission-kernel` | Task-submission kernel | `shipped` | [archive/completed/0064-task-submission-kernel.md](archive/completed/0064-task-submission-kernel.md) |
 | `0065-job-lifecycle-controls` | Task-neutral job lifecycle controls | `candidate` | [backlog.md](backlog.md) |
 | `0066-task-aware-reporting` | Task-aware reporting and validation results | `candidate` | [backlog.md](backlog.md) |
 | `0067-github-block-validation-submission` | GitHub block-validation submission | `candidate` | [backlog.md](backlog.md) |
@@ -123,7 +123,7 @@ need editing when an item's status or location changes.
 | `v25-worker-fleet-block-validation` | First worker fleet and dedicated block validation | `shipped` | [archive/completed/0004-worker-fleet.md](archive/completed/0004-worker-fleet.md) |
 | `v26-sandboxed-worker-execution` | Sandboxed worker execution and block validation | `shipped` | [archive/completed/0062-sandboxed-worker-execution.md](archive/completed/0062-sandboxed-worker-execution.md) |
 | `v27.1-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
-| `v27.2-task-submission-kernel` | Task-submission kernel | `planned` | [iterations/v27.2-task-submission-kernel.md](iterations/v27.2-task-submission-kernel.md) |
+| `v27.2-task-submission-kernel` | Task-submission kernel | `shipped` | [archive/completed/0064-task-submission-kernel.md](archive/completed/0064-task-submission-kernel.md) |
 
 ## Decisions
 

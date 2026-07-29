@@ -14,19 +14,23 @@ use uuid::Uuid;
 use crate::Result;
 use crate::db::Pool;
 use crate::db::jobs::{
-    BaselineAnchor, BaselineMatch, BaselineSelection, BenchmarkRunMetric, CreatedJob,
-    JobCompletion, JobCreationOutcome, JobFailure, JobStore, NewBenchmarkSpec, PendingBenchmarkRun,
+    BaselineAnchor, BaselineMatch, BaselineSelection, BenchmarkRunMetric, JobCompletion,
+    JobFailure, JobStore, PendingBenchmarkRun,
 };
+#[cfg(feature = "testing")]
+use crate::db::jobs::{CreatedJob, JobCreationOutcome, NewBenchmarkSpec};
 use crate::models::{
-    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
-    JobEventKind, JobEventStatus, JobMetric, JobResult, JobStatus, NewJob, NewJobEvent,
-    QueuedEventDetail, ResolvedCommit, SubmissionSpec, SubmissionStepKind, TaskKind,
-    TaskSubmission, TerminalJobStatus, uses_shared_calibration,
+    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobEvent, JobEventKind,
+    JobEventStatus, JobMetric, JobResult, JobStatus, NewJobEvent, QueuedEventDetail,
+    ResolvedCommit, SubmissionSpec, SubmissionStepKind, TaskKind, TaskSubmission,
+    TerminalJobStatus, uses_shared_calibration,
 };
+#[cfg(feature = "testing")]
+use crate::models::{JobCreationRequest, NewJob};
 
 #[derive(Clone)]
 pub struct PostgresJobStore {
-    pool: Pool,
+    pub(super) pool: Pool,
 }
 
 impl PostgresJobStore {
@@ -69,7 +73,25 @@ impl PostgresJobStore {
     #[cfg(feature = "testing")]
     pub async fn user_links(&self) -> Vec<GithubUserJob> {
         sqlx::query_as::<_, Db<GithubUserJob>>(
-            "SELECT github_user_id, job_id, created_at FROM github_user_job ORDER BY created_at",
+            r#"
+            SELECT github.triggering_user_id AS github_user_id,
+                   job.id AS job_id, github.created_at
+              FROM task_submission_github github
+              JOIN job ON job.task_submission_id = github.task_submission_id
+             WHERE github.triggering_user_id IS NOT NULL
+            UNION ALL
+            SELECT legacy.github_user_id, legacy.job_id, legacy.created_at
+              FROM github_user_job legacy
+             WHERE NOT EXISTS (
+                   SELECT 1
+                     FROM job
+                     JOIN task_submission_github github
+                       ON github.task_submission_id = job.task_submission_id
+                    WHERE job.id = legacy.job_id
+                      AND github.triggering_user_id IS NOT NULL
+             )
+             ORDER BY created_at
+            "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -80,8 +102,26 @@ impl PostgresJobStore {
     #[cfg(feature = "testing")]
     pub async fn pr_links(&self) -> Vec<GithubPullRequestJob> {
         sqlx::query_as::<_, Db<GithubPullRequestJob>>(
-            "SELECT job_id, github_pull_request_id, triggering_comment_id, created_at \
-             FROM github_pull_request_job ORDER BY created_at",
+            r#"
+            SELECT job.id AS job_id, github.github_pull_request_id,
+                   github.triggering_comment_id, github.created_at
+              FROM task_submission_github github
+              JOIN job ON job.task_submission_id = github.task_submission_id
+             WHERE github.github_pull_request_id IS NOT NULL
+            UNION ALL
+            SELECT legacy.job_id, legacy.github_pull_request_id,
+                   legacy.triggering_comment_id, legacy.created_at
+              FROM github_pull_request_job legacy
+             WHERE NOT EXISTS (
+                   SELECT 1
+                     FROM job
+                     JOIN task_submission_github github
+                       ON github.task_submission_id = job.task_submission_id
+                    WHERE job.id = legacy.job_id
+                      AND github.github_pull_request_id IS NOT NULL
+             )
+             ORDER BY created_at
+            "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -119,13 +159,14 @@ impl PostgresJobStore {
         .into_domain()
     }
 
+    #[cfg(feature = "testing")]
     async fn create_submission_specs(
         tx: &mut Transaction<'_, Postgres>,
         specs: &[NewBenchmarkSpec],
     ) -> Result<(Uuid, Vec<Uuid>)> {
         let Some(first) = specs.first() else {
             return Err(crate::Error::Other(anyhow::anyhow!(
-                "benchmark group needs at least one spec"
+                "benchmark submission needs at least one spec"
             )));
         };
         let first_job = &first.new_job;
@@ -162,7 +203,7 @@ impl PostgresJobStore {
                 || new.axes.intent != first_job.axes.intent
             {
                 return Err(crate::Error::Other(anyhow::anyhow!(
-                    "benchmark group specs must share installation, source, and intent"
+                    "benchmark submission specs must share installation, source, and intent"
                 )));
             }
 
@@ -259,6 +300,7 @@ impl PostgresJobStore {
         Ok((submission_id, spec_ids))
     }
 
+    #[cfg(feature = "testing")]
     async fn create_singleton_submission_spec(
         tx: &mut Transaction<'_, Postgres>,
         new: &NewJob,
@@ -275,6 +317,7 @@ impl PostgresJobStore {
         Ok((submission_id, spec_id))
     }
 
+    #[cfg(feature = "testing")]
     fn requested_run_count_from_detail(detail: &serde_json::Value) -> i32 {
         match serde_json::from_value::<QueuedEventDetail>(detail.clone()) {
             Ok(QueuedEventDetail::SlackAdhoc { clean_repetitions, .. }) => {
@@ -295,8 +338,8 @@ impl PostgresJobStore {
                 (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
-                 source, intent, task_kind, build_target)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 source, intent, task_kind, build_target, required_capability)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
@@ -318,6 +361,9 @@ impl PostgresJobStore {
         .bind(Db(prior.intent))
         .bind(Db(prior.task_kind))
         .bind(Db(prior.build_target))
+        .bind(Db(prior
+            .task_kind
+            .required_capability()))
         .fetch_one(&mut **tx)
         .await
         .core()?;
@@ -340,8 +386,8 @@ impl PostgresJobStore {
                 (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
-                 source, intent, task_kind, build_target)
-            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 source, intent, task_kind, build_target, required_capability)
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
@@ -362,6 +408,9 @@ impl PostgresJobStore {
         .bind(Db(submission.intent))
         .bind(Db(spec.task_kind))
         .bind(Db(spec.build_target))
+        .bind(Db(spec
+            .task_kind
+            .required_capability()))
         .fetch_one(&mut **tx)
         .await
         .core()?;
@@ -475,6 +524,7 @@ impl BaselineRow {
 
 #[async_trait]
 impl JobStore for PostgresJobStore {
+    #[cfg(feature = "testing")]
     async fn insert_job(&self, new: &NewJob) -> Result<Job> {
         let mut tx = self
             .pool
@@ -493,8 +543,8 @@ impl JobStore for PostgresJobStore {
                 (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
-                 source, intent, task_kind, build_target)
-            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 source, intent, task_kind, build_target, required_capability)
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
@@ -515,6 +565,10 @@ impl JobStore for PostgresJobStore {
         .bind(Db(new.axes.intent))
         .bind(Db(new.axes.task_kind))
         .bind(Db(new.axes.build_target))
+        .bind(Db(new
+            .axes
+            .task_kind
+            .required_capability()))
         .fetch_one(&mut *tx)
         .await
         .core()?;
@@ -522,6 +576,7 @@ impl JobStore for PostgresJobStore {
         Ok(row.0)
     }
 
+    #[cfg(feature = "testing")]
     async fn create_job_with_links(
         &self,
         request: &JobCreationRequest,
@@ -552,8 +607,8 @@ impl JobStore for PostgresJobStore {
                 (task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
-                 source, intent, task_kind, build_target)
-            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 source, intent, task_kind, build_target, required_capability)
+            VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
@@ -593,6 +648,11 @@ impl JobStore for PostgresJobStore {
             .new_job
             .axes
             .build_target))
+        .bind(Db(request
+            .new_job
+            .axes
+            .task_kind
+            .required_capability()))
         .fetch_one(&mut *tx)
         .await
         .core()?;
@@ -678,6 +738,7 @@ impl JobStore for PostgresJobStore {
         })))
     }
 
+    #[cfg(feature = "testing")]
     async fn create_unlinked_job(
         &self,
         job_id: Uuid,
@@ -708,8 +769,8 @@ impl JobStore for PostgresJobStore {
                 (id, task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
-                 source, intent, task_kind, build_target)
-            VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 source, intent, task_kind, build_target, required_capability)
+            VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
@@ -731,6 +792,10 @@ impl JobStore for PostgresJobStore {
         .bind(Db(new_job.axes.intent))
         .bind(Db(new_job.axes.task_kind))
         .bind(Db(new_job.axes.build_target))
+        .bind(Db(new_job
+            .axes
+            .task_kind
+            .required_capability()))
         .fetch_one(&mut *tx)
         .await
         .core()?;
@@ -881,7 +946,10 @@ impl JobStore for PostgresJobStore {
             let submission: Db<TaskSubmission> = sqlx::query_as(
                 r#"
                 SELECT id, github_installation_id, github_repo_id, source, intent,
-                       artifact_prefix, host_key, created_at, updated_at
+                       artifact_prefix, contract_version, request_digest,
+                       required_worker_id, required_measurement_profile,
+                       assigned_worker_id, assigned_measurement_profile,
+                       created_at, updated_at
                   FROM task_submission
                  WHERE id = $1
                 "#,
@@ -899,6 +967,7 @@ impl JobStore for PostgresJobStore {
         Ok(Some(job))
     }
 
+    #[cfg(feature = "testing")]
     async fn create_unlinked_benchmark_submission(
         &self,
         first_job_id: Uuid,
@@ -917,7 +986,7 @@ impl JobStore for PostgresJobStore {
         let Some(first) = specs.first() else {
             tx.rollback().await.core()?;
             return Err(crate::Error::Other(anyhow::anyhow!(
-                "benchmark group needs at least one spec"
+                "benchmark submission needs at least one spec"
             )));
         };
         let first_spec_id = spec_ids[0];
@@ -928,8 +997,8 @@ impl JobStore for PostgresJobStore {
                 (id, task_submission_id, task_spec_id, task_run_index,
                  github_installation_id, github_repo_id, git_ref_kind, git_ref_display,
                  git_commit_hash, git_committed_at, workload_key,
-                 source, intent, task_kind, build_target)
-            VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 source, intent, task_kind, build_target, required_capability)
+            VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING id, task_submission_id, task_spec_id, task_run_index,
                       github_installation_id, github_repo_id, status,
                       source, intent, task_kind, build_target, git_ref_kind,
@@ -951,6 +1020,10 @@ impl JobStore for PostgresJobStore {
         .bind(Db(new_job.axes.intent))
         .bind(Db(new_job.axes.task_kind))
         .bind(Db(new_job.axes.build_target))
+        .bind(Db(new_job
+            .axes
+            .task_kind
+            .required_capability()))
         .fetch_one(&mut *tx)
         .await
         .core()?;
@@ -1115,7 +1188,10 @@ impl JobStore for PostgresJobStore {
         let row = sqlx::query_as::<_, Db<TaskSubmission>>(
             r#"
             SELECT id, github_installation_id, github_repo_id, source, intent,
-                   artifact_prefix, host_key, created_at, updated_at
+                   artifact_prefix, contract_version, request_digest,
+                   required_worker_id, required_measurement_profile,
+                   assigned_worker_id, assigned_measurement_profile,
+                   created_at, updated_at
               FROM task_submission
              WHERE id = $1
             "#,
@@ -1599,11 +1675,11 @@ impl JobStore for PostgresJobStore {
         let exact: Option<BaselineRow> = sqlx::query_as(
             r#"
             WITH subject AS (
-                SELECT submission.measurement_profile
+                SELECT submission.assigned_measurement_profile AS measurement_profile
                   FROM job subject_job
                   JOIN task_submission submission ON submission.id = subject_job.task_submission_id
                  WHERE subject_job.id = $1
-                   AND submission.measurement_profile IS NOT NULL
+                   AND submission.assigned_measurement_profile IS NOT NULL
             )
             SELECT j.github_repo_id,
                    j.git_commit_hash AS commit,
@@ -1616,7 +1692,7 @@ impl JobStore for PostgresJobStore {
                    m.warmup_blocks, m.created_at
               FROM job j
               JOIN task_submission submission ON submission.id = j.task_submission_id
-              JOIN subject ON subject.measurement_profile = submission.measurement_profile
+              JOIN subject ON subject.measurement_profile = submission.assigned_measurement_profile
               JOIN job_metric m ON m.job_id = j.id
              WHERE j.git_commit_hash = $2
                AND j.workload_key = $3
@@ -1646,11 +1722,11 @@ impl JobStore for PostgresJobStore {
         let nearest: Option<BaselineRow> = sqlx::query_as(
             r#"
             WITH subject AS (
-                SELECT submission.measurement_profile
+                SELECT submission.assigned_measurement_profile AS measurement_profile
                   FROM job subject_job
                   JOIN task_submission submission ON submission.id = subject_job.task_submission_id
                  WHERE subject_job.id = $1
-                   AND submission.measurement_profile IS NOT NULL
+                   AND submission.assigned_measurement_profile IS NOT NULL
             )
             SELECT j.github_repo_id,
                    j.git_commit_hash AS commit,
@@ -1663,7 +1739,7 @@ impl JobStore for PostgresJobStore {
                    m.warmup_blocks, m.created_at
               FROM job j
               JOIN task_submission submission ON submission.id = j.task_submission_id
-              JOIN subject ON subject.measurement_profile = submission.measurement_profile
+              JOIN subject ON subject.measurement_profile = submission.assigned_measurement_profile
               JOIN job_metric m ON m.job_id = j.id
              WHERE j.git_ref_display = $2
                AND j.workload_key = $3
@@ -1763,9 +1839,28 @@ impl JobStore for PostgresJobStore {
 
     async fn pull_request_link(&self, job_id: Uuid) -> Result<Option<GithubPullRequestJob>> {
         let row = sqlx::query_as::<_, Db<GithubPullRequestJob>>(
-            "SELECT job_id, github_pull_request_id, triggering_comment_id, created_at
-               FROM github_pull_request_job
-              WHERE job_id = $1",
+            r#"
+            SELECT $1 AS job_id, github.github_pull_request_id,
+                   github.triggering_comment_id, github.created_at
+              FROM job
+              JOIN task_submission_github github
+                ON github.task_submission_id = job.task_submission_id
+             WHERE job.id = $1
+               AND github.github_pull_request_id IS NOT NULL
+            UNION ALL
+            SELECT job_id, github_pull_request_id, triggering_comment_id, created_at
+              FROM github_pull_request_job
+             WHERE job_id = $1
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM job aggregate_job
+                     JOIN task_submission_github github
+                       ON github.task_submission_id = aggregate_job.task_submission_id
+                    WHERE aggregate_job.id = $1
+                      AND github.github_pull_request_id IS NOT NULL
+               )
+             LIMIT 1
+            "#,
         )
         .bind(job_id)
         .fetch_optional(&self.pool)
@@ -1816,23 +1911,69 @@ impl JobStore for PostgresJobStore {
     }
 
     async fn latest_plan_message_ts(&self, job_id: Uuid) -> Result<Option<String>> {
-        // The newest `plan_message_sent` event's Slack `ts`, from the JSONB
-        // detail (a string id — unlike the BIGINT comment/check ids).
         let ts: Option<String> = sqlx::query_scalar(
-            "SELECT detail->>'plan_message_ts'
-               FROM job_event
-              WHERE job_id = $1
-                AND event_kind = 'plan_message_sent'
-                AND detail->>'plan_message_ts' IS NOT NULL
-           ORDER BY occurred_at DESC, id DESC
-              LIMIT 1",
+            r#"
+            SELECT COALESCE(
+                (
+                    SELECT slack.report_message_ts
+                      FROM job
+                      JOIN task_submission_slack slack
+                        ON slack.task_submission_id = job.task_submission_id
+                     WHERE job.id = $1
+                ),
+                (
+                    SELECT detail->>'plan_message_ts'
+                      FROM job_event
+                     WHERE job_id = $1
+                       AND event_kind = 'plan_message_sent'
+                       AND detail->>'plan_message_ts' IS NOT NULL
+                     ORDER BY occurred_at DESC, id DESC
+                     LIMIT 1
+                )
+            )
+            "#,
         )
         .bind(job_id)
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .core()?
-        .flatten();
+        .core()?;
         Ok(ts)
+    }
+
+    async fn record_plan_message_ts(&self, job_id: Uuid, message_ts: &str) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        sqlx::query(
+            r#"
+            UPDATE task_submission_slack slack
+               SET report_message_ts = $2
+              FROM job
+             WHERE job.id = $1
+               AND slack.task_submission_id = job.task_submission_id
+            "#,
+        )
+        .bind(job_id)
+        .bind(message_ts)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        sqlx::query(
+            r#"
+            INSERT INTO job_event
+                (job_id, event_kind, event_status, detail)
+            VALUES ($1, 'plan_message_sent', 'success', $2)
+            "#,
+        )
+        .bind(job_id)
+        .bind(serde_json::json!({ "plan_message_ts": message_ts }))
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        tx.commit().await.core()?;
+        Ok(())
     }
 
     async fn insert_event(&self, new: &NewJobEvent) -> Result<JobEvent> {
@@ -1902,6 +2043,7 @@ impl JobStore for PostgresJobStore {
         Ok(())
     }
 
+    #[cfg(feature = "testing")]
     async fn link_to_webhook(&self, webhook_id: i64, job_id: Uuid) -> Result<GithubWebhookJob> {
         let row = sqlx::query_as::<_, Db<GithubWebhookJob>>(
             "INSERT INTO github_webhook_job (github_webhook_id, job_id) VALUES ($1, $2)
@@ -1915,6 +2057,7 @@ impl JobStore for PostgresJobStore {
         Ok(row.0)
     }
 
+    #[cfg(feature = "testing")]
     async fn link_to_user(&self, user_id: i64, job_id: Uuid) -> Result<GithubUserJob> {
         let row = sqlx::query_as::<_, Db<GithubUserJob>>(
             "INSERT INTO github_user_job (github_user_id, job_id) VALUES ($1, $2)
@@ -1928,6 +2071,7 @@ impl JobStore for PostgresJobStore {
         Ok(row.0)
     }
 
+    #[cfg(feature = "testing")]
     async fn link_to_pull_request(
         &self,
         pull_request_id: i64,

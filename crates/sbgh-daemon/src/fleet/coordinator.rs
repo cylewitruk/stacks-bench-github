@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use sbgh_core::bench_args::resolve_bench_args;
+use sbgh_core::bench_args::{ResolvedBenchArgs, resolve_bench_args, workload_key};
 use sbgh_core::config::DaemonConfig;
 use sbgh_core::db::fleet::{FleetStore, PreparedExecution, ResolvedSpecSource};
 use sbgh_core::db::{JobStore, RepoStore};
@@ -169,7 +169,6 @@ impl FleetCoordinator {
                 commit,
                 payload,
                 payload_hash,
-                worker_id: None,
             })
             .await?;
         Ok(())
@@ -307,7 +306,7 @@ impl FleetCoordinator {
             self.fleet
                 .freeze_submission_sources(job.task_submission_id, &sources)
                 .await?,
-            "benchmark group {} changed while source refs were being frozen",
+            "benchmark submission {} changed while source refs were being frozen",
             job.task_submission_id
         );
         sources
@@ -571,7 +570,21 @@ impl FleetCoordinator {
 fn payload_for(job: &RunnableJob, default_args: &str) -> anyhow::Result<TaskPayload> {
     match (job.task_kind, job.build_target) {
         (TaskKind::Benchmark, BuildTarget::StacksBench) => {
-            let resolved = resolve_bench_args(&job.bench_args, default_args);
+            // v27.2 snapshots can legitimately freeze an empty argument list.
+            // Distinguish that from a legacy empty override by its enqueue-time
+            // workload key; only legacy rows may still fall back to the current
+            // daemon default.
+            let frozen_key = workload_key(&job.bench_args);
+            let resolved = if job.bench_args.is_empty()
+                && job.workload_key.as_deref() == Some(frozen_key.as_str())
+            {
+                ResolvedBenchArgs {
+                    effective_args: Vec::new(),
+                    workload_key: frozen_key,
+                }
+            } else {
+                resolve_bench_args(&job.bench_args, default_args)
+            };
             anyhow::ensure!(
                 job.workload_key.as_deref() == Some(resolved.workload_key.as_str()),
                 "job {} effective arguments do not match its enqueue-time workload key",

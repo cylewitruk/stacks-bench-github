@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     BenchmarkQueue, MentionEvent, Result, SlackClient, SlackConnector, SlackConnectorConfig,
-    SlackError, SlackJobTarget,
+    SlackError,
 };
 
 /// Socket credentials and connector policy projected by the daemon.
@@ -151,7 +151,6 @@ fn is_transient_socket_error(err: &(dyn std::error::Error + Send + Sync + 'stati
 /// decides whether that is fatal (it isn't: Slack is an optional surface).
 pub async fn run(
     cfg: SlackSocketConfig,
-    target: SlackJobTarget,
     jobs: Arc<dyn BenchmarkQueue>,
     web_client: Arc<dyn SlackClient>,
     intent_resolver: Option<Arc<dyn sbgh_intent::IntentResolver>>,
@@ -167,7 +166,7 @@ pub async fn run(
 
     // The connector (authz/resolve/enqueue/react) shares the Web API client and
     // rides into the listener via user state.
-    let mut connector = SlackConnector::new(cfg.connector, target, jobs, web_client)
+    let mut connector = SlackConnector::new(cfg.connector, jobs, web_client)
         .with_max_clean_repetitions(options.max_clean_repetitions)
         .with_comparison_limits(options.max_variants, options.max_comparison_lifecycles)
         .with_binary_cache_enabled(options.binary_cache_enabled);

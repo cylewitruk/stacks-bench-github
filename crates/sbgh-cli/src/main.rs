@@ -400,7 +400,10 @@ enum JobsAction {
         #[arg(long)]
         commit: String,
         #[arg(long)]
-        worker_id: String,
+        worker_id: Option<String>,
+        /// Stable retry key for this logical request.
+        #[arg(long)]
+        idempotency_key: String,
         #[arg(long, default_value = "nakamoto")]
         epoch: String,
         #[arg(long)]
@@ -1080,6 +1083,7 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
             repo_id,
             commit,
             worker_id,
+            idempotency_key,
             epoch,
             range_start,
             range_end,
@@ -1089,6 +1093,7 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
         } => {
             let response = client
                 .enqueue_block_validation(&EnqueueBlockValidationRequest {
+                    idempotency_key,
                     install_id,
                     repo_id,
                     commit,
@@ -1102,7 +1107,7 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
                 })
                 .await
                 .context("enqueue block validation")?;
-            println!("{}", response.job_id);
+            println!("{}", response.submission_id);
         }
     }
     Ok(())

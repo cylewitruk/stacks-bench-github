@@ -33,4 +33,4 @@ sbgh-postgres = { path = ".", features = ["testing"] }
 [features]
 # Exposes the shared PostgreSQL test database plus fixture/inspection helpers
 # around the production stores. Never enable in release builds.
-testing = []
+testing = ["sbgh-core/testing"]

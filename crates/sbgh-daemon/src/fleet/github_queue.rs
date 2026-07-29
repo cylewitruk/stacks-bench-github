@@ -1,22 +1,23 @@
-use sbgh_core::db::fleet::PreparedExecution;
 use sbgh_core::models::{
-    BuildTarget, GitRefKind, JobAxes, JobIntent, JobSource, NewJob, NewPullRequestLink,
-    QueuedEventDetail, TaskKind,
+    BuildTarget, GitRefKind, JobIntent, JobSource, QueuedEventDetail, TaskKind,
 };
-use sbgh_postgres::{PostgresFleetStore, PreparedJobProvenance};
+use sbgh_core::submission::{
+    BlockValidationPlan, GithubSubmissionProvenance, ProducerKey, ResolvedTaskSource,
+    SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionProvenance, TaskPlan,
+};
+use sbgh_postgres::PostgresJobStore;
 use sbgh_proto::{BlockValidationPayload, TaskPayload};
-use uuid::Uuid;
 
 use super::config::GitHubBlockValidationConfig;
 use crate::webhook_processor::{BlockValidationJobRequest, BlockValidationQueue};
 
 pub struct PostgresBlockValidationQueue {
-    store: PostgresFleetStore,
+    store: PostgresJobStore,
     config: GitHubBlockValidationConfig,
 }
 
 impl PostgresBlockValidationQueue {
-    pub fn new(store: PostgresFleetStore, config: GitHubBlockValidationConfig) -> Self {
+    pub fn new(store: PostgresJobStore, config: GitHubBlockValidationConfig) -> Self {
         Self { store, config }
     }
 }
@@ -33,23 +34,8 @@ impl BlockValidationQueue for PostgresBlockValidationQueue {
         });
         sbgh_proto::Validate::validate(&payload)
             .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
-        let payload_hash = sbgh_proto::payload_digest(&payload)
-            .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
-        let job_id = Uuid::new_v4();
-        let new = NewJob {
-            github_installation_id: request.github_installation_id,
-            github_repo_id: request.github_repo_id,
-            axes: JobAxes {
-                source: JobSource::GithubComment,
-                intent: JobIntent::BlockValidation,
-                task_kind: TaskKind::BlockValidation,
-                build_target: BuildTarget::StacksInspect,
-            },
-            git_ref_kind: GitRefKind::Commit,
-            git_ref_display: request.commit.clone(),
-            git_commit_hash: Some(request.commit.clone()),
-            git_committed_at: None,
-            workload_key: None,
+        let TaskPayload::BlockValidation(payload) = payload else {
+            unreachable!("constructed as block validation")
         };
         let detail = serde_json::to_value(QueuedEventDetail::BlockValidation {
             range_start: request.range.start,
@@ -58,27 +44,45 @@ impl BlockValidationQueue for PostgresBlockValidationQueue {
             max_concurrency: self.config.max_concurrency,
         })
         .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
-        self.store
-            .enqueue_prepared_job(
-                job_id,
-                &new,
-                &detail,
-                &PreparedExecution {
-                    job_id,
+        let command = SubmissionCommand {
+            actor: SubmissionActor::GithubUser {
+                user_id: request.triggering_user_id,
+            },
+            producer_key: ProducerKey {
+                namespace: "github_webhook".into(),
+                key: request.webhook_id.to_string(),
+            },
+            constraints: SchedulingConstraints::default(),
+            task: TaskPlan::BlockValidation(BlockValidationPlan {
+                source: ResolvedTaskSource {
+                    github_installation_id: request.github_installation_id,
+                    github_repo_id: request.github_repo_id,
+                    source: JobSource::GithubComment,
+                    intent: JobIntent::BlockValidation,
+                    task_kind: TaskKind::BlockValidation,
+                    build_target: BuildTarget::StacksInspect,
+                    git_ref_kind: GitRefKind::Commit,
+                    git_ref_display: request.commit.clone(),
                     commit: request.commit,
-                    payload,
-                    payload_hash,
-                    worker_id: Some(self.config.worker_id),
+                    committed_at: None,
+                    workload_key: None,
                 },
-                &PreparedJobProvenance {
-                    github_webhook_id: Some(request.webhook_id),
+                payload,
+            }),
+            provenance: SubmissionProvenance {
+                queued_event_detail: detail,
+                github: Some(GithubSubmissionProvenance {
+                    webhook_id: request.webhook_id,
                     triggering_user_id: Some(request.triggering_user_id),
-                    pull_request_link: Some(NewPullRequestLink {
-                        github_pull_request_id: request.github_pull_request_id,
-                        triggering_comment_id: Some(request.triggering_comment_id),
-                    }),
-                },
-            )
+                    pull_request_id: Some(request.github_pull_request_id),
+                    triggering_comment_id: Some(request.triggering_comment_id),
+                }),
+                slack: None,
+            },
+        };
+        crate::submission::submit(&self.store, command)
             .await
+            .map(|_| ())
+            .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))
     }
 }

@@ -221,6 +221,13 @@ comparison. `--worker-id` optionally pins the new generation to an enabled,
 non-draining worker authorized for benchmark work; omit it to let normal
 compatible-worker placement choose.
 
+New task demand enters through the daemon's submission kernel before any worker
+is selected. A caller-stable producer key makes retries return the original
+submission receipt; reusing that key for different executable demand fails
+closed. Optional worker/profile values are immutable operator constraints.
+Scheduler-owned assignments remain empty until a compatible worker polls, so
+submitting while every worker is offline is expected and safe.
+
 The authenticated `/api/fleet` view shows registry/session/resource,
 lease, attempt, trace, and cleanup state. `/api/fleet/metrics` exports
 Prometheus text. Alert initially on:
@@ -250,6 +257,16 @@ cannot register with a v3 daemon:
 4. Upgrade workers to the identical release.
 5. Start workers, verify mTLS registration/version/capabilities, then
    undrain.
+
+The v27.2 submission migration additionally requires a restored-production
+rehearsal. Queued demand may remain, but claimed/running jobs, active attempts,
+and pending cleanup obligations must be zero. Stop daemon writers, take and
+restore a production backup into isolated PostgreSQL, apply the migration
+there, and compare submission/job counts plus GitHub/Slack provenance and
+idempotency rows before touching production. Duplicate historical Slack
+reporting identities must resolve to the earliest submission. A reported
+GitHub-plus-Slack identity conflict names corrupt aggregates that must be
+investigated; never bypass the guard or discard one producer identity.
 
 Treat nftables, libvirt firewall, and host firewall upgrades as network-policy
 maintenance, even when no sbgh release changes. The supported nftables version

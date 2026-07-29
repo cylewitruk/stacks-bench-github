@@ -112,7 +112,6 @@ async fn enqueue_build(store: &PostgresFleetStore, job_id: Uuid) {
                 commit: "1111111111111111111111111111111111111111".into(),
                 payload,
                 payload_hash,
-                worker_id: None,
             },
             &PreparedJobProvenance::default(),
         )
@@ -162,7 +161,6 @@ async fn enqueue_benchmark(store: &PostgresFleetStore, job_id: Uuid) {
                 commit: "1111111111111111111111111111111111111111".into(),
                 payload,
                 payload_hash,
-                worker_id: None,
             },
             &PreparedJobProvenance::default(),
         )
@@ -232,7 +230,6 @@ async fn prepared_execution_payload_is_immutable_after_enqueue() {
                 commit: "2222222222222222222222222222222222222222".into(),
                 payload_hash: sbgh_proto::payload_digest(&changed).unwrap(),
                 payload: changed,
-                worker_id: None,
             })
             .await
             .unwrap(),
@@ -1176,7 +1173,6 @@ async fn capability_routes_only_to_a_compatible_worker() {
                 commit: "1111111111111111111111111111111111111111".into(),
                 payload: payload.clone(),
                 payload_hash: sbgh_proto::payload_digest(&payload).unwrap(),
-                worker_id: Some(block_worker),
             },
             &PreparedJobProvenance::default(),
         )
@@ -1281,6 +1277,17 @@ async fn explicit_submission_recovery_can_target_a_compatible_worker() {
             .fetch_one(&pool)
             .await
             .unwrap();
+    let request_digest = "a".repeat(64);
+    sqlx::query(
+        "UPDATE task_submission
+            SET contract_version = 1, request_digest = $2
+          WHERE id = $1",
+    )
+    .bind(submission_id)
+    .bind(&request_digest)
+    .execute(&pool)
+    .await
+    .unwrap();
     let incompatible_worker = Uuid::new_v4();
     store
         .upsert_worker(&registration(incompatible_worker))
@@ -1315,8 +1322,9 @@ async fn explicit_submission_recovery_can_target_a_compatible_worker() {
         .unwrap();
     assert_eq!(recovery.prior_submission_id, submission_id);
     assert_eq!(recovery.execution_generation, 2);
-    let row: (i64, Option<Uuid>, Uuid) = sqlx::query_as(
-        "SELECT execution_generation, worker_id, recovery_of_submission_id
+    let row: (i64, Option<Uuid>, Uuid, Option<i32>, Option<String>) = sqlx::query_as(
+        "SELECT execution_generation, required_worker_id, recovery_of_submission_id,
+                contract_version, request_digest
            FROM task_submission WHERE id = $1",
     )
     .bind(recovery.new_submission_id)
@@ -1326,6 +1334,8 @@ async fn explicit_submission_recovery_can_target_a_compatible_worker() {
     assert_eq!(row.0, 2);
     assert_eq!(row.1, Some(target_worker));
     assert_eq!(row.2, submission_id);
+    assert_eq!(row.3, Some(1));
+    assert_eq!(row.4.as_deref(), Some(request_digest.as_str()));
     let copied_hash: String =
         sqlx::query_scalar("SELECT execution_payload_hash FROM job WHERE id = $1")
             .bind(recovery.first_job_id)

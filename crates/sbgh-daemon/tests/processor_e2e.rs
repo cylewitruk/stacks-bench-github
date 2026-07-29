@@ -142,7 +142,7 @@ fn build_processor_with_gh(pool: &Pool, gh: Arc<FakeGitHub>) -> WebhookProcessor
             installation_store.clone(),
             policy_store.clone(),
             user_store.clone(),
-            gh,
+            gh.clone(),
         )))
         .with_handler(Arc::new(PullRequestHandler::new(
             repo_store,
@@ -156,7 +156,9 @@ fn build_processor_with_gh(pool: &Pool, gh: Arc<FakeGitHub>) -> WebhookProcessor
             installation_store.clone(),
             jobs_store.clone(),
         )))
-        .with_handler(Arc::new(CreateHandler::new(policy_store, installation_store, jobs_store)))
+        .with_handler(Arc::new(
+            CreateHandler::new(policy_store, installation_store, jobs_store).with_github(gh),
+        ))
         .build();
     WebhookProcessor::new(inbox, Arc::new(classifier), ProcessorConfig::default())
 }
@@ -346,12 +348,17 @@ async fn pipeline_classifies_pr_benchmark_as_enqueued_job() {
     assert_eq!(job_status, "queued");
 
     // Webhook link points back to the e2e-bench webhook row.
-    let linked_webhook: i64 =
-        sqlx::query_scalar("SELECT github_webhook_id FROM github_webhook_job WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("webhook link exists");
+    let linked_webhook: i64 = sqlx::query_scalar(
+        "SELECT github.github_webhook_id
+           FROM job
+           JOIN task_submission_github github
+             ON github.task_submission_id = job.task_submission_id
+          WHERE job.id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("webhook link exists");
     let webhook_row: i64 =
         sqlx::query_scalar("SELECT id FROM github_webhook WHERE delivery_id = 'e2e-bench'")
             .fetch_one(&pool)
@@ -360,16 +367,24 @@ async fn pipeline_classifies_pr_benchmark_as_enqueued_job() {
     assert_eq!(linked_webhook, webhook_row);
 
     // Owner link = the commenter (id=99); PR link = the materialised PR.
-    let owner: i64 =
-        sqlx::query_scalar("SELECT github_user_id FROM github_user_job WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("user link exists");
+    let owner: i64 = sqlx::query_scalar(
+        "SELECT github.triggering_user_id
+           FROM job
+           JOIN task_submission_github github
+             ON github.task_submission_id = job.task_submission_id
+          WHERE job.id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("user link exists");
     assert_eq!(owner, 99);
     let (pr_link_id, comment_id): (i64, Option<i64>) = sqlx::query_as(
-        "SELECT github_pull_request_id, triggering_comment_id FROM github_pull_request_job WHERE \
-         job_id = $1",
+        "SELECT github.github_pull_request_id, github.triggering_comment_id
+           FROM job
+           JOIN task_submission_github github
+             ON github.task_submission_id = job.task_submission_id
+          WHERE job.id = $1",
     )
     .bind(job_id)
     .fetch_one(&pool)
@@ -1441,19 +1456,31 @@ async fn pipeline_push_with_matching_branch_trigger_enqueues_baseline_job() {
     assert_eq!(ref_display, "develop");
     assert_eq!(commit.as_deref(), Some("e2epushsha"), "resolved at enqueue");
     // Automated trigger: webhook link present, no user/PR link.
-    let webhook_links: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM github_webhook_job WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let webhook_links: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM job
+           JOIN task_submission_github github
+             ON github.task_submission_id = job.task_submission_id
+          WHERE job.id = $1
+            AND github.github_webhook_id IS NOT NULL",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(webhook_links, 1);
-    let user_links: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM github_user_job WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let user_links: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM job
+           JOIN task_submission_github github
+             ON github.task_submission_id = job.task_submission_id
+          WHERE job.id = $1
+            AND github.triggering_user_id IS NOT NULL",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(user_links, 0);
 }
 
@@ -1496,9 +1523,8 @@ async fn pipeline_push_with_no_matching_trigger_is_ignored_action() {
 
 #[tokio::test]
 async fn pipeline_create_tag_with_matching_pattern_trigger_enqueues_baseline_job() {
-    // A matching tag creates a `baseline` job with an UNRESOLVED commit
-    // (the create event has no SHA — the daemon resolves the tag
-    // → commit at claim time) and terminates as `EnqueuedJob`.
+    // A matching tag is resolved before its immutable baseline demand is
+    // persisted and terminates as `EnqueuedJob`.
     let (_db, pool) = setup_pg_db().await;
     seed_install_with_base_and_head(&pool, 100, 10, 20).await;
     sqlx::query(
@@ -1524,7 +1550,9 @@ async fn pipeline_create_tag_with_matching_pattern_trigger_enqueues_baseline_job
         .await
         .unwrap();
 
-    let processor = build_processor(&pool);
+    let gh = Arc::new(FakeGitHub::new());
+    gh.set_commit("o/r", "tags/release/1.2", &"a".repeat(40), None);
+    let processor = build_processor_with_gh(&pool, gh);
     processor
         .process_one()
         .await
@@ -1553,7 +1581,7 @@ async fn pipeline_create_tag_with_matching_pattern_trigger_enqueues_baseline_job
     assert_eq!(intent, "baseline_benchmark");
     assert_eq!(ref_kind, "tag");
     assert_eq!(ref_display, "release/1.2");
-    assert!(commit.is_none(), "tag job queued with unresolved commit");
+    assert_eq!(commit.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 }
 
 #[tokio::test]

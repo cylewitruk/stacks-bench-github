@@ -73,22 +73,15 @@ async fn assert_singleton_model(
         Option<String>,
     );
 
-    let (source, intent, artifact_prefix, host_key): (
-        Db<JobSource>,
-        Db<JobIntent>,
-        String,
-        Option<String>,
-    ) = sqlx::query_as(
-        "SELECT source, intent, artifact_prefix, host_key FROM task_submission WHERE id = $1",
-    )
-    .bind(submission_id)
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    let (source, intent, artifact_prefix): (Db<JobSource>, Db<JobIntent>, String) =
+        sqlx::query_as("SELECT source, intent, artifact_prefix FROM task_submission WHERE id = $1")
+            .bind(submission_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
     assert_eq!(source.0, expected_axes.source);
     assert_eq!(intent.0, expected_axes.intent);
     assert_eq!(artifact_prefix, submission_id.to_string());
-    assert_eq!(host_key, None);
 
     let (
         spec_submission_id,

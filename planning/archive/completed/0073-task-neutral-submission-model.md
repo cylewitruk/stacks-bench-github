@@ -7,7 +7,7 @@ benchmark-specific terminology to their existing task-neutral meaning, without
 changing submission, scheduling, execution, reporting, or lifecycle semantics.
 
 > **Status:** shipped — completed locally on 2026-07-28 and continued in
-> [v27.2](../../iterations/v27.2-task-submission-kernel.md).
+> [v27.2](0064-task-submission-kernel.md).
 >
 > This is a mechanical vocabulary and schema cutover. The existing creation
 > paths, transactions, idempotency, worker pinning/affinity, lazy benchmark-run
@@ -296,5 +296,5 @@ No down-migration or mixed-schema deployment is supported.
 
 ## Continuation
 
-[v27.2](../../iterations/v27.2-task-submission-kernel.md) implements
+[v27.2](0064-task-submission-kernel.md) implements
 `0064-task-submission-kernel` against this final task-neutral model.

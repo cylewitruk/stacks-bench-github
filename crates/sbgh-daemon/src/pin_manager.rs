@@ -30,8 +30,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sbgh_core::db::{JobStore, PolicyStore, RepoStore};
 use sbgh_core::models::{
-    BuildTarget, GitRefKind, GithubRepo, JobAxes, JobIntent, JobSource, NewJob, QueuedEventDetail,
-    TaskKind,
+    BuildTarget, GitRefKind, GithubRepo, JobIntent, JobSource, QueuedEventDetail, TaskKind,
 };
 use sbgh_driver::{CacheControl, CacheEnvironment};
 
@@ -279,19 +278,17 @@ async fn warm_missing(
             }
         }
 
-        let new_job = NewJob {
+        let source = sbgh_core::submission::ResolvedTaskSource {
             github_installation_id: t.installation_id,
             github_repo_id: t.repo_id,
-            axes: JobAxes {
-                source: JobSource::Daemon,
-                intent: JobIntent::CacheWarm,
-                task_kind: TaskKind::BuildOnly,
-                build_target,
-            },
+            source: JobSource::Daemon,
+            intent: JobIntent::CacheWarm,
+            task_kind: TaskKind::BuildOnly,
+            build_target,
             git_ref_kind: git_ref_kind(t.ref_kind),
             git_ref_display: t.ref_name.clone(),
-            git_commit_hash: Some(t.commit.clone()),
-            git_committed_at: None,
+            commit: t.commit.clone(),
+            committed_at: None,
             workload_key: None,
         };
         let detail = serde_json::to_value(QueuedEventDetail::CacheWarm {
@@ -302,16 +299,28 @@ async fn warm_missing(
         })
         .expect("QueuedEventDetail::CacheWarm serializes");
 
-        // Warming has no Slack surface: a fresh id and no message timestamp.
-        match jobs
-            .create_unlinked_job(uuid::Uuid::new_v4(), &new_job, &detail, None)
-            .await
-        {
-            Ok(job) => {
+        let command = sbgh_core::submission::SubmissionCommand {
+            actor: sbgh_core::submission::SubmissionActor::System,
+            producer_key: sbgh_core::submission::ProducerKey {
+                namespace: "cache_warm".into(),
+                key: uuid::Uuid::new_v4().to_string(),
+            },
+            constraints: sbgh_core::submission::SchedulingConstraints::default(),
+            task: sbgh_core::submission::TaskPlan::BuildOnly(
+                sbgh_core::submission::BuildOnlyPlan { source },
+            ),
+            provenance: sbgh_core::submission::SubmissionProvenance {
+                queued_event_detail: detail,
+                github: None,
+                slack: None,
+            },
+        };
+        match crate::submission::submit(jobs, command).await {
+            Ok(receipt) => {
                 seen.insert(t.commit.clone());
                 enqueued += 1;
                 tracing::info!(
-                    job_id = %job.id,
+                    submission_id = %receipt.submission_id,
                     repo_id = t.repo_id,
                     git_ref = %t.ref_name,
                     commit = %t.commit,

@@ -19,6 +19,7 @@ mod shutdown;
 mod slack_queue;
 mod slack_report;
 mod slack_target;
+mod submission;
 mod webhook_processor;
 
 use std::sync::Arc;
@@ -126,7 +127,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         .github_block_validation
         .clone()
         .map(|trigger| {
-            Arc::new(fleet::PostgresBlockValidationQueue::new(postgres_fleet.clone(), trigger))
+            Arc::new(fleet::PostgresBlockValidationQueue::new((*jobs_store).clone(), trigger))
                 as Arc<dyn webhook_processor::BlockValidationQueue>
         });
     let issue_comment_handler = IssueCommentHandler::new(
@@ -180,6 +181,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         ))
         .with_handler(Arc::new(
             CreateHandler::new(policy_store, installation_store, jobs_store.clone())
+                .with_github(gh.clone())
                 .with_default_args(
                     config
                         .stacks_bench
@@ -264,9 +266,15 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                         .clone(),
                 ),
             },
-            target,
-            Arc::new(slack_queue::SlackBenchmarkQueue::new(jobs_store.clone()))
-                as Arc<dyn sbgh_slack::BenchmarkQueue>,
+            Arc::new(slack_queue::SlackBenchmarkQueue::new(
+                jobs_store.clone(),
+                gh.clone(),
+                target,
+                config
+                    .slack
+                    .default_repository
+                    .clone(),
+            )) as Arc<dyn sbgh_slack::BenchmarkQueue>,
             web_client,
             intent_resolver,
             config
@@ -298,7 +306,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     ));
     let fleet_slack = slack_runtime
         .as_ref()
-        .map(|(_, _, _, web_client, ..)| web_client.clone());
+        .map(|(_, _, web_client, ..)| web_client.clone());
     let fleet_coordinator = fleet::FleetCoordinator::new(
         Arc::new(config.clone()),
         fleet::FleetCoordinatorDependencies {
@@ -375,7 +383,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             // never collapses the `try_join!` early.
             if let Some((
                 cfg,
-                target,
                 jobs,
                 web_client,
                 intent_resolver,
@@ -388,7 +395,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             {
                 if let Err(e) = sbgh_slack::run(
                     cfg,
-                    target,
                     jobs,
                     web_client,
                     intent_resolver,

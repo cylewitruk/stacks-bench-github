@@ -5,5 +5,6 @@ pub mod jobs;
 pub mod policy;
 pub mod pull_request;
 pub mod repo;
+mod submissions;
 pub mod user;
 pub mod webhook;

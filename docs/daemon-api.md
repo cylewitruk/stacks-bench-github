@@ -220,15 +220,20 @@ listener. Workers cannot call the cookie-authenticated operator API.
 | ---- | ---- | ---- | ---- |
 | `GET` | `/api/fleet` | `read` | Registry/session/resource, active attempt, trace, and cleanup summary |
 | `GET` | `/api/fleet/metrics` | `read` | Prometheus text for heartbeat/lease, wait, ACK lag, resend pressure, staging, cleanup |
-| `POST` | `/api/jobs/block-validation` | `admin` | Enqueue a fully specified block-validation job |
+| `POST` | `/api/jobs/block-validation` | `admin` | Submit fully specified block-validation demand; requires a caller-stable `idempotency_key`, while `worker_id` is an optional operator constraint |
 | `POST` | `/api/fleet/workers/{id}/drain` | `admin` | Set/clear durable drain |
 | `POST` | `/api/fleet/jobs/{id}/cancel` | `admin` | Durably request cancellation of a running fleet attempt |
 | `POST` | `/api/fleet/submissions/{id}/recover` | `admin` | Start a new generation from the first spec/run, optionally pinned to a compatible `worker_id` |
 
+The response identifies the canonical `submission_id`, whether it was
+`created` or `already_submitted`, and its `initial_job_ids`. Submission does not
+require a connected worker.
+
 The bounded GitHub command `/validate-blocks <epoch> <start> <end>` uses the
 same PR-role and target/source policy checks as `/benchmark`. Shard,
-concurrency, timeout, and worker are server-owned fleet configuration, never
-comment input. The selected read-only chainstate origin is worker-local.
+concurrency, and timeout are server-owned fleet configuration, never comment
+input. It creates unpinned demand which any compatible polling worker may
+claim. The selected read-only chainstate origin is worker-local.
 
 ### Not an endpoint
 

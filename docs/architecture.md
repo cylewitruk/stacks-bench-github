@@ -87,7 +87,9 @@ business events, authorize requests, create jobs, or access PostgreSQL.
 
 The daemon owns:
 
-- webhook classification, authorization, and immutable job creation;
+- webhook classification, authorization, and one task-submission application
+  boundary that validates, fingerprints, and atomically persists immutable
+  demand;
 - worker registry, session, placement, lease, fence, cancellation, and
   recovery state;
 - reliable-event/progress ingest and replayable projection;
@@ -186,10 +188,11 @@ boundary and avoid conflating durable planning with one concrete attempt.
 
 The fleet lifecycle is additive across task kinds:
 
-- `benchmark`: comparison-bearing submission pinned to one worker and measurement
-  profile for every variant/repeat/calibration/carried job;
+- `benchmark`: comparison-bearing submission assigned by worker pull to one
+  worker and measurement profile for every variant/repeat/calibration/carried
+  job;
 - `build_only`: cache production through the same lease/event/artifact path;
-- `block_validation`: one fleet job pinned to one capable worker, with one VM,
+- `block_validation`: one fleet job claimed by a capable worker, with one VM,
   K private snapshots of its newest local RO chainstate origin, guest-observed
   range verification, and its own typed result table;
 - future tasks: add a protocol payload, capability, worker recipe, task-specific
@@ -199,6 +202,14 @@ The fleet lifecycle is additive across task kinds:
 Moving a partial benchmark submission between workers is never automatic. Explicit
 recovery creates a new execution generation and reruns from its first
 specification so comparison results never mix measurement environments.
+
+Submission is deliberately separate from scheduling and coordination. Surface
+adapters authorize and resolve mutable refs; the submission kernel records a
+versioned plan, aggregate provenance, and namespaced idempotency receipt without
+consulting live workers. The pull scheduler later matches each concrete job's
+stored capability and optional operator constraints, and only then records its
+worker/profile assignment. The fleet coordinator alone owns offers, attempts,
+leases, fencing, cancellation, and cleanup.
 
 ## Reporting
 

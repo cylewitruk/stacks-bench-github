@@ -28,14 +28,17 @@ use chrono::Utc;
 use sbgh_core::Result;
 use sbgh_core::bench_args::{normalize_stored, resolve_bench_args};
 use sbgh_core::db::{
-    ClaimedWebhook, InstallationStore, JobCreationOutcome, JobStore, NewInstallation,
-    NewPullRequest, NewRepoIdentity, NewRepoLineage, NewUser, PolicyStore, PullRequestStore,
-    RepoStore, UserStore, WebhookInbox,
+    ClaimedWebhook, InstallationStore, JobStore, NewInstallation, NewPullRequest, NewRepoIdentity,
+    NewRepoLineage, NewUser, PolicyStore, PullRequestStore, RepoStore, UserStore, WebhookInbox,
 };
 use sbgh_core::models::{
-    BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobCreationRequest, JobIntent, JobSource,
-    NewJob, NewPullRequestLink, QueuedEventDetail, TaskKind, TriggerKind, TriggerMatchSpec,
-    TriggerPolicy, UserRole, WebhookOutcome,
+    BuildTarget, GitRefKind, GithubAccountType, JobIntent, JobSource, QueuedEventDetail, TaskKind,
+    TriggerKind, TriggerMatchSpec, TriggerPolicy, UserRole, WebhookOutcome,
+};
+use sbgh_core::submission::{
+    BenchmarkPlan, BenchmarkVariant, GithubSubmissionProvenance, ProducerKey, ResolvedTaskSource,
+    SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionDisposition,
+    SubmissionProvenance, TaskPlan,
 };
 use sbgh_github::{
     Command, CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent,
@@ -239,7 +242,7 @@ impl Classifier for BasicClassifier {
 ///   Unauthorized → `denied_unauthorized` (the user upsert still happens so the
 ///   attempt has an audit trail). Authorized + policies accepted →
 ///   `enqueued_job` (creates the `job` row + links via the atomic
-///   `create_job_with_links` boundary). Deny → `denied_target_policy` /
+///   shared submission-kernel boundary). Deny → `denied_target_policy` /
 ///   `denied_source_policy`.
 /// - NULL / unparseable payload → `error` (can't classify; better terminal than
 ///   infinite retry)
@@ -568,28 +571,24 @@ impl EventHandler for IssueCommentHandler {
                         let resolved =
                             resolve_bench_args(&normalize_stored(&detail), &self.default_args);
                         let workload_key = resolved.workload_key.clone();
-                        let request = JobCreationRequest {
-                            new_job: NewJob {
+                        let request = GithubBenchmarkSubmission {
+                            source: ResolvedTaskSource {
                                 github_installation_id: install_id,
                                 github_repo_id: pr.base.repo.id,
-                                axes: JobAxes {
-                                    source: JobSource::GithubComment,
-                                    intent: JobIntent::AdhocBenchmark,
-                                    task_kind: TaskKind::Benchmark,
-                                    build_target: BuildTarget::StacksBench,
-                                },
+                                source: JobSource::GithubComment,
+                                intent: JobIntent::AdhocBenchmark,
+                                task_kind: TaskKind::Benchmark,
+                                build_target: BuildTarget::StacksBench,
                                 git_ref_kind: GitRefKind::Branch,
                                 git_ref_display: pr.head.branch.clone(),
-                                git_commit_hash: Some(pr.head.sha.clone()),
-                                git_committed_at: None,
+                                commit: pr.head.sha.clone(),
+                                committed_at: None,
                                 workload_key: Some(workload_key.clone()),
                             },
-                            github_webhook_id: webhook.id,
+                            webhook_id: webhook.id,
                             triggering_user_id: Some(event.sender.id),
-                            pull_request_link: Some(NewPullRequestLink {
-                                github_pull_request_id: pr_row.id,
-                                triggering_comment_id: Some(event.comment.id),
-                            }),
+                            pull_request_id: Some(pr_row.id),
+                            triggering_comment_id: Some(event.comment.id),
                             queued_event_detail: queued_detail(detail, &resolved.effective_args),
                         };
                         // Phase 5 dedup (BEST-EFFORT): if an active `/benchmark`
@@ -1388,10 +1387,11 @@ async fn evaluate_pr_policies(
 }
 
 /// Slice 9: create a new-schema `job` (+ webhook/user/PR links + queued
-/// `job_event`) through the atomic `create_job_with_links` boundary and
+/// aggregate provenance plus the initial `job_event` through the atomic
+/// submission-kernel boundary and
 /// map the result to a terminal `EnqueuedJob`.
 ///
-/// Any store error becomes `Retryable`: `create_job_with_links` is
+/// Any store error becomes `Retryable`: the submission transaction is
 /// all-or-nothing, so a failure leaves zero job rows and the webhook is
 /// safely reprocessed. All FK targets (install/repo membership, webhook,
 /// user, PR) are materialised earlier in each handler, so a persistent
@@ -1400,70 +1400,100 @@ async fn evaluate_pr_policies(
 ///
 /// `enqueue` deliberately creates exactly ONE job per accepted webhook:
 /// a single all-or-nothing transaction is retry-safe (a partial-failure
-/// loop over multiple `create_job_with_links` calls could duplicate
+/// loop over multiple per-job persistence calls could duplicate
 /// already-created jobs on retry). Push/tag handlers log when more than
 /// one trigger matched so multi-trigger fan-out isn't silently dropped.
-async fn enqueue_job(job_store: &dyn JobStore, request: JobCreationRequest) -> ClassifyOutcome {
-    match job_store
-        .create_job_with_links(&request)
-        .await
-    {
-        Ok(JobCreationOutcome::Created(created)) => {
+struct GithubBenchmarkSubmission {
+    source: ResolvedTaskSource,
+    webhook_id: i64,
+    triggering_user_id: Option<i64>,
+    pull_request_id: Option<i64>,
+    triggering_comment_id: Option<i64>,
+    queued_event_detail: serde_json::Value,
+}
+
+async fn enqueue_job(
+    job_store: &dyn JobStore,
+    request: GithubBenchmarkSubmission,
+) -> ClassifyOutcome {
+    let queued_event_detail = request.queued_event_detail;
+    let effective_args = queued_event_detail
+        .get("effective_args")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+        .unwrap_or_default();
+    let actor = request
+        .triggering_user_id
+        .map(|user_id| SubmissionActor::GithubUser { user_id })
+        .unwrap_or(SubmissionActor::System);
+    let command = SubmissionCommand {
+        actor,
+        producer_key: ProducerKey {
+            namespace: "github_webhook".into(),
+            key: request.webhook_id.to_string(),
+        },
+        constraints: SchedulingConstraints::default(),
+        task: TaskPlan::Benchmark(BenchmarkPlan {
+            variants: vec![BenchmarkVariant {
+                source: request.source.clone(),
+                requested_run_count: 1,
+                baseline_calibration_id: None,
+            }],
+            effective_args,
+        }),
+        provenance: SubmissionProvenance {
+            queued_event_detail,
+            github: Some(GithubSubmissionProvenance {
+                webhook_id: request.webhook_id,
+                triggering_user_id: request.triggering_user_id,
+                pull_request_id: request.pull_request_id,
+                triggering_comment_id: request.triggering_comment_id,
+            }),
+            slack: None,
+        },
+    };
+    match crate::submission::submit(job_store, command).await {
+        Ok(receipt) if receipt.disposition == SubmissionDisposition::Created => {
+            let job_id = receipt.initial_job_ids[0];
             // The single "delivery X → job Y" breadcrumb: correlate the
             // source webhook to the created job + its routing keys.
             tracing::info!(
-                job_id = %created.job.id,
-                webhook_id = request.github_webhook_id,
-                installation_id = created.job.github_installation_id,
-                repo_id = created.job.github_repo_id,
-                source = ?created.job.source,
-                intent = ?created.job.intent,
-                task_kind = ?created.job.task_kind,
-                build_target = ?created.job.build_target,
-                git_ref = %created.job.git_ref_display,
-                "enqueued new-schema job"
+                submission_id = %receipt.submission_id,
+                job_id = %job_id,
+                webhook_id = request.webhook_id,
+                installation_id = request.source.github_installation_id,
+                repo_id = request.source.github_repo_id,
+                source = ?request.source.source,
+                intent = ?request.source.intent,
+                task_kind = ?request.source.task_kind,
+                build_target = ?request.source.build_target,
+                git_ref = %request.source.git_ref_display,
+                "enqueued task submission"
             );
             ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
         }
-        // Idempotent retry: a prior (interrupted) attempt already created
-        // the job for this webhook. Terminalize as EnqueuedJob WITHOUT
-        // minting a duplicate (the UNIQUE(github_webhook_id) guard +
-        // ON CONFLICT made the second create a no-op).
-        Ok(JobCreationOutcome::AlreadyEnqueued) => {
+        // Idempotent retry: a prior attempt already committed the canonical
+        // aggregate for this webhook. Terminalize without minting a duplicate.
+        Ok(_) => {
             tracing::info!(
-                webhook_id = request.github_webhook_id,
-                "slice 9: webhook already has a job (idempotent reprocess); no duplicate created"
+                webhook_id = request.webhook_id,
+                "webhook already maps to a task submission; no duplicate created"
             );
             ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)
         }
-        Err(e) => ClassifyOutcome::Retryable(format!("create_job_with_links: {e}")),
+        Err(e) => ClassifyOutcome::Retryable(format!("submit task: {e}")),
     }
 }
 
-/// Serialise a queued-event provenance payload to JSONB. Serialisation
-/// of these small, owned structs is infallible in practice; on the
-/// impossible error we log and fall back to `None` (the job + links
-/// still get created — the provenance detail is audit-only).
-fn queued_detail(
-    detail: QueuedEventDetail,
-    effective_args: &[String],
-) -> Option<serde_json::Value> {
-    match serde_json::to_value(&detail) {
-        Ok(mut value) => {
-            if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "effective_args".into(),
-                    serde_json::to_value(effective_args)
-                        .expect("benchmark arguments always serialize"),
-                );
-            }
-            Some(value)
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "failed to serialise queued-event detail; omitting");
-            None
-        }
-    }
+fn queued_detail(detail: QueuedEventDetail, effective_args: &[String]) -> serde_json::Value {
+    let mut value = serde_json::to_value(&detail).expect("queued event detail always serializes");
+    value
+        .as_object_mut()
+        .expect("queued event detail serializes as an object")
+        .insert(
+            "effective_args".into(),
+            serde_json::to_value(effective_args).expect("benchmark arguments always serialize"),
+        );
+    value
 }
 
 /// Slice 7: shared PR materialisation. Upsert base+head repo
@@ -1941,26 +1971,24 @@ impl EventHandler for PushHandler {
         };
         let resolved = resolve_bench_args(&normalize_stored(&detail), &self.default_args);
         let workload_key = resolved.workload_key.clone();
-        let request = JobCreationRequest {
-            new_job: NewJob {
+        let request = GithubBenchmarkSubmission {
+            source: ResolvedTaskSource {
                 github_installation_id: event.installation.id,
                 github_repo_id: event.repository.id,
-                axes: JobAxes {
-                    source: JobSource::GithubWebhook,
-                    intent: JobIntent::BaselineBenchmark,
-                    task_kind: TaskKind::Benchmark,
-                    build_target: BuildTarget::StacksBench,
-                },
+                source: JobSource::GithubWebhook,
+                intent: JobIntent::BaselineBenchmark,
+                task_kind: TaskKind::Benchmark,
+                build_target: BuildTarget::StacksBench,
                 git_ref_kind: GitRefKind::Branch,
                 git_ref_display: branch.to_string(),
-                git_commit_hash: Some(head_commit.id.clone()),
-                git_committed_at: Some(head_commit.timestamp),
+                commit: head_commit.id.clone(),
+                committed_at: Some(head_commit.timestamp),
                 workload_key: Some(workload_key),
             },
-            github_webhook_id: webhook.id,
-            // No responsible user for an automated branch-push trigger.
+            webhook_id: webhook.id,
             triggering_user_id: None,
-            pull_request_link: None,
+            pull_request_id: None,
+            triggering_comment_id: None,
             queued_event_detail: queued_detail(detail, &resolved.effective_args),
         };
         enqueue_job(self.job_store.as_ref(), request).await
@@ -1974,10 +2002,10 @@ impl EventHandler for PushHandler {
 pub struct CreateHandler {
     policy_store: Arc<dyn PolicyStore>,
     install_store: Arc<dyn InstallationStore>,
-    /// A matched `tag_created` trigger creates a `baseline` job with an
-    /// unresolved commit (the `create` event carries no SHA); the
-    /// daemon resolves the tag → commit at claim time.
+    /// A matched `tag_created` trigger resolves the mutable tag before
+    /// submitting immutable baseline demand.
     job_store: Arc<dyn JobStore>,
+    github: Option<Arc<dyn GitHubApi>>,
     /// roadmap-v7: configured `default_args` for the baseline's `workload_key`
     /// (a trigger with NULL `bench_args` resolves to these). Set via
     /// [`Self::with_default_args`]; defaults to empty.
@@ -1994,8 +2022,14 @@ impl CreateHandler {
             policy_store,
             install_store,
             job_store,
+            github: None,
             default_args: String::new(),
         }
+    }
+
+    pub fn with_github(mut self, github: Arc<dyn GitHubApi>) -> Self {
+        self.github = Some(github);
+        self
     }
 
     /// roadmap-v7: supply the configured `default_args` so baseline jobs get a
@@ -2104,28 +2138,48 @@ impl EventHandler for CreateHandler {
         };
         let resolved = resolve_bench_args(&normalize_stored(&detail), &self.default_args);
         let workload_key = resolved.workload_key.clone();
-        let request = JobCreationRequest {
-            new_job: NewJob {
+        let Some(github) = &self.github else {
+            return ClassifyOutcome::Retryable(
+                "tag submission requires a GitHub ref resolver".into(),
+            );
+        };
+        let repository = event
+            .repository
+            .full_name
+            .clone();
+        let resolved_commit = match github
+            .resolve_commit(
+                event.installation.id,
+                &repository,
+                &format!("tags/{}", event.ref_field),
+            )
+            .await
+        {
+            Ok(commit) => commit,
+            Err(error) => {
+                return ClassifyOutcome::Retryable(format!(
+                    "resolve tag before submission: {error}"
+                ));
+            }
+        };
+        let request = GithubBenchmarkSubmission {
+            source: ResolvedTaskSource {
                 github_installation_id: event.installation.id,
                 github_repo_id: event.repository.id,
-                axes: JobAxes {
-                    source: JobSource::GithubWebhook,
-                    intent: JobIntent::BaselineBenchmark,
-                    task_kind: TaskKind::Benchmark,
-                    build_target: BuildTarget::StacksBench,
-                },
+                source: JobSource::GithubWebhook,
+                intent: JobIntent::BaselineBenchmark,
+                task_kind: TaskKind::Benchmark,
+                build_target: BuildTarget::StacksBench,
                 git_ref_kind: GitRefKind::Tag,
                 git_ref_display: event.ref_field.clone(),
-                // The create event carries no SHA; the fleet coordinator
-                // resolves tag → immutable commit before creating the
-                // schedulable execution payload.
-                git_commit_hash: None,
-                git_committed_at: None,
+                commit: resolved_commit.hash,
+                committed_at: resolved_commit.committed_at,
                 workload_key: Some(workload_key),
             },
-            github_webhook_id: webhook.id,
+            webhook_id: webhook.id,
             triggering_user_id: None,
-            pull_request_link: None,
+            pull_request_id: None,
+            triggering_comment_id: None,
             queued_event_detail: queued_detail(detail, &resolved.effective_args),
         };
         enqueue_job(self.job_store.as_ref(), request).await
@@ -5838,10 +5892,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_tag_matching_pattern_enqueues_baseline_job_with_unresolved_commit() {
-        // A matching tag regex creates a `baseline` job. The create event
-        // carries no SHA, so the job is queued with an UNRESOLVED commit
-        // (the daemon resolves the tag → commit at claim time).
+    async fn create_tag_matching_pattern_freezes_commit_before_enqueuing() {
+        // A matching tag regex creates a `baseline` submission only after the
+        // mutable tag has been resolved to its immutable commit.
         // Terminates as `EnqueuedJob`.
         //
         // Parent target must be enabled — slice 5 second-pass runtime
@@ -5861,7 +5914,10 @@ mod tests {
                 true,
             )
             .await;
-        let h = CreateHandler::new(policy_store, install_store, job_store.clone());
+        let github = sbgh_github::test_support::FakeGitHub::new();
+        github.set_commit("o/r", "tags/release/1.2", &"a".repeat(40), None);
+        let h = CreateHandler::new(policy_store, install_store, job_store.clone())
+            .with_github(Arc::new(github));
         let w = create_webhook_claimed(create_event_payload(100, 10, "release/1.2", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
@@ -5873,9 +5929,9 @@ mod tests {
         assert_eq!(job.source, sbgh_core::models::JobSource::GithubWebhook);
         assert_eq!(job.git_ref_kind, GitRefKind::Tag);
         assert_eq!(job.git_ref_display, "release/1.2");
-        assert!(
-            job.git_commit_hash.is_none(),
-            "create event carries no SHA — daemon resolves at claim time"
+        assert_eq!(
+            job.git_commit_hash.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 
@@ -5896,7 +5952,10 @@ mod tests {
                 true,
             )
             .await;
-        let h = CreateHandler::new(policy_store, install_store, job_store);
+        let github = sbgh_github::test_support::FakeGitHub::new();
+        github.set_commit("o/r", "tags/v1", &"b".repeat(40), None);
+        let h = CreateHandler::new(policy_store, install_store, job_store)
+            .with_github(Arc::new(github));
         let w = create_webhook_claimed(create_event_payload(100, 10, "feature/foo", "tag"));
         let outcome = h.handle(&w).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::IgnoredAction)));
@@ -5942,7 +6001,10 @@ mod tests {
                 true,
             )
             .await;
-        let h = CreateHandler::new(policy_store, install_store, job_store);
+        let github = sbgh_github::test_support::FakeGitHub::new();
+        github.set_commit("o/r", "tags/v1", &"b".repeat(40), None);
+        let h = CreateHandler::new(policy_store, install_store, job_store)
+            .with_github(Arc::new(github));
         let w = create_webhook_claimed(create_event_payload(100, 10, "v1", "tag"));
         let outcome = h.handle(&w).await;
         // The good trigger still matches and enqueues despite the malformed peer.

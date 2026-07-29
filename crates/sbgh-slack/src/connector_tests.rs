@@ -24,15 +24,7 @@ fn event(text: &str) -> MentionEvent {
 }
 
 fn connector(queue: Arc<RecordingBenchmarkQueue>, slack: Arc<FakeSlackClient>) -> SlackConnector {
-    SlackConnector::new(
-        config(),
-        SlackJobTarget {
-            installation_id: 100,
-            repo_id: 10,
-        },
-        queue,
-        slack,
-    )
+    SlackConnector::new(config(), queue, slack)
 }
 
 struct FakeIntentResolver {
@@ -300,24 +292,17 @@ async fn deterministic_comparison_enqueues_ordered_variants() {
         .await;
 
     let job = &queue.jobs()[0];
-    let specs = queue.requested_specs_for_submission(job.task_submission_id);
+    let variants = queue.requested_variants_for_submission(job.task_submission_id);
     assert_eq!(
-        specs
+        variants
             .iter()
-            .map(|spec| spec
-                .new_job
-                .git_ref_display
-                .as_str())
+            .map(|variant| variant.rev.as_str())
             .collect::<Vec<_>>(),
         vec!["baseline", "candidate"]
     );
-    let keys = specs
+    let keys = variants
         .iter()
-        .map(|spec| {
-            spec.new_job
-                .workload_key
-                .as_deref()
-        })
+        .map(|variant| Some(variant.workload_key.as_str()))
         .collect::<Vec<_>>();
     assert!(keys[0].is_some(), "Slack enqueue must snapshot a workload key");
     assert_eq!(keys[0], keys[1], "comparison variants share one workload");

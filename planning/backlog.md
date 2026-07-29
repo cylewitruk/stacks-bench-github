@@ -28,7 +28,7 @@ in [v26](archive/completed/0062-sandboxed-worker-execution.md). The
 task-neutral model continuation `0073-task-neutral-submission-model` shipped
 in [v27.1](archive/completed/0073-task-neutral-submission-model.md), followed by
 `0064-task-submission-kernel` in
-[v27.2](iterations/v27.2-task-submission-kernel.md).*
+[v27.2](archive/completed/0064-task-submission-kernel.md).*
 
 ### 0065 — Task-neutral job lifecycle controls
 

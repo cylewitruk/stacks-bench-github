@@ -425,9 +425,8 @@ pub struct Job {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Slice 8 insert payload for the new-schema `job` table. Slice 9
-/// uses this from the processor's job-creation path; slice 8 only
-/// exercises it via integration tests.
+/// Legacy job fixture retained only for store integration tests.
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub struct NewJob {
     pub github_installation_id: i64,
@@ -463,8 +462,16 @@ pub struct TaskSubmission {
     /// Store-key prefix for submission-scoped artifacts. Singleton runs keep using
     /// `<job_id>/...`; later submission-aware artifacts use `<artifact_prefix>/...`.
     pub artifact_prefix: String,
-    /// Future worker-fleet host pin. `None` on the current single-host daemon.
-    pub host_key: Option<String>,
+    /// Null only for submissions migrated from before the v27.2 kernel.
+    pub contract_version: Option<i32>,
+    /// Null only for submissions migrated from before the v27.2 kernel.
+    pub request_digest: Option<String>,
+    /// Immutable operator-requested placement constraints.
+    pub required_worker_id: Option<Uuid>,
+    pub required_measurement_profile: Option<String>,
+    /// Scheduler-owned placement selected by worker pull.
+    pub assigned_worker_id: Option<Uuid>,
+    pub assigned_measurement_profile: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -563,13 +570,8 @@ pub struct ResolvedCommit {
     pub committed_at: Option<DateTime<Utc>>,
 }
 
-/// Slice 8 (post-review fix): atomic-creation request for the
-/// `JobStore::create_job_with_links` boundary. Captures everything
-/// the slice 9 processor needs to insert in one transaction: the
-/// `job` row, the webhook→job ingest link, the optional owner link
-/// (absent for branch_push / tag_created / scheduled), the optional
-/// PR association, and the queued `job_event` (provenance JSONB
-/// keyed off `trigger_kind`).
+/// Legacy linked-job fixture retained only for store integration tests.
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub struct JobCreationRequest {
     pub new_job: NewJob,
@@ -587,6 +589,7 @@ pub struct JobCreationRequest {
     pub queued_event_detail: Option<serde_json::Value>,
 }
 
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub struct NewPullRequestLink {
     pub github_pull_request_id: i64,
@@ -653,6 +656,17 @@ pub enum TaskKind {
     Benchmark,
     BlockValidation,
     BuildOnly,
+}
+
+impl TaskKind {
+    /// Fleet capability required to execute this task kind.
+    pub fn required_capability(self) -> sbgh_proto::WorkerCapability {
+        match self {
+            Self::Benchmark => sbgh_proto::WorkerCapability::Benchmark,
+            Self::BlockValidation => sbgh_proto::WorkerCapability::BlockValidation,
+            Self::BuildOnly => sbgh_proto::WorkerCapability::BuildOnly,
+        }
+    }
 }
 
 /// WHICH artifact binary a job produces / consumes.

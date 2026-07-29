@@ -91,6 +91,19 @@ impl From<sbgh_core::Error> for ApiErr {
     }
 }
 
+impl From<sbgh_core::submission::SubmissionError> for ApiErr {
+    fn from(error: sbgh_core::submission::SubmissionError) -> Self {
+        use sbgh_core::submission::SubmissionError;
+        match error {
+            SubmissionError::Invalid(message) => Self::bad_request(message),
+            SubmissionError::Conflict { namespace, key } => {
+                Self::conflict(format!("submission key {namespace}:{key} was reused differently"))
+            }
+            SubmissionError::Persistence(error) => Self::db(error.to_string()),
+        }
+    }
+}
+
 impl From<InstallerError> for ApiErr {
     fn from(e: InstallerError) -> Self {
         use InstallerError::*;

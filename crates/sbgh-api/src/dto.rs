@@ -149,10 +149,13 @@ pub struct JobView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnqueueBlockValidationRequest {
+    /// Caller-stable key used to reconcile retries without duplicating work.
+    pub idempotency_key: String,
     pub install_id: i64,
     pub repo_id: i64,
     pub commit: String,
-    pub worker_id: String,
+    /// Optional operator placement constraint. Ordinary demand is unpinned.
+    pub worker_id: Option<String>,
     /// `pre_nakamoto` or `nakamoto`.
     pub epoch: String,
     pub range_start: u64,
@@ -164,7 +167,9 @@ pub struct EnqueueBlockValidationRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnqueueJobResponse {
-    pub job_id: String,
+    pub submission_id: String,
+    pub disposition: String,
+    pub initial_job_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

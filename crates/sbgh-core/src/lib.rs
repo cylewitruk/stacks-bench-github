@@ -4,6 +4,7 @@ pub mod db;
 pub mod error;
 pub mod memory;
 pub mod models;
+pub mod submission;
 pub mod workload;
 
 pub use error::{Error, Result};

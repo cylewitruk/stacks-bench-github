@@ -41,10 +41,6 @@ pub struct PreparedExecution {
     pub commit: String,
     pub payload: TaskPayload,
     pub payload_hash: String,
-    /// Explicit host placement for host-pinned tasks such as validation.
-    /// Benchmark placement remains `None` until the scheduling transaction
-    /// chooses and pins a measurement profile.
-    pub worker_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]

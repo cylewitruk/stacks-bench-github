@@ -50,7 +50,6 @@ pub struct FleetConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubBlockValidationConfig {
-    pub worker_id: Uuid,
     pub requested_shards: u32,
     pub max_concurrency: u32,
     pub timeout_secs: u64,
@@ -190,18 +189,6 @@ impl FleetConfig {
                     && trigger.max_concurrency <= trigger.requested_shards
                     && trigger.timeout_secs <= MAX_VALIDATION_TIMEOUT_SECS,
                 "github_block_validation limits exceed protocol bounds"
-            );
-            let worker = self
-                .workers
-                .iter()
-                .find(|worker| worker.id == trigger.worker_id)
-                .context("github_block_validation worker_id is not registered")?;
-            ensure!(
-                worker.enabled
-                    && worker
-                        .capabilities
-                        .contains(&WorkerCapability::BlockValidation),
-                "github_block_validation worker must be enabled and authorized for block_validation"
             );
         }
         Ok(())

@@ -20,7 +20,6 @@ max_attempt_artifact_bytes = 34359738368
 # Optional bounded PR command:
 # /validate-blocks nakamoto <inclusive-global-start> <inclusive-global-end>
 [github_block_validation]
-worker_id = "22222222-2222-4222-8222-222222222222"
 requested_shards = 32
 max_concurrency = 24
 timeout_secs = 86400

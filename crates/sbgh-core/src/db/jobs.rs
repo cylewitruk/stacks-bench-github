@@ -36,10 +36,12 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::models::{
-    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobCreationRequest, JobEvent,
-    JobEventKind, JobEventStatus, JobMetric, JobResult, NewJob, NewJobEvent, ResolvedCommit,
-    SubmissionSpec, TaskSubmission, TerminalJobStatus, measured_run_count,
+    GithubPullRequestJob, GithubUserJob, GithubWebhookJob, Job, JobEvent, JobEventKind,
+    JobEventStatus, JobMetric, JobResult, NewJobEvent, ResolvedCommit, SubmissionSpec,
+    TaskSubmission, TerminalJobStatus, measured_run_count,
 };
+#[cfg(feature = "testing")]
+use crate::models::{JobCreationRequest, NewJob};
 
 /// Slice 10: atomic "the run completed" write. Bundles the terminal
 /// status transition + the write-once outcome companions + the terminal
@@ -78,10 +80,8 @@ pub struct JobFailure {
     pub event_detail: Option<serde_json::Value>,
 }
 
-/// Slice 8 (post-review): typed bundle returned by
-/// `create_job_with_links` so callers (slice 9) can chain follow-up
-/// operations against the freshly-created job + links + queued event
-/// without an extra lookup.
+/// Legacy linked-job result retained only for store integration tests.
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub struct CreatedJob {
     pub job: Job,
@@ -91,16 +91,8 @@ pub struct CreatedJob {
     pub queued_event: JobEvent,
 }
 
-/// Slice 9: outcome of `create_job_with_links`, distinguishing a fresh
-/// creation from an idempotent no-op when the webhook already has a job.
-///
-/// Job creation is the first non-idempotent side effect in the classify
-/// pipeline; the inbox is at-least-once (a webhook can be reprocessed
-/// after a failed `complete()` or a swept claim lease). The
-/// `github_webhook_job` `UNIQUE (github_webhook_id)` constraint makes
-/// "one job per webhook" structural, and this outcome lets the caller
-/// treat a retry that hit the constraint as success without minting a
-/// duplicate. Mirrors the `IngestOutcome::Duplicate` pattern.
+/// Legacy linked-job outcome retained only for store integration tests.
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub enum JobCreationOutcome {
     /// A new job (+ links + queued event) was created this call.
@@ -165,11 +157,8 @@ pub struct BenchmarkRunMetric {
     pub metric: JobMetric,
 }
 
-/// One requested submission spec inside a newly-created benchmark submission.
-///
-/// The store API is deliberately N-shaped: v22 caps comparison requests at two
-/// variants at validation time, but the persistence layer accepts an ordered
-/// list so future cap lifts do not require a schema/API retrofit.
+/// Legacy benchmark-plan fixture retained only for store integration tests.
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub struct NewBenchmarkSpec {
     pub new_job: NewJob,
@@ -177,6 +166,7 @@ pub struct NewBenchmarkSpec {
     pub baseline_calibration_id: Option<i64>,
 }
 
+#[cfg(feature = "testing")]
 impl NewBenchmarkSpec {
     pub fn singleton(new_job: NewJob, requested_run_count: i32) -> Self {
         Self {
@@ -192,7 +182,8 @@ impl NewBenchmarkSpec {
 }
 
 #[async_trait]
-pub trait JobStore: Send + Sync + 'static {
+pub trait JobStore: crate::db::SubmissionStore + Send + Sync + 'static {
+    #[cfg(feature = "testing")]
     async fn insert_job(&self, new: &NewJob) -> Result<Job>;
 
     /// Slice 8 (post-review): atomic job-creation boundary. Inserts the
@@ -213,6 +204,7 @@ pub trait JobStore: Send + Sync + 'static {
     /// `JobCreationOutcome::AlreadyEnqueued` is returned — the
     /// `UNIQUE (github_webhook_id)` constraint makes this race-safe even
     /// against a concurrent re-claim.
+    #[cfg(feature = "testing")]
     async fn create_job_with_links(
         &self,
         request: &JobCreationRequest,
@@ -236,6 +228,7 @@ pub trait JobStore: Send + Sync + 'static {
     /// webhook-keyed idempotency**. These triggers have no at-least-once inbox
     /// behind them — a Slack envelope is acked before enqueuing, and warming
     /// dedups itself against in-flight builds — making this a plain create.
+    #[cfg(feature = "testing")]
     async fn create_unlinked_job(
         &self,
         job_id: Uuid,
@@ -254,6 +247,7 @@ pub trait JobStore: Send + Sync + 'static {
     /// `task_spec` rows up front. Later runs/specs are materialized by
     /// [`append_next_benchmark_run`](Self::append_next_benchmark_run) so the
     /// submission preserves the "at most one active run" scheduling invariant.
+    #[cfg(feature = "testing")]
     async fn create_unlinked_benchmark_submission(
         &self,
         first_job_id: Uuid,
@@ -416,8 +410,9 @@ pub trait JobStore: Send + Sync + 'static {
     ///
     /// Only `intent='baseline_benchmark'`, `status='completed'`,
     /// matching-`workload_key`, and matching non-NULL submission
-    /// `measurement_profile` rows are eligible; a NULL workload/profile never
-    /// matches. `None` when neither step finds one. Ties (a commit
+    /// `assigned_measurement_profile` rows are eligible; a NULL
+    /// workload/profile never matches. `None` when neither step finds one.
+    /// Ties (a commit
     /// benchmarked more than once, or two commits sharing a timestamp) resolve
     /// **deterministically** to the freshest measurement, then the highest job
     /// id — so a report never silently flips which baseline it cites.
@@ -535,10 +530,13 @@ pub trait JobStore: Send + Sync + 'static {
 
     async fn record_result(&self, result: &JobResult) -> Result<()>;
 
+    #[cfg(feature = "testing")]
     async fn link_to_webhook(&self, webhook_id: i64, job_id: Uuid) -> Result<GithubWebhookJob>;
 
+    #[cfg(feature = "testing")]
     async fn link_to_user(&self, user_id: i64, job_id: Uuid) -> Result<GithubUserJob>;
 
+    #[cfg(feature = "testing")]
     async fn link_to_pull_request(
         &self,
         pull_request_id: i64,

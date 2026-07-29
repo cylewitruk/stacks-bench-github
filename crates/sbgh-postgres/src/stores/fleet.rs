@@ -13,7 +13,9 @@ use sbgh_core::db::fleet::{
     ProjectedReportMutation, ReportProjectionSeed, ResolvedSpecSource, StoredAttemptEvent,
     StoredProgress, SubmissionRecovery, TerminalAcceptance, WorkerRegistration,
 };
-use sbgh_core::models::{JobEventKind, JobEventStatus, NewJob, NewPullRequestLink};
+use sbgh_core::models::{JobEventKind, JobEventStatus};
+#[cfg(feature = "testing")]
+use sbgh_core::models::{NewJob, NewPullRequestLink};
 use sbgh_proto::{
     ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DesiredState, ProgressRequest,
     RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload, TaskPayload,
@@ -30,6 +32,7 @@ pub struct PostgresFleetStore {
 }
 
 #[derive(Debug, Clone, Default)]
+#[cfg(feature = "testing")]
 pub struct PreparedJobProvenance {
     pub github_webhook_id: Option<i64>,
     pub triggering_user_id: Option<i64>,
@@ -45,6 +48,7 @@ impl PostgresFleetStore {
     ///
     /// A worker can never observe the job between queue insertion and
     /// immutable-payload persistence.
+    #[cfg(feature = "testing")]
     pub async fn enqueue_prepared_job(
         &self,
         job_id: Uuid,
@@ -71,8 +75,8 @@ impl PostgresFleetStore {
             r#"
             INSERT INTO task_submission
                 (id, github_installation_id, github_repo_id, source, intent,
-                 artifact_prefix, worker_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 artifact_prefix)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(submission_id)
@@ -81,7 +85,6 @@ impl PostgresFleetStore {
         .bind(Db(new.axes.source))
         .bind(Db(new.axes.intent))
         .bind(submission_id.to_string())
-        .bind(prepared.worker_id)
         .execute(&mut *tx)
         .await
         .core()?;
@@ -130,10 +133,11 @@ impl PostgresFleetStore {
                  github_installation_id, github_repo_id, git_ref_kind,
                  git_ref_display, git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target,
-                 execution_payload_version, execution_payload, execution_payload_hash)
+                 required_capability, execution_payload_version,
+                 execution_payload, execution_payload_hash)
             VALUES (
                 $1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17
+                $11, $12, $13, $14, $15, $16, $17, $18
             )
             "#,
         )
@@ -151,6 +155,10 @@ impl PostgresFleetStore {
         .bind(Db(new.axes.intent))
         .bind(Db(new.axes.task_kind))
         .bind(Db(new.axes.build_target))
+        .bind(Db(new
+            .axes
+            .task_kind
+            .required_capability()))
         .bind(i32::from(sbgh_proto::PROTOCOL_VERSION))
         .bind(payload)
         .bind(&prepared.payload_hash)
@@ -332,7 +340,7 @@ const OFFER_SELECT: &str = r#"
            j.github_installation_id,
            j.github_repo_id,
            repo.owner || '/' || repo.name AS repository,
-           submission.measurement_profile
+           submission.assigned_measurement_profile AS measurement_profile
       FROM worker_attempt a
       JOIN job j ON j.id = a.job_id
       JOIN github_repo repo ON repo.id = j.github_repo_id
@@ -874,8 +882,7 @@ impl FleetStore for PostgresFleetStore {
             .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
         let result = sqlx::query(
             r#"
-            WITH prepared_job AS (
-                UPDATE job
+            UPDATE job
                SET git_commit_hash = $2,
                    execution_payload_version = $3,
                    execution_payload = $4,
@@ -884,23 +891,6 @@ impl FleetStore for PostgresFleetStore {
              WHERE id = $1
                AND status = 'queued'
                AND execution_payload IS NULL
-               AND EXISTS (
-                   SELECT 1
-                     FROM task_submission compatible_submission
-                    WHERE compatible_submission.id = job.task_submission_id
-                      AND (
-                          $6::uuid IS NULL
-                          OR compatible_submission.worker_id IS NULL
-                          OR compatible_submission.worker_id = $6
-                      )
-               )
-             RETURNING task_submission_id
-            )
-            UPDATE task_submission
-               SET worker_id = COALESCE(worker_id, $6),
-                   updated_at = NOW()
-             WHERE id = (SELECT task_submission_id FROM prepared_job)
-               AND ($6::uuid IS NULL OR worker_id IS NULL OR worker_id = $6)
             "#,
         )
         .bind(prepared.job_id)
@@ -908,7 +898,6 @@ impl FleetStore for PostgresFleetStore {
         .bind(i32::from(sbgh_proto::PROTOCOL_VERSION))
         .bind(payload)
         .bind(&prepared.payload_hash)
-        .bind(prepared.worker_id)
         .execute(&self.pool)
         .await
         .core()?;
@@ -1023,14 +1012,10 @@ impl FleetStore for PostgresFleetStore {
                    j.git_commit_hash,
                    j.execution_payload,
                    j.execution_payload_hash,
-                   CASE j.task_kind
-                       WHEN 'benchmark' THEN 'benchmark'
-                       WHEN 'build_only' THEN 'build_only'
-                       WHEN 'block_validation' THEN 'block_validation'
-                   END AS capability,
+                   j.required_capability::text AS capability,
                    repo.owner || '/' || repo.name AS repository,
-                   submission.worker_id AS placed_worker_id,
-                   submission.measurement_profile AS placed_measurement_profile,
+                   submission.assigned_worker_id AS placed_worker_id,
+                   submission.assigned_measurement_profile AS placed_measurement_profile,
                    submission.execution_generation,
                    submission.fencing_generation
               FROM job j
@@ -1039,16 +1024,24 @@ impl FleetStore for PostgresFleetStore {
              WHERE j.status = 'queued'
                AND j.execution_payload IS NOT NULL
                AND j.git_commit_hash IS NOT NULL
-               AND CASE j.task_kind
-                       WHEN 'benchmark' THEN 'benchmark'
-                       WHEN 'build_only' THEN 'build_only'
-                       WHEN 'block_validation' THEN 'block_validation'
-                   END = ANY($1::text[])
-               AND (submission.worker_id IS NULL OR submission.worker_id = $2)
+               AND j.required_capability::text = ANY($1::text[])
+               AND (
+                   submission.required_worker_id IS NULL
+                   OR submission.required_worker_id = $2
+               )
+               AND (
+                   submission.assigned_worker_id IS NULL
+                   OR submission.assigned_worker_id = $2
+               )
                AND (
                    j.task_kind <> 'benchmark'
-                   OR submission.measurement_profile IS NULL
-                   OR submission.measurement_profile IS NOT DISTINCT FROM $3
+                   OR submission.required_measurement_profile IS NULL
+                   OR submission.required_measurement_profile IS NOT DISTINCT FROM $3
+               )
+               AND (
+                   j.task_kind <> 'benchmark'
+                   OR submission.assigned_measurement_profile IS NULL
+                   OR submission.assigned_measurement_profile IS NOT DISTINCT FROM $3
                )
                AND NOT EXISTS (
                    SELECT 1
@@ -1110,15 +1103,16 @@ impl FleetStore for PostgresFleetStore {
         let placement = sqlx::query(
             r#"
             UPDATE task_submission
-               SET worker_id = COALESCE(worker_id, $2),
-                   measurement_profile = CASE
-                       WHEN measurement_profile IS NULL THEN $3
-                       ELSE measurement_profile
+               SET assigned_worker_id = COALESCE(assigned_worker_id, $2),
+                   assigned_measurement_profile = CASE
+                       WHEN assigned_measurement_profile IS NULL THEN $3
+                       ELSE assigned_measurement_profile
                    END,
                    fencing_generation = $4,
                    updated_at = NOW()
              WHERE id = $1
-               AND (worker_id IS NULL OR worker_id = $2)
+               AND (assigned_worker_id IS NULL OR assigned_worker_id = $2)
+               AND (required_worker_id IS NULL OR required_worker_id = $2)
             "#,
         )
         .bind(task_submission_id)
@@ -1840,11 +1834,13 @@ impl FleetStore for PostgresFleetStore {
             r#"
             INSERT INTO task_submission
                 (id, github_installation_id, github_repo_id, source, intent,
-                 artifact_prefix, host_key, recovery_of_submission_id,
-                 execution_generation, fencing_generation, worker_id)
+                 artifact_prefix, recovery_of_submission_id,
+                 execution_generation, fencing_generation, required_worker_id,
+                 required_measurement_profile, contract_version, request_digest)
             SELECT $2, github_installation_id, github_repo_id, source, intent,
-                   $2::text, host_key, COALESCE(recovery_of_submission_id, id),
-                   $3, fencing_generation + 1, $4
+                   $2::text, COALESCE(recovery_of_submission_id, id),
+                   $3, fencing_generation + 1, $4,
+                   required_measurement_profile, contract_version, request_digest
               FROM task_submission
              WHERE id = $1
             "#,
@@ -1908,13 +1904,15 @@ impl FleetStore for PostgresFleetStore {
                  github_installation_id, github_repo_id, git_ref_kind,
                  git_ref_display, git_commit_hash, git_committed_at, workload_key,
                  source, intent, task_kind, build_target,
-                 execution_payload_version, execution_payload, execution_payload_hash)
+                 required_capability, execution_payload_version,
+                 execution_payload, execution_payload_hash)
             SELECT $2, new_spec.id, 0, old_job.github_installation_id,
                    old_job.github_repo_id, old_job.git_ref_kind,
                    old_job.git_ref_display, old_job.git_commit_hash,
                    old_job.git_committed_at, old_job.workload_key,
                    old_job.source, old_job.intent, old_job.task_kind,
-                   old_job.build_target, old_job.execution_payload_version,
+                   old_job.build_target, old_job.required_capability,
+                   old_job.execution_payload_version,
                    old_job.execution_payload, old_job.execution_payload_hash
               FROM job old_job
               JOIN task_spec old_spec
@@ -1964,60 +1962,48 @@ impl FleetStore for PostgresFleetStore {
         .execute(&mut *tx)
         .await
         .core()?;
-        for table in ["github_pull_request_job", "github_webhook_job", "github_user_job"] {
-            let sql = match table {
-                "github_pull_request_job" => {
-                    r#"
-                    INSERT INTO github_pull_request_job
-                        (job_id, github_pull_request_id, triggering_comment_id)
-                    SELECT $2, github_pull_request_id, triggering_comment_id
-                      FROM github_pull_request_job
-                     WHERE job_id = (
-                         SELECT old_job.id FROM job old_job
-                         JOIN task_spec old_spec ON old_spec.id = old_job.task_spec_id
-                         WHERE old_spec.task_submission_id = $1
-                           AND old_spec.spec_index = 0
-                           AND old_job.task_run_index = 0
-                         ORDER BY old_job.created_at, old_job.id LIMIT 1
-                     )
-                    "#
-                }
-                "github_webhook_job" => {
-                    r#"
-                    INSERT INTO github_webhook_job (github_webhook_id, job_id)
-                    SELECT github_webhook_id, $2 FROM github_webhook_job
-                     WHERE job_id = (
-                         SELECT old_job.id FROM job old_job
-                         JOIN task_spec old_spec ON old_spec.id = old_job.task_spec_id
-                         WHERE old_spec.task_submission_id = $1
-                           AND old_spec.spec_index = 0
-                           AND old_job.task_run_index = 0
-                         ORDER BY old_job.created_at, old_job.id LIMIT 1
-                     )
-                    "#
-                }
-                _ => {
-                    r#"
-                    INSERT INTO github_user_job (github_user_id, job_id)
-                    SELECT github_user_id, $2 FROM github_user_job
-                     WHERE job_id = (
-                         SELECT old_job.id FROM job old_job
-                         JOIN task_spec old_spec ON old_spec.id = old_job.task_spec_id
-                         WHERE old_spec.task_submission_id = $1
-                           AND old_spec.spec_index = 0
-                           AND old_job.task_run_index = 0
-                         ORDER BY old_job.created_at, old_job.id LIMIT 1
-                     )
-                    "#
-                }
-            };
-            sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(submission_id)
-                .bind(first_job_id)
-                .execute(&mut *tx)
-                .await
-                .core()?;
-        }
+        sqlx::query(
+            r#"
+            INSERT INTO task_submission_provenance
+                (task_submission_id, actor_kind, actor_identity, queued_event_detail)
+            SELECT $2, actor_kind, actor_identity, queued_event_detail
+              FROM task_submission_provenance
+             WHERE task_submission_id = $1
+            "#,
+        )
+        .bind(submission_id)
+        .bind(new_submission_id)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        sqlx::query(
+            r#"
+            INSERT INTO task_submission_github
+                (task_submission_id, github_webhook_id, triggering_user_id,
+                 github_pull_request_id, triggering_comment_id)
+            SELECT $2, NULL, triggering_user_id,
+                   github_pull_request_id, triggering_comment_id
+              FROM task_submission_github
+             WHERE task_submission_id = $1
+            "#,
+        )
+        .bind(submission_id)
+        .bind(new_submission_id)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        // One canonical Slack reporting identity follows the active recovery
+        // generation. Prior job events retain the historical message audit.
+        sqlx::query(
+            "UPDATE task_submission_slack
+                SET task_submission_id = $2
+              WHERE task_submission_id = $1",
+        )
+        .bind(submission_id)
+        .bind(new_submission_id)
+        .execute(&mut *tx)
+        .await
+        .core()?;
         tx.commit().await.core()?;
         Ok(SubmissionRecovery {
             prior_submission_id: submission_id,

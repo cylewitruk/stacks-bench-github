@@ -13,7 +13,9 @@ pub use error::{PersistenceError, PersistenceResult};
 pub use mapping::Db;
 pub use migrate::migrate;
 pub use pool::{Pool, connect};
-pub use stores::fleet::{PostgresFleetStore, PreparedJobProvenance};
+pub use stores::fleet::PostgresFleetStore;
+#[cfg(feature = "testing")]
+pub use stores::fleet::PreparedJobProvenance;
 pub use stores::ingest::PostgresIngestStore;
 pub use stores::installation::PostgresInstallationStore;
 pub use stores::jobs::PostgresJobStore;
