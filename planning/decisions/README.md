@@ -51,4 +51,5 @@ into an ADR as we work the related item (skeleton phase — not yet extracted):
 `0002-artifact-refs-are-store-keys`,
 `0003-artifact-export-failure-not-benchmark-failure`.
 
-*Established for the worker fleet:* `0004-protobuf-fleet-protocol`.
+*Established for the worker fleet:* `0004-protobuf-fleet-protocol`,
+`0005-public-key-worker-identities`.

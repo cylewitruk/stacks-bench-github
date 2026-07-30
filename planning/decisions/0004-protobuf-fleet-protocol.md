@@ -4,7 +4,8 @@
 - **date:** 2026-07
 - **related items:** `0004-worker-fleet`, `0017-generic-phase-events`,
   `0074-protobuf-fleet-protocol`,
-  `0075-rolling-worker-protocol-compatibility`
+  `0075-rolling-worker-protocol-compatibility`,
+  `0077-worker-identity-and-config-simplification`
 
 ## Decision
 
@@ -29,10 +30,12 @@ Supporting simultaneous protocol revisions and rolling protocol upgrades is a
 separate follow-up (`0075`) required before the first incompatible protobuf
 change.
 
-TLS 1.3 mutual X.509 authentication, certificate URI-SAN worker identity,
-server-owned capability authorization, message validation/bounds, attempt
-leases, fencing, idempotency, and cleanup remain mandatory. Protobuf decoding
-is not authorization or validation.
+TLS 1.3 peer authentication, server-owned capability authorization, message
+validation/bounds, attempt leases, fencing, idempotency, and cleanup remain
+mandatory. Protobuf decoding is not authorization or validation. The current
+worker-key and daemon Web-PKI trust model is owned by
+[Decision 0005](0005-public-key-worker-identities.md); generated request fields
+are not an identity authority.
 
 Payload and terminal identities remain semantic digests. They do not hash
 serialized protobuf bytes because protobuf serialization is not canonical
@@ -60,7 +63,7 @@ work.
   Breaking-change enforcement against a previous release begins with `0075`.
 - Exact protocol mismatch fails before session registration or assignment.
   Ordinary software releases need not change the protocol version.
-- mTLS identities, registry authorization, leases, events, and
+- TLS peer identities, registry authorization, leases, events, and
   artifact-transfer policy remain mandatory.
 - Generated messages remain at transport boundaries, keeping `sbgh-core`,
   `sbgh-driver`, and `sbgh-postgres` independent of Prost, Tonic, and gRPC.

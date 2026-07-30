@@ -13,6 +13,12 @@ configuration to daemon bootstrap and transport settings.
 > v29 established the first protobuf worker transport. v30 removes the static
 > worker allowlist and daemon-restart reconciliation before onboarding
 > independently operated workers.
+>
+> The database-authority design remains current. Its undeployed private-CA,
+> certificate-fingerprint, and worker-local configuration details are
+> intentionally continued and replaced by
+> [v31](../../iterations/v31-worker-identity-config-simplification.md) before
+> the first fleet rollout.
 
 ## Item
 
