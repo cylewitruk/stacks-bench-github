@@ -8,7 +8,8 @@ use crate::dto::{
     FleetRecoveryRequest, FleetRecoveryResponse, FleetWorkerView, GrantRoleResult, HealthResponse,
     InstallationView, InstallerView, JobView, PinTriggerRequest, PolicyView, RepoRootView,
     ResolveRepoResponse, RoleRequest, RoleView, SubmissionReportView, TriggerView, UserView,
-    WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerDrainRequest,
+    WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerCertificateRequest,
+    WorkerCreateRequest, WorkerDrainRequest, WorkerPolicyView, WorkerUpdateRequest,
 };
 use crate::error::ApiError;
 
@@ -311,6 +312,69 @@ impl Client {
         self.get("/api/fleet").await
     }
 
+    pub async fn create_worker(
+        &self,
+        request: &WorkerCreateRequest,
+    ) -> Result<WorkerPolicyView, ClientError> {
+        self.post_json("/api/fleet/workers", request)
+            .await
+    }
+
+    pub async fn worker(&self, worker_id: &str) -> Result<WorkerPolicyView, ClientError> {
+        self.get(&format!("/api/fleet/workers/{worker_id}"))
+            .await
+    }
+
+    pub async fn update_worker(
+        &self,
+        worker_id: &str,
+        request: &WorkerUpdateRequest,
+    ) -> Result<WorkerPolicyView, ClientError> {
+        self.patch_json(&format!("/api/fleet/workers/{worker_id}"), request)
+            .await
+    }
+
+    pub async fn authorize_worker_certificate(
+        &self,
+        worker_id: &str,
+        certificate_pem: String,
+    ) -> Result<WorkerPolicyView, ClientError> {
+        self.post_json(
+            &format!("/api/fleet/workers/{worker_id}/certificates"),
+            &WorkerCertificateRequest { certificate_pem },
+        )
+        .await
+    }
+
+    pub async fn revoke_worker_certificate(
+        &self,
+        worker_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerPolicyView, ClientError> {
+        self.delete(&format!("/api/fleet/workers/{worker_id}/certificates/{fingerprint}"))
+            .await
+    }
+
+    pub async fn emergency_disable_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<WorkerPolicyView, ClientError> {
+        self.post_json(&format!("/api/fleet/workers/{worker_id}/emergency-disable"), &())
+            .await
+    }
+
+    pub async fn emergency_revoke_worker_certificate(
+        &self,
+        worker_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerPolicyView, ClientError> {
+        self.post_json(
+            &format!("/api/fleet/workers/{worker_id}/certificates/{fingerprint}/emergency-revoke"),
+            &(),
+        )
+        .await
+    }
+
     pub async fn set_worker_draining(
         &self,
         worker_id: &str,
@@ -358,6 +422,31 @@ impl Client {
             .http
             .post(format!("{}{}", self.base_url, path))
             .json(body);
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        decode(req.send().await?).await
+    }
+
+    async fn patch_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let mut req = self
+            .http
+            .patch(format!("{}{}", self.base_url, path))
+            .json(body);
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        decode(req.send().await?).await
+    }
+
+    async fn delete<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
+        let mut req = self
+            .http
+            .delete(format!("{}{}", self.base_url, path));
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, ensure};
+use rustls::pki_types::UnixTime;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
@@ -27,7 +28,7 @@ const ACCEPTED_CONNECTION_BUFFER: usize = 128;
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPeer {
     pub worker_id: Uuid,
-    pub certificate_sha256: String,
+    pub certificate_sha256: [u8; 32],
     pub socket_addr: SocketAddr,
 }
 
@@ -239,6 +240,41 @@ fn certificates(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
         .with_context(|| format!("parsing certificate {}", path.display()))
 }
 
+pub(crate) fn validate_worker_certificate(
+    pem: &[u8],
+    worker_id: Uuid,
+    ca_path: &Path,
+) -> anyhow::Result<[u8; 32]> {
+    ensure!(pem.len() <= 64 * 1024, "worker certificate exceeds 64 KiB");
+    let mut items = rustls_pemfile::read_all(&mut BufReader::new(pem))
+        .collect::<Result<Vec<_>, _>>()
+        .context("parsing worker certificate PEM")?;
+    ensure!(items.len() == 1, "expected exactly one public worker leaf certificate");
+    let leaf = match items.remove(0) {
+        rustls_pemfile::Item::X509Certificate(certificate) => certificate,
+        _ => anyhow::bail!("worker enrollment accepts a public certificate only"),
+    };
+    ensure!(
+        worker_id_from_certificate(leaf.as_ref())? == worker_id,
+        "worker certificate URI SAN does not match worker identity"
+    );
+
+    let mut roots = RootCertStore::empty();
+    for certificate in certificates(ca_path)? {
+        roots
+            .add(certificate)
+            .context("adding worker CA certificate to enrollment verifier")?;
+    }
+    ensure!(!roots.is_empty(), "worker CA certificate file is empty");
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("building worker certificate enrollment verifier")?;
+    verifier
+        .verify_client_cert(&leaf, &[], UnixTime::now())
+        .context("worker certificate is not currently valid for client authentication")?;
+    Ok(Sha256::digest(leaf.as_ref()).into())
+}
+
 fn private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
     #[cfg(unix)]
     {
@@ -270,14 +306,14 @@ fn peer_worker_id(stream: &TlsStream<TcpStream>) -> anyhow::Result<Uuid> {
     worker_id_from_certificate(certificates[0].as_ref())
 }
 
-fn peer_certificate_sha256(stream: &TlsStream<TcpStream>) -> anyhow::Result<String> {
+fn peer_certificate_sha256(stream: &TlsStream<TcpStream>) -> anyhow::Result<[u8; 32]> {
     let leaf = stream
         .get_ref()
         .1
         .peer_certificates()
         .and_then(|certificates| certificates.first())
         .context("authenticated worker presented no leaf certificate")?;
-    Ok(hex::encode(Sha256::digest(leaf.as_ref())))
+    Ok(Sha256::digest(leaf.as_ref()).into())
 }
 
 fn worker_id_from_certificate(der: &[u8]) -> anyhow::Result<Uuid> {
@@ -307,7 +343,7 @@ fn worker_id_from_certificate(der: &[u8]) -> anyhow::Result<Uuid> {
 mod tests {
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
-        KeyPair, KeyUsagePurpose, SanType,
+        KeyPair, KeyUsagePurpose, SanType, date_time_ymd,
     };
     use rustls::ClientConfig;
     use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
@@ -363,6 +399,11 @@ mod tests {
         server_certificate: std::path::PathBuf,
         server_key: std::path::PathBuf,
         ca_certificate: std::path::PathBuf,
+        client_pem: String,
+        client_private_pem: String,
+        wrong_eku_pem: String,
+        expired_pem: String,
+        not_yet_valid_pem: String,
         client_certificate: CertificateDer<'static>,
         client_key: PrivateKeyDer<'static>,
     }
@@ -401,6 +442,23 @@ mod tests {
         let client = client_params
             .signed_by(&client_key, &ca)
             .unwrap();
+        let mut wrong_eku_params = client_params.clone();
+        wrong_eku_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let wrong_eku = wrong_eku_params
+            .signed_by(&KeyPair::generate().unwrap(), &ca)
+            .unwrap();
+        let mut expired_params = client_params.clone();
+        expired_params.not_before = date_time_ymd(2019, 1, 1);
+        expired_params.not_after = date_time_ymd(2020, 1, 1);
+        let expired = expired_params
+            .signed_by(&KeyPair::generate().unwrap(), &ca)
+            .unwrap();
+        let mut not_yet_valid_params = client_params.clone();
+        not_yet_valid_params.not_before = date_time_ymd(4096, 1, 1);
+        not_yet_valid_params.not_after = date_time_ymd(4097, 1, 1);
+        let not_yet_valid = not_yet_valid_params
+            .signed_by(&KeyPair::generate().unwrap(), &ca)
+            .unwrap();
 
         let server_certificate = directory
             .path()
@@ -426,9 +484,113 @@ mod tests {
             server_certificate,
             server_key: server_key_path,
             ca_certificate,
+            client_pem: client.pem(),
+            client_private_pem: client_key.serialize_pem(),
+            wrong_eku_pem: wrong_eku.pem(),
+            expired_pem: expired.pem(),
+            not_yet_valid_pem: not_yet_valid.pem(),
             client_certificate: client.der().clone(),
             client_key: PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
         }
+    }
+
+    #[test]
+    fn enrollment_validates_trust_usage_and_worker_identity() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let worker_id = Uuid::new_v4();
+        let trusted = pki_fixture(worker_id);
+        let fingerprint = validate_worker_certificate(
+            trusted.client_pem.as_bytes(),
+            worker_id,
+            &trusted.ca_certificate,
+        )
+        .unwrap();
+        assert_eq!(
+            fingerprint,
+            <[u8; 32]>::from(Sha256::digest(
+                trusted
+                    .client_certificate
+                    .as_ref()
+            ))
+        );
+        assert!(
+            validate_worker_certificate(
+                trusted.client_pem.as_bytes(),
+                Uuid::new_v4(),
+                &trusted.ca_certificate,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_worker_certificate(
+                trusted
+                    .not_yet_valid_pem
+                    .as_bytes(),
+                worker_id,
+                &trusted.ca_certificate,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_worker_certificate(b"not a certificate", worker_id, &trusted.ca_certificate)
+                .is_err()
+        );
+        let duplicate_leaf = format!("{}{}", trusted.client_pem, trusted.client_pem);
+        assert!(
+            validate_worker_certificate(
+                duplicate_leaf.as_bytes(),
+                worker_id,
+                &trusted.ca_certificate,
+            )
+            .is_err()
+        );
+        let certificate_with_private_key =
+            format!("{}{}", trusted.client_pem, trusted.client_private_pem);
+        assert!(
+            validate_worker_certificate(
+                certificate_with_private_key.as_bytes(),
+                worker_id,
+                &trusted.ca_certificate,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_worker_certificate(
+                trusted
+                    .wrong_eku_pem
+                    .as_bytes(),
+                worker_id,
+                &trusted.ca_certificate,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_worker_certificate(
+                trusted.expired_pem.as_bytes(),
+                worker_id,
+                &trusted.ca_certificate,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_worker_certificate(
+                &vec![b'x'; 64 * 1024 + 1],
+                worker_id,
+                &trusted.ca_certificate
+            )
+            .is_err()
+        );
+        let untrusted = pki_fixture(worker_id);
+        assert!(
+            validate_worker_certificate(
+                untrusted
+                    .client_pem
+                    .as_bytes(),
+                worker_id,
+                &trusted.ca_certificate,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -436,11 +598,12 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let worker_id = Uuid::new_v4();
         let fixture = pki_fixture(worker_id);
-        let expected_fingerprint = hex::encode(Sha256::digest(
+        let expected_fingerprint: [u8; 32] = Sha256::digest(
             fixture
                 .client_certificate
                 .as_ref(),
-        ));
+        )
+        .into();
         let server = server_config(
             &fixture.server_certificate,
             &fixture.server_key,

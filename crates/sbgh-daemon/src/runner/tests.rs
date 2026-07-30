@@ -4,8 +4,8 @@ use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use sbgh_core::config::{
-    ApiConfig, BaselineReport, DaemonServerConfig, GitHubConfig, LvmConfig, PathsConfig, PrReport,
-    ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
+    ApiConfig, BaselineReport, DaemonServerConfig, FleetConfig, GitHubConfig, LvmConfig,
+    PathsConfig, PrReport, ReportingConfig, RunnerConfig, StacksBenchConfig, VmConfig,
 };
 use sbgh_core::models::{BuildTarget, GitRefKind, ResolvedCommit, TaskKind};
 use sbgh_github::test_support::FakeGitHub;
@@ -510,7 +510,9 @@ fn test_config(tmp: &TempDir) -> DaemonConfig {
             client_id: "Iv23litest".into(),
             api_base_url: "https://api.github.test".into(),
             private_key_path: PathBuf::from("/dev/null"),
+            block_validation: None,
         },
+        fleet: FleetConfig::default(),
         vm: VmConfig {
             golden_image: p.join("golden.qcow2"),
             build_vcpus: 4,

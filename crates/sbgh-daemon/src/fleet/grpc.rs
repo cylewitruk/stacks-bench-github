@@ -19,9 +19,6 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 use super::service::{self, FleetRuntime, FleetService, ServiceCode, ServiceError};
 use super::tls::{AuthenticatedPeer, MtlsListener};
 
-const MIN_CONCURRENT_REQUESTS: usize = 64;
-const MAX_CONCURRENT_REQUESTS: usize = 1_024;
-
 #[derive(Clone)]
 struct GrpcFleet {
     service: FleetService,
@@ -219,11 +216,7 @@ pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::
         .service
         .config()
         .clone();
-    let request_limit = config
-        .workers
-        .len()
-        .saturating_mul(2)
-        .clamp(MIN_CONCURRENT_REQUESTS, MAX_CONCURRENT_REQUESTS);
+    let request_limit = config.max_concurrent_requests;
     let listener = MtlsListener::bind(
         config.listen,
         &config.server_certificate,

@@ -20,7 +20,8 @@ use clap::{Parser, Subcommand};
 use sbgh_api::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest, Client,
     DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest,
-    EnqueueBlockValidationRequest, PinTriggerRequest, RoleRequest, TriggerView, read_cookie,
+    EnqueueBlockValidationRequest, PinTriggerRequest, RoleRequest, TriggerView,
+    WorkerCreateRequest, WorkerPolicyView, WorkerUpdateRequest, read_cookie,
 };
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -423,6 +424,71 @@ enum JobsAction {
 enum FleetAction {
     /// Show worker/session/attempt status and fleet health counters.
     Status,
+    /// Enroll a new disabled and drained worker policy.
+    AddWorker {
+        #[arg(long)]
+        worker_id: Option<String>,
+        #[arg(long)]
+        display_name: String,
+        #[arg(long = "capability", required = true)]
+        capabilities: Vec<String>,
+        #[arg(long)]
+        measurement_profile: Option<String>,
+    },
+    /// Show one worker policy and its certificate fingerprints.
+    ShowWorker {
+        #[arg(long)]
+        worker_id: String,
+    },
+    /// Update a drained worker's policy.
+    UpdateWorker {
+        #[arg(long)]
+        worker_id: String,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        #[arg(long, conflicts_with = "clear_measurement_profile")]
+        measurement_profile: Option<String>,
+        #[arg(long)]
+        clear_measurement_profile: bool,
+    },
+    /// Enable a drained worker after authorizing a certificate.
+    EnableWorker {
+        #[arg(long)]
+        worker_id: String,
+    },
+    /// Disable a drained and quiescent worker.
+    DisableWorker {
+        #[arg(long)]
+        worker_id: String,
+    },
+    /// Immediately withdraw a worker and expire its live leases.
+    EmergencyDisableWorker {
+        #[arg(long)]
+        worker_id: String,
+    },
+    /// Validate and authorize a public worker leaf certificate.
+    AuthorizeCertificate {
+        #[arg(long)]
+        worker_id: String,
+        #[arg(long)]
+        certificate: PathBuf,
+    },
+    /// Revoke an authorized certificate fingerprint.
+    RevokeCertificate {
+        #[arg(long)]
+        worker_id: String,
+        #[arg(long)]
+        fingerprint: String,
+    },
+    /// Immediately revoke a certificate and expire sessions using it.
+    EmergencyRevokeCertificate {
+        #[arg(long)]
+        worker_id: String,
+        #[arg(long)]
+        fingerprint: String,
+    },
     /// Stop a worker from claiming new work after its active attempt.
     Drain {
         #[arg(long)]
@@ -1176,6 +1242,113 @@ async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
                 );
             }
         }
+        FleetAction::AddWorker {
+            worker_id,
+            display_name,
+            capabilities,
+            measurement_profile,
+        } => {
+            let worker = client
+                .create_worker(&WorkerCreateRequest {
+                    worker_id,
+                    display_name,
+                    capabilities,
+                    measurement_profile,
+                })
+                .await
+                .context("add fleet worker")?;
+            print_worker_policy(&worker);
+        }
+        FleetAction::ShowWorker { worker_id } => {
+            let worker = client
+                .worker(&worker_id)
+                .await
+                .with_context(|| format!("show worker {worker_id}"))?;
+            print_worker_policy(&worker);
+        }
+        FleetAction::UpdateWorker {
+            worker_id,
+            display_name,
+            capabilities,
+            measurement_profile,
+            clear_measurement_profile,
+        } => {
+            let measurement_profile =
+                if clear_measurement_profile { Some(None) } else { measurement_profile.map(Some) };
+            let worker = client
+                .update_worker(
+                    &worker_id,
+                    &WorkerUpdateRequest {
+                        display_name,
+                        capabilities: (!capabilities.is_empty()).then_some(capabilities),
+                        measurement_profile,
+                        enabled: None,
+                    },
+                )
+                .await
+                .with_context(|| format!("update worker {worker_id}"))?;
+            print_worker_policy(&worker);
+        }
+        FleetAction::EnableWorker { worker_id } => {
+            let worker = client
+                .update_worker(
+                    &worker_id,
+                    &WorkerUpdateRequest {
+                        display_name: None,
+                        capabilities: None,
+                        measurement_profile: None,
+                        enabled: Some(true),
+                    },
+                )
+                .await
+                .with_context(|| format!("enable worker {worker_id}"))?;
+            print_worker_policy(&worker);
+        }
+        FleetAction::DisableWorker { worker_id } => {
+            let worker = client
+                .update_worker(
+                    &worker_id,
+                    &WorkerUpdateRequest {
+                        display_name: None,
+                        capabilities: None,
+                        measurement_profile: None,
+                        enabled: Some(false),
+                    },
+                )
+                .await
+                .with_context(|| format!("disable worker {worker_id}"))?;
+            print_worker_policy(&worker);
+        }
+        FleetAction::EmergencyDisableWorker { worker_id } => {
+            let worker = client
+                .emergency_disable_worker(&worker_id)
+                .await
+                .with_context(|| format!("emergency-disable worker {worker_id}"))?;
+            print_worker_policy(&worker);
+        }
+        FleetAction::AuthorizeCertificate { worker_id, certificate } => {
+            let certificate_pem = std::fs::read_to_string(&certificate)
+                .with_context(|| format!("reading {}", certificate.display()))?;
+            let worker = client
+                .authorize_worker_certificate(&worker_id, certificate_pem)
+                .await
+                .with_context(|| format!("authorize certificate for worker {worker_id}"))?;
+            print_worker_policy(&worker);
+        }
+        FleetAction::RevokeCertificate { worker_id, fingerprint } => {
+            let worker = client
+                .revoke_worker_certificate(&worker_id, &fingerprint)
+                .await
+                .with_context(|| format!("revoke certificate for worker {worker_id}"))?;
+            print_worker_policy(&worker);
+        }
+        FleetAction::EmergencyRevokeCertificate { worker_id, fingerprint } => {
+            let worker = client
+                .emergency_revoke_worker_certificate(&worker_id, &fingerprint)
+                .await
+                .with_context(|| format!("emergency-revoke certificate for worker {worker_id}"))?;
+            print_worker_policy(&worker);
+        }
         FleetAction::Drain { worker_id } => {
             let worker = client
                 .set_worker_draining(&worker_id, true)
@@ -1216,6 +1389,10 @@ async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_worker_policy(policy: &WorkerPolicyView) {
+    println!("{}", serde_json::to_string_pretty(policy).expect("worker policy is serializable"));
 }
 
 fn init_tracing() {

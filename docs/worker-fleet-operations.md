@@ -236,24 +236,63 @@ urn:sbgh:worker:<worker-uuid>
 
 1. Issue a replacement for the same UUID with
    [fleet-pki.sh](../scripts/fleet-pki.sh).
-2. Add both old and new leaf SHA-256 fingerprints to the worker registry.
-3. Restart the daemon so it loads the overlap.
-4. Drain the worker.
-5. Atomically replace its certificate and private key.
-6. Restart the worker and confirm registration under the same UUID.
-7. Remove the old fingerprint and restart the daemon.
-8. Undrain the worker.
+2. Authorize the replacement public leaf while the old certificate remains
+   active:
+
+   ```bash
+   sbgh fleet authorize-certificate \
+     --worker-id <worker-uuid> \
+     --certificate /path/to/replacement/client.crt
+   ```
+
+3. Drain the worker and wait for its active attempt and cleanup to reach zero.
+4. Atomically replace its certificate and private key.
+5. Restart the worker and confirm registration under the same UUID.
+6. Revoke the old fingerprint:
+
+   ```bash
+   sbgh fleet revoke-certificate \
+     --worker-id <worker-uuid> \
+     --fingerprint <old-lowercase-sha256>
+   ```
+
+7. Undrain the worker.
+
+The old/new overlap takes effect immediately and requires no daemon restart.
 
 ### Revoke
 
-- Remove one fingerprint and restart the daemon to reject that certificate.
-- Set `enabled = false` in registry policy and restart the daemon to revoke the
-  worker identity.
-- Use network and CA revocation as additional containment for a compromised
-  key.
+- For planned removal, drain the worker, wait for quiescence, then use
+  `revoke-certificate` and `disable-worker`.
+- For a suspected compromise, use `emergency-revoke-certificate` or
+  `emergency-disable-worker`. These immediately reject the next RPC on an
+  existing connection and expire affected leases. The fleet coordinator then
+  fences attempts and records cleanup/requeue through the normal state
+  machine.
+- Use network containment and CA rotation as additional measures when the
+  worker CA itself may be compromised.
 
 The daemon rechecks fingerprint and registry authorization on every worker
-request.
+request. Revoked fingerprints remain auditable and can never be reassigned or
+reactivated.
+
+### Change worker policy
+
+Drain the worker and wait for active attempts and cleanup obligations to reach
+zero before changing capabilities, measurement profile, or enabled state:
+
+```bash
+sbgh fleet drain --worker-id <worker-uuid>
+sbgh fleet update-worker \
+  --worker-id <worker-uuid> \
+  --capability benchmark \
+  --measurement-profile <profile>
+sbgh fleet enable-worker --worker-id <worker-uuid>
+```
+
+Restart the worker after a capability/profile change so its new session
+advertisement is intersected with the updated policy. Display-name changes and
+drain state do not require a restart.
 
 ### Rotate the lease key
 

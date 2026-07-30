@@ -18,7 +18,7 @@ The required components are:
 - the host-side `sbgh-daemon` and operator `sbgh-cli`;
 - PostgreSQL plus the containerized webhook handler and smee forwarder;
 - S3-compatible object storage;
-- a private worker PKI and daemon-owned worker registry;
+- a private worker PKI and PostgreSQL-backed worker registry;
 - at least one KVM/libvirt worker with the managed `sandbox-egress` network,
   a golden VM image, and a read-only LVM chainstate origin.
 
@@ -223,7 +223,7 @@ The daemon API must not bind a public interface. Determine the Docker bridge
 gateway with `docker network inspect bridge` or `ip addr show docker0`, and
 firewall that listener to the local Docker network.
 
-## 6. Create the worker PKI and registry
+## 6. Create the worker PKI
 
 Keep the CA key offline after certificate issuance. The following example uses
 a temporary protected directory; move its encrypted CA key to offline storage
@@ -243,18 +243,6 @@ For each worker, choose a UUID and issue one certificate:
 WORKER_ID=$(uuidgen)
 ./scripts/fleet-pki.sh worker \
   "$PKI_DIR/ca" "$PKI_DIR/worker-$WORKER_ID" "$WORKER_ID"
-```
-
-The helper prints the leaf SHA-256 fingerprint. Copy
-[config.example.fleet.toml](../config.example.fleet.toml) to
-`/etc/sbgh/fleet/config.toml`, then register each UUID, fingerprint, allowed
-capabilities, and optional benchmark measurement profile. Worker claims never
-expand this server-owned policy.
-
-```bash
-sudo install -m 0640 -o sbgh -g sbgh \
-  config.example.fleet.toml /etc/sbgh/fleet/config.toml
-sudo -u sbgh $EDITOR /etc/sbgh/fleet/config.toml
 ```
 
 Install the daemon-side TLS material and lease key:
@@ -284,7 +272,6 @@ Create `/etc/sbgh/daemon/secrets.env`:
 
 ```text
 SBGH_API_INGEST_TOKEN=<same value as the handler>
-SBGH_FLEET_CONFIG=/etc/sbgh/fleet/config.toml
 SBGH_ARTIFACTS_S3_ACCESS_KEY_ID=<access key>
 SBGH_ARTIFACTS_S3_SECRET_ACCESS_KEY=<secret key>
 ```
@@ -427,24 +414,56 @@ sudo -u sbgh-worker sbgh-worker \
 
 Use the corresponding block-validation profile on that host.
 
-## 9. Start the control plane and workers
+## 9. Start the control plane, enroll workers, and start execution
 
-Start the daemon first, then the edge containers and workers:
+Start the daemon first. It can start with an empty worker registry:
 
 ```bash
 sudo systemctl enable --now sbgh-daemon.service
 sudo -u sbgh sbgh-cli status
+```
+
+Enroll each worker through the admin API. New workers start disabled and
+draining; authorizing the public leaf and enabling the policy makes the
+identity eligible to register without restarting the daemon:
+
+```bash
+alias sbgh='sudo -u sbgh sbgh-cli'
+
+sbgh fleet add-worker \
+  --worker-id "$WORKER_ID" \
+  --display-name "benchmark-fsn1-01" \
+  --capability benchmark \
+  --measurement-profile "hetzner-ax162"
+sbgh fleet authorize-certificate \
+  --worker-id "$WORKER_ID" \
+  --certificate "$PKI_DIR/worker-$WORKER_ID/client.crt"
+sbgh fleet enable-worker --worker-id "$WORKER_ID"
+sbgh fleet show-worker --worker-id "$WORKER_ID"
+```
+
+Use `--capability block_validation` without a measurement profile for a
+dedicated validation worker. Repeat `--capability` to authorize one host for
+multiple task kinds. A worker's advertisement can narrow this server-owned
+policy but cannot expand it.
+
+Start the edge containers and the matching worker profile:
+
+```bash
 
 docker compose -f docker/docker-compose.yml up -d --build
 curl --fail http://127.0.0.1:8080/health
 
 sudo systemctl enable --now sbgh-worker@benchmark.service
-sudo -u sbgh sbgh-cli fleet status
+sbgh fleet status
+sbgh fleet undrain --worker-id "$WORKER_ID"
 ```
 
 On a separate block-validation host, start
 `sbgh-worker@block-validation.service` instead. Confirm that every worker
 registers with its expected identity, capability, and discovered CPU/memory.
+Adding, rotating, draining, disabling, or revoking a worker is a database/API
+operation and never requires editing daemon configuration.
 
 ## 10. Enable backups
 

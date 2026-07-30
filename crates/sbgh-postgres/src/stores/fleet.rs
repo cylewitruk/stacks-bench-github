@@ -11,7 +11,9 @@ use sbgh_core::db::fleet::{
     FleetCompletion, FleetFailure, FleetSnapshot, FleetStore, FleetTerminalSubmission,
     FleetTerminalWrite, OfferedAssignment, PendingArtifactPromotion, PreparedExecution,
     ProjectedReportMutation, ReportProjectionSeed, ResolvedSpecSource, StoredAttemptEvent,
-    StoredProgress, SubmissionRecovery, TerminalAcceptance, WorkerRegistration,
+    StoredProgress, SubmissionRecovery, TerminalAcceptance, WorkerAuthorization,
+    WorkerCertificateRecord, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryEntry,
+    WorkerRegistryMutation, WorkerRegistryStore,
 };
 use sbgh_core::models::{JobEventKind, JobEventStatus};
 #[cfg(feature = "testing")]
@@ -42,6 +44,67 @@ pub struct PreparedJobProvenance {
 impl PostgresFleetStore {
     pub fn new(pool: Pool) -> Self {
         Self { pool }
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn seed_worker(&self, registration: &WorkerRegistration) -> sbgh_core::Result<()> {
+        let capabilities = capability_names(&registration.allowed_capabilities);
+        sqlx::query(
+            r#"
+            INSERT INTO worker_registry
+                (worker_id, identity_uri, display_name, allowed_capabilities,
+                 measurement_profile, enabled, draining)
+            VALUES (
+                $1, 'urn:sbgh:worker:' || $1::text, $2,
+                ARRAY(SELECT value::worker_capability FROM unnest($3::text[]) value),
+                $4, $5, $6
+            )
+            ON CONFLICT (worker_id) DO UPDATE
+                SET display_name = EXCLUDED.display_name,
+                    allowed_capabilities = EXCLUDED.allowed_capabilities,
+                    measurement_profile = EXCLUDED.measurement_profile,
+                    enabled = EXCLUDED.enabled,
+                    draining = EXCLUDED.draining,
+                    updated_at = NOW()
+            "#,
+        )
+        .bind(registration.worker_id)
+        .bind(&registration.display_name)
+        .bind(capabilities)
+        .bind(&registration.measurement_profile)
+        .bind(registration.enabled)
+        .bind(registration.draining)
+        .execute(&self.pool)
+        .await
+        .core()?;
+        sqlx::query(
+            "INSERT INTO worker_certificate (certificate_sha256, worker_id)
+             VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(test_certificate(registration.worker_id).as_slice())
+        .bind(registration.worker_id)
+        .execute(&self.pool)
+        .await
+        .core()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn register_session(
+        &self,
+        worker_id: Uuid,
+        request: &RegisterSessionRequest,
+        session_ttl: Duration,
+    ) -> sbgh_core::Result<AuthorizedSession> {
+        <Self as FleetStore>::register_session(
+            self,
+            worker_id,
+            test_certificate(worker_id),
+            request,
+            session_ttl,
+        )
+        .await
     }
 
     /// Atomically create and prepare a singleton fleet task.
@@ -221,6 +284,14 @@ impl PostgresFleetStore {
     }
 }
 
+#[cfg(feature = "testing")]
+fn test_certificate(worker_id: Uuid) -> [u8; 32] {
+    let mut fingerprint = [0_u8; 32];
+    fingerprint[..16].copy_from_slice(worker_id.as_bytes());
+    fingerprint[16..].copy_from_slice(worker_id.as_bytes());
+    fingerprint
+}
+
 fn capability_name(capability: WorkerCapability) -> &'static str {
     match capability {
         WorkerCapability::Benchmark => "benchmark",
@@ -241,10 +312,13 @@ fn capability(value: &str) -> sbgh_core::Result<WorkerCapability> {
 }
 
 fn capability_names<'a>(values: impl IntoIterator<Item = &'a WorkerCapability>) -> Vec<String> {
-    values
+    let mut names = values
         .into_iter()
         .map(|value| capability_name(*value).to_owned())
-        .collect()
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn millis(timestamp: DateTime<Utc>) -> i64 {
@@ -371,11 +445,59 @@ async fn insert_job_event(
     Ok(())
 }
 
+async fn expire_worker_leases(
+    tx: &mut Transaction<'_, Postgres>,
+    worker_id: Uuid,
+    certificate_sha256: Option<[u8; 32]>,
+) -> sbgh_core::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE worker_attempt attempt
+           SET offer_expires_at = LEAST(offer_expires_at, NOW()),
+               lease_expires_at = LEAST(lease_expires_at, NOW()),
+               updated_at = NOW()
+          FROM worker_session session
+         WHERE attempt.worker_session_id = session.worker_session_id
+           AND attempt.worker_id = $1
+           AND ($2::bytea IS NULL OR session.certificate_sha256 = $2)
+           AND attempt.status IN ('offered', 'running', 'cancel_requested')
+        "#,
+    )
+    .bind(worker_id)
+    .bind(certificate_sha256.map(|value| value.to_vec()))
+    .execute(&mut **tx)
+    .await
+    .core()?;
+    sqlx::query(
+        r#"
+        UPDATE worker_session
+           SET expires_at = LEAST(expires_at, NOW()),
+               status = CASE
+                   WHEN status IN ('registered', 'idle', 'draining') THEN 'draining'
+                   ELSE status
+               END
+         WHERE worker_id = $1
+           AND ($2::bytea IS NULL OR certificate_sha256 = $2)
+           AND status IN ('registered', 'idle', 'offered', 'running', 'draining')
+        "#,
+    )
+    .bind(worker_id)
+    .bind(certificate_sha256.map(|value| value.to_vec()))
+    .execute(&mut **tx)
+    .await
+    .core()?;
+    Ok(())
+}
+
 #[async_trait]
-impl FleetStore for PostgresFleetStore {
-    async fn upsert_worker(&self, registration: &WorkerRegistration) -> sbgh_core::Result<()> {
+impl WorkerRegistryStore for PostgresFleetStore {
+    async fn create_worker(
+        &self,
+        registration: &WorkerRegistration,
+    ) -> sbgh_core::Result<WorkerRegistryMutation> {
         let capabilities = capability_names(&registration.allowed_capabilities);
-        sqlx::query(
+        let expected_capabilities = capabilities.clone();
+        let result = sqlx::query(
             r#"
             INSERT INTO worker_registry
                 (worker_id, identity_uri, display_name, allowed_capabilities,
@@ -390,13 +512,7 @@ impl FleetStore for PostgresFleetStore {
                 ),
                 $4, $5, $6
             )
-            ON CONFLICT (worker_id) DO UPDATE
-                SET display_name = EXCLUDED.display_name,
-                    allowed_capabilities = EXCLUDED.allowed_capabilities,
-                    measurement_profile = EXCLUDED.measurement_profile,
-                    enabled = EXCLUDED.enabled,
-                    draining = EXCLUDED.draining,
-                    updated_at = NOW()
+            ON CONFLICT DO NOTHING
             "#,
         )
         .bind(registration.worker_id)
@@ -408,30 +524,687 @@ impl FleetStore for PostgresFleetStore {
         .execute(&self.pool)
         .await
         .core()?;
-        Ok(())
+        if result.rows_affected() == 1 {
+            return Ok(WorkerRegistryMutation::Applied);
+        }
+        let existing = sqlx::query(
+            r#"
+            SELECT display_name,
+                   ARRAY(
+                       SELECT capability::text
+                         FROM unnest(allowed_capabilities) AS capability
+                   ) AS allowed_capabilities,
+                   measurement_profile, enabled, draining
+              FROM worker_registry
+             WHERE worker_id = $1
+            "#,
+        )
+        .bind(registration.worker_id)
+        .fetch_one(&self.pool)
+        .await
+        .core()?;
+        let exact_retry = existing
+            .try_get::<String, _>("display_name")
+            .core()?
+            == registration.display_name
+            && existing
+                .try_get::<Vec<String>, _>("allowed_capabilities")
+                .core()?
+                == expected_capabilities
+            && existing
+                .try_get::<Option<String>, _>("measurement_profile")
+                .core()?
+                == registration.measurement_profile
+            && existing
+                .try_get::<bool, _>("enabled")
+                .core()?
+                == registration.enabled
+            && existing
+                .try_get::<bool, _>("draining")
+                .core()?
+                == registration.draining;
+        Ok(if exact_retry {
+            WorkerRegistryMutation::Unchanged
+        } else {
+            WorkerRegistryMutation::Conflict
+        })
     }
 
-    async fn disable_workers_except(&self, worker_ids: &[Uuid]) -> sbgh_core::Result<u64> {
+    async fn update_worker(
+        &self,
+        worker_id: Uuid,
+        patch: &WorkerPolicyPatch,
+    ) -> sbgh_core::Result<WorkerRegistryMutation> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let current = sqlx::query(
+            r#"
+            SELECT display_name,
+                   ARRAY(
+                       SELECT capability::text
+                         FROM unnest(allowed_capabilities) AS capability
+                   ) AS allowed_capabilities,
+                   measurement_profile, enabled, draining
+              FROM worker_registry
+             WHERE worker_id = $1
+             FOR UPDATE
+            "#,
+        )
+        .bind(worker_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .core()?;
+        let Some(current) = current else {
+            return Ok(WorkerRegistryMutation::NotFound);
+        };
+
+        let current_capabilities: Vec<String> = current
+            .try_get("allowed_capabilities")
+            .core()?;
+        let next_capabilities = patch
+            .allowed_capabilities
+            .as_ref()
+            .map(capability_names)
+            .unwrap_or_else(|| current_capabilities.clone());
+        let current_profile: Option<String> = current
+            .try_get("measurement_profile")
+            .core()?;
+        let next_profile = patch
+            .measurement_profile
+            .clone()
+            .unwrap_or_else(|| current_profile.clone());
+        if next_capabilities
+            .iter()
+            .any(|capability| capability == "benchmark")
+            && !next_profile
+                .as_deref()
+                .is_some_and(|profile| !profile.is_empty())
+        {
+            return Ok(WorkerRegistryMutation::Conflict);
+        }
+        let current_enabled: bool = current
+            .try_get("enabled")
+            .core()?;
+        let next_enabled = patch
+            .enabled
+            .unwrap_or(current_enabled);
+        let sensitive = next_capabilities != current_capabilities
+            || next_profile != current_profile
+            || next_enabled != current_enabled;
+
+        if sensitive {
+            let draining: bool = current
+                .try_get("draining")
+                .core()?;
+            let busy: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM worker_attempt
+                     WHERE worker_id = $1
+                       AND status IN ('offered', 'running', 'cancel_requested')
+                ) OR EXISTS (
+                    SELECT 1 FROM worker_cleanup_obligation
+                     WHERE worker_id = $1 AND status = 'pending'
+                )
+                "#,
+            )
+            .bind(worker_id)
+            .fetch_one(&mut *tx)
+            .await
+            .core()?;
+            if !draining || busy {
+                return Ok(WorkerRegistryMutation::Busy);
+            }
+        }
+
+        if next_enabled {
+            let has_certificate: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM worker_certificate
+                     WHERE worker_id = $1 AND revoked_at IS NULL
+                 )",
+            )
+            .bind(worker_id)
+            .fetch_one(&mut *tx)
+            .await
+            .core()?;
+            if !has_certificate {
+                return Ok(WorkerRegistryMutation::MissingCertificate);
+            }
+        }
+
+        let display_name: String = current
+            .try_get("display_name")
+            .core()?;
+        let next_display_name = patch
+            .display_name
+            .as_deref()
+            .unwrap_or(&display_name);
         let result = sqlx::query(
             r#"
             UPDATE worker_registry
-               SET enabled = FALSE,
-                   draining = TRUE,
+               SET display_name = $2,
+                   allowed_capabilities = ARRAY(
+                       SELECT value::worker_capability
+                         FROM unnest($3::text[]) AS value
+                   ),
+                   measurement_profile = $4,
+                   enabled = $5,
                    updated_at = NOW()
-             WHERE enabled
-               AND NOT (worker_id = ANY($1::uuid[]))
+             WHERE worker_id = $1
             "#,
         )
-        .bind(worker_ids)
-        .execute(&self.pool)
+        .bind(worker_id)
+        .bind(next_display_name)
+        .bind(next_capabilities)
+        .bind(next_profile)
+        .bind(next_enabled)
+        .execute(&mut *tx)
         .await
         .core()?;
-        Ok(result.rows_affected())
+        if sensitive {
+            sqlx::query(
+                r#"
+                UPDATE worker_session
+                   SET status = 'offline', ended_at = NOW()
+                 WHERE worker_id = $1
+                   AND status IN ('registered', 'idle', 'draining')
+                "#,
+            )
+            .bind(worker_id)
+            .execute(&mut *tx)
+            .await
+            .core()?;
+        }
+        tx.commit().await.core()?;
+        Ok(if result.rows_affected() == 1 {
+            WorkerRegistryMutation::Applied
+        } else {
+            WorkerRegistryMutation::NotFound
+        })
     }
 
+    async fn authorize_certificate(
+        &self,
+        worker_id: Uuid,
+        certificate_sha256: [u8; 32],
+    ) -> sbgh_core::Result<WorkerRegistryMutation> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let worker_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM worker_registry WHERE worker_id = $1)",
+        )
+        .bind(worker_id)
+        .fetch_one(&mut *tx)
+        .await
+        .core()?;
+        if !worker_exists {
+            return Ok(WorkerRegistryMutation::NotFound);
+        }
+        let result = sqlx::query(
+            r#"
+            INSERT INTO worker_certificate (certificate_sha256, worker_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(certificate_sha256.as_slice())
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        if result.rows_affected() == 1 {
+            tx.commit().await.core()?;
+            return Ok(WorkerRegistryMutation::Applied);
+        }
+        let existing = sqlx::query(
+            "SELECT worker_id, revoked_at IS NOT NULL AS revoked
+               FROM worker_certificate
+              WHERE certificate_sha256 = $1",
+        )
+        .bind(certificate_sha256.as_slice())
+        .fetch_one(&mut *tx)
+        .await
+        .core()?;
+        let same_active = existing
+            .try_get::<Uuid, _>("worker_id")
+            .core()?
+            == worker_id
+            && !existing
+                .try_get::<bool, _>("revoked")
+                .core()?;
+        tx.commit().await.core()?;
+        Ok(if same_active {
+            WorkerRegistryMutation::Unchanged
+        } else {
+            WorkerRegistryMutation::Conflict
+        })
+    }
+
+    async fn revoke_certificate(
+        &self,
+        worker_id: Uuid,
+        certificate_sha256: [u8; 32],
+    ) -> sbgh_core::Result<WorkerRegistryMutation> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let certificate = sqlx::query(
+            r#"
+            SELECT certificate_sha256, revoked_at, registry.enabled, registry.draining
+              FROM worker_certificate certificate
+              JOIN worker_registry registry USING (worker_id)
+             WHERE certificate.worker_id = $1
+               AND certificate.certificate_sha256 = $2
+             FOR UPDATE OF certificate, registry
+            "#,
+        )
+        .bind(worker_id)
+        .bind(certificate_sha256.as_slice())
+        .fetch_optional(&mut *tx)
+        .await
+        .core()?;
+        let Some(certificate) = certificate else {
+            return Ok(WorkerRegistryMutation::NotFound);
+        };
+        if certificate
+            .try_get::<Option<DateTime<Utc>>, _>("revoked_at")
+            .core()?
+            .is_some()
+        {
+            return Ok(WorkerRegistryMutation::Unchanged);
+        }
+        let used_by_live_session: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM worker_session
+                 WHERE worker_id = $1
+                   AND certificate_sha256 = $2
+                   AND status IN ('registered', 'idle', 'offered', 'running', 'draining')
+            )
+            "#,
+        )
+        .bind(worker_id)
+        .bind(certificate_sha256.as_slice())
+        .fetch_one(&mut *tx)
+        .await
+        .core()?;
+        let active_certificate_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM worker_certificate
+              WHERE worker_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(worker_id)
+        .fetch_one(&mut *tx)
+        .await
+        .core()?;
+        let final_certificate_for_enabled_worker = active_certificate_count == 1
+            && certificate
+                .try_get::<bool, _>("enabled")
+                .core()?;
+        if used_by_live_session || final_certificate_for_enabled_worker {
+            let draining: bool = certificate
+                .try_get("draining")
+                .core()?;
+            let busy: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM worker_attempt
+                     WHERE worker_id = $1
+                       AND status IN ('offered', 'running', 'cancel_requested')
+                ) OR EXISTS (
+                    SELECT 1 FROM worker_cleanup_obligation
+                     WHERE worker_id = $1 AND status = 'pending'
+                )
+                "#,
+            )
+            .bind(worker_id)
+            .fetch_one(&mut *tx)
+            .await
+            .core()?;
+            if !draining || busy {
+                return Ok(WorkerRegistryMutation::Busy);
+            }
+            if used_by_live_session {
+                sqlx::query(
+                    r#"
+                    UPDATE worker_session
+                       SET status = 'offline', ended_at = NOW()
+                     WHERE worker_id = $1
+                       AND certificate_sha256 = $2
+                       AND status IN ('registered', 'idle', 'draining')
+                    "#,
+                )
+                .bind(worker_id)
+                .bind(certificate_sha256.as_slice())
+                .execute(&mut *tx)
+                .await
+                .core()?;
+            }
+        }
+        sqlx::query(
+            "UPDATE worker_certificate
+                SET revoked_at = NOW()
+              WHERE certificate_sha256 = $1",
+        )
+        .bind(certificate_sha256.as_slice())
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        tx.commit().await.core()?;
+        Ok(WorkerRegistryMutation::Applied)
+    }
+
+    async fn emergency_disable_worker(
+        &self,
+        worker_id: Uuid,
+    ) -> sbgh_core::Result<WorkerRegistryMutation> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let result = sqlx::query(
+            "UPDATE worker_registry
+                SET enabled = FALSE, draining = TRUE, updated_at = NOW()
+              WHERE worker_id = $1",
+        )
+        .bind(worker_id)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        if result.rows_affected() == 0 {
+            return Ok(WorkerRegistryMutation::NotFound);
+        }
+        expire_worker_leases(&mut tx, worker_id, None).await?;
+        tx.commit().await.core()?;
+        Ok(WorkerRegistryMutation::Applied)
+    }
+
+    async fn emergency_revoke_certificate(
+        &self,
+        worker_id: Uuid,
+        certificate_sha256: [u8; 32],
+    ) -> sbgh_core::Result<WorkerRegistryMutation> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let result = sqlx::query(
+            "UPDATE worker_certificate
+                SET revoked_at = NOW()
+              WHERE worker_id = $1
+                AND certificate_sha256 = $2
+                AND revoked_at IS NULL",
+        )
+        .bind(worker_id)
+        .bind(certificate_sha256.as_slice())
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        if result.rows_affected() == 0 {
+            let existing: Option<bool> = sqlx::query_scalar(
+                "SELECT revoked_at IS NOT NULL
+                   FROM worker_certificate
+                  WHERE worker_id = $1 AND certificate_sha256 = $2",
+            )
+            .bind(worker_id)
+            .bind(certificate_sha256.as_slice())
+            .fetch_optional(&mut *tx)
+            .await
+            .core()?;
+            return Ok(match existing {
+                Some(true) => WorkerRegistryMutation::Unchanged,
+                _ => WorkerRegistryMutation::NotFound,
+            });
+        }
+        expire_worker_leases(&mut tx, worker_id, Some(certificate_sha256)).await?;
+        tx.commit().await.core()?;
+        Ok(WorkerRegistryMutation::Applied)
+    }
+
+    async fn worker_certificates(
+        &self,
+        worker_id: Uuid,
+    ) -> sbgh_core::Result<Vec<WorkerCertificateRecord>> {
+        let rows = sqlx::query(
+            "SELECT certificate_sha256, created_at, revoked_at
+               FROM worker_certificate
+              WHERE worker_id = $1
+              ORDER BY created_at, certificate_sha256",
+        )
+        .bind(worker_id)
+        .fetch_all(&self.pool)
+        .await
+        .core()?;
+        rows.into_iter()
+            .map(|row| {
+                let bytes: Vec<u8> = row
+                    .try_get("certificate_sha256")
+                    .core()?;
+                let certificate_sha256 = bytes
+                    .try_into()
+                    .map_err(|_| {
+                        sbgh_core::Error::Config(
+                            "worker certificate fingerprint is not 32 bytes".into(),
+                        )
+                    })?;
+                Ok(WorkerCertificateRecord {
+                    certificate_sha256,
+                    created_at: row
+                        .try_get("created_at")
+                        .core()?,
+                    revoked_at: row
+                        .try_get("revoked_at")
+                        .core()?,
+                })
+            })
+            .collect()
+    }
+
+    async fn workers(
+        &self,
+        worker_id: Option<Uuid>,
+    ) -> sbgh_core::Result<Vec<WorkerRegistryEntry>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT registry.worker_id,
+                   registry.display_name,
+                   registry.enabled,
+                   registry.draining,
+                   ARRAY(
+                       SELECT capability::text
+                         FROM unnest(registry.allowed_capabilities) capability
+                   ) AS capabilities,
+                   registry.measurement_profile,
+                   session.worker_session_id,
+                   session.status::text AS session_status,
+                   session.software_version,
+                   session.last_heartbeat_at,
+                   session.expires_at,
+                   session.resource_facts,
+                   attempt.attempt_id,
+                   attempt.job_id,
+                   attempt.trace_id
+              FROM worker_registry registry
+              LEFT JOIN LATERAL (
+                  SELECT *
+                    FROM worker_session
+                   WHERE worker_id = registry.worker_id
+                   ORDER BY started_at DESC
+                   LIMIT 1
+              ) session ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT attempt_id, job_id, trace_id
+                    FROM worker_attempt
+                   WHERE worker_id = registry.worker_id
+                     AND status IN ('offered', 'running', 'cancel_requested')
+                   ORDER BY created_at DESC
+                   LIMIT 1
+              ) attempt ON TRUE
+             WHERE ($1::uuid IS NULL OR registry.worker_id = $1)
+             ORDER BY registry.display_name, registry.worker_id
+            "#,
+        )
+        .bind(worker_id)
+        .fetch_all(&self.pool)
+        .await
+        .core()?;
+        rows.into_iter()
+            .map(|row| {
+                let capabilities: Vec<String> = row
+                    .try_get("capabilities")
+                    .core()?;
+                Ok(WorkerRegistryEntry {
+                    worker_id: row
+                        .try_get("worker_id")
+                        .core()?,
+                    display_name: row
+                        .try_get("display_name")
+                        .core()?,
+                    enabled: row
+                        .try_get("enabled")
+                        .core()?,
+                    draining: row
+                        .try_get("draining")
+                        .core()?,
+                    allowed_capabilities: capabilities,
+                    measurement_profile: row
+                        .try_get("measurement_profile")
+                        .core()?,
+                    worker_session_id: row
+                        .try_get("worker_session_id")
+                        .core()?,
+                    session_status: row
+                        .try_get("session_status")
+                        .core()?,
+                    software_version: row
+                        .try_get("software_version")
+                        .core()?,
+                    last_heartbeat_at: row
+                        .try_get("last_heartbeat_at")
+                        .core()?,
+                    session_expires_at: row
+                        .try_get("expires_at")
+                        .core()?,
+                    resource_facts: row
+                        .try_get("resource_facts")
+                        .core()?,
+                    attempt_id: row
+                        .try_get("attempt_id")
+                        .core()?,
+                    job_id: row.try_get("job_id").core()?,
+                    trace_id: row
+                        .try_get("trace_id")
+                        .core()?,
+                })
+            })
+            .collect()
+    }
+
+    async fn authorize_worker(
+        &self,
+        worker_id: Uuid,
+        certificate_sha256: [u8; 32],
+    ) -> sbgh_core::Result<Option<WorkerAuthorization>> {
+        let row = sqlx::query(
+            r#"
+            SELECT ARRAY(
+                       SELECT capability::text
+                         FROM unnest(registry.allowed_capabilities) AS capability
+                   ) AS allowed_capabilities,
+                   registry.measurement_profile,
+                   registry.draining
+              FROM worker_registry registry
+              JOIN worker_certificate certificate
+                ON certificate.worker_id = registry.worker_id
+               AND certificate.certificate_sha256 = $2
+               AND certificate.revoked_at IS NULL
+             WHERE registry.worker_id = $1
+               AND registry.enabled
+            "#,
+        )
+        .bind(worker_id)
+        .bind(certificate_sha256.as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .core()?;
+        row.map(|row| {
+            let capabilities: Vec<String> = row
+                .try_get("allowed_capabilities")
+                .core()?;
+            Ok(WorkerAuthorization {
+                worker_id,
+                allowed_capabilities: capabilities
+                    .iter()
+                    .map(|value| capability(value))
+                    .collect::<sbgh_core::Result<Vec<_>>>()?,
+                measurement_profile: row
+                    .try_get("measurement_profile")
+                    .core()?,
+                draining: row
+                    .try_get("draining")
+                    .core()?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn set_worker_draining(
+        &self,
+        worker_id: Uuid,
+        draining: bool,
+    ) -> sbgh_core::Result<WorkerRegistryMutation> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let result = sqlx::query(
+            "UPDATE worker_registry
+                SET draining = $2, updated_at = NOW()
+              WHERE worker_id = $1",
+        )
+        .bind(worker_id)
+        .bind(draining)
+        .execute(&mut *tx)
+        .await
+        .core()?;
+        if result.rows_affected() == 0 {
+            return Ok(WorkerRegistryMutation::NotFound);
+        }
+        if !draining {
+            sqlx::query(
+                "UPDATE worker_session
+                    SET status = 'idle'
+                  WHERE worker_id = $1
+                    AND status = 'draining'
+                    AND expires_at > NOW()",
+            )
+            .bind(worker_id)
+            .execute(&mut *tx)
+            .await
+            .core()?;
+        }
+        tx.commit().await.core()?;
+        Ok(WorkerRegistryMutation::Applied)
+    }
+}
+
+#[async_trait]
+impl FleetStore for PostgresFleetStore {
     async fn register_session(
         &self,
         certificate_worker_id: Uuid,
+        certificate_sha256: [u8; 32],
         request: &RegisterSessionRequest,
         session_ttl: Duration,
     ) -> sbgh_core::Result<AuthorizedSession> {
@@ -454,12 +1227,17 @@ impl FleetStore for PostgresFleetStore {
                    measurement_profile,
                    enabled,
                    draining
-              FROM worker_registry
-             WHERE worker_id = $1
+              FROM worker_registry registry
+              JOIN worker_certificate certificate
+                ON certificate.worker_id = registry.worker_id
+               AND certificate.certificate_sha256 = $2
+               AND certificate.revoked_at IS NULL
+             WHERE registry.worker_id = $1
              FOR UPDATE
             "#,
         )
         .bind(request.worker_id)
+        .bind(certificate_sha256.as_slice())
         .fetch_optional(&mut *tx)
         .await
         .core()?
@@ -507,7 +1285,8 @@ impl FleetStore for PostgresFleetStore {
                    ) AS advertised_capabilities,
                    protocol_version,
                    software_version,
-                   resource_facts
+                   resource_facts,
+                   certificate_sha256
               FROM worker_session
              WHERE worker_id = $1
                AND worker_session_id = $2
@@ -536,7 +1315,12 @@ impl FleetStore for PostgresFleetStore {
                 && existing
                     .try_get::<serde_json::Value, _>("resource_facts")
                     .core()?
-                    == resources;
+                    == resources
+                && existing
+                    .try_get::<Option<Vec<u8>>, _>("certificate_sha256")
+                    .core()?
+                    .as_deref()
+                    == Some(certificate_sha256.as_slice());
             if !same {
                 return Err(sbgh_core::Error::Config(
                     "a worker session UUID cannot be reused with different registration facts"
@@ -694,12 +1478,12 @@ impl FleetStore for PostgresFleetStore {
             INSERT INTO worker_session
                 (worker_session_id, worker_id, status, protocol_version,
                  software_version, advertised_capabilities, effective_capabilities,
-                 resource_facts, expires_at)
+                 resource_facts, expires_at, certificate_sha256)
             VALUES (
                 $1, $2, $3::text::worker_session_status, $4, $5,
                 ARRAY(SELECT value::worker_capability FROM unnest($6::text[]) AS value),
                 ARRAY(SELECT value::worker_capability FROM unnest($7::text[]) AS value),
-                $8, $9
+                $8, $9, $10
             )
             "#,
         )
@@ -712,6 +1496,7 @@ impl FleetStore for PostgresFleetStore {
         .bind(&effective)
         .bind(resources)
         .bind(expires_at)
+        .bind(certificate_sha256.as_slice())
         .execute(&mut *tx)
         .await
         .core()?;
@@ -934,7 +1719,7 @@ impl FleetStore for PostgresFleetStore {
                AND session.advertised_capabilities && registry.allowed_capabilities
                AND session.expires_at > NOW()
                AND session.status IN ('registered', 'idle', 'offered')
-             FOR UPDATE OF session
+             FOR UPDATE OF session, registry
             "#,
         )
         .bind(worker_id)
@@ -3413,7 +4198,7 @@ impl FleetStore for PostgresFleetStore {
                   WHERE highest_contiguous_reliable_seq > projected_reliable_seq)
                     AS reliable_event_gap_attempts,
                 COALESCE((SELECT sum(size_bytes) FROM worker_artifact_staging
-                  WHERE status IN ('granted', 'uploaded', 'verified')), 0)
+                  WHERE status IN ('granted', 'uploaded', 'verified')), 0)::bigint
                     AS staged_artifact_bytes
             "#,
         )

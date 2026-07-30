@@ -2,8 +2,9 @@
 # (or wherever $SBGH_CONFIG points) and fill in.
 #
 # The daemon is the fleet orchestrator and sole DB/GitHub/Slack side-effect
-# owner. Worker transport policy is in config.example.fleet.toml; execution
-# settings live in the worker profile examples. Full validation still requires
+# owner. Fleet bootstrap is configured below; durable worker policy is managed
+# through `sbgh fleet` admin commands. Execution settings live in the worker
+# profile examples. Full validation still requires
 # a compatibility-only golden image, LVM volume group, and thin pool (supplied
 # below or by env); the other [vm], [paths], and [lvm] values have defaults.
 # The daemon has no execution path and does not use them to run work.
@@ -28,6 +29,31 @@ service_user = "sbgh"
 client_id = "Iv23liREPLACE_ME"
 api_base_url = "https://api.github.com"
 private_key_path = "/etc/sbgh/daemon/github-app.private-key.pem"
+
+[github.block_validation]
+requested_shards = 32
+max_concurrency = 24
+timeout_secs = 86400
+
+[fleet]
+# Protobuf/gRPC worker control plane over HTTP/2 with mandatory TLS 1.3 mTLS.
+listen = "10.0.0.10:9443"
+server_certificate = "/etc/sbgh/fleet/orchestrator.crt"
+server_private_key = "/etc/sbgh/fleet/orchestrator.key"
+client_ca_certificate = "/etc/sbgh/fleet/worker-ca.crt"
+lease_hmac_key = "/etc/sbgh/fleet/lease-hmac.key"
+
+heartbeat_seconds = 10
+lease_seconds = 45
+offer_seconds = 30
+session_seconds = 90
+long_poll_seconds = 20
+request_timeout_seconds = 120
+upload_grant_seconds = 300
+staging_gc_grace_seconds = 86400
+max_artifact_bytes = 8589934592
+max_attempt_artifact_bytes = 34359738368
+max_concurrent_requests = 64
 
 [vm]
 # Compatibility-only daemon fields. Configure live execution resources under

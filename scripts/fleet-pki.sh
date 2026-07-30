@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Minimal private-PKI helper for v25. Keep the CA directory offline and backed up.
+# Minimal private-PKI helper. Keep the CA directory offline and backed up.
 set -euo pipefail
 umask 077
 
@@ -96,7 +96,7 @@ case "$action" in
             -noout -fingerprint -sha256)
         fingerprint=${fingerprint#*=}
         fingerprint=${fingerprint//:/}
-        printf 'certificate_sha256 = ["%s"]\n' "${fingerprint,,}"
+        printf 'certificate_sha256=%s\n' "${fingerprint,,}"
         ;;
     *)
         usage

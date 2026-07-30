@@ -5,92 +5,29 @@ use axum::extract::{Path, State};
 use axum::http::header;
 use sbgh_api::{
     FleetCancellationResponse, FleetOverview, FleetRecoveryRequest, FleetRecoveryResponse,
-    FleetSummaryView, FleetWorkerView, WorkerDrainRequest,
+    FleetSummaryView, FleetWorkerView, WorkerCertificateRequest, WorkerCertificateView,
+    WorkerCreateRequest, WorkerDrainRequest, WorkerPolicyView, WorkerUpdateRequest,
 };
-use sbgh_core::db::fleet::FleetStore;
+use sbgh_core::db::fleet::{
+    FleetStore, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryEntry, WorkerRegistryMutation,
+    WorkerRegistryStore,
+};
+use sbgh_fleet::WorkerCapability;
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::api::error::ApiErr;
 use crate::api::state::ApiState;
+use crate::fleet::validate_worker_certificate;
 
 pub async fn overview(State(state): State<ApiState>) -> Result<Json<FleetOverview>, ApiErr> {
     let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
     let summary = store.fleet_snapshot().await?;
-    let rows = sqlx::query(
-        r#"
-        SELECT registry.worker_id,
-               registry.display_name,
-               registry.enabled,
-               registry.draining,
-               ARRAY(
-                   SELECT capability::text
-                     FROM unnest(registry.allowed_capabilities) capability
-               ) AS capabilities,
-               registry.measurement_profile,
-               session.worker_session_id,
-               session.status::text AS session_status,
-               session.software_version,
-               session.last_heartbeat_at,
-               session.expires_at,
-               session.resource_facts,
-               attempt.attempt_id,
-               attempt.job_id,
-               attempt.trace_id
-          FROM worker_registry registry
-          LEFT JOIN LATERAL (
-              SELECT *
-                FROM worker_session
-               WHERE worker_id = registry.worker_id
-               ORDER BY started_at DESC
-               LIMIT 1
-          ) session ON TRUE
-          LEFT JOIN LATERAL (
-              SELECT attempt_id, job_id, trace_id
-                FROM worker_attempt
-               WHERE worker_id = registry.worker_id
-                 AND status IN ('offered', 'running', 'cancel_requested')
-               ORDER BY created_at DESC
-               LIMIT 1
-          ) attempt ON TRUE
-         ORDER BY registry.display_name, registry.worker_id
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let workers = rows
+    let workers = store
+        .workers(None)
+        .await?
         .into_iter()
-        .map(|row| FleetWorkerView {
-            worker_id: row
-                .get::<Uuid, _>("worker_id")
-                .to_string(),
-            display_name: row.get("display_name"),
-            enabled: row.get("enabled"),
-            draining: row.get("draining"),
-            capabilities: row.get("capabilities"),
-            measurement_profile: row.get("measurement_profile"),
-            worker_session_id: row
-                .get::<Option<Uuid>, _>("worker_session_id")
-                .map(|id| id.to_string()),
-            session_status: row.get("session_status"),
-            software_version: row.get("software_version"),
-            last_heartbeat_at: row
-                .get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_heartbeat_at")
-                .map(|value| value.to_rfc3339()),
-            session_expires_at: row
-                .get::<Option<chrono::DateTime<chrono::Utc>>, _>("expires_at")
-                .map(|value| value.to_rfc3339()),
-            resource_facts: row.get("resource_facts"),
-            attempt_id: row
-                .get::<Option<Uuid>, _>("attempt_id")
-                .map(|id| id.to_string()),
-            job_id: row
-                .get::<Option<Uuid>, _>("job_id")
-                .map(|id| id.to_string()),
-            trace_id: row
-                .get::<Option<Uuid>, _>("trace_id")
-                .map(|id| id.to_string()),
-        })
+        .map(worker_view)
         .collect();
     Ok(Json(FleetOverview {
         summary: FleetSummaryView {
@@ -104,6 +41,321 @@ pub async fn overview(State(state): State<ApiState>) -> Result<Json<FleetOvervie
         },
         workers,
     }))
+}
+
+pub async fn create_worker(
+    State(state): State<ApiState>,
+    Json(request): Json<WorkerCreateRequest>,
+) -> Result<Json<WorkerPolicyView>, ApiErr> {
+    let worker_id = request
+        .worker_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| ApiErr::bad_request("worker_id must be a UUID"))?
+        .unwrap_or_else(Uuid::new_v4);
+    let display_name = validated_display_name(&request.display_name)?;
+    let capabilities = parse_capabilities(&request.capabilities)?;
+    let measurement_profile = normalize_measurement_profile(request.measurement_profile)?;
+    validate_profile(&capabilities, measurement_profile.as_deref())?;
+    let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
+    mutation_response(
+        store
+            .create_worker(&WorkerRegistration {
+                worker_id,
+                display_name,
+                allowed_capabilities: capabilities,
+                measurement_profile,
+                enabled: false,
+                draining: true,
+            })
+            .await?,
+        "worker already exists",
+    )?;
+    worker_detail(&state, worker_id).await
+}
+
+pub async fn show_worker(
+    State(state): State<ApiState>,
+    Path(worker_id): Path<Uuid>,
+) -> Result<Json<WorkerPolicyView>, ApiErr> {
+    worker_detail(&state, worker_id).await
+}
+
+pub async fn update_worker(
+    State(state): State<ApiState>,
+    Path(worker_id): Path<Uuid>,
+    Json(request): Json<WorkerUpdateRequest>,
+) -> Result<Json<WorkerPolicyView>, ApiErr> {
+    let display_name = request
+        .display_name
+        .as_deref()
+        .map(validated_display_name)
+        .transpose()?;
+    let capabilities = request
+        .capabilities
+        .as_deref()
+        .map(parse_capabilities)
+        .transpose()?;
+    let measurement_profile = request
+        .measurement_profile
+        .map(normalize_measurement_profile)
+        .transpose()?;
+    if let Some(capabilities) = capabilities.as_ref() {
+        validate_profile(
+            capabilities,
+            measurement_profile
+                .as_ref()
+                .and_then(|profile| profile.as_deref()),
+        )?;
+    }
+    let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
+    mutation_response(
+        store
+            .update_worker(
+                worker_id,
+                &WorkerPolicyPatch {
+                    display_name,
+                    allowed_capabilities: capabilities,
+                    measurement_profile,
+                    enabled: request.enabled,
+                },
+            )
+            .await?,
+        "worker policy conflicts with current state",
+    )?;
+    worker_detail(&state, worker_id).await
+}
+
+pub async fn authorize_certificate(
+    State(state): State<ApiState>,
+    Path(worker_id): Path<Uuid>,
+    Json(request): Json<WorkerCertificateRequest>,
+) -> Result<Json<WorkerPolicyView>, ApiErr> {
+    let certificate_sha256 = validate_worker_certificate(
+        request
+            .certificate_pem
+            .as_bytes(),
+        worker_id,
+        &state.worker_ca_certificate,
+    )
+    .map_err(|error| ApiErr::bad_request(error.to_string()))?;
+    let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
+    mutation_response(
+        store
+            .authorize_certificate(worker_id, certificate_sha256)
+            .await?,
+        "certificate is already bound or revoked",
+    )?;
+    tracing::info!(
+        %worker_id,
+        certificate_sha256 = %hex::encode(certificate_sha256),
+        "worker certificate authorized"
+    );
+    worker_detail(&state, worker_id).await
+}
+
+pub async fn revoke_certificate(
+    State(state): State<ApiState>,
+    Path((worker_id, fingerprint)): Path<(Uuid, String)>,
+) -> Result<Json<WorkerPolicyView>, ApiErr> {
+    let certificate_sha256 = parse_fingerprint(&fingerprint)?;
+    let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
+    mutation_response(
+        store
+            .revoke_certificate(worker_id, certificate_sha256)
+            .await?,
+        "certificate cannot be revoked in the current worker state",
+    )?;
+    tracing::info!(
+        %worker_id,
+        certificate_sha256 = %hex::encode(certificate_sha256),
+        "worker certificate revoked"
+    );
+    worker_detail(&state, worker_id).await
+}
+
+pub async fn emergency_disable_worker(
+    State(state): State<ApiState>,
+    Path(worker_id): Path<Uuid>,
+) -> Result<Json<WorkerPolicyView>, ApiErr> {
+    let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
+    mutation_response(
+        store
+            .emergency_disable_worker(worker_id)
+            .await?,
+        "worker cannot be disabled",
+    )?;
+    tracing::warn!(%worker_id, "worker authorization withdrawn and leases expired");
+    worker_detail(&state, worker_id).await
+}
+
+pub async fn emergency_revoke_certificate(
+    State(state): State<ApiState>,
+    Path((worker_id, fingerprint)): Path<(Uuid, String)>,
+) -> Result<Json<WorkerPolicyView>, ApiErr> {
+    let certificate_sha256 = parse_fingerprint(&fingerprint)?;
+    let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
+    mutation_response(
+        store
+            .emergency_revoke_certificate(worker_id, certificate_sha256)
+            .await?,
+        "certificate cannot be revoked",
+    )?;
+    tracing::warn!(
+        %worker_id,
+        certificate_sha256 = %hex::encode(certificate_sha256),
+        "worker certificate revoked and authenticated leases expired"
+    );
+    worker_detail(&state, worker_id).await
+}
+
+async fn worker_detail(
+    state: &ApiState,
+    worker_id: Uuid,
+) -> Result<Json<WorkerPolicyView>, ApiErr> {
+    let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
+    let worker = store
+        .workers(Some(worker_id))
+        .await?
+        .into_iter()
+        .next()
+        .map(worker_view)
+        .ok_or_else(|| ApiErr::not_found("worker not found"))?;
+    let certificates = store
+        .worker_certificates(worker_id)
+        .await?
+        .into_iter()
+        .map(|record| WorkerCertificateView {
+            certificate_sha256: hex::encode(record.certificate_sha256),
+            created_at: record.created_at.to_rfc3339(),
+            revoked_at: record
+                .revoked_at
+                .map(|value| value.to_rfc3339()),
+        })
+        .collect();
+    Ok(Json(WorkerPolicyView { worker, certificates }))
+}
+
+fn worker_view(record: WorkerRegistryEntry) -> FleetWorkerView {
+    FleetWorkerView {
+        worker_id: record.worker_id.to_string(),
+        display_name: record.display_name,
+        enabled: record.enabled,
+        draining: record.draining,
+        capabilities: record.allowed_capabilities,
+        measurement_profile: record.measurement_profile,
+        worker_session_id: record
+            .worker_session_id
+            .map(|id| id.to_string()),
+        session_status: record.session_status,
+        software_version: record.software_version,
+        last_heartbeat_at: record
+            .last_heartbeat_at
+            .map(|value| value.to_rfc3339()),
+        session_expires_at: record
+            .session_expires_at
+            .map(|value| value.to_rfc3339()),
+        resource_facts: record.resource_facts,
+        attempt_id: record
+            .attempt_id
+            .map(|id| id.to_string()),
+        job_id: record
+            .job_id
+            .map(|id| id.to_string()),
+        trace_id: record
+            .trace_id
+            .map(|id| id.to_string()),
+    }
+}
+
+fn mutation_response(
+    mutation: WorkerRegistryMutation,
+    conflict: &'static str,
+) -> Result<(), ApiErr> {
+    match mutation {
+        WorkerRegistryMutation::Applied | WorkerRegistryMutation::Unchanged => Ok(()),
+        WorkerRegistryMutation::NotFound => {
+            Err(ApiErr::not_found("worker or certificate not found"))
+        }
+        WorkerRegistryMutation::Busy => {
+            Err(ApiErr::conflict("worker must be drained and quiescent"))
+        }
+        WorkerRegistryMutation::MissingCertificate => {
+            Err(ApiErr::conflict("worker has no active certificate"))
+        }
+        WorkerRegistryMutation::Conflict => Err(ApiErr::conflict(conflict)),
+    }
+}
+
+fn parse_capabilities(values: &[String]) -> Result<Vec<WorkerCapability>, ApiErr> {
+    if values.is_empty() {
+        return Err(ApiErr::bad_request("at least one capability is required"));
+    }
+    let mut capabilities = values
+        .iter()
+        .map(|value| match value.as_str() {
+            "benchmark" => Ok(WorkerCapability::Benchmark),
+            "build_only" => Ok(WorkerCapability::BuildOnly),
+            "block_validation" => Ok(WorkerCapability::BlockValidation),
+            _ => Err(ApiErr::bad_request(format!("unknown capability `{value}`"))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    capabilities.sort();
+    capabilities.dedup();
+    Ok(capabilities)
+}
+
+fn validate_profile(
+    capabilities: &[WorkerCapability],
+    measurement_profile: Option<&str>,
+) -> Result<(), ApiErr> {
+    if capabilities.contains(&WorkerCapability::Benchmark)
+        && !measurement_profile.is_some_and(|profile| !profile.trim().is_empty())
+    {
+        return Err(ApiErr::bad_request("benchmark capability requires measurement_profile"));
+    }
+    if measurement_profile.is_some_and(|profile| profile.is_empty() || profile.len() > 128) {
+        return Err(ApiErr::bad_request("measurement_profile must contain 1..=128 bytes"));
+    }
+    Ok(())
+}
+
+fn normalize_measurement_profile(value: Option<String>) -> Result<Option<String>, ApiErr> {
+    value
+        .map(|profile| {
+            let profile = profile.trim();
+            if profile.is_empty() || profile.len() > 128 {
+                return Err(ApiErr::bad_request("measurement_profile must contain 1..=128 bytes"));
+            }
+            Ok(profile.to_owned())
+        })
+        .transpose()
+}
+
+fn validated_display_name(value: &str) -> Result<String, ApiErr> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return Err(ApiErr::bad_request("display_name must contain 1..=128 bytes"));
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_fingerprint(value: &str) -> Result<[u8; 32], ApiErr> {
+    let bytes = hex::decode(value).map_err(|_| {
+        ApiErr::bad_request("certificate fingerprint must be lowercase SHA-256 hex")
+    })?;
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase())
+        || bytes.len() != 32
+    {
+        return Err(ApiErr::bad_request("certificate fingerprint must be lowercase SHA-256 hex"));
+    }
+    bytes
+        .try_into()
+        .map_err(|_| ApiErr::bad_request("certificate fingerprint must be 32 bytes"))
 }
 
 /// Prometheus text exposition for the operational signals pinned by v25.
@@ -255,42 +507,17 @@ pub async fn set_drain(
     Path(worker_id): Path<Uuid>,
     Json(request): Json<WorkerDrainRequest>,
 ) -> Result<Json<FleetWorkerView>, ApiErr> {
-    let mut tx = state.pool.begin().await?;
-    let changed = sqlx::query(
-        "UPDATE worker_registry
-            SET draining = $2, updated_at = NOW()
-          WHERE worker_id = $1
-        RETURNING display_name",
-    )
-    .bind(worker_id)
-    .bind(request.draining)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if changed.is_none() {
-        return Err(ApiErr::not_found("worker not found"));
-    }
-    if !request.draining {
-        sqlx::query(
-            "UPDATE worker_session
-                SET status = 'idle'
-              WHERE worker_id = $1
-                AND status = 'draining'
-                AND expires_at > NOW()",
-        )
-        .bind(worker_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    let overview = overview(State(state))
+    let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
+    mutation_response(
+        store
+            .set_worker_draining(worker_id, request.draining)
+            .await?,
+        "worker drain state conflicts",
+    )?;
+    let detail = worker_detail(&state, worker_id)
         .await?
         .0;
-    let worker = overview
-        .workers
-        .into_iter()
-        .find(|worker| worker.worker_id == worker_id.to_string())
-        .ok_or_else(|| ApiErr::not_found("worker not found"))?;
-    Ok(Json(worker))
+    Ok(Json(detail.worker))
 }
 
 pub async fn recover_submission(

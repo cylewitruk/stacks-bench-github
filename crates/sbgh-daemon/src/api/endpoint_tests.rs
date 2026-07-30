@@ -24,6 +24,7 @@ fn router_with(pool: Pool, gh_api_base: String) -> Router {
         pool: pool.clone(),
         ingest: Arc::new(PostgresIngestStore::new(pool)),
         gh_api_base,
+        worker_ca_certificate: "worker-ca.pem".into(),
     };
     build_router(state, tokens)
 }
@@ -133,6 +134,63 @@ async fn authenticated_submission_report_uses_not_found_envelope() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn worker_policy_is_admin_mutated_and_starts_inert() {
+    let (_db, pool) = setup_pg_db().await;
+    let router = router_with(pool, "http://unused".into());
+    let worker_id = uuid::Uuid::new_v4();
+    let body = serde_json::json!({
+        "worker_id": worker_id,
+        "display_name": "operator-host",
+        "capabilities": ["block_validation"],
+        "measurement_profile": null
+    })
+    .to_string();
+    let (status, created) =
+        send(&router, "POST", "/api/fleet/workers", Some("admintok"), Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(created["worker"]["worker_id"], worker_id.to_string());
+    assert_eq!(created["worker"]["enabled"], false);
+    assert_eq!(created["worker"]["draining"], true);
+    assert_eq!(created["certificates"], serde_json::json!([]));
+    let (status, retried) =
+        send(&router, "POST", "/api/fleet/workers", Some("admintok"), Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_eq!(retried["worker"]["worker_id"], worker_id.to_string());
+
+    let invalid = serde_json::json!({
+        "worker_id": uuid::Uuid::new_v4(),
+        "display_name": "unknown-field",
+        "capabilities": ["build_only"],
+        "measurement_profile": null,
+        "unexpected": true
+    })
+    .to_string();
+    let (status, _) =
+        send(&router, "POST", "/api/fleet/workers", Some("admintok"), Some(&invalid)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, _) = send(
+        &router,
+        "PATCH",
+        &format!("/api/fleet/workers/{worker_id}"),
+        Some("readtok"),
+        Some(r#"{"enabled":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, failed) = send(
+        &router,
+        "PATCH",
+        &format!("/api/fleet/workers/{worker_id}"),
+        Some("admintok"),
+        Some(r#"{"enabled":true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(failed["error"]["message"], "worker has no active certificate");
 }
 
 #[tokio::test]

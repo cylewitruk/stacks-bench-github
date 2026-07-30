@@ -5,7 +5,8 @@ use sbgh_core::db::JobStore;
 use sbgh_core::db::fleet::{
     ArtifactGrantRecord, EventIngest, FleetCompletion, FleetStore, FleetTerminalSubmission,
     FleetTerminalWrite, PreparedExecution, ProjectedReportMutation, ResolvedSpecSource,
-    TerminalAcceptance, WorkerRegistration,
+    TerminalAcceptance, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryMutation,
+    WorkerRegistryStore,
 };
 use sbgh_core::models::{
     BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobIntent, JobResult, JobSource, NewJob,
@@ -52,6 +53,437 @@ async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
         .add_or_restore_membership(install_id, repo_id)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn registry_certificate_revocation_is_irreversible_and_immediate() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker_id = Uuid::new_v4();
+    let fingerprint = [0x31; 32];
+    assert_eq!(
+        store
+            .create_worker(&registration(worker_id))
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
+    );
+    assert_eq!(
+        store
+            .authorize_certificate(worker_id, fingerprint)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
+    );
+    assert!(
+        store
+            .authorize_worker(worker_id, fingerprint)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .revoke_certificate(worker_id, fingerprint)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Busy,
+        "the final certificate of an enabled worker requires drain"
+    );
+    store
+        .set_worker_draining(worker_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .revoke_certificate(worker_id, fingerprint)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
+    );
+    assert!(
+        store
+            .authorize_worker(worker_id, fingerprint)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .authorize_certificate(worker_id, fingerprint)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Conflict
+    );
+    let deletion = sqlx::query("DELETE FROM worker_certificate WHERE certificate_sha256 = $1")
+        .bind(fingerprint.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(deletion.contains("immutable audit history"), "{deletion}");
+}
+
+#[tokio::test]
+async fn worker_creation_is_idempotent_but_rejects_conflicting_reuse() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool);
+    let worker_id = Uuid::new_v4();
+    let registration = registration(worker_id);
+    assert_eq!(
+        store
+            .create_worker(&registration)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
+    );
+    assert_eq!(
+        store
+            .create_worker(&registration)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Unchanged
+    );
+    let mut conflicting = registration;
+    conflicting.display_name = "different".into();
+    assert_eq!(
+        store
+            .create_worker(&conflicting)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Conflict
+    );
+}
+
+#[tokio::test]
+async fn concurrent_certificate_ownership_elects_one_worker() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    store
+        .create_worker(&registration(first))
+        .await
+        .unwrap();
+    store
+        .create_worker(&registration(second))
+        .await
+        .unwrap();
+    let fingerprint = [0x42; 32];
+    let (left, right) = tokio::join!(
+        store.authorize_certificate(first, fingerprint),
+        store.authorize_certificate(second, fingerprint),
+    );
+    let mut outcomes = [left.unwrap(), right.unwrap()];
+    outcomes.sort_by_key(|outcome| match outcome {
+        WorkerRegistryMutation::Applied => 0,
+        WorkerRegistryMutation::Conflict => 1,
+        _ => 2,
+    });
+    assert_eq!(outcomes, [WorkerRegistryMutation::Applied, WorkerRegistryMutation::Conflict]);
+}
+
+#[tokio::test]
+async fn live_session_binds_certificate_and_requires_quiescent_revocation() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let fingerprint = [0x53; 32];
+    store
+        .create_worker(&registration(worker_id))
+        .await
+        .unwrap();
+    store
+        .authorize_certificate(worker_id, fingerprint)
+        .await
+        .unwrap();
+    <PostgresFleetStore as FleetStore>::register_session(
+        &store,
+        worker_id,
+        fingerprint,
+        &session(worker_id, session_id),
+        Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+    let persisted: Vec<u8> = sqlx::query_scalar(
+        "SELECT certificate_sha256 FROM worker_session WHERE worker_session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, fingerprint);
+    assert_eq!(
+        store
+            .revoke_certificate(worker_id, fingerprint)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Busy
+    );
+    store
+        .set_worker_draining(worker_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .revoke_certificate(worker_id, fingerprint)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
+    );
+    assert!(
+        !store
+            .session_is_active(worker_id, session_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn emergency_revocation_withdraws_authorization_and_expires_the_live_session() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool);
+    let worker_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let fingerprint = [0x59; 32];
+    store
+        .create_worker(&registration(worker_id))
+        .await
+        .unwrap();
+    store
+        .authorize_certificate(worker_id, fingerprint)
+        .await
+        .unwrap();
+    <PostgresFleetStore as FleetStore>::register_session(
+        &store,
+        worker_id,
+        fingerprint,
+        &session(worker_id, session_id),
+        Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store
+            .emergency_revoke_certificate(worker_id, fingerprint)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
+    );
+    assert!(
+        store
+            .authorize_worker(worker_id, fingerprint)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !store
+            .session_is_active(worker_id, session_id)
+            .await
+            .unwrap()
+    );
+    let certificates = store
+        .worker_certificates(worker_id)
+        .await
+        .unwrap();
+    assert_eq!(certificates.len(), 1);
+    assert!(
+        certificates[0]
+            .revoked_at
+            .is_some()
+    );
+    assert!(certificates[0].created_at <= Utc::now());
+}
+
+#[tokio::test]
+async fn emergency_disable_reuses_lease_expiry_fencing_and_cleanup() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let fingerprint = [0x5a; 32];
+    let job_id = Uuid::new_v4();
+    store
+        .create_worker(&registration(worker_id))
+        .await
+        .unwrap();
+    store
+        .authorize_certificate(worker_id, fingerprint)
+        .await
+        .unwrap();
+    <PostgresFleetStore as FleetStore>::register_session(
+        &store,
+        worker_id,
+        fingerprint,
+        &session(worker_id, session_id),
+        Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+    enqueue_build(&store, job_id).await;
+    running_attempt(&store, worker_id, session_id, job_id).await;
+
+    assert_eq!(
+        store
+            .emergency_disable_worker(worker_id)
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
+    );
+    assert!(
+        store
+            .authorize_worker(worker_id, fingerprint)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .expire_stale_attempts()
+            .await
+            .unwrap(),
+        1
+    );
+    let pending_cleanup: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM worker_cleanup_obligation
+          WHERE worker_id = $1 AND status = 'pending'",
+    )
+    .bind(worker_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pending_cleanup, 1);
+}
+
+#[tokio::test]
+async fn drain_policy_update_serializes_with_offer_polling() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let fingerprint = [0x5b; 32];
+    store
+        .create_worker(&registration(worker_id))
+        .await
+        .unwrap();
+    store
+        .authorize_certificate(worker_id, fingerprint)
+        .await
+        .unwrap();
+    <PostgresFleetStore as FleetStore>::register_session(
+        &store,
+        worker_id,
+        fingerprint,
+        &session(worker_id, session_id),
+        Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+
+    let mut policy_tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM worker_registry WHERE worker_id = $1 FOR UPDATE")
+        .bind(worker_id)
+        .fetch_one(&mut *policy_tx)
+        .await
+        .unwrap();
+    let polling_store = store.clone();
+    let poll = tokio::spawn(async move {
+        polling_store
+            .poll_offer(worker_id, session_id, Duration::seconds(30), Duration::seconds(60))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!poll.is_finished(), "poll must wait for the policy row lock");
+    sqlx::query(
+        "UPDATE worker_registry
+            SET draining = TRUE, updated_at = NOW()
+          WHERE worker_id = $1",
+    )
+    .bind(worker_id)
+    .execute(&mut *policy_tx)
+    .await
+    .unwrap();
+    policy_tx
+        .commit()
+        .await
+        .unwrap();
+
+    assert!(
+        poll.await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM worker_session WHERE worker_session_id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "draining");
+}
+
+#[tokio::test]
+async fn enabling_requires_an_active_certificate_and_policy_changes_require_drain() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool);
+    let worker_id = Uuid::new_v4();
+    let mut inert = registration(worker_id);
+    inert.enabled = false;
+    inert.draining = true;
+    store
+        .create_worker(&inert)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_worker(
+                worker_id,
+                &WorkerPolicyPatch {
+                    enabled: Some(true),
+                    ..WorkerPolicyPatch::default()
+                },
+            )
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::MissingCertificate
+    );
+    store
+        .authorize_certificate(worker_id, [0x64; 32])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_worker(
+                worker_id,
+                &WorkerPolicyPatch {
+                    enabled: Some(true),
+                    ..WorkerPolicyPatch::default()
+                },
+            )
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
+    );
+    assert_eq!(
+        store
+            .update_worker(
+                worker_id,
+                &WorkerPolicyPatch {
+                    allowed_capabilities: Some(vec![WorkerCapability::BlockValidation]),
+                    ..WorkerPolicyPatch::default()
+                },
+            )
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied,
+        "worker remains drained until the operator explicitly undrains it"
+    );
 }
 
 fn registration(worker_id: Uuid) -> WorkerRegistration {
@@ -333,7 +765,7 @@ async fn response_loss_and_successor_session_are_safely_fenced() {
     let worker_id = Uuid::new_v4();
     let first_session = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store
@@ -516,7 +948,7 @@ async fn idle_drain_is_observable_and_stops_new_claims() {
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store
@@ -552,13 +984,13 @@ async fn idle_drain_is_observable_and_stops_new_claims() {
 }
 
 #[tokio::test]
-async fn registry_removal_or_capability_reduction_revokes_live_session() {
+async fn drained_capability_reduction_closes_live_session() {
     let (_db, pool) = setup_pg_db().await;
     let store = PostgresFleetStore::new(pool);
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store
@@ -566,38 +998,44 @@ async fn registry_removal_or_capability_reduction_revokes_live_session() {
         .await
         .unwrap();
 
-    store
-        .upsert_worker(&WorkerRegistration {
-            worker_id,
-            display_name: "reduced".into(),
-            allowed_capabilities: vec![WorkerCapability::Benchmark],
-            measurement_profile: Some("profile-v1".into()),
-            enabled: true,
-            draining: false,
-        })
-        .await
-        .unwrap();
-    assert!(
-        !store
-            .session_is_active(worker_id, session_id)
-            .await
-            .unwrap(),
-        "a live session cannot retain a removed capability"
-    );
-
     assert_eq!(
         store
-            .disable_workers_except(&[Uuid::new_v4()])
+            .update_worker(
+                worker_id,
+                &WorkerPolicyPatch {
+                    allowed_capabilities: Some(vec![WorkerCapability::Benchmark]),
+                    measurement_profile: Some(Some("profile-v1".into())),
+                    ..WorkerPolicyPatch::default()
+                },
+            )
             .await
             .unwrap(),
-        1
+        WorkerRegistryMutation::Busy
+    );
+    store
+        .set_worker_draining(worker_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_worker(
+                worker_id,
+                &WorkerPolicyPatch {
+                    allowed_capabilities: Some(vec![WorkerCapability::Benchmark]),
+                    measurement_profile: Some(Some("profile-v1".into())),
+                    ..WorkerPolicyPatch::default()
+                },
+            )
+            .await
+            .unwrap(),
+        WorkerRegistryMutation::Applied
     );
     assert!(
         !store
             .session_is_active(worker_id, session_id)
             .await
             .unwrap(),
-        "an identity removed from declarative policy is disabled"
+        "a policy change is effective only after closing the prior session"
     );
 }
 
@@ -609,7 +1047,7 @@ async fn reliable_prefix_and_terminal_submission_are_idempotent() {
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store
@@ -899,7 +1337,7 @@ async fn cancellation_fences_an_offer_before_worker_execution_starts() {
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store
@@ -955,7 +1393,7 @@ async fn concurrent_accept_and_cancel_serialize_without_an_unsafe_intermediate_s
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store
@@ -1009,7 +1447,7 @@ async fn terminal_after_orchestrator_lease_expiry_is_fenced() {
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store
@@ -1096,11 +1534,11 @@ async fn capability_routes_only_to_a_compatible_worker() {
     let build_session = Uuid::new_v4();
     let block_session = Uuid::new_v4();
     store
-        .upsert_worker(&registration(build_worker))
+        .seed_worker(&registration(build_worker))
         .await
         .unwrap();
     store
-        .upsert_worker(&WorkerRegistration {
+        .seed_worker(&WorkerRegistration {
             worker_id: block_worker,
             display_name: "block".into(),
             allowed_capabilities: vec![WorkerCapability::BlockValidation],
@@ -1288,7 +1726,7 @@ async fn explicit_submission_recovery_can_target_a_compatible_worker() {
     .unwrap();
     let incompatible_worker = Uuid::new_v4();
     store
-        .upsert_worker(&registration(incompatible_worker))
+        .seed_worker(&registration(incompatible_worker))
         .await
         .unwrap();
     assert!(
@@ -1304,7 +1742,7 @@ async fn explicit_submission_recovery_can_target_a_compatible_worker() {
     );
     let target_worker = Uuid::new_v4();
     store
-        .upsert_worker(&WorkerRegistration {
+        .seed_worker(&WorkerRegistration {
             worker_id: target_worker,
             display_name: "replacement benchmark host".into(),
             allowed_capabilities: vec![WorkerCapability::Benchmark],
@@ -1363,7 +1801,7 @@ async fn accepted_terminal_waits_for_durable_artifact_promotion() {
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store
@@ -1526,7 +1964,7 @@ async fn staged_artifact_is_marked_reaped_only_after_external_delete_ack() {
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     store
-        .upsert_worker(&registration(worker_id))
+        .seed_worker(&registration(worker_id))
         .await
         .unwrap();
     store

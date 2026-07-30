@@ -8,7 +8,9 @@
 //!   3. environment variables (always win)
 
 use std::env;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +26,7 @@ const DAEMON_HOME_RELATIVE: &str = ".config/sbgh/daemon/config.toml";
 pub struct DaemonConfig {
     pub server: DaemonServerConfig,
     pub github: GitHubConfig,
+    pub fleet: FleetConfig,
     pub vm: VmConfig,
     pub paths: PathsConfig,
     pub lvm: LvmConfig,
@@ -103,6 +106,93 @@ pub struct GitHubConfig {
     pub client_id: String,
     pub api_base_url: String,
     pub private_key_path: PathBuf,
+    pub block_validation: Option<GitHubBlockValidationConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubBlockValidationConfig {
+    pub requested_shards: u32,
+    pub max_concurrency: u32,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetConfig {
+    pub listen: SocketAddr,
+    pub server_certificate: PathBuf,
+    pub server_private_key: PathBuf,
+    pub client_ca_certificate: PathBuf,
+    pub lease_hmac_key: PathBuf,
+    pub heartbeat_seconds: u64,
+    pub lease_seconds: u64,
+    pub offer_seconds: u64,
+    pub session_seconds: u64,
+    pub long_poll_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub upload_grant_seconds: u64,
+    pub staging_gc_grace_seconds: u64,
+    pub max_artifact_bytes: u64,
+    pub max_attempt_artifact_bytes: u64,
+    pub max_concurrent_requests: usize,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:9443"
+                .parse()
+                .expect("valid fleet default"),
+            server_certificate: "/etc/sbgh/fleet/orchestrator.crt".into(),
+            server_private_key: "/etc/sbgh/fleet/orchestrator.key".into(),
+            client_ca_certificate: "/etc/sbgh/fleet/worker-ca.crt".into(),
+            lease_hmac_key: "/etc/sbgh/fleet/lease-hmac.key".into(),
+            heartbeat_seconds: 10,
+            lease_seconds: 45,
+            offer_seconds: 30,
+            session_seconds: 90,
+            long_poll_seconds: 20,
+            request_timeout_seconds: 120,
+            upload_grant_seconds: 300,
+            staging_gc_grace_seconds: 86_400,
+            max_artifact_bytes: 8 * 1024 * 1024 * 1024,
+            max_attempt_artifact_bytes: 32 * 1024 * 1024 * 1024,
+            max_concurrent_requests: 64,
+        }
+    }
+}
+
+impl FleetConfig {
+    pub fn heartbeat_interval(&self) -> Duration {
+        Duration::from_secs(self.heartbeat_seconds)
+    }
+
+    pub fn lease_ttl(&self) -> Duration {
+        Duration::from_secs(self.lease_seconds)
+    }
+
+    pub fn offer_ttl(&self) -> Duration {
+        Duration::from_secs(self.offer_seconds)
+    }
+
+    pub fn session_ttl(&self) -> Duration {
+        Duration::from_secs(self.session_seconds)
+    }
+
+    pub fn long_poll_timeout(&self) -> Duration {
+        Duration::from_secs(self.long_poll_seconds)
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_timeout_seconds)
+    }
+
+    pub fn upload_grant_ttl(&self) -> Duration {
+        Duration::from_secs(self.upload_grant_seconds)
+    }
+
+    pub fn staging_gc_grace(&self) -> Duration {
+        Duration::from_secs(self.staging_gc_grace_seconds)
+    }
 }
 
 /// Which surfaces receive a job's benchmark result.
@@ -447,6 +537,7 @@ impl DaemonConfig {
 struct RawDaemon {
     server: RawDaemonServer,
     github: RawGitHub,
+    fleet: RawFleet,
     vm: RawVm,
     paths: RawPaths,
     lvm: RawLvm,
@@ -561,6 +652,36 @@ struct RawGitHub {
     client_id: Option<String>,
     api_base_url: Option<String>,
     private_key_path: Option<PathBuf>,
+    block_validation: RawGitHubBlockValidation,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawGitHubBlockValidation {
+    requested_shards: Option<u32>,
+    max_concurrency: Option<u32>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawFleet {
+    listen: Option<SocketAddr>,
+    server_certificate: Option<PathBuf>,
+    server_private_key: Option<PathBuf>,
+    client_ca_certificate: Option<PathBuf>,
+    lease_hmac_key: Option<PathBuf>,
+    heartbeat_seconds: Option<u64>,
+    lease_seconds: Option<u64>,
+    offer_seconds: Option<u64>,
+    session_seconds: Option<u64>,
+    long_poll_seconds: Option<u64>,
+    request_timeout_seconds: Option<u64>,
+    upload_grant_seconds: Option<u64>,
+    staging_gc_grace_seconds: Option<u64>,
+    max_artifact_bytes: Option<u64>,
+    max_attempt_artifact_bytes: Option<u64>,
+    max_concurrent_requests: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -617,6 +738,95 @@ impl RawDaemon {
         merge_opt(&mut self.github.client_id, other.github.client_id);
         merge_opt(&mut self.github.api_base_url, other.github.api_base_url);
         merge_opt(&mut self.github.private_key_path, other.github.private_key_path);
+        merge_opt(
+            &mut self
+                .github
+                .block_validation
+                .requested_shards,
+            other
+                .github
+                .block_validation
+                .requested_shards,
+        );
+        merge_opt(
+            &mut self
+                .github
+                .block_validation
+                .max_concurrency,
+            other
+                .github
+                .block_validation
+                .max_concurrency,
+        );
+        merge_opt(
+            &mut self
+                .github
+                .block_validation
+                .timeout_secs,
+            other
+                .github
+                .block_validation
+                .timeout_secs,
+        );
+
+        merge_opt(&mut self.fleet.listen, other.fleet.listen);
+        merge_opt(&mut self.fleet.server_certificate, other.fleet.server_certificate);
+        merge_opt(&mut self.fleet.server_private_key, other.fleet.server_private_key);
+        merge_opt(
+            &mut self
+                .fleet
+                .client_ca_certificate,
+            other
+                .fleet
+                .client_ca_certificate,
+        );
+        merge_opt(&mut self.fleet.lease_hmac_key, other.fleet.lease_hmac_key);
+        merge_opt(&mut self.fleet.heartbeat_seconds, other.fleet.heartbeat_seconds);
+        merge_opt(&mut self.fleet.lease_seconds, other.fleet.lease_seconds);
+        merge_opt(&mut self.fleet.offer_seconds, other.fleet.offer_seconds);
+        merge_opt(&mut self.fleet.session_seconds, other.fleet.session_seconds);
+        merge_opt(&mut self.fleet.long_poll_seconds, other.fleet.long_poll_seconds);
+        merge_opt(
+            &mut self
+                .fleet
+                .request_timeout_seconds,
+            other
+                .fleet
+                .request_timeout_seconds,
+        );
+        merge_opt(
+            &mut self
+                .fleet
+                .upload_grant_seconds,
+            other
+                .fleet
+                .upload_grant_seconds,
+        );
+        merge_opt(
+            &mut self
+                .fleet
+                .staging_gc_grace_seconds,
+            other
+                .fleet
+                .staging_gc_grace_seconds,
+        );
+        merge_opt(&mut self.fleet.max_artifact_bytes, other.fleet.max_artifact_bytes);
+        merge_opt(
+            &mut self
+                .fleet
+                .max_attempt_artifact_bytes,
+            other
+                .fleet
+                .max_attempt_artifact_bytes,
+        );
+        merge_opt(
+            &mut self
+                .fleet
+                .max_concurrent_requests,
+            other
+                .fleet
+                .max_concurrent_requests,
+        );
 
         merge_opt(&mut self.reporting.pr_report, other.reporting.pr_report);
         merge_opt(
@@ -807,6 +1017,23 @@ impl RawDaemon {
         env_into(&mut self.github.api_base_url, "SBGH_GH_API_BASE_URL");
         env_path_into(&mut self.github.private_key_path, "SBGH_GH_PRIVATE_KEY_PATH");
 
+        env_parse_into(&mut self.fleet.listen, "SBGH_FLEET_LISTEN");
+        env_path_into(&mut self.fleet.server_certificate, "SBGH_FLEET_SERVER_CERTIFICATE");
+        env_path_into(&mut self.fleet.server_private_key, "SBGH_FLEET_SERVER_PRIVATE_KEY");
+        env_path_into(
+            &mut self
+                .fleet
+                .client_ca_certificate,
+            "SBGH_FLEET_CLIENT_CA_CERTIFICATE",
+        );
+        env_path_into(&mut self.fleet.lease_hmac_key, "SBGH_FLEET_LEASE_HMAC_KEY");
+        env_parse_into(
+            &mut self
+                .fleet
+                .max_concurrent_requests,
+            "SBGH_FLEET_MAX_CONCURRENT_REQUESTS",
+        );
+
         env_path_into(&mut self.vm.golden_image, "SBGH_VM_GOLDEN_IMAGE");
         env_parse_into(&mut self.vm.build_vcpus, "SBGH_VM_BUILD_VCPUS");
         env_parse_into(&mut self.vm.bench_vcpus, "SBGH_VM_BENCH_VCPUS");
@@ -953,6 +1180,100 @@ impl RawDaemon {
     }
 
     fn into_config(self) -> Result<DaemonConfig> {
+        let block_validation = match (
+            self.github
+                .block_validation
+                .requested_shards,
+            self.github
+                .block_validation
+                .max_concurrency,
+            self.github
+                .block_validation
+                .timeout_secs,
+        ) {
+            (None, None, None) => None,
+            (requested_shards, max_concurrency, timeout_secs) => {
+                Some(GitHubBlockValidationConfig {
+                    requested_shards: required(
+                        requested_shards,
+                        "[github.block_validation].requested_shards",
+                    )?,
+                    max_concurrency: required(
+                        max_concurrency,
+                        "[github.block_validation].max_concurrency",
+                    )?,
+                    timeout_secs: required(timeout_secs, "[github.block_validation].timeout_secs")?,
+                })
+            }
+        };
+        let fleet_defaults = FleetConfig::default();
+        let fleet = FleetConfig {
+            listen: self
+                .fleet
+                .listen
+                .unwrap_or(fleet_defaults.listen),
+            server_certificate: self
+                .fleet
+                .server_certificate
+                .unwrap_or(fleet_defaults.server_certificate),
+            server_private_key: self
+                .fleet
+                .server_private_key
+                .unwrap_or(fleet_defaults.server_private_key),
+            client_ca_certificate: self
+                .fleet
+                .client_ca_certificate
+                .unwrap_or(fleet_defaults.client_ca_certificate),
+            lease_hmac_key: self
+                .fleet
+                .lease_hmac_key
+                .unwrap_or(fleet_defaults.lease_hmac_key),
+            heartbeat_seconds: self
+                .fleet
+                .heartbeat_seconds
+                .unwrap_or(fleet_defaults.heartbeat_seconds),
+            lease_seconds: self
+                .fleet
+                .lease_seconds
+                .unwrap_or(fleet_defaults.lease_seconds),
+            offer_seconds: self
+                .fleet
+                .offer_seconds
+                .unwrap_or(fleet_defaults.offer_seconds),
+            session_seconds: self
+                .fleet
+                .session_seconds
+                .unwrap_or(fleet_defaults.session_seconds),
+            long_poll_seconds: self
+                .fleet
+                .long_poll_seconds
+                .unwrap_or(fleet_defaults.long_poll_seconds),
+            request_timeout_seconds: self
+                .fleet
+                .request_timeout_seconds
+                .unwrap_or(fleet_defaults.request_timeout_seconds),
+            upload_grant_seconds: self
+                .fleet
+                .upload_grant_seconds
+                .unwrap_or(fleet_defaults.upload_grant_seconds),
+            staging_gc_grace_seconds: self
+                .fleet
+                .staging_gc_grace_seconds
+                .unwrap_or(fleet_defaults.staging_gc_grace_seconds),
+            max_artifact_bytes: self
+                .fleet
+                .max_artifact_bytes
+                .unwrap_or(fleet_defaults.max_artifact_bytes),
+            max_attempt_artifact_bytes: self
+                .fleet
+                .max_attempt_artifact_bytes
+                .unwrap_or(fleet_defaults.max_attempt_artifact_bytes),
+            max_concurrent_requests: self
+                .fleet
+                .max_concurrent_requests
+                .unwrap_or(fleet_defaults.max_concurrent_requests),
+        };
+        validate_fleet_config(&fleet, block_validation.as_ref())?;
         Ok(DaemonConfig {
             server: DaemonServerConfig {
                 database_url: required(self.server.database_url, "DATABASE_URL")?,
@@ -974,7 +1295,9 @@ impl RawDaemon {
                     self.github.private_key_path,
                     "[github].private_key_path / SBGH_GH_PRIVATE_KEY_PATH",
                 )?,
+                block_validation,
             },
+            fleet,
             vm: VmConfig {
                 golden_image: required(self.vm.golden_image, "[vm].golden_image")?,
                 // Build phase defaults — give cargo plenty of parallelism
@@ -1284,6 +1607,58 @@ impl RawDaemon {
 }
 
 // ─────────────────────────── Shared helpers ───────────────────────────
+
+fn validate_fleet_config(
+    fleet: &FleetConfig,
+    block_validation: Option<&GitHubBlockValidationConfig>,
+) -> Result<()> {
+    if fleet.heartbeat_seconds == 0
+        || fleet.lease_seconds
+            < fleet
+                .heartbeat_seconds
+                .saturating_mul(3)
+        || fleet.offer_seconds == 0
+        || fleet.session_seconds
+            < fleet
+                .lease_seconds
+                .saturating_mul(2)
+    {
+        return Err(Error::Config(
+            "fleet heartbeat/lease/offer/session durations are inconsistent".into(),
+        ));
+    }
+    if fleet.long_poll_seconds == 0
+        || fleet.long_poll_seconds > sbgh_fleet::MAX_LONG_POLL_SECS
+        || fleet.request_timeout_seconds <= fleet.long_poll_seconds
+    {
+        return Err(Error::Config(
+            "fleet long-poll/request timeout exceeds transport bounds".into(),
+        ));
+    }
+    if fleet.upload_grant_seconds == 0
+        || fleet.staging_gc_grace_seconds < fleet.upload_grant_seconds
+        || fleet.staging_gc_grace_seconds > i64::MAX as u64
+        || fleet.max_artifact_bytes == 0
+        || fleet.max_attempt_artifact_bytes < fleet.max_artifact_bytes
+        || !(64..=1_024).contains(&fleet.max_concurrent_requests)
+    {
+        return Err(Error::Config("fleet transport or artifact limits are invalid".into()));
+    }
+    if let Some(trigger) = block_validation
+        && (trigger.requested_shards == 0
+            || trigger.requested_shards > sbgh_fleet::MAX_VALIDATION_SHARDS
+            || trigger.max_concurrency == 0
+            || trigger.max_concurrency > sbgh_fleet::MAX_VALIDATION_CONCURRENCY
+            || trigger.max_concurrency > trigger.requested_shards
+            || trigger.timeout_secs == 0
+            || trigger.timeout_secs > sbgh_fleet::MAX_VALIDATION_TIMEOUT_SECS)
+    {
+        return Err(Error::Config(
+            "GitHub block-validation defaults exceed protocol bounds".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Trim each id and drop blank entries, so a TOML `["", "  "]` (which `env_csv`
 /// already filters for env input) collapses to empty rather than passing as a

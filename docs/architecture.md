@@ -179,10 +179,12 @@ identity SAN:
 urn:sbgh:worker:<worker-uuid>
 ```
 
-The daemon ignores Common Name and binds the UUID to configured certificate
-fingerprints, capabilities, measurement profile, enabled state, and drain
-state. Registry policy is authoritative; worker-advertised data cannot elevate
-access.
+The daemon ignores Common Name. TLS authenticates the certificate identity;
+PostgreSQL authorizes its active SHA-256 fingerprint, capabilities,
+measurement profile, enabled state, and drain state on every RPC. Registration
+records current worker advertisement, whose capabilities can only narrow
+server policy. Enrollment and rotation use the admin API and do not require a
+daemon restart.
 
 Every guest phase uses the checked-in
 [`sandbox-egress`](../network/sandbox-egress.xml) network. Its nftables policy:

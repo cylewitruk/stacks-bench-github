@@ -300,6 +300,43 @@ pub struct WorkerDrainRequest {
     pub draining: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCreateRequest {
+    pub worker_id: Option<String>,
+    pub display_name: String,
+    pub capabilities: Vec<String>,
+    pub measurement_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerUpdateRequest {
+    pub display_name: Option<String>,
+    pub capabilities: Option<Vec<String>>,
+    pub measurement_profile: Option<Option<String>>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCertificateRequest {
+    pub certificate_pem: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCertificateView {
+    pub certificate_sha256: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerPolicyView {
+    pub worker: FleetWorkerView,
+    pub certificates: Vec<WorkerCertificateView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetCancellationResponse {
     pub job_id: String,

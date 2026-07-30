@@ -35,7 +35,7 @@ use std::sync::Arc;
 use anyhow::Context;
 pub use auth::{ApiTokens, Scope};
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, patch, post};
 pub use state::ApiState;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -71,6 +71,7 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/jobs", get(jobs::list))
             .route("/api/submissions/{id}/report", get(jobs::report))
             .route("/api/fleet", get(fleet::overview))
+            .route("/api/fleet/workers/{id}", get(fleet::show_worker))
             .route("/api/fleet/metrics", get(fleet::metrics)),
         tokens.clone(),
         Scope::Read,
@@ -91,6 +92,21 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/roles", post(users::grant))
             .route("/api/roles/revoke", post(users::revoke))
             .route("/api/jobs/block-validation", post(jobs::enqueue_block_validation))
+            .route("/api/fleet/workers", post(fleet::create_worker))
+            .route("/api/fleet/workers/{id}", patch(fleet::update_worker))
+            .route("/api/fleet/workers/{id}/certificates", post(fleet::authorize_certificate))
+            .route(
+                "/api/fleet/workers/{id}/certificates/{fingerprint}",
+                delete(fleet::revoke_certificate),
+            )
+            .route(
+                "/api/fleet/workers/{id}/emergency-disable",
+                post(fleet::emergency_disable_worker),
+            )
+            .route(
+                "/api/fleet/workers/{id}/certificates/{fingerprint}/emergency-revoke",
+                post(fleet::emergency_revoke_certificate),
+            )
             .route("/api/fleet/workers/{id}/drain", post(fleet::set_drain))
             .route("/api/fleet/jobs/{id}/cancel", post(fleet::cancel_job))
             .route("/api/fleet/submissions/{id}/recover", post(fleet::recover_submission)),
@@ -190,6 +206,7 @@ mod tests {
             pool: pool.clone(),
             ingest: Arc::new(sbgh_postgres::PostgresIngestStore::new(pool)),
             gh_api_base: "https://api.github.com".into(),
+            worker_ca_certificate: "worker-ca.pem".into(),
         }
     }
 

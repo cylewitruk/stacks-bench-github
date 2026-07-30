@@ -120,11 +120,11 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let jobs_store = Arc::new(PostgresJobStore::new(pool.clone()));
     // Write-through inbox for the `/api` webhook-submit endpoint.
     let api_ingest = Arc::new(PostgresIngestStore::new(pool.clone()));
-    let fleet_config =
-        fleet::FleetConfig::load_from_env().context("loading worker fleet config")?;
+    let fleet_config = config.fleet.clone();
     let postgres_fleet = sbgh_postgres::PostgresFleetStore::new(pool.clone());
-    let block_validation_queue = fleet_config
-        .github_block_validation
+    let block_validation_queue = config
+        .github
+        .block_validation
         .clone()
         .map(|trigger| {
             Arc::new(fleet::PostgresBlockValidationQueue::new((*jobs_store).clone(), trigger))
@@ -203,10 +203,13 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let artifact_store_config = execution_artifact_store_config(&config)?;
     let artifact_store = artifact_store::build_store(&artifact_store_config)
         .context("building the artifact store")?;
-    let fleet_store: Arc<dyn sbgh_core::db::fleet::FleetStore> = Arc::new(postgres_fleet);
+    let fleet_store: Arc<dyn sbgh_core::db::fleet::FleetStore> = Arc::new(postgres_fleet.clone());
+    let worker_registry: Arc<dyn sbgh_core::db::fleet::WorkerRegistryStore> =
+        Arc::new(postgres_fleet);
     let fleet_runtime = fleet::FleetRuntime::build(
         fleet_config,
         fleet_store.clone(),
+        worker_registry,
         artifact_store.clone(),
         tokens,
     )
@@ -352,6 +355,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         gh_api_base: config
             .github
             .api_base_url
+            .clone(),
+        worker_ca_certificate: config
+            .fleet
+            .client_ca_certificate
             .clone(),
     };
     let api_router = api::build_router(api_state, api_tokens);

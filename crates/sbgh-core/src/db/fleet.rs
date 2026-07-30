@@ -27,6 +27,58 @@ pub struct WorkerRegistration {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkerAuthorization {
+    pub worker_id: Uuid,
+    pub allowed_capabilities: Vec<WorkerCapability>,
+    pub measurement_profile: Option<String>,
+    pub draining: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerRegistryEntry {
+    pub worker_id: Uuid,
+    pub display_name: String,
+    pub enabled: bool,
+    pub draining: bool,
+    pub allowed_capabilities: Vec<String>,
+    pub measurement_profile: Option<String>,
+    pub worker_session_id: Option<Uuid>,
+    pub session_status: Option<String>,
+    pub software_version: Option<String>,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub session_expires_at: Option<DateTime<Utc>>,
+    pub resource_facts: Option<serde_json::Value>,
+    pub attempt_id: Option<Uuid>,
+    pub job_id: Option<Uuid>,
+    pub trace_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkerPolicyPatch {
+    pub display_name: Option<String>,
+    pub allowed_capabilities: Option<Vec<WorkerCapability>>,
+    pub measurement_profile: Option<Option<String>>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCertificateRecord {
+    pub certificate_sha256: [u8; 32],
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerRegistryMutation {
+    Applied,
+    Unchanged,
+    NotFound,
+    Busy,
+    MissingCertificate,
+    Conflict,
+}
+
+#[derive(Debug, Clone)]
 pub struct AuthorizedSession {
     pub worker_id: Uuid,
     pub worker_session_id: Uuid,
@@ -197,15 +249,66 @@ pub struct SubmissionRecovery {
 }
 
 #[async_trait]
+pub trait WorkerRegistryStore: Send + Sync + 'static {
+    async fn create_worker(
+        &self,
+        registration: &WorkerRegistration,
+    ) -> Result<WorkerRegistryMutation>;
+
+    async fn update_worker(
+        &self,
+        worker_id: Uuid,
+        patch: &WorkerPolicyPatch,
+    ) -> Result<WorkerRegistryMutation>;
+
+    async fn authorize_certificate(
+        &self,
+        worker_id: Uuid,
+        certificate_sha256: [u8; 32],
+    ) -> Result<WorkerRegistryMutation>;
+
+    async fn revoke_certificate(
+        &self,
+        worker_id: Uuid,
+        certificate_sha256: [u8; 32],
+    ) -> Result<WorkerRegistryMutation>;
+
+    /// Immediately withdraw authorization and expire this worker's current
+    /// session/attempt leases. The normal expiry coordinator performs
+    /// fencing, cleanup, and safe requeue.
+    async fn emergency_disable_worker(&self, worker_id: Uuid) -> Result<WorkerRegistryMutation>;
+
+    /// Immediately revoke one certificate and expire sessions authenticated
+    /// by it. The normal expiry coordinator owns subsequent recovery.
+    async fn emergency_revoke_certificate(
+        &self,
+        worker_id: Uuid,
+        certificate_sha256: [u8; 32],
+    ) -> Result<WorkerRegistryMutation>;
+
+    async fn worker_certificates(&self, worker_id: Uuid) -> Result<Vec<WorkerCertificateRecord>>;
+
+    async fn workers(&self, worker_id: Option<Uuid>) -> Result<Vec<WorkerRegistryEntry>>;
+
+    async fn authorize_worker(
+        &self,
+        worker_id: Uuid,
+        certificate_sha256: [u8; 32],
+    ) -> Result<Option<WorkerAuthorization>>;
+
+    async fn set_worker_draining(
+        &self,
+        worker_id: Uuid,
+        draining: bool,
+    ) -> Result<WorkerRegistryMutation>;
+}
+
+#[async_trait]
 pub trait FleetStore: Send + Sync + 'static {
-    async fn upsert_worker(&self, registration: &WorkerRegistration) -> Result<()>;
-
-    /// Disable registry identities absent from the current declarative policy.
-    async fn disable_workers_except(&self, worker_ids: &[Uuid]) -> Result<u64>;
-
     async fn register_session(
         &self,
         certificate_worker_id: Uuid,
+        certificate_sha256: [u8; 32],
         request: &RegisterSessionRequest,
         session_ttl: Duration,
     ) -> Result<AuthorizedSession>;

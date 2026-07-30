@@ -8,8 +8,8 @@ use sbgh_core::submission::{
 use sbgh_fleet::{BlockValidationPayload, TaskPayload};
 use sbgh_postgres::PostgresJobStore;
 
-use super::config::GitHubBlockValidationConfig;
 use crate::webhook_processor::{BlockValidationJobRequest, BlockValidationQueue};
+use sbgh_core::config::GitHubBlockValidationConfig;
 
 pub struct PostgresBlockValidationQueue {
     store: PostgresJobStore,

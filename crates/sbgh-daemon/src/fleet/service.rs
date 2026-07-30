@@ -5,9 +5,11 @@ use std::time::Duration as StdDuration;
 
 use anyhow::Context;
 use chrono::{Duration, Utc};
+use sbgh_core::config::FleetConfig;
 use sbgh_core::db::fleet::{
     ArtifactGrantRecord, EventIngest, FleetCompletion, FleetFailure, FleetStore,
-    FleetTerminalSubmission, FleetTerminalWrite, TerminalAcceptance, WorkerRegistration,
+    FleetTerminalSubmission, FleetTerminalWrite, TerminalAcceptance, WorkerAuthorization,
+    WorkerRegistryStore,
 };
 use sbgh_core::models::JobResult;
 use sbgh_fleet::{
@@ -23,7 +25,6 @@ use sbgh_github::InstallationTokenCache;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::config::FleetConfig;
 use super::lease::LeaseSigner;
 use super::tls::AuthenticatedPeer;
 use crate::artifact_store::ArtifactStore;
@@ -83,6 +84,7 @@ impl Drop for ActivePollGuard {
 #[derive(Clone)]
 pub(super) struct FleetService {
     store: Arc<dyn FleetStore>,
+    registry: Arc<dyn WorkerRegistryStore>,
     artifacts: Arc<dyn ArtifactStore>,
     github_tokens: InstallationTokenCache,
     signer: LeaseSigner,
@@ -98,40 +100,15 @@ impl FleetRuntime {
     pub async fn build(
         config: FleetConfig,
         store: Arc<dyn FleetStore>,
+        registry: Arc<dyn WorkerRegistryStore>,
         artifacts: Arc<dyn ArtifactStore>,
         github_tokens: InstallationTokenCache,
     ) -> anyhow::Result<Self> {
         let signer = LeaseSigner::load(&config.lease_hmac_key)?;
-        for worker in &config.workers {
-            store
-                .upsert_worker(&WorkerRegistration {
-                    worker_id: worker.id,
-                    display_name: worker.display_name.clone(),
-                    allowed_capabilities: worker
-                        .capabilities
-                        .iter()
-                        .copied()
-                        .collect(),
-                    measurement_profile: worker
-                        .measurement_profile
-                        .clone(),
-                    enabled: worker.enabled,
-                    draining: worker.draining,
-                })
-                .await?;
-        }
-        store
-            .disable_workers_except(
-                &config
-                    .workers
-                    .iter()
-                    .map(|worker| worker.id)
-                    .collect::<Vec<_>>(),
-            )
-            .await?;
         Ok(Self {
             service: FleetService {
                 store,
+                registry,
                 artifacts,
                 github_tokens,
                 signer,
@@ -161,11 +138,16 @@ pub(super) async fn register(
             false,
         ));
     }
-    let configured = authorized_worker(state, peer)?;
+    let configured = authorized_worker(state, peer).await?;
     validate(&request)?;
     if request
         .advertised_capabilities
-        .is_disjoint(&configured.capabilities)
+        .iter()
+        .all(|capability| {
+            !configured
+                .allowed_capabilities
+                .contains(capability)
+        })
     {
         return Err(service_error(
             ServiceCode::PermissionDenied,
@@ -176,7 +158,12 @@ pub(super) async fn register(
     }
     let session = state
         .store
-        .register_session(peer.worker_id, &request, chrono_duration(state.config.session_ttl())?)
+        .register_session(
+            peer.worker_id,
+            peer.certificate_sha256,
+            &request,
+            chrono_duration(state.config.session_ttl())?,
+        )
         .await
         .map_err(internal)?;
     tracing::info!(
@@ -205,7 +192,7 @@ pub(super) async fn poll(
     peer: &AuthenticatedPeer,
     request: PollRequest,
 ) -> ServiceResult<PollResponse> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     if !state
         .store
@@ -307,7 +294,7 @@ pub(super) async fn accept(
     peer: &AuthenticatedPeer,
     request: AcceptOfferRequest,
 ) -> ServiceResult<AcceptOfferResponse> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     authorize_attempt(state, peer.worker_id, &request.identity)?;
     let offered = state
@@ -347,7 +334,7 @@ pub(super) async fn repository_credential(
     peer: &AuthenticatedPeer,
     request: RepositoryCredentialRequest,
 ) -> ServiceResult<RepositoryCredentialResponse> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     authorize_attempt(state, peer.worker_id, &request.identity)?;
     let heartbeat = state
@@ -405,7 +392,7 @@ pub(super) async fn heartbeat(
     peer: &AuthenticatedPeer,
     request: HeartbeatRequest,
 ) -> ServiceResult<HeartbeatResponse> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     authorize_attempt(state, peer.worker_id, &request.identity)?;
     let heartbeat = state
@@ -433,7 +420,7 @@ pub(super) async fn event(
     peer: &AuthenticatedPeer,
     request: ReliableEventEnvelope,
 ) -> ServiceResult<ReliableEventAck> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     authorize_attempt(state, peer.worker_id, &request.identity)?;
     let ingest = state
@@ -479,7 +466,7 @@ pub(super) async fn progress(
     peer: &AuthenticatedPeer,
     request: ProgressRequest,
 ) -> ServiceResult<bool> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     authorize_attempt(state, peer.worker_id, &request.identity)?;
     let offered = state
@@ -564,7 +551,7 @@ pub(super) async fn artifact_grant(
     peer: &AuthenticatedPeer,
     request: ArtifactGrantRequest,
 ) -> ServiceResult<ArtifactGrantResponse> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     authorize_attempt(state, peer.worker_id, &request.identity)?;
     if request.operation == ArtifactOperation::Get {
@@ -697,7 +684,7 @@ pub(super) async fn complete(
     peer: &AuthenticatedPeer,
     request: CompleteAttemptRequest,
 ) -> ServiceResult<CompleteAttemptResponse> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     authorize_attempt(state, peer.worker_id, &request.identity)?;
     let offered = state
@@ -818,7 +805,7 @@ pub(super) async fn cleanup(
     peer: &AuthenticatedPeer,
     request: CleanupListRequest,
 ) -> ServiceResult<Vec<CleanupItem>> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     let obligations = state
         .store
@@ -841,7 +828,7 @@ pub(super) async fn cleanup_complete(
     peer: &AuthenticatedPeer,
     request: CleanupCompleteRequest,
 ) -> ServiceResult<bool> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     let completed = state
         .store
@@ -865,7 +852,7 @@ pub(super) async fn deregister(
     peer: &AuthenticatedPeer,
     request: DeregisterSessionRequest,
 ) -> ServiceResult<bool> {
-    authorized_worker(state, peer)?;
+    authorized_worker(state, peer).await?;
     validate(&request)?;
     let deregistered = state
         .store
@@ -1105,42 +1092,29 @@ fn authorize_attempt(
     }
 }
 
-fn authorized_worker<'a>(
-    state: &'a FleetService,
+async fn authorized_worker(
+    state: &FleetService,
     peer: &AuthenticatedPeer,
-) -> ServiceResult<&'a super::config::ConfiguredWorker> {
-    let worker = state
-        .config
-        .workers
-        .iter()
-        .find(|worker| worker.id == peer.worker_id)
+) -> ServiceResult<WorkerAuthorization> {
+    authorize_peer(state.registry.as_ref(), peer).await
+}
+
+async fn authorize_peer(
+    registry: &dyn WorkerRegistryStore,
+    peer: &AuthenticatedPeer,
+) -> ServiceResult<WorkerAuthorization> {
+    let worker = registry
+        .authorize_worker(peer.worker_id, peer.certificate_sha256)
+        .await
+        .map_err(internal)?
         .ok_or_else(|| {
             service_error(
                 ServiceCode::PermissionDenied,
                 "worker_not_registered",
-                "certificate identity is not present in the worker registry policy",
+                "worker identity, enabled state, or certificate authorization is invalid",
                 false,
             )
         })?;
-    if !worker.enabled {
-        return Err(service_error(
-            ServiceCode::PermissionDenied,
-            "worker_disabled",
-            "worker identity is disabled",
-            false,
-        ));
-    }
-    if !worker
-        .certificate_sha256
-        .contains(&peer.certificate_sha256)
-    {
-        return Err(service_error(
-            ServiceCode::PermissionDenied,
-            "worker_certificate_revoked",
-            "worker certificate is not authorized for this identity",
-            false,
-        ));
-    }
     Ok(worker)
 }
 
@@ -1199,17 +1173,143 @@ fn service_error(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use async_trait::async_trait;
+    use sbgh_core::db::fleet::{
+        WorkerAuthorization, WorkerCertificateRecord, WorkerPolicyPatch, WorkerRegistration,
+        WorkerRegistryEntry, WorkerRegistryMutation, WorkerRegistryStore,
+    };
     use sbgh_fleet::{
         ArtifactDescriptor, BlockValidationPayload, BlockValidationResult, InclusiveRange,
         TaskPayload, TerminalOutcome, ValidationEpoch,
     };
 
     use super::{
-        ActivePolls, ServiceCode, accept_event_ingest, artifact_staging_key, logical_artifacts,
-        validate_terminal_for_assignment,
+        ActivePolls, ServiceCode, accept_event_ingest, artifact_staging_key, authorize_peer,
+        logical_artifacts, validate_terminal_for_assignment,
     };
     use sbgh_core::db::fleet::EventIngest;
+
+    #[derive(Default)]
+    struct ToggleRegistry {
+        authorized: AtomicBool,
+    }
+
+    #[async_trait]
+    impl WorkerRegistryStore for ToggleRegistry {
+        async fn create_worker(
+            &self,
+            _: &WorkerRegistration,
+        ) -> sbgh_core::Result<WorkerRegistryMutation> {
+            Ok(WorkerRegistryMutation::NotFound)
+        }
+
+        async fn update_worker(
+            &self,
+            _: uuid::Uuid,
+            _: &WorkerPolicyPatch,
+        ) -> sbgh_core::Result<WorkerRegistryMutation> {
+            Ok(WorkerRegistryMutation::NotFound)
+        }
+
+        async fn authorize_certificate(
+            &self,
+            _: uuid::Uuid,
+            _: [u8; 32],
+        ) -> sbgh_core::Result<WorkerRegistryMutation> {
+            Ok(WorkerRegistryMutation::NotFound)
+        }
+
+        async fn revoke_certificate(
+            &self,
+            _: uuid::Uuid,
+            _: [u8; 32],
+        ) -> sbgh_core::Result<WorkerRegistryMutation> {
+            Ok(WorkerRegistryMutation::NotFound)
+        }
+
+        async fn emergency_disable_worker(
+            &self,
+            _: uuid::Uuid,
+        ) -> sbgh_core::Result<WorkerRegistryMutation> {
+            Ok(WorkerRegistryMutation::NotFound)
+        }
+
+        async fn emergency_revoke_certificate(
+            &self,
+            _: uuid::Uuid,
+            _: [u8; 32],
+        ) -> sbgh_core::Result<WorkerRegistryMutation> {
+            Ok(WorkerRegistryMutation::NotFound)
+        }
+
+        async fn worker_certificates(
+            &self,
+            _: uuid::Uuid,
+        ) -> sbgh_core::Result<Vec<WorkerCertificateRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn workers(
+            &self,
+            _: Option<uuid::Uuid>,
+        ) -> sbgh_core::Result<Vec<WorkerRegistryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn authorize_worker(
+            &self,
+            worker_id: uuid::Uuid,
+            _: [u8; 32],
+        ) -> sbgh_core::Result<Option<WorkerAuthorization>> {
+            Ok(self
+                .authorized
+                .load(Ordering::SeqCst)
+                .then_some(WorkerAuthorization {
+                    worker_id,
+                    allowed_capabilities: vec![sbgh_fleet::WorkerCapability::BuildOnly],
+                    measurement_profile: None,
+                    draining: false,
+                }))
+        }
+
+        async fn set_worker_draining(
+            &self,
+            _: uuid::Uuid,
+            _: bool,
+        ) -> sbgh_core::Result<WorkerRegistryMutation> {
+            Ok(WorkerRegistryMutation::NotFound)
+        }
+    }
+
+    #[tokio::test]
+    async fn same_authenticated_connection_peer_is_rechecked_after_revocation() {
+        let registry = ToggleRegistry::default();
+        registry
+            .authorized
+            .store(true, Ordering::SeqCst);
+        let peer = crate::fleet::tls::AuthenticatedPeer {
+            worker_id: uuid::Uuid::new_v4(),
+            certificate_sha256: [0x77; 32],
+            socket_addr: "127.0.0.1:1234"
+                .parse()
+                .unwrap(),
+        };
+        assert!(
+            authorize_peer(&registry, &peer)
+                .await
+                .is_ok()
+        );
+        registry
+            .authorized
+            .store(false, Ordering::SeqCst);
+        let error = authorize_peer(&registry, &peer)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ServiceCode::PermissionDenied);
+        assert_eq!(error.stable_code, "worker_not_registered");
+    }
 
     #[test]
     fn one_worker_session_cannot_hold_multiple_long_polls() {
