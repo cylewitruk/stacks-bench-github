@@ -5,7 +5,7 @@ use sbgh_core::reporting::{
     InclusiveReportRange, InvalidBlockReport, ReportArtifact, ReportIdentity, ReportLifecycle,
     ReportLifecycleState, SubmissionReportView, TaskReport,
 };
-use sbgh_proto::{ArtifactDescriptor, TaskPayload, Validate};
+use sbgh_fleet::{ArtifactDescriptor, TaskPayload, Validate};
 use sqlx::Row as _;
 use uuid::Uuid;
 
@@ -231,7 +231,7 @@ pub async fn submission_report(
             .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
             match result {
                 Some(row) => {
-                    let invalid: Vec<sbgh_proto::InvalidBlock> = serde_json::from_value(
+                    let invalid: Vec<sbgh_fleet::InvalidBlock> = serde_json::from_value(
                         row.try_get("invalid_blocks")
                             .map_err(other)?,
                     )
@@ -272,12 +272,12 @@ pub async fn submission_report(
                         .map_err(other)?;
                     let detail = match observed_range {
                         Some(range) => {
-                            let result = sbgh_proto::BlockValidationResult {
+                            let result = sbgh_fleet::BlockValidationResult {
                                 valid,
                                 checked_blocks,
                                 invalid_blocks: invalid,
                                 chainstate_origin,
-                                observed_range: sbgh_proto::InclusiveRange {
+                                observed_range: sbgh_fleet::InclusiveRange {
                                     start: range.start,
                                     end: range.end,
                                 },
@@ -405,7 +405,7 @@ fn aggregate_state(
 
 fn parse_validation_request(
     value: serde_json::Value,
-) -> Result<sbgh_proto::BlockValidationPayload> {
+) -> Result<sbgh_fleet::BlockValidationPayload> {
     let payload: TaskPayload = serde_json::from_value(value).map_err(other)?;
     payload
         .validate()

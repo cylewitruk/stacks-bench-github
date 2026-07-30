@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 sbgh-core.workspace = true
-sbgh-proto.workspace = true
+sbgh-fleet.workspace = true
 
 async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

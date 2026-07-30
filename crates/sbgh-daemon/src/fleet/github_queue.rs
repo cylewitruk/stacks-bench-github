@@ -5,8 +5,8 @@ use sbgh_core::submission::{
     BlockValidationPlan, GithubSubmissionProvenance, ProducerKey, ResolvedTaskSource,
     SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionProvenance, TaskPlan,
 };
+use sbgh_fleet::{BlockValidationPayload, TaskPayload};
 use sbgh_postgres::PostgresJobStore;
-use sbgh_proto::{BlockValidationPayload, TaskPayload};
 
 use super::config::GitHubBlockValidationConfig;
 use crate::webhook_processor::{BlockValidationJobRequest, BlockValidationQueue};
@@ -32,7 +32,7 @@ impl BlockValidationQueue for PostgresBlockValidationQueue {
             max_concurrency: self.config.max_concurrency,
             timeout_secs: self.config.timeout_secs,
         });
-        sbgh_proto::Validate::validate(&payload)
+        sbgh_fleet::Validate::validate(&payload)
             .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
         let TaskPayload::BlockValidation(payload) = payload else {
             unreachable!("constructed as block validation")

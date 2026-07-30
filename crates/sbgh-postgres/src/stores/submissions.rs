@@ -6,7 +6,7 @@ use sbgh_core::submission::{
     PreparedSubmission, SubmissionActor, SubmissionDisposition, SubmissionError, SubmissionReceipt,
     TaskPlan,
 };
-use sbgh_proto::TaskPayload;
+use sbgh_fleet::TaskPayload;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
@@ -243,9 +243,9 @@ impl SubmissionStore for PostgresJobStore {
         let (execution_version, execution_payload, execution_hash) = match &prepared.command.task {
             TaskPlan::BlockValidation(plan) => {
                 let payload = TaskPayload::BlockValidation(plan.payload.clone());
-                let hash = sbgh_proto::payload_digest(&payload).map_err(persistence)?;
+                let hash = sbgh_fleet::payload_digest(&payload).map_err(persistence)?;
                 (
-                    Some(i32::from(sbgh_proto::PROTOCOL_VERSION)),
+                    Some(i32::from(sbgh_fleet::PROTOCOL_VERSION)),
                     Some(serde_json::to_value(payload).map_err(persistence)?),
                     Some(hash),
                 )

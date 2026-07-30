@@ -1,4 +1,5 @@
-# Daemon-owned worker control plane. Set SBGH_FLEET_CONFIG to this file.
+# Daemon-owned protobuf/gRPC worker control plane over HTTP/2 mTLS.
+# Set SBGH_FLEET_CONFIG to this file.
 # Private keys and the lease key must be mode 0600 and owned by the daemon user.
 listen = "10.0.0.10:9443"
 server_certificate = "/etc/sbgh/fleet/pki/orchestrator.crt"

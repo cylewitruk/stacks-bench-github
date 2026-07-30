@@ -37,7 +37,7 @@ use futures::StreamExt;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 #[cfg(test)]
 use sbgh_driver::ArtifactSink;
-use sbgh_proto::{ArtifactDescriptor, ArtifactGrantResponse, HeaderValue};
+use sbgh_fleet::{ArtifactDescriptor, ArtifactGrantResponse, HeaderValue};
 use tokio::io::AsyncWriteExt;
 
 /// TTL for the short-lived presigned URLs the store mints for its **own**

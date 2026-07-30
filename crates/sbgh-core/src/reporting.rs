@@ -77,8 +77,8 @@ pub struct BlockValidationReportView {
 
 impl BlockValidationReportView {
     pub fn from_result(
-        request: Option<&sbgh_proto::BlockValidationPayload>,
-        result: &sbgh_proto::BlockValidationResult,
+        request: Option<&sbgh_fleet::BlockValidationPayload>,
+        result: &sbgh_fleet::BlockValidationResult,
     ) -> Self {
         Self {
             requested_range: request.map(|request| InclusiveReportRange {

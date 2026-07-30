@@ -15,10 +15,11 @@ ROOT = Path(__file__).resolve().parent.parent
 ALLOWED_INTERNAL = {
     "sbgh-api": set(),
     "sbgh-cli": {"sbgh-api"},
-    "sbgh-core": {"sbgh-proto"},
+    "sbgh-core": {"sbgh-fleet"},
     "sbgh-daemon": {
         "sbgh-api",
         "sbgh-core",
+        "sbgh-fleet",
         "sbgh-github",
         "sbgh-intent",
         "sbgh-postgres",
@@ -26,15 +27,16 @@ ALLOWED_INTERNAL = {
         "sbgh-proto",
     },
     "sbgh-driver": set(),
+    "sbgh-fleet": set(),
     "sbgh-github": {"sbgh-core"},
     "sbgh-handler": {"sbgh-api"},
     "sbgh-intent": {"sbgh-core"},
     "sbgh-libvirt": {"sbgh-driver"},
-    "sbgh-postgres": {"sbgh-core", "sbgh-proto"},
-    "sbgh-proto": set(),
+    "sbgh-postgres": {"sbgh-core", "sbgh-fleet"},
+    "sbgh-proto": {"sbgh-fleet"},
     "sbgh-slack": {"sbgh-core", "sbgh-intent"},
     "sbgh-smee": set(),
-    "sbgh-worker": {"sbgh-driver", "sbgh-libvirt", "sbgh-proto"},
+    "sbgh-worker": {"sbgh-driver", "sbgh-fleet", "sbgh-libvirt", "sbgh-proto"},
 }
 
 DRIVER_FORBIDDEN = {

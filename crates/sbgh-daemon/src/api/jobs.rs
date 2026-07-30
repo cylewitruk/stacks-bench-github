@@ -15,7 +15,7 @@ use sbgh_core::submission::{
     BlockValidationPlan, ProducerKey, ResolvedTaskSource, SchedulingConstraints, SubmissionActor,
     SubmissionCommand, SubmissionDisposition, SubmissionProvenance, TaskPlan,
 };
-use sbgh_proto::{BlockValidationPayload, InclusiveRange, TaskPayload, Validate, ValidationEpoch};
+use sbgh_fleet::{BlockValidationPayload, InclusiveRange, TaskPayload, Validate, ValidationEpoch};
 use serde::Deserialize;
 
 use crate::api::conv::enum_str;

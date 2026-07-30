@@ -20,6 +20,7 @@ operator sbgh-cli ─────────────────┤
                        v       v              v
                    PostgreSQL GitHub/Slack    S3
                        |
+                       | protobuf/gRPC over HTTP/2;
                        | TLS 1.3 mutual X.509;
                        | workers poll outbound
                ┌───────┴────────┐
@@ -45,13 +46,14 @@ leader election are not implemented.
 | --- | --- |
 | `sbgh-api` | Operator/ingest HTTP DTOs and typed client |
 | `sbgh-core` | Domain models, policy, configuration, and persistence ports |
+| `sbgh-fleet` | Transport-neutral fleet values, validation, and semantic digests |
 | `sbgh-driver` | Backend-neutral execution contracts |
 | `sbgh-github` | GitHub contracts, webhook DTOs, authentication, and API adapter |
 | `sbgh-handler` | Webhook HMAC verification and forwarding |
 | `sbgh-intent` | Validated request-intent contract and OpenAI adapter |
 | `sbgh-libvirt` | Libvirt VM and LVM snapshot adapter |
 | `sbgh-postgres` | SQLx persistence adapters and migrations |
-| `sbgh-proto` | Versioned worker-control-plane DTOs |
+| `sbgh-proto` | Generated `sbgh.fleet.v1` protobuf/gRPC boundary and conversions |
 | `sbgh-slack` | Slack intake, snapshot rendering, and transport |
 | `sbgh-smee` | smee.io forwarding for the deployed webhook edge |
 | `sbgh-worker` | Worker transport, recipes, execution, and cleanup |
@@ -109,6 +111,12 @@ their contiguous sequence prefix. Best-effort fine progress has a separate
 wire sequence. Durable leases and events let daemon restart/replay converge
 without rerunning accepted work or accepting a stale terminal.
 
+The worker control plane is the generated
+`sbgh.fleet.v1.WorkerFleetService` gRPC service. Polling remains a bounded
+unary long-poll, and automatic gRPC retries are disabled; the worker's explicit
+reconnect/resend loops and application idempotency own retry behavior. Artifact
+bytes remain outside gRPC.
+
 ### Task kinds
 
 - **Benchmark** submissions may contain variants, repetitions, calibration,
@@ -163,7 +171,8 @@ defined result code.
 ## Network and identity
 
 The worker listener is separate from the operator API and requires TLS 1.3
-mutual X.509 authentication. A client certificate must contain exactly one URI
+mutual X.509 authentication. It accepts protobuf/gRPC over HTTP/2 only; there
+is no JSON worker API. A client certificate must contain exactly one URI
 identity SAN:
 
 ```text

@@ -11,16 +11,16 @@ use sbgh_core::models::{
     BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobIntent, JobResult, JobSource, NewJob,
     QueuedEventDetail, TaskKind,
 };
-use sbgh_postgres::db::{
-    InstallationStore, NewInstallation, Pool, PostgresInstallationStore, setup_pg_db,
-};
-use sbgh_postgres::{PostgresFleetStore, PostgresJobStore, PreparedJobProvenance};
-use sbgh_proto::{
+use sbgh_fleet::{
     ArtifactDescriptor, AttemptIdentity, BlockValidationPayload, BlockValidationResult,
     InclusiveRange, PROTOCOL_VERSION, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
     ReliableEventEnvelope, ReliableEventPayload, ResourceFacts, TaskPayload, TerminalOutcome,
     ValidationEpoch, WorkerCapability,
 };
+use sbgh_postgres::db::{
+    InstallationStore, NewInstallation, Pool, PostgresInstallationStore, setup_pg_db,
+};
+use sbgh_postgres::{PostgresFleetStore, PostgresJobStore, PreparedJobProvenance};
 use uuid::Uuid;
 
 async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
@@ -81,7 +81,7 @@ fn session(worker_id: Uuid, worker_session_id: Uuid) -> RegisterSessionRequest {
 
 async fn enqueue_build(store: &PostgresFleetStore, job_id: Uuid) {
     let payload = TaskPayload::BuildOnly;
-    let payload_hash = sbgh_proto::payload_digest(&payload).unwrap();
+    let payload_hash = sbgh_fleet::payload_digest(&payload).unwrap();
     store
         .enqueue_prepared_job(
             job_id,
@@ -120,7 +120,7 @@ async fn enqueue_build(store: &PostgresFleetStore, job_id: Uuid) {
 }
 
 async fn enqueue_benchmark(store: &PostgresFleetStore, job_id: Uuid) {
-    let payload = TaskPayload::Benchmark(sbgh_proto::BenchmarkPayload {
+    let payload = TaskPayload::Benchmark(sbgh_fleet::BenchmarkPayload {
         effective_args: vec!["--mine-microblocks".into()],
         workload_key: Some("workload-v1".into()),
         sqlite_seed_key: None,
@@ -129,7 +129,7 @@ async fn enqueue_benchmark(store: &PostgresFleetStore, job_id: Uuid) {
         run_index: 0,
         requested_run_count: 1,
     });
-    let payload_hash = sbgh_proto::payload_digest(&payload).unwrap();
+    let payload_hash = sbgh_fleet::payload_digest(&payload).unwrap();
     store
         .enqueue_prepared_job(
             job_id,
@@ -196,11 +196,10 @@ fn event(
     payload: ReliableEventPayload,
 ) -> ReliableEventEnvelope {
     ReliableEventEnvelope {
-        protocol_version: PROTOCOL_VERSION,
         identity: identity.clone(),
         trace_id,
         reliable_seq,
-        payload_digest: sbgh_proto::payload_digest(&payload).unwrap(),
+        payload_digest: sbgh_fleet::payload_digest(&payload).unwrap(),
         payload,
         worker_timestamp_ms: Utc::now().timestamp_millis(),
     }
@@ -214,7 +213,7 @@ async fn prepared_execution_payload_is_immutable_after_enqueue() {
     let job_id = Uuid::new_v4();
     enqueue_benchmark(&store, job_id).await;
 
-    let changed = TaskPayload::Benchmark(sbgh_proto::BenchmarkPayload {
+    let changed = TaskPayload::Benchmark(sbgh_fleet::BenchmarkPayload {
         effective_args: vec!["--count".into(), "999".into()],
         workload_key: Some("drifted".into()),
         sqlite_seed_key: None,
@@ -228,7 +227,7 @@ async fn prepared_execution_payload_is_immutable_after_enqueue() {
             .prepare_execution(&PreparedExecution {
                 job_id,
                 commit: "2222222222222222222222222222222222222222".into(),
-                payload_hash: sbgh_proto::payload_digest(&changed).unwrap(),
+                payload_hash: sbgh_fleet::payload_digest(&changed).unwrap(),
                 payload: changed,
             })
             .await
@@ -244,7 +243,7 @@ async fn prepared_execution_payload_is_immutable_after_enqueue() {
     assert_eq!(stored.0, "1111111111111111111111111111111111111111");
     assert_eq!(
         serde_json::from_value::<TaskPayload>(stored.1).unwrap(),
-        TaskPayload::Benchmark(sbgh_proto::BenchmarkPayload {
+        TaskPayload::Benchmark(sbgh_fleet::BenchmarkPayload {
             effective_args: vec!["--mine-microblocks".into()],
             workload_key: Some("workload-v1".into()),
             sqlite_seed_key: None,
@@ -640,12 +639,12 @@ async fn reliable_prefix_and_terminal_submission_are_idempotent() {
             .unwrap()
             .unwrap()
             .desired_state,
-        sbgh_proto::DesiredState::Cancel
+        sbgh_fleet::DesiredState::Cancel
     );
 
     let terminal = TerminalOutcome::Cancelled { reason: "operator test".into() };
     let terminal_payload = ReliableEventPayload::Terminal {
-        outcome_digest: sbgh_proto::payload_digest(&terminal).unwrap(),
+        outcome_digest: sbgh_fleet::payload_digest(&terminal).unwrap(),
     };
     let second = event(&identity, trace_id, 2, terminal_payload.clone());
     assert_eq!(
@@ -744,7 +743,6 @@ async fn reliable_prefix_and_terminal_submission_are_idempotent() {
             if label == "build"
     ));
     let progress = ProgressRequest {
-        protocol_version: PROTOCOL_VERSION,
         identity: identity.clone(),
         trace_id,
         progress_seq: 1,
@@ -1027,7 +1025,7 @@ async fn terminal_after_orchestrator_lease_expiry_is_fenced() {
         trace_id,
         1,
         ReliableEventPayload::Terminal {
-            outcome_digest: sbgh_proto::payload_digest(&terminal).unwrap(),
+            outcome_digest: sbgh_fleet::payload_digest(&terminal).unwrap(),
         },
     );
     store
@@ -1172,7 +1170,7 @@ async fn capability_routes_only_to_a_compatible_worker() {
                 job_id,
                 commit: "1111111111111111111111111111111111111111".into(),
                 payload: payload.clone(),
-                payload_hash: sbgh_proto::payload_digest(&payload).unwrap(),
+                payload_hash: sbgh_fleet::payload_digest(&payload).unwrap(),
             },
             &PreparedJobProvenance::default(),
         )
@@ -1193,7 +1191,7 @@ async fn capability_routes_only_to_a_compatible_worker() {
         .unwrap();
     assert_eq!(offered.offer.job_id, job_id);
     assert_eq!(offered.offer.capability, WorkerCapability::BlockValidation);
-    assert_eq!(offered.offer.requirements, sbgh_proto::OfferRequirements::from(&payload));
+    assert_eq!(offered.offer.requirements, sbgh_fleet::OfferRequirements::from(&payload));
     assert!(
         store
             .accept_offer(block_worker, &offered.offer.identity, Duration::seconds(60))
@@ -1216,7 +1214,7 @@ async fn capability_routes_only_to_a_compatible_worker() {
         offered.offer.trace_id,
         1,
         ReliableEventPayload::Terminal {
-            outcome_digest: sbgh_proto::payload_digest(&terminal).unwrap(),
+            outcome_digest: sbgh_fleet::payload_digest(&terminal).unwrap(),
         },
     );
     store
@@ -1344,7 +1342,7 @@ async fn explicit_submission_recovery_can_target_a_compatible_worker() {
             .unwrap();
     assert_eq!(
         copied_hash,
-        sbgh_proto::payload_digest(&TaskPayload::Benchmark(sbgh_proto::BenchmarkPayload {
+        sbgh_fleet::payload_digest(&TaskPayload::Benchmark(sbgh_fleet::BenchmarkPayload {
             effective_args: vec!["--mine-microblocks".into()],
             workload_key: Some("workload-v1".into()),
             sqlite_seed_key: None,
@@ -1435,7 +1433,7 @@ async fn accepted_terminal_waits_for_durable_artifact_promotion() {
         trace_id,
         1,
         ReliableEventPayload::Terminal {
-            outcome_digest: sbgh_proto::payload_digest(&terminal).unwrap(),
+            outcome_digest: sbgh_fleet::payload_digest(&terminal).unwrap(),
         },
     );
     store

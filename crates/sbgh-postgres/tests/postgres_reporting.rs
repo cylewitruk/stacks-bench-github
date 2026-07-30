@@ -7,8 +7,8 @@ use sbgh_core::submission::{
     BlockValidationPlan, PreparedSubmission, ProducerKey, ResolvedTaskSource,
     SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionProvenance, TaskPlan,
 };
+use sbgh_fleet::{BlockValidationPayload, InclusiveRange, ValidationEpoch};
 use sbgh_postgres::db::{Pool, PostgresJobStore, setup_pg_db};
-use sbgh_proto::{BlockValidationPayload, InclusiveRange, ValidationEpoch};
 use uuid::Uuid;
 
 async fn seed_install_repo(pool: &Pool) {

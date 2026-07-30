@@ -40,11 +40,11 @@ use sbgh_core::submission::{
     SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionDisposition,
     SubmissionProvenance, TaskPlan,
 };
+use sbgh_fleet::{InclusiveRange, ValidationEpoch};
 use sbgh_github::{
     Command, CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent,
     IssueCommentEvent, PullRequestEvent, PushEvent, RepoRef, RepoSummary, parse_command,
 };
-use sbgh_proto::{InclusiveRange, ValidationEpoch};
 
 /// What a [`Classifier`] decides to do with a claimed webhook.
 #[derive(Debug, Clone)]

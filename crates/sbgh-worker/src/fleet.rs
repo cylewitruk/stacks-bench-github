@@ -10,20 +10,20 @@ use sbgh_driver::{
     ExecutionPlacement, ExecutionRequest, ExecutionTask, InclusiveRange, RepositoryCredential,
     Terminal, ValidationEpoch, WorkerEvent,
 };
-use sbgh_libvirt::SystemShell;
-use sbgh_proto::{
+use sbgh_fleet::{
     AcceptOfferRequest, CompleteAttemptRequest, DesiredState, HeartbeatRequest, PROTOCOL_VERSION,
     PollRequest, PollResponse, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
     ReliableEventEnvelope, ReliableEventPayload, RepositoryCredentialRequest, RepositoryToken,
     ResourceFacts, TaskPayload, TerminalOutcome, Validate,
 };
+use sbgh_libvirt::SystemShell;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::WorkerConfig;
 use crate::remote_artifacts::RemoteArtifactSink;
-use crate::transport::{FleetApiError, FleetClient};
+use crate::transport::{FleetClient, FleetClientError};
 use crate::{WorkerRuntime, build_binary_cache};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
@@ -34,7 +34,7 @@ pub async fn preflight_local_execution(config: &WorkerConfig) -> anyhow::Result<
     let driver = preflight_driver(config)?;
     if config
         .capabilities
-        .contains(&sbgh_proto::WorkerCapability::Benchmark)
+        .contains(&sbgh_fleet::WorkerCapability::Benchmark)
     {
         driver
             .preflight_benchmark()
@@ -42,7 +42,7 @@ pub async fn preflight_local_execution(config: &WorkerConfig) -> anyhow::Result<
             .context("validating benchmark sandbox and immutable origin")?;
     } else if config
         .capabilities
-        .contains(&sbgh_proto::WorkerCapability::BuildOnly)
+        .contains(&sbgh_fleet::WorkerCapability::BuildOnly)
     {
         driver
             .preflight_build()
@@ -51,7 +51,7 @@ pub async fn preflight_local_execution(config: &WorkerConfig) -> anyhow::Result<
     }
     if config
         .capabilities
-        .contains(&sbgh_proto::WorkerCapability::BlockValidation)
+        .contains(&sbgh_fleet::WorkerCapability::BlockValidation)
     {
         preflight_block_validation(&driver).await?;
     }
@@ -84,21 +84,21 @@ async fn preflight_block_validation(driver: &sbgh_libvirt::LibvirtDriver) -> any
 
 fn driver_block_result_to_wire(
     result: sbgh_driver::BlockValidationOutput,
-) -> sbgh_proto::BlockValidationResult {
-    sbgh_proto::BlockValidationResult {
+) -> sbgh_fleet::BlockValidationResult {
+    sbgh_fleet::BlockValidationResult {
         valid: result.valid,
         checked_blocks: result.checked_blocks,
         invalid_blocks: result
             .invalid_blocks
             .into_iter()
-            .map(|invalid| sbgh_proto::InvalidBlock {
+            .map(|invalid| sbgh_fleet::InvalidBlock {
                 shard: invalid.shard,
                 block: invalid.block,
                 reason: invalid.reason,
             })
             .collect(),
         chainstate_origin: result.chainstate_origin,
-        observed_range: sbgh_proto::InclusiveRange {
+        observed_range: sbgh_fleet::InclusiveRange {
             start: result.observed_range.start,
             end: result.observed_range.end,
         },
@@ -141,10 +141,7 @@ pub async fn run(
     let mut draining = false;
     while !shutdown.is_cancelled() && !draining {
         let poll = client
-            .poll(&PollRequest {
-                protocol_version: PROTOCOL_VERSION,
-                worker_session_id: session_id,
-            })
+            .poll(&PollRequest { worker_session_id: session_id })
             .await;
         let response = match poll {
             Ok(response) => {
@@ -178,13 +175,12 @@ pub async fn run(
                 admit_offer(&config, &offer).await?;
                 let accepted = match client
                     .accept(&AcceptOfferRequest {
-                        protocol_version: PROTOCOL_VERSION,
                         identity: offer.identity.clone(),
                     })
                     .await
                 {
                     Ok(accepted) => accepted,
-                    Err(error) if has_api_code(&error, "stale_attempt") => {
+                    Err(error) if has_fleet_code(&error, "stale_attempt") => {
                         tracing::info!(
                             attempt_id = %offer.identity.attempt_id,
                             "work offer became stale before acceptance; resuming polling"
@@ -202,7 +198,7 @@ pub async fn run(
                         .payload_hash
                         == offer.payload_hash
                         && accepted.assignment.trace_id == offer.trace_id
-                        && sbgh_proto::OfferRequirements::from(&accepted.assignment.payload)
+                        && sbgh_fleet::OfferRequirements::from(&accepted.assignment.payload)
                             == offer.requirements,
                     "accepted assignment does not match its offer"
                 );
@@ -227,7 +223,7 @@ pub async fn run(
     Ok(())
 }
 
-async fn admit_offer(config: &WorkerConfig, offer: &sbgh_proto::WorkOffer) -> anyhow::Result<()> {
+async fn admit_offer(config: &WorkerConfig, offer: &sbgh_fleet::WorkOffer) -> anyhow::Result<()> {
     anyhow::ensure!(
         config
             .capabilities
@@ -235,24 +231,24 @@ async fn admit_offer(config: &WorkerConfig, offer: &sbgh_proto::WorkOffer) -> an
         "orchestrator offered an unadvertised capability"
     );
     match &offer.requirements {
-        sbgh_proto::OfferRequirements::Benchmark => {
+        sbgh_fleet::OfferRequirements::Benchmark => {
             anyhow::ensure!(
-                offer.capability == sbgh_proto::WorkerCapability::Benchmark,
+                offer.capability == sbgh_fleet::WorkerCapability::Benchmark,
                 "offer capability/requirements mismatch"
             );
         }
-        sbgh_proto::OfferRequirements::BuildOnly => {
+        sbgh_fleet::OfferRequirements::BuildOnly => {
             anyhow::ensure!(
-                offer.capability == sbgh_proto::WorkerCapability::BuildOnly,
+                offer.capability == sbgh_fleet::WorkerCapability::BuildOnly,
                 "offer capability/requirements mismatch"
             );
         }
-        sbgh_proto::OfferRequirements::BlockValidation {
+        sbgh_fleet::OfferRequirements::BlockValidation {
             requested_shards,
             max_concurrency,
         } => {
             anyhow::ensure!(
-                offer.capability == sbgh_proto::WorkerCapability::BlockValidation,
+                offer.capability == sbgh_fleet::WorkerCapability::BlockValidation,
                 "offer capability/requirements mismatch"
             );
             let profile = config
@@ -285,7 +281,7 @@ async fn admit_offer(config: &WorkerConfig, offer: &sbgh_proto::WorkOffer) -> an
 async fn execute_assignment(
     config: &WorkerConfig,
     client: &FleetClient,
-    assignment: sbgh_proto::Assignment,
+    assignment: sbgh_fleet::Assignment,
     heartbeat_interval: Duration,
     lease_ttl: Duration,
     shutdown: &CancellationToken,
@@ -343,13 +339,12 @@ async fn execute_assignment(
             .await?
         }
     };
-    let outcome_digest = sbgh_proto::payload_digest(&terminal)?;
+    let outcome_digest = sbgh_fleet::payload_digest(&terminal)?;
     let terminal_event = reliable
         .send(ReliableEventPayload::Terminal { outcome_digest })
         .await?;
     let manifest = artifacts.manifest().await;
     let completion = CompleteAttemptRequest {
-        protocol_version: PROTOCOL_VERSION,
         identity: assignment.identity.clone(),
         trace_id: assignment.trace_id,
         terminal_reliable_seq: terminal_event.reliable_seq,
@@ -371,11 +366,10 @@ enum CredentialFetch {
 
 async fn fetch_repository_credential(
     client: &FleetClient,
-    assignment: &sbgh_proto::Assignment,
+    assignment: &sbgh_fleet::Assignment,
     cancel: &CancellationToken,
 ) -> anyhow::Result<CredentialFetch> {
     let request = RepositoryCredentialRequest {
-        protocol_version: PROTOCOL_VERSION,
         identity: assignment.identity.clone(),
     };
     let mut backoff = Duration::from_millis(250);
@@ -421,7 +415,7 @@ async fn fetch_repository_credential(
 }
 
 struct HeartbeatContext {
-    identity: sbgh_proto::AttemptIdentity,
+    identity: sbgh_fleet::AttemptIdentity,
     heartbeat_interval: Duration,
     lease_ttl: Duration,
     cancel: CancellationToken,
@@ -438,7 +432,6 @@ async fn heartbeat_loop(client: FleetClient, context: HeartbeatContext) {
             () = context.cancel.cancelled() => return,
             _ = interval.tick() => {
                 match client.heartbeat(&HeartbeatRequest {
-                    protocol_version: PROTOCOL_VERSION,
                     identity: context.identity.clone(),
                     reliable_buffer_len: context.reliable.unacknowledged_len(),
                 }).await {
@@ -508,7 +501,7 @@ impl Drop for HeartbeatSupervisor {
 
 async fn execute_driver(
     config: &WorkerConfig,
-    assignment: &sbgh_proto::Assignment,
+    assignment: &sbgh_fleet::Assignment,
     repository_token: &RepositoryToken,
     artifacts: Arc<RemoteArtifactSink>,
     client: &FleetClient,
@@ -553,7 +546,6 @@ async fn execute_driver(
                 Some(WorkerEvent::Progress(progress)) => {
                     progress_seq = progress_seq.saturating_add(1);
                     let _ = client.progress(&ProgressRequest {
-                        protocol_version: PROTOCOL_VERSION,
                         identity: assignment.identity.clone(),
                         trace_id: assignment.trace_id,
                         progress_seq,
@@ -610,7 +602,7 @@ async fn execute_driver(
 }
 
 fn execution_request(
-    assignment: &sbgh_proto::Assignment,
+    assignment: &sbgh_fleet::Assignment,
     repository_token: &RepositoryToken,
 ) -> anyhow::Result<ExecutionRequest> {
     let task = match &assignment.payload {
@@ -630,8 +622,8 @@ fn execution_request(
         TaskPayload::BlockValidation(payload) => {
             ExecutionTask::BlockValidation(BlockValidationTaskSpec {
                 epoch: match payload.epoch {
-                    sbgh_proto::ValidationEpoch::PreNakamoto => ValidationEpoch::PreNakamoto,
-                    sbgh_proto::ValidationEpoch::Nakamoto => ValidationEpoch::Nakamoto,
+                    sbgh_fleet::ValidationEpoch::PreNakamoto => ValidationEpoch::PreNakamoto,
+                    sbgh_fleet::ValidationEpoch::Nakamoto => ValidationEpoch::Nakamoto,
                 },
                 range: InclusiveRange {
                     start: payload.range.start,
@@ -669,7 +661,7 @@ fn execution_request(
 
 struct ReliableSender {
     client: FleetClient,
-    identity: sbgh_proto::AttemptIdentity,
+    identity: sbgh_fleet::AttemptIdentity,
     trace_id: Uuid,
     state: Mutex<ReliableState>,
     buffer_len: AtomicU32,
@@ -684,7 +676,7 @@ struct ReliableState {
 impl ReliableSender {
     fn new(
         client: FleetClient,
-        identity: sbgh_proto::AttemptIdentity,
+        identity: sbgh_fleet::AttemptIdentity,
         trace_id: Uuid,
         lease_lost: Arc<AtomicBool>,
     ) -> Self {
@@ -722,11 +714,10 @@ impl ReliableSender {
             "reliable event resend buffer is full"
         );
         let envelope = ReliableEventEnvelope {
-            protocol_version: PROTOCOL_VERSION,
             identity: self.identity.clone(),
             trace_id: self.trace_id,
             reliable_seq: state.next_seq,
-            payload_digest: sbgh_proto::payload_digest(&payload)?,
+            payload_digest: sbgh_fleet::payload_digest(&payload)?,
             payload,
             worker_timestamp_ms: now_millis(),
         };
@@ -785,7 +776,7 @@ async fn retry_terminal(
     client: &FleetClient,
     completion: &CompleteAttemptRequest,
     shutdown: &CancellationToken,
-) -> anyhow::Result<sbgh_proto::CompleteAttemptResponse> {
+) -> anyhow::Result<sbgh_fleet::CompleteAttemptResponse> {
     let mut backoff = Duration::from_millis(100);
     loop {
         match client
@@ -896,21 +887,21 @@ fn jitter(duration: Duration) -> Duration {
 fn is_non_retryable(error: &anyhow::Error) -> bool {
     error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<FleetApiError>())
+        .find_map(|cause| cause.downcast_ref::<FleetClientError>())
         .is_some_and(|error| !error.retryable)
 }
 
-fn has_api_code(error: &anyhow::Error, code: &str) -> bool {
+fn has_fleet_code(error: &anyhow::Error, code: &str) -> bool {
     error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<FleetApiError>())
+        .find_map(|cause| cause.downcast_ref::<FleetClientError>())
         .is_some_and(|error| error.code == code)
 }
 
 fn retry_delay(error: &anyhow::Error, fallback: Duration) -> Duration {
     error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<FleetApiError>())
+        .find_map(|cause| cause.downcast_ref::<FleetClientError>())
         .and_then(|error| error.retry_after)
         .unwrap_or_else(|| jitter(fallback))
         .min(Duration::from_secs(30))
@@ -918,17 +909,17 @@ fn retry_delay(error: &anyhow::Error, fallback: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{admit_offer, has_api_code, is_non_retryable, retry_delay};
+    use super::{admit_offer, has_fleet_code, is_non_retryable, retry_delay};
     use crate::WorkerConfig;
-    use crate::transport::FleetApiError;
-    use sbgh_proto::{AttemptIdentity, LeaseToken, OfferRequirements, WorkOffer, WorkerCapability};
+    use crate::transport::FleetClientError;
+    use sbgh_fleet::{AttemptIdentity, LeaseToken, OfferRequirements, WorkOffer, WorkerCapability};
     use std::path::Path;
     use std::time::Duration;
     use uuid::Uuid;
 
-    fn api_error(code: &str, retryable: bool, retry_after: Option<Duration>) -> anyhow::Error {
-        anyhow::Error::new(FleetApiError {
-            path: "/v1/event".into(),
+    fn client_error(code: &str, retryable: bool, retry_after: Option<Duration>) -> anyhow::Error {
+        anyhow::Error::new(FleetClientError {
+            path: "PublishReliableEvent".into(),
             code: code.into(),
             message: "test response".into(),
             retryable,
@@ -940,21 +931,21 @@ mod tests {
     #[test]
     fn typed_stale_and_sequence_conflict_errors_stop_reliable_retries() {
         for code in ["stale_attempt", "event_sequence_conflict"] {
-            let error = api_error(code, false, None);
+            let error = client_error(code, false, None);
             assert!(
                 is_non_retryable(&error),
                 "{code} must remain non-retryable through anyhow context"
             );
-            assert!(has_api_code(&error, code));
+            assert!(has_fleet_code(&error, code));
         }
-        assert!(!is_non_retryable(&api_error("temporary", true, None)));
+        assert!(!is_non_retryable(&client_error("temporary", true, None)));
     }
 
     #[test]
     fn server_retry_delay_is_bounded() {
         assert_eq!(
             retry_delay(
-                &api_error("busy", true, Some(Duration::from_secs(300))),
+                &client_error("busy", true, Some(Duration::from_secs(300))),
                 Duration::from_millis(10),
             ),
             Duration::from_secs(30)

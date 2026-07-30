@@ -8,7 +8,7 @@ use crate::ProtocolError;
 ///
 /// Protocol digests must not depend on map insertion order or serializer
 /// implementation details.
-pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
     let value = serde_json::to_value(value)
         .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
     let mut out = Vec::new();
@@ -59,11 +59,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::{BlockValidationPayload, InclusiveRange, TaskPayload, ValidationEpoch};
 
     #[test]
     fn digest_is_independent_of_object_insertion_order() {
         let left = json!({"b": 2, "a": {"d": 4, "c": 3}});
         let right = json!({"a": {"c": 3, "d": 4}, "b": 2});
         assert_eq!(payload_digest(&left).unwrap(), payload_digest(&right).unwrap());
+    }
+
+    #[test]
+    fn digest_changes_when_semantic_payload_changes() {
+        let original = TaskPayload::BlockValidation(BlockValidationPayload {
+            epoch: ValidationEpoch::Nakamoto,
+            range: InclusiveRange { start: 10, end: 20 },
+            requested_shards: 4,
+            max_concurrency: 2,
+            timeout_secs: 600,
+        });
+        let mut changed = original.clone();
+        let TaskPayload::BlockValidation(changed) = &mut changed else {
+            unreachable!();
+        };
+        changed.range.end += 1;
+
+        assert_ne!(payload_digest(&original).unwrap(), payload_digest(&changed).unwrap());
     }
 }

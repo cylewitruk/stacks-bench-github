@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 sbgh-core.workspace = true
 sbgh-api.workspace = true
+sbgh-fleet.workspace = true
 sbgh-proto.workspace = true
 sbgh-postgres.workspace = true
 sbgh-github.workspace = true
@@ -37,6 +38,9 @@ tokio = { workspace = true, features = [
 tokio-util.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+tokio-stream.workspace = true
+prost.workspace = true
+tonic.workspace = true
 
 # Daemon admin and webhook-ingest `/api` server.
 axum.workspace = true

@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
+use sbgh_fleet::{ResourceFacts, WorkerCapability};
 use sbgh_libvirt::LibvirtConfig;
-use sbgh_proto::{ResourceFacts, WorkerCapability};
 use serde::Deserialize;
 use uuid::Uuid;
 

@@ -91,7 +91,7 @@ need editing when an item's status or location changes.
 | `0071-github-job-lifecycle-controls` | GitHub job lifecycle controls | `candidate` | [backlog.md](backlog.md) |
 | `0072-pre-attempt-terminal-projection` | Pre-attempt terminal projection | `candidate` | [backlog.md](backlog.md) |
 | `0073-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
-| `0074-protobuf-fleet-protocol` | Protobuf worker protocol | `planned` | [iterations/v29-protobuf-fleet-protocol.md](iterations/v29-protobuf-fleet-protocol.md) |
+| `0074-protobuf-fleet-protocol` | Protobuf worker protocol | `shipped` | [archive/completed/0074-protobuf-fleet-protocol.md](archive/completed/0074-protobuf-fleet-protocol.md) |
 | `0075-rolling-worker-protocol-compatibility` | Rolling worker protocol compatibility | `candidate` | [backlog.md](backlog.md) |
 
 ## Iterations
@@ -127,7 +127,7 @@ need editing when an item's status or location changes.
 | `v27.1-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
 | `v27.2-task-submission-kernel` | Task-submission kernel | `shipped` | [archive/completed/0064-task-submission-kernel.md](archive/completed/0064-task-submission-kernel.md) |
 | `v28-task-aware-reporting` | Task-aware reporting and validation results | `shipped` | [archive/completed/0066-task-aware-reporting.md](archive/completed/0066-task-aware-reporting.md) |
-| `v29-protobuf-fleet-protocol` | Protobuf worker protocol | `planned` | [iterations/v29-protobuf-fleet-protocol.md](iterations/v29-protobuf-fleet-protocol.md) |
+| `v29-protobuf-fleet-protocol` | Protobuf worker protocol | `shipped` | [archive/completed/0074-protobuf-fleet-protocol.md](archive/completed/0074-protobuf-fleet-protocol.md) |
 
 ## Decisions
 

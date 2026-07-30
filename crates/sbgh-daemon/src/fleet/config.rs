@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
-use sbgh_proto::{
+use sbgh_fleet::{
     MAX_LONG_POLL_SECS, MAX_VALIDATION_CONCURRENCY, MAX_VALIDATION_SHARDS,
     MAX_VALIDATION_TIMEOUT_SECS, WorkerCapability,
 };

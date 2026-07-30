@@ -11,7 +11,7 @@ use sbgh_core::submission::{
     ResolvedTaskSource, SUBMISSION_CONTRACT_VERSION, SubmissionActor, SubmissionCommand,
     SubmissionError, SubmissionReceipt, TaskPlan,
 };
-use sbgh_proto::Validate;
+use sbgh_fleet::Validate;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -27,7 +27,7 @@ struct DigestMaterial<'a> {
 enum DigestTask<'a> {
     Benchmark { variants: Vec<DigestVariant<'a>>, effective_args: &'a [String] },
     BuildOnly { source: DigestSource<'a> },
-    BlockValidation { source: DigestSource<'a>, payload: &'a sbgh_proto::BlockValidationPayload },
+    BlockValidation { source: DigestSource<'a>, payload: &'a sbgh_fleet::BlockValidationPayload },
 }
 
 #[derive(Serialize)]
@@ -258,7 +258,7 @@ fn validate(command: &SubmissionCommand) -> Result<(), SubmissionError> {
                     "validation plan has an unsupported task/build target".into(),
                 ));
             }
-            sbgh_proto::TaskPayload::BlockValidation(plan.payload.clone())
+            sbgh_fleet::TaskPayload::BlockValidation(plan.payload.clone())
                 .validate()
                 .map_err(|error| SubmissionError::Invalid(error.to_string()))?;
         }

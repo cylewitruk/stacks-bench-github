@@ -4,39 +4,50 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration as StdDuration;
 
 use anyhow::Context;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use sbgh_core::db::fleet::{
     ArtifactGrantRecord, EventIngest, FleetCompletion, FleetFailure, FleetStore,
     FleetTerminalSubmission, FleetTerminalWrite, TerminalAcceptance, WorkerRegistration,
 };
 use sbgh_core::models::JobResult;
-use sbgh_github::InstallationTokenCache;
-use sbgh_proto::{
-    AcceptOfferRequest, AcceptOfferResponse, ApiError, ArtifactGrantRequest, ArtifactGrantResponse,
+use sbgh_fleet::{
+    AcceptOfferRequest, AcceptOfferResponse, ArtifactGrantRequest, ArtifactGrantResponse,
     ArtifactOperation, Assignment, AssignmentContext, CleanupCompleteRequest, CleanupItem,
     CleanupListRequest, CompleteAttemptRequest, CompleteAttemptResponse, DeregisterSessionRequest,
-    HeartbeatRequest, HeartbeatResponse, MAX_REQUEST_BYTES, PROTOCOL_VERSION, PollRequest,
-    PollResponse, ProgressRequest, RegisterSessionRequest, RegisterSessionResponse,
-    ReliableEventAck, ReliableEventEnvelope, RepositoryCredentialRequest,
-    RepositoryCredentialResponse, RepositoryToken, Validate,
+    HeartbeatRequest, HeartbeatResponse, PROTOCOL_VERSION, PollRequest, PollResponse,
+    ProgressRequest, RegisterSessionRequest, RegisterSessionResponse, ReliableEventAck,
+    ReliableEventEnvelope, RepositoryCredentialRequest, RepositoryCredentialResponse,
+    RepositoryToken, Validate,
 };
+use sbgh_github::InstallationTokenCache;
 use tokio_util::sync::CancellationToken;
-use tower::limit::GlobalConcurrencyLimitLayer;
-use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
 use super::config::FleetConfig;
 use super::lease::LeaseSigner;
-use super::tls::{AuthenticatedPeer, MtlsListener};
+use super::tls::AuthenticatedPeer;
 use crate::artifact_store::ArtifactStore;
 
-type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
-const MIN_CONCURRENT_REQUESTS: usize = 64;
-const MAX_CONCURRENT_REQUESTS: usize = 1_024;
+pub(super) type ServiceResult<T> = Result<T, ServiceError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ServiceCode {
+    InvalidArgument,
+    PermissionDenied,
+    FailedPrecondition,
+    ResourceExhausted,
+    Unavailable,
+    Internal,
+}
+
+#[derive(Debug)]
+pub(super) struct ServiceError {
+    pub code: ServiceCode,
+    pub stable_code: &'static str,
+    pub message: String,
+    pub retryable: bool,
+    pub retry_after_ms: Option<u64>,
+}
 
 #[derive(Default)]
 struct ActivePolls {
@@ -70,7 +81,7 @@ impl Drop for ActivePollGuard {
 }
 
 #[derive(Clone)]
-struct ApiState {
+pub(super) struct FleetService {
     store: Arc<dyn FleetStore>,
     artifacts: Arc<dyn ArtifactStore>,
     github_tokens: InstallationTokenCache,
@@ -80,7 +91,7 @@ struct ApiState {
 }
 
 pub struct FleetRuntime {
-    state: ApiState,
+    pub(super) service: FleetService,
 }
 
 impl FleetRuntime {
@@ -119,7 +130,7 @@ impl FleetRuntime {
             )
             .await?;
         Ok(Self {
-            state: ApiState {
+            service: FleetService {
                 store,
                 artifacts,
                 github_tokens,
@@ -131,75 +142,33 @@ impl FleetRuntime {
     }
 }
 
-pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::Result<()> {
-    let config = runtime.state.config.clone();
-    let request_limit = config
-        .workers
-        .len()
-        .saturating_mul(2)
-        .clamp(MIN_CONCURRENT_REQUESTS, MAX_CONCURRENT_REQUESTS);
-    let listener = MtlsListener::bind(
-        config.listen,
-        &config.server_certificate,
-        &config.server_private_key,
-        &config.client_ca_certificate,
-    )
-    .await?;
-    let router = Router::new()
-        .route("/v1/register", post(register))
-        .route("/v1/poll", post(poll))
-        .route("/v1/accept", post(accept))
-        .route("/v1/repository-credential", post(repository_credential))
-        .route("/v1/heartbeat", post(heartbeat))
-        .route("/v1/events", post(event))
-        .route("/v1/progress", post(progress))
-        .route("/v1/artifacts/grant", post(artifact_grant))
-        .route("/v1/complete", post(complete))
-        .route("/v1/cleanup", get(cleanup).post(cleanup_complete))
-        .route("/v1/deregister", post(deregister))
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .layer(GlobalConcurrencyLimitLayer::new(request_limit))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            config.request_timeout(),
-        ))
-        .with_state(runtime.state.clone());
-
-    let maintenance_state = runtime.state.clone();
-    let maintenance_shutdown = shutdown.clone();
-    let maintenance = tokio::spawn(async move {
-        maintenance_loop(maintenance_state, maintenance_shutdown).await;
-    });
-    tracing::info!(listen = %config.listen, "worker fleet mTLS listener started");
-    let serving =
-        axum::serve(listener, router.into_make_service_with_connect_info::<AuthenticatedPeer>())
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await;
-    maintenance.abort();
-    serving.map_err(anyhow::Error::from)
+impl FleetService {
+    pub(super) fn config(&self) -> &Arc<FleetConfig> {
+        &self.config
+    }
 }
 
-async fn register(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<RegisterSessionRequest>,
-) -> ApiResult<RegisterSessionResponse> {
+pub(super) async fn register(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: RegisterSessionRequest,
+) -> ServiceResult<RegisterSessionResponse> {
     if request.worker_id != peer.worker_id {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
+        return Err(service_error(
+            ServiceCode::PermissionDenied,
             "worker_identity_mismatch",
             "certificate identity does not match the requested worker",
             false,
         ));
     }
-    let configured = authorized_worker(&state, &peer)?;
+    let configured = authorized_worker(state, peer)?;
     validate(&request)?;
     if request
         .advertised_capabilities
         .is_disjoint(&configured.capabilities)
     {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
+        return Err(service_error(
+            ServiceCode::PermissionDenied,
             "capability_not_authorized",
             "worker advertises no server-authorized capability",
             false,
@@ -217,7 +186,7 @@ async fn register(
         capabilities = ?session.effective_capabilities,
         "worker session registered"
     );
-    Ok(Json(RegisterSessionResponse {
+    Ok(RegisterSessionResponse {
         protocol_version: PROTOCOL_VERSION,
         heartbeat_interval_ms: state
             .config
@@ -228,15 +197,15 @@ async fn register(
             .lease_ttl()
             .as_millis() as u64,
         server_time_ms: Utc::now().timestamp_millis(),
-    }))
+    })
 }
 
-async fn poll(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<PollRequest>,
-) -> ApiResult<PollResponse> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn poll(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: PollRequest,
+) -> ServiceResult<PollResponse> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
     if !state
         .store
@@ -244,8 +213,8 @@ async fn poll(
         .await
         .map_err(internal)?
     {
-        return Err(api_error(
-            StatusCode::CONFLICT,
+        return Err(service_error(
+            ServiceCode::FailedPrecondition,
             "stale_session",
             "worker session is not active",
             false,
@@ -255,8 +224,8 @@ async fn poll(
         .active_polls
         .enter(peer.worker_id, request.worker_session_id)
         .ok_or_else(|| {
-            api_error(
-                StatusCode::CONFLICT,
+            service_error(
+                ServiceCode::FailedPrecondition,
                 "poll_already_active",
                 "this worker session already has an active long poll",
                 true,
@@ -303,7 +272,7 @@ async fn poll(
                 trace_id = %offered.offer.trace_id,
                 "work offered"
             );
-            return Ok(Json(PollResponse::Offer { offer: Box::new(offered.offer) }));
+            return Ok(PollResponse::Offer { offer: Box::new(offered.offer) });
         }
         if state
             .store
@@ -311,7 +280,7 @@ async fn poll(
             .await
             .map_err(internal)?
         {
-            return Ok(Json(PollResponse::Drain));
+            return Ok(PollResponse::Drain);
         }
         if !state
             .store
@@ -319,28 +288,28 @@ async fn poll(
             .await
             .map_err(internal)?
         {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
+            return Err(service_error(
+                ServiceCode::PermissionDenied,
                 "worker_session_inactive",
                 "worker session is expired, disabled, or superseded",
                 false,
             ));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(Json(PollResponse::NoWork { retry_after_ms: 1_000 }));
+            return Ok(PollResponse::NoWork { retry_after_ms: 1_000 });
         }
         tokio::time::sleep(StdDuration::from_millis(250)).await;
     }
 }
 
-async fn accept(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<AcceptOfferRequest>,
-) -> ApiResult<AcceptOfferResponse> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn accept(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: AcceptOfferRequest,
+) -> ServiceResult<AcceptOfferResponse> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
-    authorize_attempt(&state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, peer.worker_id, &request.identity)?;
     let offered = state
         .store
         .offered_assignment(peer.worker_id, &request.identity)
@@ -370,17 +339,17 @@ async fn accept(
     assignment
         .validate()
         .map_err(protocol_error)?;
-    Ok(Json(AcceptOfferResponse { assignment }))
+    Ok(AcceptOfferResponse { assignment })
 }
 
-async fn repository_credential(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<RepositoryCredentialRequest>,
-) -> ApiResult<RepositoryCredentialResponse> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn repository_credential(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: RepositoryCredentialRequest,
+) -> ServiceResult<RepositoryCredentialResponse> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
-    authorize_attempt(&state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, peer.worker_id, &request.identity)?;
     let heartbeat = state
         .store
         .heartbeat_attempt(
@@ -392,9 +361,9 @@ async fn repository_credential(
         .await
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
-    if heartbeat.desired_state == sbgh_proto::DesiredState::Cancel {
-        return Err(api_error(
-            StatusCode::CONFLICT,
+    if heartbeat.desired_state == sbgh_fleet::DesiredState::Cancel {
+        return Err(service_error(
+            ServiceCode::FailedPrecondition,
             "attempt_cancelled",
             "repository credentials are unavailable after cancellation is committed",
             false,
@@ -416,29 +385,29 @@ async fn repository_credential(
                 %error,
                 "repository token mint failed"
             );
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
+            service_error(
+                ServiceCode::Unavailable,
                 "repository_token_unavailable",
                 "repository credential is temporarily unavailable",
                 true,
             )
         })?;
-    Ok(Json(RepositoryCredentialResponse {
+    Ok(RepositoryCredentialResponse {
         token: RepositoryToken(token.token),
         expires_at_ms: token
             .expires_at
             .timestamp_millis(),
-    }))
+    })
 }
 
-async fn heartbeat(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<HeartbeatRequest>,
-) -> ApiResult<HeartbeatResponse> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn heartbeat(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: HeartbeatRequest,
+) -> ServiceResult<HeartbeatResponse> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
-    authorize_attempt(&state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, peer.worker_id, &request.identity)?;
     let heartbeat = state
         .store
         .heartbeat_attempt(
@@ -450,23 +419,23 @@ async fn heartbeat(
         .await
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
-    Ok(Json(HeartbeatResponse {
+    Ok(HeartbeatResponse {
         desired_state: heartbeat.desired_state,
         lease_expires_at_ms: heartbeat
             .lease_expires_at
             .timestamp_millis(),
         highest_contiguous_reliable_seq: heartbeat.highest_contiguous_reliable_seq,
-    }))
+    })
 }
 
-async fn event(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<ReliableEventEnvelope>,
-) -> ApiResult<ReliableEventAck> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn event(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: ReliableEventEnvelope,
+) -> ServiceResult<ReliableEventAck> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
-    authorize_attempt(&state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, peer.worker_id, &request.identity)?;
     let ingest = state
         .store
         .ingest_reliable_event(peer.worker_id, &request)
@@ -484,18 +453,18 @@ async fn event(
         .await
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
-    Ok(Json(ReliableEventAck {
+    Ok(ReliableEventAck {
         highest_contiguous_reliable_seq: heartbeat.highest_contiguous_reliable_seq,
-    }))
+    })
 }
 
-fn accept_event_ingest(ingest: EventIngest) -> Result<(), (StatusCode, Json<ApiError>)> {
+fn accept_event_ingest(ingest: EventIngest) -> ServiceResult<()> {
     match ingest {
         EventIngest::Inserted | EventIngest::Duplicate => {}
         EventIngest::Stale => return Err(stale_attempt()),
         EventIngest::Conflict => {
-            return Err(api_error(
-                StatusCode::CONFLICT,
+            return Err(service_error(
+                ServiceCode::FailedPrecondition,
                 "event_sequence_conflict",
                 "reliable event sequence was reused with different content",
                 false,
@@ -505,14 +474,14 @@ fn accept_event_ingest(ingest: EventIngest) -> Result<(), (StatusCode, Json<ApiE
     Ok(())
 }
 
-async fn progress(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<ProgressRequest>,
-) -> ApiResult<serde_json::Value> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn progress(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: ProgressRequest,
+) -> ServiceResult<bool> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
-    authorize_attempt(&state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, peer.worker_id, &request.identity)?;
     let offered = state
         .store
         .offered_assignment(peer.worker_id, &request.identity)
@@ -520,8 +489,8 @@ async fn progress(
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
     if offered.offer.trace_id != request.trace_id {
-        return Err(api_error(
-            StatusCode::CONFLICT,
+        return Err(service_error(
+            ServiceCode::FailedPrecondition,
             "trace_mismatch",
             "progress trace does not match the active attempt",
             false,
@@ -547,18 +516,18 @@ async fn progress(
         message = ?request.update.message,
         "worker progress"
     );
-    Ok(Json(serde_json::json!({ "accepted": true })))
+    Ok(true)
 }
 
 fn validate_terminal_for_assignment(
-    payload: &sbgh_proto::TaskPayload,
-    outcome: &sbgh_proto::TerminalOutcome,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let sbgh_proto::TerminalOutcome::Completed { block_validation, .. } = outcome else {
+    payload: &sbgh_fleet::TaskPayload,
+    outcome: &sbgh_fleet::TerminalOutcome,
+) -> ServiceResult<()> {
+    let sbgh_fleet::TerminalOutcome::Completed { block_validation, .. } = outcome else {
         return Ok(());
     };
     match (payload, block_validation) {
-        (sbgh_proto::TaskPayload::BlockValidation(payload), Some(result))
+        (sbgh_fleet::TaskPayload::BlockValidation(payload), Some(result))
             if result
                 .invalid_blocks
                 .iter()
@@ -574,15 +543,15 @@ fn validate_terminal_for_assignment(
         {
             Ok(())
         }
-        (sbgh_proto::TaskPayload::BlockValidation(_), _) => Err(api_error(
-            StatusCode::CONFLICT,
+        (sbgh_fleet::TaskPayload::BlockValidation(_), _) => Err(service_error(
+            ServiceCode::FailedPrecondition,
             "block_validation_result_mismatch",
             "completed block-validation result does not match its pinned assignment",
             false,
         )),
         (_, None) => Ok(()),
-        (_, Some(_)) => Err(api_error(
-            StatusCode::CONFLICT,
+        (_, Some(_)) => Err(service_error(
+            ServiceCode::FailedPrecondition,
             "unexpected_block_validation_result",
             "a non-block-validation assignment cannot submit a block-validation result",
             false,
@@ -590,14 +559,14 @@ fn validate_terminal_for_assignment(
     }
 }
 
-async fn artifact_grant(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<ArtifactGrantRequest>,
-) -> ApiResult<ArtifactGrantResponse> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn artifact_grant(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: ArtifactGrantRequest,
+) -> ServiceResult<ArtifactGrantResponse> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
-    authorize_attempt(&state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, peer.worker_id, &request.identity)?;
     if request.operation == ArtifactOperation::Get {
         let offered = state
             .store
@@ -606,7 +575,7 @@ async fn artifact_grant(
             .map_err(internal)?
             .ok_or_else(stale_attempt)?;
         let allowed = match offered.payload {
-            sbgh_proto::TaskPayload::Benchmark(payload) => {
+            sbgh_fleet::TaskPayload::Benchmark(payload) => {
                 payload
                     .sqlite_seed_key
                     .as_deref()
@@ -615,8 +584,8 @@ async fn artifact_grant(
             _ => false,
         };
         if !allowed {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
+            return Err(service_error(
+                ServiceCode::PermissionDenied,
                 "artifact_read_forbidden",
                 "artifact is not an input of this assignment",
                 false,
@@ -632,14 +601,14 @@ async fn artifact_grant(
             )
             .map_err(|error| {
                 tracing::warn!(%error, "fleet artifact read grant unavailable");
-                api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                service_error(
+                    ServiceCode::Unavailable,
                     "artifact_store_unavailable",
                     "fleet mode requires a reachable S3-compatible artifact store",
                     true,
                 )
             })?;
-        return Ok(Json(grant));
+        return Ok(grant);
     }
     let offered = state
         .store
@@ -651,8 +620,8 @@ async fn artifact_grant(
         .key
         .starts_with(&format!("{}/", offered.offer.job_id))
     {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
+        return Err(service_error(
+            ServiceCode::PermissionDenied,
             "artifact_key_forbidden",
             "output artifacts must stay inside the assigned job namespace",
             false,
@@ -672,8 +641,8 @@ async fn artifact_grant(
             .config
             .max_artifact_bytes
     {
-        return Err(api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
+        return Err(service_error(
+            ServiceCode::ResourceExhausted,
             "artifact_too_large",
             "artifact exceeds the configured object limit",
             false,
@@ -693,8 +662,8 @@ async fn artifact_grant(
         )
         .map_err(|error| {
             tracing::warn!(%error, "fleet artifact grant unavailable");
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
+            service_error(
+                ServiceCode::Unavailable,
                 "artifact_store_unavailable",
                 "fleet mode requires a reachable S3-compatible artifact store",
                 true,
@@ -720,17 +689,17 @@ async fn artifact_grant(
     if !recorded {
         return Err(stale_attempt());
     }
-    Ok(Json(grant))
+    Ok(grant)
 }
 
-async fn complete(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<CompleteAttemptRequest>,
-) -> ApiResult<CompleteAttemptResponse> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn complete(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: CompleteAttemptRequest,
+) -> ServiceResult<CompleteAttemptResponse> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
-    authorize_attempt(&state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, peer.worker_id, &request.identity)?;
     let offered = state
         .store
         .completion_assignment(peer.worker_id, &request.identity)
@@ -738,8 +707,8 @@ async fn complete(
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
     if offered.offer.trace_id != request.trace_id {
-        return Err(api_error(
-            StatusCode::CONFLICT,
+        return Err(service_error(
+            ServiceCode::FailedPrecondition,
             "trace_mismatch",
             "terminal trace does not match the active attempt",
             false,
@@ -757,8 +726,8 @@ async fn complete(
             .config
             .max_attempt_artifact_bytes
     {
-        return Err(api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
+        return Err(service_error(
+            ServiceCode::ResourceExhausted,
             "attempt_artifacts_too_large",
             "attempt artifacts exceed the configured aggregate limit",
             false,
@@ -789,8 +758,8 @@ async fn complete(
                     .await
                     .map_err(internal)?
             {
-                return Err(api_error(
-                    StatusCode::CONFLICT,
+                return Err(service_error(
+                    ServiceCode::FailedPrecondition,
                     "artifact_verification_failed",
                     "an artifact is absent or does not match its signed upload metadata",
                     true,
@@ -831,50 +800,48 @@ async fn complete(
             )
             .await
             {
-                return Err(api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                return Err(service_error(
+                    ServiceCode::Unavailable,
                     "artifact_promotion_failed",
                     "terminal is accepted but artifact promotion is incomplete; retry",
                     true,
                 ));
             }
-            Ok(Json(CompleteAttemptResponse { accepted: true }))
+            Ok(CompleteAttemptResponse { accepted: true })
         }
         TerminalAcceptance::Stale => Err(stale_attempt()),
     }
 }
 
-async fn cleanup(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    axum::extract::Query(request): axum::extract::Query<CleanupListRequest>,
-) -> ApiResult<Vec<CleanupItem>> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn cleanup(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: CleanupListRequest,
+) -> ServiceResult<Vec<CleanupItem>> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
     let obligations = state
         .store
         .cleanup_obligations(peer.worker_id, request.worker_session_id)
         .await
         .map_err(internal)?;
-    Ok(Json(
-        obligations
-            .into_iter()
-            .map(|item| CleanupItem {
-                id: item.id,
-                attempt_id: item.attempt_id,
-                job_id: item.job_id,
-                reason: item.reason,
-            })
-            .collect(),
-    ))
+    Ok(obligations
+        .into_iter()
+        .map(|item| CleanupItem {
+            id: item.id,
+            attempt_id: item.attempt_id,
+            job_id: item.job_id,
+            reason: item.reason,
+        })
+        .collect())
 }
 
-async fn cleanup_complete(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<CleanupCompleteRequest>,
-) -> ApiResult<serde_json::Value> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn cleanup_complete(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: CleanupCompleteRequest,
+) -> ServiceResult<bool> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
     let completed = state
         .store
@@ -890,25 +857,25 @@ async fn cleanup_complete(
         obligation_id = request.obligation_id,
         "worker cleanup obligation completed"
     );
-    Ok(Json(serde_json::json!({ "completed": true })))
+    Ok(true)
 }
 
-async fn deregister(
-    State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<AuthenticatedPeer>,
-    Json(request): Json<DeregisterSessionRequest>,
-) -> ApiResult<serde_json::Value> {
-    authorized_worker(&state, &peer)?;
+pub(super) async fn deregister(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: DeregisterSessionRequest,
+) -> ServiceResult<bool> {
+    authorized_worker(state, peer)?;
     validate(&request)?;
     let deregistered = state
         .store
         .deregister_session(peer.worker_id, request.worker_session_id)
         .await
         .map_err(internal)?;
-    Ok(Json(serde_json::json!({ "deregistered": deregistered })))
+    Ok(deregistered)
 }
 
-async fn maintenance_loop(state: ApiState, shutdown: CancellationToken) {
+pub(super) async fn maintenance_loop(state: FleetService, shutdown: CancellationToken) {
     let mut interval = tokio::time::interval(StdDuration::from_secs(2));
     loop {
         tokio::select! {
@@ -922,7 +889,7 @@ async fn maintenance_loop(state: ApiState, shutdown: CancellationToken) {
     }
 }
 
-async fn maintenance_tick(state: &ApiState) -> sbgh_core::Result<()> {
+async fn maintenance_tick(state: &FleetService) -> sbgh_core::Result<()> {
     for pending in state
         .store
         .pending_artifact_promotions(32)
@@ -978,7 +945,7 @@ async fn promote_artifacts(
     artifacts: &dyn ArtifactStore,
     store: &dyn FleetStore,
     attempt_id: Uuid,
-    manifest: &[sbgh_proto::ArtifactDescriptor],
+    manifest: &[sbgh_fleet::ArtifactDescriptor],
 ) -> bool {
     for artifact in manifest {
         if !artifacts
@@ -1003,13 +970,13 @@ async fn promote_artifacts(
 async fn terminal_write(
     job_id: Uuid,
     attempt_id: Uuid,
-    outcome: &sbgh_proto::TerminalOutcome,
-    artifacts: &[sbgh_proto::ArtifactDescriptor],
+    outcome: &sbgh_fleet::TerminalOutcome,
+    artifacts: &[sbgh_fleet::ArtifactDescriptor],
     store: &dyn ArtifactStore,
 ) -> FleetTerminalWrite {
     let logical_artifacts = logical_artifacts(artifacts);
     match outcome {
-        sbgh_proto::TerminalOutcome::Completed { summary, block_validation } => {
+        sbgh_fleet::TerminalOutcome::Completed { summary, block_validation } => {
             let (result, metric) = if block_validation.is_some() {
                 (
                     JobResult {
@@ -1038,7 +1005,7 @@ async fn terminal_write(
                 artifact_manifest: logical_artifacts,
             }))
         }
-        sbgh_proto::TerminalOutcome::Failed { error, summary, .. } => {
+        sbgh_fleet::TerminalOutcome::Failed { error, summary, .. } => {
             let result = match summary {
                 Some(summary) => {
                     let staging_summary = staging_summary(summary, artifacts);
@@ -1059,18 +1026,18 @@ async fn terminal_write(
                 })),
             })
         }
-        sbgh_proto::TerminalOutcome::Cancelled { reason } => {
+        sbgh_fleet::TerminalOutcome::Cancelled { reason } => {
             FleetTerminalWrite::Cancelled { remark: reason.clone() }
         }
     }
 }
 
 fn logical_artifacts(
-    artifacts: &[sbgh_proto::ArtifactDescriptor],
-) -> Vec<sbgh_proto::ArtifactDescriptor> {
+    artifacts: &[sbgh_fleet::ArtifactDescriptor],
+) -> Vec<sbgh_fleet::ArtifactDescriptor> {
     artifacts
         .iter()
-        .map(|artifact| sbgh_proto::ArtifactDescriptor {
+        .map(|artifact| sbgh_fleet::ArtifactDescriptor {
             key: artifact.logical_key.clone(),
             logical_key: artifact.logical_key.clone(),
             size: artifact.size,
@@ -1084,8 +1051,8 @@ fn artifact_staging_key(
     logical_key: &str,
     size: u64,
     sha256: &str,
-) -> Result<String, sbgh_proto::ProtocolError> {
-    let identity = sbgh_proto::payload_digest(&serde_json::json!({
+) -> Result<String, sbgh_fleet::ProtocolError> {
+    let identity = sbgh_fleet::payload_digest(&serde_json::json!({
         "attempt_id": attempt_id,
         "logical_key": logical_key,
         "size": size,
@@ -1096,7 +1063,7 @@ fn artifact_staging_key(
 
 fn staging_summary(
     summary: &serde_json::Value,
-    artifacts: &[sbgh_proto::ArtifactDescriptor],
+    artifacts: &[sbgh_fleet::ArtifactDescriptor],
 ) -> serde_json::Value {
     let mut summary = summary.clone();
     let Some(logical_key) = summary
@@ -1119,18 +1086,18 @@ fn staging_summary(
 }
 
 fn authorize_attempt(
-    state: &ApiState,
+    state: &FleetService,
     worker_id: Uuid,
-    identity: &sbgh_proto::AttemptIdentity,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
+    identity: &sbgh_fleet::AttemptIdentity,
+) -> ServiceResult<()> {
     if state
         .signer
         .verify(worker_id, identity)
     {
         Ok(())
     } else {
-        Err(api_error(
-            StatusCode::FORBIDDEN,
+        Err(service_error(
+            ServiceCode::PermissionDenied,
             "invalid_lease_token",
             "attempt authorization is invalid",
             false,
@@ -1139,25 +1106,25 @@ fn authorize_attempt(
 }
 
 fn authorized_worker<'a>(
-    state: &'a ApiState,
+    state: &'a FleetService,
     peer: &AuthenticatedPeer,
-) -> Result<&'a super::config::ConfiguredWorker, (StatusCode, Json<ApiError>)> {
+) -> ServiceResult<&'a super::config::ConfiguredWorker> {
     let worker = state
         .config
         .workers
         .iter()
         .find(|worker| worker.id == peer.worker_id)
         .ok_or_else(|| {
-            api_error(
-                StatusCode::FORBIDDEN,
+            service_error(
+                ServiceCode::PermissionDenied,
                 "worker_not_registered",
                 "certificate identity is not present in the worker registry policy",
                 false,
             )
         })?;
     if !worker.enabled {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
+        return Err(service_error(
+            ServiceCode::PermissionDenied,
             "worker_disabled",
             "worker identity is disabled",
             false,
@@ -1167,8 +1134,8 @@ fn authorized_worker<'a>(
         .certificate_sha256
         .contains(&peer.certificate_sha256)
     {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
+        return Err(service_error(
+            ServiceCode::PermissionDenied,
             "worker_certificate_revoked",
             "worker certificate is not authorized for this identity",
             false,
@@ -1177,70 +1144,69 @@ fn authorized_worker<'a>(
     Ok(worker)
 }
 
-fn validate<T: Validate>(value: &T) -> Result<(), (StatusCode, Json<ApiError>)> {
+fn validate<T: Validate>(value: &T) -> ServiceResult<()> {
     value
         .validate()
         .map_err(protocol_error)
 }
 
-fn chrono_duration(value: StdDuration) -> Result<Duration, (StatusCode, Json<ApiError>)> {
+fn chrono_duration(value: StdDuration) -> ServiceResult<Duration> {
     Duration::from_std(value).map_err(|error| internal(anyhow::Error::new(error)))
 }
 
-fn protocol_error(error: sbgh_proto::ProtocolError) -> (StatusCode, Json<ApiError>) {
-    api_error(StatusCode::BAD_REQUEST, "invalid_protocol_message", &error.to_string(), false)
+fn protocol_error(error: sbgh_fleet::ProtocolError) -> ServiceError {
+    service_error(
+        ServiceCode::InvalidArgument,
+        "invalid_protocol_message",
+        &error.to_string(),
+        false,
+    )
 }
 
-fn bad_request(error: anyhow::Error) -> (StatusCode, Json<ApiError>) {
-    api_error(StatusCode::BAD_REQUEST, "invalid_request", &error.to_string(), false)
+fn bad_request(error: anyhow::Error) -> ServiceError {
+    service_error(ServiceCode::InvalidArgument, "invalid_request", &error.to_string(), false)
 }
 
-fn stale_attempt() -> (StatusCode, Json<ApiError>) {
-    api_error(
-        StatusCode::CONFLICT,
+fn stale_attempt() -> ServiceError {
+    service_error(
+        ServiceCode::FailedPrecondition,
         "stale_attempt",
         "attempt is expired, fenced, or no longer current",
         false,
     )
 }
 
-fn internal(error: impl std::fmt::Display) -> (StatusCode, Json<ApiError>) {
-    tracing::error!(%error, "worker API operation failed");
-    api_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
-        "worker API operation failed",
-        true,
-    )
+fn internal(error: impl std::fmt::Display) -> ServiceError {
+    tracing::error!(%error, "worker fleet operation failed");
+    service_error(ServiceCode::Internal, "internal_error", "worker fleet operation failed", true)
 }
 
-fn api_error(
-    status: StatusCode,
-    code: &str,
+fn service_error(
+    status: ServiceCode,
+    code: &'static str,
     message: &str,
     retryable: bool,
-) -> (StatusCode, Json<ApiError>) {
-    (
-        status,
-        Json(ApiError {
-            code: code.into(),
-            message: message.into(),
-            retryable,
-        }),
-    )
+) -> ServiceError {
+    ServiceError {
+        code: status,
+        stable_code: code,
+        message: message.into(),
+        retryable,
+        retry_after_ms: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use sbgh_proto::{
+    use sbgh_fleet::{
         ArtifactDescriptor, BlockValidationPayload, BlockValidationResult, InclusiveRange,
         TaskPayload, TerminalOutcome, ValidationEpoch,
     };
 
     use super::{
-        ActivePolls, accept_event_ingest, artifact_staging_key, logical_artifacts,
+        ActivePolls, ServiceCode, accept_event_ingest, artifact_staging_key, logical_artifacts,
         validate_terminal_for_assignment,
     };
     use sbgh_core::db::fleet::EventIngest;
@@ -1288,9 +1254,9 @@ mod tests {
             (EventIngest::Stale, "stale_attempt"),
             (EventIngest::Conflict, "event_sequence_conflict"),
         ] {
-            let (status, axum::Json(error)) = accept_event_ingest(ingest).unwrap_err();
-            assert_eq!(status, axum::http::StatusCode::CONFLICT);
-            assert_eq!(error.code, expected_code);
+            let error = accept_event_ingest(ingest).unwrap_err();
+            assert_eq!(error.code, ServiceCode::FailedPrecondition);
+            assert_eq!(error.stable_code, expected_code);
             assert!(!error.retryable);
         }
         assert!(accept_event_ingest(EventIngest::Inserted).is_ok());

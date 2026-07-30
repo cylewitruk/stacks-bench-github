@@ -4,23 +4,35 @@ use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, SanType,
 };
-use rustls::RootCertStore;
-use rustls::pki_types::PrivatePkcs8KeyDer;
-use rustls::server::WebPkiClientVerifier;
-use sbgh_proto::{
-    AcceptOfferRequest, ApiError, AttemptIdentity, DeregisterSessionRequest, LeaseToken,
-    PROTOCOL_VERSION, PollRequest, PollResponse, RegisterSessionRequest, ResourceFacts, WorkOffer,
+use sbgh_fleet::{
+    AttemptIdentity, LeaseToken, PollResponse, RegisterSessionResponse, ResourceFacts, WorkOffer,
     WorkerCapability,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use sbgh_proto::FleetRpcError;
+use sbgh_proto::Wire;
+use sbgh_proto::fleet::v1::worker_fleet_service_server::{
+    WorkerFleetService, WorkerFleetServiceServer,
+};
+use sbgh_proto::fleet::v1::{
+    AcceptRequest, AcceptResponse, CompleteAttemptRequest, CompleteAttemptResponse,
+    CompleteCleanupRequest, CompleteCleanupResponse, DeregisterRequest, DeregisterResponse,
+    FetchRepositoryCredentialRequest, FetchRepositoryCredentialResponse, GrantArtifactRequest,
+    GrantArtifactResponse, HeartbeatRequest, HeartbeatResponse, ListCleanupRequest,
+    ListCleanupResponse, PollRequest, PollResponse as WirePollResponse, PublishProgressRequest,
+    PublishProgressResponse, PublishReliableEventRequest, PublishReliableEventResponse,
+    RegisterRequest, RegisterResponse as WireRegisterResponse,
+};
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
+use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::{Code, Request, Response, Status};
 use uuid::Uuid;
 
 struct PkiFixture {
@@ -28,7 +40,8 @@ struct PkiFixture {
     client_certificate: PathBuf,
     client_key: PathBuf,
     ca_certificate: PathBuf,
-    server: rustls::ServerConfig,
+    server_certificate: PathBuf,
+    server_key: PathBuf,
 }
 
 fn pki_fixture(worker_id: Uuid) -> PkiFixture {
@@ -75,143 +88,243 @@ fn pki_fixture(worker_id: Uuid) -> PkiFixture {
     let ca_certificate_path = directory
         .path()
         .join("ca.crt");
+    let server_certificate_path = directory
+        .path()
+        .join("server.crt");
+    let server_key_path = directory
+        .path()
+        .join("server.key");
     std::fs::write(&client_certificate_path, client_certificate.pem()).unwrap();
     std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
     std::fs::write(&ca_certificate_path, ca.pem()).unwrap();
-    std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-    let mut roots = RootCertStore::empty();
-    roots
-        .add(ca.der().clone())
-        .unwrap();
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .unwrap();
-    let mut server =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(
-                vec![
-                    server_certificate
-                        .der()
-                        .clone(),
-                ],
-                PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
-            )
-            .unwrap();
-    server.alpn_protocols = vec![b"http/1.1".to_vec()];
+    std::fs::write(&server_certificate_path, server_certificate.pem()).unwrap();
+    std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
+    for key in [&client_key_path, &server_key_path] {
+        std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     PkiFixture {
         _directory: directory,
         client_certificate: client_certificate_path,
         client_key: client_key_path,
         ca_certificate: ca_certificate_path,
-        server,
+        server_certificate: server_certificate_path,
+        server_key: server_key_path,
     }
 }
 
-struct Request {
-    path: String,
-    body: Vec<u8>,
+#[derive(Clone, Copy)]
+enum Mode {
+    Drain,
+    RejectFirstOffer,
 }
 
-async fn read_request(
-    stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-) -> Request {
-    const HEADER_LIMIT: usize = 32 * 1024;
-    let mut bytes = Vec::new();
-    let header_end = loop {
-        assert!(bytes.len() < HEADER_LIMIT, "request headers exceeded test limit");
-        let mut buffer = [0_u8; 4096];
-        let read = stream
-            .read(&mut buffer)
-            .await
-            .unwrap();
-        assert!(read > 0, "connection closed before request headers");
-        bytes.extend_from_slice(&buffer[..read]);
-        if let Some(offset) = bytes
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-        {
-            break offset + 4;
+#[derive(Clone)]
+struct MockFleet {
+    worker_id: Uuid,
+    mode: Mode,
+    session_id: Arc<std::sync::Mutex<Option<Uuid>>>,
+    polls: Arc<AtomicUsize>,
+}
+
+impl MockFleet {
+    fn unimplemented<T>() -> Result<Response<T>, Status> {
+        Err(Status::unimplemented("not used by this test"))
+    }
+}
+
+#[tonic::async_trait]
+impl WorkerFleetService for MockFleet {
+    async fn register(
+        &self,
+        request: Request<RegisterRequest>,
+    ) -> Result<Response<WireRegisterResponse>, Status> {
+        let registration = request
+            .into_inner()
+            .into_domain()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        assert_eq!(registration.worker_id, self.worker_id);
+        assert_eq!(
+            registration.advertised_capabilities,
+            BTreeSet::from([WorkerCapability::BuildOnly])
+        );
+        assert_eq!(registration.resources, worker_resources());
+        *self
+            .session_id
+            .lock()
+            .unwrap() = Some(registration.worker_session_id);
+        Ok(Response::new(WireRegisterResponse::from_domain(RegisterSessionResponse {
+            protocol_version: sbgh_fleet::PROTOCOL_VERSION,
+            heartbeat_interval_ms: 1_000,
+            lease_ttl_ms: 5_000,
+            server_time_ms: 0,
+        })))
+    }
+
+    async fn poll(
+        &self,
+        request: Request<PollRequest>,
+    ) -> Result<Response<WirePollResponse>, Status> {
+        let poll = request
+            .into_inner()
+            .into_domain()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        assert_eq!(
+            Some(poll.worker_session_id),
+            *self
+                .session_id
+                .lock()
+                .unwrap()
+        );
+        let index = self
+            .polls
+            .fetch_add(1, Ordering::SeqCst);
+        let response = match (self.mode, index) {
+            (Mode::RejectFirstOffer, 0) => PollResponse::Offer {
+                offer: Box::new(WorkOffer {
+                    identity: AttemptIdentity {
+                        worker_session_id: poll.worker_session_id,
+                        attempt_id: Uuid::new_v4(),
+                        fencing_generation: 1,
+                        lease_token: LeaseToken("a".repeat(64)),
+                    },
+                    job_id: Uuid::new_v4(),
+                    trace_id: Uuid::new_v4(),
+                    capability: WorkerCapability::BuildOnly,
+                    requirements: sbgh_fleet::OfferRequirements::BuildOnly,
+                    payload_hash: "ab".repeat(32),
+                    offer_expires_at_ms: i64::MAX,
+                }),
+            },
+            _ => PollResponse::Drain,
+        };
+        Ok(Response::new(WirePollResponse::from_domain(response)))
+    }
+
+    async fn accept(
+        &self,
+        _request: Request<AcceptRequest>,
+    ) -> Result<Response<AcceptResponse>, Status> {
+        Err(FleetRpcError {
+            status: Code::FailedPrecondition,
+            code: "stale_attempt".into(),
+            message: "attempt is stale, expired, fenced, or unauthorized".into(),
+            retryable: false,
+            retry_after_ms: None,
         }
-    };
-    let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
-    let request_line = headers
-        .lines()
-        .next()
-        .unwrap();
-    let mut request_parts = request_line.split_whitespace();
-    let _method = request_parts.next().unwrap();
-    let path = request_parts
-        .next()
-        .unwrap()
-        .to_owned();
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| {
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .unwrap()
-                })
-        })
-        .unwrap_or(0);
-    while bytes.len() < header_end + content_length {
-        let mut buffer = [0_u8; 4096];
-        let read = stream
-            .read(&mut buffer)
-            .await
-            .unwrap();
-        assert!(read > 0, "connection closed before request body");
-        bytes.extend_from_slice(&buffer[..read]);
+        .into_status())
     }
-    Request {
-        path,
-        body: bytes[header_end..header_end + content_length].to_vec(),
+
+    async fn list_cleanup(
+        &self,
+        request: Request<ListCleanupRequest>,
+    ) -> Result<Response<ListCleanupResponse>, Status> {
+        let cleanup = request
+            .into_inner()
+            .into_domain()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        assert_eq!(
+            Some(cleanup.worker_session_id),
+            *self
+                .session_id
+                .lock()
+                .unwrap()
+        );
+        Ok(Response::new(ListCleanupResponse::from_domain(Vec::new())))
+    }
+
+    async fn deregister(
+        &self,
+        request: Request<DeregisterRequest>,
+    ) -> Result<Response<DeregisterResponse>, Status> {
+        let request = request
+            .into_inner()
+            .into_domain()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        assert_eq!(
+            Some(request.worker_session_id),
+            *self
+                .session_id
+                .lock()
+                .unwrap()
+        );
+        Ok(Response::new(DeregisterResponse::from_domain(true)))
+    }
+
+    async fn fetch_repository_credential(
+        &self,
+        _request: Request<FetchRepositoryCredentialRequest>,
+    ) -> Result<Response<FetchRepositoryCredentialResponse>, Status> {
+        Self::unimplemented()
+    }
+
+    async fn heartbeat(
+        &self,
+        _request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        Self::unimplemented()
+    }
+
+    async fn publish_reliable_event(
+        &self,
+        _request: Request<PublishReliableEventRequest>,
+    ) -> Result<Response<PublishReliableEventResponse>, Status> {
+        Self::unimplemented()
+    }
+
+    async fn publish_progress(
+        &self,
+        _request: Request<PublishProgressRequest>,
+    ) -> Result<Response<PublishProgressResponse>, Status> {
+        Self::unimplemented()
+    }
+
+    async fn grant_artifact(
+        &self,
+        _request: Request<GrantArtifactRequest>,
+    ) -> Result<Response<GrantArtifactResponse>, Status> {
+        Self::unimplemented()
+    }
+
+    async fn complete_attempt(
+        &self,
+        _request: Request<CompleteAttemptRequest>,
+    ) -> Result<Response<CompleteAttemptResponse>, Status> {
+        Self::unimplemented()
+    }
+
+    async fn complete_cleanup(
+        &self,
+        _request: Request<CompleteCleanupRequest>,
+    ) -> Result<Response<CompleteCleanupResponse>, Status> {
+        Self::unimplemented()
     }
 }
 
-async fn respond(stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>, body: &str) {
-    respond_with_status(stream, "200 OK", body).await;
-}
-
-async fn respond_with_status(
-    stream: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-    status: &str,
-    body: &str,
+async fn serve_mock(
+    listener: TcpListener,
+    server_certificate: Vec<u8>,
+    server_key: Vec<u8>,
+    client_ca: Vec<u8>,
+    fleet: MockFleet,
+    shutdown: CancellationToken,
 ) {
-    let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream
-        .write_all(response.as_bytes())
+    let identity = Identity::from_pem(server_certificate, server_key);
+    let client_ca = Certificate::from_pem(client_ca);
+    Server::builder()
+        .tls_config(
+            ServerTlsConfig::new()
+                .identity(identity)
+                .client_ca_root(client_ca),
+        )
+        .unwrap()
+        .serve_with_incoming_shutdown(
+            WorkerFleetServiceServer::new(fleet),
+            TcpListenerStream::new(listener),
+            shutdown.cancelled_owned(),
+        )
         .await
         .unwrap();
-    stream
-        .shutdown()
-        .await
-        .unwrap();
-}
-
-async fn accept_request(
-    listener: &TcpListener,
-    acceptor: &TlsAcceptor,
-) -> (tokio_rustls::server::TlsStream<tokio::net::TcpStream>, Request) {
-    let (tcp, _) = listener
-        .accept()
-        .await
-        .unwrap();
-    let mut stream = acceptor
-        .accept(tcp)
-        .await
-        .unwrap();
-    let request = read_request(&mut stream).await;
-    (stream, request)
 }
 
 fn worker_config(
@@ -284,8 +397,7 @@ fn configure_sandbox_preflight_fixture(config: &mut sbgh_worker::WorkerConfig, d
     libvirt.paths.git_binary = host_tool;
 }
 
-#[tokio::test]
-async fn real_worker_registers_polls_drain_and_deregisters_over_mtls_loopback() {
+async fn run_case(mode: Mode) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let worker_id = Uuid::new_v4();
     let pki = pki_fixture(worker_id);
@@ -293,80 +405,21 @@ async fn real_worker_registers_polls_drain_and_deregisters_over_mtls_loopback() 
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
-    let acceptor = TlsAcceptor::from(Arc::new(pki.server.clone()));
-    let server = tokio::spawn(async move {
-        let mut session_id = None;
-        for response in [
-            format!(
-                r#"{{"protocol_version":{PROTOCOL_VERSION},"heartbeat_interval_ms":1000,"lease_ttl_ms":5000,"server_time_ms":0}}"#
-            ),
-            "[]".into(),
-            r#"{"kind":"drain"}"#.into(),
-            "{}".into(),
-        ] {
-            let (tcp, _) = listener
-                .accept()
-                .await
-                .unwrap();
-            let mut stream = acceptor
-                .accept(tcp)
-                .await
-                .unwrap();
-            let request = read_request(&mut stream).await;
-            if request.path == "/v1/register" {
-                let registration: RegisterSessionRequest =
-                    serde_json::from_slice(&request.body).unwrap();
-                assert_eq!(registration.protocol_version, PROTOCOL_VERSION);
-                assert_eq!(registration.worker_id, worker_id);
-                assert_eq!(
-                    registration.advertised_capabilities,
-                    BTreeSet::from([WorkerCapability::BuildOnly])
-                );
-                assert_eq!(registration.resources, worker_resources());
-                session_id = Some(registration.worker_session_id);
-            } else if request
-                .path
-                .starts_with("/v1/cleanup?")
-            {
-                let query = request
-                    .path
-                    .split_once('?')
-                    .unwrap()
-                    .1;
-                let parameters = query
-                    .split('&')
-                    .filter_map(|pair| pair.split_once('='))
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                assert_eq!(
-                    *parameters
-                        .get("protocol_version")
-                        .unwrap(),
-                    PROTOCOL_VERSION.to_string()
-                );
-                assert_eq!(
-                    *parameters
-                        .get("worker_session_id")
-                        .unwrap(),
-                    session_id
-                        .unwrap()
-                        .to_string()
-                );
-            } else if request.path == "/v1/poll" {
-                let poll: PollRequest = serde_json::from_slice(&request.body).unwrap();
-                assert_eq!(poll.protocol_version, PROTOCOL_VERSION);
-                assert_eq!(Some(poll.worker_session_id), session_id);
-            } else if request.path == "/v1/deregister" {
-                let deregister: DeregisterSessionRequest =
-                    serde_json::from_slice(&request.body).unwrap();
-                assert_eq!(deregister.protocol_version, PROTOCOL_VERSION);
-                assert_eq!(Some(deregister.worker_session_id), session_id);
-            } else {
-                panic!("unexpected worker request {}", request.path);
-            }
-            respond(&mut stream, &response).await;
-        }
-        assert!(session_id.is_some());
-    });
+    let fleet = MockFleet {
+        worker_id,
+        mode,
+        session_id: Arc::new(std::sync::Mutex::new(None)),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let server_shutdown = CancellationToken::new();
+    let server = tokio::spawn(serve_mock(
+        listener,
+        std::fs::read(&pki.server_certificate).unwrap(),
+        std::fs::read(&pki.server_key).unwrap(),
+        std::fs::read(&pki.ca_certificate).unwrap(),
+        fleet.clone(),
+        server_shutdown.clone(),
+    ));
 
     sbgh_worker::run_fleet(
         worker_config(worker_id, address, &pki),
@@ -375,94 +428,30 @@ async fn real_worker_registers_polls_drain_and_deregisters_over_mtls_loopback() 
     )
     .await
     .unwrap();
+    server_shutdown.cancel();
     server.await.unwrap();
+
+    assert!(
+        fleet
+            .session_id
+            .lock()
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fleet
+            .polls
+            .load(Ordering::SeqCst)
+            >= 1
+    );
+}
+
+#[tokio::test]
+async fn real_worker_registers_polls_drain_and_deregisters_over_mtls_grpc() {
+    run_case(Mode::Drain).await;
 }
 
 #[tokio::test]
 async fn cancellation_winning_before_accept_never_starts_execution() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let worker_id = Uuid::new_v4();
-    let pki = pki_fixture(worker_id);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let address = listener.local_addr().unwrap();
-    let acceptor = TlsAcceptor::from(Arc::new(pki.server.clone()));
-    let server = tokio::spawn(async move {
-        let (mut stream, request) = accept_request(&listener, &acceptor).await;
-        assert_eq!(request.path, "/v1/register");
-        let registration: RegisterSessionRequest = serde_json::from_slice(&request.body).unwrap();
-        let session_id = registration.worker_session_id;
-        respond(
-            &mut stream,
-            &format!(
-                r#"{{"protocol_version":{PROTOCOL_VERSION},"heartbeat_interval_ms":1000,"lease_ttl_ms":5000,"server_time_ms":0}}"#
-            ),
-        )
-        .await;
-
-        let (mut stream, request) = accept_request(&listener, &acceptor).await;
-        assert!(
-            request
-                .path
-                .starts_with("/v1/cleanup?")
-        );
-        respond(&mut stream, "[]").await;
-
-        let identity = AttemptIdentity {
-            worker_session_id: session_id,
-            attempt_id: Uuid::new_v4(),
-            fencing_generation: 1,
-            lease_token: LeaseToken("a".repeat(64)),
-        };
-        let offer = PollResponse::Offer {
-            offer: Box::new(WorkOffer {
-                identity: identity.clone(),
-                job_id: Uuid::new_v4(),
-                trace_id: Uuid::new_v4(),
-                capability: WorkerCapability::BuildOnly,
-                requirements: sbgh_proto::OfferRequirements::BuildOnly,
-                payload_hash: "ab".repeat(32),
-                offer_expires_at_ms: i64::MAX,
-            }),
-        };
-        let (mut stream, request) = accept_request(&listener, &acceptor).await;
-        assert_eq!(request.path, "/v1/poll");
-        respond(&mut stream, &serde_json::to_string(&offer).unwrap()).await;
-
-        let (mut stream, request) = accept_request(&listener, &acceptor).await;
-        assert_eq!(request.path, "/v1/accept");
-        let accepted: AcceptOfferRequest = serde_json::from_slice(&request.body).unwrap();
-        assert_eq!(accepted.identity, identity);
-        respond_with_status(
-            &mut stream,
-            "409 Conflict",
-            &serde_json::to_string(&ApiError {
-                code: "stale_attempt".into(),
-                message: "attempt is stale, expired, fenced, or unauthorized".into(),
-                retryable: false,
-            })
-            .unwrap(),
-        )
-        .await;
-
-        let (mut stream, request) = accept_request(&listener, &acceptor).await;
-        assert_eq!(request.path, "/v1/poll");
-        respond(&mut stream, &serde_json::to_string(&PollResponse::Drain).unwrap()).await;
-
-        let (mut stream, request) = accept_request(&listener, &acceptor).await;
-        assert_eq!(request.path, "/v1/deregister");
-        let deregister: DeregisterSessionRequest = serde_json::from_slice(&request.body).unwrap();
-        assert_eq!(deregister.worker_session_id, session_id);
-        respond(&mut stream, "{}").await;
-    });
-
-    sbgh_worker::run_fleet(
-        worker_config(worker_id, address, &pki),
-        worker_resources(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    server.await.unwrap();
+    run_case(Mode::RejectFirstOffer).await;
 }

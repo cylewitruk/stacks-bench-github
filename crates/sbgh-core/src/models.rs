@@ -660,11 +660,11 @@ pub enum TaskKind {
 
 impl TaskKind {
     /// Fleet capability required to execute this task kind.
-    pub fn required_capability(self) -> sbgh_proto::WorkerCapability {
+    pub fn required_capability(self) -> sbgh_fleet::WorkerCapability {
         match self {
-            Self::Benchmark => sbgh_proto::WorkerCapability::Benchmark,
-            Self::BlockValidation => sbgh_proto::WorkerCapability::BlockValidation,
-            Self::BuildOnly => sbgh_proto::WorkerCapability::BuildOnly,
+            Self::Benchmark => sbgh_fleet::WorkerCapability::Benchmark,
+            Self::BlockValidation => sbgh_fleet::WorkerCapability::BlockValidation,
+            Self::BuildOnly => sbgh_fleet::WorkerCapability::BuildOnly,
         }
     }
 }

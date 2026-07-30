@@ -272,9 +272,11 @@ sudo chown sbgh:sbgh /etc/sbgh/fleet/lease-hmac.key
 
 The server certificate DNS SAN must match every worker's
 `orchestrator_url`. Expose the fleet listener only on the private worker
-network. TLS 1.3 mutual authentication is mandatory even for a worker on the
-daemon host. Securely transfer each worker's leaf certificate/key and the CA
-certificate to that worker; never transfer the CA private key.
+network. It serves protobuf/gRPC over HTTP/2; do not place an HTTP/1-only
+reverse proxy in front of it. TLS 1.3 mutual authentication is mandatory even
+for a worker on the daemon host. Securely transfer each worker's leaf
+certificate/key and the CA certificate to that worker; never transfer the CA
+private key.
 
 ## 7. Configure the daemon secrets and install binaries
 

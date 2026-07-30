@@ -19,7 +19,7 @@ pub struct ResourceFacts {
     pub memory_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterSessionRequest {
     pub protocol_version: u16,
     pub worker_id: Uuid,
@@ -29,7 +29,7 @@ pub struct RegisterSessionRequest {
     pub resources: ResourceFacts,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterSessionResponse {
     pub protocol_version: u16,
     pub heartbeat_interval_ms: u64,
@@ -37,13 +37,12 @@ pub struct RegisterSessionResponse {
     pub server_time_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupListRequest {
-    pub protocol_version: u16,
     pub worker_session_id: Uuid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupItem {
     pub id: i64,
     pub attempt_id: Uuid,
@@ -51,27 +50,23 @@ pub struct CleanupItem {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupCompleteRequest {
-    pub protocol_version: u16,
     pub worker_session_id: Uuid,
     pub obligation_id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeregisterSessionRequest {
-    pub protocol_version: u16,
     pub worker_session_id: Uuid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PollRequest {
-    pub protocol_version: u16,
     pub worker_session_id: Uuid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollResponse {
     NoWork {
         retry_after_ms: u64,
@@ -84,8 +79,7 @@ pub enum PollResponse {
     },
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LeaseToken(pub String);
 
 impl fmt::Debug for LeaseToken {
@@ -94,7 +88,7 @@ impl fmt::Debug for LeaseToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptIdentity {
     pub worker_session_id: Uuid,
     pub attempt_id: Uuid,
@@ -102,7 +96,7 @@ pub struct AttemptIdentity {
     pub lease_token: LeaseToken,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkOffer {
     pub identity: AttemptIdentity,
     pub job_id: Uuid,
@@ -115,8 +109,7 @@ pub struct WorkOffer {
     pub offer_expires_at_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfferRequirements {
     Benchmark,
     BuildOnly,
@@ -136,14 +129,12 @@ impl From<&TaskPayload> for OfferRequirements {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptOfferRequest {
-    pub protocol_version: u16,
     pub identity: AttemptIdentity,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RepositoryToken(pub String);
 
 impl fmt::Debug for RepositoryToken {
@@ -152,7 +143,7 @@ impl fmt::Debug for RepositoryToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentContext {
     pub job_id: Uuid,
     pub repository: String,
@@ -210,7 +201,7 @@ impl TaskPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     pub identity: AttemptIdentity,
     pub trace_id: Uuid,
@@ -220,40 +211,37 @@ pub struct Assignment {
     pub vcpu_cpuset: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptOfferResponse {
     pub assignment: Assignment,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryCredentialRequest {
-    pub protocol_version: u16,
     pub identity: AttemptIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryCredentialResponse {
     pub token: RepositoryToken,
     pub expires_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesiredState {
     Continue,
     Cancel,
     Drain,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartbeatRequest {
-    pub protocol_version: u16,
     pub identity: AttemptIdentity,
     /// Current same-session reliable resend pressure. Telemetry only.
     pub reliable_buffer_len: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartbeatResponse {
     pub desired_state: DesiredState,
     pub lease_expires_at_ms: i64,
@@ -267,9 +255,8 @@ pub enum ReliableEventPayload {
     Terminal { outcome_digest: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReliableEventEnvelope {
-    pub protocol_version: u16,
     pub identity: AttemptIdentity,
     pub trace_id: Uuid,
     pub reliable_seq: u64,
@@ -278,7 +265,7 @@ pub struct ReliableEventEnvelope {
     pub worker_timestamp_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReliableEventAck {
     pub highest_contiguous_reliable_seq: u64,
 }
@@ -294,25 +281,22 @@ pub struct ProgressUpdate {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressRequest {
-    pub protocol_version: u16,
     pub identity: AttemptIdentity,
     pub trace_id: Uuid,
     pub progress_seq: u64,
     pub update: ProgressUpdate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactOperation {
     Put,
     Get,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactGrantRequest {
-    pub protocol_version: u16,
     pub identity: AttemptIdentity,
     pub operation: ArtifactOperation,
     pub key: String,
@@ -320,13 +304,13 @@ pub struct ArtifactGrantRequest {
     pub sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderValue {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactGrantResponse {
     pub method: String,
     /// Orchestrator-derived attempt staging key. The worker must use this key
@@ -371,9 +355,8 @@ pub enum TerminalOutcome {
     Cancelled { reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompleteAttemptRequest {
-    pub protocol_version: u16,
     pub identity: AttemptIdentity,
     pub trace_id: Uuid,
     pub terminal_reliable_seq: u64,
@@ -382,16 +365,9 @@ pub struct CompleteAttemptRequest {
     pub artifacts: Vec<ArtifactDescriptor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteAttemptResponse {
     pub accepted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiError {
-    pub code: String,
-    pub message: String,
-    pub retryable: bool,
 }
 
 #[cfg(test)]
@@ -414,14 +390,6 @@ mod tests {
                 requested_shards: 8,
                 max_concurrency: 4,
             }
-        );
-        let encoded = serde_json::to_value(OfferRequirements::from(&payload)).unwrap();
-        assert_eq!(encoded["kind"], "block_validation");
-        assert!(encoded.get("range").is_none());
-        assert!(
-            encoded
-                .get("timeout_secs")
-                .is_none()
         );
     }
 }

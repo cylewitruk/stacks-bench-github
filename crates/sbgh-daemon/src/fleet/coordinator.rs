@@ -8,8 +8,8 @@ use sbgh_core::config::DaemonConfig;
 use sbgh_core::db::fleet::{FleetStore, PreparedExecution, ResolvedSpecSource};
 use sbgh_core::db::{JobStore, RepoStore};
 use sbgh_core::models::{BuildTarget, GitRefKind, TaskKind, uses_shared_calibration};
+use sbgh_fleet::{BenchmarkPayload, ReliableEventPayload, TaskPayload};
 use sbgh_github::GitHubApi;
-use sbgh_proto::{BenchmarkPayload, ReliableEventPayload, TaskPayload};
 use sbgh_slack::SlackClient;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
@@ -162,7 +162,7 @@ impl FleetCoordinator {
                 .stacks_bench
                 .default_args,
         )?;
-        let payload_hash = sbgh_proto::payload_digest(&payload)?;
+        let payload_hash = sbgh_fleet::payload_digest(&payload)?;
         self.fleet
             .prepare_execution(&PreparedExecution {
                 job_id: job.id,
@@ -488,7 +488,7 @@ impl FleetCoordinator {
     async fn plan_next_repeat(
         &self,
         job: &RunnableJob,
-        outcome: &sbgh_proto::TerminalOutcome,
+        outcome: &sbgh_fleet::TerminalOutcome,
     ) -> anyhow::Result<()> {
         if !uses_shared_calibration(
             job.task_kind,
@@ -497,7 +497,7 @@ impl FleetCoordinator {
         ) {
             return Ok(());
         }
-        let sbgh_proto::TerminalOutcome::Completed { summary, .. } = outcome else {
+        let sbgh_fleet::TerminalOutcome::Completed { summary, .. } = outcome else {
             return Ok(());
         };
         let key = summary

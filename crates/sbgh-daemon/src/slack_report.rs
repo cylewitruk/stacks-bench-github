@@ -383,7 +383,7 @@ impl ReportSurface for SlackReportSurface {
         *view = initial_view(&self.job, view.identity.clone());
         view.version = run_version_base(&self.job).saturating_add(seed.mutation_count);
         match &seed.latest {
-            ProjectedReportMutation::Phase(sbgh_proto::ReliableEventPayload::Phase {
+            ProjectedReportMutation::Phase(sbgh_fleet::ReliableEventPayload::Phase {
                 label,
                 ..
             }) if label == "accepted" => {
@@ -391,7 +391,7 @@ impl ReportSurface for SlackReportSurface {
                 view.phase = Some("preparing execution".into());
                 view.progress = None;
             }
-            ProjectedReportMutation::Phase(sbgh_proto::ReliableEventPayload::Phase {
+            ProjectedReportMutation::Phase(sbgh_fleet::ReliableEventPayload::Phase {
                 label,
                 ..
             }) => {
@@ -399,7 +399,7 @@ impl ReportSurface for SlackReportSurface {
                 view.phase = Some(human_phase(&PhaseLabel::new(label.clone(), false)));
                 view.progress = None;
             }
-            ProjectedReportMutation::Phase(sbgh_proto::ReliableEventPayload::Terminal {
+            ProjectedReportMutation::Phase(sbgh_fleet::ReliableEventPayload::Terminal {
                 ..
             }) => {
                 tracing::warn!(

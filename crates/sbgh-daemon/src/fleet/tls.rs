@@ -1,15 +1,16 @@
 use std::io::{self, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, ensure};
-use axum::extract::connect_info::Connected;
-use axum::serve::Listener;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -32,13 +33,54 @@ pub struct AuthenticatedPeer {
 
 pub struct MtlsListener {
     local_addr: SocketAddr,
-    accepted: mpsc::Receiver<(TlsStream<TcpStream>, AuthenticatedPeer)>,
+    accepted: mpsc::Receiver<AuthenticatedStream>,
     accept_task: JoinHandle<()>,
 }
 
-impl Connected<axum::serve::IncomingStream<'_, MtlsListener>> for AuthenticatedPeer {
-    fn connect_info(stream: axum::serve::IncomingStream<'_, MtlsListener>) -> Self {
-        stream.remote_addr().clone()
+pub struct AuthenticatedStream {
+    inner: TlsStream<TcpStream>,
+    peer: AuthenticatedPeer,
+}
+
+impl tonic::transport::server::Connected for AuthenticatedStream {
+    type ConnectInfo = AuthenticatedPeer;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.peer.clone()
+    }
+}
+
+impl AsyncRead for AuthenticatedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for AuthenticatedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
     }
 }
 
@@ -65,6 +107,10 @@ impl MtlsListener {
             accept_task,
         })
     }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
 }
 
 impl Drop for MtlsListener {
@@ -76,7 +122,7 @@ impl Drop for MtlsListener {
 async fn run_accept_loop(
     tcp: TcpListener,
     acceptor: TlsAcceptor,
-    accepted: mpsc::Sender<(TlsStream<TcpStream>, AuthenticatedPeer)>,
+    accepted: mpsc::Sender<AuthenticatedStream>,
 ) {
     let handshakes = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
     loop {
@@ -133,36 +179,29 @@ async fn run_accept_loop(
                 }
             };
             let _ = accepted
-                .send((
-                    tls,
-                    AuthenticatedPeer {
+                .send(AuthenticatedStream {
+                    inner: tls,
+                    peer: AuthenticatedPeer {
                         worker_id,
                         certificate_sha256,
                         socket_addr,
                     },
-                ))
+                })
                 .await;
         });
     }
 }
 
-impl Listener for MtlsListener {
-    type Io = TlsStream<TcpStream>;
-    type Addr = AuthenticatedPeer;
+impl tokio_stream::Stream for MtlsListener {
+    type Item = io::Result<AuthenticatedStream>;
 
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Option<Self::Item>> {
         self.accepted
-            .recv()
-            .await
-            .unwrap_or_else(|| panic!("worker mTLS accept task stopped unexpectedly"))
-    }
-
-    fn local_addr(&self) -> io::Result<Self::Addr> {
-        Ok(AuthenticatedPeer {
-            worker_id: Uuid::nil(),
-            certificate_sha256: String::new(),
-            socket_addr: self.local_addr,
-        })
+            .poll_recv(context)
+            .map(|value| value.map(Ok))
     }
 }
 
@@ -188,7 +227,7 @@ fn server_config(
         .with_client_cert_verifier(verifier)
         .with_single_cert(server_certificates, key)
         .context("building TLS 1.3 worker server configuration")?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"h2".to_vec()];
     Ok(config)
 }
 
@@ -273,6 +312,7 @@ mod tests {
     use rustls::ClientConfig;
     use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
     use tokio_rustls::TlsConnector;
+    use tokio_stream::StreamExt;
 
     use super::*;
 
@@ -426,10 +466,11 @@ mod tests {
                     .remove(0),
             )
             .unwrap();
-        let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        let mut client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_root_certificates(roots)
             .with_client_auth_cert(vec![fixture.client_certificate], fixture.client_key)
             .unwrap();
+        client.alpn_protocols = vec![b"h2".to_vec()];
         let stream = TcpStream::connect(address)
             .await
             .unwrap();
@@ -446,6 +487,92 @@ mod tests {
                 .protocol_version(),
             Some(rustls::ProtocolVersion::TLSv1_3)
         );
+        assert_eq!(
+            tls.get_ref()
+                .1
+                .alpn_protocol(),
+            Some(b"h2".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn tls12_clients_are_rejected() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let fixture = pki_fixture(Uuid::new_v4());
+        let server = server_config(
+            &fixture.server_certificate,
+            &fixture.server_key,
+            &fixture.ca_certificate,
+        )
+        .unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = tcp.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = tcp.accept().await.unwrap();
+            TlsAcceptor::from(Arc::new(server))
+                .accept(stream)
+                .await
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(
+                certificates(&fixture.ca_certificate)
+                    .unwrap()
+                    .remove(0),
+            )
+            .unwrap();
+        let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![fixture.client_certificate], fixture.client_key)
+            .unwrap();
+        let stream = TcpStream::connect(address)
+            .await
+            .unwrap();
+        let client_result = TlsConnector::from(Arc::new(client))
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await;
+        let server_result = accept.await.unwrap();
+        assert!(
+            client_result.is_err() || server_result.is_err(),
+            "TLS 1.2 unexpectedly reached the fleet listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_http_cannot_reach_the_authenticated_stream() {
+        use tokio::io::AsyncWriteExt;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let fixture = pki_fixture(Uuid::new_v4());
+        let mut listener = MtlsListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &fixture.server_certificate,
+            &fixture.server_key,
+            &fixture.ca_certificate,
+        )
+        .await
+        .unwrap();
+        let mut plaintext = TcpStream::connect(listener.local_addr())
+            .await
+            .unwrap();
+        plaintext
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        plaintext
+            .shutdown()
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), listener.next())
+                .await
+                .is_err(),
+            "plaintext HTTP unexpectedly produced an authenticated fleet stream"
+        );
     }
 
     #[tokio::test]
@@ -461,10 +588,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let address = listener
-            .local_addr()
-            .unwrap()
-            .socket_addr;
+        let address = listener.local_addr();
         let _stalled = TcpStream::connect(address)
             .await
             .unwrap();
@@ -490,12 +614,15 @@ mod tests {
                 .await
                 .unwrap()
         };
-        let (_, (_, peer)) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            tokio::join!(connect, listener.accept())
+        let (_, accepted) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(connect, listener.next())
         })
         .await
         .expect("valid worker handshake must bypass the stalled client");
-        assert_eq!(peer.worker_id, worker_id);
+        let accepted = accepted
+            .expect("listener remains open")
+            .expect("authenticated stream");
+        assert_eq!(accepted.peer.worker_id, worker_id);
     }
 
     #[tokio::test]

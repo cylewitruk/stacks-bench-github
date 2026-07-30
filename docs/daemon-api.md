@@ -1,12 +1,14 @@
 # Daemon API
 
-`sbgh-daemon` exposes two independent HTTP surfaces:
+`sbgh-daemon` exposes two independent network surfaces:
 
 - the operator and webhook API under `/api`, authenticated with bearer tokens;
-- the worker control plane on a separate TLS 1.3 mutual-X.509 listener.
+- the `sbgh.fleet.v1.WorkerFleetService` protobuf/gRPC control plane on a separate
+  HTTP/2, TLS 1.3 mutual-X.509 listener.
 
-This document covers `/api`. Worker protocol DTOs and validation live in
-`sbgh-proto`; workers do not use operator cookies.
+This document covers `/api`. Worker wire messages live in `sbgh-proto`,
+transport-neutral fleet values live in `sbgh-fleet`, and workers do not use
+operator cookies.
 
 ## Topology
 
@@ -21,9 +23,9 @@ Bind loopback for `sbgh-cli` and the Docker bridge gateway for
 `sbgh-handler`. Do not expose `/api` on a public interface. The daemon is the
 sole database client and applies pending migrations before it begins serving.
 
-HTTP/1.1 and JSON are used throughout. Request and response types are defined
+The operator API uses HTTP/1.1 and JSON. Request and response types are defined
 in `sbgh-api`, which also provides the typed Rust client used by the handler
-and CLI.
+and CLI. This does not describe the protobuf/gRPC worker listener.
 
 ## Authentication
 

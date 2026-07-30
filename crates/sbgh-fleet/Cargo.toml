@@ -1,5 +1,5 @@
 [package]
-name = "sbgh-core"
+name = "sbgh-fleet"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -10,26 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[features]
-testing = []
-
 [dependencies]
-sbgh-fleet.workspace = true
-
-async-trait.workspace = true
-
-sha2.workspace = true
-hex.workspace = true
-
 serde.workspace = true
 serde_json.workspace = true
-
 thiserror.workspace = true
-anyhow.workspace = true
-
 uuid.workspace = true
-chrono.workspace = true
-toml.workspace = true
-
-[dev-dependencies]
-tempfile = "3"
+sha2.workspace = true
+hex.workspace = true

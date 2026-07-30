@@ -22,7 +22,8 @@ A single Cargo workspace (`crates/`):
 | `sbgh-slack` | Slack intake, snapshot rendering, and Socket/Web API transport. |
 | `sbgh-driver` | Backend-neutral task execution contracts. |
 | `sbgh-libvirt` | Concrete libvirt sandbox and LVM snapshot adapter. |
-| `sbgh-proto` | Dependency-light, versioned worker-fleet wire contracts and validation. |
+| `sbgh-fleet` | Transport-neutral fleet state-machine values, validation, and semantic digests. |
+| `sbgh-proto` | Generated `sbgh.fleet.v1` protobuf messages and gRPC client/server adapters. |
 | `sbgh-worker` | Separately deployed pull worker for benchmark/libvirt, build-only, and block-validation capabilities. |
 | `sbgh-smee` | smee.io → handler webhook forwarder. |
 

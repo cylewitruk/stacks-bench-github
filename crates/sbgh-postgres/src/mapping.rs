@@ -192,7 +192,7 @@ db_enums! {
     sbgh_core::models::BuildTarget => "build_target",
     sbgh_core::models::JobEventKind => "job_event_kind",
     sbgh_core::models::JobEventStatus => "job_event_status",
-    sbgh_proto::WorkerCapability => "worker_capability",
+    sbgh_fleet::WorkerCapability => "worker_capability",
 }
 
 #[cfg(test)]

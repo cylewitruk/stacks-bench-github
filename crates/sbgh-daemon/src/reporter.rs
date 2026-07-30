@@ -179,7 +179,7 @@ impl Reporter {
     pub(crate) async fn report_fleet_terminal(
         &self,
         surface: &dyn ReportSurface,
-        outcome: &sbgh_proto::TerminalOutcome,
+        outcome: &sbgh_fleet::TerminalOutcome,
     ) -> anyhow::Result<()> {
         let snapshot = self
             .jobs
@@ -192,7 +192,7 @@ impl Reporter {
                 )
             })?;
         match outcome {
-            sbgh_proto::TerminalOutcome::Completed { summary, block_validation } => {
+            sbgh_fleet::TerminalOutcome::Completed { summary, block_validation } => {
                 anyhow::ensure!(
                     matches!(
                         snapshot.lifecycle.state,
@@ -230,7 +230,7 @@ impl Reporter {
                     })
                     .await
             }
-            sbgh_proto::TerminalOutcome::Failed { error, .. } => {
+            sbgh_fleet::TerminalOutcome::Failed { error, .. } => {
                 anyhow::ensure!(
                     snapshot.lifecycle.state == sbgh_core::reporting::ReportLifecycleState::Failed,
                     "failed terminal outcome disagrees with canonical lifecycle {:?}",
@@ -240,7 +240,7 @@ impl Reporter {
                     .failed(&snapshot, error)
                     .await
             }
-            sbgh_proto::TerminalOutcome::Cancelled { reason } => {
+            sbgh_fleet::TerminalOutcome::Cancelled { reason } => {
                 anyhow::ensure!(
                     snapshot.lifecycle.state
                         == sbgh_core::reporting::ReportLifecycleState::Cancelled,
@@ -1998,12 +1998,12 @@ mod tests {
         let mut job = job_with(ProgressTarget::CommitCheck { check_run_id: None });
         job.task_kind = TaskKind::BlockValidation;
         job.build_target = BuildTarget::StacksInspect;
-        let result = sbgh_proto::BlockValidationResult {
+        let result = sbgh_fleet::BlockValidationResult {
             valid: true,
             checked_blocks: 1,
             invalid_blocks: Vec::new(),
             chainstate_origin: "nightly".into(),
-            observed_range: sbgh_proto::InclusiveRange { start: 1, end: 1 },
+            observed_range: sbgh_fleet::InclusiveRange { start: 1, end: 1 },
         };
         let report = SubmissionReportView {
             identity: ReportIdentity {
@@ -2049,7 +2049,7 @@ mod tests {
         reporter
             .report_fleet_terminal(
                 &crate::report::NoopReportSurface,
-                &sbgh_proto::TerminalOutcome::Completed {
+                &sbgh_fleet::TerminalOutcome::Completed {
                     summary: serde_json::json!({}),
                     block_validation: Some(result),
                 },

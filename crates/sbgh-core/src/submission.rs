@@ -4,7 +4,7 @@
 //! consume materialized jobs and do not participate in this boundary.
 
 use chrono::{DateTime, Utc};
-use sbgh_proto::{BlockValidationPayload, WorkerCapability};
+use sbgh_fleet::{BlockValidationPayload, WorkerCapability};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

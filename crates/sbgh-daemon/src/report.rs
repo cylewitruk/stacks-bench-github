@@ -1098,12 +1098,12 @@ mod tests {
             "valid": false,
             "invalid_block_count": 999
         });
-        let result = sbgh_proto::BlockValidationResult {
+        let result = sbgh_fleet::BlockValidationResult {
             valid: true,
             checked_blocks: 11,
             invalid_blocks: Vec::new(),
             chainstate_origin: "chainstate-nightly".into(),
-            observed_range: sbgh_proto::InclusiveRange { start: 10, end: 20 },
+            observed_range: sbgh_fleet::InclusiveRange { start: 10, end: 20 },
         };
         let view = sbgh_core::reporting::BlockValidationReportView::from_result(None, &result);
         let snapshot = snapshot(
@@ -1130,11 +1130,11 @@ mod tests {
 
     #[test]
     fn validation_detail_is_bounded_and_escaped() {
-        let result = sbgh_proto::BlockValidationResult {
+        let result = sbgh_fleet::BlockValidationResult {
             valid: false,
             checked_blocks: 50,
             invalid_blocks: (0..40)
-                .map(|index| sbgh_proto::InvalidBlock {
+                .map(|index| sbgh_fleet::InvalidBlock {
                     shard: index,
                     block: if index == 0 {
                         format!("`@team<unsafe>{}", "b".repeat(300))
@@ -1145,7 +1145,7 @@ mod tests {
                 })
                 .collect(),
             chainstate_origin: "`origin`".into(),
-            observed_range: sbgh_proto::InclusiveRange { start: 1, end: 50 },
+            observed_range: sbgh_fleet::InclusiveRange { start: 1, end: 50 },
         };
         let view = sbgh_core::reporting::BlockValidationReportView::from_result(None, &result);
         let body = render_block_validation_body(Uuid::new_v4(), "abc", &view);

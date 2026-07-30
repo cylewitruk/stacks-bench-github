@@ -1,0 +1,369 @@
+syntax = "proto3";
+
+package sbgh.fleet.v1;
+
+// WorkerFleetService is a pull-based, worker-initiated control plane. Artifact
+// bytes stay out-of-band over delegated HTTPS URLs.
+service WorkerFleetService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Poll(PollRequest) returns (PollResponse);
+  rpc Accept(AcceptRequest) returns (AcceptResponse);
+  rpc FetchRepositoryCredential(FetchRepositoryCredentialRequest)
+      returns (FetchRepositoryCredentialResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc PublishReliableEvent(PublishReliableEventRequest)
+      returns (PublishReliableEventResponse);
+  rpc PublishProgress(PublishProgressRequest)
+      returns (PublishProgressResponse);
+  rpc GrantArtifact(GrantArtifactRequest) returns (GrantArtifactResponse);
+  rpc CompleteAttempt(CompleteAttemptRequest)
+      returns (CompleteAttemptResponse);
+  rpc ListCleanup(ListCleanupRequest) returns (ListCleanupResponse);
+  rpc CompleteCleanup(CompleteCleanupRequest)
+      returns (CompleteCleanupResponse);
+  rpc Deregister(DeregisterRequest)
+      returns (DeregisterResponse);
+}
+
+enum WorkerCapability {
+  WORKER_CAPABILITY_UNSPECIFIED = 0;
+  WORKER_CAPABILITY_BENCHMARK = 1;
+  WORKER_CAPABILITY_BUILD_ONLY = 2;
+  WORKER_CAPABILITY_BLOCK_VALIDATION = 3;
+}
+
+enum ValidationEpoch {
+  VALIDATION_EPOCH_UNSPECIFIED = 0;
+  VALIDATION_EPOCH_PRE_NAKAMOTO = 1;
+  VALIDATION_EPOCH_NAKAMOTO = 2;
+}
+
+enum DesiredState {
+  DESIRED_STATE_UNSPECIFIED = 0;
+  DESIRED_STATE_CONTINUE = 1;
+  DESIRED_STATE_CANCEL = 2;
+  DESIRED_STATE_DRAIN = 3;
+}
+
+enum ArtifactOperation {
+  ARTIFACT_OPERATION_UNSPECIFIED = 0;
+  ARTIFACT_OPERATION_PUT = 1;
+  ARTIFACT_OPERATION_GET = 2;
+}
+
+message Empty {}
+
+message ResourceFacts {
+  uint32 logical_cpus = 1;
+  uint64 memory_bytes = 2;
+}
+
+message RegisterRequest {
+  uint32 protocol_version = 1;
+  string worker_id = 2;
+  string worker_session_id = 3;
+  string software_version = 4;
+  repeated WorkerCapability advertised_capabilities = 5;
+  ResourceFacts resources = 6;
+}
+
+message RegisterResponse {
+  uint32 protocol_version = 1;
+  uint64 heartbeat_interval_ms = 2;
+  uint64 lease_ttl_ms = 3;
+  int64 server_time_ms = 4;
+}
+
+message ListCleanupRequest {
+  string worker_session_id = 1;
+}
+
+message CleanupItem {
+  int64 id = 1;
+  string attempt_id = 2;
+  string job_id = 3;
+  string reason = 4;
+}
+
+message ListCleanupResponse {
+  repeated CleanupItem items = 1;
+}
+
+message CompleteCleanupRequest {
+  string worker_session_id = 1;
+  int64 obligation_id = 2;
+}
+
+message CompleteCleanupResponse {
+  bool completed = 1;
+}
+
+message DeregisterRequest {
+  string worker_session_id = 1;
+}
+
+message DeregisterResponse {
+  bool deregistered = 1;
+}
+
+message PollRequest {
+  string worker_session_id = 1;
+}
+
+message PollNoWork {
+  uint64 retry_after_ms = 1;
+}
+
+message PollOffer {
+  WorkOffer offer = 1;
+}
+
+message PollResponse {
+  oneof result {
+    PollNoWork no_work = 1;
+    Empty drain = 2;
+    PollOffer offer = 3;
+  }
+}
+
+message AttemptIdentity {
+  string worker_session_id = 1;
+  string attempt_id = 2;
+  uint64 fencing_generation = 3;
+  string lease_token = 4;
+}
+
+message BlockValidationRequirements {
+  uint32 requested_shards = 1;
+  uint32 max_concurrency = 2;
+}
+
+message OfferRequirements {
+  oneof kind {
+    Empty benchmark = 1;
+    Empty build_only = 2;
+    BlockValidationRequirements block_validation = 3;
+  }
+}
+
+message WorkOffer {
+  AttemptIdentity identity = 1;
+  string job_id = 2;
+  string trace_id = 3;
+  WorkerCapability capability = 4;
+  OfferRequirements requirements = 5;
+  string payload_hash = 6;
+  int64 offer_expires_at_ms = 7;
+}
+
+message AcceptRequest {
+  AttemptIdentity identity = 1;
+}
+
+message AssignmentContext {
+  string job_id = 1;
+  string repository = 2;
+  string commit = 3;
+}
+
+message BenchmarkPayload {
+  repeated string effective_args = 1;
+  optional string workload_key = 2;
+  optional string sqlite_seed_key = 3;
+  bool shared_baseline_calibration = 4;
+  optional int64 baseline_calibration_id = 5;
+  int32 run_index = 6;
+  int32 requested_run_count = 7;
+}
+
+message InclusiveRange {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+message BlockValidationPayload {
+  ValidationEpoch epoch = 1;
+  InclusiveRange range = 2;
+  uint32 requested_shards = 3;
+  uint32 max_concurrency = 4;
+  uint64 timeout_secs = 5;
+}
+
+message TaskPayload {
+  oneof kind {
+    BenchmarkPayload benchmark = 1;
+    Empty build_only = 2;
+    BlockValidationPayload block_validation = 3;
+  }
+}
+
+message Assignment {
+  AttemptIdentity identity = 1;
+  string trace_id = 2;
+  AssignmentContext context = 3;
+  TaskPayload payload = 4;
+  string payload_hash = 5;
+  optional string vcpu_cpuset = 6;
+}
+
+message AcceptResponse {
+  Assignment assignment = 1;
+}
+
+message FetchRepositoryCredentialRequest {
+  AttemptIdentity identity = 1;
+}
+
+message FetchRepositoryCredentialResponse {
+  string token = 1;
+  int64 expires_at_ms = 2;
+}
+
+message HeartbeatRequest {
+  AttemptIdentity identity = 1;
+  uint32 reliable_buffer_len = 2;
+}
+
+message HeartbeatResponse {
+  DesiredState desired_state = 1;
+  int64 lease_expires_at_ms = 2;
+  uint64 highest_contiguous_reliable_seq = 3;
+}
+
+message ReliablePhaseEvent {
+  string label = 1;
+  uint64 elapsed_ms = 2;
+}
+
+message ReliableTerminalEvent {
+  string outcome_digest = 1;
+}
+
+message ReliableEventPayload {
+  oneof kind {
+    ReliablePhaseEvent phase = 1;
+    ReliableTerminalEvent terminal = 2;
+  }
+}
+
+message PublishReliableEventRequest {
+  AttemptIdentity identity = 1;
+  string trace_id = 2;
+  uint64 reliable_seq = 3;
+  ReliableEventPayload payload = 4;
+  string payload_digest = 5;
+  int64 worker_timestamp_ms = 6;
+}
+
+message PublishReliableEventResponse {
+  uint64 highest_contiguous_reliable_seq = 1;
+}
+
+message ProgressUpdate {
+  string workflow_step = 1;
+  int32 run_index = 2;
+  int32 requested_run_count = 3;
+  string phase = 4;
+  uint64 progress = 5;
+  optional uint64 total = 6;
+  optional string message = 7;
+}
+
+message PublishProgressRequest {
+  AttemptIdentity identity = 1;
+  string trace_id = 2;
+  uint64 progress_seq = 3;
+  ProgressUpdate update = 4;
+}
+
+message PublishProgressResponse {
+  bool accepted = 1;
+}
+
+message GrantArtifactRequest {
+  AttemptIdentity identity = 1;
+  ArtifactOperation operation = 2;
+  string key = 3;
+  optional uint64 size = 4;
+  optional string sha256 = 5;
+}
+
+message HeaderValue {
+  string name = 1;
+  string value = 2;
+}
+
+message GrantArtifactResponse {
+  string method = 1;
+  string key = 2;
+  string url = 3;
+  repeated HeaderValue headers = 4;
+  int64 expires_at_ms = 5;
+}
+
+message ArtifactDescriptor {
+  string key = 1;
+  string logical_key = 2;
+  uint64 size = 3;
+  string sha256 = 4;
+}
+
+message InvalidBlock {
+  uint32 shard = 1;
+  string block = 2;
+  string reason = 3;
+}
+
+message BlockValidationResult {
+  bool valid = 1;
+  uint64 checked_blocks = 2;
+  repeated InvalidBlock invalid_blocks = 3;
+  string chainstate_origin = 4;
+  InclusiveRange observed_range = 5;
+}
+
+message CompletedOutcome {
+  // Canonical application JSON; protobuf bytes are never used for semantic
+  // payload or outcome digests.
+  string summary_json = 1;
+  BlockValidationResult block_validation = 2;
+}
+
+message FailedOutcome {
+  string error = 1;
+  optional string summary_json = 2;
+  bool retryable = 3;
+}
+
+message CancelledOutcome {
+  string reason = 1;
+}
+
+message TerminalOutcome {
+  oneof kind {
+    CompletedOutcome completed = 1;
+    FailedOutcome failed = 2;
+    CancelledOutcome cancelled = 3;
+  }
+}
+
+message CompleteAttemptRequest {
+  AttemptIdentity identity = 1;
+  string trace_id = 2;
+  uint64 terminal_reliable_seq = 3;
+  string terminal_payload_digest = 4;
+  TerminalOutcome outcome = 5;
+  repeated ArtifactDescriptor artifacts = 6;
+}
+
+message CompleteAttemptResponse {
+  bool accepted = 1;
+}
+
+// Stable machine-readable details attached to a gRPC Status. Worker behavior
+// is driven by code/retryable/retry_after_ms, never diagnostic text.
+message FleetErrorDetail {
+  string code = 1;
+  bool retryable = 2;
+  optional uint64 retry_after_ms = 3;
+}

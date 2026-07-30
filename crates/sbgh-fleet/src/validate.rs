@@ -185,14 +185,12 @@ impl Validate for RegisterSessionRequest {
 
 impl Validate for CleanupListRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         session_id(self.worker_session_id)
     }
 }
 
 impl Validate for CleanupCompleteRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         session_id(self.worker_session_id)?;
         if self.obligation_id <= 0 {
             return Err(ProtocolError::Invalid {
@@ -206,28 +204,24 @@ impl Validate for CleanupCompleteRequest {
 
 impl Validate for DeregisterSessionRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         session_id(self.worker_session_id)
     }
 }
 
 impl Validate for PollRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         session_id(self.worker_session_id)
     }
 }
 
 impl Validate for AcceptOfferRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         identity(&self.identity)
     }
 }
 
 impl Validate for HeartbeatRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         identity(&self.identity)?;
         if self.reliable_buffer_len > 4_096 {
             return Err(ProtocolError::Invalid {
@@ -241,14 +235,12 @@ impl Validate for HeartbeatRequest {
 
 impl Validate for RepositoryCredentialRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         identity(&self.identity)
     }
 }
 
 impl Validate for ReliableEventEnvelope {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         identity(&self.identity)?;
         if self.reliable_seq == 0 || self.reliable_seq > i64::MAX as u64 {
             return Err(ProtocolError::Invalid {
@@ -296,7 +288,6 @@ impl Validate for ReliableEventEnvelope {
 
 impl Validate for ProgressRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         identity(&self.identity)?;
         if self.trace_id.is_nil() || self.progress_seq == 0 || self.progress_seq > i64::MAX as u64 {
             return Err(ProtocolError::Invalid {
@@ -486,7 +477,6 @@ impl Validate for Assignment {
 
 impl Validate for ArtifactGrantRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         identity(&self.identity)?;
         if !safe_key(&self.key) {
             return Err(ProtocolError::Invalid {
@@ -565,7 +555,6 @@ fn validate_artifacts(artifacts: &[ArtifactDescriptor]) -> Result<(), ProtocolEr
 
 impl Validate for CompleteAttemptRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
         identity(&self.identity)?;
         if self.trace_id.is_nil()
             || self.terminal_reliable_seq == 0
@@ -647,8 +636,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        AssignmentContext, BenchmarkPayload, CleanupListRequest, CompleteAttemptRequest,
-        HeartbeatRequest, LeaseToken, PROTOCOL_VERSION, ResourceFacts, TaskPayload,
+        CompleteAttemptRequest, HeartbeatRequest, LeaseToken, PROTOCOL_VERSION, ResourceFacts,
         TerminalOutcome, WorkerCapability,
     };
 
@@ -680,82 +668,40 @@ mod tests {
     }
 
     #[test]
-    fn exact_protocol_version_and_telemetry_bounds_are_enforced() {
+    fn registration_protocol_version_and_telemetry_bounds_are_enforced() {
+        let registration = RegisterSessionRequest {
+            protocol_version: PROTOCOL_VERSION + 1,
+            worker_id: Uuid::new_v4(),
+            worker_session_id: Uuid::new_v4(),
+            software_version: "test".into(),
+            advertised_capabilities: BTreeSet::from([WorkerCapability::Benchmark]),
+            resources: ResourceFacts {
+                logical_cpus: 1,
+                memory_bytes: 1,
+            },
+        };
+        assert!(matches!(registration.validate(), Err(ProtocolError::Version { .. })));
+
         let identity = AttemptIdentity {
             worker_session_id: Uuid::new_v4(),
             attempt_id: Uuid::new_v4(),
             fencing_generation: 1,
             lease_token: LeaseToken("x".repeat(64)),
         };
-        let mut heartbeat = HeartbeatRequest {
-            protocol_version: PROTOCOL_VERSION + 1,
+        let heartbeat = HeartbeatRequest {
             identity,
-            reliable_buffer_len: 0,
+            reliable_buffer_len: 4_097,
         };
-        assert!(matches!(heartbeat.validate(), Err(ProtocolError::Version { .. })));
-        heartbeat.protocol_version = PROTOCOL_VERSION;
-        heartbeat.reliable_buffer_len = 4_097;
         assert!(heartbeat.validate().is_err());
-        assert!(matches!(
-            CleanupListRequest {
-                protocol_version: PROTOCOL_VERSION + 1,
-                worker_session_id: Uuid::new_v4(),
-            }
-            .validate(),
-            Err(ProtocolError::Version { .. })
-        ));
     }
 
     #[test]
-    fn assignment_wire_fixture_is_stable_and_secret_free() {
-        let assignment = Assignment {
-            identity: AttemptIdentity {
-                worker_session_id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
-                attempt_id: Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
-                fencing_generation: 7,
-                lease_token: LeaseToken("a".repeat(64)),
-            },
-            trace_id: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
-            context: AssignmentContext {
-                job_id: Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
-                repository: "stacks-network/stacks-core".into(),
-                commit: "1".repeat(40),
-            },
-            payload: TaskPayload::Benchmark(BenchmarkPayload {
-                effective_args: vec!["--mine-microblocks".into()],
-                workload_key: Some("workload-v1".into()),
-                sqlite_seed_key: None,
-                shared_baseline_calibration: false,
-                baseline_calibration_id: None,
-                run_index: 0,
-                requested_run_count: 1,
-            }),
-            payload_hash: "b".repeat(64),
-            vcpu_cpuset: Some("2-5".into()),
-        };
-        let json = serde_json::to_string(&assignment).unwrap();
+    fn secret_wrappers_redact_debug_output() {
+        assert_eq!(format!("{:?}", LeaseToken("secret".into())), "LeaseToken([REDACTED])");
         assert_eq!(
-            json,
-            concat!(
-                "{\"identity\":{\"worker_session_id\":\"11111111-1111-4111-8111-111111111111\",",
-                "\"attempt_id\":\"22222222-2222-4222-8222-222222222222\",",
-                "\"fencing_generation\":7,\"lease_token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},",
-                "\"trace_id\":\"33333333-3333-4333-8333-333333333333\",",
-                "\"context\":{\"job_id\":\"44444444-4444-4444-8444-444444444444\",",
-                "\"repository\":\"stacks-network/stacks-core\",",
-                "\"commit\":\"1111111111111111111111111111111111111111\"},",
-                "\"payload\":{\"kind\":\"benchmark\",",
-                "\"effective_args\":[\"--mine-microblocks\"],",
-                "\"workload_key\":\"workload-v1\",\"sqlite_seed_key\":null,",
-                "\"shared_baseline_calibration\":false,\"baseline_calibration_id\":null,",
-                "\"run_index\":0,\"requested_run_count\":1},",
-                "\"payload_hash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vcpu_cpuset\":\"2-5\"}"
-            )
+            format!("{:?}", crate::RepositoryToken("secret".into())),
+            "RepositoryToken([REDACTED])"
         );
-        assert!(!json.contains("repository_token"));
-        assert!(format!("{:?}", assignment.identity.lease_token).contains("[REDACTED]"));
     }
 
     #[test]
@@ -773,7 +719,6 @@ mod tests {
             outcome_digest: crate::payload_digest(&outcome).unwrap(),
         };
         let mut request = CompleteAttemptRequest {
-            protocol_version: PROTOCOL_VERSION,
             identity,
             trace_id: Uuid::new_v4(),
             terminal_reliable_seq: 1,
@@ -814,7 +759,6 @@ mod tests {
             outcome_digest: crate::payload_digest(&outcome).unwrap(),
         };
         let mut request = CompleteAttemptRequest {
-            protocol_version: PROTOCOL_VERSION,
             identity,
             trace_id: Uuid::new_v4(),
             terminal_reliable_seq: 1,

@@ -1,11 +1,12 @@
 //! Persistence port for the worker-fleet state machine.
 //!
-//! The daemon owns this port. Workers see only `sbgh-proto` and never a
-//! database model or credential.
+//! The daemon owns this port. Workers receive the same transport-neutral fleet
+//! values through the generated protobuf boundary and never see a database
+//! model or provider credential.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use sbgh_proto::{
+use sbgh_fleet::{
     ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DesiredState, ProgressRequest,
     RegisterSessionRequest, ReliableEventEnvelope, TaskPayload, TerminalOutcome, WorkOffer,
     WorkerCapability,
@@ -81,7 +82,7 @@ pub struct StoredAttemptEvent {
     pub attempt_id: Uuid,
     pub job_id: Uuid,
     pub reliable_seq: u64,
-    pub payload: sbgh_proto::ReliableEventPayload,
+    pub payload: sbgh_fleet::ReliableEventPayload,
     pub payload_digest: String,
 }
 
@@ -90,13 +91,13 @@ pub struct StoredProgress {
     pub attempt_id: Uuid,
     pub job_id: Uuid,
     pub progress_seq: u64,
-    pub update: sbgh_proto::ProgressUpdate,
+    pub update: sbgh_fleet::ProgressUpdate,
 }
 
 #[derive(Debug, Clone)]
 pub enum ProjectedReportMutation {
-    Phase(sbgh_proto::ReliableEventPayload),
-    Progress(sbgh_proto::ProgressUpdate),
+    Phase(sbgh_fleet::ReliableEventPayload),
+    Progress(sbgh_fleet::ProgressUpdate),
 }
 
 /// The latest externally projected state plus the number of version-advancing

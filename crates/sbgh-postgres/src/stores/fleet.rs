@@ -16,7 +16,7 @@ use sbgh_core::db::fleet::{
 use sbgh_core::models::{JobEventKind, JobEventStatus};
 #[cfg(feature = "testing")]
 use sbgh_core::models::{NewJob, NewPullRequestLink};
-use sbgh_proto::{
+use sbgh_fleet::{
     ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DesiredState, ProgressRequest,
     RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload, TaskPayload,
     TerminalOutcome, WorkOffer, WorkerCapability,
@@ -159,7 +159,7 @@ impl PostgresFleetStore {
             .axes
             .task_kind
             .required_capability()))
-        .bind(i32::from(sbgh_proto::PROTOCOL_VERSION))
+        .bind(i32::from(sbgh_fleet::PROTOCOL_VERSION))
         .bind(payload)
         .bind(&prepared.payload_hash)
         .execute(&mut *tx)
@@ -292,14 +292,14 @@ fn offer_from_row(row: &sqlx::postgres::PgRow) -> sbgh_core::Result<OfferedAssig
                 worker_session_id,
                 attempt_id,
                 fencing_generation: fencing_generation as u64,
-                lease_token: sbgh_proto::LeaseToken(lease_token),
+                lease_token: sbgh_fleet::LeaseToken(lease_token),
             },
             job_id: row.try_get("job_id").core()?,
             trace_id: row
                 .try_get("trace_id")
                 .core()?,
             capability: capability(&capability_text)?,
-            requirements: sbgh_proto::OfferRequirements::from(&payload),
+            requirements: sbgh_fleet::OfferRequirements::from(&payload),
             payload_hash: row
                 .try_get("payload_hash")
                 .core()?,
@@ -895,7 +895,7 @@ impl FleetStore for PostgresFleetStore {
         )
         .bind(prepared.job_id)
         .bind(&prepared.commit)
-        .bind(i32::from(sbgh_proto::PROTOCOL_VERSION))
+        .bind(i32::from(sbgh_fleet::PROTOCOL_VERSION))
         .bind(payload)
         .bind(&prepared.payload_hash)
         .execute(&self.pool)
@@ -1199,12 +1199,12 @@ impl FleetStore for PostgresFleetStore {
                     worker_session_id,
                     attempt_id,
                     fencing_generation: fence as u64,
-                    lease_token: sbgh_proto::LeaseToken(String::new()),
+                    lease_token: sbgh_fleet::LeaseToken(String::new()),
                 },
                 job_id,
                 trace_id,
                 capability: task_capability,
-                requirements: sbgh_proto::OfferRequirements::from(&payload),
+                requirements: sbgh_fleet::OfferRequirements::from(&payload),
                 payload_hash: row
                     .try_get("execution_payload_hash")
                     .core()?,
@@ -2817,7 +2817,7 @@ impl FleetStore for PostgresFleetStore {
                 "terminal event has a non-terminal payload".into(),
             ));
         };
-        let submitted_outcome_digest = sbgh_proto::payload_digest(outcome)
+        let submitted_outcome_digest = sbgh_fleet::payload_digest(outcome)
             .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
         if outcome_digest != submitted_outcome_digest {
             return Err(sbgh_core::Error::Config(

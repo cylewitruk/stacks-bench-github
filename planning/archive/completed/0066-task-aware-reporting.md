@@ -7,7 +7,7 @@ block-validation submissions through one aggregate reporting lifecycle with
 task-specific result views and renderers.
 
 > **Status:** shipped — continued in
-> [v29](../../iterations/v29-protobuf-fleet-protocol.md).
+> [v29](0074-protobuf-fleet-protocol.md).
 >
 > v27.2 made submission identity, provenance, and persistence task-neutral.
 > v28 preserves the durable fleet event path and makes its read/projection side

@@ -1,39 +1,67 @@
 # v29: Protobuf Worker Protocol
 
 Successor to
-[v28](../archive/completed/0066-task-aware-reporting.md). Replace the
-handwritten JSON worker control plane with protobuf/gRPC, deploy it to the
-current single-worker fleet, and remove the old transport while preserving the
-shipped pull scheduler and attempt state machine.
+[v28](0066-task-aware-reporting.md). Establish protobuf/gRPC as the first
+deployed worker control plane, remove the undeployed JSON prototype, and
+preserve the pull scheduler and attempt state machine.
 
-> **Status:** planned
+> **Status:** shipped — implementation and local validation completed on
+> 2026-07-30.
 >
-> v29 is a direct transport migration for the current centrally coordinated
-> fleet. Daemon and workers continue to require one exact protocol version.
+> v29 establishes the transport for the current centrally coordinated fleet.
+> Daemon and workers continue to require one exact protocol version.
 > Rolling multi-version compatibility is deferred to
-> [`0075`](../backlog.md) and is required before the first incompatible change
+> [`0075`](../../backlog.md) and is required before the first incompatible change
 > to the published protobuf contract.
 
 ## Item
 
 - **id:** `0074-protobuf-fleet-protocol`
-- **status:** `planned`
+- **status:** `shipped`
 - **priority:** `high`
 - **depends_on:** `0004-worker-fleet`, `0017-generic-phase-events`,
   `0062-sandboxed-worker-execution`
 - **relates_to:** `0075-rolling-worker-protocol-compatibility`,
   `0067-github-block-validation-submission`,
   `0070-slack-block-validation-controls`
-- **decision:** [0004-protobuf-fleet-protocol](../decisions/0004-protobuf-fleet-protocol.md)
+- **decision:** [0004-protobuf-fleet-protocol](../../decisions/0004-protobuf-fleet-protocol.md)
 - **source:** external worker-operator deployment and protocol review
   (2026-07)
 
+## Shipped
+
+Removed the worker's prototype HTTP/1.1 JSON control client and the daemon's
+prototype Axum fleet routes in favor of the generated
+`sbgh.fleet.v1.WorkerFleetService` Tonic client/server over HTTP/2 and the TLS
+1.3 mutual-X.509 listener. The
+schema covers every fleet operation and task/result union; generated messages
+are non-`Debug`, bounded at the transport, and converted before entering the
+application service. Stable gRPC status details preserve machine-readable
+error, retry, and delay behavior. Artifact contents remain delegated directly
+over presigned HTTPS.
+
+Added `sbgh-fleet` as the dependency-light owner of transport-neutral fleet
+values, validation, and semantic digests. This makes the generated `sbgh-proto`
+crate a strict wire adapter while allowing
+`sbgh-core` and `sbgh-postgres` to consume fleet contracts without importing
+Prost or Tonic. Package-DAG and source-boundary checks prevent generated
+messages or a second JSON fleet transport from crossing that edge.
+
+The first protobuf contract uses protocol revision 1 and adds reproducible
+vendored-`protoc` generation, Buf schema checks in CI, protobuf-byte round trips
+for every RPC message and union, all-RPC generated client/server coverage,
+behavior-focused digest tests, structured-error tests, and expanded TLS/plaintext
+rejection coverage. Local validation completed with workspace build/lint, 910
+passing tests (one environment skip), and `git diff --check`. The real-host
+benchmark and block-validation canaries remain rollout gates because they
+require the deployed daemon, object store, PKI, and libvirt workers.
+
 ## Problem
 
-`sbgh-proto` currently contains handwritten Serde DTOs. The worker calls an
-Axum HTTP/1.1 JSON API through a manual Reqwest client. The crate name suggests
-protobuf, but Rust structs and incidental Serde behavior are the only wire
-schema.
+The undeployed prototype `sbgh-proto` contains handwritten Serde DTOs. Its
+worker calls an Axum HTTP/1.1 JSON API through a manual Reqwest client. The
+crate name suggests protobuf, but Rust structs and incidental Serde behavior
+are the only wire schema.
 
 The immediate need is smaller than a mature rolling-upgrade system. One operator
 currently controls the central daemon and one Hetzner worker; a second operator
@@ -64,9 +92,11 @@ artifact bytes
 `sbgh-proto` becomes an actual protobuf crate. The `.proto` schema is the sole
 wire source of truth. Generated messages stop at daemon and worker transport
 adapters; neither persistence nor execution-domain crates depend on them.
+`sbgh-fleet` owns the shared transport-neutral application values so those
+inner crates do not acquire Prost or Tonic.
 
-The first cutover is coordinated: drain the JSON worker, deploy both binaries,
-run one benchmark and one block-validation canary, then install the same worker
+The first deployment installs the daemon and matching worker release, runs one
+benchmark and one block-validation canary, then installs the same worker
 release on additional hosts.
 
 ## Design Rules
@@ -85,21 +115,22 @@ release on additional hosts.
   convert generated messages into their existing application values.
   `sbgh-core`, `sbgh-driver`, `sbgh-postgres`, recipes, and reporting import no
   generated protobuf types.
-- **Keep exact protocol matching for v29.** The protobuf cutover increments the
-  existing protocol version. Registration and request validation reject a
-  different version. Worker `software_version` remains telemetry and may differ
-  without changing the wire version.
+- **Keep exact protocol matching for v29.** Registration rejects any revision
+  other than the first protobuf revision. The accepted revision belongs to the
+  session; later requests bind the session or a fenced attempt. Worker
+  `software_version` remains telemetry and may differ without changing the wire
+  version.
 - **Protobuf is not validation.** Port the current UUID, sequence, timestamp,
   string/list, hash, task-payload, artifact, and terminal-result bounds. Required
   enums reject `UNSPECIFIED`; omitted correctness-sensitive values fail closed.
-- **Do not redesign the messages during translation.** Preserve the existing
-  request/response semantics and representations unless protobuf requires
-  explicit presence. Transport cleanup must remain reviewable separately from
-  fleet behavior.
-- **Keep semantic hashes.** The existing payload and terminal digests bind
-  offers, assignments, reliable events, and completion. Keep their semantic
-  implementation and focused tests; never replace them with hashes of
-  serialized protobuf bytes.
+- **Do not preserve prototype wire shape.** Use protobuf-native request and
+  response shapes. Keep application behavior unchanged, but do not carry
+  repeated version fields, JSON-only serialization, field numbers, or digest
+  constants for an undeployed transport.
+- **Keep semantic hashes.** Payload and terminal digests bind offers,
+  assignments, reliable events, and completion within the live attempt
+  protocol. Test determinism and semantic sensitivity; never hash serialized
+  protobuf bytes.
 - **Preserve mTLS authorization.** TLS 1.3, server verification, client-CA
   verification, the sole worker URI SAN, client/server EKUs, and
   registry-bound capabilities remain mandatory. Common Name and request fields
@@ -113,12 +144,12 @@ release on additional hosts.
 - **Do not enable automatic RPC retries.** Preserve the current explicit worker
   retry/reconnect loops and application idempotency behavior. A later change may
   enable per-method gRPC retries only after proving the method safe.
-- **One production transport after cutover.** Remove the JSON fleet routes and
-  control client rather than carrying a dual stack.
+- **One production transport.** Remove the prototype JSON fleet routes and
+  control client before first deployment rather than carrying a dual stack.
 
 ## Stable Service Shape
 
-The first schema package is `sbgh.fleet.v1`, with one `WorkerFleet` service:
+The first schema package is `sbgh.fleet.v1`, with one `WorkerFleetService`:
 
 | RPC | Semantics |
 | --- | --- |
@@ -135,14 +166,14 @@ The first schema package is `sbgh.fleet.v1`, with one `WorkerFleet` service:
 | `CompleteCleanup` | acknowledge verified idempotent cleanup |
 | `Deregister` | close an idle or draining session |
 
-Use a small protobuf `FleetErrorDetail` in gRPC status details to preserve the
-current stable error code, retryability, and optional retry delay. Human text is
-diagnostic and must not drive worker behavior.
+Use a small protobuf `FleetErrorDetail` in gRPC status details to define the
+stable error code, retryability, and optional retry delay consumed by the
+worker. Human text is diagnostic and must not drive worker behavior.
 
-The existing protocol integer remains in the contract and database. v29 bumps
-it once for the JSON-to-protobuf cutover; it is not tied to the Cargo package or
-worker software version. No worker-session schema migration or version
-negotiation is required.
+Protocol revision 1 is exchanged during registration and persisted on the
+worker session. It is not tied to the Cargo package or worker software version.
+Later RPCs bind that session or a fenced attempt and do not repeat the revision.
+No worker-session schema migration or version negotiation is required.
 
 ## Target Source Layout
 
@@ -151,23 +182,25 @@ proto/
   sbgh/fleet/v1/fleet.proto       authoritative messages and service
   buf.yaml                        schema lint rules
 
+crates/sbgh-fleet/
+  src/
+    model.rs                      transport-neutral fleet values
+    validate.rs                   fail-closed application validation
+    digest.rs                     canonical semantic digest contract
+
 crates/sbgh-proto/
   build.rs                        pinned Prost/Tonic generation
   src/
     lib.rs                        generated module exports
-    validate.rs                   fail-closed wire validation
-    digest.rs                     existing semantic digest contract
+    convert.rs                    protobuf ↔ fleet-value conversion
     error.rs                      typed gRPC status details
-    primitives.rs                 dependency-free UUID/time/hash helpers
 
 crates/sbgh-daemon/src/fleet/
   service.rs                      transport-neutral fleet operations
   grpc.rs                         Tonic adapter + authenticated peer binding
-  wire.rs                         protobuf ↔ daemon conversion
 
 crates/sbgh-worker/src/
   transport.rs                    generated control client + artifact HTTP client
-  wire.rs                         protobuf ↔ worker/execution conversion
 ```
 
 Pin `protoc`, Prost, and Tonic through the workspace so builds do not depend on
@@ -178,23 +211,22 @@ schema and generator configuration are committed.
 
 ### Phase 1: Protobuf Schema and Generated Boundary
 
-**Goal:** Translate the current JSON contract into one generated protobuf
-service without changing behavior.
+**Goal:** Define the first deployed worker contract as one generated protobuf
+service without changing application behavior.
 
 **Scope:**
 
-- Define every current request, response, tagged union, task payload, event,
-  artifact descriptor, terminal result, and error in
-  `sbgh.fleet.v1.WorkerFleet`.
-- Assign stable field numbers and enum values. Reserve removed numbers/names
-  rather than reusing them.
+- Define every fleet operation, response, union, task payload, event, artifact
+  descriptor, terminal result, and error in
+  `sbgh.fleet.v1.WorkerFleetService`.
+- Assign the initial stable field numbers and enum values.
 - Add reproducible Prost/Tonic generation and schema linting.
-- Preserve the existing exact protocol integer and bump it for cutover.
+- Establish protocol revision 1 at registration and on the durable session.
 - Implement common wire validation and dependency-free primitive helpers.
 - Add daemon/worker conversion adapters without importing generated messages
   into inner crates.
-- Keep current semantic digest functions unchanged except for moving them out
-  of handwritten JSON DTO modules where necessary.
+- Keep semantic digests transport-neutral and test their determinism and
+  sensitivity rather than prototype digest constants.
 
 **Status:**
 
@@ -205,15 +237,14 @@ service without changing behavior.
 
 **Acceptance & Validation:**
 
-- [ ] Every current `sbgh-proto` DTO and fleet endpoint has exactly one
-  protobuf equivalent or a documented intentional removal.
+- [ ] Every fleet operation and task/result variant has one protobuf
+  representation.
 - [ ] Schema lint passes and code generation is reproducible without a
   host-installed `protoc`.
 - [ ] Round trips cover every message and `oneof` variant.
-- [ ] Existing validation bounds pass equivalent positive/negative protobuf
-  fixtures.
-- [ ] Existing payload/event/terminal digest tests remain green and no digest
-  uses encoded protobuf bytes.
+- [ ] Validation bounds have positive and negative protobuf fixtures.
+- [ ] Payload/event/terminal digests are deterministic, change with semantic
+  input, and never use encoded protobuf bytes.
 - [ ] Generated secret-bearing values are absent from normal debug/error
   output.
 - [ ] Package-DAG checks prove generated messages remain at transport
@@ -223,7 +254,7 @@ service without changing behavior.
 
 - Schema/generator checks.
 - Message conversion and validation tests.
-- Existing semantic-digest and secret-redaction tests.
+- Semantic-digest and secret-redaction tests.
 
 ### Phase 2: Tonic Daemon Service
 
@@ -310,19 +341,17 @@ artifact transfer.
 - Existing duplicate, conflict, stale-fence, resend, and restart tests.
 - Presigned artifact PUT/GET regression tests.
 
-### Phase 4: Coordinated Cutover and Removal
+### Phase 4: First Deployment and Prototype Removal
 
-**Goal:** Deploy protobuf/gRPC to the current worker and leave no JSON fleet
-path.
+**Goal:** Make protobuf/gRPC the only worker transport before the first fleet
+deployment.
 
 **Scope:**
 
-- Drain the JSON worker and wait for active attempts and cleanup obligations to
-  reach zero.
-- Deploy the gRPC daemon and same-release worker.
+- Deploy the gRPC daemon and matching worker release.
 - Run one real benchmark and one real block-validation canary.
-- Remove Axum worker routes, the handwritten JSON DTOs, and the Reqwest control
-  client.
+- Remove the prototype Axum worker routes, handwritten JSON DTOs, and Reqwest
+  control client.
 - Update architecture, setup, worker operations, configuration, packaging, and
   health/firewall checks for HTTP/2 gRPC.
 - Add boundary checks preventing a second fleet transport or wire model from
@@ -338,12 +367,13 @@ path.
 **Acceptance & Validation:**
 
 - [ ] No production JSON worker route or JSON control client remains.
-- [ ] `sbgh-proto` contains generated protobuf messages plus scoped
-  validation/digest/error helpers, not a handwritten mirror protocol.
+- [ ] `sbgh-proto` contains generated protobuf messages plus conversion/error
+  adapters, while `sbgh-fleet` owns validation and semantic digests; no
+  handwritten mirror protocol remains.
 - [ ] Current docs describe protobuf/gRPC and coordinated exact-version
   deployment.
-- [ ] The existing worker PKI, certificate identities, registry policy, and
-  firewall exposure continue to apply without reprovisioning credentials.
+- [ ] Worker PKI, certificate identities, registry policy, and firewall
+  exposure apply unchanged to the generated gRPC service.
 - [ ] Additional operators can install the same worker release and register
   only their pre-authorized certificate identity/capabilities.
 
@@ -372,21 +402,18 @@ path.
 - [ ] A real block validation completes on the current Hetzner worker inside
   libvirt and reports its typed verdict/provenance.
 
-## Rollout and Rollback
+## Rollout
 
-1. Retain the current daemon/worker binaries and configuration.
-2. Drain all workers and wait for active attempts and cleanup obligations to
-   reach zero.
-3. Stop workers and take a Postgres backup.
-4. Deploy the gRPC daemon.
-5. Deploy the same-release worker to the existing host.
-6. Verify mTLS registration and run benchmark/block-validation canaries.
-7. Install that worker release on the second operator's host and authorize only
+1. Deploy the gRPC daemon.
+2. Install the matching worker release on the first host.
+3. Verify mTLS registration and run benchmark/block-validation canaries.
+4. Install that worker release on the second operator's host and authorize only
    its intended capabilities.
 
-If cutover fails, stop the gRPC binaries and redeploy the retained JSON daemon
-and workers. No persistence model changes are required for v29; restore the
-backup only if an independently identified database problem requires it.
+If the first deployment fails, stop the worker and diagnose the gRPC
+configuration or implementation before admitting work. There is no deployed
+JSON fleet or fleet history to migrate or restore, and v29 adds no persistence
+migration.
 
 Until `0075` ships, a protocol-changing release uses the same coordinated
 drain. Ordinary daemon/worker software releases may be deployed independently

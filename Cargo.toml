@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/sbgh-core",
     "crates/sbgh-api",
+    "crates/sbgh-fleet",
     "crates/sbgh-proto",
     "crates/sbgh-driver",
     "crates/sbgh-libvirt",
@@ -35,6 +36,7 @@ todo = "warn"
 [workspace.dependencies]
 sbgh-core = { path = "crates/sbgh-core" }
 sbgh-api = { path = "crates/sbgh-api" }
+sbgh-fleet = { path = "crates/sbgh-fleet" }
 sbgh-proto = { path = "crates/sbgh-proto" }
 sbgh-driver = { path = "crates/sbgh-driver" }
 sbgh-libvirt = { path = "crates/sbgh-libvirt" }
@@ -50,12 +52,24 @@ tokio = { version = "1.52.3", default-features = false }
 tokio-util = { version = "0.7.18", features = ["io"] }
 async-trait = "0.1.89"
 futures = "0.3.32"
+tokio-stream = { version = "0.1.17", features = ["net"] }
 
 # HTTP / web
 axum = { version = "0.8.9", features = ["macros"] }
 tower = "0.5.3"
 tower-http = { version = "0.7.0", features = ["trace", "limit", "timeout"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 reqwest = { version = "0.13.4", default-features = false }
+prost = "0.14.4"
+tonic = { version = "=0.14.5", default-features = false, features = [
+    "codegen",
+    "transport",
+    "tls-ring",
+] }
+tonic-prost = "=0.14.5"
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "=0.14.5"
 # S3-compatible object storage for run artifacts. Sans-IO (pure
 # SigV4 signing + request building); driven by reqwest.
 rusty-s3 = "0.9.1"

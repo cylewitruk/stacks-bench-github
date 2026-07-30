@@ -3,7 +3,8 @@
 This runbook covers the current worker fleet after
 [setup](setup.md). One active `sbgh-daemon` owns scheduling, leases, durable
 events, artifacts, and provider reporting. Workers poll outbound and execute
-only registry-authorized capabilities.
+only registry-authorized capabilities. Control RPCs use generated protobuf over
+HTTP/2 with TLS 1.3 mutual X.509; artifact bodies use delegated HTTPS URLs.
 
 ## Routine status
 
@@ -44,6 +45,23 @@ authentication. Alert on:
 
 Do not hide the loss of a sole-capability worker by automatically moving
 comparison work to a different measurement environment.
+
+## Coordinated protocol deployment
+
+The current fleet requires an exact protocol revision at session registration.
+Deploy daemon and worker binaries from the same release:
+
+1. Drain every worker and wait for active attempts and cleanup obligations to
+   reach zero.
+2. Stop workers.
+3. Deploy and start the daemon.
+4. Deploy and start each matching worker release.
+5. Run one benchmark and one block-validation canary before undraining normal
+   demand.
+
+A protocol mismatch is rejected before registration or assignment. Worker
+software versions may differ only when they implement the same protocol
+revision. Rolling multi-revision compatibility is not currently supported.
 
 ## Drain, cancellation, and recovery
 

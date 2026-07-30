@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, ensure};
 use hmac::{Hmac, KeyInit, Mac};
-use sbgh_proto::{AttemptIdentity, LeaseToken};
+use sbgh_fleet::{AttemptIdentity, LeaseToken};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;

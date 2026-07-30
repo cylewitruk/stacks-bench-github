@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use sbgh_daemon::{ArtifactStore, S3Store, S3StoreConfig, artifact_key};
-use sbgh_proto::ArtifactDescriptor;
+use sbgh_fleet::ArtifactDescriptor;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 

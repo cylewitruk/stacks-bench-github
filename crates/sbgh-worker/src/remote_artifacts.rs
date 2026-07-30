@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sbgh_driver::ArtifactSink;
-use sbgh_proto::{
-    ArtifactDescriptor, ArtifactGrantRequest, ArtifactOperation, AttemptIdentity, PROTOCOL_VERSION,
-};
+use sbgh_fleet::{ArtifactDescriptor, ArtifactGrantRequest, ArtifactOperation, AttemptIdentity};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -80,7 +78,6 @@ impl ArtifactSink for RemoteArtifactSink {
         let grant = self
             .client
             .artifact_grant(&ArtifactGrantRequest {
-                protocol_version: PROTOCOL_VERSION,
                 identity: self.identity.clone(),
                 operation: ArtifactOperation::Put,
                 key: key.into(),
@@ -132,7 +129,6 @@ impl ArtifactSink for RemoteArtifactSink {
         let grant = self
             .client
             .artifact_grant(&ArtifactGrantRequest {
-                protocol_version: PROTOCOL_VERSION,
                 identity: self.identity.clone(),
                 operation: ArtifactOperation::Get,
                 key: key.into(),
@@ -171,7 +167,7 @@ async fn sha256_file(path: &Path) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use sbgh_proto::ArtifactDescriptor;
+    use sbgh_fleet::ArtifactDescriptor;
 
     use super::record_manifest_entry;
 

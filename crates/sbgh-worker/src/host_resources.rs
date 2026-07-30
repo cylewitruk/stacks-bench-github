@@ -1,5 +1,5 @@
 use anyhow::Context;
-use sbgh_proto::ResourceFacts;
+use sbgh_fleet::ResourceFacts;
 
 #[cfg(target_os = "linux")]
 const LINUX_MEMINFO: &str = "/proc/meminfo";
