@@ -177,95 +177,40 @@ generic push.
 cross-repository dependency graph. Release/tag-specific validation can reuse
 the action model after branch behavior is proven.
 
-### 0069 — Task-aware intent resolution
-
-- **id:** `0069-task-aware-intent-resolution`
-- **status:** `candidate`
-- **priority:** `medium`
-- **depends_on:** `0020-llm-intent-resolution`,
-  `0059-intent-resolution-boundary`
-- **relates_to:** `0036-pr-comment-llm-intent`,
-  `0064-task-submission-kernel`,
-  `0065-job-lifecycle-controls`
-- **unblocks:** `0036-pr-comment-llm-intent`,
-  `0070-slack-block-validation-controls`
-- **source:** block-validation user-story audit (2026-07)
-
-**Problem:** `sbgh-intent` is provider-separated but its schema and output are
-still benchmark-only. It cannot distinguish benchmark creation, validation
-creation, or lifecycle-control requests, so each natural-language surface would
-need ad-hoc parsing.
-
-**Scope:** Replace the benchmark-only outcome with a provider-neutral,
-strictly validated `UserIntent` that identifies action, task kind, repository/
-revision selector, and task-specific request fields. Preserve the deterministic
-benchmark parser as the first path and add deterministic explicit validation/
-control forms before calling a provider. Provider output may extract
-cancel/restart/replace selectors, but it never authorizes or executes them:
-surface/application policy must require an explicit job ID or one unambiguous
-visible scope, re-resolve mutable refs, and apply any confirmation rule.
-Maintain input/rate/cost limits, structured invalid diagnostics, and an eval
-corpus covering ambiguous uses of “validate”, abbreviated commits, missing
-ranges/default plans, and destructive requests.
-
-**Acceptance:**
-
-- Equivalent GitHub and Slack wording produces the same typed creation intent;
-  provider-specific JSON never reaches persistence directly.
-- Existing benchmark fixtures and deterministic commands remain compatible.
-- Ambiguous task/action/ref requests are invalid, not guessed; off-policy
-  callers can be rejected before a provider call.
-- Destructive output contains only validated selectors and cannot bypass
-  authorization, visibility, idempotency, or confirmation in `0065`.
-
-**Deferred / non-goals:** No agent tools, autonomous job enumeration, or
-provider-issued side effects. Reference resolution and default-plan selection
-remain daemon/application concerns.
-
-### 0070 — Slack block-validation and lifecycle controls
+### 0070 — Slack task lifecycle controls
 
 - **id:** `0070-slack-block-validation-controls`
 - **status:** `candidate`
 - **priority:** `medium`
-- **depends_on:** `0064-task-submission-kernel`,
-  `0065-job-lifecycle-controls`, `0066-task-aware-reporting`,
-  `0069-task-aware-intent-resolution`
+- **depends_on:** `0065-job-lifecycle-controls`,
+  `0066-task-aware-reporting`, `0072-pre-attempt-terminal-projection`,
+  `0078-slack-task-submission`
 - **relates_to:** `0035-slack-app-home-status`
 - **source:** block-validation user-story audit (2026-07)
 
-**Problem:** Slack mentions, queue persistence, reactions, and snapshots are
-benchmark-specific. An allowed user cannot request validation of a commit or
-control a long-running validation without switching to the admin CLI.
+**Problem:** v32 adds task-aware Slack creation, but allowed users still cannot
+cancel, restart, or replace long-running benchmark or block-validation work
+without switching to the admin CLI.
 
-**Scope:** Extend the extracted Slack boundary with narrow validation-enqueue
-and lifecycle-control ports implemented by daemon composition. Resolve an
-allowed repository/ref to a full immutable commit before enqueue, select a
-server-owned validation plan, and reuse request-stable Slack reporting identity
-for redelivery. Make Slack policy capability-aware: benchmark creation,
-validation creation, and destructive control need independently configurable
-authorization rather than one broad allowlist. Render through `0066`'s
-task-aware snapshot while preserving snapshot-from-current-state,
-monotonic-version, debounce, reaction, and search-before-create guarantees.
-For cancel/restart/replace, require an explicit submission ID (or a child job
-ID resolved to its submission) or exactly one visible active scope, and apply
-the product's confirmation rule before calling `0065`.
+**Scope:** Add narrow lifecycle-control ports to `sbgh-slack`, implemented by
+daemon composition over `0065`. Keep lifecycle parsing deterministic. Require
+an explicit submission ID (or a child job ID resolved to its submission) or
+exactly one visible active scope, and apply the product's confirmation rule
+before mutation. Use independently configured control authorization, record
+actor and reason, and reconcile the result through the existing task-aware,
+replay-safe Slack snapshot.
 
 **Acceptance:**
 
-- An authorized “run block validation on commit …” mention creates exactly one
-  immutable validation submission and one canonical Slack snapshot under
-  Socket Mode redelivery/restart.
-- Mutable or abbreviated revisions are resolved and frozen by the daemon;
-  nonexistent/ambiguous refs and missing plan policy are rejected without
-  enqueue.
 - Cancel/restart/replace cannot affect jobs outside the caller's configured
   repository/task scope and record actor + reason.
-- Validation progress, positive/negative result, infrastructure failure,
-  cancellation, supersession, and restart render correctly without attempting
-  benchmark metric/profiler queries.
+- Redelivery and concurrent commands converge on one lifecycle outcome;
+  ambiguous selectors fail without mutation.
+- Cancellation, supersession, and restart terminalize or replace the canonical
+  Slack snapshot without regression or duplication.
 
 **Deferred / non-goals:** No Slack App Home buttons (`0035`), general workflow
-agent, arbitrary repository selection, or autonomous destructive action.
+agent, arbitrary repository selection, or LLM-selected destructive action.
 
 ### 0071 — GitHub job lifecycle controls
 

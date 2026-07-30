@@ -86,8 +86,8 @@ need editing when an item's status or location changes.
 | `0066-task-aware-reporting` | Task-aware reporting and validation results | `shipped` | [archive/completed/0066-task-aware-reporting.md](archive/completed/0066-task-aware-reporting.md) |
 | `0067-github-block-validation-submission` | GitHub block-validation submission | `candidate` | [backlog.md](backlog.md) |
 | `0068-watched-ref-task-actions` | Watched-ref task actions and webhook fan-out | `candidate` | [backlog.md](backlog.md) |
-| `0069-task-aware-intent-resolution` | Task-aware intent resolution | `candidate` | [backlog.md](backlog.md) |
-| `0070-slack-block-validation-controls` | Slack block-validation and lifecycle controls | `candidate` | [backlog.md](backlog.md) |
+| `0069-task-aware-intent-resolution` | Task-aware intent resolution | `planned` | [iterations/v32-task-aware-slack-submission.md](iterations/v32-task-aware-slack-submission.md) |
+| `0070-slack-block-validation-controls` | Slack task lifecycle controls | `candidate` | [backlog.md](backlog.md) |
 | `0071-github-job-lifecycle-controls` | GitHub job lifecycle controls | `candidate` | [backlog.md](backlog.md) |
 | `0072-pre-attempt-terminal-projection` | Pre-attempt terminal projection | `candidate` | [backlog.md](backlog.md) |
 | `0073-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
@@ -95,6 +95,7 @@ need editing when an item's status or location changes.
 | `0075-rolling-worker-protocol-compatibility` | Rolling worker protocol compatibility | `candidate` | [backlog.md](backlog.md) |
 | `0076-database-backed-worker-registry` | Database-backed worker registry | `shipped` | [archive/completed/0076-database-backed-worker-registry.md](archive/completed/0076-database-backed-worker-registry.md) |
 | `0077-worker-identity-and-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
+| `0078-slack-task-submission` | Slack task submission | `planned` | [iterations/v32-task-aware-slack-submission.md](iterations/v32-task-aware-slack-submission.md) |
 
 ## Iterations
 
@@ -132,6 +133,7 @@ need editing when an item's status or location changes.
 | `v29-protobuf-fleet-protocol` | Protobuf worker protocol | `shipped` | [archive/completed/0074-protobuf-fleet-protocol.md](archive/completed/0074-protobuf-fleet-protocol.md) |
 | `v30-database-backed-worker-registry` | Database-backed worker registry | `shipped` | [archive/completed/0076-database-backed-worker-registry.md](archive/completed/0076-database-backed-worker-registry.md) |
 | `v31-worker-identity-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
+| `v32-task-aware-slack-submission` | Task-aware Slack submission | `planned` | [iterations/v32-task-aware-slack-submission.md](iterations/v32-task-aware-slack-submission.md) |
 
 ## Decisions
 

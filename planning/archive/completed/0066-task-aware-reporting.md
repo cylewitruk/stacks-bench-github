@@ -24,7 +24,7 @@ task-specific result views and renderers.
   `0028-results-summary-restructure`, `0065-job-lifecycle-controls`
 - **unblocks:** `0067-github-block-validation-submission`,
   `0071-github-job-lifecycle-controls`, `0068-watched-ref-task-actions`,
-  `0070-slack-block-validation-controls`
+  `0078-slack-task-submission`, `0070-slack-block-validation-controls`
 - **source:** block-validation user-story audit and post-v27 sequencing review
   (2026-07)
 
@@ -432,7 +432,8 @@ never delete them as rollback.
 - Task-neutral cancel/restart/replace persistence (`0065`).
 - Durable pre-attempt cancellation/supersession projection (`0072`).
 - GitHub lifecycle commands (`0071`).
-- Task-aware LLM intent or Slack submission/control commands (`0069`/`0070`).
+- Task-aware LLM intent, Slack submission, or Slack control commands
+  (`0069`/`0078`/`0070`).
 - Watched-ref action fan-out or latest-wins policy (`0068`).
 - Placeholder/skipped checks (`0014`).
 - Benchmark metric/result restructuring (`0028`), new execution-result
@@ -441,7 +442,7 @@ never delete them as rollback.
 
 ## Follow-Ups
 
-- `0067` and `0070` add GitHub and Slack validation producers through the v27
+- `0067` and `0078` add GitHub and Slack validation producers through the v27
   submission kernel and consume this task-aware report surface.
 - `0065` defines lifecycle mutation; `0072` projects its pre-attempt terminals
   into this same snapshot; `0071` then exposes GitHub controls.

@@ -23,7 +23,7 @@ preserve the pull scheduler and attempt state machine.
   `0062-sandboxed-worker-execution`
 - **relates_to:** `0075-rolling-worker-protocol-compatibility`,
   `0067-github-block-validation-submission`,
-  `0070-slack-block-validation-controls`
+  `0078-slack-task-submission`, `0070-slack-block-validation-controls`
 - **decision:** [0004-protobuf-fleet-protocol](../../decisions/0004-protobuf-fleet-protocol.md)
 - **source:** external worker-operator deployment and protocol review
   (2026-07)
@@ -440,5 +440,6 @@ semantics remain unchanged.
 
 - `0075-rolling-worker-protocol-compatibility` adds bounded compatibility before
   the first incompatible protobuf contract change.
-- `0065-job-lifecycle-controls`, `0067-github-block-validation-submission`, and
-  `0070-slack-block-validation-controls` remain independent application work.
+- `0065-job-lifecycle-controls`, `0067-github-block-validation-submission`,
+  `0078-slack-task-submission`, and `0070-slack-block-validation-controls`
+  remain independent application work.

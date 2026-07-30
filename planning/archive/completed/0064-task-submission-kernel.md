@@ -22,7 +22,7 @@ the existing pull scheduler and fleet coordinator.
 - **unblocks:** `0065-job-lifecycle-controls`,
   `0067-github-block-validation-submission`,
   `0068-watched-ref-task-actions`,
-  `0070-slack-block-validation-controls`
+  `0078-slack-task-submission`, `0070-slack-block-validation-controls`
 - **source:** block-validation user-story audit and submission-boundary review
   (2026-07)
 
@@ -371,7 +371,7 @@ represented as having run in this development environment.
 - Task-neutral cancel/restart/replace (`0065`).
 - Task-aware reporting redesign (`0066`).
 - Watched-ref action fan-out (`0068`).
-- Slack validation or intent changes (`0069`/`0070`).
+- Slack validation or intent changes (`0069`/`0078`).
 - New scheduling algorithms, resource admission, push scheduling, general
   workflow engine, parallel benchmark runs, distributed validation shards, or
   multi-orchestrator HA.
@@ -403,5 +403,5 @@ mixed-version dual-write period is supported.
 - `0066-task-aware-reporting` consumes submission identity and task-specific
   report views.
 - `0067-github-block-validation-submission`, `0068-watched-ref-task-actions`,
-  and `0070-slack-block-validation-controls` add surfaces through the kernel;
+  and `0078-slack-task-submission` add surfaces through the kernel;
   none may introduce another persistence writer.
