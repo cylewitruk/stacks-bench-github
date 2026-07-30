@@ -17,7 +17,7 @@ configuration to daemon bootstrap and transport settings.
 > The database-authority design remains current. Its undeployed private-CA,
 > certificate-fingerprint, and worker-local configuration details are
 > intentionally continued and replaced by
-> [v31](../../iterations/v31-worker-identity-config-simplification.md) before
+> [v31](0077-worker-identity-and-config-simplification.md) before
 > the first fleet rollout.
 
 ## Item

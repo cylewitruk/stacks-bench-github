@@ -121,7 +121,6 @@ pub struct FleetConfig {
     pub listen: SocketAddr,
     pub server_certificate: PathBuf,
     pub server_private_key: PathBuf,
-    pub client_ca_certificate: PathBuf,
     pub lease_hmac_key: PathBuf,
     pub heartbeat_seconds: u64,
     pub lease_seconds: u64,
@@ -144,7 +143,6 @@ impl Default for FleetConfig {
                 .expect("valid fleet default"),
             server_certificate: "/etc/sbgh/fleet/orchestrator.crt".into(),
             server_private_key: "/etc/sbgh/fleet/orchestrator.key".into(),
-            client_ca_certificate: "/etc/sbgh/fleet/worker-ca.crt".into(),
             lease_hmac_key: "/etc/sbgh/fleet/lease-hmac.key".into(),
             heartbeat_seconds: 10,
             lease_seconds: 45,
@@ -669,7 +667,6 @@ struct RawFleet {
     listen: Option<SocketAddr>,
     server_certificate: Option<PathBuf>,
     server_private_key: Option<PathBuf>,
-    client_ca_certificate: Option<PathBuf>,
     lease_hmac_key: Option<PathBuf>,
     heartbeat_seconds: Option<u64>,
     lease_seconds: Option<u64>,
@@ -772,14 +769,6 @@ impl RawDaemon {
         merge_opt(&mut self.fleet.listen, other.fleet.listen);
         merge_opt(&mut self.fleet.server_certificate, other.fleet.server_certificate);
         merge_opt(&mut self.fleet.server_private_key, other.fleet.server_private_key);
-        merge_opt(
-            &mut self
-                .fleet
-                .client_ca_certificate,
-            other
-                .fleet
-                .client_ca_certificate,
-        );
         merge_opt(&mut self.fleet.lease_hmac_key, other.fleet.lease_hmac_key);
         merge_opt(&mut self.fleet.heartbeat_seconds, other.fleet.heartbeat_seconds);
         merge_opt(&mut self.fleet.lease_seconds, other.fleet.lease_seconds);
@@ -1020,12 +1009,6 @@ impl RawDaemon {
         env_parse_into(&mut self.fleet.listen, "SBGH_FLEET_LISTEN");
         env_path_into(&mut self.fleet.server_certificate, "SBGH_FLEET_SERVER_CERTIFICATE");
         env_path_into(&mut self.fleet.server_private_key, "SBGH_FLEET_SERVER_PRIVATE_KEY");
-        env_path_into(
-            &mut self
-                .fleet
-                .client_ca_certificate,
-            "SBGH_FLEET_CLIENT_CA_CERTIFICATE",
-        );
         env_path_into(&mut self.fleet.lease_hmac_key, "SBGH_FLEET_LEASE_HMAC_KEY");
         env_parse_into(
             &mut self
@@ -1220,10 +1203,6 @@ impl RawDaemon {
                 .fleet
                 .server_private_key
                 .unwrap_or(fleet_defaults.server_private_key),
-            client_ca_certificate: self
-                .fleet
-                .client_ca_certificate
-                .unwrap_or(fleet_defaults.client_ca_certificate),
             lease_hmac_key: self
                 .fleet
                 .lease_hmac_key

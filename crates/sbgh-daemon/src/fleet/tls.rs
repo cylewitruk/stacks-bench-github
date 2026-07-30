@@ -6,10 +6,14 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, ensure};
-use rustls::pki_types::UnixTime;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{RootCertStore, ServerConfig};
+use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{
+    CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig,
+    SignatureScheme,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,18 +21,15 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
-use uuid::Uuid;
-use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
 
-const WORKER_URI_PREFIX: &str = "urn:sbgh:worker:";
+const MAX_IDENTITY_BYTES: usize = 16 * 1024;
 const MAX_PENDING_HANDSHAKES: usize = 128;
 const ACCEPTED_CONNECTION_BUFFER: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPeer {
-    pub worker_id: Uuid,
-    pub certificate_sha256: [u8; 32],
+    pub identity_key_sha256: [u8; 32],
     pub socket_addr: SocketAddr,
 }
 
@@ -90,9 +91,8 @@ impl MtlsListener {
         address: SocketAddr,
         server_certificate: &Path,
         server_private_key: &Path,
-        client_ca_certificate: &Path,
     ) -> anyhow::Result<Self> {
-        let config = server_config(server_certificate, server_private_key, client_ca_certificate)?;
+        let config = server_config(server_certificate, server_private_key)?;
         let tcp = TcpListener::bind(address)
             .await
             .with_context(|| format!("binding worker listener on {address}"))?;
@@ -138,7 +138,7 @@ async fn run_accept_loop(
             .clone()
             .try_acquire_owned()
         else {
-            tracing::warn!(%socket_addr, "worker mTLS handshake capacity exhausted");
+            tracing::warn!(%socket_addr, "worker TLS handshake capacity exhausted");
             continue;
         };
         let acceptor = acceptor.clone();
@@ -153,29 +153,18 @@ async fn run_accept_loop(
             {
                 Ok(Ok(tls)) => tls,
                 Ok(Err(error)) => {
-                    tracing::warn!(%socket_addr, %error, "worker mTLS handshake rejected");
+                    tracing::warn!(%socket_addr, %error, "worker TLS handshake rejected");
                     return;
                 }
                 Err(_) => {
-                    tracing::warn!(%socket_addr, "worker mTLS handshake timed out");
+                    tracing::warn!(%socket_addr, "worker TLS handshake timed out");
                     return;
                 }
             };
-            let worker_id = match peer_worker_id(&tls) {
-                Ok(worker_id) => worker_id,
+            let identity_key_sha256 = match peer_identity_key_sha256(&tls) {
+                Ok(digest) => digest,
                 Err(error) => {
-                    tracing::warn!(%socket_addr, %error, "worker certificate identity rejected");
-                    return;
-                }
-            };
-            let certificate_sha256 = match peer_certificate_sha256(&tls) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    tracing::warn!(
-                        %socket_addr,
-                        %error,
-                        "worker certificate fingerprint could not be derived"
-                    );
+                    tracing::warn!(%socket_addr, %error, "worker public identity rejected");
                     return;
                 }
             };
@@ -183,8 +172,7 @@ async fn run_accept_loop(
                 .send(AuthenticatedStream {
                     inner: tls,
                     peer: AuthenticatedPeer {
-                        worker_id,
-                        certificate_sha256,
+                        identity_key_sha256,
                         socket_addr,
                     },
                 })
@@ -206,30 +194,70 @@ impl tokio_stream::Stream for MtlsListener {
     }
 }
 
-fn server_config(
-    certificate_path: &Path,
-    key_path: &Path,
-    ca_path: &Path,
-) -> anyhow::Result<ServerConfig> {
-    let server_certificates = certificates(certificate_path)?;
-    ensure!(!server_certificates.is_empty(), "server certificate chain is empty");
-    let key = private_key(key_path)?;
-    let mut roots = RootCertStore::empty();
-    for certificate in certificates(ca_path)? {
-        roots
-            .add(certificate)
-            .context("adding worker CA certificate to trust store")?;
-    }
-    ensure!(!roots.is_empty(), "worker CA certificate file is empty");
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .context("building mandatory client-certificate verifier")?;
+fn server_config(certificate_path: &Path, key_path: &Path) -> anyhow::Result<ServerConfig> {
+    let certificates = certificates(certificate_path)?;
+    ensure!(!certificates.is_empty(), "server certificate chain is empty");
     let mut config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(server_certificates, key)
+        .with_client_cert_verifier(Arc::new(PossessionVerifier))
+        .with_single_cert(certificates, private_key(key_path)?)
         .context("building TLS 1.3 worker server configuration")?;
     config.alpn_protocols = vec![b"h2".to_vec()];
     Ok(config)
+}
+
+#[derive(Debug)]
+struct PossessionVerifier;
+
+impl ClientCertVerifier for PossessionVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        if !intermediates.is_empty()
+            || canonical_spki_from_certificate(end_entity.as_ref()).is_err()
+        {
+            return Err(TlsError::InvalidCertificate(CertificateError::BadEncoding));
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::PeerIncompatible(rustls::PeerIncompatible::Tls12NotOffered))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        if dss.scheme != SignatureScheme::ECDSA_NISTP256_SHA256 {
+            return Err(TlsError::PeerMisbehaved(
+                rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme,
+            ));
+        }
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
 }
 
 fn certificates(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
@@ -240,39 +268,66 @@ fn certificates(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
         .with_context(|| format!("parsing certificate {}", path.display()))
 }
 
-pub(crate) fn validate_worker_certificate(
-    pem: &[u8],
-    worker_id: Uuid,
-    ca_path: &Path,
-) -> anyhow::Result<[u8; 32]> {
-    ensure!(pem.len() <= 64 * 1024, "worker certificate exceeds 64 KiB");
+pub(crate) fn validate_worker_identity_key(pem: &[u8]) -> anyhow::Result<[u8; 32]> {
+    ensure!(pem.len() <= MAX_IDENTITY_BYTES, "worker public key exceeds 16 KiB");
     let mut items = rustls_pemfile::read_all(&mut BufReader::new(pem))
         .collect::<Result<Vec<_>, _>>()
-        .context("parsing worker certificate PEM")?;
-    ensure!(items.len() == 1, "expected exactly one public worker leaf certificate");
-    let leaf = match items.remove(0) {
-        rustls_pemfile::Item::X509Certificate(certificate) => certificate,
-        _ => anyhow::bail!("worker enrollment accepts a public certificate only"),
+        .context("parsing worker public key PEM")?;
+    ensure!(items.len() == 1, "expected exactly one public identity key");
+    let spki = match items.remove(0) {
+        rustls_pemfile::Item::SubjectPublicKeyInfo(spki) => spki,
+        _ => anyhow::bail!("worker enrollment accepts a PUBLIC KEY only"),
     };
-    ensure!(
-        worker_id_from_certificate(leaf.as_ref())? == worker_id,
-        "worker certificate URI SAN does not match worker identity"
-    );
+    canonical_spki_digest(spki.as_ref())
+}
 
-    let mut roots = RootCertStore::empty();
-    for certificate in certificates(ca_path)? {
-        roots
-            .add(certificate)
-            .context("adding worker CA certificate to enrollment verifier")?;
-    }
-    ensure!(!roots.is_empty(), "worker CA certificate file is empty");
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .context("building worker certificate enrollment verifier")?;
-    verifier
-        .verify_client_cert(&leaf, &[], UnixTime::now())
-        .context("worker certificate is not currently valid for client authentication")?;
-    Ok(Sha256::digest(leaf.as_ref()).into())
+fn canonical_spki_digest(spki: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let key =
+        p256::PublicKey::from_public_key_der(spki).context("identity key is not P-256 SPKI")?;
+    let canonical = key
+        .to_public_key_der()
+        .context("canonicalizing P-256 identity key")?;
+    ensure!(canonical.as_bytes() == spki, "identity key SPKI is not canonical DER");
+    Ok(Sha256::digest(canonical.as_bytes()).into())
+}
+
+fn canonical_spki_from_certificate(der: &[u8]) -> anyhow::Result<&[u8]> {
+    ensure!(der.len() <= MAX_IDENTITY_BYTES, "worker TLS wrapper exceeds 16 KiB");
+    let (remainder, certificate) = parse_x509_certificate(der)
+        .map_err(|error| anyhow::anyhow!("parsing worker X.509: {error}"))?;
+    ensure!(remainder.is_empty(), "worker TLS wrapper has trailing bytes");
+    ensure!(
+        certificate
+            .validity()
+            .is_valid(),
+        "worker TLS wrapper is not currently valid"
+    );
+    ensure!(
+        certificate
+            .validity()
+            .not_after
+            .timestamp()
+            - certificate
+                .validity()
+                .not_before
+                .timestamp()
+            <= 24 * 60 * 60,
+        "worker TLS wrapper lifetime exceeds 24 hours"
+    );
+    let usage = certificate
+        .extended_key_usage()
+        .context("reading worker TLS wrapper extended key usage")?
+        .context("worker TLS wrapper lacks extended key usage")?;
+    ensure!(
+        usage.value.client_auth && !usage.value.any && !usage.value.server_auth,
+        "worker TLS wrapper is not client-auth-only"
+    );
+    let spki = certificate
+        .tbs_certificate
+        .subject_pki
+        .raw;
+    canonical_spki_digest(spki)?;
+    Ok(spki)
 }
 
 fn private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
@@ -296,562 +351,149 @@ fn private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
         .context("private key PEM contains no supported key")
 }
 
-fn peer_worker_id(stream: &TlsStream<TcpStream>) -> anyhow::Result<Uuid> {
-    let certificates = stream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .context("authenticated worker presented no certificate")?;
-    ensure!(!certificates.is_empty(), "authenticated worker certificate chain is empty");
-    worker_id_from_certificate(certificates[0].as_ref())
-}
-
-fn peer_certificate_sha256(stream: &TlsStream<TcpStream>) -> anyhow::Result<[u8; 32]> {
+fn peer_identity_key_sha256(stream: &TlsStream<TcpStream>) -> anyhow::Result<[u8; 32]> {
     let leaf = stream
         .get_ref()
         .1
         .peer_certificates()
         .and_then(|certificates| certificates.first())
-        .context("authenticated worker presented no leaf certificate")?;
-    Ok(Sha256::digest(leaf.as_ref()).into())
-}
-
-fn worker_id_from_certificate(der: &[u8]) -> anyhow::Result<Uuid> {
-    let (_, certificate) = parse_x509_certificate(der)
-        .map_err(|error| anyhow::anyhow!("parsing worker X.509: {error}"))?;
-    let san = certificate
-        .subject_alternative_name()
-        .context("reading worker URI SAN")?
-        .context("worker certificate has no subjectAltName")?;
-    let uri_names = san
-        .value
-        .general_names
-        .iter()
-        .filter_map(|name| match name {
-            GeneralName::URI(uri) => Some(*uri),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    ensure!(uri_names.len() == 1, "worker certificate must contain exactly one URI SAN");
-    let identity = uri_names[0]
-        .strip_prefix(WORKER_URI_PREFIX)
-        .context("worker URI SAN is not an sbgh worker identity")?;
-    Uuid::parse_str(identity).context("worker URI SAN contains an invalid UUID")
+        .context("authenticated worker presented no TLS wrapper")?;
+    canonical_spki_digest(canonical_spki_from_certificate(leaf.as_ref())?)
 }
 
 #[cfg(test)]
 mod tests {
-    use rcgen::{
-        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
-        KeyPair, KeyUsagePurpose, SanType, date_time_ymd,
-    };
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
     use rustls::ClientConfig;
+    use rustls::internal::msgs::codec::{Codec, Reader};
     use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
-    use tokio_rustls::TlsConnector;
-    use tokio_stream::StreamExt;
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     use super::*;
 
-    fn certificate_with_uris(uris: &[String]) -> Vec<u8> {
-        let mut parameters = CertificateParams::default();
-        parameters.subject_alt_names = uris
-            .iter()
-            .map(|uri| {
-                SanType::URI(
-                    uri.as_str()
-                        .try_into()
-                        .unwrap(),
-                )
-            })
-            .collect();
-        parameters
-            .extended_key_usages
-            .push(ExtendedKeyUsagePurpose::ClientAuth);
-        let key = KeyPair::generate().unwrap();
-        parameters
-            .self_signed(&key)
-            .unwrap()
-            .der()
-            .to_vec()
-    }
-
     #[test]
-    fn worker_identity_comes_only_from_one_exact_uri_san() {
-        let worker_id = Uuid::new_v4();
-        let valid = certificate_with_uris(&[format!("{WORKER_URI_PREFIX}{worker_id}")]);
-        assert_eq!(worker_id_from_certificate(&valid).unwrap(), worker_id);
-
-        let foreign = certificate_with_uris(&[format!("urn:other:{worker_id}")]);
-        assert!(worker_id_from_certificate(&foreign).is_err());
-
-        let ambiguous = certificate_with_uris(&[
-            format!("{WORKER_URI_PREFIX}{worker_id}"),
-            "urn:other:identity".into(),
-        ]);
-        assert!(worker_id_from_certificate(&ambiguous).is_err());
-
-        let cn_only = certificate_with_uris(&[]);
-        assert!(worker_id_from_certificate(&cn_only).is_err());
+    fn enrollment_accepts_only_canonical_p256_public_keys() {
+        let secret = p256::SecretKey::random(&mut OsRng);
+        let public = secret
+            .public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        assert_eq!(
+            validate_worker_identity_key(public.as_bytes()).unwrap(),
+            Sha256::digest(
+                secret
+                    .public_key()
+                    .to_public_key_der()
+                    .unwrap()
+                    .as_bytes()
+            )
+            .as_slice()
+        );
+        let private = secret
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap();
+        assert!(validate_worker_identity_key(private.as_bytes()).is_err());
+        let wrapper_key = KeyPair::generate().unwrap();
+        let wrapper = CertificateParams::default()
+            .self_signed(&wrapper_key)
+            .unwrap();
+        assert!(validate_worker_identity_key(wrapper.pem().as_bytes()).is_err());
+        assert!(validate_worker_identity_key(b"not a key").is_err());
     }
 
-    struct PkiFixture {
-        _directory: tempfile::TempDir,
-        server_certificate: std::path::PathBuf,
-        server_key: std::path::PathBuf,
-        ca_certificate: std::path::PathBuf,
-        client_pem: String,
-        client_private_pem: String,
-        wrong_eku_pem: String,
-        expired_pem: String,
-        not_yet_valid_pem: String,
-        client_certificate: CertificateDer<'static>,
-        client_key: PrivateKeyDer<'static>,
-    }
-
-    fn pki_fixture(worker_id: Uuid) -> PkiFixture {
-        let directory = tempfile::tempdir().unwrap();
-        let mut ca_params = CertificateParams::default();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![
-            KeyUsagePurpose::KeyCertSign,
-            KeyUsagePurpose::CrlSign,
-            KeyUsagePurpose::DigitalSignature,
-        ];
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
-
-        let mut server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
-        server_params
-            .extended_key_usages
-            .push(ExtendedKeyUsagePurpose::ServerAuth);
+    #[tokio::test]
+    async fn tls_handshake_accepts_a_matching_identity_key() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let server = server_params
-            .signed_by(&server_key, &ca)
+            .self_signed(&server_key)
             .unwrap();
 
-        let mut client_params = CertificateParams::default();
-        client_params.subject_alt_names = vec![SanType::URI(
-            format!("{WORKER_URI_PREFIX}{worker_id}")
-                .try_into()
-                .unwrap(),
-        )];
-        client_params
-            .extended_key_usages
-            .push(ExtendedKeyUsagePurpose::ClientAuth);
         let client_key = KeyPair::generate().unwrap();
+        let mut client_params = CertificateParams::default();
+        let now = time::OffsetDateTime::now_utc();
+        client_params.not_before = now - time::Duration::minutes(1);
+        client_params.not_after = now + time::Duration::hours(1);
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         let client = client_params
-            .signed_by(&client_key, &ca)
-            .unwrap();
-        let mut wrong_eku_params = client_params.clone();
-        wrong_eku_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let wrong_eku = wrong_eku_params
-            .signed_by(&KeyPair::generate().unwrap(), &ca)
-            .unwrap();
-        let mut expired_params = client_params.clone();
-        expired_params.not_before = date_time_ymd(2019, 1, 1);
-        expired_params.not_after = date_time_ymd(2020, 1, 1);
-        let expired = expired_params
-            .signed_by(&KeyPair::generate().unwrap(), &ca)
-            .unwrap();
-        let mut not_yet_valid_params = client_params.clone();
-        not_yet_valid_params.not_before = date_time_ymd(4096, 1, 1);
-        not_yet_valid_params.not_after = date_time_ymd(4097, 1, 1);
-        let not_yet_valid = not_yet_valid_params
-            .signed_by(&KeyPair::generate().unwrap(), &ca)
+            .self_signed(&client_key)
             .unwrap();
 
-        let server_certificate = directory
-            .path()
-            .join("server.crt");
-        let server_key_path = directory
-            .path()
-            .join("server.key");
-        let ca_certificate = directory
-            .path()
-            .join("ca.crt");
-        std::fs::write(&server_certificate, server.pem()).unwrap();
-        std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
-        std::fs::write(&ca_certificate, ca.pem()).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &server_key_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )
-        .unwrap();
+        let server_config =
+            ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_client_cert_verifier(Arc::new(PossessionVerifier))
+                .with_single_cert(
+                    vec![server.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+                )
+                .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(server.der().clone())
+            .unwrap();
+        let client_config =
+            ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots)
+                .with_client_auth_cert(
+                    vec![client.der().clone()],
+                    PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
+                )
+                .unwrap();
 
-        PkiFixture {
-            _directory: directory,
-            server_certificate,
-            server_key: server_key_path,
-            ca_certificate,
-            client_pem: client.pem(),
-            client_private_pem: client_key.serialize_pem(),
-            wrong_eku_pem: wrong_eku.pem(),
-            expired_pem: expired.pem(),
-            not_yet_valid_pem: not_yet_valid.pem(),
-            client_certificate: client.der().clone(),
-            client_key: PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
-        }
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let accept = TlsAcceptor::from(Arc::new(server_config)).accept(server_io);
+        let connect = TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("localhost").unwrap(), client_io);
+        let (accepted, connected) = tokio::join!(accept, connect);
+        accepted.unwrap();
+        connected.unwrap();
     }
 
     #[test]
-    fn enrollment_validates_trust_usage_and_worker_identity() {
+    fn possession_verifier_rejects_a_signature_from_an_unrelated_key() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let worker_id = Uuid::new_v4();
-        let trusted = pki_fixture(worker_id);
-        let fingerprint = validate_worker_certificate(
-            trusted.client_pem.as_bytes(),
-            worker_id,
-            &trusted.ca_certificate,
-        )
-        .unwrap();
-        assert_eq!(
-            fingerprint,
-            <[u8; 32]>::from(Sha256::digest(
-                trusted
-                    .client_certificate
-                    .as_ref()
-            ))
-        );
-        assert!(
-            validate_worker_certificate(
-                trusted.client_pem.as_bytes(),
-                Uuid::new_v4(),
-                &trusted.ca_certificate,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_certificate(
-                trusted
-                    .not_yet_valid_pem
-                    .as_bytes(),
-                worker_id,
-                &trusted.ca_certificate,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_certificate(b"not a certificate", worker_id, &trusted.ca_certificate)
-                .is_err()
-        );
-        let duplicate_leaf = format!("{}{}", trusted.client_pem, trusted.client_pem);
-        assert!(
-            validate_worker_certificate(
-                duplicate_leaf.as_bytes(),
-                worker_id,
-                &trusted.ca_certificate,
-            )
-            .is_err()
-        );
-        let certificate_with_private_key =
-            format!("{}{}", trusted.client_pem, trusted.client_private_pem);
-        assert!(
-            validate_worker_certificate(
-                certificate_with_private_key.as_bytes(),
-                worker_id,
-                &trusted.ca_certificate,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_certificate(
-                trusted
-                    .wrong_eku_pem
-                    .as_bytes(),
-                worker_id,
-                &trusted.ca_certificate,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_certificate(
-                trusted.expired_pem.as_bytes(),
-                worker_id,
-                &trusted.ca_certificate,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_certificate(
-                &vec![b'x'; 64 * 1024 + 1],
-                worker_id,
-                &trusted.ca_certificate
-            )
-            .is_err()
-        );
-        let untrusted = pki_fixture(worker_id);
-        assert!(
-            validate_worker_certificate(
-                untrusted
-                    .client_pem
-                    .as_bytes(),
-                worker_id,
-                &trusted.ca_certificate,
-            )
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn tls13_handshake_authenticates_the_worker_uri_san() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let worker_id = Uuid::new_v4();
-        let fixture = pki_fixture(worker_id);
-        let expected_fingerprint: [u8; 32] = Sha256::digest(
-            fixture
-                .client_certificate
-                .as_ref(),
-        )
-        .into();
-        let server = server_config(
-            &fixture.server_certificate,
-            &fixture.server_key,
-            &fixture.ca_certificate,
-        )
-        .unwrap();
-        let tcp = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = tcp.local_addr().unwrap();
-        let accept = tokio::spawn(async move {
-            let (stream, _) = tcp.accept().await.unwrap();
-            TlsAcceptor::from(Arc::new(server))
-                .accept(stream)
-                .await
-        });
-
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(
-                certificates(&fixture.ca_certificate)
-                    .unwrap()
-                    .remove(0),
-            )
-            .unwrap();
-        let mut client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![fixture.client_certificate], fixture.client_key)
-            .unwrap();
-        client.alpn_protocols = vec![b"h2".to_vec()];
-        let stream = TcpStream::connect(address)
-            .await
-            .unwrap();
-        let tls = TlsConnector::from(Arc::new(client))
-            .connect(ServerName::try_from("localhost").unwrap(), stream)
-            .await
-            .unwrap();
-        let server_stream = accept.await.unwrap().unwrap();
-        assert_eq!(peer_worker_id(&server_stream).unwrap(), worker_id);
-        assert_eq!(peer_certificate_sha256(&server_stream).unwrap(), expected_fingerprint);
-        assert_eq!(
-            tls.get_ref()
-                .1
-                .protocol_version(),
-            Some(rustls::ProtocolVersion::TLSv1_3)
-        );
-        assert_eq!(
-            tls.get_ref()
-                .1
-                .alpn_protocol(),
-            Some(b"h2".as_slice())
-        );
-    }
-
-    #[tokio::test]
-    async fn tls12_clients_are_rejected() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let fixture = pki_fixture(Uuid::new_v4());
-        let server = server_config(
-            &fixture.server_certificate,
-            &fixture.server_key,
-            &fixture.ca_certificate,
-        )
-        .unwrap();
-        let tcp = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = tcp.local_addr().unwrap();
-        let accept = tokio::spawn(async move {
-            let (stream, _) = tcp.accept().await.unwrap();
-            TlsAcceptor::from(Arc::new(server))
-                .accept(stream)
-                .await
-        });
-
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(
-                certificates(&fixture.ca_certificate)
-                    .unwrap()
-                    .remove(0),
-            )
-            .unwrap();
-        let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![fixture.client_certificate], fixture.client_key)
-            .unwrap();
-        let stream = TcpStream::connect(address)
-            .await
-            .unwrap();
-        let client_result = TlsConnector::from(Arc::new(client))
-            .connect(ServerName::try_from("localhost").unwrap(), stream)
-            .await;
-        let server_result = accept.await.unwrap();
-        assert!(
-            client_result.is_err() || server_result.is_err(),
-            "TLS 1.2 unexpectedly reached the fleet listener"
-        );
-    }
-
-    #[tokio::test]
-    async fn plaintext_http_cannot_reach_the_authenticated_stream() {
-        use tokio::io::AsyncWriteExt;
-
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let fixture = pki_fixture(Uuid::new_v4());
-        let mut listener = MtlsListener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            &fixture.server_certificate,
-            &fixture.server_key,
-            &fixture.ca_certificate,
-        )
-        .await
-        .unwrap();
-        let mut plaintext = TcpStream::connect(listener.local_addr())
-            .await
-            .unwrap();
-        plaintext
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .await
-            .unwrap();
-        plaintext
-            .shutdown()
-            .await
+        let victim_key = KeyPair::generate().unwrap();
+        let mut victim_params = CertificateParams::default();
+        let now = time::OffsetDateTime::now_utc();
+        victim_params.not_before = now - time::Duration::minutes(1);
+        victim_params.not_after = now + time::Duration::hours(1);
+        victim_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let victim = victim_params
+            .self_signed(&victim_key)
             .unwrap();
 
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), listener.next())
-                .await
-                .is_err(),
-            "plaintext HTTP unexpectedly produced an authenticated fleet stream"
-        );
-    }
+        let message = b"TLS 1.3 CertificateVerify adversarial fixture";
+        let attacker = SigningKey::random(&mut OsRng);
+        let forged: Signature = attacker.sign(message);
+        let forged_der = forged.to_der();
 
-    #[tokio::test]
-    async fn stalled_client_hello_does_not_block_an_authenticated_worker() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let worker_id = Uuid::new_v4();
-        let fixture = pki_fixture(worker_id);
-        let mut listener = MtlsListener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            &fixture.server_certificate,
-            &fixture.server_key,
-            &fixture.ca_certificate,
-        )
-        .await
-        .unwrap();
-        let address = listener.local_addr();
-        let _stalled = TcpStream::connect(address)
-            .await
-            .unwrap();
-
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(
-                certificates(&fixture.ca_certificate)
-                    .unwrap()
-                    .remove(0),
-            )
-            .unwrap();
-        let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![fixture.client_certificate], fixture.client_key)
-            .unwrap();
-        let connect = async {
-            let stream = TcpStream::connect(address)
-                .await
-                .unwrap();
-            TlsConnector::from(Arc::new(client))
-                .connect(ServerName::try_from("localhost").unwrap(), stream)
-                .await
+        // `DigitallySignedStruct::new` is crate-private in rustls. Decode its
+        // normal TLS wire representation through rustls's explicitly
+        // test-oriented internal codec.
+        let mut encoded = Vec::new();
+        SignatureScheme::ECDSA_NISTP256_SHA256.encode(&mut encoded);
+        encoded.extend_from_slice(
+            &u16::try_from(forged_der.as_bytes().len())
                 .unwrap()
-        };
-        let (_, accepted) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            tokio::join!(connect, listener.next())
-        })
-        .await
-        .expect("valid worker handshake must bypass the stalled client");
-        let accepted = accepted
-            .expect("listener remains open")
-            .expect("authenticated stream");
-        assert_eq!(accepted.peer.worker_id, worker_id);
-    }
+                .to_be_bytes(),
+        );
+        encoded.extend_from_slice(forged_der.as_bytes());
+        let mut reader = Reader::init(&encoded);
+        let forged_dss = DigitallySignedStruct::read(&mut reader).unwrap();
+        reader
+            .expect_empty("forged DigitallySignedStruct")
+            .unwrap();
 
-    #[tokio::test]
-    async fn dropping_listener_releases_the_bound_socket() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let fixture = pki_fixture(Uuid::new_v4());
-        let listener = MtlsListener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            &fixture.server_certificate,
-            &fixture.server_key,
-            &fixture.ca_certificate,
-        )
-        .await
-        .unwrap();
-        let address = listener.local_addr;
-        drop(listener);
-        tokio::task::yield_now().await;
-        TcpListener::bind(address)
-            .await
-            .expect("listener drop must abort its background accept task");
-    }
-
-    #[tokio::test]
-    async fn client_certificate_from_an_untrusted_ca_is_rejected() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let trusted = pki_fixture(Uuid::new_v4());
-        let untrusted = pki_fixture(Uuid::new_v4());
-        let server = server_config(
-            &trusted.server_certificate,
-            &trusted.server_key,
-            &trusted.ca_certificate,
-        )
-        .unwrap();
-        let tcp = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = tcp.local_addr().unwrap();
-        let accept = tokio::spawn(async move {
-            let (stream, _) = tcp.accept().await.unwrap();
-            TlsAcceptor::from(Arc::new(server))
-                .accept(stream)
-                .await
-        });
-
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(
-                certificates(&trusted.ca_certificate)
-                    .unwrap()
-                    .remove(0),
-            )
-            .unwrap();
-        let client = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![untrusted.client_certificate], untrusted.client_key)
-            .unwrap();
-        let stream = TcpStream::connect(address)
-            .await
-            .unwrap();
-        let client_result = TlsConnector::from(Arc::new(client))
-            .connect(ServerName::try_from("localhost").unwrap(), stream)
-            .await;
-        let server_result = accept.await.unwrap();
+        let result = PossessionVerifier.verify_tls13_signature(message, victim.der(), &forged_dss);
         assert!(
-            client_result.is_err() || server_result.is_err(),
-            "untrusted client certificate unexpectedly completed mTLS"
+            result.is_err(),
+            "daemon verifier accepted CertificateVerify from an unrelated private key"
         );
     }
 }

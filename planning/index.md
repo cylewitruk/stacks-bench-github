@@ -94,7 +94,7 @@ need editing when an item's status or location changes.
 | `0074-protobuf-fleet-protocol` | Protobuf worker protocol | `shipped` | [archive/completed/0074-protobuf-fleet-protocol.md](archive/completed/0074-protobuf-fleet-protocol.md) |
 | `0075-rolling-worker-protocol-compatibility` | Rolling worker protocol compatibility | `candidate` | [backlog.md](backlog.md) |
 | `0076-database-backed-worker-registry` | Database-backed worker registry | `shipped` | [archive/completed/0076-database-backed-worker-registry.md](archive/completed/0076-database-backed-worker-registry.md) |
-| `0077-worker-identity-and-config-simplification` | Worker identity and configuration simplification | `planned` | [iterations/v31-worker-identity-config-simplification.md](iterations/v31-worker-identity-config-simplification.md) |
+| `0077-worker-identity-and-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
 
 ## Iterations
 
@@ -131,7 +131,7 @@ need editing when an item's status or location changes.
 | `v28-task-aware-reporting` | Task-aware reporting and validation results | `shipped` | [archive/completed/0066-task-aware-reporting.md](archive/completed/0066-task-aware-reporting.md) |
 | `v29-protobuf-fleet-protocol` | Protobuf worker protocol | `shipped` | [archive/completed/0074-protobuf-fleet-protocol.md](archive/completed/0074-protobuf-fleet-protocol.md) |
 | `v30-database-backed-worker-registry` | Database-backed worker registry | `shipped` | [archive/completed/0076-database-backed-worker-registry.md](archive/completed/0076-database-backed-worker-registry.md) |
-| `v31-worker-identity-config-simplification` | Worker identity and configuration simplification | `planned` | [iterations/v31-worker-identity-config-simplification.md](iterations/v31-worker-identity-config-simplification.md) |
+| `v31-worker-identity-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
 
 ## Decisions
 

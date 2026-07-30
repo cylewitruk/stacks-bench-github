@@ -60,11 +60,10 @@ message ResourceFacts {
 
 message RegisterRequest {
   uint32 protocol_version = 1;
-  string worker_id = 2;
-  string worker_session_id = 3;
-  string software_version = 4;
-  repeated WorkerCapability advertised_capabilities = 5;
-  ResourceFacts resources = 6;
+  string worker_session_id = 2;
+  string software_version = 3;
+  repeated WorkerCapability advertised_capabilities = 4;
+  ResourceFacts resources = 5;
 }
 
 message RegisterResponse {

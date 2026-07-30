@@ -348,11 +348,10 @@ async fn valid_worker_constraint_persists_without_an_assignment() {
     let worker_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO worker_registry
-            (worker_id, identity_uri, display_name, allowed_capabilities)
-         VALUES ($1, $2, 'offline', ARRAY['benchmark']::worker_capability[])",
+            (worker_id, display_name, allowed_capabilities)
+         VALUES ($1, 'offline', ARRAY['benchmark']::worker_capability[])",
     )
     .bind(worker_id)
-    .bind(format!("urn:sbgh:worker:{worker_id}"))
     .execute(&pool)
     .await
     .unwrap();

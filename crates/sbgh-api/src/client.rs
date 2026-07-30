@@ -8,8 +8,8 @@ use crate::dto::{
     FleetRecoveryRequest, FleetRecoveryResponse, FleetWorkerView, GrantRoleResult, HealthResponse,
     InstallationView, InstallerView, JobView, PinTriggerRequest, PolicyView, RepoRootView,
     ResolveRepoResponse, RoleRequest, RoleView, SubmissionReportView, TriggerView, UserView,
-    WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerCertificateRequest,
-    WorkerCreateRequest, WorkerDrainRequest, WorkerPolicyView, WorkerUpdateRequest,
+    WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerCreateRequest, WorkerDrainRequest,
+    WorkerIdentityRequest, WorkerPolicyView, WorkerUpdateRequest,
 };
 use crate::error::ApiError;
 
@@ -334,24 +334,24 @@ impl Client {
             .await
     }
 
-    pub async fn authorize_worker_certificate(
+    pub async fn authorize_worker_identity_key(
         &self,
         worker_id: &str,
-        certificate_pem: String,
+        public_key_pem: String,
     ) -> Result<WorkerPolicyView, ClientError> {
         self.post_json(
-            &format!("/api/fleet/workers/{worker_id}/certificates"),
-            &WorkerCertificateRequest { certificate_pem },
+            &format!("/api/fleet/workers/{worker_id}/identities"),
+            &WorkerIdentityRequest { public_key_pem },
         )
         .await
     }
 
-    pub async fn revoke_worker_certificate(
+    pub async fn revoke_worker_identity_key(
         &self,
         worker_id: &str,
-        fingerprint: &str,
+        identity: &str,
     ) -> Result<WorkerPolicyView, ClientError> {
-        self.delete(&format!("/api/fleet/workers/{worker_id}/certificates/{fingerprint}"))
+        self.delete(&format!("/api/fleet/workers/{worker_id}/identities/{identity}"))
             .await
     }
 
@@ -363,13 +363,13 @@ impl Client {
             .await
     }
 
-    pub async fn emergency_revoke_worker_certificate(
+    pub async fn emergency_revoke_worker_identity_key(
         &self,
         worker_id: &str,
-        fingerprint: &str,
+        identity: &str,
     ) -> Result<WorkerPolicyView, ClientError> {
         self.post_json(
-            &format!("/api/fleet/workers/{worker_id}/certificates/{fingerprint}/emergency-revoke"),
+            &format!("/api/fleet/workers/{worker_id}/identities/{identity}/emergency-revoke"),
             &(),
         )
         .await

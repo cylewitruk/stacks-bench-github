@@ -435,7 +435,7 @@ enum FleetAction {
         #[arg(long)]
         measurement_profile: Option<String>,
     },
-    /// Show one worker policy and its certificate fingerprints.
+    /// Show one worker policy and its identity keys.
     ShowWorker {
         #[arg(long)]
         worker_id: String,
@@ -453,7 +453,7 @@ enum FleetAction {
         #[arg(long)]
         clear_measurement_profile: bool,
     },
-    /// Enable a drained worker after authorizing a certificate.
+    /// Enable a drained worker after authorizing an identity key.
     EnableWorker {
         #[arg(long)]
         worker_id: String,
@@ -468,26 +468,26 @@ enum FleetAction {
         #[arg(long)]
         worker_id: String,
     },
-    /// Validate and authorize a public worker leaf certificate.
-    AuthorizeCertificate {
+    /// Validate and authorize a worker public identity key.
+    AuthorizeIdentity {
         #[arg(long)]
         worker_id: String,
         #[arg(long)]
-        certificate: PathBuf,
+        public_key: PathBuf,
     },
-    /// Revoke an authorized certificate fingerprint.
-    RevokeCertificate {
+    /// Revoke an authorized identity-key digest.
+    RevokeIdentity {
         #[arg(long)]
         worker_id: String,
         #[arg(long)]
-        fingerprint: String,
+        identity: String,
     },
-    /// Immediately revoke a certificate and expire sessions using it.
-    EmergencyRevokeCertificate {
+    /// Immediately revoke an identity key and expire sessions using it.
+    EmergencyRevokeIdentity {
         #[arg(long)]
         worker_id: String,
         #[arg(long)]
-        fingerprint: String,
+        identity: String,
     },
     /// Stop a worker from claiming new work after its active attempt.
     Drain {
@@ -1326,27 +1326,27 @@ async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
                 .with_context(|| format!("emergency-disable worker {worker_id}"))?;
             print_worker_policy(&worker);
         }
-        FleetAction::AuthorizeCertificate { worker_id, certificate } => {
-            let certificate_pem = std::fs::read_to_string(&certificate)
-                .with_context(|| format!("reading {}", certificate.display()))?;
+        FleetAction::AuthorizeIdentity { worker_id, public_key } => {
+            let public_key_pem = std::fs::read_to_string(&public_key)
+                .with_context(|| format!("reading {}", public_key.display()))?;
             let worker = client
-                .authorize_worker_certificate(&worker_id, certificate_pem)
+                .authorize_worker_identity_key(&worker_id, public_key_pem)
                 .await
-                .with_context(|| format!("authorize certificate for worker {worker_id}"))?;
+                .with_context(|| format!("authorize identity for worker {worker_id}"))?;
             print_worker_policy(&worker);
         }
-        FleetAction::RevokeCertificate { worker_id, fingerprint } => {
+        FleetAction::RevokeIdentity { worker_id, identity } => {
             let worker = client
-                .revoke_worker_certificate(&worker_id, &fingerprint)
+                .revoke_worker_identity_key(&worker_id, &identity)
                 .await
-                .with_context(|| format!("revoke certificate for worker {worker_id}"))?;
+                .with_context(|| format!("revoke identity for worker {worker_id}"))?;
             print_worker_policy(&worker);
         }
-        FleetAction::EmergencyRevokeCertificate { worker_id, fingerprint } => {
+        FleetAction::EmergencyRevokeIdentity { worker_id, identity } => {
             let worker = client
-                .emergency_revoke_worker_certificate(&worker_id, &fingerprint)
+                .emergency_revoke_worker_identity_key(&worker_id, &identity)
                 .await
-                .with_context(|| format!("emergency-revoke certificate for worker {worker_id}"))?;
+                .with_context(|| format!("emergency-revoke identity for worker {worker_id}"))?;
             print_worker_policy(&worker);
         }
         FleetAction::Drain { worker_id } => {

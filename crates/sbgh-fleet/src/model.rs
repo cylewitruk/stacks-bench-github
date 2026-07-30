@@ -22,7 +22,6 @@ pub struct ResourceFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterSessionRequest {
     pub protocol_version: u16,
-    pub worker_id: Uuid,
     pub worker_session_id: Uuid,
     pub software_version: String,
     pub advertised_capabilities: BTreeSet<WorkerCapability>,

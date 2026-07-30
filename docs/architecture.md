@@ -170,17 +170,15 @@ defined result code.
 
 ## Network and identity
 
-The worker listener is separate from the operator API and requires TLS 1.3
-mutual X.509 authentication. It accepts protobuf/gRPC over HTTP/2 only; there
-is no JSON worker API. A client certificate must contain exactly one URI
-identity SAN:
+The worker listener is separate from the operator API and requires TLS 1.3.
+It accepts protobuf/gRPC over HTTP/2 only; there is no JSON worker API. The
+daemon uses a Web-PKI server certificate. Each worker proves possession of a
+P-256 identity key through an in-memory, self-signed TLS wrapper; the wrapper's
+issuer, names, and certificate digest have no authorization meaning.
 
-```text
-urn:sbgh:worker:<worker-uuid>
-```
-
-The daemon ignores Common Name. TLS authenticates the certificate identity;
-PostgreSQL authorizes its active SHA-256 fingerprint, capabilities,
+The daemon derives the canonical SPKI SHA-256 digest from the authenticated
+handshake. PostgreSQL maps that digest to a stable worker UUID and authorizes
+its active identity key, capabilities,
 measurement profile, enabled state, and drain state on every RPC. Registration
 records current worker advertisement, whose capabilities can only narrow
 server policy. Enrollment and rotation use the admin API and do not require a

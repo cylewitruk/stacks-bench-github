@@ -217,7 +217,6 @@ mod tests {
             pool: pool.clone(),
             ingest: Arc::new(PostgresIngestStore::new(pool.clone())),
             gh_api_base: "https://api.github.com".into(),
-            worker_ca_certificate: "worker-ca.pem".into(),
         };
         build_router(state, tokens)
     }

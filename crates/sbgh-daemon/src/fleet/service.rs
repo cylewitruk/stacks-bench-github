@@ -130,15 +130,8 @@ pub(super) async fn register(
     peer: &AuthenticatedPeer,
     request: RegisterSessionRequest,
 ) -> ServiceResult<RegisterSessionResponse> {
-    if request.worker_id != peer.worker_id {
-        return Err(service_error(
-            ServiceCode::PermissionDenied,
-            "worker_identity_mismatch",
-            "certificate identity does not match the requested worker",
-            false,
-        ));
-    }
     let configured = authorized_worker(state, peer).await?;
+    let worker_id = configured.worker_id;
     validate(&request)?;
     if request
         .advertised_capabilities
@@ -159,15 +152,15 @@ pub(super) async fn register(
     let session = state
         .store
         .register_session(
-            peer.worker_id,
-            peer.certificate_sha256,
+            worker_id,
+            peer.identity_key_sha256,
             &request,
             chrono_duration(state.config.session_ttl())?,
         )
         .await
         .map_err(internal)?;
     tracing::info!(
-        worker_id = %peer.worker_id,
+        worker_id = %worker_id,
         session_id = %session.worker_session_id,
         peer = %peer.socket_addr,
         capabilities = ?session.effective_capabilities,
@@ -192,11 +185,13 @@ pub(super) async fn poll(
     peer: &AuthenticatedPeer,
     request: PollRequest,
 ) -> ServiceResult<PollResponse> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
     if !state
         .store
-        .session_is_active(peer.worker_id, request.worker_session_id)
+        .session_is_active(worker_id, request.worker_session_id)
         .await
         .map_err(internal)?
     {
@@ -209,7 +204,7 @@ pub(super) async fn poll(
     }
     let _poll_guard = state
         .active_polls
-        .enter(peer.worker_id, request.worker_session_id)
+        .enter(worker_id, request.worker_session_id)
         .ok_or_else(|| {
             service_error(
                 ServiceCode::FailedPrecondition,
@@ -226,7 +221,7 @@ pub(super) async fn poll(
         if let Some(mut offered) = state
             .store
             .poll_offer(
-                peer.worker_id,
+                worker_id,
                 request.worker_session_id,
                 chrono_duration(state.config.offer_ttl())?,
                 chrono_duration(state.config.lease_ttl())?,
@@ -238,7 +233,7 @@ pub(super) async fn poll(
                 .offer
                 .identity
                 .lease_token = state.signer.issue(
-                peer.worker_id,
+                worker_id,
                 offered
                     .offer
                     .identity
@@ -253,7 +248,7 @@ pub(super) async fn poll(
                     .fencing_generation,
             );
             tracing::info!(
-                worker_id = %peer.worker_id,
+                worker_id = %worker_id,
                 attempt_id = %offered.offer.identity.attempt_id,
                 job_id = %offered.offer.job_id,
                 trace_id = %offered.offer.trace_id,
@@ -263,7 +258,7 @@ pub(super) async fn poll(
         }
         if state
             .store
-            .session_is_draining(peer.worker_id, request.worker_session_id)
+            .session_is_draining(worker_id, request.worker_session_id)
             .await
             .map_err(internal)?
         {
@@ -271,7 +266,7 @@ pub(super) async fn poll(
         }
         if !state
             .store
-            .session_is_active(peer.worker_id, request.worker_session_id)
+            .session_is_active(worker_id, request.worker_session_id)
             .await
             .map_err(internal)?
         {
@@ -294,18 +289,20 @@ pub(super) async fn accept(
     peer: &AuthenticatedPeer,
     request: AcceptOfferRequest,
 ) -> ServiceResult<AcceptOfferResponse> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
-    authorize_attempt(state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, worker_id, &request.identity)?;
     let offered = state
         .store
-        .offered_assignment(peer.worker_id, &request.identity)
+        .offered_assignment(worker_id, &request.identity)
         .await
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
     let accepted = state
         .store
-        .accept_offer(peer.worker_id, &request.identity, chrono_duration(state.config.lease_ttl())?)
+        .accept_offer(worker_id, &request.identity, chrono_duration(state.config.lease_ttl())?)
         .await
         .map_err(internal)?;
     if !accepted {
@@ -334,13 +331,15 @@ pub(super) async fn repository_credential(
     peer: &AuthenticatedPeer,
     request: RepositoryCredentialRequest,
 ) -> ServiceResult<RepositoryCredentialResponse> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
-    authorize_attempt(state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, worker_id, &request.identity)?;
     let heartbeat = state
         .store
         .heartbeat_attempt(
-            peer.worker_id,
+            worker_id,
             &request.identity,
             chrono_duration(state.config.lease_ttl())?,
             None,
@@ -358,7 +357,7 @@ pub(super) async fn repository_credential(
     }
     let offered = state
         .store
-        .offered_assignment(peer.worker_id, &request.identity)
+        .offered_assignment(worker_id, &request.identity)
         .await
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
@@ -392,13 +391,15 @@ pub(super) async fn heartbeat(
     peer: &AuthenticatedPeer,
     request: HeartbeatRequest,
 ) -> ServiceResult<HeartbeatResponse> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
-    authorize_attempt(state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, worker_id, &request.identity)?;
     let heartbeat = state
         .store
         .heartbeat_attempt(
-            peer.worker_id,
+            worker_id,
             &request.identity,
             chrono_duration(state.config.lease_ttl())?,
             Some(request.reliable_buffer_len),
@@ -420,19 +421,21 @@ pub(super) async fn event(
     peer: &AuthenticatedPeer,
     request: ReliableEventEnvelope,
 ) -> ServiceResult<ReliableEventAck> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
-    authorize_attempt(state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, worker_id, &request.identity)?;
     let ingest = state
         .store
-        .ingest_reliable_event(peer.worker_id, &request)
+        .ingest_reliable_event(worker_id, &request)
         .await
         .map_err(internal)?;
     accept_event_ingest(ingest)?;
     let heartbeat = state
         .store
         .heartbeat_attempt(
-            peer.worker_id,
+            worker_id,
             &request.identity,
             chrono_duration(state.config.lease_ttl())?,
             None,
@@ -466,12 +469,14 @@ pub(super) async fn progress(
     peer: &AuthenticatedPeer,
     request: ProgressRequest,
 ) -> ServiceResult<bool> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
-    authorize_attempt(state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, worker_id, &request.identity)?;
     let offered = state
         .store
-        .offered_assignment(peer.worker_id, &request.identity)
+        .offered_assignment(worker_id, &request.identity)
         .await
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
@@ -485,14 +490,14 @@ pub(super) async fn progress(
     }
     let accepted = state
         .store
-        .ingest_progress(peer.worker_id, &request)
+        .ingest_progress(worker_id, &request)
         .await
         .map_err(internal)?;
     if !accepted {
         return Err(stale_attempt());
     }
     tracing::info!(
-        worker_id = %peer.worker_id,
+        worker_id = %worker_id,
         attempt_id = %request.identity.attempt_id,
         trace_id = %request.trace_id,
         progress_seq = request.progress_seq,
@@ -551,13 +556,15 @@ pub(super) async fn artifact_grant(
     peer: &AuthenticatedPeer,
     request: ArtifactGrantRequest,
 ) -> ServiceResult<ArtifactGrantResponse> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
-    authorize_attempt(state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, worker_id, &request.identity)?;
     if request.operation == ArtifactOperation::Get {
         let offered = state
             .store
-            .offered_assignment(peer.worker_id, &request.identity)
+            .offered_assignment(worker_id, &request.identity)
             .await
             .map_err(internal)?
             .ok_or_else(stale_attempt)?;
@@ -599,7 +606,7 @@ pub(super) async fn artifact_grant(
     }
     let offered = state
         .store
-        .offered_assignment(peer.worker_id, &request.identity)
+        .offered_assignment(worker_id, &request.identity)
         .await
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
@@ -684,12 +691,14 @@ pub(super) async fn complete(
     peer: &AuthenticatedPeer,
     request: CompleteAttemptRequest,
 ) -> ServiceResult<CompleteAttemptResponse> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
-    authorize_attempt(state, peer.worker_id, &request.identity)?;
+    authorize_attempt(state, worker_id, &request.identity)?;
     let offered = state
         .store
-        .completion_assignment(peer.worker_id, &request.identity)
+        .completion_assignment(worker_id, &request.identity)
         .await
         .map_err(internal)?
         .ok_or_else(stale_attempt)?;
@@ -765,7 +774,7 @@ pub(super) async fn complete(
     let acceptance = state
         .store
         .accept_terminal(
-            peer.worker_id,
+            worker_id,
             &request.identity,
             &FleetTerminalSubmission {
                 reliable_seq: request.terminal_reliable_seq,
@@ -805,11 +814,13 @@ pub(super) async fn cleanup(
     peer: &AuthenticatedPeer,
     request: CleanupListRequest,
 ) -> ServiceResult<Vec<CleanupItem>> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
     let obligations = state
         .store
-        .cleanup_obligations(peer.worker_id, request.worker_session_id)
+        .cleanup_obligations(worker_id, request.worker_session_id)
         .await
         .map_err(internal)?;
     Ok(obligations
@@ -828,18 +839,20 @@ pub(super) async fn cleanup_complete(
     peer: &AuthenticatedPeer,
     request: CleanupCompleteRequest,
 ) -> ServiceResult<bool> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
     let completed = state
         .store
-        .complete_cleanup(peer.worker_id, request.worker_session_id, request.obligation_id)
+        .complete_cleanup(worker_id, request.worker_session_id, request.obligation_id)
         .await
         .map_err(internal)?;
     if !completed {
         return Err(stale_attempt());
     }
     tracing::info!(
-        worker_id = %peer.worker_id,
+        worker_id = %worker_id,
         session_id = %request.worker_session_id,
         obligation_id = request.obligation_id,
         "worker cleanup obligation completed"
@@ -852,11 +865,13 @@ pub(super) async fn deregister(
     peer: &AuthenticatedPeer,
     request: DeregisterSessionRequest,
 ) -> ServiceResult<bool> {
-    authorized_worker(state, peer).await?;
+    let worker_id = authorized_worker(state, peer)
+        .await?
+        .worker_id;
     validate(&request)?;
     let deregistered = state
         .store
-        .deregister_session(peer.worker_id, request.worker_session_id)
+        .deregister_session(worker_id, request.worker_session_id)
         .await
         .map_err(internal)?;
     Ok(deregistered)
@@ -1104,14 +1119,14 @@ async fn authorize_peer(
     peer: &AuthenticatedPeer,
 ) -> ServiceResult<WorkerAuthorization> {
     let worker = registry
-        .authorize_worker(peer.worker_id, peer.certificate_sha256)
+        .authorize_worker(peer.identity_key_sha256)
         .await
         .map_err(internal)?
         .ok_or_else(|| {
             service_error(
                 ServiceCode::PermissionDenied,
                 "worker_not_registered",
-                "worker identity, enabled state, or certificate authorization is invalid",
+                "worker identity or enabled state is invalid",
                 false,
             )
         })?;
@@ -1177,7 +1192,7 @@ mod tests {
 
     use async_trait::async_trait;
     use sbgh_core::db::fleet::{
-        WorkerAuthorization, WorkerCertificateRecord, WorkerPolicyPatch, WorkerRegistration,
+        WorkerAuthorization, WorkerIdentityRecord, WorkerPolicyPatch, WorkerRegistration,
         WorkerRegistryEntry, WorkerRegistryMutation, WorkerRegistryStore,
     };
     use sbgh_fleet::{
@@ -1213,7 +1228,7 @@ mod tests {
             Ok(WorkerRegistryMutation::NotFound)
         }
 
-        async fn authorize_certificate(
+        async fn authorize_identity(
             &self,
             _: uuid::Uuid,
             _: [u8; 32],
@@ -1221,7 +1236,7 @@ mod tests {
             Ok(WorkerRegistryMutation::NotFound)
         }
 
-        async fn revoke_certificate(
+        async fn revoke_identity(
             &self,
             _: uuid::Uuid,
             _: [u8; 32],
@@ -1236,7 +1251,7 @@ mod tests {
             Ok(WorkerRegistryMutation::NotFound)
         }
 
-        async fn emergency_revoke_certificate(
+        async fn emergency_revoke_identity(
             &self,
             _: uuid::Uuid,
             _: [u8; 32],
@@ -1244,10 +1259,10 @@ mod tests {
             Ok(WorkerRegistryMutation::NotFound)
         }
 
-        async fn worker_certificates(
+        async fn worker_identities(
             &self,
             _: uuid::Uuid,
-        ) -> sbgh_core::Result<Vec<WorkerCertificateRecord>> {
+        ) -> sbgh_core::Result<Vec<WorkerIdentityRecord>> {
             Ok(Vec::new())
         }
 
@@ -1260,14 +1275,13 @@ mod tests {
 
         async fn authorize_worker(
             &self,
-            worker_id: uuid::Uuid,
             _: [u8; 32],
         ) -> sbgh_core::Result<Option<WorkerAuthorization>> {
             Ok(self
                 .authorized
                 .load(Ordering::SeqCst)
                 .then_some(WorkerAuthorization {
-                    worker_id,
+                    worker_id: uuid::Uuid::from_u128(1),
                     allowed_capabilities: vec![sbgh_fleet::WorkerCapability::BuildOnly],
                     measurement_profile: None,
                     draining: false,
@@ -1290,8 +1304,7 @@ mod tests {
             .authorized
             .store(true, Ordering::SeqCst);
         let peer = crate::fleet::tls::AuthenticatedPeer {
-            worker_id: uuid::Uuid::new_v4(),
-            certificate_sha256: [0x77; 32],
+            identity_key_sha256: [0x77; 32],
             socket_addr: "127.0.0.1:1234"
                 .parse()
                 .unwrap(),

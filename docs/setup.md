@@ -223,48 +223,25 @@ The daemon API must not bind a public interface. Determine the Docker bridge
 gateway with `docker network inspect bridge` or `ip addr show docker0`, and
 firewall that listener to the local Docker network.
 
-## 6. Create the worker PKI
+## 6. Configure fleet TLS
 
-Keep the CA key offline after certificate issuance. The following example uses
-a temporary protected directory; move its encrypted CA key to offline storage
-when finished.
-
-```bash
-PKI_DIR=$(mktemp -d)
-chmod 0700 "$PKI_DIR"
-./scripts/fleet-pki.sh init-ca "$PKI_DIR/ca"
-./scripts/fleet-pki.sh server \
-  "$PKI_DIR/ca" "$PKI_DIR/server" fleet.internal.example
-```
-
-For each worker, choose a UUID and issue one certificate:
-
-```bash
-WORKER_ID=$(uuidgen)
-./scripts/fleet-pki.sh worker \
-  "$PKI_DIR/ca" "$PKI_DIR/worker-$WORKER_ID" "$WORKER_ID"
-```
-
-Install the daemon-side TLS material and lease key:
+Give the fleet endpoint a public DNS name and a Web-PKI certificate (for
+example, from Let's Encrypt). Install its full chain and private key:
 
 ```bash
 sudo install -m 0644 -o sbgh -g sbgh \
-  "$PKI_DIR/server/server.crt" /etc/sbgh/fleet/orchestrator.crt
+  /path/to/fullchain.pem /etc/sbgh/fleet/orchestrator.crt
 sudo install -m 0600 -o sbgh -g sbgh \
-  "$PKI_DIR/server/server.key" /etc/sbgh/fleet/orchestrator.key
-sudo install -m 0644 -o sbgh -g sbgh \
-  "$PKI_DIR/ca/ca.crt" /etc/sbgh/fleet/worker-ca.crt
+  /path/to/privkey.pem /etc/sbgh/fleet/orchestrator.key
 sudo sh -c 'umask 077; openssl rand -out /etc/sbgh/fleet/lease-hmac.key 32'
 sudo chown sbgh:sbgh /etc/sbgh/fleet/lease-hmac.key
 ```
 
-The server certificate DNS SAN must match every worker's
-`orchestrator_url`. Expose the fleet listener only on the private worker
-network. It serves protobuf/gRPC over HTTP/2; do not place an HTTP/1-only
-reverse proxy in front of it. TLS 1.3 mutual authentication is mandatory even
-for a worker on the daemon host. Securely transfer each worker's leaf
-certificate/key and the CA certificate to that worker; never transfer the CA
-private key.
+The certificate DNS SAN must match every worker's `orchestrator_url`. The
+listener serves protobuf/gRPC over HTTP/2; do not put an HTTP/1-only proxy in
+front of it. Configure the ACME renewal hook to copy the renewed full chain
+and key, preserve their ownership/modes, and restart `sbgh-daemon.service`.
+Workers reconnect using the unchanged URL and platform trust store.
 
 ## 7. Configure the daemon secrets and install binaries
 
@@ -349,25 +326,25 @@ are safely reachable from the host. The ceremony must prove dependency egress
 works while host, private, metadata, IPv6, and configured protected
 destinations remain inaccessible.
 
-### Worker config, certificate, and host authority
+### Worker identity and host authority
 
-Install the matching worker certificate and CA:
+Generate a non-exported P-256 identity on each worker. The command creates the
+private key with mode `0600`, refuses overwrite, and prints only its public
+SPKI:
 
 ```bash
-sudo install -m 0644 -o sbgh-worker -g sbgh-worker \
-  /path/to/issued-worker/client.crt /etc/sbgh/worker/client.crt
-sudo install -m 0600 -o sbgh-worker -g sbgh-worker \
-  /path/to/issued-worker/client.key /etc/sbgh/worker/client.key
-sudo install -m 0644 -o sbgh-worker -g sbgh-worker \
-  /path/to/orchestrator-ca.crt /etc/sbgh/worker/orchestrator-ca.crt
+sudo -u sbgh-worker sbgh-worker identity generate \
+  --private-key /etc/sbgh/worker/identity.key \
+  > /tmp/sbgh-worker-public.pem
 ```
 
 Copy either
 [config.example.worker-benchmark.toml](../config.example.worker-benchmark.toml)
 or
 [config.example.worker-block-validation.toml](../config.example.worker-block-validation.toml)
-to `/etc/sbgh/worker/<profile>.toml`. Set the UUID, orchestrator URL, CPU
-placement, VM resources, LVM identifiers, and paths. A block-validation worker
+to `/etc/sbgh/worker/<profile>.toml`. Set the orchestrator URL, CPU placement,
+VM resources, LVM identifiers, and paths. Capabilities are inferred from the
+present `[benchmark]` and `[block_validation]` sections. A block-validation worker
 also needs a guest-safe `stacks-inspect` chain config at its configured
 `chain_config` path; it must contain no reusable credentials.
 
@@ -430,14 +407,13 @@ identity eligible to register without restarting the daemon:
 ```bash
 alias sbgh='sudo -u sbgh sbgh-cli'
 
-sbgh fleet add-worker \
-  --worker-id "$WORKER_ID" \
+WORKER_ID=$(sbgh fleet add-worker \
   --display-name "benchmark-fsn1-01" \
   --capability benchmark \
-  --measurement-profile "hetzner-ax162"
-sbgh fleet authorize-certificate \
+  --measurement-profile "hetzner-ax162" | jq -r .worker.worker_id)
+sbgh fleet authorize-identity \
   --worker-id "$WORKER_ID" \
-  --certificate "$PKI_DIR/worker-$WORKER_ID/client.crt"
+  --public-key /tmp/sbgh-worker-public.pem
 sbgh fleet enable-worker --worker-id "$WORKER_ID"
 sbgh fleet show-worker --worker-id "$WORKER_ID"
 ```

@@ -62,8 +62,8 @@ pub struct WorkerPolicyPatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerCertificateRecord {
-    pub certificate_sha256: [u8; 32],
+pub struct WorkerIdentityRecord {
+    pub identity_key_sha256: [u8; 32],
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
@@ -74,7 +74,7 @@ pub enum WorkerRegistryMutation {
     Unchanged,
     NotFound,
     Busy,
-    MissingCertificate,
+    MissingIdentity,
     Conflict,
 }
 
@@ -261,16 +261,16 @@ pub trait WorkerRegistryStore: Send + Sync + 'static {
         patch: &WorkerPolicyPatch,
     ) -> Result<WorkerRegistryMutation>;
 
-    async fn authorize_certificate(
+    async fn authorize_identity(
         &self,
         worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        identity_key_sha256: [u8; 32],
     ) -> Result<WorkerRegistryMutation>;
 
-    async fn revoke_certificate(
+    async fn revoke_identity(
         &self,
         worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        identity_key_sha256: [u8; 32],
     ) -> Result<WorkerRegistryMutation>;
 
     /// Immediately withdraw authorization and expire this worker's current
@@ -278,22 +278,21 @@ pub trait WorkerRegistryStore: Send + Sync + 'static {
     /// fencing, cleanup, and safe requeue.
     async fn emergency_disable_worker(&self, worker_id: Uuid) -> Result<WorkerRegistryMutation>;
 
-    /// Immediately revoke one certificate and expire sessions authenticated
+    /// Immediately revoke one identity key and expire sessions authenticated
     /// by it. The normal expiry coordinator owns subsequent recovery.
-    async fn emergency_revoke_certificate(
+    async fn emergency_revoke_identity(
         &self,
         worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        identity_key_sha256: [u8; 32],
     ) -> Result<WorkerRegistryMutation>;
 
-    async fn worker_certificates(&self, worker_id: Uuid) -> Result<Vec<WorkerCertificateRecord>>;
+    async fn worker_identities(&self, worker_id: Uuid) -> Result<Vec<WorkerIdentityRecord>>;
 
     async fn workers(&self, worker_id: Option<Uuid>) -> Result<Vec<WorkerRegistryEntry>>;
 
     async fn authorize_worker(
         &self,
-        worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        identity_key_sha256: [u8; 32],
     ) -> Result<Option<WorkerAuthorization>>;
 
     async fn set_worker_draining(
@@ -307,8 +306,8 @@ pub trait WorkerRegistryStore: Send + Sync + 'static {
 pub trait FleetStore: Send + Sync + 'static {
     async fn register_session(
         &self,
-        certificate_worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        worker_id: Uuid,
+        identity_key_sha256: [u8; 32],
         request: &RegisterSessionRequest,
         session_ttl: Duration,
     ) -> Result<AuthorizedSession>;

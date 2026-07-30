@@ -134,12 +134,21 @@ async fn validation_report_joins_frozen_request_without_fabricating_a_verdict() 
     let job_id = receipt.initial_job_ids[0];
     sqlx::query(
         "INSERT INTO worker_registry
-            (worker_id, identity_uri, display_name, allowed_capabilities)
-         VALUES ($1, $2, 'report worker',
+            (worker_id, display_name, allowed_capabilities)
+         VALUES ($1, 'report worker',
                  ARRAY['block_validation']::worker_capability[])",
     )
     .bind(worker_id)
-    .bind(format!("urn:sbgh:worker:{worker_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let identity = [0x42_u8; 32];
+    sqlx::query(
+        "INSERT INTO worker_identity_key (identity_key_sha256, worker_id)
+         VALUES ($1, $2)",
+    )
+    .bind(identity.as_slice())
+    .bind(worker_id)
     .execute(&pool)
     .await
     .unwrap();
@@ -147,14 +156,15 @@ async fn validation_report_joins_frozen_request_without_fabricating_a_verdict() 
         "INSERT INTO worker_session
             (worker_session_id, worker_id, status, protocol_version,
              software_version, advertised_capabilities, effective_capabilities,
-             resource_facts, expires_at)
+             resource_facts, expires_at, identity_key_sha256)
          VALUES ($1, $2, 'running', 3, 'test',
                  ARRAY['block_validation']::worker_capability[],
                  ARRAY['block_validation']::worker_capability[], '{}'::jsonb,
-                 NOW() + INTERVAL '1 hour')",
+                 NOW() + INTERVAL '1 hour', $3)",
     )
     .bind(session_id)
     .bind(worker_id)
+    .bind(identity.as_slice())
     .execute(&pool)
     .await
     .unwrap();

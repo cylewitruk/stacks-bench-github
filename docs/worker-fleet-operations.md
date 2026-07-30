@@ -110,7 +110,7 @@ Use the block-validation profile on that host. Preflight opens no fleet
 session and checks:
 
 - worker config and profile resources against discovered CPU and memory;
-- certificate/key and server CA files;
+- identity private key;
 - golden image and fixed host commands;
 - job, cache, result, and runtime paths;
 - exact `sandbox-egress` network name and structural verifier;
@@ -223,37 +223,29 @@ Start conservatively and tune shard/concurrency policy from real duration and
 host telemetry. CPU, memory, and device count are admission limits; synthetic
 storage-throughput prediction is not a release gate.
 
-## Certificate lifecycle
+## Identity-key lifecycle
 
-Worker certificates are valid for 90 days by default. Each certificate carries
-one identity URI SAN:
+### Rotate a worker identity
 
-```text
-urn:sbgh:worker:<worker-uuid>
-```
-
-### Rotate a worker certificate
-
-1. Issue a replacement for the same UUID with
-   [fleet-pki.sh](../scripts/fleet-pki.sh).
-2. Authorize the replacement public leaf while the old certificate remains
+1. Generate a replacement P-256 key on the worker and export its public SPKI.
+2. Authorize the replacement public key while the old identity remains
    active:
 
    ```bash
-   sbgh fleet authorize-certificate \
+   sbgh fleet authorize-identity \
      --worker-id <worker-uuid> \
-     --certificate /path/to/replacement/client.crt
+     --public-key /path/to/replacement-public.pem
    ```
 
 3. Drain the worker and wait for its active attempt and cleanup to reach zero.
-4. Atomically replace its certificate and private key.
+4. Atomically replace `identity.key` and keep it mode `0600`.
 5. Restart the worker and confirm registration under the same UUID.
-6. Revoke the old fingerprint:
+6. Revoke the old identity digest:
 
    ```bash
-   sbgh fleet revoke-certificate \
+   sbgh fleet revoke-identity \
      --worker-id <worker-uuid> \
-     --fingerprint <old-lowercase-sha256>
+     --identity <old-lowercase-sha256>
    ```
 
 7. Undrain the worker.
@@ -263,17 +255,16 @@ The old/new overlap takes effect immediately and requires no daemon restart.
 ### Revoke
 
 - For planned removal, drain the worker, wait for quiescence, then use
-  `revoke-certificate` and `disable-worker`.
-- For a suspected compromise, use `emergency-revoke-certificate` or
+  `revoke-identity` and `disable-worker`.
+- For a suspected compromise, use `emergency-revoke-identity` or
   `emergency-disable-worker`. These immediately reject the next RPC on an
   existing connection and expire affected leases. The fleet coordinator then
   fences attempts and records cleanup/requeue through the normal state
   machine.
-- Use network containment and CA rotation as additional measures when the
-  worker CA itself may be compromised.
+- Use network containment while the compromised worker is fenced.
 
-The daemon rechecks fingerprint and registry authorization on every worker
-request. Revoked fingerprints remain auditable and can never be reassigned or
+The daemon rechecks identity and registry authorization on every worker
+request. Revoked identities remain auditable and can never be reassigned or
 reactivated.
 
 ### Change worker policy
@@ -363,7 +354,7 @@ Exercise these cases on the deployed topology:
 - binary-cache miss followed by a hit;
 - chainstate snapshot allocation failure and partial-allocation cleanup;
 - sandbox positive-egress and protected-destination denial;
-- worker drain and certificate rotation/revocation.
+- worker drain and identity rotation/revocation.
 
 The invariants are:
 

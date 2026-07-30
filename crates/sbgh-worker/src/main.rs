@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -10,11 +10,36 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[command(version, about = "stacks-bench fleet worker")]
 struct Args {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     /// Validate the local sandbox and immutable chainstate origin without
     /// connecting to the orchestrator.
     #[arg(long)]
     preflight_only: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Manage the worker's local identity key.
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityAction {
+    /// Create a new P-256 PKCS#8 key and print its public SPKI.
+    Generate {
+        #[arg(long)]
+        private_key: PathBuf,
+    },
+    /// Print the public SPKI for an existing private key.
+    Public {
+        #[arg(long)]
+        private_key: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -25,8 +50,21 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer().json())
         .init();
     let args = Args::parse();
+    if let Some(Command::Identity { action }) = args.command {
+        let public = match action {
+            IdentityAction::Generate { private_key } => {
+                sbgh_worker::identity::generate(&private_key)
+            }
+            IdentityAction::Public { private_key } => sbgh_worker::identity::public(&private_key),
+        }?;
+        print!("{public}");
+        return Ok(());
+    }
+    let config_path = args
+        .config
+        .context("--config is required when running the worker")?;
     let config =
-        sbgh_worker::WorkerConfig::load(&args.config).context("loading worker configuration")?;
+        sbgh_worker::WorkerConfig::load(&config_path).context("loading worker configuration")?;
     let resources =
         sbgh_worker::discover_host_resources().context("discovering worker host resources")?;
     config

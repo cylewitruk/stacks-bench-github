@@ -44,7 +44,6 @@ CREATE TYPE cleanup_obligation_status AS ENUM (
 
 CREATE TABLE worker_registry (
     worker_id UUID PRIMARY KEY,
-    identity_uri TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     allowed_capabilities worker_capability[] NOT NULL,
     measurement_profile TEXT,
@@ -53,7 +52,6 @@ CREATE TABLE worker_registry (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CHECK (cardinality(allowed_capabilities) > 0),
-    CHECK (identity_uri = 'urn:sbgh:worker:' || worker_id::text),
     CHECK (measurement_profile IS NULL OR length(measurement_profile) BETWEEN 1 AND 128)
 );
 

@@ -94,18 +94,15 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/jobs/block-validation", post(jobs::enqueue_block_validation))
             .route("/api/fleet/workers", post(fleet::create_worker))
             .route("/api/fleet/workers/{id}", patch(fleet::update_worker))
-            .route("/api/fleet/workers/{id}/certificates", post(fleet::authorize_certificate))
-            .route(
-                "/api/fleet/workers/{id}/certificates/{fingerprint}",
-                delete(fleet::revoke_certificate),
-            )
+            .route("/api/fleet/workers/{id}/identities", post(fleet::authorize_identity))
+            .route("/api/fleet/workers/{id}/identities/{identity}", delete(fleet::revoke_identity))
             .route(
                 "/api/fleet/workers/{id}/emergency-disable",
                 post(fleet::emergency_disable_worker),
             )
             .route(
-                "/api/fleet/workers/{id}/certificates/{fingerprint}/emergency-revoke",
-                post(fleet::emergency_revoke_certificate),
+                "/api/fleet/workers/{id}/identities/{identity}/emergency-revoke",
+                post(fleet::emergency_revoke_identity),
             )
             .route("/api/fleet/workers/{id}/drain", post(fleet::set_drain))
             .route("/api/fleet/jobs/{id}/cancel", post(fleet::cancel_job))
@@ -206,7 +203,6 @@ mod tests {
             pool: pool.clone(),
             ingest: Arc::new(sbgh_postgres::PostgresIngestStore::new(pool)),
             gh_api_base: "https://api.github.com".into(),
-            worker_ca_certificate: "worker-ca.pem".into(),
         }
     }
 

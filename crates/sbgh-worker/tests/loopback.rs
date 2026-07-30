@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose, SanType,
+    KeyUsagePurpose,
 };
 use sbgh_fleet::{
     AttemptIdentity, LeaseToken, PollResponse, RegisterSessionResponse, ResourceFacts, WorkOffer,
@@ -31,20 +31,19 @@ use sbgh_proto::fleet::v1::{
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Code, Request, Response, Status};
 use uuid::Uuid;
 
 struct PkiFixture {
     _directory: tempfile::TempDir,
-    client_certificate: PathBuf,
     client_key: PathBuf,
     ca_certificate: PathBuf,
     server_certificate: PathBuf,
     server_key: PathBuf,
 }
 
-fn pki_fixture(worker_id: Uuid) -> PkiFixture {
+fn pki_fixture() -> PkiFixture {
     let directory = tempfile::tempdir().unwrap();
     let mut ca_parameters = CertificateParams::default();
     ca_parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -65,23 +64,7 @@ fn pki_fixture(worker_id: Uuid) -> PkiFixture {
         .signed_by(&server_key, &ca)
         .unwrap();
 
-    let mut client_parameters = CertificateParams::default();
-    client_parameters.subject_alt_names = vec![SanType::URI(
-        format!("urn:sbgh:worker:{worker_id}")
-            .try_into()
-            .unwrap(),
-    )];
-    client_parameters
-        .extended_key_usages
-        .push(ExtendedKeyUsagePurpose::ClientAuth);
     let client_key = KeyPair::generate().unwrap();
-    let client_certificate = client_parameters
-        .signed_by(&client_key, &ca)
-        .unwrap();
-
-    let client_certificate_path = directory
-        .path()
-        .join("worker.crt");
     let client_key_path = directory
         .path()
         .join("worker.key");
@@ -94,7 +77,6 @@ fn pki_fixture(worker_id: Uuid) -> PkiFixture {
     let server_key_path = directory
         .path()
         .join("server.key");
-    std::fs::write(&client_certificate_path, client_certificate.pem()).unwrap();
     std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
     std::fs::write(&ca_certificate_path, ca.pem()).unwrap();
     std::fs::write(&server_certificate_path, server_certificate.pem()).unwrap();
@@ -105,7 +87,6 @@ fn pki_fixture(worker_id: Uuid) -> PkiFixture {
 
     PkiFixture {
         _directory: directory,
-        client_certificate: client_certificate_path,
         client_key: client_key_path,
         ca_certificate: ca_certificate_path,
         server_certificate: server_certificate_path,
@@ -121,7 +102,6 @@ enum Mode {
 
 #[derive(Clone)]
 struct MockFleet {
-    worker_id: Uuid,
     mode: Mode,
     session_id: Arc<std::sync::Mutex<Option<Uuid>>>,
     polls: Arc<AtomicUsize>,
@@ -143,10 +123,9 @@ impl WorkerFleetService for MockFleet {
             .into_inner()
             .into_domain()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        assert_eq!(registration.worker_id, self.worker_id);
         assert_eq!(
             registration.advertised_capabilities,
-            BTreeSet::from([WorkerCapability::BuildOnly])
+            BTreeSet::from([WorkerCapability::Benchmark, WorkerCapability::BuildOnly])
         );
         assert_eq!(registration.resources, worker_resources());
         *self
@@ -305,18 +284,13 @@ async fn serve_mock(
     listener: TcpListener,
     server_certificate: Vec<u8>,
     server_key: Vec<u8>,
-    client_ca: Vec<u8>,
+    _client_ca: Vec<u8>,
     fleet: MockFleet,
     shutdown: CancellationToken,
 ) {
     let identity = Identity::from_pem(server_certificate, server_key);
-    let client_ca = Certificate::from_pem(client_ca);
     Server::builder()
-        .tls_config(
-            ServerTlsConfig::new()
-                .identity(identity)
-                .client_ca_root(client_ca),
-        )
+        .tls_config(ServerTlsConfig::new().identity(identity))
         .unwrap()
         .serve_with_incoming_shutdown(
             WorkerFleetServiceServer::new(fleet),
@@ -328,19 +302,16 @@ async fn serve_mock(
 }
 
 fn worker_config(
-    worker_id: Uuid,
+    _worker_id: Uuid,
     address: std::net::SocketAddr,
     pki: &PkiFixture,
 ) -> sbgh_worker::WorkerConfig {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.worker-benchmark.toml");
     let mut config = sbgh_worker::WorkerConfig::load(&path).unwrap();
-    config.worker_id = worker_id;
     config.orchestrator_url = format!("https://localhost:{}", address.port());
-    config.client_certificate = pki.client_certificate.clone();
-    config.client_private_key = pki.client_key.clone();
-    config.server_ca_certificate = pki.ca_certificate.clone();
-    config.capabilities = BTreeSet::from([WorkerCapability::BuildOnly]);
+    config.identity_private_key = pki.client_key.clone();
+    config.block_validation = None;
     configure_sandbox_preflight_fixture(&mut config, pki._directory.path());
     config.validate().unwrap();
     config
@@ -354,10 +325,6 @@ fn worker_resources() -> ResourceFacts {
 }
 
 fn configure_sandbox_preflight_fixture(config: &mut sbgh_worker::WorkerConfig, directory: &Path) {
-    let libvirt = config
-        .libvirt
-        .as_mut()
-        .unwrap();
     let golden = directory.join("golden.qcow2");
     let host_tool = directory.join("host-tool");
     let sudo = directory.join("sudo");
@@ -379,34 +346,36 @@ fn configure_sandbox_preflight_fixture(config: &mut sbgh_worker::WorkerConfig, d
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    libvirt.vm.golden_image = golden;
-    libvirt.paths.jobs_dir = directory.join("jobs");
-    libvirt.paths.git_mirror = directory.join("git/mirror.git");
-    libvirt
-        .paths
+    config.sandbox.golden_image = golden;
+    config.workspace.jobs_dir = directory.join("jobs");
+    config.workspace.git_mirror = directory.join("git/mirror.git");
+    config
+        .workspace
         .results_tmpfs_root = directory.join("results-tmpfs");
-    libvirt
-        .paths
+    config
+        .workspace
         .results_archive_dir = directory.join("results-archive");
-    libvirt.paths.sudo_binary = sudo;
-    libvirt.paths.virsh_binary = host_tool.clone();
-    libvirt.paths.qemu_img_binary = host_tool.clone();
-    libvirt
-        .paths
-        .cloud_localds_binary = host_tool.clone();
-    libvirt.paths.git_binary = host_tool;
+    config.commands.sudo = sudo;
+    config.commands.virsh = host_tool.clone();
+    config.commands.qemu_img = host_tool.clone();
+    config.commands.cloud_localds = host_tool.clone();
+    config.commands.git = host_tool;
 }
 
 async fn run_case(mode: Mode) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let worker_id = Uuid::new_v4();
-    let pki = pki_fixture(worker_id);
+    let pki = pki_fixture();
+    // rustls-native-certs honors SSL_CERT_FILE on Unix; this keeps the
+    // integration fixture on the production Web-PKI validation path.
+    unsafe {
+        std::env::set_var("SSL_CERT_FILE", &pki.ca_certificate);
+    }
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
     let fleet = MockFleet {
-        worker_id,
         mode,
         session_id: Arc::new(std::sync::Mutex::new(None)),
         polls: Arc::new(AtomicUsize::new(0)),

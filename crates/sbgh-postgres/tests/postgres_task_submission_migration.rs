@@ -13,7 +13,6 @@ type MigratedContract = (
 
 const V26_MIGRATION: i64 = 20_260_728_000_001;
 const V27_1_MIGRATION: i64 = 20_260_728_000_002;
-const V28_MIGRATION: i64 = 20_260_729_000_001;
 
 #[derive(Debug, Clone, Copy)]
 struct LegacySubmission {
@@ -222,13 +221,12 @@ async fn v27_rename_preserves_submission_objects_rows_and_relationships() {
     let worker_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO worker_registry
-            (worker_id, identity_uri, display_name, allowed_capabilities,
+            (worker_id, display_name, allowed_capabilities,
              measurement_profile)
-         VALUES ($1, $2, 'historical worker',
+         VALUES ($1, 'historical worker',
                  ARRAY['benchmark']::worker_capability[], 'profile-v1')",
     )
     .bind(worker_id)
-    .bind(format!("urn:sbgh:worker:{worker_id}"))
     .execute(&pool)
     .await
     .unwrap();
@@ -614,12 +612,11 @@ async fn v27_kernel_requires_in_flight_attempts_and_cleanup_to_be_drained() {
     let worker_session_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO worker_registry
-            (worker_id, identity_uri, display_name, allowed_capabilities)
-         VALUES ($1, $2, 'migration worker',
+            (worker_id, display_name, allowed_capabilities)
+         VALUES ($1, 'migration worker',
                  ARRAY['benchmark']::worker_capability[])",
     )
     .bind(worker_id)
-    .bind(format!("urn:sbgh:worker:{worker_id}"))
     .execute(&pool)
     .await
     .unwrap();
@@ -927,51 +924,21 @@ async fn v28_rejects_one_external_comment_owned_by_two_submissions() {
 }
 
 #[tokio::test]
-async fn v30_preserves_pre_registry_session_history_and_enforces_fingerprint_shape() {
-    let (_db, pool) = setup_pg_db_to(V28_MIGRATION).await;
+async fn v30_identity_registry_enforces_digest_shape() {
+    let (_db, pool) = sbgh_postgres::test_support::setup_pg_db().await;
     let worker_id = Uuid::new_v4();
-    let session_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO worker_registry
-            (worker_id, identity_uri, display_name, allowed_capabilities)
-         VALUES ($1, 'urn:sbgh:worker:' || $1::text, 'legacy worker',
+            (worker_id, display_name, allowed_capabilities)
+         VALUES ($1, 'legacy worker',
                  ARRAY['build_only'::worker_capability])",
     )
     .bind(worker_id)
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO worker_session
-            (worker_session_id, worker_id, status, protocol_version,
-             software_version, advertised_capabilities, effective_capabilities,
-             resource_facts, expires_at, ended_at)
-         VALUES ($1, $2, 'offline', 1, '0.1.0',
-                 ARRAY['build_only'::worker_capability],
-                 ARRAY['build_only'::worker_capability],
-                 '{\"logical_cpus\":4,\"memory_bytes\":8589934592}'::jsonb,
-                 NOW(), NOW())",
-    )
-    .bind(session_id)
-    .bind(worker_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    migrate(&pool).await.unwrap();
-
-    let historical_fingerprint: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT certificate_sha256
-           FROM worker_session
-          WHERE worker_session_id = $1",
-    )
-    .bind(session_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(historical_fingerprint, None);
     let invalid = sqlx::query(
-        "INSERT INTO worker_certificate (certificate_sha256, worker_id)
+        "INSERT INTO worker_identity_key (identity_key_sha256, worker_id)
          VALUES ($1, $2)",
     )
     .bind(vec![0u8; 31])
@@ -980,5 +947,5 @@ async fn v30_preserves_pre_registry_session_history_and_enforces_fingerprint_sha
     .await
     .unwrap_err()
     .to_string();
-    assert!(invalid.contains("worker_certificate_certificate_sha256_check"), "{invalid}");
+    assert!(invalid.contains("worker_identity_key_identity_key_sha256_check"), "{invalid}");
 }

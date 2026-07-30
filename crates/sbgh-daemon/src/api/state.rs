@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use sbgh_core::db::IngestStore;
@@ -16,7 +15,4 @@ pub struct ApiState {
     /// GitHub API base for the admin endpoints' server-side
     /// login/owner-name → id resolution.
     pub gh_api_base: String,
-    /// Worker trust anchor used to validate public leaf certificates before
-    /// adding their fingerprint to the durable registry.
-    pub worker_ca_certificate: PathBuf,
 }

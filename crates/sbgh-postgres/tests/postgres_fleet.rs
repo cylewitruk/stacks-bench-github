@@ -56,11 +56,11 @@ async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
 }
 
 #[tokio::test]
-async fn registry_certificate_revocation_is_irreversible_and_immediate() {
+async fn registry_identity_revocation_is_irreversible_and_immediate() {
     let (_db, pool) = setup_pg_db().await;
     let store = PostgresFleetStore::new(pool.clone());
     let worker_id = Uuid::new_v4();
-    let fingerprint = [0x31; 32];
+    let identity_digest = [0x31; 32];
     assert_eq!(
         store
             .create_worker(&registration(worker_id))
@@ -70,25 +70,25 @@ async fn registry_certificate_revocation_is_irreversible_and_immediate() {
     );
     assert_eq!(
         store
-            .authorize_certificate(worker_id, fingerprint)
+            .authorize_identity(worker_id, identity_digest)
             .await
             .unwrap(),
         WorkerRegistryMutation::Applied
     );
     assert!(
         store
-            .authorize_worker(worker_id, fingerprint)
+            .authorize_worker(identity_digest)
             .await
             .unwrap()
             .is_some()
     );
     assert_eq!(
         store
-            .revoke_certificate(worker_id, fingerprint)
+            .revoke_identity(worker_id, identity_digest)
             .await
             .unwrap(),
         WorkerRegistryMutation::Busy,
-        "the final certificate of an enabled worker requires drain"
+        "the final identity of an enabled worker requires drain"
     );
     store
         .set_worker_draining(worker_id, true)
@@ -96,27 +96,27 @@ async fn registry_certificate_revocation_is_irreversible_and_immediate() {
         .unwrap();
     assert_eq!(
         store
-            .revoke_certificate(worker_id, fingerprint)
+            .revoke_identity(worker_id, identity_digest)
             .await
             .unwrap(),
         WorkerRegistryMutation::Applied
     );
     assert!(
         store
-            .authorize_worker(worker_id, fingerprint)
+            .authorize_worker(identity_digest)
             .await
             .unwrap()
             .is_none()
     );
     assert_eq!(
         store
-            .authorize_certificate(worker_id, fingerprint)
+            .authorize_identity(worker_id, identity_digest)
             .await
             .unwrap(),
         WorkerRegistryMutation::Conflict
     );
-    let deletion = sqlx::query("DELETE FROM worker_certificate WHERE certificate_sha256 = $1")
-        .bind(fingerprint.as_slice())
+    let deletion = sqlx::query("DELETE FROM worker_identity_key WHERE identity_key_sha256 = $1")
+        .bind(identity_digest.as_slice())
         .execute(&pool)
         .await
         .unwrap_err()
@@ -156,7 +156,7 @@ async fn worker_creation_is_idempotent_but_rejects_conflicting_reuse() {
 }
 
 #[tokio::test]
-async fn concurrent_certificate_ownership_elects_one_worker() {
+async fn concurrent_identity_ownership_elects_one_worker() {
     let (_db, pool) = setup_pg_db().await;
     let store = PostgresFleetStore::new(pool.clone());
     let first = Uuid::new_v4();
@@ -169,10 +169,10 @@ async fn concurrent_certificate_ownership_elects_one_worker() {
         .create_worker(&registration(second))
         .await
         .unwrap();
-    let fingerprint = [0x42; 32];
+    let identity_digest = [0x42; 32];
     let (left, right) = tokio::join!(
-        store.authorize_certificate(first, fingerprint),
-        store.authorize_certificate(second, fingerprint),
+        store.authorize_identity(first, identity_digest),
+        store.authorize_identity(second, identity_digest),
     );
     let mut outcomes = [left.unwrap(), right.unwrap()];
     outcomes.sort_by_key(|outcome| match outcome {
@@ -184,40 +184,40 @@ async fn concurrent_certificate_ownership_elects_one_worker() {
 }
 
 #[tokio::test]
-async fn live_session_binds_certificate_and_requires_quiescent_revocation() {
+async fn live_session_binds_identity_and_requires_quiescent_revocation() {
     let (_db, pool) = setup_pg_db().await;
     let store = PostgresFleetStore::new(pool.clone());
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
-    let fingerprint = [0x53; 32];
+    let identity_digest = [0x53; 32];
     store
         .create_worker(&registration(worker_id))
         .await
         .unwrap();
     store
-        .authorize_certificate(worker_id, fingerprint)
+        .authorize_identity(worker_id, identity_digest)
         .await
         .unwrap();
     <PostgresFleetStore as FleetStore>::register_session(
         &store,
         worker_id,
-        fingerprint,
+        identity_digest,
         &session(worker_id, session_id),
         Duration::minutes(5),
     )
     .await
     .unwrap();
     let persisted: Vec<u8> = sqlx::query_scalar(
-        "SELECT certificate_sha256 FROM worker_session WHERE worker_session_id = $1",
+        "SELECT identity_key_sha256 FROM worker_session WHERE worker_session_id = $1",
     )
     .bind(session_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(persisted, fingerprint);
+    assert_eq!(persisted, identity_digest);
     assert_eq!(
         store
-            .revoke_certificate(worker_id, fingerprint)
+            .revoke_identity(worker_id, identity_digest)
             .await
             .unwrap(),
         WorkerRegistryMutation::Busy
@@ -228,7 +228,7 @@ async fn live_session_binds_certificate_and_requires_quiescent_revocation() {
         .unwrap();
     assert_eq!(
         store
-            .revoke_certificate(worker_id, fingerprint)
+            .revoke_identity(worker_id, identity_digest)
             .await
             .unwrap(),
         WorkerRegistryMutation::Applied
@@ -247,19 +247,19 @@ async fn emergency_revocation_withdraws_authorization_and_expires_the_live_sessi
     let store = PostgresFleetStore::new(pool);
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
-    let fingerprint = [0x59; 32];
+    let identity_digest = [0x59; 32];
     store
         .create_worker(&registration(worker_id))
         .await
         .unwrap();
     store
-        .authorize_certificate(worker_id, fingerprint)
+        .authorize_identity(worker_id, identity_digest)
         .await
         .unwrap();
     <PostgresFleetStore as FleetStore>::register_session(
         &store,
         worker_id,
-        fingerprint,
+        identity_digest,
         &session(worker_id, session_id),
         Duration::minutes(5),
     )
@@ -268,14 +268,14 @@ async fn emergency_revocation_withdraws_authorization_and_expires_the_live_sessi
 
     assert_eq!(
         store
-            .emergency_revoke_certificate(worker_id, fingerprint)
+            .emergency_revoke_identity(worker_id, identity_digest)
             .await
             .unwrap(),
         WorkerRegistryMutation::Applied
     );
     assert!(
         store
-            .authorize_worker(worker_id, fingerprint)
+            .authorize_worker(identity_digest)
             .await
             .unwrap()
             .is_none()
@@ -286,17 +286,17 @@ async fn emergency_revocation_withdraws_authorization_and_expires_the_live_sessi
             .await
             .unwrap()
     );
-    let certificates = store
-        .worker_certificates(worker_id)
+    let identitys = store
+        .worker_identities(worker_id)
         .await
         .unwrap();
-    assert_eq!(certificates.len(), 1);
+    assert_eq!(identitys.len(), 1);
     assert!(
-        certificates[0]
+        identitys[0]
             .revoked_at
             .is_some()
     );
-    assert!(certificates[0].created_at <= Utc::now());
+    assert!(identitys[0].created_at <= Utc::now());
 }
 
 #[tokio::test]
@@ -306,20 +306,20 @@ async fn emergency_disable_reuses_lease_expiry_fencing_and_cleanup() {
     let store = PostgresFleetStore::new(pool.clone());
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
-    let fingerprint = [0x5a; 32];
+    let identity_digest = [0x5a; 32];
     let job_id = Uuid::new_v4();
     store
         .create_worker(&registration(worker_id))
         .await
         .unwrap();
     store
-        .authorize_certificate(worker_id, fingerprint)
+        .authorize_identity(worker_id, identity_digest)
         .await
         .unwrap();
     <PostgresFleetStore as FleetStore>::register_session(
         &store,
         worker_id,
-        fingerprint,
+        identity_digest,
         &session(worker_id, session_id),
         Duration::minutes(5),
     )
@@ -337,7 +337,7 @@ async fn emergency_disable_reuses_lease_expiry_fencing_and_cleanup() {
     );
     assert!(
         store
-            .authorize_worker(worker_id, fingerprint)
+            .authorize_worker(identity_digest)
             .await
             .unwrap()
             .is_none()
@@ -366,19 +366,19 @@ async fn drain_policy_update_serializes_with_offer_polling() {
     let store = PostgresFleetStore::new(pool.clone());
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
-    let fingerprint = [0x5b; 32];
+    let identity_digest = [0x5b; 32];
     store
         .create_worker(&registration(worker_id))
         .await
         .unwrap();
     store
-        .authorize_certificate(worker_id, fingerprint)
+        .authorize_identity(worker_id, identity_digest)
         .await
         .unwrap();
     <PostgresFleetStore as FleetStore>::register_session(
         &store,
         worker_id,
-        fingerprint,
+        identity_digest,
         &session(worker_id, session_id),
         Duration::minutes(5),
     )
@@ -429,7 +429,7 @@ async fn drain_policy_update_serializes_with_offer_polling() {
 }
 
 #[tokio::test]
-async fn enabling_requires_an_active_certificate_and_policy_changes_require_drain() {
+async fn enabling_requires_an_active_identity_and_policy_changes_require_drain() {
     let (_db, pool) = setup_pg_db().await;
     let store = PostgresFleetStore::new(pool);
     let worker_id = Uuid::new_v4();
@@ -451,10 +451,10 @@ async fn enabling_requires_an_active_certificate_and_policy_changes_require_drai
             )
             .await
             .unwrap(),
-        WorkerRegistryMutation::MissingCertificate
+        WorkerRegistryMutation::MissingIdentity
     );
     store
-        .authorize_certificate(worker_id, [0x64; 32])
+        .authorize_identity(worker_id, [0x64; 32])
         .await
         .unwrap();
     assert_eq!(
@@ -497,10 +497,9 @@ fn registration(worker_id: Uuid) -> WorkerRegistration {
     }
 }
 
-fn session(worker_id: Uuid, worker_session_id: Uuid) -> RegisterSessionRequest {
+fn session(_worker_id: Uuid, worker_session_id: Uuid) -> RegisterSessionRequest {
     RegisterSessionRequest {
         protocol_version: PROTOCOL_VERSION,
-        worker_id,
         worker_session_id,
         software_version: env!("CARGO_PKG_VERSION").into(),
         advertised_capabilities: BTreeSet::from([WorkerCapability::BuildOnly]),
@@ -1557,7 +1556,6 @@ async fn capability_routes_only_to_a_compatible_worker() {
             block_worker,
             &RegisterSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
-                worker_id: block_worker,
                 worker_session_id: block_session,
                 software_version: env!("CARGO_PKG_VERSION").into(),
                 advertised_capabilities: BTreeSet::from([WorkerCapability::BlockValidation]),

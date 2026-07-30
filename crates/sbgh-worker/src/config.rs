@@ -3,23 +3,53 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
 use sbgh_fleet::{ResourceFacts, WorkerCapability};
-use sbgh_libvirt::LibvirtConfig;
+use sbgh_libvirt::{
+    BenchmarkProfile, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
+};
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::BinaryCacheConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
-    pub worker_id: Uuid,
     pub orchestrator_url: String,
-    pub client_certificate: PathBuf,
-    pub client_private_key: PathBuf,
-    pub server_ca_certificate: PathBuf,
-    pub capabilities: BTreeSet<WorkerCapability>,
-    pub libvirt: Option<LibvirtConfig>,
+    pub identity_private_key: PathBuf,
+    pub workspace: WorkspaceConfig,
+    pub sandbox: SandboxConfig,
+    pub commands: CommandsConfig,
+    pub lvm: LvmConfig,
+    pub benchmark: Option<BenchmarkProfile>,
+    pub block_validation: Option<BlockValidationProfile>,
     pub binary_cache: Option<BinaryCacheConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    pub jobs_dir: PathBuf,
+    pub git_mirror: PathBuf,
+    pub results_tmpfs_root: PathBuf,
+    pub results_archive_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    pub service_user: String,
+    pub golden_image: PathBuf,
+    pub boot_disk_gib: u32,
+    pub host_cpus: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandsConfig {
+    pub virsh: PathBuf,
+    pub sudo: PathBuf,
+    pub qemu_img: PathBuf,
+    pub cloud_localds: PathBuf,
+    pub git: PathBuf,
 }
 
 impl WorkerConfig {
@@ -33,7 +63,6 @@ impl WorkerConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        ensure!(!self.worker_id.is_nil(), "worker_id must not be nil");
         let url = reqwest::Url::parse(&self.orchestrator_url)
             .context("orchestrator_url is not a valid URL")?;
         ensure!(url.scheme() == "https", "orchestrator_url must use HTTPS");
@@ -46,70 +75,23 @@ impl WorkerConfig {
             "orchestrator_url must be an HTTPS origin without credentials, query, fragment, or path"
         );
         ensure!(
-            self.capabilities
-                == self
-                    .capabilities
-                    .iter()
-                    .copied()
-                    .collect(),
-            "capability set is invalid"
+            self.benchmark.is_some()
+                || self
+                    .block_validation
+                    .is_some(),
+            "at least one recipe section is required"
         );
-        ensure!(!self.capabilities.is_empty(), "at least one capability is required");
-        if let Some(libvirt) = &self.libvirt {
+        if let Some(benchmark) = &self.benchmark {
             ensure!(
-                libvirt.vm.network == "sandbox-egress",
-                "execution workers must use the policy-managed sandbox-egress network"
+                benchmark.build_vcpus > 0
+                    && benchmark.build_memory_bytes > 0
+                    && benchmark.job_timeout_secs > 0
+                    && benchmark.bench_vcpus > 0
+                    && benchmark.bench_memory_bytes > 0,
+                "benchmark recipe requires non-zero build and execution resources"
             );
         }
-        if self
-            .capabilities
-            .iter()
-            .any(|capability| {
-                matches!(capability, WorkerCapability::Benchmark | WorkerCapability::BuildOnly)
-            })
-        {
-            let libvirt = self
-                .libvirt
-                .as_ref()
-                .context("benchmark/build capability requires [libvirt]")?;
-            ensure!(
-                libvirt.benchmark.build_vcpus > 0
-                    && libvirt
-                        .benchmark
-                        .build_memory_bytes
-                        > 0
-                    && libvirt
-                        .benchmark
-                        .job_timeout_secs
-                        > 0,
-                "benchmark/build capability requires non-zero build resources"
-            );
-            if self
-                .capabilities
-                .contains(&WorkerCapability::Benchmark)
-            {
-                ensure!(
-                    libvirt.benchmark.bench_vcpus > 0
-                        && libvirt
-                            .benchmark
-                            .bench_memory_bytes
-                            > 0,
-                    "benchmark capability requires non-zero benchmark resources"
-                );
-            }
-        }
-        if self
-            .capabilities
-            .contains(&WorkerCapability::BlockValidation)
-        {
-            let libvirt = self
-                .libvirt
-                .as_ref()
-                .context("block_validation capability requires [libvirt]")?;
-            let block = libvirt
-                .block_validation
-                .as_ref()
-                .context("block_validation capability requires [libvirt.block_validation]")?;
+        if let Some(block) = &self.block_validation {
             ensure!(
                 block
                     .chain_config
@@ -137,6 +119,73 @@ impl WorkerConfig {
         Ok(())
     }
 
+    pub fn advertised_capabilities(&self) -> BTreeSet<WorkerCapability> {
+        let mut capabilities = BTreeSet::new();
+        if self.benchmark.is_some() {
+            capabilities.insert(WorkerCapability::Benchmark);
+            capabilities.insert(WorkerCapability::BuildOnly);
+        }
+        if self
+            .block_validation
+            .is_some()
+        {
+            capabilities.insert(WorkerCapability::BlockValidation);
+        }
+        capabilities
+    }
+
+    pub fn libvirt_config(&self) -> LibvirtConfig {
+        LibvirtConfig {
+            vm: VmConfig {
+                golden_image: self
+                    .sandbox
+                    .golden_image
+                    .clone(),
+                boot_disk_gib: self.sandbox.boot_disk_gib,
+                network: "sandbox-egress".into(),
+                poll_interval_secs: 5,
+                heartbeat_interval_secs: 60,
+            },
+            benchmark: self
+                .benchmark
+                .clone()
+                .unwrap_or_default(),
+            paths: PathsConfig {
+                jobs_dir: self
+                    .workspace
+                    .jobs_dir
+                    .clone(),
+                git_mirror: self
+                    .workspace
+                    .git_mirror
+                    .clone(),
+                results_tmpfs_root: self
+                    .workspace
+                    .results_tmpfs_root
+                    .clone(),
+                results_archive_dir: self
+                    .workspace
+                    .results_archive_dir
+                    .clone(),
+                virsh_binary: self.commands.virsh.clone(),
+                sudo_binary: self.commands.sudo.clone(),
+                qemu_img_binary: self.commands.qemu_img.clone(),
+                cloud_localds_binary: self
+                    .commands
+                    .cloud_localds
+                    .clone(),
+                git_binary: self.commands.git.clone(),
+            },
+            lvm: self.lvm.clone(),
+            service_user: self
+                .sandbox
+                .service_user
+                .clone(),
+            host_cpus: self.sandbox.host_cpus.clone(),
+            block_validation: self.block_validation.clone(),
+        }
+    }
+
     /// Validate operator-selected guest profiles against measured host
     /// capacity. Build and execution VMs are sequential within an assignment,
     /// so each phase is checked independently rather than summed.
@@ -145,47 +194,19 @@ impl WorkerConfig {
             resources.logical_cpus > 0 && resources.memory_bytes > 0,
             "discovered host resources require non-zero CPU and memory"
         );
-        if self
-            .capabilities
-            .iter()
-            .any(|capability| {
-                matches!(capability, WorkerCapability::Benchmark | WorkerCapability::BuildOnly)
-            })
-        {
-            let benchmark = &self
-                .libvirt
-                .as_ref()
-                .context("benchmark/build capability requires [libvirt]")?
-                .benchmark;
+        if let Some(benchmark) = &self.benchmark {
             ensure!(
                 benchmark.build_vcpus <= resources.logical_cpus
                     && benchmark.build_memory_bytes <= resources.memory_bytes,
                 "benchmark build profile exceeds discovered host CPU or memory"
             );
-            if self
-                .capabilities
-                .contains(&WorkerCapability::Benchmark)
-            {
-                ensure!(
-                    benchmark.bench_vcpus <= resources.logical_cpus
-                        && benchmark.bench_memory_bytes <= resources.memory_bytes,
-                    "benchmark execution profile exceeds discovered host CPU or memory"
-                );
-            }
+            ensure!(
+                benchmark.bench_vcpus <= resources.logical_cpus
+                    && benchmark.bench_memory_bytes <= resources.memory_bytes,
+                "benchmark execution profile exceeds discovered host CPU or memory"
+            );
         }
-        if self
-            .capabilities
-            .contains(&WorkerCapability::BlockValidation)
-        {
-            let block = self
-                .libvirt
-                .as_ref()
-                .and_then(|libvirt| {
-                    libvirt
-                        .block_validation
-                        .as_ref()
-                })
-                .context("block_validation capability requires [libvirt.block_validation]")?;
+        if let Some(block) = &self.block_validation {
             let reserved_memory = block
                 .memory_bytes
                 .checked_add(u64::from(block.results_tmpfs_mib) * 1024 * 1024)
@@ -212,27 +233,19 @@ mod tests {
             WorkerConfig::load(&root.join("config.example.worker-block-validation.toml")).unwrap();
 
         assert_eq!(
-            benchmark
-                .libvirt
-                .as_ref()
-                .unwrap()
-                .vm
-                .network,
-            "sandbox-egress"
+            benchmark.advertised_capabilities(),
+            BTreeSet::from([WorkerCapability::Benchmark, WorkerCapability::BuildOnly])
+        );
+        assert_eq!(
+            block.advertised_capabilities(),
+            BTreeSet::from([WorkerCapability::BlockValidation])
         );
         assert_eq!(
             benchmark
-                .libvirt
-                .as_ref()
-                .unwrap()
+                .libvirt_config()
                 .vm
                 .network,
-            block
-                .libvirt
-                .as_ref()
-                .unwrap()
-                .vm
-                .network
+            "sandbox-egress"
         );
     }
 
@@ -253,6 +266,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_identity_capability_and_adapter_fields_are_rejected() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("config.example.worker-benchmark.toml")).unwrap();
+        for stale in [
+            format!("worker_id = \"{}\"\n{text}", uuid::Uuid::new_v4()),
+            format!("capabilities = [\"benchmark\"]\n{text}"),
+            format!("client_certificate = \"/tmp/client.crt\"\n{text}"),
+            format!("{text}\n[libvirt]\nservice_user = \"stale\"\n"),
+        ] {
+            assert!(toml::from_str::<WorkerConfig>(&stale).is_err());
+        }
+    }
+
+    #[test]
     fn worker_url_rejects_ambient_credentials_and_path_confusion() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut config =
@@ -266,27 +294,6 @@ mod tests {
             config.orchestrator_url = invalid.into();
             assert!(config.validate().is_err(), "{invalid} unexpectedly passed");
         }
-    }
-
-    #[test]
-    fn execution_worker_rejects_an_unmanaged_guest_network() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut config =
-            WorkerConfig::load(&root.join("config.example.worker-benchmark.toml")).unwrap();
-        config
-            .libvirt
-            .as_mut()
-            .unwrap()
-            .vm
-            .network = "default".into();
-
-        let error = config.validate().unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("policy-managed sandbox-egress")
-        );
     }
 
     #[test]

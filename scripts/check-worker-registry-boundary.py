@@ -22,7 +22,7 @@ for path in [
     *sorted((ROOT / "crates/sbgh-daemon/src/fleet").glob("*.rs")),
 ]:
     text = path.read_text()
-    for marker in ("workers: Vec<", "RawWorker", "certificate_sha256: Vec<"):
+    for marker in ("workers: Vec<", "RawWorker", "client_ca_certificate"):
         if marker in text:
             errors.append(
                 f"{path.relative_to(ROOT)}: forbidden static worker-policy shape {marker!r}"
@@ -31,6 +31,23 @@ for path in [
 legacy_example = ROOT / "config.example.fleet.toml"
 if legacy_example.exists():
     errors.append("config.example.fleet.toml: static fleet registry must not be restored")
+
+worker_config = (ROOT / "crates/sbgh-worker/src/config.rs").read_text()
+for marker in (
+    "pub worker_id:",
+    "pub capabilities:",
+    "pub client_certificate:",
+    "pub server_ca_certificate:",
+    "pub libvirt:",
+):
+    if marker in worker_config:
+        errors.append(f"worker config: forbidden legacy field {marker!r}")
+
+for path in sorted(ROOT.glob("config.example.worker-*.toml")):
+    text = path.read_text()
+    for marker in ("worker_id =", "capabilities =", "client_certificate =", "[libvirt"):
+        if marker in text:
+            errors.append(f"{path.name}: forbidden legacy worker setting {marker!r}")
 
 if errors:
     raise SystemExit("\n".join(errors))

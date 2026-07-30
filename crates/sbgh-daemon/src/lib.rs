@@ -356,10 +356,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             .github
             .api_base_url
             .clone(),
-        worker_ca_certificate: config
-            .fleet
-            .client_ca_certificate
-            .clone(),
     };
     let api_router = api::build_router(api_state, api_tokens);
 

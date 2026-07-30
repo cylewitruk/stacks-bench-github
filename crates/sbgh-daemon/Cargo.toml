@@ -60,6 +60,7 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 x509-parser.workspace = true
+p256.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
@@ -88,3 +89,4 @@ tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
 rcgen = "0.14.7"
+time.workspace = true

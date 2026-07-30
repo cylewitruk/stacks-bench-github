@@ -12,7 +12,7 @@ use sbgh_core::db::fleet::{
     FleetTerminalWrite, OfferedAssignment, PendingArtifactPromotion, PreparedExecution,
     ProjectedReportMutation, ReportProjectionSeed, ResolvedSpecSource, StoredAttemptEvent,
     StoredProgress, SubmissionRecovery, TerminalAcceptance, WorkerAuthorization,
-    WorkerCertificateRecord, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryEntry,
+    WorkerIdentityRecord, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryEntry,
     WorkerRegistryMutation, WorkerRegistryStore,
 };
 use sbgh_core::models::{JobEventKind, JobEventStatus};
@@ -52,10 +52,10 @@ impl PostgresFleetStore {
         sqlx::query(
             r#"
             INSERT INTO worker_registry
-                (worker_id, identity_uri, display_name, allowed_capabilities,
+                (worker_id, display_name, allowed_capabilities,
                  measurement_profile, enabled, draining)
             VALUES (
-                $1, 'urn:sbgh:worker:' || $1::text, $2,
+                $1, $2,
                 ARRAY(SELECT value::worker_capability FROM unnest($3::text[]) value),
                 $4, $5, $6
             )
@@ -78,11 +78,11 @@ impl PostgresFleetStore {
         .await
         .core()?;
         sqlx::query(
-            "INSERT INTO worker_certificate (certificate_sha256, worker_id)
+            "INSERT INTO worker_identity_key (identity_key_sha256, worker_id)
              VALUES ($1, $2)
              ON CONFLICT DO NOTHING",
         )
-        .bind(test_certificate(registration.worker_id).as_slice())
+        .bind(test_identity(registration.worker_id).as_slice())
         .bind(registration.worker_id)
         .execute(&self.pool)
         .await
@@ -100,7 +100,7 @@ impl PostgresFleetStore {
         <Self as FleetStore>::register_session(
             self,
             worker_id,
-            test_certificate(worker_id),
+            test_identity(worker_id),
             request,
             session_ttl,
         )
@@ -285,11 +285,11 @@ impl PostgresFleetStore {
 }
 
 #[cfg(feature = "testing")]
-fn test_certificate(worker_id: Uuid) -> [u8; 32] {
-    let mut fingerprint = [0_u8; 32];
-    fingerprint[..16].copy_from_slice(worker_id.as_bytes());
-    fingerprint[16..].copy_from_slice(worker_id.as_bytes());
-    fingerprint
+fn test_identity(worker_id: Uuid) -> [u8; 32] {
+    let mut digest = [0_u8; 32];
+    digest[..16].copy_from_slice(worker_id.as_bytes());
+    digest[16..].copy_from_slice(worker_id.as_bytes());
+    digest
 }
 
 fn capability_name(capability: WorkerCapability) -> &'static str {
@@ -448,7 +448,7 @@ async fn insert_job_event(
 async fn expire_worker_leases(
     tx: &mut Transaction<'_, Postgres>,
     worker_id: Uuid,
-    certificate_sha256: Option<[u8; 32]>,
+    identity_key_sha256: Option<[u8; 32]>,
 ) -> sbgh_core::Result<()> {
     sqlx::query(
         r#"
@@ -459,12 +459,12 @@ async fn expire_worker_leases(
           FROM worker_session session
          WHERE attempt.worker_session_id = session.worker_session_id
            AND attempt.worker_id = $1
-           AND ($2::bytea IS NULL OR session.certificate_sha256 = $2)
+           AND ($2::bytea IS NULL OR session.identity_key_sha256 = $2)
            AND attempt.status IN ('offered', 'running', 'cancel_requested')
         "#,
     )
     .bind(worker_id)
-    .bind(certificate_sha256.map(|value| value.to_vec()))
+    .bind(identity_key_sha256.map(|value| value.to_vec()))
     .execute(&mut **tx)
     .await
     .core()?;
@@ -477,12 +477,12 @@ async fn expire_worker_leases(
                    ELSE status
                END
          WHERE worker_id = $1
-           AND ($2::bytea IS NULL OR certificate_sha256 = $2)
+           AND ($2::bytea IS NULL OR identity_key_sha256 = $2)
            AND status IN ('registered', 'idle', 'offered', 'running', 'draining')
         "#,
     )
     .bind(worker_id)
-    .bind(certificate_sha256.map(|value| value.to_vec()))
+    .bind(identity_key_sha256.map(|value| value.to_vec()))
     .execute(&mut **tx)
     .await
     .core()?;
@@ -500,11 +500,10 @@ impl WorkerRegistryStore for PostgresFleetStore {
         let result = sqlx::query(
             r#"
             INSERT INTO worker_registry
-                (worker_id, identity_uri, display_name, allowed_capabilities,
+                (worker_id, display_name, allowed_capabilities,
                  measurement_profile, enabled, draining)
             VALUES (
                 $1,
-                'urn:sbgh:worker:' || $1::text,
                 $2,
                 ARRAY(
                     SELECT value::worker_capability
@@ -661,9 +660,9 @@ impl WorkerRegistryStore for PostgresFleetStore {
         }
 
         if next_enabled {
-            let has_certificate: bool = sqlx::query_scalar(
+            let has_identity: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
-                    SELECT 1 FROM worker_certificate
+                    SELECT 1 FROM worker_identity_key
                      WHERE worker_id = $1 AND revoked_at IS NULL
                  )",
             )
@@ -671,8 +670,8 @@ impl WorkerRegistryStore for PostgresFleetStore {
             .fetch_one(&mut *tx)
             .await
             .core()?;
-            if !has_certificate {
-                return Ok(WorkerRegistryMutation::MissingCertificate);
+            if !has_identity {
+                return Ok(WorkerRegistryMutation::MissingIdentity);
             }
         }
 
@@ -727,10 +726,10 @@ impl WorkerRegistryStore for PostgresFleetStore {
         })
     }
 
-    async fn authorize_certificate(
+    async fn authorize_identity(
         &self,
         worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        identity_key_sha256: [u8; 32],
     ) -> sbgh_core::Result<WorkerRegistryMutation> {
         let mut tx = self
             .pool
@@ -749,12 +748,12 @@ impl WorkerRegistryStore for PostgresFleetStore {
         }
         let result = sqlx::query(
             r#"
-            INSERT INTO worker_certificate (certificate_sha256, worker_id)
+            INSERT INTO worker_identity_key (identity_key_sha256, worker_id)
             VALUES ($1, $2)
             ON CONFLICT DO NOTHING
             "#,
         )
-        .bind(certificate_sha256.as_slice())
+        .bind(identity_key_sha256.as_slice())
         .bind(worker_id)
         .execute(&mut *tx)
         .await
@@ -765,10 +764,10 @@ impl WorkerRegistryStore for PostgresFleetStore {
         }
         let existing = sqlx::query(
             "SELECT worker_id, revoked_at IS NOT NULL AS revoked
-               FROM worker_certificate
-              WHERE certificate_sha256 = $1",
+               FROM worker_identity_key
+              WHERE identity_key_sha256 = $1",
         )
-        .bind(certificate_sha256.as_slice())
+        .bind(identity_key_sha256.as_slice())
         .fetch_one(&mut *tx)
         .await
         .core()?;
@@ -787,35 +786,35 @@ impl WorkerRegistryStore for PostgresFleetStore {
         })
     }
 
-    async fn revoke_certificate(
+    async fn revoke_identity(
         &self,
         worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        identity_key_sha256: [u8; 32],
     ) -> sbgh_core::Result<WorkerRegistryMutation> {
         let mut tx = self
             .pool
             .begin()
             .await
             .core()?;
-        let certificate = sqlx::query(
+        let identity = sqlx::query(
             r#"
-            SELECT certificate_sha256, revoked_at, registry.enabled, registry.draining
-              FROM worker_certificate certificate
+            SELECT identity_key_sha256, revoked_at, registry.enabled, registry.draining
+              FROM worker_identity_key identity
               JOIN worker_registry registry USING (worker_id)
-             WHERE certificate.worker_id = $1
-               AND certificate.certificate_sha256 = $2
-             FOR UPDATE OF certificate, registry
+             WHERE identity.worker_id = $1
+               AND identity.identity_key_sha256 = $2
+             FOR UPDATE OF identity, registry
             "#,
         )
         .bind(worker_id)
-        .bind(certificate_sha256.as_slice())
+        .bind(identity_key_sha256.as_slice())
         .fetch_optional(&mut *tx)
         .await
         .core()?;
-        let Some(certificate) = certificate else {
+        let Some(identity) = identity else {
             return Ok(WorkerRegistryMutation::NotFound);
         };
-        if certificate
+        if identity
             .try_get::<Option<DateTime<Utc>>, _>("revoked_at")
             .core()?
             .is_some()
@@ -827,30 +826,30 @@ impl WorkerRegistryStore for PostgresFleetStore {
             SELECT EXISTS (
                 SELECT 1 FROM worker_session
                  WHERE worker_id = $1
-                   AND certificate_sha256 = $2
+                   AND identity_key_sha256 = $2
                    AND status IN ('registered', 'idle', 'offered', 'running', 'draining')
             )
             "#,
         )
         .bind(worker_id)
-        .bind(certificate_sha256.as_slice())
+        .bind(identity_key_sha256.as_slice())
         .fetch_one(&mut *tx)
         .await
         .core()?;
-        let active_certificate_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM worker_certificate
+        let active_identity_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM worker_identity_key
               WHERE worker_id = $1 AND revoked_at IS NULL",
         )
         .bind(worker_id)
         .fetch_one(&mut *tx)
         .await
         .core()?;
-        let final_certificate_for_enabled_worker = active_certificate_count == 1
-            && certificate
+        let final_identity_for_enabled_worker = active_identity_count == 1
+            && identity
                 .try_get::<bool, _>("enabled")
                 .core()?;
-        if used_by_live_session || final_certificate_for_enabled_worker {
-            let draining: bool = certificate
+        if used_by_live_session || final_identity_for_enabled_worker {
+            let draining: bool = identity
                 .try_get("draining")
                 .core()?;
             let busy: bool = sqlx::query_scalar(
@@ -878,23 +877,23 @@ impl WorkerRegistryStore for PostgresFleetStore {
                     UPDATE worker_session
                        SET status = 'offline', ended_at = NOW()
                      WHERE worker_id = $1
-                       AND certificate_sha256 = $2
+                       AND identity_key_sha256 = $2
                        AND status IN ('registered', 'idle', 'draining')
                     "#,
                 )
                 .bind(worker_id)
-                .bind(certificate_sha256.as_slice())
+                .bind(identity_key_sha256.as_slice())
                 .execute(&mut *tx)
                 .await
                 .core()?;
             }
         }
         sqlx::query(
-            "UPDATE worker_certificate
+            "UPDATE worker_identity_key
                 SET revoked_at = NOW()
-              WHERE certificate_sha256 = $1",
+              WHERE identity_key_sha256 = $1",
         )
-        .bind(certificate_sha256.as_slice())
+        .bind(identity_key_sha256.as_slice())
         .execute(&mut *tx)
         .await
         .core()?;
@@ -928,10 +927,10 @@ impl WorkerRegistryStore for PostgresFleetStore {
         Ok(WorkerRegistryMutation::Applied)
     }
 
-    async fn emergency_revoke_certificate(
+    async fn emergency_revoke_identity(
         &self,
         worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        identity_key_sha256: [u8; 32],
     ) -> sbgh_core::Result<WorkerRegistryMutation> {
         let mut tx = self
             .pool
@@ -939,25 +938,25 @@ impl WorkerRegistryStore for PostgresFleetStore {
             .await
             .core()?;
         let result = sqlx::query(
-            "UPDATE worker_certificate
+            "UPDATE worker_identity_key
                 SET revoked_at = NOW()
               WHERE worker_id = $1
-                AND certificate_sha256 = $2
+                AND identity_key_sha256 = $2
                 AND revoked_at IS NULL",
         )
         .bind(worker_id)
-        .bind(certificate_sha256.as_slice())
+        .bind(identity_key_sha256.as_slice())
         .execute(&mut *tx)
         .await
         .core()?;
         if result.rows_affected() == 0 {
             let existing: Option<bool> = sqlx::query_scalar(
                 "SELECT revoked_at IS NOT NULL
-                   FROM worker_certificate
-                  WHERE worker_id = $1 AND certificate_sha256 = $2",
+                   FROM worker_identity_key
+                  WHERE worker_id = $1 AND identity_key_sha256 = $2",
             )
             .bind(worker_id)
-            .bind(certificate_sha256.as_slice())
+            .bind(identity_key_sha256.as_slice())
             .fetch_optional(&mut *tx)
             .await
             .core()?;
@@ -966,20 +965,20 @@ impl WorkerRegistryStore for PostgresFleetStore {
                 _ => WorkerRegistryMutation::NotFound,
             });
         }
-        expire_worker_leases(&mut tx, worker_id, Some(certificate_sha256)).await?;
+        expire_worker_leases(&mut tx, worker_id, Some(identity_key_sha256)).await?;
         tx.commit().await.core()?;
         Ok(WorkerRegistryMutation::Applied)
     }
 
-    async fn worker_certificates(
+    async fn worker_identities(
         &self,
         worker_id: Uuid,
-    ) -> sbgh_core::Result<Vec<WorkerCertificateRecord>> {
+    ) -> sbgh_core::Result<Vec<WorkerIdentityRecord>> {
         let rows = sqlx::query(
-            "SELECT certificate_sha256, created_at, revoked_at
-               FROM worker_certificate
+            "SELECT identity_key_sha256, created_at, revoked_at
+               FROM worker_identity_key
               WHERE worker_id = $1
-              ORDER BY created_at, certificate_sha256",
+              ORDER BY created_at, identity_key_sha256",
         )
         .bind(worker_id)
         .fetch_all(&self.pool)
@@ -988,17 +987,15 @@ impl WorkerRegistryStore for PostgresFleetStore {
         rows.into_iter()
             .map(|row| {
                 let bytes: Vec<u8> = row
-                    .try_get("certificate_sha256")
+                    .try_get("identity_key_sha256")
                     .core()?;
-                let certificate_sha256 = bytes
+                let identity_key_sha256 = bytes
                     .try_into()
                     .map_err(|_| {
-                        sbgh_core::Error::Config(
-                            "worker certificate fingerprint is not 32 bytes".into(),
-                        )
+                        sbgh_core::Error::Config("worker identity digest is not 32 bytes".into())
                     })?;
-                Ok(WorkerCertificateRecord {
-                    certificate_sha256,
+                Ok(WorkerIdentityRecord {
+                    identity_key_sha256,
                     created_at: row
                         .try_get("created_at")
                         .core()?,
@@ -1112,28 +1109,26 @@ impl WorkerRegistryStore for PostgresFleetStore {
 
     async fn authorize_worker(
         &self,
-        worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        identity_key_sha256: [u8; 32],
     ) -> sbgh_core::Result<Option<WorkerAuthorization>> {
         let row = sqlx::query(
             r#"
-            SELECT ARRAY(
+            SELECT registry.worker_id,
+                   ARRAY(
                        SELECT capability::text
                          FROM unnest(registry.allowed_capabilities) AS capability
                    ) AS allowed_capabilities,
                    registry.measurement_profile,
                    registry.draining
               FROM worker_registry registry
-              JOIN worker_certificate certificate
-                ON certificate.worker_id = registry.worker_id
-               AND certificate.certificate_sha256 = $2
-               AND certificate.revoked_at IS NULL
-             WHERE registry.worker_id = $1
-               AND registry.enabled
+              JOIN worker_identity_key identity
+                ON identity.worker_id = registry.worker_id
+               AND identity.identity_key_sha256 = $1
+               AND identity.revoked_at IS NULL
+             WHERE registry.enabled
             "#,
         )
-        .bind(worker_id)
-        .bind(certificate_sha256.as_slice())
+        .bind(identity_key_sha256.as_slice())
         .fetch_optional(&self.pool)
         .await
         .core()?;
@@ -1142,7 +1137,9 @@ impl WorkerRegistryStore for PostgresFleetStore {
                 .try_get("allowed_capabilities")
                 .core()?;
             Ok(WorkerAuthorization {
-                worker_id,
+                worker_id: row
+                    .try_get("worker_id")
+                    .core()?,
                 allowed_capabilities: capabilities
                     .iter()
                     .map(|value| capability(value))
@@ -1203,16 +1200,11 @@ impl WorkerRegistryStore for PostgresFleetStore {
 impl FleetStore for PostgresFleetStore {
     async fn register_session(
         &self,
-        certificate_worker_id: Uuid,
-        certificate_sha256: [u8; 32],
+        worker_id: Uuid,
+        identity_key_sha256: [u8; 32],
         request: &RegisterSessionRequest,
         session_ttl: Duration,
     ) -> sbgh_core::Result<AuthorizedSession> {
-        if certificate_worker_id != request.worker_id {
-            return Err(sbgh_core::Error::Config(
-                "certificate worker identity does not match request worker_id".into(),
-            ));
-        }
         let mut tx = self
             .pool
             .begin()
@@ -1228,16 +1220,16 @@ impl FleetStore for PostgresFleetStore {
                    enabled,
                    draining
               FROM worker_registry registry
-              JOIN worker_certificate certificate
-                ON certificate.worker_id = registry.worker_id
-               AND certificate.certificate_sha256 = $2
-               AND certificate.revoked_at IS NULL
+              JOIN worker_identity_key identity
+                ON identity.worker_id = registry.worker_id
+               AND identity.identity_key_sha256 = $2
+               AND identity.revoked_at IS NULL
              WHERE registry.worker_id = $1
              FOR UPDATE
             "#,
         )
-        .bind(request.worker_id)
-        .bind(certificate_sha256.as_slice())
+        .bind(worker_id)
+        .bind(identity_key_sha256.as_slice())
         .fetch_optional(&mut *tx)
         .await
         .core()?
@@ -1286,7 +1278,7 @@ impl FleetStore for PostgresFleetStore {
                    protocol_version,
                    software_version,
                    resource_facts,
-                   certificate_sha256
+                   identity_key_sha256
               FROM worker_session
              WHERE worker_id = $1
                AND worker_session_id = $2
@@ -1294,7 +1286,7 @@ impl FleetStore for PostgresFleetStore {
              FOR UPDATE
             "#,
         )
-        .bind(request.worker_id)
+        .bind(worker_id)
         .bind(request.worker_session_id)
         .fetch_optional(&mut *tx)
         .await
@@ -1317,10 +1309,10 @@ impl FleetStore for PostgresFleetStore {
                     .core()?
                     == resources
                 && existing
-                    .try_get::<Option<Vec<u8>>, _>("certificate_sha256")
+                    .try_get::<Option<Vec<u8>>, _>("identity_key_sha256")
                     .core()?
                     .as_deref()
-                    == Some(certificate_sha256.as_slice());
+                    == Some(identity_key_sha256.as_slice());
             if !same {
                 return Err(sbgh_core::Error::Config(
                     "a worker session UUID cannot be reused with different registration facts"
@@ -1352,7 +1344,7 @@ impl FleetStore for PostgresFleetStore {
             .core()?;
             tx.commit().await.core()?;
             return Ok(AuthorizedSession {
-                worker_id: request.worker_id,
+                worker_id,
                 worker_session_id: request.worker_session_id,
                 effective_capabilities: effective
                     .iter()
@@ -1376,7 +1368,7 @@ impl FleetStore for PostgresFleetStore {
                AND expires_at <= NOW()
             "#,
         )
-        .bind(request.worker_id)
+        .bind(worker_id)
         .execute(&mut *tx)
         .await
         .core()?;
@@ -1390,7 +1382,7 @@ impl FleetStore for PostgresFleetStore {
              FOR UPDATE
             "#,
         )
-        .bind(request.worker_id)
+        .bind(worker_id)
         .bind(request.worker_session_id)
         .fetch_all(&mut *tx)
         .await
@@ -1448,7 +1440,7 @@ impl FleetStore for PostgresFleetStore {
                     ON CONFLICT (attempt_id) DO NOTHING
                     "#,
                 )
-                .bind(request.worker_id)
+                .bind(worker_id)
                 .bind(predecessor_session_id)
                 .bind(attempt_id)
                 .bind(job_id)
@@ -1467,7 +1459,7 @@ impl FleetStore for PostgresFleetStore {
                AND status IN ('registered', 'idle', 'offered', 'running', 'draining')
             "#,
         )
-        .bind(request.worker_id)
+        .bind(worker_id)
         .bind(request.worker_session_id)
         .execute(&mut *tx)
         .await
@@ -1478,7 +1470,7 @@ impl FleetStore for PostgresFleetStore {
             INSERT INTO worker_session
                 (worker_session_id, worker_id, status, protocol_version,
                  software_version, advertised_capabilities, effective_capabilities,
-                 resource_facts, expires_at, certificate_sha256)
+                 resource_facts, expires_at, identity_key_sha256)
             VALUES (
                 $1, $2, $3::text::worker_session_status, $4, $5,
                 ARRAY(SELECT value::worker_capability FROM unnest($6::text[]) AS value),
@@ -1488,7 +1480,7 @@ impl FleetStore for PostgresFleetStore {
             "#,
         )
         .bind(request.worker_session_id)
-        .bind(request.worker_id)
+        .bind(worker_id)
         .bind(if draining { "draining" } else { "registered" })
         .bind(i32::from(request.protocol_version))
         .bind(&request.software_version)
@@ -1496,14 +1488,14 @@ impl FleetStore for PostgresFleetStore {
         .bind(&effective)
         .bind(resources)
         .bind(expires_at)
-        .bind(certificate_sha256.as_slice())
+        .bind(identity_key_sha256.as_slice())
         .execute(&mut *tx)
         .await
         .core()?;
         tx.commit().await.core()?;
 
         Ok(AuthorizedSession {
-            worker_id: request.worker_id,
+            worker_id,
             worker_session_id: request.worker_session_id,
             effective_capabilities: effective
                 .iter()

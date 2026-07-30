@@ -41,8 +41,11 @@ clap.workspace = true
 toml.workspace = true
 reqwest = { workspace = true, features = ["rustls", "json", "query", "stream"] }
 rustls.workspace = true
-rustls-pemfile.workspace = true
+rustls-native-certs.workspace = true
 tokio-rustls.workspace = true
+p256.workspace = true
+rcgen = "0.14.7"
+time.workspace = true
 futures.workspace = true
 tonic.workspace = true
 hyper-util.workspace = true
@@ -51,4 +54,3 @@ hyper-util.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-stream.workspace = true
-rcgen = "0.14.7"

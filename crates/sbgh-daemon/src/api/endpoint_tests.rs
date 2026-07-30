@@ -24,7 +24,6 @@ fn router_with(pool: Pool, gh_api_base: String) -> Router {
         pool: pool.clone(),
         ingest: Arc::new(PostgresIngestStore::new(pool)),
         gh_api_base,
-        worker_ca_certificate: "worker-ca.pem".into(),
     };
     build_router(state, tokens)
 }
@@ -154,7 +153,7 @@ async fn worker_policy_is_admin_mutated_and_starts_inert() {
     assert_eq!(created["worker"]["worker_id"], worker_id.to_string());
     assert_eq!(created["worker"]["enabled"], false);
     assert_eq!(created["worker"]["draining"], true);
-    assert_eq!(created["certificates"], serde_json::json!([]));
+    assert_eq!(created["identities"], serde_json::json!([]));
     let (status, retried) =
         send(&router, "POST", "/api/fleet/workers", Some("admintok"), Some(&body)).await;
     assert_eq!(status, StatusCode::OK, "{retried}");
@@ -190,7 +189,7 @@ async fn worker_policy_is_admin_mutated_and_starts_inert() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(failed["error"]["message"], "worker has no active certificate");
+    assert_eq!(failed["error"]["message"], "worker has no active identity key");
 }
 
 #[tokio::test]

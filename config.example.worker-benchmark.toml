@@ -1,48 +1,38 @@
-worker_id = "11111111-1111-4111-8111-111111111111"
 orchestrator_url = "https://fleet.internal.example:9443"
-client_certificate = "/etc/sbgh/worker/client.crt"
-client_private_key = "/etc/sbgh/worker/client.key"
-server_ca_certificate = "/etc/sbgh/worker/orchestrator-ca.crt"
-capabilities = ["benchmark", "build_only"]
+identity_private_key = "/etc/sbgh/worker/client.key"
 
 [binary_cache]
 enabled = true
 max_bytes = 53687091200
 dir = "/var/lib/sbgh-worker/binary-cache"
 
-[libvirt]
+[sandbox]
 service_user = "sbgh-worker"
 host_cpus = "6-7"
-
-[libvirt.vm]
 golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
 boot_disk_gib = 64
-# The versioned, policy-managed network used by every adversarial guest phase.
-# Install it with scripts/install-sandbox-network.sh; other names fail
-# preflight.
-network = "sandbox-egress"
-poll_interval_secs = 5
-heartbeat_interval_secs = 60
 
-[libvirt.benchmark]
+[benchmark]
 build_vcpus = 4
 bench_vcpus = 2
 build_memory_bytes = 17179869184
 bench_memory_bytes = 8589934592
 job_timeout_secs = 21600
 
-[libvirt.paths]
+[workspace]
 jobs_dir = "/var/lib/sbgh-worker/jobs"
 git_mirror = "/var/lib/sbgh-worker/git/stacks-core.git"
 results_tmpfs_root = "/run/sbgh-worker/jobs"
 results_archive_dir = "/var/lib/sbgh-worker/results"
-virsh_binary = "/usr/bin/virsh"
-sudo_binary = "/usr/bin/sudo"
-qemu_img_binary = "/usr/bin/qemu-img"
-cloud_localds_binary = "/usr/bin/cloud-localds"
-git_binary = "/usr/bin/git"
 
-[libvirt.lvm]
+[commands]
+virsh = "/usr/bin/virsh"
+sudo = "/usr/bin/sudo"
+qemu_img = "/usr/bin/qemu-img"
+cloud_localds = "/usr/bin/cloud-localds"
+git = "/usr/bin/git"
+
+[lvm]
 vg_name = "vg0"
 thinpool = "thinpool"
 chainstate_base_prefix = "mainnet-"

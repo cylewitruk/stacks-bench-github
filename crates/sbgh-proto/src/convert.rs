@@ -523,7 +523,6 @@ impl Wire for wire::RegisterRequest {
     fn into_domain(self) -> Result<Self::Domain, domain::ProtocolError> {
         Ok(domain::RegisterSessionRequest {
             protocol_version: protocol_version(self.protocol_version)?,
-            worker_id: uuid("worker_id", &self.worker_id)?,
             worker_session_id: uuid("worker_session_id", &self.worker_session_id)?,
             software_version: self.software_version,
             advertised_capabilities: self
@@ -538,7 +537,6 @@ impl Wire for wire::RegisterRequest {
     fn from_domain(value: Self::Domain) -> Self {
         Self {
             protocol_version: u32::from(value.protocol_version),
-            worker_id: value.worker_id.to_string(),
             worker_session_id: value
                 .worker_session_id
                 .to_string(),
@@ -1126,7 +1124,6 @@ mod tests {
 
     #[test]
     fn every_rpc_message_round_trips_through_protobuf_bytes() {
-        let worker_id = id("55555555-5555-4555-8555-555555555555");
         let session_id = attempt_identity().worker_session_id;
         let trace_id = id("33333333-3333-4333-8333-333333333333");
         let event_payload = domain::ReliableEventPayload::Phase {
@@ -1140,7 +1137,6 @@ mod tests {
         });
         assert_wire_round_trip::<wire::RegisterRequest>(domain::RegisterSessionRequest {
             protocol_version: domain::PROTOCOL_VERSION,
-            worker_id,
             worker_session_id: session_id,
             software_version: "v29-test".into(),
             advertised_capabilities: BTreeSet::from([
@@ -1347,7 +1343,6 @@ mod tests {
         assert!(
             wire::RegisterRequest {
                 protocol_version: u32::from(domain::PROTOCOL_VERSION),
-                worker_id: Uuid::new_v4().to_string(),
                 worker_session_id: Uuid::new_v4().to_string(),
                 software_version: "test".into(),
                 advertised_capabilities: vec![wire::WorkerCapability::Benchmark as i32],

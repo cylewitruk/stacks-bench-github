@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::io::{self, BufReader};
+use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, ensure};
 use hyper_util::rt::TokioIo;
 use reqwest::header::{HeaderName, HeaderValue};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use sbgh_fleet::{
     AcceptOfferRequest, AcceptOfferResponse, ArtifactGrantRequest, ArtifactGrantResponse,
@@ -81,21 +81,11 @@ impl Service<Uri> for Tls13Connector {
 }
 
 impl FleetClient {
-    pub fn build(
-        base_url: &str,
-        client_certificate: &Path,
-        client_private_key: &Path,
-        server_ca_certificate: &Path,
-    ) -> anyhow::Result<Self> {
-        require_private_permissions(client_private_key)?;
-        let certificate_pem = std::fs::read(client_certificate).with_context(|| {
-            format!("reading worker certificate {}", client_certificate.display())
+    pub fn build(base_url: &str, identity_private_key: &Path) -> anyhow::Result<Self> {
+        crate::identity::require_private_permissions(identity_private_key)?;
+        let private_key_pem = std::fs::read_to_string(identity_private_key).with_context(|| {
+            format!("reading worker identity key {}", identity_private_key.display())
         })?;
-        let private_key_pem = std::fs::read(client_private_key).with_context(|| {
-            format!("reading worker private key {}", client_private_key.display())
-        })?;
-        let ca_pem = std::fs::read(server_ca_certificate)
-            .with_context(|| format!("reading server CA {}", server_ca_certificate.display()))?;
         let origin = reqwest::Url::parse(base_url).context("parsing fleet gRPC endpoint")?;
         ensure!(
             origin.scheme() == "https"
@@ -125,7 +115,7 @@ impl FleetClient {
             .context("parsing fleet gRPC endpoint")?
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(MAX_LONG_POLL_SECS + 15));
-        let connector = tls13_connector(&host, port, &certificate_pem, &private_key_pem, &ca_pem)?;
+        let connector = tls13_connector(&host, port, &private_key_pem)?;
         // The endpoint URI is deliberately `http` only to keep Tonic from
         // applying its TLS-1.2-capable convenience connector. Every socket is
         // wrapped by this TLS-1.3-only connector before HTTP/2 sees it.
@@ -365,22 +355,36 @@ impl FleetClient {
 fn tls13_connector(
     host: &str,
     port: u16,
-    certificate_pem: &[u8],
-    private_key_pem: &[u8],
-    ca_pem: &[u8],
+    identity_private_key_pem: &str,
 ) -> anyhow::Result<Tls13Connector> {
     let mut roots = RootCertStore::empty();
-    let authorities = certificates(ca_pem).context("parsing fleet server CA certificate")?;
-    ensure!(!authorities.is_empty(), "fleet server CA contains no certificates");
-    for authority in authorities {
+    let native = rustls_native_certs::load_native_certs();
+    for error in native.errors {
+        tracing::warn!(%error, "skipping an unreadable platform trust anchor");
+    }
+    for authority in native.certs {
         roots
             .add(authority)
-            .context("adding fleet server CA certificate")?;
+            .context("adding native server trust anchor")?;
     }
-    let certificate_chain =
-        certificates(certificate_pem).context("parsing worker client certificate")?;
-    ensure!(!certificate_chain.is_empty(), "worker client certificate is empty");
-    let private_key = private_key(private_key_pem).context("parsing worker client private key")?;
+    ensure!(!roots.is_empty(), "platform trust store contains no certificates");
+
+    let key = rcgen::KeyPair::from_pem(identity_private_key_pem)
+        .context("parsing P-256 worker identity private key")?;
+    ensure!(
+        key.algorithm() == &rcgen::PKCS_ECDSA_P256_SHA256,
+        "worker identity key must use P-256"
+    );
+    let mut params = rcgen::CertificateParams::default();
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::minutes(1);
+    params.not_after = now + time::Duration::hours(1);
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let wrapper = params
+        .self_signed(&key)
+        .context("creating ephemeral worker TLS wrapper")?;
+    let certificate_chain = vec![wrapper.der().clone()];
+    let private_key = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
     let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_root_certificates(roots)
         .with_client_auth_cert(certificate_chain, private_key)
@@ -394,16 +398,6 @@ fn tls13_connector(
             .context("fleet server name is invalid")?,
         tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
     })
-}
-
-fn certificates(pem: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    rustls_pemfile::certs(&mut BufReader::new(pem))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(anyhow::Error::from)
-}
-
-fn private_key(pem: &[u8]) -> anyhow::Result<PrivateKeyDer<'static>> {
-    rustls_pemfile::private_key(&mut BufReader::new(pem))?.context("PEM contains no private key")
 }
 
 fn delegated_artifact_url(raw: &str) -> anyhow::Result<reqwest::Url> {
@@ -427,23 +421,6 @@ fn delegated_artifact_url(raw: &str) -> anyhow::Result<reqwest::Url> {
         "artifact grant URL must use HTTPS (HTTP is accepted only on loopback)"
     );
     Ok(url)
-}
-
-fn require_private_permissions(path: &Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
-            .with_context(|| format!("stat worker private key {}", path.display()))?
-            .permissions()
-            .mode();
-        ensure!(
-            mode & 0o077 == 0,
-            "worker private key {} must not be accessible by group/other",
-            path.display()
-        );
-    }
-    Ok(())
 }
 
 fn fleet_error(path: &str, status: tonic::Status) -> anyhow::Error {
@@ -786,14 +763,12 @@ mod tests {
                 .build()
                 .unwrap(),
         };
-        let worker_id = Uuid::new_v4();
         let session_id = identity().worker_session_id;
         let trace_id = assignment().trace_id;
 
         client
             .register(&RegisterSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
-                worker_id,
                 worker_session_id: session_id,
                 software_version: "test".into(),
                 advertised_capabilities: std::collections::BTreeSet::from([

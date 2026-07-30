@@ -1,13 +1,13 @@
 # v31: Worker Identity and Configuration Simplification
 
 Successor to
-[v30](../archive/completed/0076-database-backed-worker-registry.md).
+[v30](0076-database-backed-worker-registry.md).
 Make the first deployed worker identity contract key-based rather than
 private-CA based, derive local capabilities from configured recipes, and make
 the operator-facing worker configuration belong to `sbgh-worker` rather than
 the libvirt adapter.
 
-> **Status:** planned
+> **Status:** shipped
 >
 > v29 and v30 established protobuf transport and database-owned worker policy,
 > but the fleet has not yet been deployed. v31 consolidates their undeployed
@@ -15,18 +15,20 @@ the libvirt adapter.
 > rollout. It does not preserve an unused certificate wire or storage contract.
 > The operator confirmed on 2026-07-30 that v30 has not been deployed or pushed
 > to a shared environment; only recreatable local development state may contain
-> its migration.
+> its migration. Implementation and local validation are complete; the public
+> endpoint, certificate-renewal, and real-host canaries remain first-deployment
+> rollout gates.
 
 ## Item
 
 - **id:** `0077-worker-identity-and-config-simplification`
-- **status:** `planned`
+- **status:** `shipped`
 - **priority:** `high`
 - **depends_on:** `0074-protobuf-fleet-protocol`,
   `0076-database-backed-worker-registry`
 - **relates_to:** `0075-rolling-worker-protocol-compatibility`
 - **decision:**
-  [0005-public-key-worker-identities](../decisions/0005-public-key-worker-identities.md)
+  [0005-public-key-worker-identities](../../decisions/0005-public-key-worker-identities.md)
 - **source:** worker configuration and identity simplification review (2026-07)
 
 ## Why
@@ -295,16 +297,16 @@ changing transport.
 
 **Acceptance & Validation:**
 
-- [ ] The same public key always yields the same digest regardless of PEM
+- [x] The same public key always yields the same digest regardless of PEM
   whitespace or regenerated TLS wrapper; a different key yields a different
   digest.
-- [ ] Malformed, private, multiple, oversized, noncanonical, and unsupported
+- [x] Malformed, private, multiple, oversized, noncanonical, and unsupported
   keys fail before persistence.
-- [ ] Concurrent enrollment elects one worker; revoked keys cannot be
+- [x] Concurrent enrollment elects one worker; revoked keys cannot be
   resurrected or reassigned.
-- [ ] Registry/session history and normal/emergency revocation invariants
+- [x] Registry/session history and normal/emergency revocation invariants
   remain covered.
-- [ ] Fresh schema and representative upgrade tests contain no certificate
+- [x] Fresh schema and representative upgrade tests contain no certificate
   table, URI identity, or certificate fingerprint.
 
 ### Phase 2: Web-PKI Daemon and Key-Authenticated Workers
@@ -328,19 +330,19 @@ possession while retaining TLS 1.3 and gRPC.
 
 **Acceptance & Validation:**
 
-- [ ] Wrong hostname, untrusted/expired daemon chain, plaintext, TLS downgrade,
+- [x] Wrong hostname, untrusted/expired daemon chain, plaintext, TLS downgrade,
   missing client proof, malformed wrapper, and unsupported key fail closed.
-- [ ] A full-handshake adversarial test presents an enrolled victim SPKI but
+- [x] A full-handshake adversarial test presents an enrolled victim SPKI but
   attempts `CertificateVerify` with a different private key; the handshake
   fails before any gRPC handler or database authorization call. Corrupted
   transcript signatures fail equivalently.
-- [ ] A valid but unenrolled key cannot register or invoke another RPC.
-- [ ] An enrolled key registers as its database-mapped UUID without sending
+- [x] A valid but unenrolled key cannot register or invoke another RPC.
+- [x] An enrolled key registers as its database-mapped UUID without sending
   that UUID; no CN, SAN, or request field can override the mapping.
-- [ ] Revocation rejects the next RPC on an existing HTTP/2 connection.
-- [ ] Two active keys can overlap for one worker; revoking one does not affect a
+- [x] Revocation rejects the next RPC on an existing HTTP/2 connection.
+- [x] Two active keys can overlap for one worker; revoking one does not affect a
   session authenticated by the other.
-- [ ] All generated gRPC RPCs retain deadlines, retry idempotency, size bounds,
+- [x] All generated gRPC RPCs retain deadlines, retry idempotency, size bounds,
   fencing, and structured error behavior.
 
 ### Phase 3: Worker-Owned Configuration and Capability Inference
@@ -361,15 +363,15 @@ into the libvirt adapter.
 
 **Acceptance & Validation:**
 
-- [ ] Benchmark-only, validation-only, and combined examples parse, validate
+- [x] Benchmark-only, validation-only, and combined examples parse, validate
   host resources, preflight every configured recipe, and advertise exactly the
   inferred capabilities.
-- [ ] A worker with no recipe fails startup; database policy can narrow but
+- [x] A worker with no recipe fails startup; database policy can narrow but
   never expand inferred support.
-- [ ] Legacy identity, capability, and `[libvirt.*]` fields fail as unknown.
-- [ ] Task-specific validation remains beside its task profile; the adapter
+- [x] Legacy identity, capability, and `[libvirt.*]` fields fail as unknown.
+- [x] Task-specific validation remains beside its task profile; the adapter
   receives only a validated projection.
-- [ ] Existing VM XML, command construction, resource allocation, chainstate,
+- [x] Existing VM XML, command construction, resource allocation, chainstate,
   cache, artifact, cancellation, and cleanup golden tests remain unchanged
   except for config construction.
 
@@ -394,33 +396,33 @@ worker setup concise and difficult to misuse.
 
 **Acceptance & Validation:**
 
-- [ ] A new operator can generate one key, provide only its public half to the
+- [x] A new operator can generate one key, provide only its public half to the
   administrator, install the two-line worker identity/endpoint config, and
   register after authorization.
-- [ ] Documentation has no worker certificate issuance, CA distribution,
+- [x] Documentation has no worker certificate issuance, CA distribution,
   URI-SAN, or insecure-verification path.
-- [ ] Daemon certificate renewal requires no worker config change and workers
+- [x] Daemon certificate renewal requires no worker config change and workers
   reconnect safely after restart.
-- [ ] Private key files are create-new, mode `0600`, non-serializable, and
+- [x] Private key files are create-new, mode `0600`, non-serializable, and
   absent from logs, API payloads, snapshots, and test output.
-- [ ] Config examples and planning/docs registries are parse/link checked.
+- [x] Config examples and planning/docs registries are parse/link checked.
 
 ## Final Validation
 
-- [ ] `just build --no-sccache`
-- [ ] `just lint --no-sccache`
-- [ ] `just test --summary --no-sccache`
-- [ ] `git diff --check`
-- [ ] Fresh and representative migration suites pass with the final identity
+- [x] `just build --no-sccache`
+- [x] `just lint --no-sccache`
+- [x] `just test --summary --no-sccache`
+- [x] `git diff --check`
+- [x] Fresh and representative migration suites pass with the final identity
   schema only.
-- [ ] Protobuf generation, Buf lint, all-RPC conversion, package-DAG, and wire
+- [x] Protobuf generation, Buf lint, all-RPC conversion, package-DAG, and wire
   boundary checks pass.
-- [ ] Public-key parser/digest, TLS handshake, hostname/trust, enrollment,
+- [x] Public-key parser/digest, TLS handshake, hostname/trust, enrollment,
   concurrent ownership, overlap rotation, revocation, and open-connection
   authorization suites pass.
-- [ ] All three worker configuration shapes, capability intersection, host
+- [x] All three worker configuration shapes, capability intersection, host
   discovery, libvirt projection, preflight, and stale-field rejection pass.
-- [ ] Existing scheduler, lease/fence, event resend, cancellation, artifact,
+- [x] Existing scheduler, lease/fence, event resend, cancellation, artifact,
   cleanup, benchmark, block-validation, and reporting suites remain green.
 - [ ] On the real deployment, a publicly trusted daemon endpoint accepts one
   enrolled benchmark worker and one enrolled block-validation worker; both

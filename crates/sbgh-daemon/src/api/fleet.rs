@@ -5,8 +5,8 @@ use axum::extract::{Path, State};
 use axum::http::header;
 use sbgh_api::{
     FleetCancellationResponse, FleetOverview, FleetRecoveryRequest, FleetRecoveryResponse,
-    FleetSummaryView, FleetWorkerView, WorkerCertificateRequest, WorkerCertificateView,
-    WorkerCreateRequest, WorkerDrainRequest, WorkerPolicyView, WorkerUpdateRequest,
+    FleetSummaryView, FleetWorkerView, WorkerCreateRequest, WorkerDrainRequest,
+    WorkerIdentityRequest, WorkerIdentityView, WorkerPolicyView, WorkerUpdateRequest,
 };
 use sbgh_core::db::fleet::{
     FleetStore, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryEntry, WorkerRegistryMutation,
@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::api::error::ApiErr;
 use crate::api::state::ApiState;
-use crate::fleet::validate_worker_certificate;
+use crate::fleet::validate_worker_identity_key;
 
 pub async fn overview(State(state): State<ApiState>) -> Result<Json<FleetOverview>, ApiErr> {
     let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
@@ -127,50 +127,48 @@ pub async fn update_worker(
     worker_detail(&state, worker_id).await
 }
 
-pub async fn authorize_certificate(
+pub async fn authorize_identity(
     State(state): State<ApiState>,
     Path(worker_id): Path<Uuid>,
-    Json(request): Json<WorkerCertificateRequest>,
+    Json(request): Json<WorkerIdentityRequest>,
 ) -> Result<Json<WorkerPolicyView>, ApiErr> {
-    let certificate_sha256 = validate_worker_certificate(
+    let identity_key_sha256 = validate_worker_identity_key(
         request
-            .certificate_pem
+            .public_key_pem
             .as_bytes(),
-        worker_id,
-        &state.worker_ca_certificate,
     )
     .map_err(|error| ApiErr::bad_request(error.to_string()))?;
     let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
     mutation_response(
         store
-            .authorize_certificate(worker_id, certificate_sha256)
+            .authorize_identity(worker_id, identity_key_sha256)
             .await?,
-        "certificate is already bound or revoked",
+        "identity key is already bound or revoked",
     )?;
     tracing::info!(
         %worker_id,
-        certificate_sha256 = %hex::encode(certificate_sha256),
-        "worker certificate authorized"
+        identity_key_sha256 = %hex::encode(identity_key_sha256),
+        "worker identity key authorized"
     );
     worker_detail(&state, worker_id).await
 }
 
-pub async fn revoke_certificate(
+pub async fn revoke_identity(
     State(state): State<ApiState>,
-    Path((worker_id, fingerprint)): Path<(Uuid, String)>,
+    Path((worker_id, identity)): Path<(Uuid, String)>,
 ) -> Result<Json<WorkerPolicyView>, ApiErr> {
-    let certificate_sha256 = parse_fingerprint(&fingerprint)?;
+    let identity_key_sha256 = parse_identity_digest(&identity)?;
     let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
     mutation_response(
         store
-            .revoke_certificate(worker_id, certificate_sha256)
+            .revoke_identity(worker_id, identity_key_sha256)
             .await?,
-        "certificate cannot be revoked in the current worker state",
+        "identity key cannot be revoked in the current worker state",
     )?;
     tracing::info!(
         %worker_id,
-        certificate_sha256 = %hex::encode(certificate_sha256),
-        "worker certificate revoked"
+        identity_key_sha256 = %hex::encode(identity_key_sha256),
+        "worker identity key revoked"
     );
     worker_detail(&state, worker_id).await
 }
@@ -190,22 +188,22 @@ pub async fn emergency_disable_worker(
     worker_detail(&state, worker_id).await
 }
 
-pub async fn emergency_revoke_certificate(
+pub async fn emergency_revoke_identity(
     State(state): State<ApiState>,
-    Path((worker_id, fingerprint)): Path<(Uuid, String)>,
+    Path((worker_id, identity)): Path<(Uuid, String)>,
 ) -> Result<Json<WorkerPolicyView>, ApiErr> {
-    let certificate_sha256 = parse_fingerprint(&fingerprint)?;
+    let identity_key_sha256 = parse_identity_digest(&identity)?;
     let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
     mutation_response(
         store
-            .emergency_revoke_certificate(worker_id, certificate_sha256)
+            .emergency_revoke_identity(worker_id, identity_key_sha256)
             .await?,
-        "certificate cannot be revoked",
+        "identity key cannot be revoked",
     )?;
     tracing::warn!(
         %worker_id,
-        certificate_sha256 = %hex::encode(certificate_sha256),
-        "worker certificate revoked and authenticated leases expired"
+        identity_key_sha256 = %hex::encode(identity_key_sha256),
+        "worker identity key revoked and authenticated leases expired"
     );
     worker_detail(&state, worker_id).await
 }
@@ -222,19 +220,19 @@ async fn worker_detail(
         .next()
         .map(worker_view)
         .ok_or_else(|| ApiErr::not_found("worker not found"))?;
-    let certificates = store
-        .worker_certificates(worker_id)
+    let identities = store
+        .worker_identities(worker_id)
         .await?
         .into_iter()
-        .map(|record| WorkerCertificateView {
-            certificate_sha256: hex::encode(record.certificate_sha256),
+        .map(|record| WorkerIdentityView {
+            identity_key_sha256: format!("sha256:{}", hex::encode(record.identity_key_sha256)),
             created_at: record.created_at.to_rfc3339(),
             revoked_at: record
                 .revoked_at
                 .map(|value| value.to_rfc3339()),
         })
         .collect();
-    Ok(Json(WorkerPolicyView { worker, certificates }))
+    Ok(Json(WorkerPolicyView { worker, identities }))
 }
 
 fn worker_view(record: WorkerRegistryEntry) -> FleetWorkerView {
@@ -276,13 +274,13 @@ fn mutation_response(
     match mutation {
         WorkerRegistryMutation::Applied | WorkerRegistryMutation::Unchanged => Ok(()),
         WorkerRegistryMutation::NotFound => {
-            Err(ApiErr::not_found("worker or certificate not found"))
+            Err(ApiErr::not_found("worker or identity key not found"))
         }
         WorkerRegistryMutation::Busy => {
             Err(ApiErr::conflict("worker must be drained and quiescent"))
         }
-        WorkerRegistryMutation::MissingCertificate => {
-            Err(ApiErr::conflict("worker has no active certificate"))
+        WorkerRegistryMutation::MissingIdentity => {
+            Err(ApiErr::conflict("worker has no active identity key"))
         }
         WorkerRegistryMutation::Conflict => Err(ApiErr::conflict(conflict)),
     }
@@ -341,21 +339,23 @@ fn validated_display_name(value: &str) -> Result<String, ApiErr> {
     Ok(value.to_owned())
 }
 
-fn parse_fingerprint(value: &str) -> Result<[u8; 32], ApiErr> {
-    let bytes = hex::decode(value).map_err(|_| {
-        ApiErr::bad_request("certificate fingerprint must be lowercase SHA-256 hex")
-    })?;
+fn parse_identity_digest(value: &str) -> Result<[u8; 32], ApiErr> {
+    let value = value
+        .strip_prefix("sha256:")
+        .ok_or_else(|| ApiErr::bad_request("identity digest must use sha256:<hex>"))?;
+    let bytes = hex::decode(value)
+        .map_err(|_| ApiErr::bad_request("identity digest must be lowercase SHA-256 hex"))?;
     if value.len() != 64
         || value
             .bytes()
             .any(|byte| byte.is_ascii_uppercase())
         || bytes.len() != 32
     {
-        return Err(ApiErr::bad_request("certificate fingerprint must be lowercase SHA-256 hex"));
+        return Err(ApiErr::bad_request("identity digest must be lowercase SHA-256 hex"));
     }
     bytes
         .try_into()
-        .map_err(|_| ApiErr::bad_request("certificate fingerprint must be 32 bytes"))
+        .map_err(|_| ApiErr::bad_request("identity digest must be 32 bytes"))
 }
 
 /// Prometheus text exposition for the operational signals pinned by v25.

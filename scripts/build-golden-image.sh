@@ -15,7 +15,7 @@
 # and the appliance can't reach anything useful).
 #
 # Output: a qcow2 image at the path passed as $1, ready to be referenced by
-# `[libvirt.vm].golden_image` in the worker profile.
+# `[sandbox].golden_image` in the worker profile.
 #
 # Requires (on the build host): qemu-utils, cloud-image-utils,
 # libvirt-daemon-system, virtinst, libguestfs-tools (for virt-sysprep),

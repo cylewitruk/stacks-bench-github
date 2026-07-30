@@ -153,13 +153,12 @@ impl Validate for InclusiveRange {
 impl Validate for RegisterSessionRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         version(self.protocol_version)?;
-        if self.worker_id.is_nil()
-            || self
-                .worker_session_id
-                .is_nil()
+        if self
+            .worker_session_id
+            .is_nil()
         {
             return Err(ProtocolError::Invalid {
-                field: "worker identity",
+                field: "worker_session_id",
                 reason: "UUID must not be nil".into(),
             });
         }
@@ -644,7 +643,6 @@ mod tests {
     fn registration_accepts_resource_facts_without_dataset_coordination() {
         let request = RegisterSessionRequest {
             protocol_version: PROTOCOL_VERSION,
-            worker_id: Uuid::new_v4(),
             worker_session_id: Uuid::new_v4(),
             software_version: "test".into(),
             advertised_capabilities: BTreeSet::from([WorkerCapability::Benchmark]),
@@ -671,7 +669,6 @@ mod tests {
     fn registration_protocol_version_and_telemetry_bounds_are_enforced() {
         let registration = RegisterSessionRequest {
             protocol_version: PROTOCOL_VERSION + 1,
-            worker_id: Uuid::new_v4(),
             worker_session_id: Uuid::new_v4(),
             software_version: "test".into(),
             advertised_capabilities: BTreeSet::from([WorkerCapability::Benchmark]),

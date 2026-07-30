@@ -32,37 +32,26 @@ const EVENT_BUFFER_CAPACITY: usize = 256;
 /// session.
 pub async fn preflight_local_execution(config: &WorkerConfig) -> anyhow::Result<()> {
     let driver = preflight_driver(config)?;
-    if config
-        .capabilities
-        .contains(&sbgh_fleet::WorkerCapability::Benchmark)
-    {
+    let capabilities = config.advertised_capabilities();
+    if capabilities.contains(&sbgh_fleet::WorkerCapability::Benchmark) {
         driver
             .preflight_benchmark()
             .await
             .context("validating benchmark sandbox and immutable origin")?;
-    } else if config
-        .capabilities
-        .contains(&sbgh_fleet::WorkerCapability::BuildOnly)
-    {
+    } else if capabilities.contains(&sbgh_fleet::WorkerCapability::BuildOnly) {
         driver
             .preflight_build()
             .await
             .context("validating build-only sandbox")?;
     }
-    if config
-        .capabilities
-        .contains(&sbgh_fleet::WorkerCapability::BlockValidation)
-    {
+    if capabilities.contains(&sbgh_fleet::WorkerCapability::BlockValidation) {
         preflight_block_validation(&driver).await?;
     }
     Ok(())
 }
 
 fn preflight_driver(config: &WorkerConfig) -> anyhow::Result<sbgh_libvirt::LibvirtDriver> {
-    let libvirt = config
-        .libvirt
-        .clone()
-        .context("execution capabilities require [libvirt]")?;
+    let libvirt = config.libvirt_config();
     Ok(sbgh_libvirt::LibvirtDriver::new(
         libvirt.clone(),
         Arc::new(SystemShell::new(&libvirt.paths.sudo_binary)),
@@ -114,20 +103,14 @@ pub async fn run(
         .validate_host_resources(&resources)
         .context("validating execution profiles against discovered host resources")?;
     preflight_local_execution(&config).await?;
-    let client = FleetClient::build(
-        &config.orchestrator_url,
-        &config.client_certificate,
-        &config.client_private_key,
-        &config.server_ca_certificate,
-    )?;
+    let client = FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?;
     let session_id = Uuid::new_v4();
     let registration = client
         .register(&RegisterSessionRequest {
             protocol_version: PROTOCOL_VERSION,
-            worker_id: config.worker_id,
             worker_session_id: session_id,
             software_version: env!("CARGO_PKG_VERSION").into(),
-            advertised_capabilities: config.capabilities.clone(),
+            advertised_capabilities: config.advertised_capabilities(),
             resources,
         })
         .await
@@ -226,7 +209,7 @@ pub async fn run(
 async fn admit_offer(config: &WorkerConfig, offer: &sbgh_fleet::WorkOffer) -> anyhow::Result<()> {
     anyhow::ensure!(
         config
-            .capabilities
+            .advertised_capabilities()
             .contains(&offer.capability),
         "orchestrator offered an unadvertised capability"
     );
@@ -252,13 +235,8 @@ async fn admit_offer(config: &WorkerConfig, offer: &sbgh_fleet::WorkOffer) -> an
                 "offer capability/requirements mismatch"
             );
             let profile = config
-                .libvirt
+                .block_validation
                 .as_ref()
-                .and_then(|libvirt| {
-                    libvirt
-                        .block_validation
-                        .as_ref()
-                })
                 .context("block-validation offer has no local sandbox profile")?;
             anyhow::ensure!(
                 *requested_shards > 0 && *requested_shards <= profile.max_shards,
@@ -288,10 +266,7 @@ async fn execute_assignment(
 ) -> anyhow::Result<bool> {
     let attempt_cancel = shutdown.child_token();
     let local_artifact_root = config
-        .libvirt
-        .as_ref()
-        .context("sandboxed assignment received without local libvirt config")?
-        .paths
+        .workspace
         .results_archive_dir
         .join("fleet");
     let artifacts =
@@ -508,10 +483,7 @@ async fn execute_driver(
     cancel: &CancellationToken,
     reliable: &ReliableSender,
 ) -> anyhow::Result<TerminalOutcome> {
-    let libvirt = config
-        .libvirt
-        .clone()
-        .context("sandboxed assignment received without [libvirt]")?;
+    let libvirt = config.libvirt_config();
     let cache = config
         .binary_cache
         .as_ref()
@@ -820,7 +792,12 @@ async fn cleanup_obligations(
             "cleaning orphaned worker resources"
         );
         let mut cleaned = true;
-        if let Some(libvirt) = &config.libvirt {
+        if config.benchmark.is_some()
+            || config
+                .block_validation
+                .is_some()
+        {
+            let libvirt = config.libvirt_config();
             let runtime = WorkerRuntime::libvirt(
                 libvirt.clone(),
                 Arc::new(SystemShell::new(&libvirt.paths.sudo_binary)),

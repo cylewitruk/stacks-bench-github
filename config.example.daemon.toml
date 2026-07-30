@@ -40,7 +40,6 @@ timeout_secs = 86400
 listen = "10.0.0.10:9443"
 server_certificate = "/etc/sbgh/fleet/orchestrator.crt"
 server_private_key = "/etc/sbgh/fleet/orchestrator.key"
-client_ca_certificate = "/etc/sbgh/fleet/worker-ca.crt"
 lease_hmac_key = "/etc/sbgh/fleet/lease-hmac.key"
 
 heartbeat_seconds = 10
@@ -57,7 +56,7 @@ max_concurrent_requests = 64
 
 [vm]
 # Compatibility-only daemon fields. Configure live execution resources under
-# [libvirt] in each worker profile.
+# the worker's top-level recipe and sandbox sections.
 golden_image = "/var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2"
 
 # Required compatibility values only; current VM sizing is worker-owned.

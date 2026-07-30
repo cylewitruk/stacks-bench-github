@@ -238,12 +238,12 @@ returns a conflict.
 | `GET` | `/api/fleet` | `read` | Worker/session/resource, lease, attempt, trace, and cleanup state |
 | `GET` | `/api/fleet/metrics` | `read` | Prometheus text |
 | `POST` | `/api/fleet/workers` | `admin` | Create a disabled, drained worker policy |
-| `GET` | `/api/fleet/workers/{id}` | `read` | Inspect policy, session, and certificate metadata |
+| `GET` | `/api/fleet/workers/{id}` | `read` | Inspect policy, session, and identity metadata |
 | `PATCH` | `/api/fleet/workers/{id}` | `admin` | Update a drained worker policy or enable/disable it |
-| `POST` | `/api/fleet/workers/{id}/certificates` | `admin` | Validate and authorize a public worker leaf certificate |
-| `DELETE` | `/api/fleet/workers/{id}/certificates/{fingerprint}` | `admin` | Revoke a certificate under normal lifecycle guards |
+| `POST` | `/api/fleet/workers/{id}/identities` | `admin` | Validate and authorize a public P-256 identity key |
+| `DELETE` | `/api/fleet/workers/{id}/identities/{identity}` | `admin` | Revoke an identity under normal lifecycle guards |
 | `POST` | `/api/fleet/workers/{id}/emergency-disable` | `admin` | Withdraw worker authorization and expire its leases |
-| `POST` | `/api/fleet/workers/{id}/certificates/{fingerprint}/emergency-revoke` | `admin` | Revoke a certificate and expire sessions using it |
+| `POST` | `/api/fleet/workers/{id}/identities/{identity}/emergency-revoke` | `admin` | Revoke an identity and expire sessions using it |
 | `POST` | `/api/fleet/workers/{id}/drain` | `admin` | Set or clear durable drain |
 | `POST` | `/api/fleet/jobs/{id}/cancel` | `admin` | Request cancellation |
 | `POST` | `/api/fleet/submissions/{id}/recover` | `admin` | Create a fresh execution generation |
@@ -252,13 +252,12 @@ Recovery starts again at the submission's first specification/run. An optional
 compatible worker constraint can pin the new generation; older results remain
 auditable and do not enter the new comparison.
 
-Worker creation, policy updates, and certificate operations return canonical
-worker detail. Certificate requests contain only a bounded public PEM leaf;
-the daemon validates its CA, client EKU, validity, and sole
-`urn:sbgh:worker:<uuid>` URI SAN, then stores and returns only the lowercase
-SHA-256 fingerprint and timestamps. Private keys are never accepted.
+Worker creation, policy updates, and identity operations return canonical
+worker detail. Identity requests contain one bounded P-256 `PUBLIC KEY` PEM.
+The daemon canonicalizes its SPKI and returns only the lowercase SHA-256 digest
+and timestamps. Private keys and certificate wrappers are never accepted.
 
-Normal capability/profile/disable and final-certificate changes require a
+Normal capability/profile/disable and final-identity changes require a
 drained, quiescent worker. Emergency operations immediately withdraw
 authorization and expire relevant leases; the existing expiry coordinator
 then owns fencing, cleanup, and safe requeue.
@@ -299,8 +298,8 @@ sudo -u sbgh sbgh-cli jobs --help
 sudo -u sbgh sbgh-cli fleet --help
 ```
 
-Worker enrollment and certificate commands print the canonical worker policy
-as JSON so setup and rotation scripts can consume UUIDs, fingerprints, and
+Worker enrollment and identity commands print the canonical worker policy
+as JSON so setup and rotation scripts can consume UUIDs, identity digests, and
 timestamps without parsing log text.
 
 The defaults are `http://127.0.0.1:8787` and

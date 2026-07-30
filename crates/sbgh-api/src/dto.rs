@@ -320,13 +320,13 @@ pub struct WorkerUpdateRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkerCertificateRequest {
-    pub certificate_pem: String,
+pub struct WorkerIdentityRequest {
+    pub public_key_pem: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerCertificateView {
-    pub certificate_sha256: String,
+pub struct WorkerIdentityView {
+    pub identity_key_sha256: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
 }
@@ -334,7 +334,7 @@ pub struct WorkerCertificateView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerPolicyView {
     pub worker: FleetWorkerView,
-    pub certificates: Vec<WorkerCertificateView>,
+    pub identities: Vec<WorkerIdentityView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

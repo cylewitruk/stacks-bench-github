@@ -21,7 +21,7 @@ pub use dto::{
     PinTriggerRequest, PolicyView, RepoRootView, ReportArtifactView, ReportIdentityView,
     ReportLifecycleView, ReportRange, ResolveRepoResponse, RoleRequest, RoleView,
     SubmissionReportView, TaskReportView, TriggerView, UserView, WebhookSubmitResponse,
-    WebhookSummary, WhoamiResponse, WorkerCertificateRequest, WorkerCertificateView,
-    WorkerCreateRequest, WorkerDrainRequest, WorkerPolicyView, WorkerUpdateRequest,
+    WebhookSummary, WhoamiResponse, WorkerCreateRequest, WorkerDrainRequest, WorkerIdentityRequest,
+    WorkerIdentityView, WorkerPolicyView, WorkerUpdateRequest,
 };
 pub use error::{ApiError, ErrorBody};

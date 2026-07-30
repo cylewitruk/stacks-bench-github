@@ -217,13 +217,9 @@ pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::
         .config()
         .clone();
     let request_limit = config.max_concurrent_requests;
-    let listener = MtlsListener::bind(
-        config.listen,
-        &config.server_certificate,
-        &config.server_private_key,
-        &config.client_ca_certificate,
-    )
-    .await?;
+    let listener =
+        MtlsListener::bind(config.listen, &config.server_certificate, &config.server_private_key)
+            .await?;
     let local_addr = listener.local_addr();
     let grpc = GrpcFleet {
         service: runtime.service.clone(),
