@@ -245,7 +245,6 @@ max_shards = 48
 max_concurrency = 48
 max_parallel_jobs = 1
 results_tmpfs_mib = 5120
-chain_config = "/etc/sbgh/worker/stacks-inspect-mainnet.toml"
 snapshot_prefix = "sbgh-block"
 mount_options = ["nouuid", "noatime"]
 ```
@@ -255,6 +254,8 @@ host-capacity stanza: registration advertises logical capability plus CPU and
 RAM facts discovered at startup, while server authorization remains
 authoritative. Storage admission remains backend-specific rather than using an
 aggregate host byte estimate.
+Block validation explicitly selects `stacks-inspect`'s built-in mainnet network
+configuration; workers do not provision a separate node configuration file.
 Fleet protocol v3 puts only `task kind + requested shard count + concurrency`
 on `WorkOffer`; the worker verifies that bounded summary before acceptance,
 then verifies the accepted payload projects to the same requirements. Before

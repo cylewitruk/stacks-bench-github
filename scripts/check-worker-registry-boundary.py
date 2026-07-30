@@ -39,13 +39,20 @@ for marker in (
     "pub client_certificate:",
     "pub server_ca_certificate:",
     "pub libvirt:",
+    "pub chain_config:",
 ):
     if marker in worker_config:
         errors.append(f"worker config: forbidden legacy field {marker!r}")
 
 for path in sorted(ROOT.glob("config.example.worker-*.toml")):
     text = path.read_text()
-    for marker in ("worker_id =", "capabilities =", "client_certificate =", "[libvirt"):
+    for marker in (
+        "worker_id =",
+        "capabilities =",
+        "client_certificate =",
+        "chain_config =",
+        "[libvirt",
+    ):
         if marker in text:
             errors.append(f"{path.name}: forbidden legacy worker setting {marker!r}")
 

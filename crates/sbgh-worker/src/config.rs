@@ -93,12 +93,6 @@ impl WorkerConfig {
         }
         if let Some(block) = &self.block_validation {
             ensure!(
-                block
-                    .chain_config
-                    .is_absolute(),
-                "chain_config must be an absolute path"
-            );
-            ensure!(
                 block.vcpus > 0
                     && block.memory_bytes > 0
                     && u64::from(block.results_tmpfs_mib)
@@ -266,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_identity_capability_and_adapter_fields_are_rejected() {
+    fn retired_identity_capability_and_recipe_fields_are_rejected() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let text =
             std::fs::read_to_string(root.join("config.example.worker-benchmark.toml")).unwrap();
@@ -278,6 +272,27 @@ mod tests {
         ] {
             assert!(toml::from_str::<WorkerConfig>(&stale).is_err());
         }
+    }
+
+    #[test]
+    fn retired_block_validation_chain_config_is_rejected() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("config.example.worker-block-validation.toml"))
+                .unwrap();
+        let stale = text.replace(
+            "results_tmpfs_mib = 5120",
+            "results_tmpfs_mib = 5120\n\
+             chain_config = \"/etc/sbgh/worker/stacks-inspect-mainnet.toml\"",
+        );
+
+        let error = toml::from_str::<WorkerConfig>(&stale).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `chain_config`")
+        );
     }
 
     #[test]

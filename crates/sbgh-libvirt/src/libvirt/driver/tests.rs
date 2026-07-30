@@ -586,7 +586,7 @@ fn test_config(tmp: &TempDir) -> LibvirtConfig {
     }
 }
 
-fn enable_block_profile(config: &mut LibvirtConfig, tmp: &TempDir) {
+fn enable_block_profile(config: &mut LibvirtConfig) {
     config.block_validation = Some(BlockValidationProfile {
         vcpus: 4,
         memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -595,7 +595,6 @@ fn enable_block_profile(config: &mut LibvirtConfig, tmp: &TempDir) {
         max_concurrency: 4,
         max_parallel_jobs: 1,
         results_tmpfs_mib: 512,
-        chain_config: tmp.path().join("chain.toml"),
         snapshot_prefix: "sbgh-block".into(),
         mount_options: vec!["nouuid".into()],
     });
@@ -683,14 +682,8 @@ async fn sandbox_preflight_rejects_an_unmanaged_network_before_host_commands() {
 async fn block_validation_preflight_proves_fixed_sandbox_dependencies() {
     let tmp = TempDir::new().unwrap();
     let mut config = test_config(&tmp);
-    enable_block_profile(&mut config, &tmp);
+    enable_block_profile(&mut config);
     prepare_sandbox_preflight_files(&mut config, &tmp);
-    let profile = config
-        .block_validation
-        .as_ref()
-        .unwrap();
-    std::fs::write(&profile.chain_config, b"[node]\nnetwork = \"mainnet\"\n").unwrap();
-
     let shell = RecordingShell::new();
     shell
         .expect_ok(1) // qemu-img info
@@ -744,15 +737,9 @@ async fn block_validation_preflight_proves_fixed_sandbox_dependencies() {
 async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     let tmp = TempDir::new().unwrap();
     let mut config = test_config(&tmp);
-    enable_block_profile(&mut config, &tmp);
+    enable_block_profile(&mut config);
     std::fs::write(&config.vm.golden_image, b"golden").unwrap();
     std::fs::create_dir_all(&config.paths.git_mirror).unwrap();
-
-    let profile = config
-        .block_validation
-        .as_ref()
-        .unwrap();
-    std::fs::write(&profile.chain_config, b"[node]\nnetwork = \"mainnet\"\n").unwrap();
 
     let job = fake_job();
     let toolchain = "[toolchain]\nchannel = \"1.95.0\"\n";
@@ -1000,7 +987,7 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
 async fn attempt_cleanup_refuses_to_address_a_newer_attempt_snapshot() {
     let tmp = TempDir::new().unwrap();
     let mut config = test_config(&tmp);
-    enable_block_profile(&mut config, &tmp);
+    enable_block_profile(&mut config);
     let shell = Arc::new(RecordingShell::new());
     shell.reply(PreparedReply::with_stdout(
         "sbgh-block-job-old-g1-s0000\nsbgh-block-job-new-g2-s0000\n",
@@ -1041,7 +1028,7 @@ async fn attempt_cleanup_refuses_to_address_a_newer_attempt_snapshot() {
 async fn attempt_cleanup_rejects_unsafe_identity_before_host_commands() {
     let tmp = TempDir::new().unwrap();
     let mut config = test_config(&tmp);
-    enable_block_profile(&mut config, &tmp);
+    enable_block_profile(&mut config);
     let shell = Arc::new(RecordingShell::new());
     let driver = test_driver(&config, shell.clone());
 
@@ -1706,7 +1693,7 @@ async fn cleanup_by_job_id_reconstructs_full_teardown_from_id() {
 async fn cleanup_preserves_every_dependency_when_domain_destroy_fails() {
     let tmp = TempDir::new().unwrap();
     let mut config = test_config(&tmp);
-    enable_block_profile(&mut config, &tmp);
+    enable_block_profile(&mut config);
     let cfg = Arc::new(config);
     let job_id = "orphan-live-domain";
     let job_dir = cfg

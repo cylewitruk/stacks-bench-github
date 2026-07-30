@@ -43,8 +43,5 @@ max_shards = 48
 max_concurrency = 48
 max_parallel_jobs = 1
 results_tmpfs_mib = 5120
-# This file is copied into the guest. It must contain no reusable worker,
-# fleet, database, object-store, or repository credentials.
-chain_config = "/etc/sbgh/worker/stacks-inspect-mainnet.toml"
 snapshot_prefix = "sbgh-block"
 mount_options = ["nouuid", "noatime"]

@@ -99,11 +99,6 @@ impl ResultsTmpfs {
             .join("block-validation-result.json")
     }
 
-    pub fn chain_config(&self) -> PathBuf {
-        self.mount_dir
-            .join("chain-config.toml")
-    }
-
     /// Path to the JSON stdout capture of `stacks-bench bench run --json`.
     /// Archived for use by the PR-comment summary builder + as a
     /// human-readable record of the run's high-level metrics.

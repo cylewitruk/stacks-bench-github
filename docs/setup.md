@@ -344,9 +344,8 @@ or
 [config.example.worker-block-validation.toml](../config.example.worker-block-validation.toml)
 to `/etc/sbgh/worker/<profile>.toml`. Set the orchestrator URL, CPU placement,
 VM resources, LVM identifiers, and paths. Capabilities are inferred from the
-present `[benchmark]` and `[block_validation]` sections. A block-validation worker
-also needs a guest-safe `stacks-inspect` chain config at its configured
-`chain_config` path; it must contain no reusable credentials.
+present `[benchmark]` and `[block_validation]` sections. Block validation uses
+`stacks-inspect`'s built-in mainnet network configuration.
 
 ```bash
 sudo install -m 0600 -o sbgh-worker -g sbgh-worker \

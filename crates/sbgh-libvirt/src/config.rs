@@ -101,7 +101,6 @@ pub struct BlockValidationProfile {
     pub max_parallel_jobs: u32,
     #[serde(default = "default_block_results_tmpfs_mib")]
     pub results_tmpfs_mib: u32,
-    pub chain_config: PathBuf,
     #[serde(default = "default_snapshot_prefix")]
     pub snapshot_prefix: String,
     #[serde(default = "default_mount_options")]

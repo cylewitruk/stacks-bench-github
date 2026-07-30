@@ -541,23 +541,6 @@ impl LibvirtDriver {
                 .any(|option| option == "nouuid"),
             "block-validation mount_options must include `nouuid` for XFS snapshots"
         );
-        anyhow::ensure!(
-            profile
-                .chain_config
-                .is_absolute(),
-            "block-validation chain_config must be absolute"
-        );
-        anyhow::ensure!(
-            profile.chain_config.is_file(),
-            "block-validation chain config is not a regular file: {}",
-            profile.chain_config.display()
-        );
-        std::fs::File::open(&profile.chain_config).with_context(|| {
-            format!(
-                "block-validation chain config is not readable: {}",
-                profile.chain_config.display()
-            )
-        })?;
         self.preflight_sandbox()
             .await?;
         crate::libvirt::lvm::validate_latest_origin(self.shell.as_ref(), &self.config.lvm).await?;
@@ -930,8 +913,6 @@ impl LibvirtDriver {
                         tmpfs.binary(BuildArtifact::StacksInspect.executable_name()),
                     )?;
                 }
-                std::fs::copy(&profile.chain_config, tmpfs.chain_config())
-                    .context("staging block-validation chain config")?;
                 let plan = BlockGuestPlan::new(
                     &job_id,
                     &attempt_id,

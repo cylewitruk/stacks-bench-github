@@ -339,6 +339,9 @@ mod tests {
     fn block_validation_guest_script_enforces_the_sandbox_contract() {
         let rendered = wrap_in_cloud_config(BLOCK_VALIDATION_SCRIPT, "sbgh-block-validation.sh");
         assert!(rendered.contains("cargo build --locked --release --package stacks-inspect"));
+        assert!(rendered.contains("[BIN, \"--network-config\", \"mainnet\", \"validate-block\""));
+        assert!(!rendered.contains("--config"));
+        assert!(!rendered.contains("chain-config.toml"));
         assert!(rendered.contains("/dev/disk/by-id/"));
         assert!(rendered.contains("[\"mount\", \"-t\", \"xfs\""));
         assert!(rendered.contains("observed_range"));

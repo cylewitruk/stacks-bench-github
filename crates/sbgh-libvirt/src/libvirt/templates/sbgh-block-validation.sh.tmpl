@@ -47,7 +47,6 @@ import time
 
 RESULTS = "/results"
 PLAN_PATH = RESULTS + "/block-plan.json"
-CONFIG = RESULTS + "/chain-config.toml"
 BIN = "/opt/stacks-core/target/release/stacks-inspect"
 with open(PLAN_PATH, encoding="utf-8") as handle:
     plan = json.load(handle)
@@ -84,7 +83,7 @@ for item in plan["devices"]:
 
 def probe(kind):
     output = subprocess.check_output(
-        [BIN, "--config", CONFIG, "validate-block", mounts[0], kind],
+        [BIN, "--network-config", "mainnet", "validate-block", mounts[0], kind],
         text=True,
         stderr=subprocess.PIPE,
     )
@@ -158,7 +157,7 @@ while pending or active:
         stdout_handle = open(RESULTS + "/" + stdout_name, "wb")
         stderr_handle = open(RESULTS + "/" + stderr_name, "wb")
         command = [
-            BIN, "--config", CONFIG, "validate-block", mounts[index],
+            BIN, "--network-config", "mainnet", "validate-block", mounts[index],
             range_kind, str(command_start), str(command_end + 1),
         ]
         process = subprocess.Popen(
