@@ -3,7 +3,7 @@ use std::sync::Arc;
 use slack_morphism::errors::{SlackClientEndOfStreamError, SlackClientSocketModeProtocolError};
 
 use super::*;
-use crate::test_support::{FakeSlackClient, RecordingBenchmarkQueue};
+use crate::test_support::{FakeSlackClient, RecordingTaskSubmissionPort};
 
 const APP_MENTION_JSON: &str = r#"{
     "team_id": "T_OK",
@@ -24,7 +24,7 @@ fn parse_callback() -> SlackPushEventCallback {
 }
 
 fn config() -> SlackConnectorConfig {
-    SlackConnectorConfig::new("develop", vec!["T_OK".into()], vec!["U_OK".into()])
+    SlackConnectorConfig::new("develop", vec!["T_OK".into()], vec!["U_OK".into()], None)
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn maps_app_mention_to_provider_neutral_event() {
 
 #[tokio::test]
 async fn dispatched_mention_enqueues_off_the_ack_path() {
-    let queue = Arc::new(RecordingBenchmarkQueue::default());
+    let queue = Arc::new(RecordingTaskSubmissionPort::default());
     let client = Arc::new(FakeSlackClient::default());
     let connector = Arc::new(SlackConnector::new(config(), queue.clone(), client));
     spawn_dispatch(Some(connector), mention_from_callback(&parse_callback()).unwrap());

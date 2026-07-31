@@ -29,6 +29,13 @@ pub enum ResolutionStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum CreationTaskKind {
+    Benchmark,
+    BlockValidation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum TargetKind {
     Block,
     BlockRange,
@@ -45,6 +52,7 @@ pub enum BlockSelectorKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentIssueField {
+    Task,
     Target,
     Block,
     BlockRange,
@@ -53,6 +61,9 @@ pub enum IntentIssueField {
     Warmup,
     Rev,
     VariantRefs,
+    Repository,
+    ValidationEpoch,
+    ValidationRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -88,10 +99,18 @@ pub struct IntentBlockRangeJson {
     pub end: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationEpochIntent {
+    PreNakamoto,
+    Nakamoto,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IntentResolutionJson {
     pub status: ResolutionStatus,
+    pub task_kind: Option<CreationTaskKind>,
     pub target_kind: Option<TargetKind>,
     pub block: Option<Vec<IntentBlockSelectorJson>>,
     pub block_range: Option<IntentBlockRangeJson>,
@@ -100,8 +119,41 @@ pub struct IntentResolutionJson {
     pub warmup: Option<u32>,
     pub rev: Option<String>,
     pub variant_refs: Option<Vec<String>>,
+    pub repository: Option<String>,
+    pub validation_epoch: Option<ValidationEpochIntent>,
+    pub validation_start: Option<u64>,
+    pub validation_end: Option<u64>,
     pub reason: Option<String>,
     pub issues: Option<Vec<IntentIssueJson>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedSource {
+    pub repository: Option<String>,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationSelection {
+    DefaultPlan,
+    Range { epoch: ValidationEpochIntent, start: u64, end: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockValidationIntent {
+    pub source: RequestedSource,
+    pub selection: ValidationSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCreationIntent {
+    Benchmark(BenchmarkRequest),
+    BlockValidation(BlockValidationIntent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserIntent {
+    Create(TaskCreationIntent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +200,7 @@ impl From<&str> for IntentInvalid {
 impl IntentIssueField {
     fn label(self) -> &'static str {
         match self {
+            Self::Task => "task",
             Self::Target => "target",
             Self::Block => "block",
             Self::BlockRange => "block range",
@@ -156,13 +209,16 @@ impl IntentIssueField {
             Self::Warmup => "warmup",
             Self::Rev => "rev",
             Self::VariantRefs => "variant refs",
+            Self::Repository => "repository",
+            Self::ValidationEpoch => "validation epoch",
+            Self::ValidationRange => "validation range",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntentOutcome {
-    Resolved(BenchmarkRequest),
+    Resolved(UserIntent),
     Invalid(IntentInvalid),
 }
 
@@ -197,7 +253,8 @@ pub fn validate_intent_resolution(
 fn validate_invalid_intent(
     intent: IntentResolutionJson,
 ) -> Result<IntentOutcome, IntentValidationError> {
-    if intent.target_kind.is_some()
+    if intent.task_kind.is_some()
+        || intent.target_kind.is_some()
         || intent.block.is_some()
         || intent.block_range.is_some()
         || intent.txids.is_some()
@@ -205,6 +262,16 @@ fn validate_invalid_intent(
         || intent.warmup.is_some()
         || intent.rev.is_some()
         || intent.variant_refs.is_some()
+        || intent.repository.is_some()
+        || intent
+            .validation_epoch
+            .is_some()
+        || intent
+            .validation_start
+            .is_some()
+        || intent
+            .validation_end
+            .is_some()
     {
         return Err(IntentValidationError::InvalidShape(
             "invalid status must not carry target or run fields".into(),
@@ -218,6 +285,20 @@ fn validate_invalid_intent(
 fn validate_resolved_intent(
     intent: IntentResolutionJson,
 ) -> Result<IntentOutcome, IntentValidationError> {
+    let task_kind = required(intent.task_kind, "task_kind")?;
+    match task_kind {
+        CreationTaskKind::Benchmark => validate_resolved_benchmark(intent),
+        CreationTaskKind::BlockValidation => validate_resolved_block_validation(intent),
+    }
+}
+
+fn validate_resolved_benchmark(
+    intent: IntentResolutionJson,
+) -> Result<IntentOutcome, IntentValidationError> {
+    require_absent(intent.repository, "repository")?;
+    require_absent(intent.validation_epoch, "validation_epoch")?;
+    require_absent(intent.validation_start, "validation_start")?;
+    require_absent(intent.validation_end, "validation_end")?;
     let target_kind = intent
         .target_kind
         .ok_or_else(|| {
@@ -298,12 +379,78 @@ fn validate_resolved_intent(
                 "comparison requests must use variant_refs instead of rev".into(),
             ));
         }
-        return Ok(IntentOutcome::Resolved(BenchmarkRequest::Comparison(ComparisonRequest {
-            workload,
-            variants,
-        })));
+        return Ok(IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Comparison(ComparisonRequest { workload, variants }),
+        ))));
     }
-    Ok(IntentOutcome::Resolved(BenchmarkRequest::Single(workload)))
+    Ok(IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+        BenchmarkRequest::Single(workload),
+    ))))
+}
+
+fn validate_resolved_block_validation(
+    intent: IntentResolutionJson,
+) -> Result<IntentOutcome, IntentValidationError> {
+    require_absent(intent.target_kind, "target_kind")?;
+    require_absent(intent.block, "block")?;
+    require_absent(intent.block_range, "block_range")?;
+    require_absent(intent.txids, "txids")?;
+    require_absent(intent.repetitions, "repetitions")?;
+    require_absent(intent.warmup, "warmup")?;
+    require_absent(intent.variant_refs, "variant_refs")?;
+
+    let source = RequestedSource {
+        repository: normalize_bounded_selector(intent.repository, "repository")?,
+        revision: normalize_bounded_selector(intent.rev, "rev")?,
+    };
+    let selection = match (intent.validation_epoch, intent.validation_start, intent.validation_end)
+    {
+        (None, None, None) => ValidationSelection::DefaultPlan,
+        (Some(epoch), Some(start), Some(end)) => {
+            if start > end {
+                return Err(IntentValidationError::InvalidValue {
+                    field: "validation_range",
+                    value: format!("{start}..{end}"),
+                    reason: "start must be <= end".into(),
+                });
+            }
+            ValidationSelection::Range { epoch, start, end }
+        }
+        _ => {
+            return Err(IntentValidationError::InvalidShape(
+                "validation range requires validation_epoch, validation_start, and validation_end"
+                    .into(),
+            ));
+        }
+    };
+    Ok(IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::BlockValidation(
+        BlockValidationIntent { source, selection },
+    ))))
+}
+
+fn normalize_bounded_selector(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<Option<String>, IntentValidationError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(IntentValidationError::InvalidValue {
+            field,
+            value: String::new(),
+            reason: "must be non-empty when provided".into(),
+        });
+    }
+    if value.chars().count() > 255 {
+        return Err(IntentValidationError::InvalidValue {
+            field,
+            value: "<overlong>".into(),
+            reason: "must be at most 255 characters".into(),
+        });
+    }
+    Ok(Some(value.into()))
 }
 
 fn validate_issues(
@@ -440,6 +587,94 @@ fn normalize_variant_refs(
     Ok(Some(variants))
 }
 
+/// Resolve the explicit, provider-free block-validation grammar.
+///
+/// `Ok(None)` means the input is not a validation command. Once the
+/// `validate` verb is present, malformed or partial flags fail closed instead
+/// of falling through to a provider.
+pub fn resolve_validation_command(text: &str) -> Result<Option<UserIntent>, IntentValidationError> {
+    let mut tokens = text
+        .split_whitespace()
+        .peekable();
+    if tokens.next() != Some("validate") {
+        return Ok(None);
+    }
+    if tokens
+        .peek()
+        .is_some_and(|token| !token.starts_with("--"))
+    {
+        return Ok(None);
+    }
+    let mut revision = None;
+    let mut epoch = None;
+    let mut start = None;
+    let mut end = None;
+    while let Some(flag) = tokens.next() {
+        let value = tokens.next().ok_or_else(|| {
+            IntentValidationError::InvalidShape(format!("{flag} requires a value"))
+        })?;
+        match flag {
+            "--rev" if revision.is_none() => revision = Some(value.to_string()),
+            "--epoch" if epoch.is_none() => {
+                epoch = Some(match value {
+                    "pre-nakamoto" => ValidationEpochIntent::PreNakamoto,
+                    "nakamoto" => ValidationEpochIntent::Nakamoto,
+                    _ => {
+                        return Err(IntentValidationError::InvalidValue {
+                            field: "validation_epoch",
+                            value: value.into(),
+                            reason: "expected pre-nakamoto or nakamoto".into(),
+                        });
+                    }
+                });
+            }
+            "--start-at" if start.is_none() => {
+                start = Some(parse_height("validation_start", value)?);
+            }
+            "--end-at" if end.is_none() => {
+                end = Some(parse_height("validation_end", value)?);
+            }
+            _ => {
+                return Err(IntentValidationError::InvalidShape(format!(
+                    "unknown or duplicate validation flag `{flag}`"
+                )));
+            }
+        }
+    }
+    let selection = match (epoch, start, end) {
+        (None, None, None) => ValidationSelection::DefaultPlan,
+        (Some(epoch), Some(start), Some(end)) if start <= end => {
+            ValidationSelection::Range { epoch, start, end }
+        }
+        (Some(_), Some(start), Some(end)) => {
+            return Err(IntentValidationError::InvalidValue {
+                field: "validation_range",
+                value: format!("{start}..{end}"),
+                reason: "start must be <= end".into(),
+            });
+        }
+        _ => {
+            return Err(IntentValidationError::InvalidShape(
+                "validation range requires --epoch, --start-at, and --end-at".into(),
+            ));
+        }
+    };
+    Ok(Some(UserIntent::Create(TaskCreationIntent::BlockValidation(BlockValidationIntent {
+        source: RequestedSource { repository: None, revision },
+        selection,
+    }))))
+}
+
+fn parse_height(field: &'static str, value: &str) -> Result<u64, IntentValidationError> {
+    value
+        .parse()
+        .map_err(|_| IntentValidationError::InvalidValue {
+            field,
+            value: value.into(),
+            reason: "expected a non-negative integer".into(),
+        })
+}
+
 /// JSON schema body for OpenAI `text.format` (`type = json_schema`).
 ///
 /// This is intentionally pinned rather than relying solely on generated schema:
@@ -448,13 +683,14 @@ fn normalize_variant_refs(
 pub fn intent_response_text_format() -> Value {
     json!({
         "type": "json_schema",
-        "name": "sbgh_benchmark_intent",
+        "name": "sbgh_task_creation_intent",
         "strict": true,
         "schema": {
             "type": "object",
             "additionalProperties": false,
             "required": [
                 "status",
+                "task_kind",
                 "target_kind",
                 "block",
                 "block_range",
@@ -463,11 +699,19 @@ pub fn intent_response_text_format() -> Value {
                 "warmup",
                 "rev",
                 "variant_refs",
+                "repository",
+                "validation_epoch",
+                "validation_start",
+                "validation_end",
                 "reason",
                 "issues"
             ],
             "properties": {
                 "status": { "type": "string", "enum": ["resolved", "invalid"] },
+                "task_kind": {
+                    "type": ["string", "null"],
+                    "enum": ["benchmark", "block_validation", null]
+                },
                 "target_kind": {
                     "type": ["string", "null"],
                     "enum": ["block", "block_range", "txids", null]
@@ -511,6 +755,16 @@ pub fn intent_response_text_format() -> Value {
                     "maxItems": 2,
                     "items": { "type": "string" }
                 },
+                "repository": {
+                    "type": ["string", "null"],
+                    "description": "Optional repository selector for block validation; null uses configured repository."
+                },
+                "validation_epoch": {
+                    "type": ["string", "null"],
+                    "enum": ["pre_nakamoto", "nakamoto", null]
+                },
+                "validation_start": { "type": ["integer", "null"], "minimum": 0 },
+                "validation_end": { "type": ["integer", "null"], "minimum": 0 },
                 "reason": { "type": ["string", "null"] },
                 "issues": {
                     "type": ["array", "null"],
@@ -522,6 +776,7 @@ pub fn intent_response_text_format() -> Value {
                             "field": {
                                 "type": "string",
                                 "enum": [
+                                    "task",
                                     "target",
                                     "block",
                                     "block_range",
@@ -529,7 +784,10 @@ pub fn intent_response_text_format() -> Value {
                                     "repetitions",
                                     "warmup",
                                     "rev",
-                                    "variant_refs"
+                                    "variant_refs",
+                                    "repository",
+                                    "validation_epoch",
+                                    "validation_range"
                                 ]
                             },
                             "code": {
@@ -645,6 +903,22 @@ pub const EVAL_FIXTURES: &[IntentEvalFixture] = &[
         prompt: "please run a benchmark",
         expected: EvalExpected::Invalid,
     },
+    IntentEvalFixture {
+        prompt: "run block validation on commit abc123",
+        expected: EvalExpected::Resolved,
+    },
+    IntentEvalFixture {
+        prompt: "validate Nakamoto blocks 185700 through 186000 on abc123",
+        expected: EvalExpected::Resolved,
+    },
+    IntentEvalFixture {
+        prompt: "validate this change",
+        expected: EvalExpected::Invalid,
+    },
+    IntentEvalFixture {
+        prompt: "cancel validation and benchmark the replacement",
+        expected: EvalExpected::Invalid,
+    },
 ];
 
 #[cfg(test)]
@@ -697,6 +971,7 @@ mod tests {
     fn resolved_base(target_kind: TargetKind) -> IntentResolutionJson {
         IntentResolutionJson {
             status: ResolutionStatus::Resolved,
+            task_kind: Some(CreationTaskKind::Benchmark),
             target_kind: Some(target_kind),
             block: None,
             block_range: None,
@@ -705,6 +980,10 @@ mod tests {
             warmup: Some(0),
             rev: None,
             variant_refs: None,
+            repository: None,
+            validation_epoch: None,
+            validation_start: None,
+            validation_end: None,
             reason: None,
             issues: None,
         }
@@ -725,8 +1004,9 @@ mod tests {
                 hash: Some(HASH.into()),
             },
         ]);
-        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
-            validate_intent_resolution(intent).unwrap()
+        let IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Single(spec),
+        ))) = validate_intent_resolution(intent).unwrap()
         else {
             panic!("expected resolved");
         };
@@ -750,8 +1030,9 @@ mod tests {
         intent.repetitions = Some(3);
         intent.warmup = Some(2);
         intent.rev = Some(" develop ".into());
-        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
-            validate_intent_resolution(intent).unwrap()
+        let IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Single(spec),
+        ))) = validate_intent_resolution(intent).unwrap()
         else {
             panic!("expected resolved");
         };
@@ -773,8 +1054,9 @@ mod tests {
         intent.rev = Some("sb-integration/squash".into());
         intent.variant_refs = None;
 
-        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
-            validate_intent_resolution(intent).unwrap()
+        let IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Single(spec),
+        ))) = validate_intent_resolution(intent).unwrap()
         else {
             panic!("expected single-ref benchmark");
         };
@@ -795,8 +1077,9 @@ mod tests {
     fn validates_txids_and_strips_prefix() {
         let mut intent = resolved_base(TargetKind::Txids);
         intent.txids = Some(vec![TXID.into()]);
-        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
-            validate_intent_resolution(intent).unwrap()
+        let IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Single(spec),
+        ))) = validate_intent_resolution(intent).unwrap()
         else {
             panic!("expected resolved");
         };
@@ -822,8 +1105,9 @@ mod tests {
             message: "diagnostic noise from resolved response".into(),
         }]);
 
-        let IntentOutcome::Resolved(BenchmarkRequest::Single(spec)) =
-            validate_intent_resolution(intent).unwrap()
+        let IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Single(spec),
+        ))) = validate_intent_resolution(intent).unwrap()
         else {
             panic!("expected resolved");
         };
@@ -841,8 +1125,9 @@ mod tests {
         intent.warmup = Some(10);
         intent.variant_refs =
             Some(vec![" sb-integration/3.4.0.0.2 ".into(), "sb-integration/3.4.0.0.3".into()]);
-        let IntentOutcome::Resolved(BenchmarkRequest::Comparison(comparison)) =
-            validate_intent_resolution(intent).unwrap()
+        let IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Comparison(comparison),
+        ))) = validate_intent_resolution(intent).unwrap()
         else {
             panic!("expected comparison");
         };
@@ -881,6 +1166,7 @@ mod tests {
     fn invalid_status_returns_reason_and_no_spec() {
         let intent = IntentResolutionJson {
             status: ResolutionStatus::Invalid,
+            task_kind: None,
             target_kind: None,
             block: None,
             block_range: None,
@@ -889,6 +1175,10 @@ mod tests {
             warmup: None,
             rev: None,
             variant_refs: None,
+            repository: None,
+            validation_epoch: None,
+            validation_start: None,
+            validation_end: None,
             reason: Some("I need a target".into()),
             issues: Some(vec![IntentIssueJson {
                 field: IntentIssueField::Target,
@@ -925,6 +1215,7 @@ mod tests {
             .collect();
         let intent = IntentResolutionJson {
             status: ResolutionStatus::Invalid,
+            task_kind: None,
             target_kind: None,
             block: None,
             block_range: None,
@@ -933,6 +1224,10 @@ mod tests {
             warmup: None,
             rev: None,
             variant_refs: None,
+            repository: None,
+            validation_epoch: None,
+            validation_start: None,
+            validation_end: None,
             reason: Some("r".repeat(600)),
             issues: Some(issues),
         };
@@ -1006,6 +1301,168 @@ mod tests {
     }
 
     #[test]
+    fn validates_default_and_explicit_block_validation_intent() {
+        let default = IntentResolutionJson {
+            status: ResolutionStatus::Resolved,
+            task_kind: Some(CreationTaskKind::BlockValidation),
+            target_kind: None,
+            block: None,
+            block_range: None,
+            txids: None,
+            repetitions: None,
+            warmup: None,
+            rev: Some(" abc123 ".into()),
+            variant_refs: None,
+            repository: None,
+            validation_epoch: None,
+            validation_start: None,
+            validation_end: None,
+            reason: None,
+            issues: None,
+        };
+        assert_eq!(
+            validate_intent_resolution(default).unwrap(),
+            IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::BlockValidation(
+                BlockValidationIntent {
+                    source: RequestedSource {
+                        repository: None,
+                        revision: Some("abc123".into()),
+                    },
+                    selection: ValidationSelection::DefaultPlan,
+                }
+            )))
+        );
+
+        let explicit = IntentResolutionJson {
+            validation_epoch: Some(ValidationEpochIntent::Nakamoto),
+            validation_start: Some(100),
+            validation_end: Some(200),
+            ..IntentResolutionJson {
+                status: ResolutionStatus::Resolved,
+                task_kind: Some(CreationTaskKind::BlockValidation),
+                target_kind: None,
+                block: None,
+                block_range: None,
+                txids: None,
+                repetitions: None,
+                warmup: None,
+                rev: None,
+                variant_refs: None,
+                repository: None,
+                validation_epoch: None,
+                validation_start: None,
+                validation_end: None,
+                reason: None,
+                issues: None,
+            }
+        };
+        assert!(matches!(
+            validate_intent_resolution(explicit).unwrap(),
+            IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::BlockValidation(
+                BlockValidationIntent {
+                    selection: ValidationSelection::Range {
+                        epoch: ValidationEpochIntent::Nakamoto,
+                        start: 100,
+                        end: 200,
+                    },
+                    ..
+                }
+            )))
+        ));
+    }
+
+    #[test]
+    fn block_validation_rejects_cross_task_and_partial_fields() {
+        let mut cross_task = resolved_base(TargetKind::BlockRange);
+        cross_task.task_kind = Some(CreationTaskKind::BlockValidation);
+        cross_task.block_range = Some(IntentBlockRangeJson { start: 1, end: 2 });
+        assert!(matches!(
+            validate_intent_resolution(cross_task),
+            Err(IntentValidationError::InvalidShape(_))
+        ));
+
+        let partial = IntentResolutionJson {
+            status: ResolutionStatus::Resolved,
+            task_kind: Some(CreationTaskKind::BlockValidation),
+            target_kind: None,
+            block: None,
+            block_range: None,
+            txids: None,
+            repetitions: None,
+            warmup: None,
+            rev: None,
+            variant_refs: None,
+            repository: None,
+            validation_epoch: Some(ValidationEpochIntent::Nakamoto),
+            validation_start: Some(1),
+            validation_end: None,
+            reason: None,
+            issues: None,
+        };
+        assert!(matches!(
+            validate_intent_resolution(partial),
+            Err(IntentValidationError::InvalidShape(message))
+                if message.contains("requires validation_epoch")
+        ));
+
+        let mut empty_source = IntentResolutionJson {
+            status: ResolutionStatus::Resolved,
+            task_kind: Some(CreationTaskKind::BlockValidation),
+            target_kind: None,
+            block: None,
+            block_range: None,
+            txids: None,
+            repetitions: None,
+            warmup: None,
+            rev: Some("  ".into()),
+            variant_refs: None,
+            repository: None,
+            validation_epoch: None,
+            validation_start: None,
+            validation_end: None,
+            reason: None,
+            issues: None,
+        };
+        assert!(validate_intent_resolution(empty_source.clone()).is_err());
+        empty_source.rev = None;
+        empty_source.repository = Some(String::new());
+        assert!(validate_intent_resolution(empty_source).is_err());
+    }
+
+    #[test]
+    fn deterministic_validation_command_is_strict_and_typed() {
+        assert_eq!(
+            resolve_validation_command("validate --rev abc123").unwrap(),
+            Some(UserIntent::Create(TaskCreationIntent::BlockValidation(BlockValidationIntent {
+                source: RequestedSource {
+                    repository: None,
+                    revision: Some("abc123".into()),
+                },
+                selection: ValidationSelection::DefaultPlan,
+            })))
+        );
+        assert!(matches!(
+            resolve_validation_command("validate --epoch nakamoto --start-at 10 --end-at 20")
+                .unwrap(),
+            Some(UserIntent::Create(TaskCreationIntent::BlockValidation(BlockValidationIntent {
+                selection: ValidationSelection::Range {
+                    epoch: ValidationEpochIntent::Nakamoto,
+                    start: 10,
+                    end: 20,
+                },
+                ..
+            })))
+        ));
+        assert!(
+            resolve_validation_command("bench --block 1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(resolve_validation_command("validate --start-at 10").is_err());
+        assert!(resolve_validation_command("validate --cancel abc").is_err());
+    }
+
+    #[test]
     fn schema_payload_is_strict_openai_shape() {
         let format = intent_response_text_format();
         assert_eq!(format["type"], "json_schema");
@@ -1018,6 +1475,7 @@ mod tests {
             .unwrap();
         for field in [
             "status",
+            "task_kind",
             "target_kind",
             "block",
             "block_range",
@@ -1026,6 +1484,10 @@ mod tests {
             "warmup",
             "rev",
             "variant_refs",
+            "repository",
+            "validation_epoch",
+            "validation_start",
+            "validation_end",
             "reason",
             "issues",
         ] {
@@ -1035,6 +1497,16 @@ mod tests {
                     .any(|v| v == field),
                 "{field} is required"
             );
+        }
+        let encoded = format.to_string();
+        for forbidden in [
+            "worker_id",
+            "requested_shards",
+            "max_concurrency",
+            "timeout_secs",
+            "required_capability",
+        ] {
+            assert!(!encoded.contains(forbidden), "provider schema exposes {forbidden}");
         }
     }
 

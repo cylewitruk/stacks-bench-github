@@ -2,7 +2,7 @@
 //!
 //! This crate owns Socket Mode intake, the narrow Web API contract, request
 //! orchestration, canonical snapshot rendering, and replay-safe message
-//! publication. Database lookup and benchmark result policy remain in the
+//! publication. Database lookup and task policy remain in the
 //! daemon.
 
 mod api_client;
@@ -21,8 +21,8 @@ pub use client::{
     RUNNING_REACTION, SlackClient,
 };
 pub use connector::{
-    BenchmarkQueue, BenchmarkVariantRequest, MentionEvent, SlackConnector, SlackConnectorConfig,
-    SlackJobTarget, SlackSubmissionActor,
+    BenchmarkVariantRequest, MentionEvent, SlackConnector, SlackConnectorConfig, SlackJobTarget,
+    SlackSubmissionActor, TaskSubmissionPort, TaskSubmissionRequest,
 };
 pub use error::{Result, SlackError};
 pub use snapshot::{

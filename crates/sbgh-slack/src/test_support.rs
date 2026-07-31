@@ -5,12 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use sbgh_core::models::{BuildTarget, GitRefKind, Job, JobIntent, JobSource, JobStatus, TaskKind};
+use sbgh_core::models::{
+    BuildTarget, GitRefKind, Job, JobIntent, JobSource, JobStatus, QueuedEventDetail, TaskKind,
+};
 use uuid::Uuid;
 
 use crate::{
-    BenchmarkQueue, BenchmarkVariantRequest, FoundMessage, ReportingIdentity, Result, SlackClient,
-    SlackError, SlackMessageTarget,
+    BenchmarkVariantRequest, FoundMessage, ReportingIdentity, Result, SlackClient, SlackError,
+    SlackMessageTarget, TaskSubmissionPort, TaskSubmissionRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,19 +246,20 @@ impl SlackClient for FakeSlackClient {
 }
 
 #[derive(Default)]
-pub struct RecordingBenchmarkQueue {
+pub struct RecordingTaskSubmissionPort {
     calls: Mutex<Vec<RecordedQueueCall>>,
     fail_create: AtomicBool,
 }
 
 struct RecordedQueueCall {
     job: Job,
+    reporting_identity: String,
     variants: Vec<BenchmarkVariantRequest>,
     queued_event_detail: serde_json::Value,
     plan_message_ts: Option<String>,
 }
 
-impl RecordingBenchmarkQueue {
+impl RecordingTaskSubmissionPort {
     pub fn fail_create(&self) {
         self.fail_create
             .store(true, Ordering::SeqCst);
@@ -307,23 +310,91 @@ impl RecordingBenchmarkQueue {
 }
 
 #[async_trait]
-impl BenchmarkQueue for RecordingBenchmarkQueue {
-    async fn submit_benchmark(
+impl TaskSubmissionPort for RecordingTaskSubmissionPort {
+    async fn submit(
         &self,
-        requested_variants: &[BenchmarkVariantRequest],
-        queued_event_detail: &serde_json::Value,
+        request: TaskSubmissionRequest,
         plan_message_ts: Option<&str>,
-        _actor: crate::SlackSubmissionActor<'_>,
+        actor: crate::SlackSubmissionActor<'_>,
     ) -> sbgh_core::Result<sbgh_core::submission::SubmissionReceipt> {
+        if let Some(existing) = self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|call| call.reporting_identity == actor.reporting_identity)
+        {
+            return Ok(sbgh_core::submission::SubmissionReceipt {
+                submission_id: existing
+                    .job
+                    .task_submission_id,
+                disposition: sbgh_core::submission::SubmissionDisposition::AlreadySubmitted,
+                initial_job_ids: vec![existing.job.id],
+            });
+        }
         if self
             .fail_create
             .load(Ordering::SeqCst)
         {
             return Err(std::io::Error::other("injected benchmark queue failure").into());
         }
-        let first = requested_variants
-            .first()
-            .ok_or_else(|| std::io::Error::other("benchmark submission needs at least one spec"))?;
+        let (variants, queued_event_detail, git_ref_display, intent, task_kind, build_target, key) =
+            match request {
+                TaskSubmissionRequest::Benchmark {
+                    variants,
+                    effective_args,
+                    clean_repetitions,
+                } => {
+                    let first = variants
+                        .first()
+                        .ok_or_else(|| {
+                            std::io::Error::other("benchmark submission needs at least one spec")
+                        })?;
+                    let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+                        channel: actor.channel_id.into(),
+                        message_ts: actor
+                            .request_message_ts
+                            .into(),
+                        reporting_identity: Some(
+                            actor
+                                .reporting_identity
+                                .into(),
+                        ),
+                        bench_args: effective_args,
+                        clean_repetitions,
+                    })?;
+                    (
+                        variants.clone(),
+                        detail,
+                        first.rev.clone(),
+                        JobIntent::AdhocBenchmark,
+                        TaskKind::Benchmark,
+                        BuildTarget::StacksBench,
+                        Some(first.workload_key.clone()),
+                    )
+                }
+                TaskSubmissionRequest::BlockValidation(request) => {
+                    let revision = request
+                        .source
+                        .revision
+                        .unwrap_or_else(|| "develop".into());
+                    let detail = serde_json::to_value(QueuedEventDetail::BlockValidation {
+                        range_start: 1,
+                        range_end: 2,
+                        requested_shards: 1,
+                        max_concurrency: 1,
+                    })?;
+                    (
+                        Vec::new(),
+                        detail,
+                        revision,
+                        JobIntent::BlockValidation,
+                        TaskKind::BlockValidation,
+                        BuildTarget::StacksInspect,
+                        None,
+                    )
+                }
+            };
         let now = Utc::now();
         let submission_id = Uuid::new_v4();
         let first_job_id = Uuid::new_v4();
@@ -336,14 +407,14 @@ impl BenchmarkQueue for RecordingBenchmarkQueue {
             github_repo_id: 10,
             status: JobStatus::Queued,
             source: JobSource::Slack,
-            intent: JobIntent::AdhocBenchmark,
-            task_kind: TaskKind::Benchmark,
-            build_target: BuildTarget::StacksBench,
+            intent,
+            task_kind,
+            build_target,
             git_ref_kind: GitRefKind::Branch,
-            git_ref_display: first.rev.clone(),
+            git_ref_display,
             git_commit_hash: None,
             git_committed_at: None,
-            workload_key: Some(first.workload_key.clone()),
+            workload_key: key,
             claim_token: None,
             claimed_at: None,
             created_at: now,
@@ -354,8 +425,11 @@ impl BenchmarkQueue for RecordingBenchmarkQueue {
             .unwrap()
             .push(RecordedQueueCall {
                 job: job.clone(),
-                variants: requested_variants.to_vec(),
-                queued_event_detail: queued_event_detail.clone(),
+                reporting_identity: actor
+                    .reporting_identity
+                    .into(),
+                variants,
+                queued_event_detail,
                 plan_message_ts: plan_message_ts.map(str::to_owned),
             });
         Ok(sbgh_core::submission::SubmissionReceipt {

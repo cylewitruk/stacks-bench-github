@@ -1,6 +1,7 @@
 pub mod api;
 mod artifact_store;
 mod bench_summary;
+mod block_validation_submission;
 mod comparison;
 mod duration;
 mod fleet;
@@ -122,12 +123,20 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let api_ingest = Arc::new(PostgresIngestStore::new(pool.clone()));
     let fleet_config = config.fleet.clone();
     let postgres_fleet = sbgh_postgres::PostgresFleetStore::new(pool.clone());
-    let block_validation_queue = config
-        .github
+    let block_validation_service = config
+        .tasks
         .block_validation
         .clone()
-        .map(|trigger| {
-            Arc::new(fleet::PostgresBlockValidationQueue::new((*jobs_store).clone(), trigger))
+        .map(|policy| {
+            Arc::new(block_validation_submission::BlockValidationSubmissionService::new(
+                jobs_store.clone(),
+                policy,
+            ))
+        });
+    let block_validation_queue = block_validation_service
+        .as_ref()
+        .map(|service| {
+            Arc::new(fleet::PostgresBlockValidationQueue::new(service.clone()))
                 as Arc<dyn webhook_processor::BlockValidationQueue>
         });
     let issue_comment_handler = IssueCommentHandler::new(
@@ -267,17 +276,28 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                         .slack
                         .allowed_user_ids
                         .clone(),
+                    Some(
+                        config
+                            .slack
+                            .block_validation_user_ids
+                            .clone(),
+                    ),
                 ),
             },
-            Arc::new(slack_queue::SlackBenchmarkQueue::new(
+            Arc::new(slack_queue::SlackTaskSubmissionAdapter::new(
                 jobs_store.clone(),
                 gh.clone(),
+                block_validation_service.clone(),
                 target,
                 config
                     .slack
                     .default_repository
                     .clone(),
-            )) as Arc<dyn sbgh_slack::BenchmarkQueue>,
+                config
+                    .slack
+                    .default_rev
+                    .clone(),
+            )) as Arc<dyn sbgh_slack::TaskSubmissionPort>,
             web_client,
             intent_resolver,
             config

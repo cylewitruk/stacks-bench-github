@@ -1,4 +1,4 @@
-//! OpenAI Responses API adapter for benchmark intent extraction.
+//! OpenAI Responses API adapter for task-creation intent extraction.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -9,7 +9,12 @@ use crate::intent::{
 };
 
 const INTENT_SYSTEM_PROMPT: &str = concat!(
-    "Resolve benchmark requests into the provided JSON schema. ",
+    "Resolve creation requests for either benchmarks or block validation into the provided JSON schema. ",
+    "Set exactly one task_kind. Reject cancel, restart, replace, supersede, scheduling, worker-selection, ",
+    "or mixed-task requests as invalid. ",
+    "For block_validation, rev and repository are optional source selectors. ",
+    "Use a null validation epoch/start/end for the server-owned default plan, or provide all three. ",
+    "Never choose shards, concurrency, timeout, resources, workers, or raw command arguments. ",
     "Treat repetitions as clean daemon-orchestrated VM executions, not in-process CLI loops. ",
     "A request that says `on <ref>` or `against <ref>` with one ref is a single-ref request: ",
     "set rev to that ref and set variant_refs to null. ",
@@ -17,7 +22,7 @@ const INTENT_SYSTEM_PROMPT: &str = concat!(
     "versus, or between <ref> and <ref>, and only when exactly two refs are present. ",
     "For comparison requests, emit exactly two refs in variant_refs and leave rev null; ",
     "never emit raw CLI flags. ",
-    "Return status=invalid when required benchmark inputs are missing or ambiguous, ",
+    "Return status=invalid when required inputs or task identity are missing or ambiguous, ",
     "with a concise reason and field-level issues. Never emit extra text."
 );
 
@@ -159,7 +164,7 @@ impl IntentResolver for OpenAiIntentResolver {
                     .into(),
             ));
         }
-        tracing::info!(model = %self.model, input_chars, "llm: resolving benchmark intent via openai");
+        tracing::info!(model = %self.model, input_chars, "llm: resolving task intent via openai");
 
         let started = std::time::Instant::now();
         let outcome = self
@@ -274,6 +279,12 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("against <ref>` with one ref is a single-ref request")
+        );
+        assert!(
+            body["input"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Never choose shards, concurrency, timeout")
         );
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][1]["content"][0]["text"], "bench block 1");

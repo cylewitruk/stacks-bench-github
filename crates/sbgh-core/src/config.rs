@@ -26,6 +26,7 @@ const DAEMON_HOME_RELATIVE: &str = ".config/sbgh/daemon/config.toml";
 pub struct DaemonConfig {
     pub server: DaemonServerConfig,
     pub github: GitHubConfig,
+    pub tasks: TasksConfig,
     pub fleet: FleetConfig,
     pub vm: VmConfig,
     pub paths: PathsConfig,
@@ -106,14 +107,22 @@ pub struct GitHubConfig {
     pub client_id: String,
     pub api_base_url: String,
     pub private_key_path: PathBuf,
-    pub block_validation: Option<GitHubBlockValidationConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitHubBlockValidationConfig {
+pub struct TasksConfig {
+    pub block_validation: Option<BlockValidationTaskConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockValidationTaskConfig {
+    pub default_epoch: sbgh_fleet::ValidationEpoch,
+    pub default_range_start: u64,
+    pub default_range_end: u64,
     pub requested_shards: u32,
     pub max_concurrency: u32,
     pub timeout_secs: u64,
+    pub allow_range_override: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,9 +471,9 @@ pub struct S3Config {
     pub secret_access_key: String,
 }
 
-/// Slack ad-hoc profiling connector. Disabled by default; when `enabled`, the
-/// orchestrator opens a Socket Mode connection and
-/// serves `@BenchBot` mention benches. The code under test is a **constant**
+/// Slack task-creation connector. Disabled by default; when `enabled`, the
+/// orchestrator opens a Socket Mode connection and serves benchmark and
+/// block-validation mentions. The code under test is a **constant**
 /// (`default_repository`/`default_rev`); the workload is the variable (the
 /// mention's args). Tokens are **env-only**; identities are allowlisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,6 +501,10 @@ pub struct SlackConfig {
     pub allowed_team_ids: Vec<String>,
     /// Allowlisted Slack user ids permitted to trigger benches.
     pub allowed_user_ids: Vec<String>,
+    /// Allowlisted Slack user ids permitted to trigger block validation.
+    /// Omitted configuration inherits `allowed_user_ids`; an explicit empty
+    /// list disables block-validation creation from Slack.
+    pub block_validation_user_ids: Vec<String>,
 }
 
 impl Default for SlackConfig {
@@ -505,6 +518,7 @@ impl Default for SlackConfig {
             default_rev: String::new(),
             allowed_team_ids: Vec::new(),
             allowed_user_ids: Vec::new(),
+            block_validation_user_ids: Vec::new(),
         }
     }
 }
@@ -535,6 +549,7 @@ impl DaemonConfig {
 struct RawDaemon {
     server: RawDaemonServer,
     github: RawGitHub,
+    tasks: RawTasks,
     fleet: RawFleet,
     vm: RawVm,
     paths: RawPaths,
@@ -582,6 +597,7 @@ struct RawSlack {
     default_rev: Option<String>,
     allowed_team_ids: Option<Vec<String>>,
     allowed_user_ids: Option<Vec<String>>,
+    block_validation_user_ids: Option<Vec<String>>,
     /// **Env-only** (`SBGH_SLACK_APP_TOKEN`) — `#[serde(skip)]` so a TOML key
     /// is a hard error; the `xapp-` secret stays out of the config file.
     #[serde(skip)]
@@ -650,15 +666,24 @@ struct RawGitHub {
     client_id: Option<String>,
     api_base_url: Option<String>,
     private_key_path: Option<PathBuf>,
-    block_validation: RawGitHubBlockValidation,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RawGitHubBlockValidation {
+struct RawTasks {
+    block_validation: RawBlockValidationTask,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawBlockValidationTask {
+    default_epoch: Option<sbgh_fleet::ValidationEpoch>,
+    default_range_start: Option<u64>,
+    default_range_end: Option<u64>,
     requested_shards: Option<u32>,
     max_concurrency: Option<u32>,
     timeout_secs: Option<u64>,
+    allow_range_override: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -737,33 +762,73 @@ impl RawDaemon {
         merge_opt(&mut self.github.private_key_path, other.github.private_key_path);
         merge_opt(
             &mut self
-                .github
+                .tasks
+                .block_validation
+                .default_epoch,
+            other
+                .tasks
+                .block_validation
+                .default_epoch,
+        );
+        merge_opt(
+            &mut self
+                .tasks
+                .block_validation
+                .default_range_start,
+            other
+                .tasks
+                .block_validation
+                .default_range_start,
+        );
+        merge_opt(
+            &mut self
+                .tasks
+                .block_validation
+                .default_range_end,
+            other
+                .tasks
+                .block_validation
+                .default_range_end,
+        );
+        merge_opt(
+            &mut self
+                .tasks
                 .block_validation
                 .requested_shards,
             other
-                .github
+                .tasks
                 .block_validation
                 .requested_shards,
         );
         merge_opt(
             &mut self
-                .github
+                .tasks
                 .block_validation
                 .max_concurrency,
             other
-                .github
+                .tasks
                 .block_validation
                 .max_concurrency,
         );
         merge_opt(
             &mut self
-                .github
+                .tasks
                 .block_validation
                 .timeout_secs,
             other
-                .github
+                .tasks
                 .block_validation
                 .timeout_secs,
+        );
+        merge_opt(
+            &mut self
+                .tasks
+                .block_validation
+                .allow_range_override,
+            other
+                .tasks
+                .block_validation
+                .allow_range_override,
         );
 
         merge_opt(&mut self.fleet.listen, other.fleet.listen);
@@ -980,6 +1045,14 @@ impl RawDaemon {
         merge_opt(&mut self.slack.default_rev, other.slack.default_rev);
         merge_opt(&mut self.slack.allowed_team_ids, other.slack.allowed_team_ids);
         merge_opt(&mut self.slack.allowed_user_ids, other.slack.allowed_user_ids);
+        merge_opt(
+            &mut self
+                .slack
+                .block_validation_user_ids,
+            other
+                .slack
+                .block_validation_user_ids,
+        );
         // `slack.{app_token,bot_token}` are env-only.
 
         merge_opt(&mut self.llm.enabled, other.llm.enabled);
@@ -1145,6 +1218,12 @@ impl RawDaemon {
         env_into(&mut self.slack.default_rev, "SBGH_SLACK_DEFAULT_REV");
         env_csv_into(&mut self.slack.allowed_team_ids, "SBGH_SLACK_ALLOWED_TEAM_IDS");
         env_csv_into(&mut self.slack.allowed_user_ids, "SBGH_SLACK_ALLOWED_USER_IDS");
+        env_csv_into(
+            &mut self
+                .slack
+                .block_validation_user_ids,
+            "SBGH_SLACK_BLOCK_VALIDATION_USER_IDS",
+        );
         env_into(&mut self.slack.app_token, "SBGH_SLACK_APP_TOKEN");
         env_into(&mut self.slack.bot_token, "SBGH_SLACK_BOT_TOKEN");
 
@@ -1164,30 +1243,61 @@ impl RawDaemon {
 
     fn into_config(self) -> Result<DaemonConfig> {
         let block_validation = match (
-            self.github
+            self.tasks
+                .block_validation
+                .default_epoch,
+            self.tasks
+                .block_validation
+                .default_range_start,
+            self.tasks
+                .block_validation
+                .default_range_end,
+            self.tasks
                 .block_validation
                 .requested_shards,
-            self.github
+            self.tasks
                 .block_validation
                 .max_concurrency,
-            self.github
+            self.tasks
                 .block_validation
                 .timeout_secs,
+            self.tasks
+                .block_validation
+                .allow_range_override,
         ) {
-            (None, None, None) => None,
-            (requested_shards, max_concurrency, timeout_secs) => {
-                Some(GitHubBlockValidationConfig {
-                    requested_shards: required(
-                        requested_shards,
-                        "[github.block_validation].requested_shards",
-                    )?,
-                    max_concurrency: required(
-                        max_concurrency,
-                        "[github.block_validation].max_concurrency",
-                    )?,
-                    timeout_secs: required(timeout_secs, "[github.block_validation].timeout_secs")?,
-                })
-            }
+            (None, None, None, None, None, None, None) => None,
+            (
+                default_epoch,
+                default_range_start,
+                default_range_end,
+                requested_shards,
+                max_concurrency,
+                timeout_secs,
+                allow_range_override,
+            ) => Some(BlockValidationTaskConfig {
+                default_epoch: required(default_epoch, "[tasks.block_validation].default_epoch")?,
+                default_range_start: required(
+                    default_range_start,
+                    "[tasks.block_validation].default_range_start",
+                )?,
+                default_range_end: required(
+                    default_range_end,
+                    "[tasks.block_validation].default_range_end",
+                )?,
+                requested_shards: required(
+                    requested_shards,
+                    "[tasks.block_validation].requested_shards",
+                )?,
+                max_concurrency: required(
+                    max_concurrency,
+                    "[tasks.block_validation].max_concurrency",
+                )?,
+                timeout_secs: required(timeout_secs, "[tasks.block_validation].timeout_secs")?,
+                allow_range_override: required(
+                    allow_range_override,
+                    "[tasks.block_validation].allow_range_override",
+                )?,
+            }),
         };
         let fleet_defaults = FleetConfig::default();
         let fleet = FleetConfig {
@@ -1252,7 +1362,9 @@ impl RawDaemon {
                 .max_concurrent_requests
                 .unwrap_or(fleet_defaults.max_concurrent_requests),
         };
-        validate_fleet_config(&fleet, block_validation.as_ref())?;
+        validate_fleet_config(&fleet)?;
+        validate_block_validation_config(block_validation.as_ref())?;
+        let block_validation_configured = block_validation.is_some();
         Ok(DaemonConfig {
             server: DaemonServerConfig {
                 database_url: required(self.server.database_url, "DATABASE_URL")?,
@@ -1274,8 +1386,8 @@ impl RawDaemon {
                     self.github.private_key_path,
                     "[github].private_key_path / SBGH_GH_PRIVATE_KEY_PATH",
                 )?,
-                block_validation,
             },
+            tasks: TasksConfig { block_validation },
             fleet,
             vm: VmConfig {
                 golden_image: required(self.vm.golden_image, "[vm].golden_image")?,
@@ -1513,6 +1625,18 @@ impl RawDaemon {
                             .allowed_user_ids
                             .unwrap_or_default(),
                     );
+                    let block_validation_user_ids = self
+                        .slack
+                        .block_validation_user_ids
+                        .map(normalize_ids)
+                        .unwrap_or_else(|| user_ids.clone());
+                    if !block_validation_user_ids.is_empty() && !block_validation_configured {
+                        return Err(Error::Config(
+                            "[slack].block_validation_user_ids requires a complete \
+                             [tasks.block_validation] policy; set [] for benchmark-only Slack"
+                                .into(),
+                        ));
+                    }
                     if team_ids.is_empty() || user_ids.is_empty() {
                         return Err(Error::Config(
                             "[slack].enabled = true requires non-empty allowed_team_ids and \
@@ -1540,6 +1664,7 @@ impl RawDaemon {
                         )?,
                         allowed_team_ids: team_ids,
                         allowed_user_ids: user_ids,
+                        block_validation_user_ids,
                     }
                 } else {
                     SlackConfig::default()
@@ -1587,10 +1712,7 @@ impl RawDaemon {
 
 // ─────────────────────────── Shared helpers ───────────────────────────
 
-fn validate_fleet_config(
-    fleet: &FleetConfig,
-    block_validation: Option<&GitHubBlockValidationConfig>,
-) -> Result<()> {
+fn validate_fleet_config(fleet: &FleetConfig) -> Result<()> {
     if fleet.heartbeat_seconds == 0
         || fleet.lease_seconds
             < fleet
@@ -1623,8 +1745,15 @@ fn validate_fleet_config(
     {
         return Err(Error::Config("fleet transport or artifact limits are invalid".into()));
     }
+    Ok(())
+}
+
+fn validate_block_validation_config(
+    block_validation: Option<&BlockValidationTaskConfig>,
+) -> Result<()> {
     if let Some(trigger) = block_validation
-        && (trigger.requested_shards == 0
+        && (trigger.default_range_start > trigger.default_range_end
+            || trigger.requested_shards == 0
             || trigger.requested_shards > sbgh_fleet::MAX_VALIDATION_SHARDS
             || trigger.max_concurrency == 0
             || trigger.max_concurrency > sbgh_fleet::MAX_VALIDATION_CONCURRENCY
@@ -1632,9 +1761,7 @@ fn validate_fleet_config(
             || trigger.timeout_secs == 0
             || trigger.timeout_secs > sbgh_fleet::MAX_VALIDATION_TIMEOUT_SECS)
     {
-        return Err(Error::Config(
-            "GitHub block-validation defaults exceed protocol bounds".into(),
-        ));
+        return Err(Error::Config("block-validation task defaults exceed protocol bounds".into()));
     }
     Ok(())
 }
@@ -2089,7 +2216,10 @@ mod tests {
         let f = write(
             "[slack]\nenabled = true\ndefault_repository = \
              \"stacks-network/stacks-core\"\ndefault_rev = \"develop\"\nallowed_team_ids = \
-             [\"T1\"]\nallowed_user_ids = [\"U1\", \"U2\"]\n",
+             [\"T1\"]\nallowed_user_ids = [\"U1\", \"U2\"]\n\n[tasks.block_validation]\n\
+             default_epoch = \"nakamoto\"\ndefault_range_start = 100\ndefault_range_end = \
+             200\nrequested_shards = 8\nmax_concurrency = 4\ntimeout_secs = \
+             300\nallow_range_override = true\n",
         );
         let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         assert!(cfg.slack.enabled);
@@ -2097,6 +2227,12 @@ mod tests {
         assert_eq!(cfg.slack.default_rev, "develop");
         assert_eq!(cfg.slack.allowed_team_ids, vec!["T1"]);
         assert_eq!(cfg.slack.allowed_user_ids, vec!["U1", "U2"]);
+        assert_eq!(
+            cfg.slack
+                .block_validation_user_ids,
+            vec!["U1", "U2"],
+            "omitted validation allowlist inherits benchmark users"
+        );
         assert_eq!(cfg.slack.app_token.as_deref(), Some("xapp-abc"));
         assert_eq!(cfg.slack.bot_token.as_deref(), Some("xoxb-def"));
     }
@@ -2126,6 +2262,72 @@ mod tests {
         );
         let err = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
         assert!(matches!(err, Error::Config(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn daemon_slack_validation_allowlist_can_override_or_disable_inheritance() {
+        let mut env = daemon_env();
+        env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
+        env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
+             \"develop\"\nallowed_team_ids = [\"T1\"]\nallowed_user_ids = \
+             [\"U_BENCH\"]\nblock_validation_user_ids = []\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        assert_eq!(cfg.slack.allowed_user_ids, vec!["U_BENCH"]);
+        assert!(
+            cfg.slack
+                .block_validation_user_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn daemon_slack_validation_entitlement_requires_task_policy() {
+        let mut env = daemon_env();
+        env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
+        env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
+             \"develop\"\nallowed_team_ids = [\"T1\"]\nallowed_user_ids = [\"U1\"]\n",
+        );
+        let error = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("[tasks.block_validation]")
+        );
+    }
+
+    #[test]
+    fn task_owned_block_validation_policy_is_complete_and_bounded() {
+        let _g = EnvGuard::set(&daemon_env());
+        let f = write(
+            "[tasks.block_validation]\ndefault_epoch = \"nakamoto\"\ndefault_range_start = \
+             100\ndefault_range_end = 200\nrequested_shards = 8\nmax_concurrency = \
+             4\ntimeout_secs = 300\nallow_range_override = true\n",
+        );
+        let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
+        let policy = cfg
+            .tasks
+            .block_validation
+            .unwrap();
+        assert_eq!(policy.default_epoch, sbgh_fleet::ValidationEpoch::Nakamoto);
+        assert_eq!((policy.default_range_start, policy.default_range_end), (100, 200));
+        assert!(policy.allow_range_override);
+
+        let incomplete =
+            write("[tasks.block_validation]\ndefault_epoch = \"nakamoto\"\nrequested_shards = 8\n");
+        assert!(DaemonConfig::load_layered(Some(incomplete.path())).is_err());
+
+        let legacy = write(
+            "[github.block_validation]\nrequested_shards = 8\nmax_concurrency = \
+             4\ntimeout_secs = 300\n",
+        );
+        assert!(DaemonConfig::load_layered(Some(legacy.path())).is_err());
     }
 
     #[test]
@@ -2223,7 +2425,9 @@ mod tests {
         let f = write(
             "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
              \"develop\"\nallowed_team_ids = [\"  T1  \"]\nallowed_user_ids = [\"U1\", \"  U2 \
-             \"]\n",
+             \"]\n\n[tasks.block_validation]\ndefault_epoch = \
+             \"nakamoto\"\ndefault_range_start = 100\ndefault_range_end = 200\nrequested_shards \
+             = 8\nmax_concurrency = 4\ntimeout_secs = 300\nallow_range_override = true\n",
         );
         let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         assert_eq!(cfg.slack.allowed_team_ids, vec!["T1"]);

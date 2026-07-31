@@ -1,9 +1,11 @@
-//! Provider-backed resolution of user requests into validated benchmark intent.
+//! Provider-backed resolution of user requests into validated task-creation intent.
 
 mod intent;
 mod openai;
 
 pub use intent::{
-    IntentInvalid, IntentOutcome, IntentProviderError, IntentResolver, IntentValidationError,
+    BlockValidationIntent, IntentInvalid, IntentOutcome, IntentProviderError, IntentResolver,
+    IntentValidationError, RequestedSource, TaskCreationIntent, UserIntent, ValidationEpochIntent,
+    ValidationSelection, resolve_validation_command,
 };
 pub use openai::{OpenAiIntentConfig, OpenAiIntentResolver};

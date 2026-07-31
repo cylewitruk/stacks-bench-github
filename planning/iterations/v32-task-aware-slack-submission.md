@@ -6,7 +6,8 @@ Resolve authorized Slack natural language into typed benchmark or
 block-validation intent and submit either task through the existing
 task-submission kernel.
 
-> **Status:** planned
+> **Status:** in_progress — local implementation and validation are complete;
+> real Slack/provider/worker canaries remain deployment gates.
 >
 > v32 is creation-only. It makes intent resolution and Slack intake task-aware
 > without adding cancel, restart, replace, scheduling, or worker-selection
@@ -17,13 +18,13 @@ task-submission kernel.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0069-task-aware-intent-resolution` | primary: provider-neutral typed intent | planned |
-| `0078-slack-task-submission` | co-primary: Slack benchmark/validation creation | planned |
+| `0069-task-aware-intent-resolution` | primary: provider-neutral typed intent | in_progress |
+| `0078-slack-task-submission` | co-primary: Slack benchmark/validation creation | in_progress |
 
 ## 0069 — Task-Aware Intent Resolution
 
 - **id:** `0069-task-aware-intent-resolution`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `high`
 - **depends_on:** `0020-llm-intent-resolution`,
   `0059-intent-resolution-boundary`
@@ -63,7 +64,7 @@ enumeration, provider-issued side effects, or provider-owned authorization.
 ## 0078 — Slack Task Submission
 
 - **id:** `0078-slack-task-submission`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `high`
 - **depends_on:** `0064-task-submission-kernel`,
   `0066-task-aware-reporting`, `0069-task-aware-intent-resolution`

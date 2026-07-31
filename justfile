@@ -76,6 +76,7 @@ lint *args:
     python3 scripts/check-docs.py
     python3 scripts/check-task-submission-names.py
     python3 scripts/check-reporting-boundaries.py
+    python3 scripts/check-task-aware-intake.py
     python3 scripts/check-protobuf-boundary.py
     python3 scripts/check-worker-registry-boundary.py
     python3 scripts/check-package-dag.py

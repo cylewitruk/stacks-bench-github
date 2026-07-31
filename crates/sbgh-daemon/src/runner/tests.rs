@@ -510,8 +510,8 @@ fn test_config(tmp: &TempDir) -> DaemonConfig {
             client_id: "Iv23litest".into(),
             api_base_url: "https://api.github.test".into(),
             private_key_path: PathBuf::from("/dev/null"),
-            block_validation: None,
         },
+        tasks: sbgh_core::config::TasksConfig { block_validation: None },
         fleet: FleetConfig::default(),
         vm: VmConfig {
             golden_image: p.join("golden.qcow2"),

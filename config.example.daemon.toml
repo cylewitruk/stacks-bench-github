@@ -30,10 +30,14 @@ client_id = "Iv23liREPLACE_ME"
 api_base_url = "https://api.github.com"
 private_key_path = "/etc/sbgh/daemon/github-app.private-key.pem"
 
-[github.block_validation]
+[tasks.block_validation]
+default_epoch = "nakamoto"
+default_range_start = 185630
+default_range_end = 186000
 requested_shards = 32
 max_concurrency = 24
 timeout_secs = 86400
+allow_range_override = true
 
 [fleet]
 # Protobuf/gRPC worker control plane over HTTP/2 with mandatory TLS 1.3 mTLS.
@@ -202,9 +206,9 @@ region = "fsn1"
 # Env equivalents:
 #   SBGH_ARTIFACTS_BINARY_CACHE_ENABLED / _MAX_SIZE / _DIR
 
-# Slack benchmark connector. Disabled by
+# Slack task-submission connector. Disabled by
 # default — when off, the connector never starts and the rest of this section is
-# inert. Enable it to serve `@BenchBot bench …` mention benches over Socket Mode.
+# inert. Enable it to serve benchmark and block-validation mentions over Socket Mode.
 [slack]
 enabled = false
 
@@ -214,6 +218,8 @@ enabled = false
 #   default_rev        = "develop"                      # its default branch/tag/sha
 #   allowed_team_ids   = ["T0123ABCD"]                  # allowlisted workspaces (non-empty)
 #   allowed_user_ids   = ["U0123ABCD", "U0456WXYZ"]     # allowlisted users (non-empty)
+#   # Optional validation entitlement; omitted inherits allowed_user_ids.
+#   block_validation_user_ids = ["U0123ABCD"]
 #
 # Tokens are ENV-ONLY (never in this file — a TOML key here is a hard error):
 #   SBGH_SLACK_APP_TOKEN   # xapp-… (connections:write) — the Socket Mode connection
@@ -222,6 +228,7 @@ enabled = false
 # See docs/slack-setup.md + docs/slack-app-manifest.yaml to create the app.
 #
 # All non-secret fields can also come from env for a fully env-driven deploy:
+#   SBGH_SLACK_BLOCK_VALIDATION_USER_IDS
 #   SBGH_SLACK_ENABLED=true
 #   SBGH_SLACK_DEFAULT_REPOSITORY / _DEFAULT_REV
 #   SBGH_SLACK_ALLOWED_TEAM_IDS / _ALLOWED_USER_IDS   # comma-separated

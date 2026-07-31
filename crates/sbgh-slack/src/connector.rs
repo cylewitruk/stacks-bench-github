@@ -1,9 +1,9 @@
-//! Slack mention-to-benchmark orchestration.
+//! Slack mention-to-task-creation orchestration.
 //!
 //! Flow for one `@BenchBot bench …` mention, in this order:
 //!   1. **authz** (team + user allowlist) — *before* anything else;
-//!   2. **resolve** the workload (deterministic parser fast-path, then optional
-//!      LLM intent resolver);
+//!   2. **resolve** typed benchmark or block-validation intent (deterministic
+//!      parser fast-path, then optional LLM intent resolver);
 //!   3. **post/reconcile** the queued snapshot in-thread, then **create** the
 //!      job (default repo/rev, no webhook), recording the message `ts` in the
 //!      same transaction — so the job is never claimable without its
@@ -26,9 +26,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sbgh_core::bench_args::workload_key;
-use sbgh_core::models::QueuedEventDetail;
 use sbgh_core::submission::SubmissionReceipt;
-use sbgh_intent::{IntentOutcome, IntentResolver};
+use sbgh_intent::{
+    BlockValidationIntent, IntentOutcome, IntentResolver, TaskCreationIntent, UserIntent,
+    resolve_validation_command,
+};
 
 use crate::{
     ACK_REACTION, PublishUrgency, QUEUED_REACTION, ReportingIdentity, SlackClient,
@@ -55,7 +57,7 @@ pub struct MentionEvent {
     pub text: String,
 }
 
-/// Resolved code-under-test for Slack jobs.
+/// Resolved code-under-test for Slack task creation.
 #[derive(Debug, Clone, Copy)]
 pub struct SlackJobTarget {
     pub installation_id: i64,
@@ -68,6 +70,7 @@ pub struct SlackConnectorConfig {
     default_rev: String,
     allowed_team_ids: Vec<String>,
     allowed_user_ids: Vec<String>,
+    block_validation_user_ids: Vec<String>,
 }
 
 impl SlackConnectorConfig {
@@ -75,18 +78,22 @@ impl SlackConnectorConfig {
         default_rev: impl Into<String>,
         allowed_team_ids: Vec<String>,
         allowed_user_ids: Vec<String>,
+        block_validation_user_ids: Option<Vec<String>>,
     ) -> Self {
+        let block_validation_user_ids =
+            block_validation_user_ids.unwrap_or_else(|| allowed_user_ids.clone());
         Self {
             default_rev: default_rev.into(),
             allowed_team_ids,
             allowed_user_ids,
+            block_validation_user_ids,
         }
     }
 }
 
 pub struct SlackConnector {
     cfg: SlackConnectorConfig,
-    jobs: Arc<dyn BenchmarkQueue>,
+    jobs: Arc<dyn TaskSubmissionPort>,
     client: Arc<dyn SlackClient>,
     intent_resolver: Option<Arc<dyn IntentResolver>>,
     intent_rate_limit_per_minute: u32,
@@ -103,14 +110,23 @@ pub struct SlackConnector {
 /// small recorder while daemon composition adapts the real transactional
 /// store.
 #[async_trait]
-pub trait BenchmarkQueue: Send + Sync + 'static {
-    async fn submit_benchmark(
+pub trait TaskSubmissionPort: Send + Sync + 'static {
+    async fn submit(
         &self,
-        variants: &[BenchmarkVariantRequest],
-        queued_event_detail: &serde_json::Value,
+        request: TaskSubmissionRequest,
         plan_message_ts: Option<&str>,
         actor: SlackSubmissionActor<'_>,
     ) -> sbgh_core::Result<SubmissionReceipt>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskSubmissionRequest {
+    Benchmark {
+        variants: Vec<BenchmarkVariantRequest>,
+        effective_args: Vec<String>,
+        clean_repetitions: u32,
+    },
+    BlockValidation(BlockValidationIntent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +148,7 @@ pub struct SlackSubmissionActor<'a> {
 impl SlackConnector {
     pub fn new(
         cfg: SlackConnectorConfig,
-        jobs: Arc<dyn BenchmarkQueue>,
+        jobs: Arc<dyn TaskSubmissionPort>,
         client: Arc<dyn SlackClient>,
     ) -> Self {
         Self {
@@ -202,9 +218,9 @@ impl SlackConnector {
         tracing::info!("slack: mention received");
         // 1. Authz FIRST — an off-allowlist sender is rejected without parsing (or,
         //    later, spending an LLM call) on their input.
-        if !self.is_authorized(&event.team_id, &event.user) {
+        if !self.is_admitted(&event.team_id, &event.user) {
             tracing::info!("slack: mention rejected — sender/workspace not on the allowlist");
-            self.reject(&event, "not authorized to run benchmarks here")
+            self.reject(&event, "not authorized to create tasks here")
                 .await;
             return;
         }
@@ -223,6 +239,19 @@ impl SlackConnector {
             Ok(request) => request,
             Err(reason) => {
                 self.reject_after_ack(&event, &reason)
+                    .await;
+                return;
+            }
+        };
+        if !self.is_authorized_for(&event.user, &request) {
+            self.reject_after_ack(&event, "not authorized to create that task")
+                .await;
+            return;
+        }
+        let request = match request {
+            TaskCreationIntent::Benchmark(request) => request,
+            TaskCreationIntent::BlockValidation(request) => {
+                self.handle_block_validation(&event, request)
                     .await;
                 return;
             }
@@ -300,26 +329,6 @@ impl SlackConnector {
         tracing::debug!(bench_args = ?bench_args, "slack: resolved bench args");
         let reporting_identity =
             ReportingIdentity::for_request(&event.team_id, &event.channel, &event.message_ts);
-        let mut detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
-            channel: event.channel.clone(),
-            message_ts: event.message_ts.clone(),
-            reporting_identity: Some(
-                reporting_identity
-                    .as_str()
-                    .to_string(),
-            ),
-            bench_args: bench_args.clone(),
-            clean_repetitions,
-        })
-        .expect("QueuedEventDetail serializes");
-        detail
-            .as_object_mut()
-            .expect("queued detail is an object")
-            .insert(
-                "effective_args".into(),
-                serde_json::to_value(&bench_args).expect("benchmark arguments serialize"),
-            );
-
         // 3a. Reconcile or post before creating the job. The identity is stable
         //     across Socket Mode redelivery, so a lost post response can be
         //     adopted rather than duplicated when the reporter takes over.
@@ -336,9 +345,12 @@ impl SlackConnector {
         //     claimable without its plan `ts`.
         let receipt = match self
             .jobs
-            .submit_benchmark(
-                &specs,
-                &detail,
+            .submit(
+                TaskSubmissionRequest::Benchmark {
+                    variants: specs,
+                    effective_args: bench_args,
+                    clean_repetitions,
+                },
                 posted.as_deref(),
                 SlackSubmissionActor {
                     team_id: &event.team_id,
@@ -386,6 +398,74 @@ impl SlackConnector {
         }
     }
 
+    async fn handle_block_validation(&self, event: &MentionEvent, request: BlockValidationIntent) {
+        let reference = request
+            .source
+            .revision
+            .as_deref()
+            .unwrap_or(&self.cfg.default_rev);
+        let reporting_identity =
+            ReportingIdentity::for_request(&event.team_id, &event.channel, &event.message_ts);
+        let queued_snapshot = self
+            .post_queued_task_snapshot(
+                event,
+                "Block validation",
+                reference,
+                reporting_identity.clone(),
+            )
+            .await;
+        let posted = queued_snapshot
+            .publisher
+            .message_ts()
+            .await;
+        let receipt = self
+            .jobs
+            .submit(
+                TaskSubmissionRequest::BlockValidation(request),
+                posted.as_deref(),
+                SlackSubmissionActor {
+                    team_id: &event.team_id,
+                    user_id: &event.user,
+                    channel_id: &event.channel,
+                    request_message_ts: &event.message_ts,
+                    reporting_identity: reporting_identity.as_str(),
+                },
+            )
+            .await;
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::error!(error = %error, "slack: block-validation enqueue failed");
+                self.fail_queued_snapshot(&queued_snapshot)
+                    .await;
+                self.reject_after_ack(event, "couldn't enqueue block validation — please retry")
+                    .await;
+                return;
+            }
+        };
+        tracing::Span::current()
+            .record("submission_id", tracing::field::display(receipt.submission_id));
+        if let Some(job_id) = receipt
+            .initial_job_ids
+            .first()
+        {
+            tracing::Span::current().record("job_id", tracing::field::display(job_id));
+        }
+        tracing::info!(
+            disposition = ?receipt.disposition,
+            snapshot_posted = posted.is_some(),
+            "slack: block validation enqueued"
+        );
+        self.remove_ack(event).await;
+        if let Err(error) = self
+            .client
+            .add_reaction(&event.channel, &event.message_ts, QUEUED_REACTION)
+            .await
+        {
+            tracing::warn!(error = %error, "slack: add_reaction failed (job still enqueued)");
+        }
+    }
+
     /// Add the 👀 acknowledgment reaction. Best-effort.
     async fn add_ack(&self, event: &MentionEvent) {
         if let Err(e) = self
@@ -427,7 +507,7 @@ impl SlackConnector {
         view.version = view.version.saturating_add(1);
         view.status = crate::SlackStatus::Failed;
         view.phase = None;
-        view.details = vec!["Couldn't enqueue the benchmark — please retry.".into()];
+        view.details = vec!["Couldn't enqueue the task — please retry.".into()];
         let result = queued
             .publisher
             .publish(view, PublishUrgency::Immediate)
@@ -449,14 +529,24 @@ impl SlackConnector {
         &self,
         event: &MentionEvent,
         text: &str,
-    ) -> Result<BenchmarkRequest, String> {
+    ) -> Result<TaskCreationIntent, String> {
+        match resolve_validation_command(text) {
+            Ok(Some(UserIntent::Create(intent))) => {
+                tracing::info!(
+                    "slack: validation request resolved via deterministic parser fast-path"
+                );
+                return Ok(intent);
+            }
+            Err(error) => return Err(error.to_string()),
+            Ok(None) => {}
+        }
         match resolve_benchmark_request(text) {
             Ok(request) => {
                 tracing::info!(
                     request_kind = request.kind_label(),
                     "slack: workload resolved via deterministic parser fast-path"
                 );
-                return Ok(request);
+                return Ok(TaskCreationIntent::Benchmark(request));
             }
             Err(e) if self.intent_resolver.is_none() => return Err(e.to_string()),
             Err(_) => {}
@@ -468,17 +558,17 @@ impl SlackConnector {
             .expect("checked above");
         if !self.allow_intent_call(&event.user) {
             tracing::info!("slack: natural-language request rate-limited before the llm call");
-            return Err("too many benchmark requests using natural language — please try again \
+            return Err("too many task requests using natural language — please try again \
                         shortly"
                 .into());
         }
         tracing::info!("slack: parser did not match — resolving via the llm intent resolver");
         match resolver.resolve(text).await {
-            Ok(IntentOutcome::Resolved(request)) => Ok(request),
+            Ok(IntentOutcome::Resolved(UserIntent::Create(request))) => Ok(request),
             Ok(IntentOutcome::Invalid(invalid)) => Err(invalid.user_message()),
             Err(e) => {
                 tracing::warn!(error = %e, "slack: intent resolver failed");
-                Err("couldn't resolve that benchmark request — please try again or use explicit \
+                Err("couldn't resolve that task request — please try again or use explicit \
                      flags"
                     .into())
             }
@@ -546,18 +636,60 @@ impl SlackConnector {
         QueuedSnapshot { publisher, view }
     }
 
-    /// A mention is authorized iff BOTH its workspace AND its sender are
-    /// allowlisted (the authenticated socket says nothing about *who* sent it).
-    fn is_authorized(&self, team_id: &str, user: &str) -> bool {
+    async fn post_queued_task_snapshot(
+        &self,
+        event: &MentionEvent,
+        title: &str,
+        reference: &str,
+        identity: ReportingIdentity,
+    ) -> QueuedSnapshot {
+        let target = SlackMessageTarget {
+            channel: event.channel.clone(),
+            thread_ts: event.message_ts.clone(),
+        };
+        let publisher =
+            SlackSnapshotPublisher::new(self.client.clone(), target, identity.clone(), None, None);
+        let view = SlackProgressView::queued(identity, title, reference);
+        if let Err(error) = publisher
+            .publish(view.clone(), PublishUrgency::Immediate)
+            .await
+        {
+            tracing::warn!(error = ?error, "slack: posting/reconciling queued snapshot failed (non-fatal)");
+        }
+        QueuedSnapshot { publisher, view }
+    }
+
+    /// Pre-provider admission uses the union of task entitlements.
+    fn is_admitted(&self, team_id: &str, user: &str) -> bool {
         self.cfg
             .allowed_team_ids
             .iter()
             .any(|t| t == team_id)
-            && self
+            && (self
                 .cfg
                 .allowed_user_ids
                 .iter()
                 .any(|u| u == user)
+                || self
+                    .cfg
+                    .block_validation_user_ids
+                    .iter()
+                    .any(|u| u == user))
+    }
+
+    fn is_authorized_for(&self, user: &str, intent: &TaskCreationIntent) -> bool {
+        match intent {
+            TaskCreationIntent::Benchmark(_) => self
+                .cfg
+                .allowed_user_ids
+                .iter()
+                .any(|allowed| allowed == user),
+            TaskCreationIntent::BlockValidation(_) => self
+                .cfg
+                .block_validation_user_ids
+                .iter()
+                .any(|allowed| allowed == user),
+        }
     }
 
     async fn reject(&self, event: &MentionEvent, reason: &str) {

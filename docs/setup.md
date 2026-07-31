@@ -211,7 +211,9 @@ Copy [config.example.daemon.toml](../config.example.daemon.toml) to
 - `[github].client_id` and `[github].private_key_path`;
 - `[api].listen` to loopback plus the Docker bridge gateway address;
 - `[artifacts]` to the S3 endpoint, bucket, and region;
-- benchmark defaults and reporting policy appropriate for this host.
+- benchmark defaults and reporting policy appropriate for this host;
+- `[tasks.block_validation]` with the default inclusive epoch/range and
+  server-owned shard, concurrency, timeout, and range-override policy.
 
 ```bash
 sudo install -m 0600 -o sbgh -g sbgh \

@@ -68,8 +68,8 @@ domain code does not import SQLx, Octocrab, Slack, or libvirt.
 
 Submission is separate from scheduling and attempt coordination.
 
-1. A GitHub, Slack, or operator adapter authorizes a request and resolves
-   mutable repository references.
+1. A GitHub, Slack, or operator adapter authorizes a typed benchmark or
+   block-validation request and resolves mutable repository references.
 2. The submission kernel validates a typed plan, freezes executable inputs,
    calculates a demand digest, and atomically persists the aggregate,
    provenance, jobs, and namespaced idempotency receipt.

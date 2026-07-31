@@ -18,8 +18,8 @@ use slack_morphism::prelude::*;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BenchmarkQueue, MentionEvent, Result, SlackClient, SlackConnector, SlackConnectorConfig,
-    SlackError,
+    MentionEvent, Result, SlackClient, SlackConnector, SlackConnectorConfig, SlackError,
+    TaskSubmissionPort,
 };
 
 /// Socket credentials and connector policy projected by the daemon.
@@ -151,7 +151,7 @@ fn is_transient_socket_error(err: &(dyn std::error::Error + Send + Sync + 'stati
 /// decides whether that is fatal (it isn't: Slack is an optional surface).
 pub async fn run(
     cfg: SlackSocketConfig,
-    jobs: Arc<dyn BenchmarkQueue>,
+    jobs: Arc<dyn TaskSubmissionPort>,
     web_client: Arc<dyn SlackClient>,
     intent_resolver: Option<Arc<dyn sbgh_intent::IntentResolver>>,
     options: SocketRunOptions,
