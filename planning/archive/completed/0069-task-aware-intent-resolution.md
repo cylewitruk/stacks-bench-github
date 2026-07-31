@@ -1,30 +1,37 @@
 # v32: Task-Aware Slack Submission
 
 Successor to
-[v31](../archive/completed/0077-worker-identity-and-config-simplification.md).
+[v31](0077-worker-identity-and-config-simplification.md).
 Resolve authorized Slack natural language into typed benchmark or
 block-validation intent and submit either task through the existing
 task-submission kernel.
 
-> **Status:** in_progress — local implementation and validation are complete;
-> real Slack/provider/worker canaries remain deployment gates.
+Continued by
+[v33](../../iterations/v33-dynamic-block-validation-planning.md), which
+replaces v32's static validation default/range/resource policy without
+changing its task-aware Slack boundary.
+
+> **Status:** shipped (2026-07-31) — implementation, review, and local
+> validation are complete. v32 was not deployed. Its real Slack
+> block-validation and worker proof transfers to v33 so the retired static
+> range/resource model is not canaried separately.
 >
 > v32 is creation-only. It makes intent resolution and Slack intake task-aware
 > without adding cancel, restart, replace, scheduling, or worker-selection
 > behavior. Slack lifecycle controls remain in
-> [`0070`](../backlog.md).
+> [`0070`](../../backlog.md).
 
 ## Items
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0069-task-aware-intent-resolution` | primary: provider-neutral typed intent | in_progress |
-| `0078-slack-task-submission` | co-primary: Slack benchmark/validation creation | in_progress |
+| `0069-task-aware-intent-resolution` | primary: provider-neutral typed intent | shipped |
+| `0078-slack-task-submission` | co-primary: Slack benchmark/validation creation | shipped |
 
 ## 0069 — Task-Aware Intent Resolution
 
 - **id:** `0069-task-aware-intent-resolution`
-- **status:** `in_progress`
+- **status:** `shipped`
 - **priority:** `high`
 - **depends_on:** `0020-llm-intent-resolution`,
   `0059-intent-resolution-boundary`
@@ -64,7 +71,7 @@ enumeration, provider-issued side effects, or provider-owned authorization.
 ## 0078 — Slack Task Submission
 
 - **id:** `0078-slack-task-submission`
-- **status:** `in_progress`
+- **status:** `shipped`
 - **priority:** `high`
 - **depends_on:** `0064-task-submission-kernel`,
   `0066-task-aware-reporting`, `0069-task-aware-intent-resolution`
@@ -319,17 +326,17 @@ contract.
 
 **Status:**
 
-- [ ] Baseline tests added or confirmed
-- [ ] Reviewed
-- [ ] Validated
+- [x] Baseline tests added or confirmed
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] Existing accepted benchmark inputs produce identical normalized
+- [x] Existing accepted benchmark inputs produce identical normalized
   `BenchmarkRequest` values.
-- [ ] Existing invalid diagnostics remain bounded and do not expose provider
+- [x] Existing invalid diagnostics remain bounded and do not expose provider
   errors.
-- [ ] Existing Slack benchmark submission remains exactly-once.
+- [x] Existing Slack benchmark submission remains exactly-once.
 
 ### Phase 2: Introduce the Task-Aware Intent Contract
 
@@ -347,17 +354,17 @@ contract.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/schema tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Core implementation
+- [x] Unit/schema tests
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] Cross-task fields, unknown variants, partial ranges, zero/overflow
+- [x] Cross-task fields, unknown variants, partial ranges, zero/overflow
   values, ambiguous actions, and lifecycle actions fail closed.
-- [ ] Model DTOs are not exported as application contracts.
-- [ ] `sbgh-intent` remains independent of daemon, Slack, PostgreSQL, and
+- [x] Model DTOs are not exported as application contracts.
+- [x] `sbgh-intent` remains independent of daemon, Slack, PostgreSQL, and
   generated fleet protocol types.
 
 ### Phase 3: Add Deterministic and Provider-Backed Resolution
@@ -377,17 +384,17 @@ contract.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/eval/provider-adapter tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Core implementation
+- [x] Unit/eval/provider-adapter tests
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] Natural-language benchmark and validation examples resolve to the
+- [x] Natural-language benchmark and validation examples resolve to the
   expected typed variants.
-- [ ] Deterministic requests make no provider call.
-- [ ] Provider output cannot introduce raw CLI arguments or execution policy.
+- [x] Deterministic requests make no provider call.
+- [x] Provider output cannot introduce raw CLI arguments or execution policy.
 
 ### Phase 4: Consolidate Validation Submission Policy
 
@@ -406,18 +413,18 @@ contract.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/PostgreSQL/config tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Core implementation
+- [x] Unit/PostgreSQL/config tests
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] GitHub and Slack validation submission produce the same payload for the
+- [x] GitHub and Slack validation submission produce the same payload for the
   same resolved source and plan.
-- [ ] The service performs no scheduling or worker selection.
-- [ ] Submission plus provenance remains one transaction under `0064`.
-- [ ] Existing `/validate-blocks` redelivery remains idempotent.
+- [x] The service performs no scheduling or worker selection.
+- [x] Submission plus provenance remains one transaction under `0064`.
+- [x] Existing `/validate-blocks` redelivery remains idempotent.
 
 ### Phase 5: Make Slack Creation Task-Aware
 
@@ -435,24 +442,24 @@ contract.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests
-- [ ] Reviewed
-- [ ] Validated
+- [x] Core implementation
+- [x] Unit/integration tests
+- [x] Reviewed
+- [x] Validated
 
 **Acceptance & Validation:**
 
-- [ ] Authorized natural-language benchmark and validation mentions create
+- [x] Authorized natural-language benchmark and validation mentions create
   their expected immutable submissions.
-- [ ] A user authorized for only one task cannot submit the other.
-- [ ] A caller with no task permission causes no provider, GitHub, database, or
+- [x] A user authorized for only one task cannot submit the other.
+- [x] A caller with no task permission causes no provider, GitHub, database, or
   Slack side effect beyond the bounded rejection path.
-- [ ] A partially authorized caller may consume only a rate-limited provider
+- [x] A partially authorized caller may consume only a rate-limited provider
   call before the task-specific check rejects the other task; no source
   resolution, submission, or public Slack message follows.
-- [ ] Duplicate Socket Mode delivery returns/adopts the canonical receipt and
+- [x] Duplicate Socket Mode delivery returns/adopts the canonical receipt and
   snapshot without duplicate work.
-- [ ] Block-validation queued/running/terminal snapshots use task-aware
+- [x] Block-validation queued/running/terminal snapshots use task-aware
   reporting and never enter benchmark-only result paths.
 
 ### Phase 6: Ratchets, Documentation, and Rollout Proof
@@ -471,19 +478,20 @@ contract.
 
 **Status:**
 
-- [ ] Documentation updated
-- [ ] Ratchets added
-- [ ] Workspace validation green
-- [ ] Real Slack canaries recorded
+- [x] Documentation updated
+- [x] Ratchets added
+- [x] Workspace validation green
+- [ ] Real Slack canaries recorded — not run; transferred to v33's first
+  deployment
 
 **Acceptance & Validation:**
 
-- [ ] Docs describe current task-aware behavior without lifecycle promises.
-- [ ] `sbgh-slack` and `sbgh-intent` contain no SQL or provider credentials
+- [x] Docs describe current task-aware behavior without lifecycle promises.
+- [x] `sbgh-slack` and `sbgh-intent` contain no SQL or provider credentials
   outside their owned adapters.
-- [ ] The canonical daemon example loads and old policy keys fail loudly.
+- [x] The canonical daemon example loads and old policy keys fail loudly.
 - [ ] Real Slack messages produce one benchmark and one block-validation
-  submission, each reaching its correct report surface.
+  submission, each reaching its correct report surface — transferred to v33
 
 ## Test Matrix
 
@@ -501,38 +509,35 @@ contract.
 
 ## Final Validation
 
-- [ ] `just build --no-sccache`
-- [ ] `just lint --no-sccache`
-- [ ] `just test --summary --no-sccache`
-- [ ] `git diff --check`
-- [ ] Package metadata still matches the documented dependency graph.
-- [ ] Existing benchmark deterministic/LLM/Slack golden behavior remains
+- [x] `just build --no-sccache`
+- [x] `just lint --no-sccache`
+- [x] `just test --summary --no-sccache`
+- [x] `git diff --check`
+- [x] Package metadata still matches the documented dependency graph.
+- [x] Existing benchmark deterministic/LLM/Slack golden behavior remains
   compatible except for the explicit authorization/config migration.
-- [ ] Validation intent cannot choose scheduling, worker, resource, or
+- [x] Validation intent cannot choose scheduling, worker, resource, or
   credential fields.
-- [ ] GitHub and Slack validation creation share one application planner and
+- [x] GitHub and Slack validation creation share one application planner and
   task-submission kernel.
-- [ ] Socket Mode redelivery/restart cannot duplicate either task or its Slack
+- [x] Socket Mode redelivery/restart cannot duplicate either task or its Slack
   report message.
 - [ ] One real natural-language benchmark and one real natural-language
-  block-validation request complete through Slack.
+  block-validation request complete through Slack — transferred to v33
 
-## Rollout
+## Deployment Status
 
-1. Configure `[tasks.block_validation]` with a bounded default plan. Leave
-   `block_validation_user_ids` omitted to inherit the benchmark allowlist, or
-   set an explicit validation list.
-2. Deploy with LLM resolution disabled; verify deterministic benchmark and
-   validation commands plus existing GitHub `/validate-blocks`.
-3. Enable the configured provider and run invalid/ambiguous probes, confirming
-   no work is submitted.
-4. Run one natural-language benchmark and one natural-language validation
-   canary from an authorized user.
-5. Redeliver each Socket Mode envelope and restart the daemon; verify one
-   submission and one Slack reporting message per request.
+v32 was not deployed. Its static block-validation range and resource policy is
+superseded by `0079`, so proving that path separately would validate behavior
+that v33 removes. v33's first-deployment ceremony owns:
 
-Rollback disables Slack/LLM intake and redeploys the prior binary/config. The
-iteration adds no worker protocol or database schema migration.
+- one natural-language Slack benchmark proving v32's retained intent,
+  authorization, submission, and reporting path;
+- one natural-language Slack validation using v33's recent selector;
+- explicit/full validation, cancellation, cleanup, and replay canaries; and
+- Socket Mode redelivery checks for both task kinds.
+
+No v32 rollback ceremony was needed.
 
 ## Deferred / Follow-Ups
 
@@ -543,3 +548,5 @@ iteration adds no worker protocol or database schema migration.
 - `0067` adds policy-backed GitHub `/validate`.
 - `0036` reuses `UserIntent` for natural-language GitHub PR comments.
 - `0068` adds watched-ref benchmark/validation fan-out.
+- `0079` replaces the static default range and daemon-owned shard/concurrency
+  values with chainstate-relative worker planning.

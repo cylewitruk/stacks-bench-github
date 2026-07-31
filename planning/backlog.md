@@ -90,48 +90,6 @@ surface-specific authorization grammar; GitHub/background/Slack adapters own
 those policies. Durable external projection of pre-attempt terminals is
 `0072`.
 
-### 0067 — GitHub block-validation submission
-
-- **id:** `0067-github-block-validation-submission`
-- **status:** `candidate`
-- **priority:** `high`
-- **depends_on:** `0064-task-submission-kernel`,
-  `0066-task-aware-reporting`
-- **relates_to:** `0036-pr-comment-llm-intent`,
-  `0071-github-job-lifecycle-controls`
-- **source:** block-validation user-story audit (2026-07)
-
-**Problem:** GitHub currently exposes only
-`/validate-blocks <epoch> <start> <end>`. It has no simple policy-backed
-`/validate` and no validation-specific authorization. The existing path builds
-its own submission and pins demand to one global worker configuration.
-
-**Scope:** Define a bounded, deterministic `/validate` PR-command grammar that
-freezes the current full PR-head SHA and selects a repository/default
-`ValidationPlan`, with optional explicit overrides permitted by server policy.
-Preserve `/validate-blocks` as a documented compatibility form or migration
-alias, but route both through `0064`. Perform GitHub role and target/source
-policy checks before resolution or submission, with a validation-specific
-permission (or an explicitly renamed task-trigger permission) rather than
-accidentally inheriting a benchmark-only role. Return/reconcile one
-acknowledgement containing the canonical submission ID and task-aware check link.
-Redelivery uses the webhook/comment command identity as the submission
-idempotency key.
-
-**Acceptance:**
-
-- An authorized `/validate` freezes the current PR head and selected plan,
-  submits exactly once under redelivery, and reports through the validation
-  check/comment surface.
-- Unauthorized, ambiguous, invalid-plan, stale-head, or policy-denied requests
-  do not submit and receive bounded diagnostics where disclosure is safe.
-- `/validate` and `/validate-blocks` do not construct persistence/execution
-  records or select a live worker; both call the shared submission boundary.
-
-**Deferred / non-goals:** No natural-language PR intent (`0036`), no watched-ref
-automation (`0068`), no lifecycle commands (`0071`), and no implicit
-cancellation of older PR heads (`0032`).
-
 ### 0068 — Watched-ref task actions and webhook fan-out
 
 - **id:** `0068-watched-ref-task-actions`

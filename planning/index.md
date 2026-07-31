@@ -84,9 +84,9 @@ need editing when an item's status or location changes.
 | `0064-task-submission-kernel` | Task-submission kernel | `shipped` | [archive/completed/0064-task-submission-kernel.md](archive/completed/0064-task-submission-kernel.md) |
 | `0065-job-lifecycle-controls` | Task-neutral job lifecycle controls | `candidate` | [backlog.md](backlog.md) |
 | `0066-task-aware-reporting` | Task-aware reporting and validation results | `shipped` | [archive/completed/0066-task-aware-reporting.md](archive/completed/0066-task-aware-reporting.md) |
-| `0067-github-block-validation-submission` | GitHub block-validation submission | `candidate` | [backlog.md](backlog.md) |
+| `0067-github-block-validation-submission` | GitHub block-validation submission | `planned` | [iterations/v33-dynamic-block-validation-planning.md](iterations/v33-dynamic-block-validation-planning.md) |
 | `0068-watched-ref-task-actions` | Watched-ref task actions and webhook fan-out | `candidate` | [backlog.md](backlog.md) |
-| `0069-task-aware-intent-resolution` | Task-aware intent resolution | `in_progress` | [iterations/v32-task-aware-slack-submission.md](iterations/v32-task-aware-slack-submission.md) |
+| `0069-task-aware-intent-resolution` | Task-aware intent resolution | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
 | `0070-slack-block-validation-controls` | Slack task lifecycle controls | `candidate` | [backlog.md](backlog.md) |
 | `0071-github-job-lifecycle-controls` | GitHub job lifecycle controls | `candidate` | [backlog.md](backlog.md) |
 | `0072-pre-attempt-terminal-projection` | Pre-attempt terminal projection | `candidate` | [backlog.md](backlog.md) |
@@ -95,7 +95,8 @@ need editing when an item's status or location changes.
 | `0075-rolling-worker-protocol-compatibility` | Rolling worker protocol compatibility | `candidate` | [backlog.md](backlog.md) |
 | `0076-database-backed-worker-registry` | Database-backed worker registry | `shipped` | [archive/completed/0076-database-backed-worker-registry.md](archive/completed/0076-database-backed-worker-registry.md) |
 | `0077-worker-identity-and-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
-| `0078-slack-task-submission` | Slack task submission | `in_progress` | [iterations/v32-task-aware-slack-submission.md](iterations/v32-task-aware-slack-submission.md) |
+| `0078-slack-task-submission` | Slack task submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
+| `0079-dynamic-block-validation-planning` | Dynamic block-validation planning | `planned` | [iterations/v33-dynamic-block-validation-planning.md](iterations/v33-dynamic-block-validation-planning.md) |
 
 ## Iterations
 
@@ -133,7 +134,8 @@ need editing when an item's status or location changes.
 | `v29-protobuf-fleet-protocol` | Protobuf worker protocol | `shipped` | [archive/completed/0074-protobuf-fleet-protocol.md](archive/completed/0074-protobuf-fleet-protocol.md) |
 | `v30-database-backed-worker-registry` | Database-backed worker registry | `shipped` | [archive/completed/0076-database-backed-worker-registry.md](archive/completed/0076-database-backed-worker-registry.md) |
 | `v31-worker-identity-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
-| `v32-task-aware-slack-submission` | Task-aware Slack submission | `in_progress` | [iterations/v32-task-aware-slack-submission.md](iterations/v32-task-aware-slack-submission.md) |
+| `v32-task-aware-slack-submission` | Task-aware Slack submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
+| `v33-dynamic-block-validation-planning` | Dynamic block-validation planning | `planned` | [iterations/v33-dynamic-block-validation-planning.md](iterations/v33-dynamic-block-validation-planning.md) |
 
 ## Decisions
 
