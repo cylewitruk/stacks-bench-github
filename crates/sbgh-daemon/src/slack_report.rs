@@ -641,14 +641,38 @@ fn block_validation_details(
                 .checked_blocks
                 .unwrap_or(0)
         ),
-        match result.requested_range {
-            Some(range) => format!("Requested range: {}..={}", range.start, range.end),
-            None => "Requested range: unavailable (legacy request)".into(),
+        match &result.requested {
+            Some(sbgh_core::reporting::BlockValidationSelectionReport::Recent { block_count }) => {
+                format!("Requested: latest {block_count} Nakamoto blocks")
+            }
+            Some(sbgh_core::reporting::BlockValidationSelectionReport::Full) => {
+                "Requested: full observed history".into()
+            }
+            Some(sbgh_core::reporting::BlockValidationSelectionReport::Range { range }) => {
+                format!("Requested: explicit range {}..={}", range.start, range.end)
+            }
+            None => "Requested: unavailable".into(),
         },
-        match result.observed_range {
-            Some(range) => format!("Observed range: {}..={}", range.start, range.end),
-            None => "Observed range: unavailable".into(),
+        match result.observed {
+            Some(coverage) => format!(
+                "Observed: {} pre-Nakamoto + {} Nakamoto",
+                coverage.pre_nakamoto_count, coverage.nakamoto_count
+            ),
+            None => "Observed: unavailable".into(),
         },
+        match result.resolved_range {
+            Some(range) => format!("Resolved range: {}..={}", range.start, range.end),
+            None => "Resolved range: unavailable".into(),
+        },
+        format!(
+            "Execution: {} shards / {} concurrent",
+            result
+                .shard_count
+                .unwrap_or(0),
+            result
+                .max_concurrency
+                .unwrap_or(0)
+        ),
         format!(
             "Chainstate: {}",
             slack_safe_detail(
@@ -886,8 +910,12 @@ mod tests {
     #[test]
     fn validation_details_bound_and_escape_block_identity() {
         let result = sbgh_core::reporting::BlockValidationReportView {
-            requested_range: None,
-            observed_range: None,
+            requested: None,
+            observed: None,
+            resolved_range: None,
+            segments: Vec::new(),
+            shard_count: None,
+            max_concurrency: None,
             verdict: Some(sbgh_core::reporting::BlockValidationVerdict::Invalid),
             checked_blocks: Some(1),
             chainstate_origin: Some("nightly".into()),

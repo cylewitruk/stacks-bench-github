@@ -808,14 +808,7 @@ impl Reporter {
                 TaskReport::BuildOnly(BuildOnlyReportView { cache_outcome: None })
             }
             sbgh_core::models::TaskKind::BlockValidation => {
-                TaskReport::BlockValidation(BlockValidationReportView {
-                    requested_range: None,
-                    observed_range: None,
-                    verdict: None,
-                    checked_blocks: None,
-                    chainstate_origin: None,
-                    invalid_blocks: Vec::new(),
-                })
+                TaskReport::BlockValidation(BlockValidationReportView::from_request(None))
             }
         };
         SubmissionReportView {
@@ -1992,8 +1985,8 @@ mod tests {
     #[tokio::test]
     async fn validation_terminal_does_not_query_benchmark_comparison_data() {
         use sbgh_core::reporting::{
-            BlockValidationReportView, BlockValidationVerdict, ReportIdentity, ReportLifecycle,
-            ReportLifecycleState, SubmissionReportView, TaskReport,
+            BlockValidationReportView, ReportIdentity, ReportLifecycle, ReportLifecycleState,
+            SubmissionReportView, TaskReport,
         };
 
         let tmp = TempDir::new().unwrap();
@@ -2005,7 +1998,18 @@ mod tests {
             checked_blocks: 1,
             invalid_blocks: Vec::new(),
             chainstate_origin: "nightly".into(),
-            observed_range: sbgh_fleet::InclusiveRange { start: 1, end: 1 },
+            observed: sbgh_fleet::ObservedValidationIndex {
+                pre_nakamoto_count: 1,
+                nakamoto_count: 1,
+            },
+            resolved_range: sbgh_fleet::InclusiveRange { start: 1, end: 1 },
+            segments: vec![sbgh_fleet::ValidationEpochSegment {
+                epoch: sbgh_fleet::ValidationEpoch::Nakamoto,
+                global_range: sbgh_fleet::InclusiveRange { start: 1, end: 1 },
+                local_range: sbgh_fleet::InclusiveRange { start: 0, end: 0 },
+            }],
+            shard_count: 1,
+            max_concurrency: 1,
         };
         let report = SubmissionReportView {
             identity: ReportIdentity {
@@ -2024,17 +2028,9 @@ mod tests {
                 total_jobs: 1,
                 failure: None,
             },
-            task: TaskReport::BlockValidation(BlockValidationReportView {
-                requested_range: None,
-                observed_range: Some(sbgh_core::reporting::InclusiveReportRange {
-                    start: 1,
-                    end: 1,
-                }),
-                verdict: Some(BlockValidationVerdict::Valid),
-                checked_blocks: Some(1),
-                chainstate_origin: Some("nightly".into()),
-                invalid_blocks: Vec::new(),
-            }),
+            task: TaskReport::BlockValidation(BlockValidationReportView::from_result(
+                None, &result,
+            )),
             artifacts: Vec::new(),
         };
         let store = Arc::new(RecordingStore::with_report(report));

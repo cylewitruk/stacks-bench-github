@@ -40,7 +40,6 @@ use sbgh_core::submission::{
     SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionDisposition,
     SubmissionProvenance, TaskPlan,
 };
-use sbgh_fleet::{InclusiveRange, ValidationEpoch};
 use sbgh_github::{
     Command, CreateEvent, GitHubApi, InstallationEvent, InstallationRepositoriesEvent,
     IssueCommentEvent, PullRequestEvent, PushEvent, RepoRef, RepoSummary, parse_command,
@@ -316,8 +315,7 @@ pub struct BlockValidationJobRequest {
     pub triggering_user_id: i64,
     pub github_pull_request_id: i64,
     pub triggering_comment_id: i64,
-    pub epoch: ValidationEpoch,
-    pub range: InclusiveRange,
+    pub selection: sbgh_intent::ValidationSelection,
 }
 
 #[async_trait]
@@ -328,44 +326,12 @@ pub trait BlockValidationQueue: Send + Sync + 'static {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IssueTaskCommand {
     Benchmark(Command),
-    BlockValidation { epoch: ValidationEpoch, range: InclusiveRange },
+    BlockValidation,
 }
 
 fn parse_issue_task_command(body: &str) -> std::result::Result<Option<IssueTaskCommand>, ()> {
-    const PREFIX: &str = "/validate-blocks";
-    let line = body
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim_end();
-    if let Some(rest) = line.strip_prefix(PREFIX) {
-        if !rest.starts_with(char::is_whitespace) {
-            return Ok(None);
-        }
-        let tokens = rest
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        if tokens.len() != 3 {
-            return Err(());
-        }
-        let epoch = match tokens[0] {
-            "pre-nakamoto" | "pre_nakamoto" => ValidationEpoch::PreNakamoto,
-            "nakamoto" => ValidationEpoch::Nakamoto,
-            _ => return Err(()),
-        };
-        let start = tokens[1]
-            .parse()
-            .map_err(|_| ())?;
-        let end = tokens[2]
-            .parse()
-            .map_err(|_| ())?;
-        if start > end {
-            return Err(());
-        }
-        return Ok(Some(IssueTaskCommand::BlockValidation {
-            epoch,
-            range: InclusiveRange { start, end },
-        }));
+    if body.trim() == "/validate" {
+        return Ok(Some(IssueTaskCommand::BlockValidation));
     }
     parse_command(body)
         .map(|command| command.map(IssueTaskCommand::Benchmark))
@@ -483,14 +449,13 @@ impl EventHandler for IssueCommentHandler {
                 {
                     return ClassifyOutcome::Retryable(format!("upsert_user(sender): {e}"));
                 }
+                let required_role = match &command {
+                    IssueTaskCommand::Benchmark(_) => UserRole::TriggerPrBenchmark,
+                    IssueTaskCommand::BlockValidation => UserRole::TriggerBlockValidation,
+                };
                 match self
                     .user_store
-                    .has_role(
-                        event.sender.id,
-                        install_id,
-                        pr.base.repo.id,
-                        UserRole::TriggerPrBenchmark,
-                    )
+                    .has_role(event.sender.id, install_id, pr.base.repo.id, required_role)
                     .await
                 {
                     Ok(true) => {}
@@ -501,8 +466,8 @@ impl EventHandler for IssueCommentHandler {
                             sender_id = event.sender.id,
                             sender_login = event.sender.login.as_str(),
                             base_repo_id = pr.base.repo.id,
-                            "denied /benchmark: sender lacks trigger_pr_benchmark role on target \
-                             repo"
+                            role = ?required_role,
+                            "denied task command: sender lacks required role on target repo"
                         );
                         return ClassifyOutcome::Terminal(WebhookOutcome::DeniedUnauthorized);
                     }
@@ -535,7 +500,7 @@ impl EventHandler for IssueCommentHandler {
                         // the membership/policy-gated side. Head SHA is
                         // known from the PR API; committed_at is left for
                         // the daemon to backfill if needed.
-                        if let IssueTaskCommand::BlockValidation { epoch, range } = command {
+                        if let IssueTaskCommand::BlockValidation = command {
                             let Some(queue) = &self.block_validation else {
                                 return ClassifyOutcome::Terminal(WebhookOutcome::IgnoredNoCommand);
                             };
@@ -547,8 +512,9 @@ impl EventHandler for IssueCommentHandler {
                                 triggering_user_id: event.sender.id,
                                 github_pull_request_id: pr_row.id,
                                 triggering_comment_id: event.comment.id,
-                                epoch,
-                                range,
+                                selection: sbgh_intent::ValidationSelection::Recent {
+                                    block_count: None,
+                                },
                             };
                             return match queue.enqueue(request).await {
                                 Ok(()) => ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob),
@@ -2536,18 +2502,29 @@ mod tests {
 
     use super::*;
 
+    #[derive(Default)]
+    struct RecordingBlockValidationQueue(Mutex<Vec<BlockValidationJobRequest>>);
+
+    #[async_trait]
+    impl BlockValidationQueue for RecordingBlockValidationQueue {
+        async fn enqueue(&self, request: BlockValidationJobRequest) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(request);
+            Ok(())
+        }
+    }
+
     #[test]
-    fn block_validation_command_is_bounded_and_typed() {
+    fn block_validation_command_is_exact_and_argument_free() {
         assert_eq!(
-            parse_issue_task_command("/validate-blocks nakamoto 185630 185999").unwrap(),
-            Some(IssueTaskCommand::BlockValidation {
-                epoch: ValidationEpoch::Nakamoto,
-                range: InclusiveRange { start: 185_630, end: 185_999 },
-            })
+            parse_issue_task_command("/validate").unwrap(),
+            Some(IssueTaskCommand::BlockValidation)
         );
-        assert!(parse_issue_task_command("/validate-blocks nakamoto 20 10").is_err());
-        assert!(parse_issue_task_command("/validate-blocks nakamoto 1 2 extra").is_err());
-        assert_eq!(parse_issue_task_command("please /validate-blocks nakamoto 1 2"), Ok(None));
+        assert_eq!(parse_issue_task_command("/validate full"), Ok(None));
+        assert_eq!(parse_issue_task_command("/validate all"), Ok(None));
+        assert_eq!(parse_issue_task_command("please /validate"), Ok(None));
     }
 
     /// Wide event-type filter for tests that exercise the inbox
@@ -3044,6 +3021,7 @@ mod tests {
         Arc<PostgresInstallationStore>,
         Arc<PostgresUserStore>,
         Arc<PostgresJobStore>,
+        Pool,
     ) {
         let (db, pool) = setup_pg_db().await;
         let repo_store = Arc::new(PostgresRepoStore::new(pool.clone()));
@@ -3153,7 +3131,7 @@ mod tests {
             Arc::new(gh.clone()),
             job_store.clone(),
         );
-        (db, handler, gh, policy_store, install_store, user_store, job_store)
+        (db, handler, gh, policy_store, install_store, user_store, job_store, pool)
     }
 
     #[tokio::test]
@@ -3162,7 +3140,7 @@ mod tests {
         // + an authorized user → accepted → creates a `pr_comment`
         // ad-hoc job (+ webhook/user/PR links + queued event) and
         // terminates as `EnqueuedJob`.
-        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store, _pool) =
             make_benchmark_handler().await;
         policy_store
             .seed_target(1, 10, true)
@@ -3247,7 +3225,7 @@ mod tests {
         // claim lease. Handling the SAME webhook twice must yield
         // EnqueuedJob both times but only ONE job (idempotent on
         // github_webhook_id).
-        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store, _pool) =
             make_benchmark_handler().await;
         policy_store
             .seed_target(1, 10, true)
@@ -3285,7 +3263,7 @@ mod tests {
         // so it clears the per-webhook idempotency) for a commit that already
         // has an active job must NOT enqueue a duplicate — two jobs on one head
         // SHA would fight over GitHub's single check per `(name, head_sha)`.
-        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, job_store, _pool) =
             make_benchmark_handler().await;
         policy_store
             .seed_target(1, 10, true)
@@ -3344,7 +3322,7 @@ mod tests {
         // surfaces the denial — even though the legacy handler may
         // still run the bench in Phase 1, the inbox row signals "the
         // new pipeline would have denied this."
-        let (_db, h, _gh, _policy_store, _install_store, _user_store, _job_store) =
+        let (_db, h, _gh, _policy_store, _install_store, _user_store, _job_store, _pool) =
             make_benchmark_handler().await;
         // No target policy seeded.
         let webhook = make_claimed(
@@ -3360,7 +3338,7 @@ mod tests {
     async fn benchmark_with_disabled_target_policy_is_denied_target_policy() {
         // Soft-disabled target (operator paused) takes the same deny
         // path as a missing target row.
-        let (_db, h, _gh, policy_store, _install_store, _user_store, _job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, _job_store, _pool) =
             make_benchmark_handler().await;
         policy_store
             .seed_target(1, 10, false)
@@ -3379,7 +3357,7 @@ mod tests {
 
     #[tokio::test]
     async fn benchmark_with_no_source_policy_is_denied_source_policy() {
-        let (_db, h, _gh, policy_store, _install_store, _user_store, _job_store) =
+        let (_db, h, _gh, policy_store, _install_store, _user_store, _job_store, _pool) =
             make_benchmark_handler().await;
         policy_store
             .seed_target(1, 10, true)
@@ -3401,7 +3379,7 @@ mod tests {
     /// or assert that the unauthorized path fires.
     async fn make_benchmark_handler_without_role_grant()
     -> (TestDb, IssueCommentHandler, Arc<PostgresUserStore>) {
-        let (db, h, _gh, policy_store, _install_store, user_store, _job_store) =
+        let (db, h, _gh, policy_store, _install_store, user_store, _job_store, _pool) =
             make_benchmark_handler().await;
         policy_store
             .seed_target(1, 10, true)
@@ -3454,6 +3432,189 @@ mod tests {
         );
         let outcome = h.handle(&webhook).await;
         assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
+    }
+
+    #[tokio::test]
+    async fn validate_requires_its_own_scoped_role_and_enqueues_default_recent() {
+        let (_db, h, _gh, policy_store, _install_store, user_store, _job_store, _pool) =
+            make_benchmark_handler().await;
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        policy_store
+            .seed_source(1, 20, true)
+            .await;
+        user_store
+            .seed_role(42, 1, Some(10), UserRole::TriggerBlockValidation)
+            .await;
+        let queue = Arc::new(RecordingBlockValidationQueue::default());
+        let h = h.with_block_validation(queue.clone());
+
+        let outcome = h
+            .handle(&make_claimed(
+                "issue_comment",
+                Some("created"),
+                Some(issue_comment_payload("created", "/validate", true)),
+            ))
+            .await;
+        assert!(matches!(outcome, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
+        let requests = queue.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].selection,
+            sbgh_intent::ValidationSelection::Recent { block_count: None }
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_role_lookup_failure_is_retryable_and_never_enqueues() {
+        let (_db, h, _gh, _policy_store, _install_store, _user_store, _job_store, pool) =
+            make_benchmark_handler().await;
+        let queue = Arc::new(RecordingBlockValidationQueue::default());
+        let h = h.with_block_validation(queue.clone());
+
+        // Exercise the production Postgres store's failure path rather than a
+        // permissive fake: authorization uncertainty must never become a deny
+        // or an accepted submission.
+        sqlx::query("ALTER TABLE github_user_role RENAME TO github_user_role_unavailable")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = h
+            .handle(&make_claimed(
+                "issue_comment",
+                Some("created"),
+                Some(issue_comment_payload("created", "/validate", true)),
+            ))
+            .await;
+        assert!(matches!(
+            outcome,
+            ClassifyOutcome::Retryable(error) if error.contains("has_role")
+        ));
+        assert!(
+            queue
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_scoped_admin_and_rejects_revoked_or_wrong_scope_grants() {
+        let (_db, h, _gh, policy_store, _install_store, user_store, _job_store, _pool) =
+            make_benchmark_handler().await;
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        policy_store
+            .seed_source(1, 20, true)
+            .await;
+        user_store
+            .revoke_role(42, 1, Some(10), UserRole::TriggerPrBenchmark)
+            .await
+            .unwrap();
+        let queue = Arc::new(RecordingBlockValidationQueue::default());
+        let h = h.with_block_validation(queue.clone());
+
+        user_store
+            .seed_role(42, 1, Some(20), UserRole::TriggerBlockValidation)
+            .await;
+        let wrong_scope = h
+            .handle(&make_claimed(
+                "issue_comment",
+                Some("created"),
+                Some(issue_comment_payload("created", "/validate", true)),
+            ))
+            .await;
+        assert!(matches!(
+            wrong_scope,
+            ClassifyOutcome::Terminal(WebhookOutcome::DeniedUnauthorized)
+        ));
+        assert!(
+            queue
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        user_store
+            .seed_role(42, 1, Some(10), UserRole::TriggerBlockValidation)
+            .await;
+        user_store
+            .revoke_role(42, 1, Some(10), UserRole::TriggerBlockValidation)
+            .await
+            .unwrap();
+        let revoked = h
+            .handle(&make_claimed(
+                "issue_comment",
+                Some("created"),
+                Some(issue_comment_payload("created", "/validate", true)),
+            ))
+            .await;
+        assert!(matches!(revoked, ClassifyOutcome::Terminal(WebhookOutcome::DeniedUnauthorized)));
+        assert!(
+            queue
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+
+        user_store
+            .seed_role(42, 1, Some(10), UserRole::Admin)
+            .await;
+        let admin = h
+            .handle(&make_claimed(
+                "issue_comment",
+                Some("created"),
+                Some(issue_comment_payload("created", "/validate", true)),
+            ))
+            .await;
+        assert!(matches!(admin, ClassifyOutcome::Terminal(WebhookOutcome::EnqueuedJob)));
+        assert_eq!(queue.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn benchmark_and_validation_roles_do_not_imply_each_other() {
+        let (_db, h, _gh, policy_store, _install_store, user_store, _job_store, _pool) =
+            make_benchmark_handler().await;
+        policy_store
+            .seed_target(1, 10, true)
+            .await;
+        policy_store
+            .seed_source(1, 20, true)
+            .await;
+
+        let validation = h
+            .handle(&make_claimed(
+                "issue_comment",
+                Some("created"),
+                Some(issue_comment_payload("created", "/validate", true)),
+            ))
+            .await;
+        assert!(matches!(
+            validation,
+            ClassifyOutcome::Terminal(WebhookOutcome::DeniedUnauthorized)
+        ));
+
+        user_store
+            .revoke_role(42, 1, Some(10), UserRole::TriggerPrBenchmark)
+            .await
+            .unwrap();
+        user_store
+            .seed_role(42, 1, Some(10), UserRole::TriggerBlockValidation)
+            .await;
+        let benchmark = h
+            .handle(&make_claimed(
+                "issue_comment",
+                Some("created"),
+                Some(issue_comment_payload("created", "/benchmark run", true)),
+            ))
+            .await;
+        assert!(matches!(benchmark, ClassifyOutcome::Terminal(WebhookOutcome::DeniedUnauthorized)));
     }
 
     #[tokio::test]
@@ -3568,7 +3729,7 @@ mod tests {
     async fn benchmark_gh_api_failure_is_retryable() {
         // If we can't fetch the PR (GH API down, install token expired,
         // etc.), the policy eval can't complete → Retryable.
-        let (_db, h, _gh, _policy_store, _install_store, _user_store, _job_store) =
+        let (_db, h, _gh, _policy_store, _install_store, _user_store, _job_store, _pool) =
             make_benchmark_handler().await;
         // Build a webhook for a DIFFERENT PR than the canned one, so
         // FakeGitHub returns an error.

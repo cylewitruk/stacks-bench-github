@@ -2,8 +2,8 @@
 //!
 //! Flow for one `@BenchBot bench …` mention, in this order:
 //!   1. **authz** (team + user allowlist) — *before* anything else;
-//!   2. **resolve** typed benchmark or block-validation intent (deterministic
-//!      parser fast-path, then optional LLM intent resolver);
+//!   2. **resolve** typed benchmark or block-validation intent through the
+//!      configured LLM provider;
 //!   3. **post/reconcile** the queued snapshot in-thread, then **create** the
 //!      job (default repo/rev, no webhook), recording the message `ts` in the
 //!      same transaction — so the job is never claimable without its
@@ -29,16 +29,13 @@ use sbgh_core::bench_args::workload_key;
 use sbgh_core::submission::SubmissionReceipt;
 use sbgh_intent::{
     BlockValidationIntent, IntentOutcome, IntentResolver, TaskCreationIntent, UserIntent,
-    resolve_validation_command,
 };
 
 use crate::{
     ACK_REACTION, PublishUrgency, QUEUED_REACTION, ReportingIdentity, SlackClient,
     SlackMessageTarget, SlackProgressView, SlackSnapshotPublisher,
 };
-use sbgh_core::workload::{
-    BenchmarkRequest, RequestLimits, resolve_benchmark_request, validate_benchmark_request,
-};
+use sbgh_core::workload::{BenchmarkRequest, RequestLimits, validate_benchmark_request};
 
 /// One inbound Slack mention, normalized from the Socket Mode `app_mention`
 /// envelope (the receive loop, wiring slice, builds these).
@@ -229,8 +226,7 @@ impl SlackConnector {
         //     round-trip. Removed on any rejection below.
         self.add_ack(&event).await;
 
-        // 2. Resolve the workload (mention stripped → parser fast-path, then optional
-        //    LLM resolver).
+        // 2. Resolve the task through the typed LLM boundary.
         let text = strip_leading_mention(&event.text);
         let request = match self
             .resolve_request_for_event(&event, text)
@@ -530,47 +526,35 @@ impl SlackConnector {
         event: &MentionEvent,
         text: &str,
     ) -> Result<TaskCreationIntent, String> {
-        match resolve_validation_command(text) {
-            Ok(Some(UserIntent::Create(intent))) => {
-                tracing::info!(
-                    "slack: validation request resolved via deterministic parser fast-path"
-                );
-                return Ok(intent);
-            }
-            Err(error) => return Err(error.to_string()),
-            Ok(None) => {}
+        if text
+            .split_whitespace()
+            .any(|token| token.starts_with("--"))
+        {
+            return Err(
+                "CLI-style flags are not accepted in Slack; describe the task in natural language"
+                    .into(),
+            );
         }
-        match resolve_benchmark_request(text) {
-            Ok(request) => {
-                tracing::info!(
-                    request_kind = request.kind_label(),
-                    "slack: workload resolved via deterministic parser fast-path"
-                );
-                return Ok(TaskCreationIntent::Benchmark(request));
-            }
-            Err(e) if self.intent_resolver.is_none() => return Err(e.to_string()),
-            Err(_) => {}
-        }
-
-        let resolver = self
-            .intent_resolver
-            .as_ref()
-            .expect("checked above");
+        let Some(resolver) = self.intent_resolver.as_ref() else {
+            return Err(
+                "natural-language task resolution is not configured; use an exact supported \
+                 trigger or the admin API"
+                    .into(),
+            );
+        };
         if !self.allow_intent_call(&event.user) {
             tracing::info!("slack: natural-language request rate-limited before the llm call");
             return Err("too many task requests using natural language — please try again \
                         shortly"
                 .into());
         }
-        tracing::info!("slack: parser did not match — resolving via the llm intent resolver");
+        tracing::info!("slack: resolving task through the llm intent resolver");
         match resolver.resolve(text).await {
             Ok(IntentOutcome::Resolved(UserIntent::Create(request))) => Ok(request),
             Ok(IntentOutcome::Invalid(invalid)) => Err(invalid.user_message()),
             Err(e) => {
                 tracing::warn!(error = %e, "slack: intent resolver failed");
-                Err("couldn't resolve that task request — please try again or use explicit \
-                     flags"
-                    .into())
+                Err("couldn't resolve that task request — please try again".into())
             }
         }
     }

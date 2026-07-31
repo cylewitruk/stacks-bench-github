@@ -169,13 +169,15 @@ impl TaskSubmissionPort for SlackTaskSubmissionAdapter {
                     .source
                     .revision
                     .unwrap_or_else(|| self.default_rev.clone());
-                let (epoch, range) = validation.resolve_user_selection(&request.selection)?;
+                let selection = validation
+                    .resolve_user_selection(&request.selection)
+                    .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
                 let resolved = self
                     .github
                     .resolve_commit(self.target.installation_id, &self.repository, &revision)
                     .await
                     .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
-                let detail = validation.queued_detail(&range)?;
+                let detail = validation.queued_detail(&selection)?;
                 validation
                     .submit(BlockValidationSubmission {
                         source: ResolvedTaskSource {
@@ -191,8 +193,8 @@ impl TaskSubmissionPort for SlackTaskSubmissionAdapter {
                             committed_at: resolved.committed_at,
                             workload_key: None,
                         },
-                        epoch,
-                        range,
+                        selection,
+                        constraints: SchedulingConstraints::default(),
                         actor: SubmissionActor::SlackUser {
                             team_id: actor.team_id.into(),
                             user_id: actor.user_id.into(),
@@ -201,6 +203,7 @@ impl TaskSubmissionPort for SlackTaskSubmissionAdapter {
                         provenance: Self::slack_provenance(actor, detail, plan_message_ts),
                     })
                     .await
+                    .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))
             }
         }
     }
@@ -215,7 +218,7 @@ mod tests {
     use sbgh_core::submission::{
         PreparedSubmission, SubmissionDisposition, SubmissionError, TaskPlan,
     };
-    use sbgh_fleet::ValidationEpoch;
+    use sbgh_fleet::BlockValidationSelection;
     use sbgh_github::test_support::FakeGitHub;
     use sbgh_intent::{BlockValidationIntent, RequestedSource, ValidationSelection};
     use uuid::Uuid;
@@ -251,12 +254,10 @@ mod tests {
         let validation = Arc::new(BlockValidationSubmissionService::new(
             store.clone(),
             BlockValidationTaskConfig {
-                default_epoch: ValidationEpoch::Nakamoto,
-                default_range_start: 100,
-                default_range_end: 200,
-                requested_shards: 8,
-                max_concurrency: 4,
+                default_recent_blocks: 100,
+                max_recent_blocks: 200,
                 timeout_secs: 300,
+                allow_full_validation: true,
                 allow_range_override: false,
             },
         ));
@@ -275,7 +276,7 @@ mod tests {
                         repository: None,
                         revision: Some("candidate".into()),
                     },
-                    selection: ValidationSelection::DefaultPlan,
+                    selection: ValidationSelection::Recent { block_count: None },
                 }),
                 Some("1.3"),
                 SlackSubmissionActor {
@@ -296,8 +297,10 @@ mod tests {
             };
             assert_eq!(plan.source.commit, "a".repeat(40));
             assert_eq!(plan.source.git_ref_display, "candidate");
-            assert_eq!((plan.payload.range.start, plan.payload.range.end), (100, 200));
-            assert_eq!(plan.payload.requested_shards, 8);
+            assert_eq!(
+                plan.payload.selection,
+                BlockValidationSelection::Recent { block_count: 100 }
+            );
         }
 
         let error = adapter
@@ -307,7 +310,7 @@ mod tests {
                         repository: Some("other/repository".into()),
                         revision: Some("candidate".into()),
                     },
-                    selection: ValidationSelection::DefaultPlan,
+                    selection: ValidationSelection::Recent { block_count: None },
                 }),
                 None,
                 SlackSubmissionActor {

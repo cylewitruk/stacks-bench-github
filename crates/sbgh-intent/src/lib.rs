@@ -5,7 +5,7 @@ mod openai;
 
 pub use intent::{
     BlockValidationIntent, IntentInvalid, IntentOutcome, IntentProviderError, IntentResolver,
-    IntentValidationError, RequestedSource, TaskCreationIntent, UserIntent, ValidationEpochIntent,
-    ValidationSelection, resolve_validation_command,
+    IntentValidationError, RequestedSource, TaskCreationIntent, UserIntent, ValidationSelection,
+    ValidationSelectionKind,
 };
 pub use openai::{OpenAiIntentConfig, OpenAiIntentResolver};

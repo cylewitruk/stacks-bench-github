@@ -519,21 +519,15 @@ fn validate_terminal_for_assignment(
         return Ok(());
     };
     match (payload, block_validation) {
-        (sbgh_fleet::TaskPayload::BlockValidation(payload), Some(result))
-            if result
-                .invalid_blocks
-                .iter()
-                .all(|invalid| invalid.shard < payload.requested_shards)
-                && result.observed_range.start <= payload.range.start
-                && result.observed_range.end >= payload.range.end
-                && payload
-                    .range
-                    .end
-                    .checked_sub(payload.range.start)
-                    .and_then(|distance| distance.checked_add(1))
-                    == Some(result.checked_blocks) =>
-        {
-            Ok(())
+        (sbgh_fleet::TaskPayload::BlockValidation(payload), Some(result)) => {
+            sbgh_fleet::validate_block_validation_result(payload, result).map_err(|_| {
+                service_error(
+                    ServiceCode::FailedPrecondition,
+                    "block_validation_result_mismatch",
+                    "completed block-validation result does not match its pinned assignment",
+                    false,
+                )
+            })
         }
         (sbgh_fleet::TaskPayload::BlockValidation(_), _) => Err(service_error(
             ServiceCode::FailedPrecondition,
@@ -1379,10 +1373,9 @@ mod tests {
     #[test]
     fn block_terminal_must_match_observed_range_and_task_kind() {
         let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-            epoch: ValidationEpoch::Nakamoto,
-            range: InclusiveRange { start: 10, end: 19 },
-            requested_shards: 2,
-            max_concurrency: 2,
+            selection: sbgh_fleet::BlockValidationSelection::Range {
+                range: InclusiveRange { start: 10, end: 19 },
+            },
             timeout_secs: 60,
         });
         let outcome = TerminalOutcome::Completed {
@@ -1392,7 +1385,18 @@ mod tests {
                 checked_blocks: 10,
                 invalid_blocks: Vec::new(),
                 chainstate_origin: "vg/mainnet-2026-07-28".into(),
-                observed_range: InclusiveRange { start: 10, end: 30 },
+                observed: sbgh_fleet::ObservedValidationIndex {
+                    pre_nakamoto_count: 10,
+                    nakamoto_count: 21,
+                },
+                resolved_range: InclusiveRange { start: 10, end: 19 },
+                segments: vec![sbgh_fleet::ValidationEpochSegment {
+                    epoch: ValidationEpoch::Nakamoto,
+                    global_range: InclusiveRange { start: 10, end: 19 },
+                    local_range: InclusiveRange { start: 0, end: 9 },
+                }],
+                shard_count: 2,
+                max_concurrency: 2,
             }),
         };
         assert!(validate_terminal_for_assignment(&payload, &outcome).is_ok());
@@ -1410,7 +1414,7 @@ mod tests {
             block_validation: Some(result), ..
         } = &mut missing_coverage
         {
-            result.observed_range.end = 18;
+            result.resolved_range.end = 18;
         }
         assert!(validate_terminal_for_assignment(&payload, &missing_coverage).is_err());
         assert!(validate_terminal_for_assignment(&TaskPayload::BuildOnly, &outcome).is_err());

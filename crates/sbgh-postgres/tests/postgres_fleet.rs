@@ -1571,10 +1571,9 @@ async fn capability_routes_only_to_a_compatible_worker() {
 
     let job_id = Uuid::new_v4();
     let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-        epoch: ValidationEpoch::Nakamoto,
-        range: InclusiveRange { start: 100, end: 199 },
-        requested_shards: 8,
-        max_concurrency: 4,
+        selection: sbgh_fleet::BlockValidationSelection::Range {
+            range: InclusiveRange { start: 100, end: 199 },
+        },
         timeout_secs: 60,
     });
     store
@@ -1596,10 +1595,9 @@ async fn capability_routes_only_to_a_compatible_worker() {
                 workload_key: None,
             },
             &serde_json::to_value(QueuedEventDetail::BlockValidation {
-                range_start: 100,
-                range_end: 199,
-                requested_shards: 8,
-                max_concurrency: 4,
+                selection: sbgh_fleet::BlockValidationSelection::Range {
+                    range: InclusiveRange { start: 100, end: 199 },
+                },
             })
             .unwrap(),
             &PreparedExecution {
@@ -1639,7 +1637,18 @@ async fn capability_routes_only_to_a_compatible_worker() {
         checked_blocks: 100,
         invalid_blocks: Vec::new(),
         chainstate_origin: "vg0/mainnet-2026-07-28".into(),
-        observed_range: InclusiveRange { start: 0, end: 1_000 },
+        observed: sbgh_fleet::ObservedValidationIndex {
+            pre_nakamoto_count: 100,
+            nakamoto_count: 901,
+        },
+        resolved_range: InclusiveRange { start: 100, end: 199 },
+        segments: vec![sbgh_fleet::ValidationEpochSegment {
+            epoch: ValidationEpoch::Nakamoto,
+            global_range: InclusiveRange { start: 100, end: 199 },
+            local_range: InclusiveRange { start: 0, end: 99 },
+        }],
+        shard_count: 4,
+        max_concurrency: 4,
     };
     let terminal = TerminalOutcome::Completed {
         summary: serde_json::json!({"chainstate_origin": block_result.chainstate_origin}),
@@ -1686,8 +1695,9 @@ async fn capability_routes_only_to_a_compatible_worker() {
             .unwrap(),
         TerminalAcceptance::Accepted
     );
-    let persisted: (String, i64, i64) = sqlx::query_as(
-        "SELECT chainstate_origin, observed_start, observed_end
+    let persisted: (String, i64, i64, i64, i32, i32) = sqlx::query_as(
+        "SELECT chainstate_origin, pre_nakamoto_count, nakamoto_count,
+                resolved_start, shard_count, max_concurrency
            FROM block_validation_result
           WHERE job_id = $1",
     )
@@ -1695,7 +1705,7 @@ async fn capability_routes_only_to_a_compatible_worker() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(persisted, ("vg0/mainnet-2026-07-28".into(), 0, 1_000));
+    assert_eq!(persisted, ("vg0/mainnet-2026-07-28".into(), 100, 901, 100, 4, 4));
 }
 
 #[tokio::test]

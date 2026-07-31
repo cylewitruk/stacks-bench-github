@@ -53,13 +53,16 @@ block_validation_user_ids = ["U0123ABCD"]
 
 The default repository must already be known to the daemon. Startup fails
 closed if required IDs, repository state, or tokens are missing.
-Block-validation defaults and execution limits come from
+Block-validation selector limits and timeout come from
 `[tasks.block_validation]`; Slack input cannot choose workers, shards,
-concurrency, or timeouts. A non-empty effective validation allowlist requires
+concurrency, or timeouts. Users may naturally request recent coverage (with an
+optional count), full coverage, or an explicit range when the corresponding
+daemon policy permits it. A non-empty effective validation allowlist requires
 that complete task policy at startup. Set `block_validation_user_ids = []` for
 a benchmark-only Slack surface.
 
-Natural-language resolution is optional:
+Slack task creation is natural-language only, so enabling Slack also requires
+the intent resolver:
 
 ```toml
 [llm]
@@ -71,9 +74,10 @@ timeout_secs = 15
 per_user_rate_limit_per_minute = 5
 ```
 
-Set `SBGH_OPENAI_API_KEY` in the daemon environment. Explicit flag-shaped
-requests continue to use the deterministic parser; all model output is
-schema-validated and revalidated before submission.
+Set `SBGH_OPENAI_API_KEY` in the daemon environment. Conversational task
+creation requires the intent provider; CLI-style flags are rejected. All model
+output is schema-validated and revalidated against daemon policy before
+submission.
 
 ## Verify
 
@@ -83,8 +87,8 @@ schema-validated and revalidated before submission.
 4. From an allowed user, mention the bot:
 
    ```text
-   @BenchBot bench --block <height>
-   @BenchBot validate --rev <branch-or-commit>
+   @BenchBot benchmark block <height> on <branch-or-commit>
+   @BenchBot validate the latest 500k blocks on <branch-or-commit>
    @BenchBot run block validation on commit <branch-or-commit>
    ```
 

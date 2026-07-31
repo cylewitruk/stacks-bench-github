@@ -15,4 +15,6 @@ pub struct ApiState {
     /// GitHub API base for the admin endpoints' server-side
     /// login/owner-name → id resolution.
     pub gh_api_base: String,
+    pub block_validation:
+        Option<Arc<crate::block_validation_submission::BlockValidationSubmissionService>>,
 }

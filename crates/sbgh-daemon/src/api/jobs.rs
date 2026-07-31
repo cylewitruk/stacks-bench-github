@@ -3,24 +3,24 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use sbgh_api::{
-    BenchmarkReportDetail, BlockValidationReportDetail, BuildOnlyReportDetail,
-    EnqueueBlockValidationRequest, EnqueueJobResponse, InvalidBlockDetail, JobView,
+    BenchmarkReportDetail, BlockValidationReportDetail, BlockValidationSelectionDetail,
+    BlockValidationSelectionRequest, BuildOnlyReportDetail, EnqueueBlockValidationRequest,
+    EnqueueJobResponse, InvalidBlockDetail, JobView, ObservedValidationIndexDetail,
     ReportArtifactView, ReportIdentityView, ReportLifecycleView, ReportRange, SubmissionReportView,
-    TaskReportView,
+    TaskReportView, ValidationEpochSegmentDetail,
 };
-use sbgh_core::models::{
-    BuildTarget, GitRefKind, Job, JobIntent, JobSource, QueuedEventDetail, TaskKind,
-};
+use sbgh_core::models::{BuildTarget, GitRefKind, Job, JobIntent, JobSource, TaskKind};
 use sbgh_core::submission::{
-    BlockValidationPlan, ProducerKey, ResolvedTaskSource, SchedulingConstraints, SubmissionActor,
-    SubmissionCommand, SubmissionDisposition, SubmissionProvenance, TaskPlan,
+    ProducerKey, ResolvedTaskSource, SchedulingConstraints, SubmissionActor, SubmissionDisposition,
+    SubmissionProvenance,
 };
-use sbgh_fleet::{BlockValidationPayload, InclusiveRange, TaskPayload, Validate, ValidationEpoch};
+use sbgh_intent::ValidationSelection;
 use serde::Deserialize;
 
 use crate::api::conv::enum_str;
 use crate::api::error::ApiErr;
 use crate::api::state::ApiState;
+use crate::block_validation_submission::BlockValidationSubmission;
 
 /// `job_status` enum values — validated before binding so a bad value is a
 /// clean 400, not a Postgres cast error.
@@ -118,18 +118,53 @@ fn report_view(report: sbgh_core::reporting::SubmissionReportView) -> Submission
         }),
         TaskReport::BlockValidation(detail) => {
             TaskReportView::BlockValidation(BlockValidationReportDetail {
-                requested_range: detail
-                    .requested_range
+                requested: detail
+                    .requested
+                    .map(|selection| match selection {
+                        sbgh_core::reporting::BlockValidationSelectionReport::Recent {
+                            block_count,
+                        } => BlockValidationSelectionDetail::Recent { block_count },
+                        sbgh_core::reporting::BlockValidationSelectionReport::Full => {
+                            BlockValidationSelectionDetail::Full
+                        }
+                        sbgh_core::reporting::BlockValidationSelectionReport::Range { range } => {
+                            BlockValidationSelectionDetail::Range {
+                                range: ReportRange {
+                                    start: range.start,
+                                    end: range.end,
+                                },
+                            }
+                        }
+                    }),
+                observed: detail
+                    .observed
+                    .map(|observed| ObservedValidationIndexDetail {
+                        pre_nakamoto_count: observed.pre_nakamoto_count,
+                        nakamoto_count: observed.nakamoto_count,
+                    }),
+                resolved_range: detail
+                    .resolved_range
                     .map(|range| ReportRange {
                         start: range.start,
                         end: range.end,
                     }),
-                observed_range: detail
-                    .observed_range
-                    .map(|range| ReportRange {
-                        start: range.start,
-                        end: range.end,
-                    }),
+                segments: detail
+                    .segments
+                    .into_iter()
+                    .map(|segment| ValidationEpochSegmentDetail {
+                        epoch: enum_str(&segment.epoch),
+                        global_range: ReportRange {
+                            start: segment.global_range.start,
+                            end: segment.global_range.end,
+                        },
+                        local_range: ReportRange {
+                            start: segment.local_range.start,
+                            end: segment.local_range.end,
+                        },
+                    })
+                    .collect(),
+                shard_count: detail.shard_count,
+                max_concurrency: detail.max_concurrency,
                 verdict: detail
                     .verdict
                     .map(|verdict| match verdict {
@@ -182,11 +217,10 @@ pub async fn enqueue_block_validation(
     State(state): State<ApiState>,
     Json(request): Json<EnqueueBlockValidationRequest>,
 ) -> Result<Json<EnqueueJobResponse>, ApiErr> {
-    let epoch = match request.epoch.as_str() {
-        "pre_nakamoto" => ValidationEpoch::PreNakamoto,
-        "nakamoto" => ValidationEpoch::Nakamoto,
-        other => return Err(ApiErr::bad_request(format!("unknown validation epoch {other:?}"))),
-    };
+    let service = state
+        .block_validation
+        .as_ref()
+        .ok_or_else(|| ApiErr::bad_request("block validation is not configured"))?;
     if !matches!(request.commit.len(), 40 | 64)
         || !request
             .commit
@@ -203,33 +237,21 @@ pub async fn enqueue_block_validation(
         .map(str::parse::<uuid::Uuid>)
         .transpose()
         .map_err(|_| ApiErr::bad_request("worker_id must be a UUID"))?;
-    let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-        epoch,
-        range: InclusiveRange {
-            start: request.range_start,
-            end: request.range_end,
-        },
-        requested_shards: request.requested_shards,
-        max_concurrency: request.max_concurrency,
-        timeout_secs: request.timeout_secs,
-    });
-    payload
-        .validate()
-        .map_err(|error| ApiErr::bad_request(error.to_string()))?;
-    let detail = serde_json::to_value(QueuedEventDetail::BlockValidation {
-        range_start: request.range_start,
-        range_end: request.range_end,
-        requested_shards: request.requested_shards,
-        max_concurrency: request.max_concurrency,
-    })
-    .map_err(|error| {
-        tracing::error!(%error, "serializing block-validation provenance failed");
-        ApiErr::new(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "could not enqueue block validation",
-        )
-    })?;
+    let requested_selection = match request.selection {
+        BlockValidationSelectionRequest::Recent { block_count } => {
+            ValidationSelection::Recent { block_count }
+        }
+        BlockValidationSelectionRequest::Full => ValidationSelection::Full,
+        BlockValidationSelectionRequest::Range { start, end } => {
+            ValidationSelection::Range { start, end }
+        }
+    };
+    let selection = service
+        .resolve_user_selection(&requested_selection)
+        .map_err(ApiErr::from)?;
+    let detail = service
+        .queued_detail(&selection)
+        .map_err(ApiErr::from)?;
     let source = ResolvedTaskSource {
         github_installation_id: request.install_id,
         github_repo_id: request.repo_id,
@@ -243,31 +265,26 @@ pub async fn enqueue_block_validation(
         committed_at: None,
         workload_key: None,
     };
-    let TaskPayload::BlockValidation(validation) = payload else {
-        unreachable!("constructed as block validation")
-    };
-    let store = sbgh_postgres::PostgresJobStore::new(state.pool);
-    let receipt = crate::submission::submit(
-        &store,
-        SubmissionCommand {
+    let receipt = service
+        .submit(BlockValidationSubmission {
+            source,
+            selection,
+            constraints: SchedulingConstraints {
+                required_worker_id,
+                required_measurement_profile: None,
+            },
             actor: SubmissionActor::System,
             producer_key: ProducerKey {
                 namespace: "admin_block_validation".into(),
                 key: request.idempotency_key,
             },
-            constraints: SchedulingConstraints {
-                required_worker_id,
-                required_measurement_profile: None,
-            },
-            task: TaskPlan::BlockValidation(BlockValidationPlan { source, payload: validation }),
             provenance: SubmissionProvenance {
                 queued_event_detail: detail,
                 github: None,
                 slack: None,
             },
-        },
-    )
-    .await?;
+        })
+        .await?;
     Ok(Json(EnqueueJobResponse {
         submission_id: receipt
             .submission_id

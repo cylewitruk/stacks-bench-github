@@ -12,7 +12,7 @@ pub use digest::payload_digest;
 pub use model::*;
 pub use validate::{
     MAX_VALIDATION_CONCURRENCY, MAX_VALIDATION_SHARDS, MAX_VALIDATION_TIMEOUT_SECS, ProtocolError,
-    Validate,
+    Validate, validate_block_validation_result,
 };
 
 /// Exact revision of the first deployed protobuf fleet protocol.

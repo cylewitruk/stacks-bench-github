@@ -39,6 +39,7 @@ min_metadata_free_percent = 5.0
 vcpus = 48
 memory_bytes = 206158430208
 cpu_set = "0-47"
+target_blocks_per_shard = 25000
 max_shards = 48
 max_concurrency = 48
 max_parallel_jobs = 1

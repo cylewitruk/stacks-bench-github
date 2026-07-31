@@ -16,8 +16,19 @@ for path in [
     ROOT / "config.example.daemon.toml",
     *sorted((ROOT / "docs").glob("*.md")),
 ]:
-    if "[github.block_validation]" in path.read_text():
-        errors.append(f"{path.relative_to(ROOT)}: validation policy remains GitHub-owned")
+    text = path.read_text()
+    for marker in (
+        "[github.block_validation]",
+        "default_epoch",
+        "default_range_start",
+        "default_range_end",
+        "requested_shards",
+        "/validate-blocks",
+    ):
+        if marker in text:
+            errors.append(
+                f"{path.relative_to(ROOT)}: retired validation intake marker {marker!r}"
+            )
 
 intent = (ROOT / "crates/sbgh-intent/src/intent.rs").read_text()
 for marker in ("enum UserIntent", "enum TaskCreationIntent", "BlockValidation(BlockValidationIntent)"):
@@ -31,6 +42,15 @@ slack = (ROOT / "crates/sbgh-slack/src/connector.rs").read_text()
 for marker in ("trait TaskSubmissionPort", "TaskSubmissionRequest::BlockValidation"):
     if marker not in slack:
         errors.append(f"Slack intake is missing task-aware marker {marker!r}")
+
+workload = (ROOT / "crates/sbgh-core/src/workload.rs").read_text()
+for marker in ("resolve_benchmark_request", "ParsedWorkloadFlags"):
+    if marker in slack or marker in workload:
+        errors.append(f"conversational intake restored the retired flag parser {marker!r}")
+
+webhook = (ROOT / "crates/sbgh-daemon/src/webhook_processor.rs").read_text()
+if "/validate-blocks" in webhook:
+    errors.append("GitHub intake restored the retired argument-style validation command")
 
 if errors:
     raise SystemExit("\n".join(errors))

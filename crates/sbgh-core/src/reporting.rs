@@ -67,8 +67,12 @@ pub struct BuildOnlyReportView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockValidationReportView {
-    pub requested_range: Option<InclusiveReportRange>,
-    pub observed_range: Option<InclusiveReportRange>,
+    pub requested: Option<BlockValidationSelectionReport>,
+    pub observed: Option<ObservedValidationIndexReport>,
+    pub resolved_range: Option<InclusiveReportRange>,
+    pub segments: Vec<ValidationEpochSegmentReport>,
+    pub shard_count: Option<u32>,
+    pub max_concurrency: Option<u32>,
     pub verdict: Option<BlockValidationVerdict>,
     pub checked_blocks: Option<u64>,
     pub chainstate_origin: Option<String>,
@@ -76,46 +80,124 @@ pub struct BlockValidationReportView {
 }
 
 impl BlockValidationReportView {
+    pub fn from_request(request: Option<&sbgh_fleet::BlockValidationPayload>) -> Self {
+        Self {
+            requested: request.map(|request| match &request.selection {
+                sbgh_fleet::BlockValidationSelection::Recent { block_count } => {
+                    BlockValidationSelectionReport::Recent { block_count: *block_count }
+                }
+                sbgh_fleet::BlockValidationSelection::Full => BlockValidationSelectionReport::Full,
+                sbgh_fleet::BlockValidationSelection::Range { range } => {
+                    BlockValidationSelectionReport::Range {
+                        range: InclusiveReportRange {
+                            start: range.start,
+                            end: range.end,
+                        },
+                    }
+                }
+            }),
+            observed: None,
+            resolved_range: None,
+            segments: Vec::new(),
+            shard_count: None,
+            max_concurrency: None,
+            verdict: None,
+            checked_blocks: None,
+            chainstate_origin: None,
+            invalid_blocks: Vec::new(),
+        }
+    }
+
     pub fn from_result(
         request: Option<&sbgh_fleet::BlockValidationPayload>,
         result: &sbgh_fleet::BlockValidationResult,
     ) -> Self {
-        Self {
-            requested_range: request.map(|request| InclusiveReportRange {
-                start: request.range.start,
-                end: request.range.end,
-            }),
-            observed_range: Some(InclusiveReportRange {
-                start: result.observed_range.start,
-                end: result.observed_range.end,
-            }),
-            verdict: Some(if result.valid {
-                BlockValidationVerdict::Valid
-            } else {
-                BlockValidationVerdict::Invalid
-            }),
-            checked_blocks: Some(result.checked_blocks),
-            chainstate_origin: Some(
-                result
-                    .chainstate_origin
-                    .clone(),
-            ),
-            invalid_blocks: result
-                .invalid_blocks
-                .iter()
-                .map(|invalid| InvalidBlockReport {
-                    shard: invalid.shard,
-                    block: invalid.block.clone(),
-                    reason: invalid.reason.clone(),
-                })
-                .collect(),
-        }
+        let mut view = Self::from_request(request);
+        view.observed = Some(ObservedValidationIndexReport {
+            pre_nakamoto_count: result
+                .observed
+                .pre_nakamoto_count,
+            nakamoto_count: result.observed.nakamoto_count,
+        });
+        view.resolved_range = Some(InclusiveReportRange {
+            start: result.resolved_range.start,
+            end: result.resolved_range.end,
+        });
+        view.segments = result
+            .segments
+            .iter()
+            .map(|segment| ValidationEpochSegmentReport {
+                epoch: match segment.epoch {
+                    sbgh_fleet::ValidationEpoch::PreNakamoto => ValidationEpochReport::PreNakamoto,
+                    sbgh_fleet::ValidationEpoch::Nakamoto => ValidationEpochReport::Nakamoto,
+                },
+                global_range: InclusiveReportRange {
+                    start: segment.global_range.start,
+                    end: segment.global_range.end,
+                },
+                local_range: InclusiveReportRange {
+                    start: segment.local_range.start,
+                    end: segment.local_range.end,
+                },
+            })
+            .collect();
+        view.shard_count = Some(result.shard_count);
+        view.max_concurrency = Some(result.max_concurrency);
+        view.verdict = Some(if result.valid {
+            BlockValidationVerdict::Valid
+        } else {
+            BlockValidationVerdict::Invalid
+        });
+        view.checked_blocks = Some(result.checked_blocks);
+        view.chainstate_origin = Some(
+            result
+                .chainstate_origin
+                .clone(),
+        );
+        view.invalid_blocks = result
+            .invalid_blocks
+            .iter()
+            .map(|invalid| InvalidBlockReport {
+                shard: invalid.shard,
+                block: invalid.block.clone(),
+                reason: invalid.reason.clone(),
+            })
+            .collect();
+        view
     }
 
     pub fn is_valid(&self) -> Option<bool> {
         self.verdict
             .map(|verdict| verdict == BlockValidationVerdict::Valid)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockValidationSelectionReport {
+    Recent { block_count: u64 },
+    Full,
+    Range { range: InclusiveReportRange },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedValidationIndexReport {
+    pub pre_nakamoto_count: u64,
+    pub nakamoto_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationEpochReport {
+    PreNakamoto,
+    Nakamoto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationEpochSegmentReport {
+    pub epoch: ValidationEpochReport,
+    pub global_range: InclusiveReportRange,
+    pub local_range: InclusiveReportRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

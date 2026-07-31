@@ -203,6 +203,7 @@ mod tests {
             pool: pool.clone(),
             ingest: Arc::new(sbgh_postgres::PostgresIngestStore::new(pool)),
             gh_api_base: "https://api.github.com".into(),
+            block_validation: None,
         }
     }
 

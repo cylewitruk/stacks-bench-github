@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use sbgh_driver::{
     ArtifactSink, BinaryCacheStore, BlockValidationTaskSpec, CachedBinary, DriverStatus,
-    DriverTaskOutput, InclusiveRange, ValidationEpoch,
+    DriverTaskOutput, InclusiveRange,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -591,6 +591,7 @@ fn enable_block_profile(config: &mut LibvirtConfig) {
         vcpus: 4,
         memory_bytes: 8 * 1024 * 1024 * 1024,
         cpu_set: Some("0-3".into()),
+        target_blocks_per_shard: 2,
         max_shards: 4,
         max_concurrency: 4,
         max_parallel_jobs: 1,
@@ -799,9 +800,16 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
             "attempt_id": job.id,
             "fencing_generation": 0,
             "chainstate_origin": "sbgh-vg/mainnet-origin",
-            "epoch": "pre_nakamoto",
-            "requested_range": {"start": 10, "end": 12},
-            "observed_range": {"start": 0, "end": 100},
+            "selection": {"kind": "range", "range": {"start": 10, "end": 12}},
+            "observed": {"pre_nakamoto_count": 101, "nakamoto_count": 1},
+            "resolved_range": {"start": 10, "end": 12},
+            "segments": [{
+                "epoch": "pre_nakamoto",
+                "global_range": {"start": 10, "end": 12},
+                "local_range": {"start": 10, "end": 12}
+            }],
+            "shard_count": 2,
+            "max_concurrency": 2,
             "shards": [
                 {
                     "index": 0,
@@ -855,10 +863,9 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     let driver = test_driver_with_cache(&config, shell.clone(), Some(cache));
     let listener = RecordingListener::default();
     let spec = BlockValidationTaskSpec {
-        epoch: ValidationEpoch::PreNakamoto,
-        range: InclusiveRange { start: 10, end: 12 },
-        requested_shards: 2,
-        max_concurrency: 2,
+        selection: sbgh_driver::BlockValidationSelection::Range {
+            range: InclusiveRange { start: 10, end: 12 },
+        },
         timeout_secs: 30,
     };
 
@@ -879,7 +886,14 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
             .is_empty()
     );
     assert_eq!(output.chainstate_origin, "sbgh-vg/mainnet-origin");
-    assert_eq!(output.observed_range, InclusiveRange { start: 0, end: 100 });
+    assert_eq!(
+        output.observed,
+        sbgh_driver::ObservedValidationIndex {
+            pre_nakamoto_count: 101,
+            nakamoto_count: 1,
+        }
+    );
+    assert_eq!(output.resolved_range, InclusiveRange { start: 10, end: 12 });
     assert_eq!(outcome.summary["chainstate_origin"], "sbgh-vg/mainnet-origin");
     assert_eq!(
         *listener

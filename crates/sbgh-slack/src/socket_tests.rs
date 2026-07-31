@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use sbgh_core::workload::{BenchmarkRequest, BlockSelector, WorkloadSpec, WorkloadTarget};
+use sbgh_intent::{
+    IntentOutcome, IntentProviderError, IntentResolver, TaskCreationIntent, UserIntent,
+};
 use slack_morphism::errors::{SlackClientEndOfStreamError, SlackClientSocketModeProtocolError};
 
 use super::*;
@@ -12,7 +17,7 @@ const APP_MENTION_JSON: &str = r#"{
         "type": "app_mention",
         "user": "U_OK",
         "channel": "C1",
-        "text": "<@U07BOT> bench --block 184231",
+        "text": "<@U07BOT> benchmark block 184231",
         "ts": "1700000000.000100"
     },
     "event_id": "Ev123",
@@ -25,6 +30,25 @@ fn parse_callback() -> SlackPushEventCallback {
 
 fn config() -> SlackConnectorConfig {
     SlackConnectorConfig::new("develop", vec!["T_OK".into()], vec!["U_OK".into()], None)
+}
+
+struct FixedResolver;
+
+#[async_trait]
+impl IntentResolver for FixedResolver {
+    async fn resolve(
+        &self,
+        _text: &str,
+    ) -> std::result::Result<IntentOutcome, IntentProviderError> {
+        Ok(IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Single(WorkloadSpec {
+                target: WorkloadTarget::Blocks(vec![BlockSelector::Height(184_231)]),
+                clean_repetitions: 1,
+                warmup: None,
+                rev: None,
+            }),
+        ))))
+    }
 }
 
 #[test]
@@ -40,7 +64,10 @@ fn maps_app_mention_to_provider_neutral_event() {
 async fn dispatched_mention_enqueues_off_the_ack_path() {
     let queue = Arc::new(RecordingTaskSubmissionPort::default());
     let client = Arc::new(FakeSlackClient::default());
-    let connector = Arc::new(SlackConnector::new(config(), queue.clone(), client));
+    let connector = Arc::new(
+        SlackConnector::new(config(), queue.clone(), client)
+            .with_intent_resolver(Arc::new(FixedResolver), 5),
+    );
     spawn_dispatch(Some(connector), mention_from_callback(&parse_callback()).unwrap());
     for _ in 0..1000 {
         if !queue.jobs().is_empty() {

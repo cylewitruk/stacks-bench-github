@@ -155,6 +155,7 @@ Roles are:
 
 - `admin`;
 - `trigger_pr_benchmark`;
+- `trigger_block_validation`;
 - `view_results`.
 
 A grant may apply to an installation or one repository within it.
@@ -192,10 +193,21 @@ exhaustive tagged task detail:
   "task": {
     "kind": "block_validation",
     "detail": {
-      "requested_range": { "start": 100, "end": 200 },
-      "observed_range": { "start": 100, "end": 200 },
+      "requested": { "kind": "recent", "block_count": 1000000 },
+      "observed": {
+        "pre_nakamoto_count": 185630,
+        "nakamoto_count": 1200000
+      },
+      "resolved_range": { "start": 385630, "end": 1385629 },
+      "segments": [{
+        "epoch": "nakamoto",
+        "global_range": { "start": 385630, "end": 1385629 },
+        "local_range": { "start": 200000, "end": 1199999 }
+      }],
+      "shard_count": 40,
+      "max_concurrency": 24,
       "verdict": "valid",
-      "checked_blocks": 101,
+      "checked_blocks": 1000000,
       "chainstate_origin": "mainnet-2026-07-29",
       "invalid_blocks": []
     }
@@ -216,12 +228,10 @@ Block-validation submission requires:
   "repo_id": 2,
   "commit": "40-or-64-character-hex-object-id",
   "worker_id": null,
-  "epoch": "nakamoto",
-  "range_start": 100,
-  "range_end": 200,
-  "requested_shards": 16,
-  "max_concurrency": 8,
-  "timeout_secs": 21600
+  "selection": {
+    "kind": "recent",
+    "block_count": 500000
+  }
 }
 ```
 
@@ -230,6 +240,11 @@ connected worker. A successful response identifies the canonical
 `submission_id`, disposition (`created` or `already_submitted`), and initial
 job IDs. Reusing the same idempotency key for different executable demand
 returns a conflict.
+
+`selection` is one of `recent` (optional `block_count`, resolved against the
+worker's chainstate), `full`, or `range` (`start` and `end` in the global
+validation-index coordinate space). The daemon enforces selector policy; the
+selected worker determines shard count and concurrency from its local profile.
 
 ### Fleet operation
 

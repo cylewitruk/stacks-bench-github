@@ -116,12 +116,10 @@ pub struct TasksConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockValidationTaskConfig {
-    pub default_epoch: sbgh_fleet::ValidationEpoch,
-    pub default_range_start: u64,
-    pub default_range_end: u64,
-    pub requested_shards: u32,
-    pub max_concurrency: u32,
+    pub default_recent_blocks: u64,
+    pub max_recent_blocks: u64,
     pub timeout_secs: u64,
+    pub allow_full_validation: bool,
     pub allow_range_override: bool,
 }
 
@@ -332,9 +330,8 @@ pub struct StacksBenchConfig {
     pub default_args: String,
 }
 
-/// LLM-backed intent extraction. Disabled by default; when enabled, Slack input
-/// can be resolved through a structured OpenAI response. The API key is
-/// environment-only.
+/// LLM-backed intent extraction. Disabled by default and required whenever
+/// Slack task creation is enabled. The API key is environment-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub enabled: bool,
@@ -475,7 +472,8 @@ pub struct S3Config {
 /// orchestrator opens a Socket Mode connection and serves benchmark and
 /// block-validation mentions. The code under test is a **constant**
 /// (`default_repository`/`default_rev`); the workload is the variable (the
-/// mention's args). Tokens are **env-only**; identities are allowlisted.
+/// resolved conversational request). Tokens are **env-only**; identities are
+/// allowlisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlackConfig {
     /// Gate the connector — `false` (default) means it never starts, so the
@@ -677,12 +675,10 @@ struct RawTasks {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawBlockValidationTask {
-    default_epoch: Option<sbgh_fleet::ValidationEpoch>,
-    default_range_start: Option<u64>,
-    default_range_end: Option<u64>,
-    requested_shards: Option<u32>,
-    max_concurrency: Option<u32>,
+    default_recent_blocks: Option<u64>,
+    max_recent_blocks: Option<u64>,
     timeout_secs: Option<u64>,
+    allow_full_validation: Option<bool>,
     allow_range_override: Option<bool>,
 }
 
@@ -764,51 +760,21 @@ impl RawDaemon {
             &mut self
                 .tasks
                 .block_validation
-                .default_epoch,
+                .default_recent_blocks,
             other
                 .tasks
                 .block_validation
-                .default_epoch,
+                .default_recent_blocks,
         );
         merge_opt(
             &mut self
                 .tasks
                 .block_validation
-                .default_range_start,
+                .max_recent_blocks,
             other
                 .tasks
                 .block_validation
-                .default_range_start,
-        );
-        merge_opt(
-            &mut self
-                .tasks
-                .block_validation
-                .default_range_end,
-            other
-                .tasks
-                .block_validation
-                .default_range_end,
-        );
-        merge_opt(
-            &mut self
-                .tasks
-                .block_validation
-                .requested_shards,
-            other
-                .tasks
-                .block_validation
-                .requested_shards,
-        );
-        merge_opt(
-            &mut self
-                .tasks
-                .block_validation
-                .max_concurrency,
-            other
-                .tasks
-                .block_validation
-                .max_concurrency,
+                .max_recent_blocks,
         );
         merge_opt(
             &mut self
@@ -819,6 +785,16 @@ impl RawDaemon {
                 .tasks
                 .block_validation
                 .timeout_secs,
+        );
+        merge_opt(
+            &mut self
+                .tasks
+                .block_validation
+                .allow_full_validation,
+            other
+                .tasks
+                .block_validation
+                .allow_full_validation,
         );
         merge_opt(
             &mut self
@@ -1245,54 +1221,41 @@ impl RawDaemon {
         let block_validation = match (
             self.tasks
                 .block_validation
-                .default_epoch,
+                .default_recent_blocks,
             self.tasks
                 .block_validation
-                .default_range_start,
-            self.tasks
-                .block_validation
-                .default_range_end,
-            self.tasks
-                .block_validation
-                .requested_shards,
-            self.tasks
-                .block_validation
-                .max_concurrency,
+                .max_recent_blocks,
             self.tasks
                 .block_validation
                 .timeout_secs,
             self.tasks
                 .block_validation
+                .allow_full_validation,
+            self.tasks
+                .block_validation
                 .allow_range_override,
         ) {
-            (None, None, None, None, None, None, None) => None,
+            (None, None, None, None, None) => None,
             (
-                default_epoch,
-                default_range_start,
-                default_range_end,
-                requested_shards,
-                max_concurrency,
+                default_recent_blocks,
+                max_recent_blocks,
                 timeout_secs,
+                allow_full_validation,
                 allow_range_override,
             ) => Some(BlockValidationTaskConfig {
-                default_epoch: required(default_epoch, "[tasks.block_validation].default_epoch")?,
-                default_range_start: required(
-                    default_range_start,
-                    "[tasks.block_validation].default_range_start",
+                default_recent_blocks: required(
+                    default_recent_blocks,
+                    "[tasks.block_validation].default_recent_blocks",
                 )?,
-                default_range_end: required(
-                    default_range_end,
-                    "[tasks.block_validation].default_range_end",
-                )?,
-                requested_shards: required(
-                    requested_shards,
-                    "[tasks.block_validation].requested_shards",
-                )?,
-                max_concurrency: required(
-                    max_concurrency,
-                    "[tasks.block_validation].max_concurrency",
+                max_recent_blocks: required(
+                    max_recent_blocks,
+                    "[tasks.block_validation].max_recent_blocks",
                 )?,
                 timeout_secs: required(timeout_secs, "[tasks.block_validation].timeout_secs")?,
+                allow_full_validation: required(
+                    allow_full_validation,
+                    "[tasks.block_validation].allow_full_validation",
+                )?,
                 allow_range_override: required(
                     allow_range_override,
                     "[tasks.block_validation].allow_range_override",
@@ -1365,7 +1328,7 @@ impl RawDaemon {
         validate_fleet_config(&fleet)?;
         validate_block_validation_config(block_validation.as_ref())?;
         let block_validation_configured = block_validation.is_some();
-        Ok(DaemonConfig {
+        let config = DaemonConfig {
             server: DaemonServerConfig {
                 database_url: required(self.server.database_url, "DATABASE_URL")?,
                 service_user: self
@@ -1706,7 +1669,15 @@ impl RawDaemon {
                     openai_api_key,
                 }
             },
-        })
+        };
+        if config.slack.enabled && !config.llm.enabled {
+            return Err(Error::Config(
+                "[slack].enabled = true requires [llm].enabled = true; Slack task creation is \
+                 natural-language only"
+                    .into(),
+            ));
+        }
+        Ok(config)
     }
 }
 
@@ -1752,12 +1723,10 @@ fn validate_block_validation_config(
     block_validation: Option<&BlockValidationTaskConfig>,
 ) -> Result<()> {
     if let Some(trigger) = block_validation
-        && (trigger.default_range_start > trigger.default_range_end
-            || trigger.requested_shards == 0
-            || trigger.requested_shards > sbgh_fleet::MAX_VALIDATION_SHARDS
-            || trigger.max_concurrency == 0
-            || trigger.max_concurrency > sbgh_fleet::MAX_VALIDATION_CONCURRENCY
-            || trigger.max_concurrency > trigger.requested_shards
+        && (trigger.default_recent_blocks == 0
+            || trigger.max_recent_blocks == 0
+            || trigger.default_recent_blocks > trigger.max_recent_blocks
+            || trigger.max_recent_blocks > i64::MAX as u64
             || trigger.timeout_secs == 0
             || trigger.timeout_secs > sbgh_fleet::MAX_VALIDATION_TIMEOUT_SECS)
     {
@@ -2212,14 +2181,15 @@ mod tests {
         let mut env = daemon_env();
         env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
         env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        env.push(("SBGH_OPENAI_API_KEY", "sk-test"));
         let _g = EnvGuard::set(&env);
         let f = write(
             "[slack]\nenabled = true\ndefault_repository = \
              \"stacks-network/stacks-core\"\ndefault_rev = \"develop\"\nallowed_team_ids = \
              [\"T1\"]\nallowed_user_ids = [\"U1\", \"U2\"]\n\n[tasks.block_validation]\n\
-             default_epoch = \"nakamoto\"\ndefault_range_start = 100\ndefault_range_end = \
-             200\nrequested_shards = 8\nmax_concurrency = 4\ntimeout_secs = \
-             300\nallow_range_override = true\n",
+             default_recent_blocks = 1000000\nmax_recent_blocks = 1000000\ntimeout_secs = \
+             300\nallow_full_validation = true\nallow_range_override = \
+             true\n\n[llm]\nenabled = true\n",
         );
         let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         assert!(cfg.slack.enabled);
@@ -2255,6 +2225,7 @@ mod tests {
         let mut env = daemon_env();
         env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
         env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        env.push(("SBGH_OPENAI_API_KEY", "sk-test"));
         let _g = EnvGuard::set(&env);
         let f = write(
             "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
@@ -2269,11 +2240,12 @@ mod tests {
         let mut env = daemon_env();
         env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
         env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        env.push(("SBGH_OPENAI_API_KEY", "sk-test"));
         let _g = EnvGuard::set(&env);
         let f = write(
             "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
              \"develop\"\nallowed_team_ids = [\"T1\"]\nallowed_user_ids = \
-             [\"U_BENCH\"]\nblock_validation_user_ids = []\n",
+             [\"U_BENCH\"]\nblock_validation_user_ids = []\n\n[llm]\nenabled = true\n",
         );
         let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         assert_eq!(cfg.slack.allowed_user_ids, vec!["U_BENCH"]);
@@ -2285,10 +2257,30 @@ mod tests {
     }
 
     #[test]
+    fn daemon_slack_requires_natural_language_resolver() {
+        let mut env = daemon_env();
+        env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
+        env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        let _g = EnvGuard::set(&env);
+        let f = write(
+            "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
+             \"develop\"\nallowed_team_ids = [\"T1\"]\nallowed_user_ids = \
+             [\"U1\"]\nblock_validation_user_ids = []\n",
+        );
+        let error = DaemonConfig::load_layered(Some(f.path())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("[llm].enabled = true")
+        );
+    }
+
+    #[test]
     fn daemon_slack_validation_entitlement_requires_task_policy() {
         let mut env = daemon_env();
         env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
         env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        env.push(("SBGH_OPENAI_API_KEY", "sk-test"));
         let _g = EnvGuard::set(&env);
         let f = write(
             "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
@@ -2306,21 +2298,21 @@ mod tests {
     fn task_owned_block_validation_policy_is_complete_and_bounded() {
         let _g = EnvGuard::set(&daemon_env());
         let f = write(
-            "[tasks.block_validation]\ndefault_epoch = \"nakamoto\"\ndefault_range_start = \
-             100\ndefault_range_end = 200\nrequested_shards = 8\nmax_concurrency = \
-             4\ntimeout_secs = 300\nallow_range_override = true\n",
+            "[tasks.block_validation]\ndefault_recent_blocks = 1000000\nmax_recent_blocks = \
+             1000000\ntimeout_secs = 300\nallow_full_validation = \
+             true\nallow_range_override = true\n",
         );
         let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         let policy = cfg
             .tasks
             .block_validation
             .unwrap();
-        assert_eq!(policy.default_epoch, sbgh_fleet::ValidationEpoch::Nakamoto);
-        assert_eq!((policy.default_range_start, policy.default_range_end), (100, 200));
+        assert_eq!(policy.default_recent_blocks, 1_000_000);
+        assert_eq!(policy.max_recent_blocks, 1_000_000);
+        assert!(policy.allow_full_validation);
         assert!(policy.allow_range_override);
 
-        let incomplete =
-            write("[tasks.block_validation]\ndefault_epoch = \"nakamoto\"\nrequested_shards = 8\n");
+        let incomplete = write("[tasks.block_validation]\ndefault_recent_blocks = 1000000\n");
         assert!(DaemonConfig::load_layered(Some(incomplete.path())).is_err());
 
         let legacy = write(
@@ -2421,13 +2413,15 @@ mod tests {
         let mut env = daemon_env();
         env.push(("SBGH_SLACK_APP_TOKEN", "xapp-abc"));
         env.push(("SBGH_SLACK_BOT_TOKEN", "xoxb-def"));
+        env.push(("SBGH_OPENAI_API_KEY", "sk-test"));
         let _g = EnvGuard::set(&env);
         let f = write(
             "[slack]\nenabled = true\ndefault_repository = \"o/r\"\ndefault_rev = \
              \"develop\"\nallowed_team_ids = [\"  T1  \"]\nallowed_user_ids = [\"U1\", \"  U2 \
-             \"]\n\n[tasks.block_validation]\ndefault_epoch = \
-             \"nakamoto\"\ndefault_range_start = 100\ndefault_range_end = 200\nrequested_shards \
-             = 8\nmax_concurrency = 4\ntimeout_secs = 300\nallow_range_override = true\n",
+             \"]\n\n[tasks.block_validation]\ndefault_recent_blocks = \
+             1000000\nmax_recent_blocks = 1000000\ntimeout_secs = \
+             300\nallow_full_validation = true\nallow_range_override = \
+             true\n\n[llm]\nenabled = true\n",
         );
         let cfg = DaemonConfig::load_layered(Some(f.path())).unwrap();
         assert_eq!(cfg.slack.allowed_team_ids, vec!["T1"]);

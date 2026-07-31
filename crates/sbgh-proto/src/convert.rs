@@ -145,11 +145,8 @@ fn requirements(
     match required("offer_requirements.kind", value.kind)? {
         wire::offer_requirements::Kind::Benchmark(_) => Ok(domain::OfferRequirements::Benchmark),
         wire::offer_requirements::Kind::BuildOnly(_) => Ok(domain::OfferRequirements::BuildOnly),
-        wire::offer_requirements::Kind::BlockValidation(value) => {
-            Ok(domain::OfferRequirements::BlockValidation {
-                requested_shards: value.requested_shards,
-                max_concurrency: value.max_concurrency,
-            })
+        wire::offer_requirements::Kind::BlockValidation(_) => {
+            Ok(domain::OfferRequirements::BlockValidation)
         }
     }
 }
@@ -162,13 +159,9 @@ fn requirements_wire(value: domain::OfferRequirements) -> wire::OfferRequirement
         domain::OfferRequirements::BuildOnly => {
             wire::offer_requirements::Kind::BuildOnly(wire::Empty {})
         }
-        domain::OfferRequirements::BlockValidation {
-            requested_shards,
-            max_concurrency,
-        } => wire::offer_requirements::Kind::BlockValidation(wire::BlockValidationRequirements {
-            requested_shards,
-            max_concurrency,
-        }),
+        domain::OfferRequirements::BlockValidation => {
+            wire::offer_requirements::Kind::BlockValidation(wire::Empty {})
+        }
     };
     wire::OfferRequirements { kind: Some(kind) }
 }
@@ -224,21 +217,38 @@ fn benchmark_payload_wire(value: domain::BenchmarkPayload) -> wire::BenchmarkPay
 fn validation_payload(
     value: wire::BlockValidationPayload,
 ) -> Result<domain::BlockValidationPayload, domain::ProtocolError> {
+    let selection = required("block_validation.selection", value.selection)?;
+    let selection = match required("block_validation.selection.kind", selection.kind)? {
+        wire::block_validation_selection::Kind::Recent(value) => {
+            domain::BlockValidationSelection::Recent { block_count: value.block_count }
+        }
+        wire::block_validation_selection::Kind::Full(_) => domain::BlockValidationSelection::Full,
+        wire::block_validation_selection::Kind::Range(value) => {
+            domain::BlockValidationSelection::Range { range: range(value) }
+        }
+    };
     Ok(domain::BlockValidationPayload {
-        epoch: epoch(value.epoch)?,
-        range: range(required("block_validation.range", value.range)?),
-        requested_shards: value.requested_shards,
-        max_concurrency: value.max_concurrency,
+        selection,
         timeout_secs: value.timeout_secs,
     })
 }
 
 fn validation_payload_wire(value: domain::BlockValidationPayload) -> wire::BlockValidationPayload {
+    let kind = match value.selection {
+        domain::BlockValidationSelection::Recent { block_count } => {
+            wire::block_validation_selection::Kind::Recent(wire::RecentBlockValidation {
+                block_count,
+            })
+        }
+        domain::BlockValidationSelection::Full => {
+            wire::block_validation_selection::Kind::Full(wire::Empty {})
+        }
+        domain::BlockValidationSelection::Range { range } => {
+            wire::block_validation_selection::Kind::Range(range_wire(range))
+        }
+    };
     wire::BlockValidationPayload {
-        epoch: epoch_wire(value.epoch),
-        range: Some(range_wire(value.range)),
-        requested_shards: value.requested_shards,
-        max_concurrency: value.max_concurrency,
+        selection: Some(wire::BlockValidationSelection { kind: Some(kind) }),
         timeout_secs: value.timeout_secs,
     }
 }
@@ -408,6 +418,7 @@ fn artifact_wire(value: domain::ArtifactDescriptor) -> wire::ArtifactDescriptor 
 fn validation_result(
     value: wire::BlockValidationResult,
 ) -> Result<domain::BlockValidationResult, domain::ProtocolError> {
+    let observed = required("block_validation_result.observed", value.observed)?;
     Ok(domain::BlockValidationResult {
         valid: value.valid,
         checked_blocks: value.checked_blocks,
@@ -421,10 +432,33 @@ fn validation_result(
             })
             .collect(),
         chainstate_origin: value.chainstate_origin,
-        observed_range: range(required(
-            "block_validation_result.observed_range",
-            value.observed_range,
+        observed: domain::ObservedValidationIndex {
+            pre_nakamoto_count: observed.pre_nakamoto_count,
+            nakamoto_count: observed.nakamoto_count,
+        },
+        resolved_range: range(required(
+            "block_validation_result.resolved_range",
+            value.resolved_range,
         )?),
+        segments: value
+            .segments
+            .into_iter()
+            .map(|segment| {
+                Ok(domain::ValidationEpochSegment {
+                    epoch: epoch(segment.epoch)?,
+                    global_range: range(required(
+                        "block_validation_result.segment.global_range",
+                        segment.global_range,
+                    )?),
+                    local_range: range(required(
+                        "block_validation_result.segment.local_range",
+                        segment.local_range,
+                    )?),
+                })
+            })
+            .collect::<Result<Vec<_>, domain::ProtocolError>>()?,
+        shard_count: value.shard_count,
+        max_concurrency: value.max_concurrency,
     })
 }
 
@@ -442,7 +476,24 @@ fn validation_result_wire(value: domain::BlockValidationResult) -> wire::BlockVa
             })
             .collect(),
         chainstate_origin: value.chainstate_origin,
-        observed_range: Some(range_wire(value.observed_range)),
+        observed: Some(wire::ObservedValidationIndex {
+            pre_nakamoto_count: value
+                .observed
+                .pre_nakamoto_count,
+            nakamoto_count: value.observed.nakamoto_count,
+        }),
+        resolved_range: Some(range_wire(value.resolved_range)),
+        segments: value
+            .segments
+            .into_iter()
+            .map(|segment| wire::ValidationEpochSegment {
+                epoch: epoch_wire(segment.epoch),
+                global_range: Some(range_wire(segment.global_range)),
+                local_range: Some(range_wire(segment.local_range)),
+            })
+            .collect(),
+        shard_count: value.shard_count,
+        max_concurrency: value.max_concurrency,
     }
 }
 
@@ -1105,10 +1156,9 @@ mod tests {
             benchmark_payload(),
             domain::TaskPayload::BuildOnly,
             domain::TaskPayload::BlockValidation(domain::BlockValidationPayload {
-                epoch: domain::ValidationEpoch::Nakamoto,
-                range: domain::InclusiveRange { start: 10, end: 20 },
-                requested_shards: 4,
-                max_concurrency: 2,
+                selection: domain::BlockValidationSelection::Range {
+                    range: domain::InclusiveRange { start: 10, end: 20 },
+                },
                 timeout_secs: 600,
             }),
         ];
@@ -1185,10 +1235,7 @@ mod tests {
                     job_id: id("44444444-4444-4444-8444-444444444444"),
                     trace_id,
                     capability: domain::WorkerCapability::BlockValidation,
-                    requirements: domain::OfferRequirements::BlockValidation {
-                        requested_shards: 8,
-                        max_concurrency: 4,
-                    },
+                    requirements: domain::OfferRequirements::BlockValidation,
                     payload_hash: "b".repeat(64),
                     offer_expires_at_ms: 1_700_000_030_000,
                 }),
@@ -1290,7 +1337,18 @@ mod tests {
                     reason: "invalid state root".into(),
                 }],
                 chainstate_origin: "mainnet-nightly".into(),
-                observed_range: domain::InclusiveRange { start: 10, end: 20 },
+                observed: domain::ObservedValidationIndex {
+                    pre_nakamoto_count: 10,
+                    nakamoto_count: 11,
+                },
+                resolved_range: domain::InclusiveRange { start: 10, end: 20 },
+                segments: vec![domain::ValidationEpochSegment {
+                    epoch: domain::ValidationEpoch::Nakamoto,
+                    global_range: domain::InclusiveRange { start: 10, end: 20 },
+                    local_range: domain::InclusiveRange { start: 0, end: 10 },
+                }],
+                shard_count: 2,
+                max_concurrency: 2,
             }),
         };
         assert_wire_round_trip::<wire::CompleteAttemptRequest>(domain::CompleteAttemptRequest {
@@ -1323,13 +1381,17 @@ mod tests {
         );
 
         let error = wire::BlockValidationPayload {
-            epoch: wire::ValidationEpoch::Unspecified as i32,
-            range: Some(wire::InclusiveRange { start: 1, end: 2 }),
-            requested_shards: 1,
-            max_concurrency: 1,
+            selection: Some(wire::BlockValidationSelection { kind: None }),
             timeout_secs: 1,
         };
         assert!(validation_payload(error).is_err());
+        assert!(
+            validation_payload(wire::BlockValidationPayload {
+                selection: None,
+                timeout_secs: 1,
+            })
+            .is_err()
+        );
 
         assert!(capability(wire::WorkerCapability::Unspecified as i32).is_err());
         assert!(capability(i32::MAX).is_err());

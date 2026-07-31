@@ -146,8 +146,10 @@ drain the worker and correct it explicitly:
 sudo lvchange --permission r vg0/mainnet-YYYY-MM-DD
 ```
 
-The selected origin and guest-observed coverage are recorded with block
-validation results. A worker whose local chainstate cannot cover the requested
+The selected origin, guest-observed epoch counts, resolved global range,
+epoch-local segments, shard count, and concurrency are recorded with block
+validation results. `recent` saturates at the observed Nakamoto count; `full`
+covers both epochs. A worker whose local chainstate cannot cover an explicit
 range fails the attempt as infrastructure; it must not fabricate a partial
 verdict.
 
@@ -218,9 +220,10 @@ The first command is a dry run. The execution creates two writable snapshots,
 mounts them with production XFS safety options, proves origin and peer write
 isolation, and fails if cleanup leaves an LV or mount.
 
-Then run one end-to-end canary at the intended block-validation shard count.
-Start conservatively and tune shard/concurrency policy from real duration and
-host telemetry. CPU, memory, and device count are admission limits; synthetic
+Then run one end-to-end canary with the intended
+`target_blocks_per_shard`, shard ceiling, and concurrency ceiling. Start
+conservatively and tune worker-local policy from real duration and host
+telemetry. CPU, memory, and device count are admission limits; synthetic
 storage-throughput prediction is not a release gate.
 
 ## Identity-key lifecycle

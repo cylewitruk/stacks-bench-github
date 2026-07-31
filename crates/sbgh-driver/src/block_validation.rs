@@ -13,14 +13,19 @@ pub struct InclusiveRange {
     pub end: u64,
 }
 
-/// Fully resolved block-validation input. Host paths and backend details are
-/// intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockValidationSelection {
+    Recent { block_count: u64 },
+    Full,
+    Range { range: InclusiveRange },
+}
+
+/// Immutable block-validation demand. The concrete range and resource plan
+/// are resolved inside the sandbox against its attached chainstate.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockValidationTaskSpec {
-    pub epoch: ValidationEpoch,
-    pub range: InclusiveRange,
-    pub requested_shards: u32,
-    pub max_concurrency: u32,
+    pub selection: BlockValidationSelection,
     pub timeout_secs: u64,
 }
 
@@ -31,6 +36,19 @@ pub struct InvalidBlock {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ObservedValidationIndex {
+    pub pre_nakamoto_count: u64,
+    pub nakamoto_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ValidationEpochSegment {
+    pub epoch: ValidationEpoch,
+    pub global_range: InclusiveRange,
+    pub local_range: InclusiveRange,
+}
+
 /// Typed logical result, kept separate from backend forensics.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockValidationOutput {
@@ -38,5 +56,9 @@ pub struct BlockValidationOutput {
     pub checked_blocks: u64,
     pub invalid_blocks: Vec<InvalidBlock>,
     pub chainstate_origin: String,
-    pub observed_range: InclusiveRange,
+    pub observed: ObservedValidationIndex,
+    pub resolved_range: InclusiveRange,
+    pub segments: Vec<ValidationEpochSegment>,
+    pub shard_count: u32,
+    pub max_concurrency: u32,
 }

@@ -95,6 +95,7 @@ pub struct BlockValidationProfile {
     pub vcpus: u32,
     pub memory_bytes: u64,
     pub cpu_set: Option<String>,
+    pub target_blocks_per_shard: u64,
     pub max_shards: u32,
     pub max_concurrency: u32,
     #[serde(default = "default_max_parallel_jobs")]

@@ -399,14 +399,9 @@ impl RunnableJobStore for FakeSource {
             TaskKind::BuildOnly => {
                 TaskReport::BuildOnly(BuildOnlyReportView { cache_outcome: None })
             }
-            TaskKind::BlockValidation => TaskReport::BlockValidation(BlockValidationReportView {
-                requested_range: None,
-                observed_range: None,
-                verdict: None,
-                checked_blocks: None,
-                chainstate_origin: None,
-                invalid_blocks: Vec::new(),
-            }),
+            TaskKind::BlockValidation => {
+                TaskReport::BlockValidation(BlockValidationReportView::from_request(None))
+            }
         };
         Ok(Some(SubmissionReportView {
             identity: ReportIdentity {

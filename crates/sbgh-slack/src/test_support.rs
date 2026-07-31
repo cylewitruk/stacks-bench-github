@@ -378,12 +378,13 @@ impl TaskSubmissionPort for RecordingTaskSubmissionPort {
                         .source
                         .revision
                         .unwrap_or_else(|| "develop".into());
-                    let detail = serde_json::to_value(QueuedEventDetail::BlockValidation {
-                        range_start: 1,
-                        range_end: 2,
-                        requested_shards: 1,
-                        max_concurrency: 1,
-                    })?;
+                    let detail = serde_json::json!({
+                        "trigger": "block_validation",
+                        "selection": {
+                            "kind": "range",
+                            "range": {"start": 1, "end": 2}
+                        }
+                    });
                     (
                         Vec::new(),
                         detail,

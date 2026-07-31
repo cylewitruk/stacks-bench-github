@@ -169,6 +169,7 @@ enum UserAction {
 enum RoleArg {
     Admin,
     TriggerPrBenchmark,
+    TriggerBlockValidation,
     ViewResults,
 }
 
@@ -177,6 +178,7 @@ impl RoleArg {
         match self {
             RoleArg::Admin => "admin",
             RoleArg::TriggerPrBenchmark => "trigger_pr_benchmark",
+            RoleArg::TriggerBlockValidation => "trigger_block_validation",
             RoleArg::ViewResults => "view_results",
         }
     }
@@ -405,19 +407,23 @@ enum JobsAction {
         /// Stable retry key for this logical request.
         #[arg(long)]
         idempotency_key: String,
-        #[arg(long, default_value = "nakamoto")]
-        epoch: String,
+        #[arg(long, value_enum, default_value_t = ValidationSelectionArg::Recent)]
+        selection: ValidationSelectionArg,
+        /// Override the configured recent-block default.
+        #[arg(long, requires = "selection")]
+        block_count: Option<u64>,
         #[arg(long)]
-        range_start: u64,
+        range_start: Option<u64>,
         #[arg(long)]
-        range_end: u64,
-        #[arg(long)]
-        shards: u32,
-        #[arg(long)]
-        concurrency: u32,
-        #[arg(long, default_value_t = 21_600)]
-        timeout_secs: u64,
+        range_end: Option<u64>,
     },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum ValidationSelectionArg {
+    Recent,
+    Full,
+    Range,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1150,13 +1156,26 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
             commit,
             worker_id,
             idempotency_key,
-            epoch,
+            selection,
+            block_count,
             range_start,
             range_end,
-            shards,
-            concurrency,
-            timeout_secs,
         } => {
+            let selection = match (selection, block_count, range_start, range_end) {
+                (ValidationSelectionArg::Recent, block_count, None, None) => {
+                    sbgh_api::BlockValidationSelectionRequest::Recent { block_count }
+                }
+                (ValidationSelectionArg::Full, None, None, None) => {
+                    sbgh_api::BlockValidationSelectionRequest::Full
+                }
+                (ValidationSelectionArg::Range, None, Some(start), Some(end)) => {
+                    sbgh_api::BlockValidationSelectionRequest::Range { start, end }
+                }
+                _ => anyhow::bail!(
+                    "recent accepts only --block-count; full accepts no selector values; range \
+                     requires --range-start and --range-end"
+                ),
+            };
             let response = client
                 .enqueue_block_validation(&EnqueueBlockValidationRequest {
                     idempotency_key,
@@ -1164,12 +1183,7 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
                     repo_id,
                     commit,
                     worker_id,
-                    epoch,
-                    range_start,
-                    range_end,
-                    requested_shards: shards,
-                    max_concurrency: concurrency,
-                    timeout_secs,
+                    selection,
                 })
                 .await
                 .context("enqueue block validation")?;
@@ -1418,6 +1432,14 @@ fn load_env(explicit: Option<&Path>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_validation_role_cli_name_maps_to_api_wire_name() {
+        use clap::ValueEnum as _;
+
+        let role = RoleArg::from_str("trigger-block-validation", true).unwrap();
+        assert_eq!(role.as_wire(), "trigger_block_validation");
+    }
 
     #[test]
     fn cli_command_graph_is_valid() {

@@ -104,7 +104,8 @@ impl WorkerConfig {
                 "block-validation profile has invalid CPU or memory"
             );
             ensure!(
-                block.max_shards > 0
+                block.target_blocks_per_shard > 0
+                    && block.max_shards > 0
                     && block.max_concurrency > 0
                     && block.max_concurrency <= block.max_shards,
                 "invalid block-validation shard/concurrency limits"
@@ -292,6 +293,40 @@ mod tests {
             error
                 .to_string()
                 .contains("unknown field `chain_config`")
+        );
+    }
+
+    #[test]
+    fn block_validation_shard_policy_fails_closed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join("config.example.worker-block-validation.toml");
+
+        let mut excessive_concurrency = WorkerConfig::load(&path).unwrap();
+        let profile = excessive_concurrency
+            .block_validation
+            .as_mut()
+            .unwrap();
+        profile.max_concurrency = profile.max_shards + 1;
+        assert!(
+            excessive_concurrency
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("shard/concurrency limits")
+        );
+
+        let mut zero_target = WorkerConfig::load(&path).unwrap();
+        zero_target
+            .block_validation
+            .as_mut()
+            .unwrap()
+            .target_blocks_per_shard = 0;
+        assert!(
+            zero_target
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("shard/concurrency limits")
         );
     }
 

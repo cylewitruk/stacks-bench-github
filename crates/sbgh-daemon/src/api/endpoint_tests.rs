@@ -24,6 +24,7 @@ fn router_with(pool: Pool, gh_api_base: String) -> Router {
         pool: pool.clone(),
         ingest: Arc::new(PostgresIngestStore::new(pool)),
         gh_api_base,
+        block_validation: None,
     };
     build_router(state, tokens)
 }

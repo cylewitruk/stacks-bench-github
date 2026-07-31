@@ -322,15 +322,13 @@ pub struct TriggerPolicy {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Slice 6: the three role values an operator can grant. Mirrors the
-/// `user_role` DB enum from slice 0. Phase 1 only acts on
-/// `TriggerPrBenchmark` (the `/benchmark` authz gate); `Admin` and
-/// `ViewResults` are present for forward-compat but unused.
+/// Roles an operator can grant to a GitHub user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserRole {
     Admin,
     TriggerPrBenchmark,
+    TriggerBlockValidation,
     ViewResults,
 }
 
@@ -842,12 +840,7 @@ pub enum QueuedEventDetail {
     /// Operator/API-requested block validation. The execution payload is
     /// persisted separately in the fleet contract; this remains audit
     /// provenance for why the job exists.
-    BlockValidation {
-        range_start: u64,
-        range_end: u64,
-        requested_shards: u32,
-        max_concurrency: u32,
-    },
+    BlockValidation { selection: sbgh_fleet::BlockValidationSelection },
 }
 
 fn default_clean_repetitions() -> u32 {

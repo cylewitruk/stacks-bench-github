@@ -7,6 +7,8 @@
 use crate::PersistenceResult;
 use crate::db::Pool;
 
+// Rebuild this crate whenever the checked-in migration ledger changes; SQLx
+// embeds that ledger into every production binary.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 pub async fn migrate(pool: &Pool) -> PersistenceResult<()> {

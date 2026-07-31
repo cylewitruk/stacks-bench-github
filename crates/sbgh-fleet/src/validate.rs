@@ -5,11 +5,136 @@ use thiserror::Error;
 
 use crate::{
     AcceptOfferRequest, ArtifactDescriptor, ArtifactGrantRequest, Assignment, AttemptIdentity,
+    BlockValidationPayload, BlockValidationResult, BlockValidationSelection,
     CleanupCompleteRequest, CleanupListRequest, CompleteAttemptRequest, DeregisterSessionRequest,
     HeartbeatRequest, InclusiveRange, PROTOCOL_VERSION, PollRequest, ProgressRequest,
     RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload,
     RepositoryCredentialRequest, TaskPayload,
 };
+
+/// Verify that a worker's concrete validation result faithfully resolves the
+/// durable selector. Resource sizing remains worker-owned; coverage does not.
+pub fn validate_block_validation_result(
+    payload: &BlockValidationPayload,
+    result: &BlockValidationResult,
+) -> Result<(), ProtocolError> {
+    if result
+        .observed
+        .pre_nakamoto_count
+        == 0
+        || result.observed.nakamoto_count == 0
+    {
+        return Err(ProtocolError::Invalid {
+            field: "block_validation.observed",
+            reason: "both epoch counts must be non-zero".into(),
+        });
+    }
+    let total = result
+        .observed
+        .pre_nakamoto_count
+        .checked_add(result.observed.nakamoto_count)
+        .ok_or_else(|| ProtocolError::Invalid {
+            field: "block_validation.observed",
+            reason: "total coverage overflows u64".into(),
+        })?;
+    if total > i64::MAX as u64 {
+        return Err(ProtocolError::Invalid {
+            field: "block_validation.observed",
+            reason: "total coverage exceeds the durable signed-integer range".into(),
+        });
+    }
+    let expected_range = match &payload.selection {
+        BlockValidationSelection::Recent { block_count } => {
+            if *block_count == 0 {
+                return Err(ProtocolError::Invalid {
+                    field: "block_validation.selection.recent.block_count",
+                    reason: "must be non-zero".into(),
+                });
+            }
+            let count = (*block_count).min(result.observed.nakamoto_count);
+            InclusiveRange {
+                start: total - count,
+                end: total - 1,
+            }
+        }
+        BlockValidationSelection::Full => InclusiveRange { start: 0, end: total - 1 },
+        BlockValidationSelection::Range { range } => {
+            if range.start > range.end || range.end >= total {
+                return Err(ProtocolError::Invalid {
+                    field: "block_validation.selection.range",
+                    reason: "is reversed or exceeds observed coverage".into(),
+                });
+            }
+            range.clone()
+        }
+    };
+    if result.resolved_range != expected_range {
+        return Err(ProtocolError::Invalid {
+            field: "block_validation.resolved_range",
+            reason: "does not match the durable selector and observed coverage".into(),
+        });
+    }
+
+    let pre_count = result
+        .observed
+        .pre_nakamoto_count;
+    let mut expected_segments = Vec::with_capacity(2);
+    if expected_range.start < pre_count {
+        let end = expected_range
+            .end
+            .min(pre_count - 1);
+        expected_segments.push(crate::ValidationEpochSegment {
+            epoch: crate::ValidationEpoch::PreNakamoto,
+            global_range: InclusiveRange {
+                start: expected_range.start,
+                end,
+            },
+            local_range: InclusiveRange {
+                start: expected_range.start,
+                end,
+            },
+        });
+    }
+    if expected_range.end >= pre_count {
+        let start = expected_range
+            .start
+            .max(pre_count);
+        expected_segments.push(crate::ValidationEpochSegment {
+            epoch: crate::ValidationEpoch::Nakamoto,
+            global_range: InclusiveRange { start, end: expected_range.end },
+            local_range: InclusiveRange {
+                start: start - pre_count,
+                end: expected_range.end - pre_count,
+            },
+        });
+    }
+    if result.segments != expected_segments {
+        return Err(ProtocolError::Invalid {
+            field: "block_validation.segments",
+            reason: "do not exactly and gaplessly cover the resolved range".into(),
+        });
+    }
+    let checked_blocks = expected_range
+        .end
+        .checked_sub(expected_range.start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| ProtocolError::Invalid {
+            field: "block_validation.checked_blocks",
+            reason: "resolved range length overflows u64".into(),
+        })?;
+    if result.checked_blocks != checked_blocks
+        || result
+            .invalid_blocks
+            .iter()
+            .any(|invalid| invalid.shard >= result.shard_count)
+    {
+        return Err(ProtocolError::Invalid {
+            field: "block_validation.result",
+            reason: "checked count or invalid-block shard does not match the resolved plan".into(),
+        });
+    }
+    Ok(())
+}
 
 const MAX_LABEL: usize = 96;
 const MAX_VERSION: usize = 128;
@@ -387,25 +512,28 @@ impl Validate for TaskPayload {
             }
             Self::BuildOnly => {}
             Self::BlockValidation(payload) => {
-                payload.range.validate()?;
-                if payload.requested_shards == 0
-                    || payload.max_concurrency == 0
-                    || payload.timeout_secs == 0
-                {
+                match &payload.selection {
+                    crate::BlockValidationSelection::Recent { block_count } => {
+                        if *block_count == 0 || *block_count > i64::MAX as u64 {
+                            return Err(ProtocolError::Invalid {
+                                field: "block_validation.selection.recent.block_count",
+                                reason: "must be within 1..=i64::MAX".into(),
+                            });
+                        }
+                    }
+                    crate::BlockValidationSelection::Full => {}
+                    crate::BlockValidationSelection::Range { range } => range.validate()?,
+                }
+                if payload.timeout_secs == 0 {
                     return Err(ProtocolError::Invalid {
                         field: "block_validation",
-                        reason: "shards, concurrency, and timeout must be non-zero".into(),
+                        reason: "timeout must be non-zero".into(),
                     });
                 }
-                if payload.requested_shards > MAX_VALIDATION_SHARDS
-                    || payload.max_concurrency > MAX_VALIDATION_CONCURRENCY
-                    || payload.max_concurrency > payload.requested_shards
-                    || payload.timeout_secs > MAX_VALIDATION_TIMEOUT_SECS
-                {
+                if payload.timeout_secs > MAX_VALIDATION_TIMEOUT_SECS {
                     return Err(ProtocolError::Invalid {
                         field: "block_validation",
-                        reason: "shard, concurrency, or timeout limit exceeds protocol bounds"
-                            .into(),
+                        reason: "timeout exceeds the protocol bound".into(),
                     });
                 }
             }
@@ -576,8 +704,44 @@ impl Validate for CompleteAttemptRequest {
                         false,
                     )?;
                     result
-                        .observed_range
+                        .resolved_range
                         .validate()?;
+                    if result
+                        .observed
+                        .pre_nakamoto_count
+                        == 0
+                        || result.observed.nakamoto_count == 0
+                    {
+                        return Err(ProtocolError::Invalid {
+                            field: "block_validation.observed",
+                            reason: "both epoch counts must be non-zero".into(),
+                        });
+                    }
+                    if result.shard_count == 0
+                        || result.shard_count > MAX_VALIDATION_SHARDS
+                        || result.max_concurrency == 0
+                        || result.max_concurrency > MAX_VALIDATION_CONCURRENCY
+                        || result.max_concurrency > result.shard_count
+                    {
+                        return Err(ProtocolError::Invalid {
+                            field: "block_validation.resource_plan",
+                            reason: "invalid shard or concurrency count".into(),
+                        });
+                    }
+                    if result.segments.is_empty() || result.segments.len() > 2 {
+                        return Err(ProtocolError::Invalid {
+                            field: "block_validation.segments",
+                            reason: "must contain one or two epoch segments".into(),
+                        });
+                    }
+                    for segment in &result.segments {
+                        segment
+                            .global_range
+                            .validate()?;
+                        segment
+                            .local_range
+                            .validate()?;
+                    }
                     if result.checked_blocks > i64::MAX as u64 {
                         return Err(ProtocolError::Invalid {
                             field: "block_validation.checked_blocks",
@@ -749,7 +913,18 @@ mod tests {
                     reason: "invalid block".into(),
                 }],
                 chainstate_origin: "chainstate".into(),
-                observed_range: crate::InclusiveRange { start: 1, end: 1 },
+                observed: crate::ObservedValidationIndex {
+                    pre_nakamoto_count: 1,
+                    nakamoto_count: 1,
+                },
+                resolved_range: crate::InclusiveRange { start: 1, end: 1 },
+                segments: vec![crate::ValidationEpochSegment {
+                    epoch: crate::ValidationEpoch::Nakamoto,
+                    global_range: crate::InclusiveRange { start: 1, end: 1 },
+                    local_range: crate::InclusiveRange { start: 0, end: 0 },
+                }],
+                shard_count: 1,
+                max_concurrency: 1,
             }),
         };
         let terminal = ReliableEventPayload::Terminal {
@@ -788,6 +963,65 @@ mod tests {
             request.validate(),
             Err(ProtocolError::Invalid {
                 field: "invalid_block.block",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_validation_result_must_resolve_selector_and_segments_exactly() {
+        let payload = crate::BlockValidationPayload {
+            selection: crate::BlockValidationSelection::Range {
+                range: crate::InclusiveRange { start: 8, end: 12 },
+            },
+            timeout_secs: 60,
+        };
+        let mut result = crate::BlockValidationResult {
+            valid: true,
+            checked_blocks: 5,
+            invalid_blocks: Vec::new(),
+            chainstate_origin: "nightly".into(),
+            observed: crate::ObservedValidationIndex {
+                pre_nakamoto_count: 10,
+                nakamoto_count: 10,
+            },
+            resolved_range: crate::InclusiveRange { start: 8, end: 12 },
+            segments: vec![
+                crate::ValidationEpochSegment {
+                    epoch: crate::ValidationEpoch::PreNakamoto,
+                    global_range: crate::InclusiveRange { start: 8, end: 9 },
+                    local_range: crate::InclusiveRange { start: 8, end: 9 },
+                },
+                crate::ValidationEpochSegment {
+                    epoch: crate::ValidationEpoch::Nakamoto,
+                    global_range: crate::InclusiveRange { start: 10, end: 12 },
+                    local_range: crate::InclusiveRange { start: 0, end: 2 },
+                },
+            ],
+            shard_count: 2,
+            max_concurrency: 2,
+        };
+        assert!(validate_block_validation_result(&payload, &result).is_ok());
+
+        result.segments[1]
+            .local_range
+            .start = 1;
+        assert!(matches!(
+            validate_block_validation_result(&payload, &result),
+            Err(ProtocolError::Invalid {
+                field: "block_validation.segments",
+                ..
+            })
+        ));
+
+        result.observed = crate::ObservedValidationIndex {
+            pre_nakamoto_count: i64::MAX as u64,
+            nakamoto_count: 1,
+        };
+        assert!(matches!(
+            validate_block_validation_result(&payload, &result),
+            Err(ProtocolError::Invalid {
+                field: "block_validation.observed",
                 ..
             })
         ));

@@ -141,7 +141,7 @@ Configure these repository permissions:
 
 Subscribe to:
 
-- **Issue comment** for `/benchmark` and `/validate-blocks`;
+- **Issue comment** for `/benchmark` and exact `/validate`;
 - **Push** for branch triggers;
 - **Create** for tag triggers;
 - **Pull request** for current PR metadata.
@@ -212,8 +212,8 @@ Copy [config.example.daemon.toml](../config.example.daemon.toml) to
 - `[api].listen` to loopback plus the Docker bridge gateway address;
 - `[artifacts]` to the S3 endpoint, bucket, and region;
 - benchmark defaults and reporting policy appropriate for this host;
-- `[tasks.block_validation]` with the default inclusive epoch/range and
-  server-owned shard, concurrency, timeout, and range-override policy.
+- `[tasks.block_validation]` with recent/full/range admission policy and the
+  task timeout. Shard sizing and concurrency are worker-local policy.
 
 ```bash
 sudo install -m 0600 -o sbgh -g sbgh \
@@ -347,7 +347,8 @@ or
 to `/etc/sbgh/worker/<profile>.toml`. Set the orchestrator URL, CPU placement,
 VM resources, LVM identifiers, and paths. Capabilities are inferred from the
 present `[benchmark]` and `[block_validation]` sections. Block validation uses
-`stacks-inspect`'s built-in mainnet network configuration.
+`stacks-inspect`'s built-in mainnet network configuration and resolves the
+durable selector against the attached chainstate before sizing shards.
 
 ```bash
 sudo install -m 0600 -o sbgh-worker -g sbgh-worker \
@@ -480,6 +481,8 @@ sbgh policy target allow --on <owner>/<repo>
 sbgh policy source allow --on <owner>/<repo>
 sbgh user grant --login <user> --on <owner>/<repo> \
   --role trigger-pr-benchmark
+sbgh user grant --login <user> --on <owner>/<repo> \
+  --role trigger-block-validation
 ```
 
 Optional automatic benchmark triggers:
@@ -501,7 +504,7 @@ On an authorized pull request, comment:
 For block validation:
 
 ```text
-/validate-blocks nakamoto <inclusive-start> <inclusive-end>
+/validate
 ```
 
 Verify the complete path:

@@ -35,6 +35,7 @@ CREATE TYPE github_account_type AS ENUM (
 CREATE TYPE user_role AS ENUM (
     'admin', -- IMPLIES all other roles within the same grant scope (install or repo)
     'trigger_pr_benchmark', -- can post /benchmark on PRs
+    'trigger_block_validation', -- can post exact /validate on PRs
     'view_results' -- read-only
 );
 

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
 use sbgh_driver::{
-    BlockValidationOutput, BlockValidationTaskSpec, InclusiveRange, InvalidBlock, ValidationEpoch,
+    BlockValidationOutput, BlockValidationSelection, BlockValidationTaskSpec, InclusiveRange,
+    InvalidBlock, ObservedValidationIndex, ValidationEpoch, ValidationEpochSegment,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,9 +25,9 @@ pub struct BlockGuestPlan {
     pub fencing_generation: u64,
     pub commit: String,
     pub chainstate_origin: String,
-    pub epoch: &'static str,
-    pub range: PlanRange,
-    pub requested_shards: u32,
+    pub selection: BlockValidationSelection,
+    pub target_blocks_per_shard: u64,
+    pub max_shards: u32,
     pub max_concurrency: u32,
     pub timeout_secs: u64,
     pub mount_options: Vec<String>,
@@ -55,11 +56,19 @@ impl BlockGuestPlan {
         commit: &str,
         spec: &BlockValidationTaskSpec,
         snapshots: &ChainstateSnapshotSet,
+        target_blocks_per_shard: u64,
+        max_shards: u32,
+        max_concurrency: u32,
         mount_options: Vec<String>,
     ) -> anyhow::Result<Self> {
         ensure!(
-            snapshots.snapshots.len() == spec.requested_shards as usize,
-            "snapshot count does not match requested shard count"
+            !snapshots.snapshots.is_empty() && snapshots.snapshots.len() <= max_shards as usize,
+            "snapshot count is outside the local shard ceiling"
+        );
+        ensure!(target_blocks_per_shard > 0, "target blocks per shard must be non-zero");
+        ensure!(
+            max_concurrency > 0 && max_concurrency <= max_shards,
+            "invalid concurrency ceiling"
         );
         Ok(Self {
             schema_version: RESULT_SCHEMA_VERSION,
@@ -68,13 +77,10 @@ impl BlockGuestPlan {
             fencing_generation,
             commit: commit.into(),
             chainstate_origin: snapshots.origin.clone(),
-            epoch: match spec.epoch {
-                ValidationEpoch::PreNakamoto => "pre_nakamoto",
-                ValidationEpoch::Nakamoto => "nakamoto",
-            },
-            range: PlanRange::from(spec.range),
-            requested_shards: spec.requested_shards,
-            max_concurrency: spec.max_concurrency,
+            selection: spec.selection.clone(),
+            target_blocks_per_shard,
+            max_shards,
+            max_concurrency,
             timeout_secs: spec.timeout_secs,
             mount_options,
             devices: snapshots
@@ -107,9 +113,12 @@ struct GuestResult {
     attempt_id: String,
     fencing_generation: u64,
     chainstate_origin: String,
-    epoch: String,
-    requested_range: PlanRange,
-    observed_range: PlanRange,
+    selection: BlockValidationSelection,
+    observed: ObservedValidationIndex,
+    resolved_range: PlanRange,
+    segments: Vec<ValidationEpochSegment>,
+    shard_count: u32,
+    max_concurrency: u32,
     shards: Vec<GuestShard>,
 }
 
@@ -149,26 +158,24 @@ pub fn reduce_result(
         "guest result attempt identity mismatch"
     );
     ensure!(
-        result.chainstate_origin == plan.chainstate_origin
-            && result.epoch == plan.epoch
-            && result.requested_range == plan.range,
+        result.chainstate_origin == plan.chainstate_origin && result.selection == plan.selection,
         "guest result task identity mismatch"
     );
-    ensure!(
-        result.observed_range.start <= plan.range.start
-            && result.observed_range.end >= plan.range.end,
-        "guest-observed chainstate does not cover the requested range"
-    );
-    // The guest may translate
-    // global Nakamoto indices into epoch-local CLI arguments, but terminal
-    // accounting always remains in the trusted global coordinate system.
-    let expected = partition(
-        InclusiveRange {
-            start: plan.range.start,
-            end: plan.range.end,
-        },
-        plan.requested_shards,
+    let resolved = resolve_execution_plan(
+        &plan.selection,
+        result.observed.clone(),
+        plan.target_blocks_per_shard,
+        plan.max_shards,
+        plan.max_concurrency,
     )?;
+    ensure!(
+        result.resolved_range == PlanRange::from(resolved.range)
+            && result.segments == resolved.segments
+            && result.shard_count == resolved.shard_count
+            && result.max_concurrency == resolved.max_concurrency,
+        "guest result does not match the trusted local planning algorithm"
+    );
+    let expected = partition(resolved.range, resolved.shard_count)?;
     ensure!(result.shards.len() == expected.len(), "guest result is partial");
     let mut shards = result.shards;
     shards.sort_by_key(|shard| shard.index);
@@ -252,13 +259,117 @@ pub fn reduce_result(
             checked_blocks,
             invalid_blocks,
             chainstate_origin: plan.chainstate_origin.clone(),
-            observed_range: InclusiveRange {
-                start: result.observed_range.start,
-                end: result.observed_range.end,
-            },
+            observed: result.observed,
+            resolved_range: resolved.range,
+            segments: resolved.segments,
+            shard_count: resolved.shard_count,
+            max_concurrency: resolved.max_concurrency,
         },
         artifacts,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedExecutionPlan {
+    pub range: InclusiveRange,
+    pub segments: Vec<ValidationEpochSegment>,
+    pub shard_count: u32,
+    pub max_concurrency: u32,
+}
+
+pub fn resolve_execution_plan(
+    selection: &BlockValidationSelection,
+    observed: ObservedValidationIndex,
+    target_blocks_per_shard: u64,
+    max_shards: u32,
+    max_concurrency: u32,
+) -> anyhow::Result<ResolvedExecutionPlan> {
+    ensure!(
+        observed.pre_nakamoto_count > 0 && observed.nakamoto_count > 0,
+        "chainstate probes must report both epoch counts"
+    );
+    ensure!(target_blocks_per_shard > 0, "target blocks per shard must be non-zero");
+    ensure!(max_shards > 0, "max shards must be non-zero");
+    ensure!(max_concurrency > 0 && max_concurrency <= max_shards, "invalid concurrency ceiling");
+    let total = observed
+        .pre_nakamoto_count
+        .checked_add(observed.nakamoto_count)
+        .context("observed validation-index count overflow")?;
+    let range = match selection {
+        BlockValidationSelection::Recent { block_count } => {
+            ensure!(*block_count > 0, "recent block count must be non-zero");
+            let count = (*block_count).min(observed.nakamoto_count);
+            InclusiveRange {
+                start: total - count,
+                end: total - 1,
+            }
+        }
+        BlockValidationSelection::Full => InclusiveRange { start: 0, end: total - 1 },
+        BlockValidationSelection::Range { range } => {
+            ensure!(range.start <= range.end, "validation range is reversed");
+            ensure!(range.end < total, "validation range exceeds observed coverage");
+            *range
+        }
+    };
+    let segments = epoch_segments(&range, observed.pre_nakamoto_count)?;
+    let count = range
+        .end
+        .checked_sub(range.start)
+        .and_then(|span| span.checked_add(1))
+        .context("resolved block count overflow")?;
+    let shard_count = planned_shard_count(count, target_blocks_per_shard, max_shards)?;
+    let concurrency = shard_count.min(max_concurrency);
+    Ok(ResolvedExecutionPlan {
+        range,
+        segments,
+        shard_count,
+        max_concurrency: concurrency,
+    })
+}
+
+pub fn planned_shard_count(
+    block_count: u64,
+    target_blocks_per_shard: u64,
+    max_shards: u32,
+) -> anyhow::Result<u32> {
+    ensure!(block_count > 0, "block count must be non-zero");
+    ensure!(target_blocks_per_shard > 0, "target blocks per shard must be non-zero");
+    ensure!(max_shards > 0, "max shards must be non-zero");
+    let desired = block_count / target_blocks_per_shard
+        + u64::from(block_count % target_blocks_per_shard != 0);
+    Ok(u32::try_from(desired.min(u64::from(max_shards)))?)
+}
+
+fn epoch_segments(
+    range: &InclusiveRange,
+    pre_nakamoto_count: u64,
+) -> anyhow::Result<Vec<ValidationEpochSegment>> {
+    let mut segments = Vec::with_capacity(2);
+    if range.start < pre_nakamoto_count {
+        let end = range
+            .end
+            .min(pre_nakamoto_count - 1);
+        segments.push(ValidationEpochSegment {
+            epoch: ValidationEpoch::PreNakamoto,
+            global_range: InclusiveRange { start: range.start, end },
+            local_range: InclusiveRange { start: range.start, end },
+        });
+    }
+    if range.end >= pre_nakamoto_count {
+        let start = range
+            .start
+            .max(pre_nakamoto_count);
+        segments.push(ValidationEpochSegment {
+            epoch: ValidationEpoch::Nakamoto,
+            global_range: InclusiveRange { start, end: range.end },
+            local_range: InclusiveRange {
+                start: start - pre_nakamoto_count,
+                end: range.end - pre_nakamoto_count,
+            },
+        });
+    }
+    ensure!(!segments.is_empty(), "resolved range produced no epoch segments");
+    Ok(segments)
 }
 
 fn safe_result_file(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
@@ -362,10 +473,9 @@ mod tests {
 
     fn plan() -> BlockGuestPlan {
         let spec = BlockValidationTaskSpec {
-            epoch: ValidationEpoch::PreNakamoto,
-            range: InclusiveRange { start: 10, end: 12 },
-            requested_shards: 2,
-            max_concurrency: 2,
+            selection: BlockValidationSelection::Range {
+                range: InclusiveRange { start: 10, end: 12 },
+            },
             timeout_secs: 60,
         };
         let snapshots = ChainstateSnapshotSet {
@@ -387,6 +497,9 @@ mod tests {
             "deadbeef",
             &spec,
             &snapshots,
+            2,
+            2,
+            2,
             vec!["nouuid".into()],
         )
         .unwrap()
@@ -404,9 +517,16 @@ mod tests {
                 "attempt_id": "attempt",
                 "fencing_generation": 4,
                 "chainstate_origin": "vg/origin",
-                "epoch": "pre_nakamoto",
-                "requested_range": {"start": 10, "end": 12},
-                "observed_range": {"start": 0, "end": 100},
+                "selection": {"kind": "range", "range": {"start": 10, "end": 12}},
+                "observed": {"pre_nakamoto_count": 101, "nakamoto_count": 1},
+                "resolved_range": {"start": 10, "end": 12},
+                "segments": [{
+                    "epoch": "pre_nakamoto",
+                    "global_range": {"start": 10, "end": 12},
+                    "local_range": {"start": 10, "end": 12}
+                }],
+                "shard_count": 2,
+                "max_concurrency": 2,
                 "shards": shards,
             }))
             .unwrap(),
@@ -437,6 +557,136 @@ mod tests {
                 ShardRange { index: 3, start: 19, end: 20 },
             ]
         );
+    }
+
+    #[test]
+    fn execution_plan_resolves_recent_full_and_cross_epoch_ranges() {
+        let observed = ObservedValidationIndex {
+            pre_nakamoto_count: 100,
+            nakamoto_count: 900,
+        };
+        let recent = resolve_execution_plan(
+            &BlockValidationSelection::Recent { block_count: 500 },
+            observed.clone(),
+            100,
+            16,
+            4,
+        )
+        .unwrap();
+        assert_eq!(recent.range, InclusiveRange { start: 500, end: 999 });
+        assert_eq!(
+            recent.segments,
+            vec![ValidationEpochSegment {
+                epoch: ValidationEpoch::Nakamoto,
+                global_range: InclusiveRange { start: 500, end: 999 },
+                local_range: InclusiveRange { start: 400, end: 899 },
+            }]
+        );
+        assert_eq!((recent.shard_count, recent.max_concurrency), (5, 4));
+
+        let saturated = resolve_execution_plan(
+            &BlockValidationSelection::Recent { block_count: 2_000 },
+            observed.clone(),
+            100,
+            16,
+            16,
+        )
+        .unwrap();
+        assert_eq!(saturated.range, InclusiveRange { start: 100, end: 999 });
+
+        let full = resolve_execution_plan(
+            &BlockValidationSelection::Full,
+            observed.clone(),
+            1_000,
+            16,
+            16,
+        )
+        .unwrap();
+        assert_eq!(full.range, InclusiveRange { start: 0, end: 999 });
+        assert_eq!(full.segments.len(), 2);
+        assert_eq!(full.segments[0].epoch, ValidationEpoch::PreNakamoto);
+        assert_eq!(full.segments[1].epoch, ValidationEpoch::Nakamoto);
+
+        let crossing = resolve_execution_plan(
+            &BlockValidationSelection::Range {
+                range: InclusiveRange { start: 90, end: 110 },
+            },
+            observed,
+            10,
+            16,
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            crossing.segments,
+            vec![
+                ValidationEpochSegment {
+                    epoch: ValidationEpoch::PreNakamoto,
+                    global_range: InclusiveRange { start: 90, end: 99 },
+                    local_range: InclusiveRange { start: 90, end: 99 },
+                },
+                ValidationEpochSegment {
+                    epoch: ValidationEpoch::Nakamoto,
+                    global_range: InclusiveRange { start: 100, end: 110 },
+                    local_range: InclusiveRange { start: 0, end: 10 },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_plan_rejects_missing_coverage_ranges_and_overflow() {
+        assert!(
+            resolve_execution_plan(
+                &BlockValidationSelection::Range {
+                    range: InclusiveRange { start: 0, end: 1_000 },
+                },
+                ObservedValidationIndex {
+                    pre_nakamoto_count: 100,
+                    nakamoto_count: 900,
+                },
+                100,
+                16,
+                4,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_execution_plan(
+                &BlockValidationSelection::Full,
+                ObservedValidationIndex {
+                    pre_nakamoto_count: u64::MAX,
+                    nakamoto_count: 1,
+                },
+                100,
+                16,
+                4,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn one_block_uses_one_shard_and_one_process() {
+        let plan = resolve_execution_plan(
+            &BlockValidationSelection::Range {
+                range: InclusiveRange { start: 123, end: 123 },
+            },
+            ObservedValidationIndex {
+                pre_nakamoto_count: 100,
+                nakamoto_count: 900,
+            },
+            100,
+            48,
+            24,
+        )
+        .unwrap();
+        assert_eq!((plan.shard_count, plan.max_concurrency), (1, 1));
+        assert_eq!(
+            partition(plan.range, plan.shard_count).unwrap(),
+            vec![ShardRange { index: 0, start: 123, end: 123 }]
+        );
+        assert_eq!(planned_shard_count(1, u64::MAX, 48).unwrap(), 1);
     }
 
     #[test]

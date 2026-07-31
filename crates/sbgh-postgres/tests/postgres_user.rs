@@ -401,6 +401,13 @@ async fn has_role_admin_grant_implies_trigger_pr_benchmark() {
             .unwrap(),
         "admin implies view_results too"
     );
+    assert!(
+        store
+            .has_role(42, 100, 10, UserRole::TriggerBlockValidation)
+            .await
+            .unwrap(),
+        "admin implies trigger_block_validation too"
+    );
 }
 
 #[tokio::test]

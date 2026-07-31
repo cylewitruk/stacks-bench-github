@@ -104,6 +104,12 @@ impl From<sbgh_core::submission::SubmissionError> for ApiErr {
     }
 }
 
+impl From<crate::block_validation_submission::BlockValidationSelectionError> for ApiErr {
+    fn from(error: crate::block_validation_submission::BlockValidationSelectionError) -> Self {
+        Self::bad_request(error.to_string())
+    }
+}
+
 impl From<InstallerError> for ApiErr {
     fn from(e: InstallerError) -> Self {
         use InstallerError::*;
@@ -218,5 +224,22 @@ mod tests {
         let parsed: sbgh_api::ApiError = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.error.code, "db_unavailable");
         assert_eq!(parsed.error.message, "database unavailable");
+    }
+
+    #[tokio::test]
+    async fn invalid_validation_selection_is_a_client_error() {
+        let err: ApiErr =
+            crate::block_validation_submission::BlockValidationSelectionError::FullDisabled.into();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let parsed: sbgh_api::ApiError = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.error.code, "bad_request");
+        assert_eq!(parsed.error.message, "full block validation is disabled");
     }
 }

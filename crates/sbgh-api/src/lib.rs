@@ -13,15 +13,16 @@ mod error;
 pub use client::{Client, ClientError, read_cookie};
 pub use dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
-    BenchmarkReportDetail, BlockValidationReportDetail, BuildOnlyReportDetail,
-    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest,
-    EnqueueBlockValidationRequest, EnqueueJobResponse, FleetCancellationResponse, FleetOverview,
-    FleetRecoveryRequest, FleetRecoveryResponse, FleetSummaryView, FleetWorkerView,
-    GrantRoleResult, HealthResponse, InstallationView, InstallerView, InvalidBlockDetail, JobView,
-    PinTriggerRequest, PolicyView, RepoRootView, ReportArtifactView, ReportIdentityView,
-    ReportLifecycleView, ReportRange, ResolveRepoResponse, RoleRequest, RoleView,
-    SubmissionReportView, TaskReportView, TriggerView, UserView, WebhookSubmitResponse,
-    WebhookSummary, WhoamiResponse, WorkerCreateRequest, WorkerDrainRequest, WorkerIdentityRequest,
+    BenchmarkReportDetail, BlockValidationReportDetail, BlockValidationSelectionDetail,
+    BlockValidationSelectionRequest, BuildOnlyReportDetail, DisableInstallerRequest,
+    DisablePolicyRequest, DisableRepoRequest, EnqueueBlockValidationRequest, EnqueueJobResponse,
+    FleetCancellationResponse, FleetOverview, FleetRecoveryRequest, FleetRecoveryResponse,
+    FleetSummaryView, FleetWorkerView, GrantRoleResult, HealthResponse, InstallationView,
+    InstallerView, InvalidBlockDetail, JobView, ObservedValidationIndexDetail, PinTriggerRequest,
+    PolicyView, RepoRootView, ReportArtifactView, ReportIdentityView, ReportLifecycleView,
+    ReportRange, ResolveRepoResponse, RoleRequest, RoleView, SubmissionReportView, TaskReportView,
+    TriggerView, UserView, ValidationEpochSegmentDetail, WebhookSubmitResponse, WebhookSummary,
+    WhoamiResponse, WorkerCreateRequest, WorkerDrainRequest, WorkerIdentityRequest,
     WorkerIdentityView, WorkerPolicyView, WorkerUpdateRequest,
 };
 pub use error::{ApiError, ErrorBody};

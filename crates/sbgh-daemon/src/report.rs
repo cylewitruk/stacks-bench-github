@@ -434,23 +434,47 @@ fn render_block_validation_body(
             ":x: block validation `{submission_id}` completed without a typed verdict for commit `{commit}`."
         );
     };
-    let requested = result
-        .requested_range
-        .map(|range| format!("`{}..={}`", range.start, range.end))
-        .unwrap_or_else(|| "unavailable (legacy request)".into());
+    let requested = match &result.requested {
+        Some(sbgh_core::reporting::BlockValidationSelectionReport::Recent { block_count }) => {
+            format!("latest `{block_count}` Nakamoto blocks")
+        }
+        Some(sbgh_core::reporting::BlockValidationSelectionReport::Full) => {
+            "full observed history".into()
+        }
+        Some(sbgh_core::reporting::BlockValidationSelectionReport::Range { range }) => {
+            format!("explicit range `{}..={}`", range.start, range.end)
+        }
+        None => "unavailable".into(),
+    };
     let observed = result
-        .observed_range
+        .observed
+        .map(|coverage| {
+            format!(
+                "`{}` pre-Nakamoto + `{}` Nakamoto",
+                coverage.pre_nakamoto_count, coverage.nakamoto_count
+            )
+        })
+        .unwrap_or_else(|| "unavailable".into());
+    let resolved = result
+        .resolved_range
         .map(|range| format!("`{}..={}`", range.start, range.end))
         .unwrap_or_else(|| "unavailable".into());
     let mut body = format!(
         "{} block validation **{}** for commit `{commit}` — checked `{}` blocks, `{}` invalid.\n\
-         Requested range: {requested}. Observed range: {observed}. Chainstate: `{}`.",
+         Requested: {requested}. Observed coverage: {observed}. Resolved range: {resolved}. \
+         Execution: `{}` shards / `{}` concurrent. Chainstate: `{}`.",
         if valid { ":white_check_mark:" } else { ":x:" },
         if valid { "passed" } else { "found invalid blocks" },
         result
             .checked_blocks
             .unwrap_or(0),
         result.invalid_blocks.len(),
+        result
+            .shard_count
+            .unwrap_or(0),
+        result
+            .max_concurrency
+            .unwrap_or(0),
         safe_inline(
             result
                 .chainstate_origin
@@ -1103,7 +1127,18 @@ mod tests {
             checked_blocks: 11,
             invalid_blocks: Vec::new(),
             chainstate_origin: "chainstate-nightly".into(),
-            observed_range: sbgh_fleet::InclusiveRange { start: 10, end: 20 },
+            observed: sbgh_fleet::ObservedValidationIndex {
+                pre_nakamoto_count: 10,
+                nakamoto_count: 11,
+            },
+            resolved_range: sbgh_fleet::InclusiveRange { start: 10, end: 20 },
+            segments: vec![sbgh_fleet::ValidationEpochSegment {
+                epoch: sbgh_fleet::ValidationEpoch::Nakamoto,
+                global_range: sbgh_fleet::InclusiveRange { start: 10, end: 20 },
+                local_range: sbgh_fleet::InclusiveRange { start: 0, end: 10 },
+            }],
+            shard_count: 1,
+            max_concurrency: 1,
         };
         let view = sbgh_core::reporting::BlockValidationReportView::from_result(None, &result);
         let snapshot = snapshot(
@@ -1145,7 +1180,18 @@ mod tests {
                 })
                 .collect(),
             chainstate_origin: "`origin`".into(),
-            observed_range: sbgh_fleet::InclusiveRange { start: 1, end: 50 },
+            observed: sbgh_fleet::ObservedValidationIndex {
+                pre_nakamoto_count: 1,
+                nakamoto_count: 50,
+            },
+            resolved_range: sbgh_fleet::InclusiveRange { start: 1, end: 50 },
+            segments: vec![sbgh_fleet::ValidationEpochSegment {
+                epoch: sbgh_fleet::ValidationEpoch::Nakamoto,
+                global_range: sbgh_fleet::InclusiveRange { start: 1, end: 50 },
+                local_range: sbgh_fleet::InclusiveRange { start: 0, end: 49 },
+            }],
+            shard_count: 50,
+            max_concurrency: 10,
         };
         let view = sbgh_core::reporting::BlockValidationReportView::from_result(None, &result);
         let body = render_block_validation_body(Uuid::new_v4(), "abc", &view);
@@ -1159,14 +1205,7 @@ mod tests {
 
     #[test]
     fn missing_validation_verdict_fails_closed_without_claiming_invalid_blocks() {
-        let view = sbgh_core::reporting::BlockValidationReportView {
-            requested_range: None,
-            observed_range: None,
-            verdict: None,
-            checked_blocks: None,
-            chainstate_origin: None,
-            invalid_blocks: Vec::new(),
-        };
+        let view = sbgh_core::reporting::BlockValidationReportView::from_request(None);
         let body = render_block_validation_body(Uuid::new_v4(), "abc", &view);
         assert!(body.contains("without a typed verdict"), "{body}");
         assert!(!body.contains("found invalid blocks"), "{body}");

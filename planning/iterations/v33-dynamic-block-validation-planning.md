@@ -5,7 +5,8 @@ Successor to
 static validation ranges and daemon-selected shard counts with
 chainstate-relative selection and worker-local execution planning.
 
-> **Status:** planned
+> **Status:** in_progress — implementation and local validation are complete;
+> first-deployment canaries remain open.
 >
 > v33 changes how block-validation demand is described and resolved. It does
 > not change pull scheduling, worker authorization, lifecycle controls, or
@@ -16,13 +17,13 @@ chainstate-relative selection and worker-local execution planning.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0079-dynamic-block-validation-planning` | primary: chainstate-relative selection and local shard planning | planned |
-| `0067-github-block-validation-submission` | co-primary: task-specific GitHub validation authorization and default trigger | planned |
+| `0079-dynamic-block-validation-planning` | primary: chainstate-relative selection and local shard planning | in_progress |
+| `0067-github-block-validation-submission` | co-primary: task-specific GitHub validation authorization and default trigger | in_progress |
 
 ## 0079 — Dynamic Block-Validation Planning
 
 - **id:** `0079-dynamic-block-validation-planning`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `high`
 - **depends_on:** `0019-block-validation-recipe`,
   `0063-libvirt-block-validation`, `0064-task-submission-kernel`,
@@ -70,7 +71,7 @@ epoch segments.
 ## 0067 — GitHub Block-Validation Submission
 
 - **id:** `0067-github-block-validation-submission`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `high`
 - **depends_on:** `0064-task-submission-kernel`,
   `0066-task-aware-reporting`
@@ -415,11 +416,11 @@ before changing transport or execution.
 
 **Acceptance & Validation:**
 
-- [ ] `get-nakamoto-tip` is not parsed as a numeric height.
-- [ ] Empty, malformed, overflowing, and inconsistent probes fail closed.
-- [ ] Recent never includes pre-Nakamoto entries.
-- [ ] Full covers both observed epochs.
-- [ ] Explicit ranges at, below, above, and across the epoch boundary have
+- [x] `get-nakamoto-tip` is not parsed as a numeric height.
+- [x] Empty, malformed, overflowing, and inconsistent probes fail closed.
+- [x] Recent never includes pre-Nakamoto entries.
+- [x] Full covers both observed epochs.
+- [x] Explicit ranges at, below, above, and across the epoch boundary have
   unambiguous results.
 
 ### Phase 2: Replace the Task and Wire Contracts
@@ -435,11 +436,11 @@ before changing transport or execution.
 
 **Acceptance & Validation:**
 
-- [ ] Proto3 unspecified/missing selector variants fail closed.
-- [ ] Core, reporting, PostgreSQL, and driver crates do not import generated
+- [x] Proto3 unspecified/missing selector variants fail closed.
+- [x] Core, reporting, PostgreSQL, and driver crates do not import generated
   protobuf types.
-- [ ] Task digests change when selection changes and ignore no semantic field.
-- [ ] No worker accepts caller-provided shard or concurrency values.
+- [x] Task digests change when selection changes and ignore no semantic field.
+- [x] No worker accepts caller-provided shard or concurrency values.
 
 ### Phase 3: Consolidate Daemon Policy and Intake
 
@@ -459,20 +460,20 @@ configuration.
 
 **Acceptance & Validation:**
 
-- [ ] Default Slack validation stores `Recent { 1_000_000 }`.
-- [ ] “Latest 500k” stores `Recent { 500_000 }`; zero, over-policy, and
+- [x] Default Slack validation stores `Recent { 1_000_000 }`.
+- [x] “Latest 500k” stores `Recent { 500_000 }`; zero, over-policy, and
   cross-selector count fields fail closed.
-- [ ] Full and range permissions are enforced before submission.
-- [ ] The LLM can extract semantic selection/count but cannot set policy
+- [x] Full and range permissions are enforced before submission.
+- [x] The LLM can extract semantic selection/count but cannot set policy
   bounds, timeout, shards, concurrency, or worker.
-- [ ] Slack/GitHub conversational text has no CLI-style flag parser.
-- [ ] Benchmark-only and validation-only GitHub grants cannot authorize the
+- [x] Slack/GitHub conversational text has no CLI-style flag parser.
+- [x] Benchmark-only and validation-only GitHub grants cannot authorize the
   other task; scoped `Admin` implies both.
-- [ ] Revoked and wrong-scope GitHub grants fail closed before submission.
-- [ ] The role migration only adds the enum label; a separate committed
+- [x] Revoked and wrong-scope GitHub grants fail closed before submission.
+- [x] The role migration only adds the enum label; a separate committed
   application action creates the first grant, and rollback tests remove all
   such grants before an older binary reads `user_role`.
-- [ ] Checked-in daemon configuration loads and retired fields fail loudly.
+- [x] Checked-in daemon configuration loads and retired fields fail loudly.
 
 ### Phase 4: Implement Worker-Local Planning
 
@@ -489,12 +490,12 @@ configuration.
 
 **Acceptance & Validation:**
 
-- [ ] One block uses one shard and one process.
-- [ ] Remainders are balanced without gaps or overlaps.
-- [ ] `max_concurrency < shard_count` runs deterministic waves; concurrency
+- [x] One block uses one shard and one process.
+- [x] Remainders are balanced without gaps or overlaps.
+- [x] `max_concurrency < shard_count` runs deterministic waves; concurrency
   never exceeds shard count.
-- [ ] Full validation can use all local shards without requiring a daemon tip.
-- [ ] Cancellation, lease loss, setup failure, and malformed results remove
+- [x] Full validation can use all local shards without requiring a daemon tip.
+- [x] Cancellation, lease loss, setup failure, and malformed results remove
   every domain, mount, and snapshot.
 
 ### Phase 5: Converge Results and Reporting
@@ -510,11 +511,11 @@ configuration.
 
 **Acceptance & Validation:**
 
-- [ ] API, GitHub, and Slack consume one typed report projection.
-- [ ] Terminal output distinguishes requested selector, observed coverage, and
+- [x] API, GitHub, and Slack consume one typed report projection.
+- [x] Terminal output distinguishes requested selector, observed coverage, and
   resolved range.
-- [ ] Replayed older progress cannot regress a terminal snapshot.
-- [ ] A retry on a newer origin is visible rather than silently presented as
+- [x] Replayed older progress cannot regress a terminal snapshot.
+- [x] A retry on a newer origin is visible rather than silently presented as
   the same concrete execution.
 
 ### Phase 6: Ratchets, Documentation, and Real-Host Proof
@@ -531,7 +532,7 @@ the real worker.
 
 **Acceptance & Validation:**
 
-- [ ] No current code or reference docs describe a configured absolute default
+- [x] No current code or reference docs describe a configured absolute default
   range or daemon-selected shard/concurrency count.
 - [ ] A real natural-language Slack benchmark completes through v32's retained
   intent, authorization, submission, and reporting path.
@@ -560,19 +561,20 @@ the real worker.
 
 ## Final Validation
 
-- [ ] `just build --no-sccache`
-- [ ] `just lint --no-sccache`
-- [ ] `just test --summary --no-sccache`
-- [ ] `git diff --check`
-- [ ] Protobuf/domain boundary checks pass.
-- [ ] The configured daemon example and benchmark/block-validation worker
+- [x] `just build --no-sccache`
+- [x] `just lint --no-sccache`
+- [x] `just test --summary --no-sccache`
+- [x] `git diff --check`
+- [x] Protobuf/domain boundary checks pass.
+- [x] The configured daemon example and benchmark/block-validation worker
   examples remain parse-tested.
-- [ ] PostgreSQL migration and task-specific GitHub role/API/CLI tests pass.
-- [ ] The `0067` authorization slice receives a focused review of enum
+- [x] PostgreSQL migration and task-specific GitHub role/API/CLI tests pass.
+- [x] The `0067` authorization slice receives a focused review of enum
   migration, scoped role lookup, `Admin` implication, and the `/validate`
   fail-closed gate before the remaining Phase 3 intake changes land.
-- [ ] Existing benchmark submission, execution, and reporting behavior is
-  unchanged.
+- [x] Existing benchmark planning, submission, execution, and reporting are
+  unchanged. Slack benchmark intake intentionally becomes LLM-only; typed
+  API/CLI producers and exact GitHub triggers remain provider-free.
 - [ ] One natural-language Slack benchmark and one natural-language Slack
   recent-validation request complete without duplicate submissions/messages.
 - [ ] Recent, full, and explicit validation each complete on a real worker.
@@ -594,11 +596,17 @@ the real worker.
    concrete reporting.
 7. Run the full-history canary through both epoch segments before enabling
    natural-language full validation.
+8. After the first successful fleet deployment, pin the deployed protocol
+   revision's canonical semantic-digest vectors before making later wire or
+   digest changes.
 
 Rollback drains workers and restores the prior coordinated daemon/worker
 binaries and configuration. If v33 changes persisted production payloads,
 rollback follows the explicit migration/legacy-decoder plan selected in Phase
-1.
+1. Before restoring a pre-v33 daemon, hard-delete every
+`github_user_role.granted_role = 'trigger_block_validation'` row after taking
+a database backup. Soft revocation is insufficient because older binaries
+still deserialize revoked rows when listing grants.
 
 ## Deferred / Follow-Ups
 

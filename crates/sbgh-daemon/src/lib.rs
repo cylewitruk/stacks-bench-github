@@ -372,6 +372,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let api_state = api::ApiState {
         pool,
         ingest: api_ingest,
+        block_validation: block_validation_service,
         gh_api_base: config
             .github
             .api_base_url

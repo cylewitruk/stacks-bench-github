@@ -3,7 +3,7 @@
 //! The model-facing JSON is deliberately separate from [`WorkloadSpec`]: it can
 //! represent an invalid/ambiguous request, and it uses a strict-schema-friendly
 //! object shape. Daemon validation then normalizes it into the internal
-//! workload type used by both deterministic parsers and surface adapters.
+//! workload type consumed by task-submission adapters.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -62,7 +62,8 @@ pub enum IntentIssueField {
     Rev,
     VariantRefs,
     Repository,
-    ValidationEpoch,
+    ValidationSelection,
+    ValidationBlockCount,
     ValidationRange,
 }
 
@@ -101,9 +102,10 @@ pub struct IntentBlockRangeJson {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ValidationEpochIntent {
-    PreNakamoto,
-    Nakamoto,
+pub enum ValidationSelectionKind {
+    Recent,
+    Full,
+    Range,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -120,7 +122,8 @@ pub struct IntentResolutionJson {
     pub rev: Option<String>,
     pub variant_refs: Option<Vec<String>>,
     pub repository: Option<String>,
-    pub validation_epoch: Option<ValidationEpochIntent>,
+    pub validation_selection: Option<ValidationSelectionKind>,
+    pub validation_block_count: Option<u64>,
     pub validation_start: Option<u64>,
     pub validation_end: Option<u64>,
     pub reason: Option<String>,
@@ -135,8 +138,9 @@ pub struct RequestedSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationSelection {
-    DefaultPlan,
-    Range { epoch: ValidationEpochIntent, start: u64, end: u64 },
+    Recent { block_count: Option<u64> },
+    Full,
+    Range { start: u64, end: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +214,8 @@ impl IntentIssueField {
             Self::Rev => "rev",
             Self::VariantRefs => "variant refs",
             Self::Repository => "repository",
-            Self::ValidationEpoch => "validation epoch",
+            Self::ValidationSelection => "validation selection",
+            Self::ValidationBlockCount => "validation block count",
             Self::ValidationRange => "validation range",
         }
     }
@@ -264,7 +269,10 @@ fn validate_invalid_intent(
         || intent.variant_refs.is_some()
         || intent.repository.is_some()
         || intent
-            .validation_epoch
+            .validation_selection
+            .is_some()
+        || intent
+            .validation_block_count
             .is_some()
         || intent
             .validation_start
@@ -296,7 +304,8 @@ fn validate_resolved_benchmark(
     intent: IntentResolutionJson,
 ) -> Result<IntentOutcome, IntentValidationError> {
     require_absent(intent.repository, "repository")?;
-    require_absent(intent.validation_epoch, "validation_epoch")?;
+    require_absent(intent.validation_selection, "validation_selection")?;
+    require_absent(intent.validation_block_count, "validation_block_count")?;
     require_absent(intent.validation_start, "validation_start")?;
     require_absent(intent.validation_end, "validation_end")?;
     let target_kind = intent
@@ -403,10 +412,24 @@ fn validate_resolved_block_validation(
         repository: normalize_bounded_selector(intent.repository, "repository")?,
         revision: normalize_bounded_selector(intent.rev, "rev")?,
     };
-    let selection = match (intent.validation_epoch, intent.validation_start, intent.validation_end)
-    {
-        (None, None, None) => ValidationSelection::DefaultPlan,
-        (Some(epoch), Some(start), Some(end)) => {
+    let selection = match (
+        required(intent.validation_selection, "validation_selection")?,
+        intent.validation_block_count,
+        intent.validation_start,
+        intent.validation_end,
+    ) {
+        (ValidationSelectionKind::Recent, block_count, None, None) => {
+            if block_count == Some(0) {
+                return Err(IntentValidationError::InvalidValue {
+                    field: "validation_block_count",
+                    value: "0".into(),
+                    reason: "must be at least 1".into(),
+                });
+            }
+            ValidationSelection::Recent { block_count }
+        }
+        (ValidationSelectionKind::Full, None, None, None) => ValidationSelection::Full,
+        (ValidationSelectionKind::Range, None, Some(start), Some(end)) => {
             if start > end {
                 return Err(IntentValidationError::InvalidValue {
                     field: "validation_range",
@@ -414,11 +437,11 @@ fn validate_resolved_block_validation(
                     reason: "start must be <= end".into(),
                 });
             }
-            ValidationSelection::Range { epoch, start, end }
+            ValidationSelection::Range { start, end }
         }
         _ => {
             return Err(IntentValidationError::InvalidShape(
-                "validation range requires validation_epoch, validation_start, and validation_end"
+                "validation selector fields do not match the selected recent/full/range mode"
                     .into(),
             ));
         }
@@ -587,94 +610,6 @@ fn normalize_variant_refs(
     Ok(Some(variants))
 }
 
-/// Resolve the explicit, provider-free block-validation grammar.
-///
-/// `Ok(None)` means the input is not a validation command. Once the
-/// `validate` verb is present, malformed or partial flags fail closed instead
-/// of falling through to a provider.
-pub fn resolve_validation_command(text: &str) -> Result<Option<UserIntent>, IntentValidationError> {
-    let mut tokens = text
-        .split_whitespace()
-        .peekable();
-    if tokens.next() != Some("validate") {
-        return Ok(None);
-    }
-    if tokens
-        .peek()
-        .is_some_and(|token| !token.starts_with("--"))
-    {
-        return Ok(None);
-    }
-    let mut revision = None;
-    let mut epoch = None;
-    let mut start = None;
-    let mut end = None;
-    while let Some(flag) = tokens.next() {
-        let value = tokens.next().ok_or_else(|| {
-            IntentValidationError::InvalidShape(format!("{flag} requires a value"))
-        })?;
-        match flag {
-            "--rev" if revision.is_none() => revision = Some(value.to_string()),
-            "--epoch" if epoch.is_none() => {
-                epoch = Some(match value {
-                    "pre-nakamoto" => ValidationEpochIntent::PreNakamoto,
-                    "nakamoto" => ValidationEpochIntent::Nakamoto,
-                    _ => {
-                        return Err(IntentValidationError::InvalidValue {
-                            field: "validation_epoch",
-                            value: value.into(),
-                            reason: "expected pre-nakamoto or nakamoto".into(),
-                        });
-                    }
-                });
-            }
-            "--start-at" if start.is_none() => {
-                start = Some(parse_height("validation_start", value)?);
-            }
-            "--end-at" if end.is_none() => {
-                end = Some(parse_height("validation_end", value)?);
-            }
-            _ => {
-                return Err(IntentValidationError::InvalidShape(format!(
-                    "unknown or duplicate validation flag `{flag}`"
-                )));
-            }
-        }
-    }
-    let selection = match (epoch, start, end) {
-        (None, None, None) => ValidationSelection::DefaultPlan,
-        (Some(epoch), Some(start), Some(end)) if start <= end => {
-            ValidationSelection::Range { epoch, start, end }
-        }
-        (Some(_), Some(start), Some(end)) => {
-            return Err(IntentValidationError::InvalidValue {
-                field: "validation_range",
-                value: format!("{start}..{end}"),
-                reason: "start must be <= end".into(),
-            });
-        }
-        _ => {
-            return Err(IntentValidationError::InvalidShape(
-                "validation range requires --epoch, --start-at, and --end-at".into(),
-            ));
-        }
-    };
-    Ok(Some(UserIntent::Create(TaskCreationIntent::BlockValidation(BlockValidationIntent {
-        source: RequestedSource { repository: None, revision },
-        selection,
-    }))))
-}
-
-fn parse_height(field: &'static str, value: &str) -> Result<u64, IntentValidationError> {
-    value
-        .parse()
-        .map_err(|_| IntentValidationError::InvalidValue {
-            field,
-            value: value.into(),
-            reason: "expected a non-negative integer".into(),
-        })
-}
-
 /// JSON schema body for OpenAI `text.format` (`type = json_schema`).
 ///
 /// This is intentionally pinned rather than relying solely on generated schema:
@@ -700,7 +635,8 @@ pub fn intent_response_text_format() -> Value {
                 "rev",
                 "variant_refs",
                 "repository",
-                "validation_epoch",
+                "validation_selection",
+                "validation_block_count",
                 "validation_start",
                 "validation_end",
                 "reason",
@@ -759,10 +695,11 @@ pub fn intent_response_text_format() -> Value {
                     "type": ["string", "null"],
                     "description": "Optional repository selector for block validation; null uses configured repository."
                 },
-                "validation_epoch": {
+                "validation_selection": {
                     "type": ["string", "null"],
-                    "enum": ["pre_nakamoto", "nakamoto", null]
+                    "enum": ["recent", "full", "range", null]
                 },
+                "validation_block_count": { "type": ["integer", "null"], "minimum": 1 },
                 "validation_start": { "type": ["integer", "null"], "minimum": 0 },
                 "validation_end": { "type": ["integer", "null"], "minimum": 0 },
                 "reason": { "type": ["string", "null"] },
@@ -786,7 +723,8 @@ pub fn intent_response_text_format() -> Value {
                                     "rev",
                                     "variant_refs",
                                     "repository",
-                                    "validation_epoch",
+                                    "validation_selection",
+                                    "validation_block_count",
                                     "validation_range"
                                 ]
                             },
@@ -908,7 +846,15 @@ pub const EVAL_FIXTURES: &[IntentEvalFixture] = &[
         expected: EvalExpected::Resolved,
     },
     IntentEvalFixture {
-        prompt: "validate Nakamoto blocks 185700 through 186000 on abc123",
+        prompt: "validate the latest 500k blocks on commit abc123",
+        expected: EvalExpected::Resolved,
+    },
+    IntentEvalFixture {
+        prompt: "run full block validation on commit abc123",
+        expected: EvalExpected::Resolved,
+    },
+    IntentEvalFixture {
+        prompt: "validate global validation indices 185700 through 186000 on abc123",
         expected: EvalExpected::Resolved,
     },
     IntentEvalFixture {
@@ -981,7 +927,8 @@ mod tests {
             rev: None,
             variant_refs: None,
             repository: None,
-            validation_epoch: None,
+            validation_selection: None,
+            validation_block_count: None,
             validation_start: None,
             validation_end: None,
             reason: None,
@@ -1176,7 +1123,8 @@ mod tests {
             rev: None,
             variant_refs: None,
             repository: None,
-            validation_epoch: None,
+            validation_selection: None,
+            validation_block_count: None,
             validation_start: None,
             validation_end: None,
             reason: Some("I need a target".into()),
@@ -1225,7 +1173,8 @@ mod tests {
             rev: None,
             variant_refs: None,
             repository: None,
-            validation_epoch: None,
+            validation_selection: None,
+            validation_block_count: None,
             validation_start: None,
             validation_end: None,
             reason: Some("r".repeat(600)),
@@ -1314,7 +1263,8 @@ mod tests {
             rev: Some(" abc123 ".into()),
             variant_refs: None,
             repository: None,
-            validation_epoch: None,
+            validation_selection: Some(ValidationSelectionKind::Recent),
+            validation_block_count: None,
             validation_start: None,
             validation_end: None,
             reason: None,
@@ -1328,13 +1278,14 @@ mod tests {
                         repository: None,
                         revision: Some("abc123".into()),
                     },
-                    selection: ValidationSelection::DefaultPlan,
+                    selection: ValidationSelection::Recent { block_count: None },
                 }
             )))
         );
 
         let explicit = IntentResolutionJson {
-            validation_epoch: Some(ValidationEpochIntent::Nakamoto),
+            validation_selection: Some(ValidationSelectionKind::Range),
+            validation_block_count: None,
             validation_start: Some(100),
             validation_end: Some(200),
             ..IntentResolutionJson {
@@ -1349,7 +1300,8 @@ mod tests {
                 rev: None,
                 variant_refs: None,
                 repository: None,
-                validation_epoch: None,
+                validation_selection: None,
+                validation_block_count: None,
                 validation_start: None,
                 validation_end: None,
                 reason: None,
@@ -1360,11 +1312,7 @@ mod tests {
             validate_intent_resolution(explicit).unwrap(),
             IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::BlockValidation(
                 BlockValidationIntent {
-                    selection: ValidationSelection::Range {
-                        epoch: ValidationEpochIntent::Nakamoto,
-                        start: 100,
-                        end: 200,
-                    },
+                    selection: ValidationSelection::Range { start: 100, end: 200 },
                     ..
                 }
             )))
@@ -1393,7 +1341,8 @@ mod tests {
             rev: None,
             variant_refs: None,
             repository: None,
-            validation_epoch: Some(ValidationEpochIntent::Nakamoto),
+            validation_selection: Some(ValidationSelectionKind::Range),
+            validation_block_count: None,
             validation_start: Some(1),
             validation_end: None,
             reason: None,
@@ -1402,7 +1351,7 @@ mod tests {
         assert!(matches!(
             validate_intent_resolution(partial),
             Err(IntentValidationError::InvalidShape(message))
-                if message.contains("requires validation_epoch")
+                if message.contains("selector fields")
         ));
 
         let mut empty_source = IntentResolutionJson {
@@ -1417,7 +1366,8 @@ mod tests {
             rev: Some("  ".into()),
             variant_refs: None,
             repository: None,
-            validation_epoch: None,
+            validation_selection: Some(ValidationSelectionKind::Recent),
+            validation_block_count: None,
             validation_start: None,
             validation_end: None,
             reason: None,
@@ -1430,36 +1380,38 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_validation_command_is_strict_and_typed() {
-        assert_eq!(
-            resolve_validation_command("validate --rev abc123").unwrap(),
-            Some(UserIntent::Create(TaskCreationIntent::BlockValidation(BlockValidationIntent {
-                source: RequestedSource {
-                    repository: None,
-                    revision: Some("abc123".into()),
-                },
-                selection: ValidationSelection::DefaultPlan,
-            })))
-        );
-        assert!(matches!(
-            resolve_validation_command("validate --epoch nakamoto --start-at 10 --end-at 20")
-                .unwrap(),
-            Some(UserIntent::Create(TaskCreationIntent::BlockValidation(BlockValidationIntent {
-                selection: ValidationSelection::Range {
-                    epoch: ValidationEpochIntent::Nakamoto,
-                    start: 10,
-                    end: 20,
-                },
-                ..
-            })))
-        ));
-        assert!(
-            resolve_validation_command("bench --block 1")
-                .unwrap()
-                .is_none()
-        );
-        assert!(resolve_validation_command("validate --start-at 10").is_err());
-        assert!(resolve_validation_command("validate --cancel abc").is_err());
+    fn validation_selection_is_exhaustive_and_typed() {
+        for (kind, block_count, start, end) in [
+            (ValidationSelectionKind::Recent, Some(500_000), None, None),
+            (ValidationSelectionKind::Full, None, None, None),
+            (ValidationSelectionKind::Range, None, Some(10), Some(20)),
+        ] {
+            let intent = IntentResolutionJson {
+                status: ResolutionStatus::Resolved,
+                task_kind: Some(CreationTaskKind::BlockValidation),
+                target_kind: None,
+                block: None,
+                block_range: None,
+                txids: None,
+                repetitions: None,
+                warmup: None,
+                rev: None,
+                variant_refs: None,
+                repository: None,
+                validation_selection: Some(kind),
+                validation_block_count: block_count,
+                validation_start: start,
+                validation_end: end,
+                reason: None,
+                issues: None,
+            };
+            assert!(matches!(
+                validate_intent_resolution(intent),
+                Ok(IntentOutcome::Resolved(UserIntent::Create(
+                    TaskCreationIntent::BlockValidation(_)
+                )))
+            ));
+        }
     }
 
     #[test]
@@ -1485,7 +1437,8 @@ mod tests {
             "rev",
             "variant_refs",
             "repository",
-            "validation_epoch",
+            "validation_selection",
+            "validation_block_count",
             "validation_start",
             "validation_end",
             "reason",

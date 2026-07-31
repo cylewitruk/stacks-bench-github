@@ -7,7 +7,7 @@ use sbgh_core::submission::{
     BlockValidationPlan, PreparedSubmission, ProducerKey, ResolvedTaskSource,
     SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionProvenance, TaskPlan,
 };
-use sbgh_fleet::{BlockValidationPayload, InclusiveRange, ValidationEpoch};
+use sbgh_fleet::{BlockValidationPayload, InclusiveRange};
 use sbgh_postgres::db::{Pool, PostgresJobStore, setup_pg_db};
 use uuid::Uuid;
 
@@ -45,10 +45,9 @@ async fn seed_install_repo(pool: &Pool) {
 fn validation_submission() -> PreparedSubmission {
     let commit = "a".repeat(40);
     let payload = BlockValidationPayload {
-        epoch: ValidationEpoch::Nakamoto,
-        range: InclusiveRange { start: 10, end: 20 },
-        requested_shards: 2,
-        max_concurrency: 2,
+        selection: sbgh_fleet::BlockValidationSelection::Range {
+            range: InclusiveRange { start: 10, end: 20 },
+        },
         timeout_secs: 60,
     };
     PreparedSubmission {
@@ -77,10 +76,9 @@ fn validation_submission() -> PreparedSubmission {
             }),
             provenance: SubmissionProvenance {
                 queued_event_detail: serde_json::to_value(QueuedEventDetail::BlockValidation {
-                    range_start: 10,
-                    range_end: 20,
-                    requested_shards: 2,
-                    max_concurrency: 2,
+                    selection: sbgh_fleet::BlockValidationSelection::Range {
+                        range: InclusiveRange { start: 10, end: 20 },
+                    },
                 })
                 .unwrap(),
                 github: None,
@@ -111,22 +109,14 @@ async fn validation_report_joins_frozen_request_without_fabricating_a_verdict() 
     let TaskReport::BlockValidation(detail) = report.task else {
         panic!("expected block-validation detail")
     };
-    assert_eq!(
-        detail
-            .requested_range
-            .unwrap()
-            .start,
-        10
-    );
-    assert_eq!(
-        detail
-            .requested_range
-            .unwrap()
-            .end,
-        20
-    );
+    assert!(matches!(
+        detail.requested,
+        Some(sbgh_core::reporting::BlockValidationSelectionReport::Range {
+            range: sbgh_core::reporting::InclusiveReportRange { start: 10, end: 20 }
+        })
+    ));
     assert_eq!(detail.verdict, None);
-    assert_eq!(detail.observed_range, None);
+    assert_eq!(detail.observed, None);
 
     let worker_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
@@ -190,10 +180,13 @@ async fn validation_report_joins_frozen_request_without_fabricating_a_verdict() 
     .unwrap();
     sqlx::query(
         "INSERT INTO block_validation_result
-            (job_id, attempt_id, chainstate_origin, observed_start,
-             observed_end, valid, checked_blocks, invalid_blocks,
-             artifact_manifest)
-         VALUES ($1, $2, 'nightly-mainnet', 10, 20, FALSE, 11,
+            (job_id, attempt_id, chainstate_origin, pre_nakamoto_count,
+             nakamoto_count, resolved_start, resolved_end, epoch_segments,
+             shard_count, max_concurrency, valid, checked_blocks,
+             invalid_blocks, artifact_manifest)
+         VALUES ($1, $2, 'nightly-mainnet', 10, 11, 10, 20,
+                 '[{\"epoch\":\"nakamoto\",\"global_range\":{\"start\":10,\"end\":20},\
+                    \"local_range\":{\"start\":0,\"end\":10}}]', 2, 2, FALSE, 11,
                  '[{\"shard\":0,\"block\":\"15\",\"reason\":\"bad hash\"}]',
                  '[{\"key\":\"reports/full.json\",\"logical_key\":\"full\",\
                     \"size\":12,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]')",
@@ -221,7 +214,7 @@ async fn validation_report_joins_frozen_request_without_fabricating_a_verdict() 
     assert_eq!(detail.verdict, Some(sbgh_core::reporting::BlockValidationVerdict::Invalid));
     assert_eq!(
         detail
-            .observed_range
+            .resolved_range
             .unwrap()
             .end,
         20

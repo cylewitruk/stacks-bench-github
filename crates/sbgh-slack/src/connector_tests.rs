@@ -30,6 +30,7 @@ fn connector(
     slack: Arc<FakeSlackClient>,
 ) -> SlackConnector {
     SlackConnector::new(config(), queue, slack)
+        .with_intent_resolver(Arc::new(FakeIntentResolver::resolved(natural_language_spec())), 60)
 }
 
 struct FakeIntentResolver {
@@ -38,6 +39,15 @@ struct FakeIntentResolver {
 }
 
 impl FakeIntentResolver {
+    fn benchmark(request: BenchmarkRequest) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            outcome: Ok(IntentOutcome::Resolved(UserIntent::Create(
+                TaskCreationIntent::Benchmark(request),
+            ))),
+        }
+    }
+
     fn resolved(spec: WorkloadSpec) -> Self {
         Self {
             calls: AtomicUsize::new(0),
@@ -54,6 +64,13 @@ impl FakeIntentResolver {
         }
     }
 
+    fn invalid(message: &str) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            outcome: Ok(IntentOutcome::Invalid(sbgh_intent::IntentInvalid::new(message))),
+        }
+    }
+
     fn block_validation(revision: &str) -> Self {
         Self {
             calls: AtomicUsize::new(0),
@@ -63,7 +80,7 @@ impl FakeIntentResolver {
                         repository: None,
                         revision: Some(revision.into()),
                     },
-                    selection: ValidationSelection::DefaultPlan,
+                    selection: ValidationSelection::Recent { block_count: None },
                 }),
             ))),
         }
@@ -100,7 +117,7 @@ async fn authorized_request_posts_one_snapshot_and_enqueues() {
     let queue = Arc::new(RecordingTaskSubmissionPort::default());
     let slack = Arc::new(FakeSlackClient::default());
     connector(queue.clone(), slack.clone())
-        .handle_mention(event("<@BOT> bench --block 184231"))
+        .handle_mention(event("<@BOT> benchmark block 184231"))
         .await;
 
     let jobs = queue.jobs();
@@ -148,10 +165,10 @@ async fn redelivery_reconciles_by_stable_request_identity() {
     let slack = Arc::new(FakeSlackClient::default());
     let connector = connector(queue.clone(), slack.clone());
     connector
-        .handle_mention(event("<@BOT> bench --block 184231"))
+        .handle_mention(event("<@BOT> benchmark block 184231"))
         .await;
     connector
-        .handle_mention(event("<@BOT> bench --block 184231"))
+        .handle_mention(event("<@BOT> benchmark block 184231"))
         .await;
     assert_eq!(slack.posts().len(), 1, "the canonical message is adopted");
     assert_eq!(queue.jobs().len(), 1, "stable producer identity deduplicates work");
@@ -163,7 +180,7 @@ async fn lost_post_response_enqueues_without_timestamp_for_claim_time_reconcilia
     let slack = Arc::new(FakeSlackClient::default());
     slack.lose_next_post_response();
     connector(queue.clone(), slack.clone())
-        .handle_mention(event("<@BOT> bench --block 184231"))
+        .handle_mention(event("<@BOT> benchmark block 184231"))
         .await;
     let job = queue
         .jobs()
@@ -181,7 +198,7 @@ async fn lost_post_response_enqueues_without_timestamp_for_claim_time_reconcilia
 async fn unauthorized_request_neither_posts_nor_enqueues() {
     let queue = Arc::new(RecordingTaskSubmissionPort::default());
     let slack = Arc::new(FakeSlackClient::default());
-    let mut mention = event("<@BOT> bench --block 184231");
+    let mut mention = event("<@BOT> benchmark block 184231");
     mention.user = "U_DENIED".into();
     connector(queue.clone(), slack.clone())
         .handle_mention(mention)
@@ -197,7 +214,7 @@ async fn enqueue_failure_marks_the_single_snapshot_failed() {
     queue.fail_create();
     let slack = Arc::new(FakeSlackClient::default());
     connector(queue.clone(), slack.clone())
-        .handle_mention(event("<@BOT> bench --block 184231"))
+        .handle_mention(event("<@BOT> benchmark block 184231"))
         .await;
     assert!(queue.jobs().is_empty());
     assert_eq!(slack.posts().len(), 1);
@@ -217,10 +234,10 @@ async fn enqueue_failure_redelivery_never_restores_queued_snapshot() {
     let connector = connector(queue, slack.clone());
 
     connector
-        .handle_mention(event("<@BOT> bench --block 184231"))
+        .handle_mention(event("<@BOT> benchmark block 184231"))
         .await;
     connector
-        .handle_mention(event("<@BOT> bench --block 184231"))
+        .handle_mention(event("<@BOT> benchmark block 184231"))
         .await;
 
     assert_eq!(slack.posts().len(), 1);
@@ -234,17 +251,20 @@ async fn enqueue_failure_redelivery_never_restores_queued_snapshot() {
 }
 
 #[tokio::test]
-async fn malformed_workload_and_repetition_cap_reject_without_enqueue() {
+async fn invalid_provider_result_and_repetition_cap_reject_without_enqueue() {
     let queue = Arc::new(RecordingTaskSubmissionPort::default());
     let slack = Arc::new(FakeSlackClient::default());
-    let connector = connector(queue.clone(), slack.clone()).with_max_clean_repetitions(2);
-    let txid = format!("0x{}", "1".repeat(64));
-
-    connector
-        .handle_mention(event(&format!("<@BOT> bench --block 1 --txid {txid}")))
+    connector(queue.clone(), slack.clone())
+        .with_intent_resolver(Arc::new(FakeIntentResolver::invalid("only one target mode")), 5)
+        .with_max_clean_repetitions(2)
+        .handle_mention(event("<@BOT> benchmark incompatible targets"))
         .await;
-    connector
-        .handle_mention(event("<@BOT> bench --block 1 --repetitions 3"))
+    let mut too_many = natural_language_spec();
+    too_many.clean_repetitions = 3;
+    connector(queue.clone(), slack.clone())
+        .with_intent_resolver(Arc::new(FakeIntentResolver::resolved(too_many)), 5)
+        .with_max_clean_repetitions(2)
+        .handle_mention(event("<@BOT> benchmark this three times"))
         .await;
 
     assert!(queue.jobs().is_empty());
@@ -264,11 +284,14 @@ async fn malformed_workload_and_repetition_cap_reject_without_enqueue() {
 
 #[tokio::test]
 async fn clean_repetitions_require_cache_and_preserve_requested_count_when_enabled() {
+    let mut repeated = natural_language_spec();
+    repeated.clean_repetitions = 2;
     let disabled_queue = Arc::new(RecordingTaskSubmissionPort::default());
     let disabled_slack = Arc::new(FakeSlackClient::default());
     connector(disabled_queue.clone(), disabled_slack.clone())
+        .with_intent_resolver(Arc::new(FakeIntentResolver::resolved(repeated.clone())), 5)
         .with_max_clean_repetitions(5)
-        .handle_mention(event("<@BOT> bench --block 1 --repetitions 2"))
+        .handle_mention(event("<@BOT> benchmark this twice"))
         .await;
     assert!(
         disabled_queue
@@ -284,9 +307,10 @@ async fn clean_repetitions_require_cache_and_preserve_requested_count_when_enabl
     let enabled_queue = Arc::new(RecordingTaskSubmissionPort::default());
     let enabled_slack = Arc::new(FakeSlackClient::default());
     connector(enabled_queue.clone(), enabled_slack)
+        .with_intent_resolver(Arc::new(FakeIntentResolver::resolved(repeated)), 5)
         .with_max_clean_repetitions(5)
         .with_binary_cache_enabled(true)
-        .handle_mention(event("<@BOT> bench --block 1 --repetitions 2"))
+        .handle_mention(event("<@BOT> benchmark this twice"))
         .await;
     let job = &enabled_queue.jobs()[0];
     let detail: QueuedEventDetail = serde_json::from_value(
@@ -302,15 +326,28 @@ async fn clean_repetitions_require_cache_and_preserve_requested_count_when_enabl
 }
 
 #[tokio::test]
-async fn deterministic_comparison_enqueues_ordered_variants() {
+async fn provider_comparison_enqueues_ordered_variants() {
     let queue = Arc::new(RecordingTaskSubmissionPort::default());
     let slack = Arc::new(FakeSlackClient::default());
+    let comparison = sbgh_core::workload::ComparisonRequest {
+        workload: WorkloadSpec {
+            target: WorkloadTarget::BlockRange { start: 100, end: 102 },
+            clean_repetitions: 1,
+            warmup: None,
+            rev: None,
+        },
+        variants: vec![
+            sbgh_core::workload::ComparisonVariant { rev: "baseline".into() },
+            sbgh_core::workload::ComparisonVariant { rev: "candidate".into() },
+        ],
+    };
     connector(queue.clone(), slack)
+        .with_intent_resolver(
+            Arc::new(FakeIntentResolver::benchmark(BenchmarkRequest::Comparison(comparison))),
+            5,
+        )
         .with_binary_cache_enabled(true)
-        .handle_mention(event(
-            "<@BOT> bench --start-at 100 --count 3 --rev baseline \
-             --compare-rev candidate --repetitions 1",
-        ))
+        .handle_mention(event("<@BOT> compare baseline and candidate over blocks 100 to 102"))
         .await;
 
     let job = &queue.jobs()[0];
@@ -356,7 +393,7 @@ async fn natural_language_resolution_and_rate_limit_are_preserved() {
 }
 
 #[tokio::test]
-async fn deterministic_and_provider_validation_requests_enqueue_typed_tasks() {
+async fn validation_requests_are_always_provider_resolved() {
     let queue = Arc::new(RecordingTaskSubmissionPort::default());
     let slack = Arc::new(FakeSlackClient::default());
     let resolver = Arc::new(FakeIntentResolver::block_validation("natural-validation"));
@@ -366,21 +403,36 @@ async fn deterministic_and_provider_validation_requests_enqueue_typed_tasks() {
     connector
         .handle_mention(event("<@BOT> validate --rev explicit-validation"))
         .await;
+    assert_eq!(resolver.calls(), 0, "flag-like input is rejected before the provider");
+    assert!(queue.jobs().is_empty());
+    assert!(
+        slack.ephemeral()[0]
+            .2
+            .contains("natural language")
+    );
+
     let mut natural = event("<@BOT> please validate the Nakamoto blocks on my revision");
     natural.message_ts = "1700000000.000200".into();
     connector
         .handle_mention(natural)
         .await;
+    let mut another = event("<@BOT> validate the recent chainstate on my revision");
+    another.message_ts = "1700000000.000300".into();
+    connector
+        .handle_mention(another)
+        .await;
 
-    assert_eq!(resolver.calls(), 1, "explicit grammar bypasses the provider");
+    assert_eq!(resolver.calls(), 2);
     let jobs = queue.jobs();
     assert_eq!(jobs.len(), 2);
     assert!(
         jobs.iter()
             .all(|job| job.task_kind == TaskKind::BlockValidation)
     );
-    assert_eq!(jobs[0].git_ref_display, "explicit-validation");
-    assert_eq!(jobs[1].git_ref_display, "natural-validation");
+    assert!(
+        jobs.iter()
+            .all(|job| job.git_ref_display == "natural-validation")
+    );
     assert!(
         slack
             .posts()
@@ -428,7 +480,8 @@ async fn validation_only_user_is_admitted_but_cannot_submit_benchmark() {
         Some(vec!["U_OK".into()]),
     );
     SlackConnector::new(cfg, queue.clone(), slack.clone())
-        .handle_mention(event("<@BOT> bench --block 184231"))
+        .with_intent_resolver(Arc::new(FakeIntentResolver::resolved(natural_language_spec())), 5)
+        .handle_mention(event("<@BOT> benchmark block 184231"))
         .await;
 
     assert!(queue.jobs().is_empty());

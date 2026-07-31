@@ -6,9 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 use sbgh_driver::{
-    ArtifactSink, BenchmarkRunContext, BenchmarkTask, BlockValidationTaskSpec, ExecutionContext,
-    ExecutionPlacement, ExecutionRequest, ExecutionTask, InclusiveRange, RepositoryCredential,
-    Terminal, ValidationEpoch, WorkerEvent,
+    ArtifactSink, BenchmarkRunContext, BenchmarkTask, BlockValidationSelection,
+    BlockValidationTaskSpec, ExecutionContext, ExecutionPlacement, ExecutionRequest, ExecutionTask,
+    InclusiveRange, RepositoryCredential, Terminal, ValidationEpoch, WorkerEvent,
 };
 use sbgh_fleet::{
     AcceptOfferRequest, CompleteAttemptRequest, DesiredState, HeartbeatRequest, PROTOCOL_VERSION,
@@ -87,10 +87,36 @@ fn driver_block_result_to_wire(
             })
             .collect(),
         chainstate_origin: result.chainstate_origin,
-        observed_range: sbgh_fleet::InclusiveRange {
-            start: result.observed_range.start,
-            end: result.observed_range.end,
+        observed: sbgh_fleet::ObservedValidationIndex {
+            pre_nakamoto_count: result
+                .observed
+                .pre_nakamoto_count,
+            nakamoto_count: result.observed.nakamoto_count,
         },
+        resolved_range: sbgh_fleet::InclusiveRange {
+            start: result.resolved_range.start,
+            end: result.resolved_range.end,
+        },
+        segments: result
+            .segments
+            .into_iter()
+            .map(|segment| sbgh_fleet::ValidationEpochSegment {
+                epoch: match segment.epoch {
+                    ValidationEpoch::PreNakamoto => sbgh_fleet::ValidationEpoch::PreNakamoto,
+                    ValidationEpoch::Nakamoto => sbgh_fleet::ValidationEpoch::Nakamoto,
+                },
+                global_range: sbgh_fleet::InclusiveRange {
+                    start: segment.global_range.start,
+                    end: segment.global_range.end,
+                },
+                local_range: sbgh_fleet::InclusiveRange {
+                    start: segment.local_range.start,
+                    end: segment.local_range.end,
+                },
+            })
+            .collect(),
+        shard_count: result.shard_count,
+        max_concurrency: result.max_concurrency,
     }
 }
 
@@ -226,26 +252,15 @@ async fn admit_offer(config: &WorkerConfig, offer: &sbgh_fleet::WorkOffer) -> an
                 "offer capability/requirements mismatch"
             );
         }
-        sbgh_fleet::OfferRequirements::BlockValidation {
-            requested_shards,
-            max_concurrency,
-        } => {
+        sbgh_fleet::OfferRequirements::BlockValidation => {
             anyhow::ensure!(
                 offer.capability == sbgh_fleet::WorkerCapability::BlockValidation,
                 "offer capability/requirements mismatch"
             );
-            let profile = config
+            config
                 .block_validation
                 .as_ref()
                 .context("block-validation offer has no local sandbox profile")?;
-            anyhow::ensure!(
-                *requested_shards > 0 && *requested_shards <= profile.max_shards,
-                "block-validation offer exceeds local shard limit"
-            );
-            anyhow::ensure!(
-                *max_concurrency > 0 && *max_concurrency <= profile.max_concurrency,
-                "block-validation offer exceeds local concurrency limit"
-            );
             // Re-check the immutable local origin and current pool health
             // immediately before acceptance;
             // registration-time health is not a durable lease.
@@ -592,17 +607,22 @@ fn execution_request(
         }),
         TaskPayload::BuildOnly => ExecutionTask::BuildOnly,
         TaskPayload::BlockValidation(payload) => {
+            let selection = match &payload.selection {
+                sbgh_fleet::BlockValidationSelection::Recent { block_count } => {
+                    BlockValidationSelection::Recent { block_count: *block_count }
+                }
+                sbgh_fleet::BlockValidationSelection::Full => BlockValidationSelection::Full,
+                sbgh_fleet::BlockValidationSelection::Range { range } => {
+                    BlockValidationSelection::Range {
+                        range: InclusiveRange {
+                            start: range.start,
+                            end: range.end,
+                        },
+                    }
+                }
+            };
             ExecutionTask::BlockValidation(BlockValidationTaskSpec {
-                epoch: match payload.epoch {
-                    sbgh_fleet::ValidationEpoch::PreNakamoto => ValidationEpoch::PreNakamoto,
-                    sbgh_fleet::ValidationEpoch::Nakamoto => ValidationEpoch::Nakamoto,
-                },
-                range: InclusiveRange {
-                    start: payload.range.start,
-                    end: payload.range.end,
-                },
-                requested_shards: payload.requested_shards,
-                max_concurrency: payload.max_concurrency,
+                selection,
                 timeout_secs: payload.timeout_secs,
             })
         }
@@ -930,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_block_offer_is_rejected_before_sandbox_preflight_or_acceptance() {
+    async fn block_offer_rejects_a_capability_requirements_mismatch_before_preflight() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let config =
             WorkerConfig::load(&root.join("config.example.worker-block-validation.toml")).unwrap();
@@ -944,10 +964,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
             capability: WorkerCapability::BlockValidation,
-            requirements: OfferRequirements::BlockValidation {
-                requested_shards: 49,
-                max_concurrency: 48,
-            },
+            requirements: OfferRequirements::Benchmark,
             payload_hash: "ab".repeat(32),
             offer_expires_at_ms: i64::MAX,
         };
@@ -957,7 +974,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("shard limit")
+                .contains("capability/requirements mismatch")
         );
     }
 }

@@ -132,16 +132,11 @@ message AttemptIdentity {
   string lease_token = 4;
 }
 
-message BlockValidationRequirements {
-  uint32 requested_shards = 1;
-  uint32 max_concurrency = 2;
-}
-
 message OfferRequirements {
   oneof kind {
     Empty benchmark = 1;
     Empty build_only = 2;
-    BlockValidationRequirements block_validation = 3;
+    Empty block_validation = 3;
   }
 }
 
@@ -180,12 +175,21 @@ message InclusiveRange {
   uint64 end = 2;
 }
 
+message RecentBlockValidation {
+  uint64 block_count = 1;
+}
+
+message BlockValidationSelection {
+  oneof kind {
+    RecentBlockValidation recent = 1;
+    Empty full = 2;
+    InclusiveRange range = 3;
+  }
+}
+
 message BlockValidationPayload {
-  ValidationEpoch epoch = 1;
-  InclusiveRange range = 2;
-  uint32 requested_shards = 3;
-  uint32 max_concurrency = 4;
-  uint64 timeout_secs = 5;
+  BlockValidationSelection selection = 1;
+  uint64 timeout_secs = 2;
 }
 
 message TaskPayload {
@@ -313,12 +317,27 @@ message InvalidBlock {
   string reason = 3;
 }
 
+message ObservedValidationIndex {
+  uint64 pre_nakamoto_count = 1;
+  uint64 nakamoto_count = 2;
+}
+
+message ValidationEpochSegment {
+  ValidationEpoch epoch = 1;
+  InclusiveRange global_range = 2;
+  InclusiveRange local_range = 3;
+}
+
 message BlockValidationResult {
   bool valid = 1;
   uint64 checked_blocks = 2;
   repeated InvalidBlock invalid_blocks = 3;
   string chainstate_origin = 4;
-  InclusiveRange observed_range = 5;
+  ObservedValidationIndex observed = 5;
+  InclusiveRange resolved_range = 6;
+  repeated ValidationEpochSegment segments = 7;
+  uint32 shard_count = 8;
+  uint32 max_concurrency = 9;
 }
 
 message CompletedOutcome {

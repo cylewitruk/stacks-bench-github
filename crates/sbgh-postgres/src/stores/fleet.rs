@@ -4392,23 +4392,51 @@ async fn persist_block_result(
 ) -> sbgh_core::Result<()> {
     let invalid_blocks = serde_json::to_value(&result.invalid_blocks)
         .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
+    let epoch_segments = serde_json::to_value(&result.segments)
+        .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
     let artifact_manifest = serde_json::to_value(artifacts)
         .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
+    let durable_i64 = |field: &'static str, value: u64| {
+        i64::try_from(value).map_err(|_| {
+            sbgh_core::Error::Other(anyhow::anyhow!("{field} exceeds PostgreSQL BIGINT"))
+        })
+    };
+    let pre_nakamoto_count = durable_i64(
+        "pre_nakamoto_count",
+        result
+            .observed
+            .pre_nakamoto_count,
+    )?;
+    let nakamoto_count = durable_i64("nakamoto_count", result.observed.nakamoto_count)?;
+    let resolved_start = durable_i64("resolved_start", result.resolved_range.start)?;
+    let resolved_end = durable_i64("resolved_end", result.resolved_range.end)?;
+    let checked_blocks = durable_i64("checked_blocks", result.checked_blocks)?;
+    let shard_count = i32::try_from(result.shard_count)
+        .map_err(|_| sbgh_core::Error::Other(anyhow::anyhow!("shard_count exceeds INTEGER")))?;
+    let max_concurrency = i32::try_from(result.max_concurrency)
+        .map_err(|_| sbgh_core::Error::Other(anyhow::anyhow!("max_concurrency exceeds INTEGER")))?;
     sqlx::query(
         r#"
         INSERT INTO block_validation_result
-            (job_id, attempt_id, chainstate_origin, observed_start, observed_end,
-             valid, checked_blocks, invalid_blocks, artifact_manifest)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (job_id, attempt_id, chainstate_origin, pre_nakamoto_count,
+             nakamoto_count, resolved_start, resolved_end, epoch_segments,
+             shard_count, max_concurrency, valid, checked_blocks,
+             invalid_blocks, artifact_manifest)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         "#,
     )
     .bind(job_id)
     .bind(attempt_id)
     .bind(&result.chainstate_origin)
-    .bind(result.observed_range.start as i64)
-    .bind(result.observed_range.end as i64)
+    .bind(pre_nakamoto_count)
+    .bind(nakamoto_count)
+    .bind(resolved_start)
+    .bind(resolved_end)
+    .bind(epoch_segments)
+    .bind(shard_count)
+    .bind(max_concurrency)
     .bind(result.valid)
-    .bind(result.checked_blocks as i64)
+    .bind(checked_blocks)
     .bind(invalid_blocks)
     .bind(artifact_manifest)
     .execute(&mut **tx)

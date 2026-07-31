@@ -124,8 +124,10 @@ bytes remain outside gRPC.
   and measurement profile.
 - **Build-only** jobs populate the same fingerprinted executable cache without
   producing an external report.
-- **Block validation** runs one resource-profiled VM with bounded shard and
-  concurrency policy and produces a typed positive or negative verdict.
+- **Block validation** persists a semantic `recent`, `full`, or explicit-range
+  selector. The selected worker resolves it against guest-observed chainstate
+  coverage, sizes shards from local policy, and produces a typed positive or
+  negative verdict.
 
 Moving a partial benchmark comparison to a different worker is never
 automatic. Explicit recovery creates a new execution generation and restarts
@@ -152,8 +154,9 @@ naming prefix. For each attempt, the trusted adapter:
 5. tears down the VM, mounts, loops, and LVs before acknowledging cleanup.
 
 Benchmark execution uses one snapshot. Block validation uses K private
-snapshots, stable virtio-scsi serials, and XFS `nouuid`. K is bounded by the
-worker's CPU, memory, device, shard, and concurrency policy; it is not used for
+snapshots, stable virtio-scsi serials, and XFS `nouuid`. The worker computes K
+from the resolved block count, its target-blocks-per-shard policy, and its
+CPU/memory/device ceilings; it is not supplied by intake and is not used for
 speculative disk-write reservation.
 
 The guest builds or reuses `stacks-bench` or `stacks-inspect` through a

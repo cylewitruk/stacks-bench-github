@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use sbgh_core::models::{BuildTarget, GitRefKind, JobIntent, JobSource, TaskKind};
 use sbgh_core::submission::{
-    GithubSubmissionProvenance, ProducerKey, ResolvedTaskSource, SubmissionActor,
-    SubmissionProvenance,
+    GithubSubmissionProvenance, ProducerKey, ResolvedTaskSource, SchedulingConstraints,
+    SubmissionActor, SubmissionProvenance,
 };
 
 use crate::block_validation_submission::{
@@ -24,9 +24,13 @@ impl PostgresBlockValidationQueue {
 #[async_trait::async_trait]
 impl BlockValidationQueue for PostgresBlockValidationQueue {
     async fn enqueue(&self, request: BlockValidationJobRequest) -> sbgh_core::Result<()> {
+        let selection = self
+            .service
+            .resolve_user_selection(&request.selection)
+            .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
         let detail = self
             .service
-            .queued_detail(&request.range)?;
+            .queued_detail(&selection)?;
         self.service
             .submit(BlockValidationSubmission {
                 source: ResolvedTaskSource {
@@ -42,8 +46,8 @@ impl BlockValidationQueue for PostgresBlockValidationQueue {
                     committed_at: None,
                     workload_key: None,
                 },
-                epoch: request.epoch,
-                range: request.range,
+                selection,
+                constraints: SchedulingConstraints::default(),
                 actor: SubmissionActor::GithubUser {
                     user_id: request.triggering_user_id,
                 },
@@ -63,6 +67,7 @@ impl BlockValidationQueue for PostgresBlockValidationQueue {
                 },
             })
             .await
+            .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))
             .map(|_| ())
     }
 }
@@ -77,7 +82,8 @@ mod tests {
     use sbgh_core::submission::{
         PreparedSubmission, SubmissionDisposition, SubmissionError, SubmissionReceipt, TaskPlan,
     };
-    use sbgh_fleet::{InclusiveRange, ValidationEpoch};
+    use sbgh_fleet::{BlockValidationSelection, InclusiveRange};
+    use sbgh_intent::ValidationSelection;
     use uuid::Uuid;
 
     use super::*;
@@ -109,12 +115,10 @@ mod tests {
         let service = Arc::new(BlockValidationSubmissionService::new(
             store.clone(),
             BlockValidationTaskConfig {
-                default_epoch: ValidationEpoch::Nakamoto,
-                default_range_start: 100,
-                default_range_end: 200,
-                requested_shards: 8,
-                max_concurrency: 4,
+                default_recent_blocks: 100,
+                max_recent_blocks: 200,
                 timeout_secs: 300,
+                allow_full_validation: true,
                 allow_range_override: true,
             },
         ));
@@ -129,8 +133,7 @@ mod tests {
                 triggering_user_id: 14,
                 github_pull_request_id: 15,
                 triggering_comment_id: 16,
-                epoch: ValidationEpoch::Nakamoto,
-                range: InclusiveRange { start: 17, end: 18 },
+                selection: ValidationSelection::Range { start: 17, end: 18 },
             })
             .await
             .unwrap();
@@ -159,10 +162,12 @@ mod tests {
         );
         assert_eq!(plan.source.github_repo_id, 12);
         assert_eq!(plan.source.commit, "a".repeat(40));
-        assert_eq!(plan.payload.epoch, ValidationEpoch::Nakamoto);
-        assert_eq!(plan.payload.range, InclusiveRange { start: 17, end: 18 });
-        assert_eq!(plan.payload.requested_shards, 8);
-        assert_eq!(plan.payload.max_concurrency, 4);
+        assert_eq!(
+            plan.payload.selection,
+            BlockValidationSelection::Range {
+                range: InclusiveRange { start: 17, end: 18 }
+            }
+        );
         assert_eq!(plan.payload.timeout_secs, 300);
         assert_eq!(
             prepared

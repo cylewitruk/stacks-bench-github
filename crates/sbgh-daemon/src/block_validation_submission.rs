@@ -7,10 +7,41 @@ use sbgh_core::db::SubmissionStore;
 use sbgh_core::models::{QueuedEventDetail, TaskKind};
 use sbgh_core::submission::{
     BlockValidationPlan, ProducerKey, ResolvedTaskSource, SchedulingConstraints, SubmissionActor,
-    SubmissionCommand, SubmissionProvenance, SubmissionReceipt, TaskPlan,
+    SubmissionCommand, SubmissionError, SubmissionProvenance, SubmissionReceipt, TaskPlan,
 };
-use sbgh_fleet::{BlockValidationPayload, InclusiveRange, TaskPayload, Validate, ValidationEpoch};
-use sbgh_intent::{ValidationEpochIntent, ValidationSelection};
+use sbgh_fleet::{
+    BlockValidationPayload, BlockValidationSelection, InclusiveRange, TaskPayload, Validate,
+};
+use sbgh_intent::ValidationSelection;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockValidationSelectionError {
+    RecentCountOutOfBounds { max: u64 },
+    FullDisabled,
+    RangeDisabled,
+    ReversedRange,
+    RangeOutOfBounds,
+}
+
+impl std::fmt::Display for BlockValidationSelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecentCountOutOfBounds { max } => {
+                write!(formatter, "requested recent block count must be within 1..={max}")
+            }
+            Self::FullDisabled => formatter.write_str("full block validation is disabled"),
+            Self::RangeDisabled => {
+                formatter.write_str("block-validation range overrides are disabled")
+            }
+            Self::ReversedRange => formatter.write_str("block-validation range is reversed"),
+            Self::RangeOutOfBounds => {
+                formatter.write_str("block-validation range exceeds the durable integer range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlockValidationSelectionError {}
 
 pub struct BlockValidationSubmissionService {
     store: Arc<dyn SubmissionStore>,
@@ -19,8 +50,8 @@ pub struct BlockValidationSubmissionService {
 
 pub struct BlockValidationSubmission {
     pub source: ResolvedTaskSource,
-    pub epoch: ValidationEpoch,
-    pub range: InclusiveRange,
+    pub selection: BlockValidationSelection,
+    pub constraints: SchedulingConstraints,
     pub actor: SubmissionActor,
     pub producer_key: ProducerKey,
     pub provenance: SubmissionProvenance,
@@ -34,83 +65,84 @@ impl BlockValidationSubmissionService {
     pub fn resolve_user_selection(
         &self,
         selection: &ValidationSelection,
-    ) -> sbgh_core::Result<(ValidationEpoch, InclusiveRange)> {
+    ) -> Result<BlockValidationSelection, BlockValidationSelectionError> {
         resolve_user_selection(&self.policy, selection)
     }
 
     pub async fn submit(
         &self,
         request: BlockValidationSubmission,
-    ) -> sbgh_core::Result<SubmissionReceipt> {
+    ) -> Result<SubmissionReceipt, SubmissionError> {
         if request.source.task_kind != TaskKind::BlockValidation {
-            return Err(sbgh_core::Error::Config(
+            return Err(SubmissionError::Invalid(
                 "block-validation submission received a non-validation source".into(),
             ));
         }
         let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-            epoch: request.epoch,
-            range: request.range.clone(),
-            requested_shards: self.policy.requested_shards,
-            max_concurrency: self.policy.max_concurrency,
+            selection: request.selection,
             timeout_secs: self.policy.timeout_secs,
         });
         payload
             .validate()
-            .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
+            .map_err(|error| SubmissionError::Invalid(error.to_string()))?;
         let TaskPayload::BlockValidation(payload) = payload else {
             unreachable!("constructed as block validation")
         };
         let command = SubmissionCommand {
             actor: request.actor,
             producer_key: request.producer_key,
-            constraints: SchedulingConstraints::default(),
+            constraints: request.constraints,
             task: TaskPlan::BlockValidation(BlockValidationPlan {
                 source: request.source,
                 payload,
             }),
             provenance: request.provenance,
         };
-        crate::submission::submit(self.store.as_ref(), command)
-            .await
-            .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))
+        crate::submission::submit(self.store.as_ref(), command).await
     }
 
-    pub fn queued_detail(&self, range: &InclusiveRange) -> sbgh_core::Result<serde_json::Value> {
-        serde_json::to_value(QueuedEventDetail::BlockValidation {
-            range_start: range.start,
-            range_end: range.end,
-            requested_shards: self.policy.requested_shards,
-            max_concurrency: self.policy.max_concurrency,
-        })
-        .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))
+    pub fn queued_detail(
+        &self,
+        selection: &BlockValidationSelection,
+    ) -> sbgh_core::Result<serde_json::Value> {
+        serde_json::to_value(QueuedEventDetail::BlockValidation { selection: selection.clone() })
+            .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))
     }
 }
 
 fn resolve_user_selection(
     policy: &BlockValidationTaskConfig,
     selection: &ValidationSelection,
-) -> sbgh_core::Result<(ValidationEpoch, InclusiveRange)> {
+) -> Result<BlockValidationSelection, BlockValidationSelectionError> {
     match selection {
-        ValidationSelection::DefaultPlan => Ok((
-            policy.default_epoch,
-            InclusiveRange {
-                start: policy.default_range_start,
-                end: policy.default_range_end,
-            },
-        )),
-        ValidationSelection::Range { epoch, start, end } => {
-            if !policy.allow_range_override {
-                return Err(sbgh_core::Error::Config(
-                    "block-validation range overrides are disabled".into(),
-                ));
+        ValidationSelection::Recent { block_count } => {
+            let block_count = block_count.unwrap_or(policy.default_recent_blocks);
+            if block_count == 0 || block_count > policy.max_recent_blocks {
+                return Err(BlockValidationSelectionError::RecentCountOutOfBounds {
+                    max: policy.max_recent_blocks,
+                });
             }
-            Ok((
-                match epoch {
-                    ValidationEpochIntent::PreNakamoto => ValidationEpoch::PreNakamoto,
-                    ValidationEpochIntent::Nakamoto => ValidationEpoch::Nakamoto,
-                },
-                InclusiveRange { start: *start, end: *end },
-            ))
+            Ok(BlockValidationSelection::Recent { block_count })
+        }
+        ValidationSelection::Full => {
+            if !policy.allow_full_validation {
+                return Err(BlockValidationSelectionError::FullDisabled);
+            }
+            Ok(BlockValidationSelection::Full)
+        }
+        ValidationSelection::Range { start, end } => {
+            if !policy.allow_range_override {
+                return Err(BlockValidationSelectionError::RangeDisabled);
+            }
+            if start > end {
+                return Err(BlockValidationSelectionError::ReversedRange);
+            }
+            if *end >= i64::MAX as u64 {
+                return Err(BlockValidationSelectionError::RangeOutOfBounds);
+            }
+            Ok(BlockValidationSelection::Range {
+                range: InclusiveRange { start: *start, end: *end },
+            })
         }
     }
 }
@@ -130,33 +162,37 @@ mod tests {
 
     fn policy(allow_range_override: bool) -> BlockValidationTaskConfig {
         BlockValidationTaskConfig {
-            default_epoch: ValidationEpoch::Nakamoto,
-            default_range_start: 100,
-            default_range_end: 200,
-            requested_shards: 8,
-            max_concurrency: 4,
+            default_recent_blocks: 100,
+            max_recent_blocks: 200,
             timeout_secs: 300,
+            allow_full_validation: true,
             allow_range_override,
         }
     }
 
     #[test]
-    fn default_and_allowed_override_are_resolved_from_server_policy() {
+    fn recent_full_and_allowed_range_are_resolved_from_server_policy() {
         assert_eq!(
-            resolve_user_selection(&policy(false), &ValidationSelection::DefaultPlan).unwrap(),
-            (ValidationEpoch::Nakamoto, InclusiveRange { start: 100, end: 200 })
+            resolve_user_selection(
+                &policy(false),
+                &ValidationSelection::Recent { block_count: None }
+            )
+            .unwrap(),
+            BlockValidationSelection::Recent { block_count: 100 }
         );
         assert_eq!(
             resolve_user_selection(
                 &policy(true),
-                &ValidationSelection::Range {
-                    epoch: ValidationEpochIntent::PreNakamoto,
-                    start: 10,
-                    end: 20,
-                }
+                &ValidationSelection::Range { start: 10, end: 20 }
             )
             .unwrap(),
-            (ValidationEpoch::PreNakamoto, InclusiveRange { start: 10, end: 20 })
+            BlockValidationSelection::Range {
+                range: InclusiveRange { start: 10, end: 20 }
+            }
+        );
+        assert_eq!(
+            resolve_user_selection(&policy(true), &ValidationSelection::Full).unwrap(),
+            BlockValidationSelection::Full
         );
     }
 
@@ -165,14 +201,41 @@ mod tests {
         assert!(
             resolve_user_selection(
                 &policy(false),
-                &ValidationSelection::Range {
-                    epoch: ValidationEpochIntent::Nakamoto,
-                    start: 10,
-                    end: 20,
-                }
+                &ValidationSelection::Range { start: 10, end: 20 }
             )
             .is_err()
         );
+        assert_eq!(
+            resolve_user_selection(
+                &policy(true),
+                &ValidationSelection::Range { start: 0, end: i64::MAX as u64 },
+            ),
+            Err(BlockValidationSelectionError::RangeOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn recent_count_and_full_mode_are_bounded_by_server_policy() {
+        assert_eq!(
+            resolve_user_selection(
+                &policy(false),
+                &ValidationSelection::Recent { block_count: Some(200) }
+            )
+            .unwrap(),
+            BlockValidationSelection::Recent { block_count: 200 }
+        );
+        for block_count in [0, 201] {
+            assert!(
+                resolve_user_selection(
+                    &policy(false),
+                    &ValidationSelection::Recent { block_count: Some(block_count) }
+                )
+                .is_err()
+            );
+        }
+        let mut no_full = policy(false);
+        no_full.allow_full_validation = false;
+        assert!(resolve_user_selection(&no_full, &ValidationSelection::Full).is_err());
     }
 
     #[derive(Default)]
@@ -216,15 +279,17 @@ mod tests {
     async fn github_and_slack_share_one_payload_planner() {
         let store = Arc::new(RecordingStore::default());
         let service = BlockValidationSubmissionService::new(store.clone(), policy(true));
-        let range = InclusiveRange { start: 10, end: 20 };
+        let selection = BlockValidationSelection::Range {
+            range: InclusiveRange { start: 10, end: 20 },
+        };
         let detail = service
-            .queued_detail(&range)
+            .queued_detail(&selection)
             .unwrap();
         service
             .submit(BlockValidationSubmission {
                 source: source(JobSource::GithubComment),
-                epoch: ValidationEpoch::Nakamoto,
-                range: range.clone(),
+                selection: selection.clone(),
+                constraints: SchedulingConstraints::default(),
                 actor: SubmissionActor::GithubUser { user_id: 7 },
                 producer_key: ProducerKey {
                     namespace: "github_webhook".into(),
@@ -246,8 +311,8 @@ mod tests {
         service
             .submit(BlockValidationSubmission {
                 source: source(JobSource::Slack),
-                epoch: ValidationEpoch::Nakamoto,
-                range,
+                selection,
+                constraints: SchedulingConstraints::default(),
                 actor: SubmissionActor::SlackUser {
                     team_id: "T1".into(),
                     user_id: "U1".into(),
@@ -280,8 +345,12 @@ mod tests {
             })
             .collect();
         assert_eq!(payloads[0], payloads[1]);
-        assert_eq!(payloads[0].requested_shards, 8);
-        assert_eq!(payloads[0].max_concurrency, 4);
+        assert_eq!(
+            payloads[0].selection,
+            BlockValidationSelection::Range {
+                range: InclusiveRange { start: 10, end: 20 }
+            }
+        );
         assert_eq!(payloads[0].timeout_secs, 300);
     }
 }

@@ -59,7 +59,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{BlockValidationPayload, InclusiveRange, TaskPayload, ValidationEpoch};
+    use crate::{BlockValidationPayload, BlockValidationSelection, InclusiveRange, TaskPayload};
 
     #[test]
     fn digest_is_independent_of_object_insertion_order() {
@@ -70,19 +70,36 @@ mod tests {
 
     #[test]
     fn digest_changes_when_semantic_payload_changes() {
-        let original = TaskPayload::BlockValidation(BlockValidationPayload {
-            epoch: ValidationEpoch::Nakamoto,
-            range: InclusiveRange { start: 10, end: 20 },
-            requested_shards: 4,
-            max_concurrency: 2,
+        let original = BlockValidationPayload {
+            selection: BlockValidationSelection::Recent { block_count: 500_000 },
             timeout_secs: 600,
-        });
-        let mut changed = original.clone();
-        let TaskPayload::BlockValidation(changed) = &mut changed else {
-            unreachable!();
         };
-        changed.range.end += 1;
-
-        assert_ne!(payload_digest(&original).unwrap(), payload_digest(&changed).unwrap());
+        let original_digest =
+            payload_digest(&TaskPayload::BlockValidation(original.clone())).unwrap();
+        for changed in [
+            BlockValidationPayload {
+                selection: BlockValidationSelection::Recent { block_count: 500_001 },
+                ..original.clone()
+            },
+            BlockValidationPayload {
+                selection: BlockValidationSelection::Full,
+                ..original.clone()
+            },
+            BlockValidationPayload {
+                selection: BlockValidationSelection::Range {
+                    range: InclusiveRange { start: 10, end: 20 },
+                },
+                ..original.clone()
+            },
+            BlockValidationPayload {
+                timeout_secs: 601,
+                ..original.clone()
+            },
+        ] {
+            assert_ne!(
+                original_digest,
+                payload_digest(&TaskPayload::BlockValidation(changed)).unwrap()
+            );
+        }
     }
 }

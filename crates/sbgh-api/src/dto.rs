@@ -146,7 +146,7 @@ pub struct JobView {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnqueueBlockValidationRequest {
     /// Caller-stable key used to reconcile retries without duplicating work.
@@ -156,13 +156,15 @@ pub struct EnqueueBlockValidationRequest {
     pub commit: String,
     /// Optional operator placement constraint. Ordinary demand is unpinned.
     pub worker_id: Option<String>,
-    /// `pre_nakamoto` or `nakamoto`.
-    pub epoch: String,
-    pub range_start: u64,
-    pub range_end: u64,
-    pub requested_shards: u32,
-    pub max_concurrency: u32,
-    pub timeout_secs: u64,
+    pub selection: BlockValidationSelectionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BlockValidationSelectionRequest {
+    Recent { block_count: Option<u64> },
+    Full,
+    Range { start: u64, end: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,12 +230,39 @@ pub struct BuildOnlyReportDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockValidationReportDetail {
-    pub requested_range: Option<ReportRange>,
-    pub observed_range: Option<ReportRange>,
+    pub requested: Option<BlockValidationSelectionDetail>,
+    pub observed: Option<ObservedValidationIndexDetail>,
+    pub resolved_range: Option<ReportRange>,
+    pub segments: Vec<ValidationEpochSegmentDetail>,
+    pub shard_count: Option<u32>,
+    pub max_concurrency: Option<u32>,
     pub verdict: Option<String>,
     pub checked_blocks: Option<u64>,
     pub chainstate_origin: Option<String>,
     pub invalid_blocks: Vec<InvalidBlockDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BlockValidationSelectionDetail {
+    Recent { block_count: u64 },
+    Full,
+    Range { range: ReportRange },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedValidationIndexDetail {
+    pub pre_nakamoto_count: u64,
+    pub nakamoto_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationEpochSegmentDetail {
+    pub epoch: String,
+    pub global_range: ReportRange,
+    pub local_range: ReportRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,7 +487,8 @@ pub struct PinTriggerRequest {
 }
 
 /// Exactly one of `login` / `user_id`. `repo` narrows the grant; omit for
-/// install-wide. `role` is `admin` / `trigger_pr_benchmark` / `view_results`.
+/// install-wide. `role` is `admin`, `trigger_pr_benchmark`,
+/// `trigger_block_validation`, or `view_results`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleRequest {
@@ -482,7 +512,9 @@ pub struct GrantRoleResult {
 
 #[cfg(test)]
 mod tests {
-    use super::FleetRecoveryResponse;
+    use super::{
+        BlockValidationSelectionRequest, EnqueueBlockValidationRequest, FleetRecoveryResponse,
+    };
 
     #[test]
     fn fleet_recovery_response_uses_submission_identity_fields() {
@@ -506,5 +538,35 @@ mod tests {
                 .get("new_group_id")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn block_validation_selector_round_trips_and_rejects_retired_plan_fields() {
+        let request = EnqueueBlockValidationRequest {
+            idempotency_key: "operator/1".into(),
+            install_id: 1,
+            repo_id: 2,
+            commit: "a".repeat(40),
+            worker_id: None,
+            selection: BlockValidationSelectionRequest::Recent { block_count: Some(500_000) },
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["selection"]["kind"], "recent");
+        assert_eq!(encoded["selection"]["block_count"], 500_000);
+        assert_eq!(
+            serde_json::from_value::<EnqueueBlockValidationRequest>(encoded).unwrap(),
+            request
+        );
+
+        let retired = serde_json::json!({
+            "idempotency_key": "operator/1",
+            "install_id": 1,
+            "repo_id": 2,
+            "commit": "a".repeat(40),
+            "worker_id": null,
+            "selection": {"kind": "full"},
+            "requested_shards": 8
+        });
+        assert!(serde_json::from_value::<EnqueueBlockValidationRequest>(retired).is_err());
     }
 }

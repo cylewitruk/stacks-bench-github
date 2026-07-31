@@ -179,6 +179,10 @@ mod tests {
             };
             *self.seen.lock().unwrap() =
                 Some((context.attempt_id, context.fencing_generation, spec.clone()));
+            let range = match &spec.selection {
+                sbgh_driver::BlockValidationSelection::Range { range } => *range,
+                _ => sbgh_driver::InclusiveRange { start: 10, end: 12 },
+            };
             Ok(DriverOutcome {
                 status: sbgh_driver::DriverStatus::Completed,
                 summary: serde_json::json!({"sandbox": "libvirt"}),
@@ -188,7 +192,18 @@ mod tests {
                         checked_blocks: 3,
                         invalid_blocks: Vec::new(),
                         chainstate_origin: "vg/mainnet-latest".into(),
-                        observed_range: spec.range,
+                        observed: sbgh_driver::ObservedValidationIndex {
+                            pre_nakamoto_count: 10,
+                            nakamoto_count: 3,
+                        },
+                        resolved_range: range,
+                        segments: vec![sbgh_driver::ValidationEpochSegment {
+                            epoch: sbgh_driver::ValidationEpoch::Nakamoto,
+                            global_range: range,
+                            local_range: sbgh_driver::InclusiveRange { start: 0, end: 2 },
+                        }],
+                        shard_count: 3,
+                        max_concurrency: 2,
                     },
                 ),
             })
@@ -230,10 +245,9 @@ mod tests {
     async fn block_validation_uses_the_common_driver_boundary_with_attempt_identity() {
         let attempt_id = Uuid::new_v4();
         let spec = BlockValidationTaskSpec {
-            epoch: sbgh_driver::ValidationEpoch::Nakamoto,
-            range: sbgh_driver::InclusiveRange { start: 10, end: 12 },
-            requested_shards: 3,
-            max_concurrency: 2,
+            selection: sbgh_driver::BlockValidationSelection::Range {
+                range: sbgh_driver::InclusiveRange { start: 10, end: 12 },
+            },
             timeout_secs: 60,
         };
         let driver = Arc::new(RecordingBlockDriver { seen: Mutex::new(None) });
@@ -286,10 +300,9 @@ mod tests {
                     repository_credential: None,
                 },
                 task: ExecutionTask::BlockValidation(BlockValidationTaskSpec {
-                    epoch: sbgh_driver::ValidationEpoch::Nakamoto,
-                    range: sbgh_driver::InclusiveRange { start: 10, end: 12 },
-                    requested_shards: 3,
-                    max_concurrency: 2,
+                    selection: sbgh_driver::BlockValidationSelection::Range {
+                        range: sbgh_driver::InclusiveRange { start: 10, end: 12 },
+                    },
                     timeout_secs: 60,
                 }),
                 placement: ExecutionPlacement::default(),

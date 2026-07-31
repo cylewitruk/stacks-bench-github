@@ -112,7 +112,7 @@ pub struct WorkOffer {
 pub enum OfferRequirements {
     Benchmark,
     BuildOnly,
-    BlockValidation { requested_shards: u32, max_concurrency: u32 },
+    BlockValidation,
 }
 
 impl From<&TaskPayload> for OfferRequirements {
@@ -120,10 +120,7 @@ impl From<&TaskPayload> for OfferRequirements {
         match payload {
             TaskPayload::Benchmark(_) => Self::Benchmark,
             TaskPayload::BuildOnly => Self::BuildOnly,
-            TaskPayload::BlockValidation(payload) => Self::BlockValidation {
-                requested_shards: payload.requested_shards,
-                max_concurrency: payload.max_concurrency,
-            },
+            TaskPayload::BlockValidation(_) => Self::BlockValidation,
         }
     }
 }
@@ -174,11 +171,16 @@ pub struct InclusiveRange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockValidationSelection {
+    Recent { block_count: u64 },
+    Full,
+    Range { range: InclusiveRange },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockValidationPayload {
-    pub epoch: ValidationEpoch,
-    pub range: InclusiveRange,
-    pub requested_shards: u32,
-    pub max_concurrency: u32,
+    pub selection: BlockValidationSelection,
     pub timeout_secs: u64,
 }
 
@@ -336,6 +338,19 @@ pub struct InvalidBlock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedValidationIndex {
+    pub pre_nakamoto_count: u64,
+    pub nakamoto_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationEpochSegment {
+    pub epoch: ValidationEpoch,
+    pub global_range: InclusiveRange,
+    pub local_range: InclusiveRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockValidationResult {
     pub valid: bool,
     pub checked_blocks: u64,
@@ -343,7 +358,13 @@ pub struct BlockValidationResult {
     /// Exact local RO LVM origin selected by the worker.
     pub chainstate_origin: String,
     /// Coverage observed inside the guest before validation began.
-    pub observed_range: InclusiveRange,
+    pub observed: ObservedValidationIndex,
+    /// Concrete attempt-scoped range resolved from the durable selector.
+    pub resolved_range: InclusiveRange,
+    /// Epoch-local commands which exactly cover `resolved_range`.
+    pub segments: Vec<ValidationEpochSegment>,
+    pub shard_count: u32,
+    pub max_concurrency: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -376,19 +397,12 @@ mod tests {
     #[test]
     fn block_offer_requirements_are_a_bounded_projection_of_the_payload() {
         let payload = TaskPayload::BlockValidation(BlockValidationPayload {
-            epoch: ValidationEpoch::Nakamoto,
-            range: InclusiveRange { start: 10, end: 20 },
-            requested_shards: 8,
-            max_concurrency: 4,
+            selection: BlockValidationSelection::Range {
+                range: InclusiveRange { start: 10, end: 20 },
+            },
             timeout_secs: 60,
         });
 
-        assert_eq!(
-            OfferRequirements::from(&payload),
-            OfferRequirements::BlockValidation {
-                requested_shards: 8,
-                max_concurrency: 4,
-            }
-        );
+        assert_eq!(OfferRequirements::from(&payload), OfferRequirements::BlockValidation);
     }
 }

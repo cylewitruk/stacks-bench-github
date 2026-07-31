@@ -31,12 +31,10 @@ api_base_url = "https://api.github.com"
 private_key_path = "/etc/sbgh/daemon/github-app.private-key.pem"
 
 [tasks.block_validation]
-default_epoch = "nakamoto"
-default_range_start = 185630
-default_range_end = 186000
-requested_shards = 32
-max_concurrency = 24
+default_recent_blocks = 1000000
+max_recent_blocks = 1000000
 timeout_secs = 86400
+allow_full_validation = true
 allow_range_override = true
 
 [fleet]
@@ -224,6 +222,7 @@ enabled = false
 # Tokens are ENV-ONLY (never in this file — a TOML key here is a hard error):
 #   SBGH_SLACK_APP_TOKEN   # xapp-… (connections:write) — the Socket Mode connection
 #   SBGH_SLACK_BOT_TOKEN   # xoxb-… — Web API (chat:write + reactions:write)
+# Slack task creation also requires [llm].enabled = true and SBGH_OPENAI_API_KEY.
 #
 # See docs/slack-setup.md + docs/slack-app-manifest.yaml to create the app.
 #
@@ -233,10 +232,9 @@ enabled = false
 #   SBGH_SLACK_DEFAULT_REPOSITORY / _DEFAULT_REV
 #   SBGH_SLACK_ALLOWED_TEAM_IDS / _ALLOWED_USER_IDS   # comma-separated
 
-# LLM-backed intent resolution. Disabled by default.
-# When enabled, explicit flag-shaped Slack input still takes the deterministic
-# parser fast-path; natural-language input is sent to OpenAI for strict
-# schema-filled intent JSON, then revalidated by the daemon before enqueue.
+# LLM-backed intent resolution. Disabled by default, but required when Slack is
+# enabled. Slack input is sent to OpenAI for strict schema-filled intent JSON,
+# then revalidated by daemon policy before enqueue; CLI-style flags are rejected.
 [llm]
 enabled = false
 provider = "openai"

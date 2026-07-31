@@ -60,7 +60,10 @@ pub async fn list_roles(
 
 fn parse_role(s: &str) -> Result<UserRole, ApiErr> {
     parse_enum(s).ok_or_else(|| {
-        ApiErr::bad_request("`role` must be `admin`, `trigger_pr_benchmark`, or `view_results`")
+        ApiErr::bad_request(
+            "`role` must be `admin`, `trigger_pr_benchmark`, \
+             `trigger_block_validation`, or `view_results`",
+        )
     })
 }
 
@@ -109,4 +112,16 @@ pub async fn revoke(
         }
     };
     Ok(Json(role_view(row)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_validation_role_wire_name_round_trips() {
+        let role = parse_role("trigger_block_validation").unwrap();
+        assert_eq!(role, UserRole::TriggerBlockValidation);
+        assert_eq!(enum_str(&role), "trigger_block_validation");
+    }
 }

@@ -26,9 +26,9 @@ use async_trait::async_trait;
 use sbgh_driver::artifact::{ArtifactSink, artifact_key};
 use sbgh_driver::cache::{BinaryCacheStore, BuildArtifact, BuildFingerprint, CacheEnvironment};
 use sbgh_driver::{
-    BenchmarkRunContext, BenchmarkTaskSpec, BlockValidationTaskSpec, Driver, DriverOutcome,
-    DriverStatus, DriverTaskOutput, EventSink, PhaseLabel, Placement, ProgressUpdate, TaskContext,
-    TaskSpec, WorkflowStep,
+    BenchmarkRunContext, BenchmarkTaskSpec, BlockValidationSelection, BlockValidationTaskSpec,
+    Driver, DriverOutcome, DriverStatus, DriverTaskOutput, EventSink, PhaseLabel, Placement,
+    ProgressUpdate, TaskContext, TaskSpec, WorkflowStep,
 };
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use crate::LibvirtConfig;
 use crate::bench_progress::parse_progress_line;
 use crate::fingerprint;
-use crate::libvirt::block_validation::{BlockGuestPlan, reduce_result};
+use crate::libvirt::block_validation::{BlockGuestPlan, planned_shard_count, reduce_result};
 use crate::libvirt::boot::BootDisk;
 use crate::libvirt::cloudinit::{
     BenchPhaseParams, CloudInitArtifacts, CloudInitCommon, build_block_validation_iso,
@@ -517,6 +517,10 @@ impl LibvirtDriver {
             "block-validation results_tmpfs_mib must be non-zero"
         );
         anyhow::ensure!(
+            profile.target_blocks_per_shard > 0,
+            "block-validation target_blocks_per_shard must be non-zero"
+        );
+        anyhow::ensure!(
             profile.max_shards > 0
                 && profile.max_concurrency > 0
                 && profile.max_concurrency <= profile.max_shards,
@@ -846,15 +850,7 @@ impl LibvirtDriver {
             .block_validation
             .as_ref()
             .context("block validation requires a configured libvirt profile")?;
-        anyhow::ensure!(spec.range.start <= spec.range.end, "validation range is reversed");
-        anyhow::ensure!(
-            spec.requested_shards > 0 && spec.requested_shards <= profile.max_shards,
-            "requested shard count exceeds the local block-validation profile"
-        );
-        anyhow::ensure!(
-            spec.max_concurrency > 0 && spec.max_concurrency <= profile.max_concurrency,
-            "requested concurrency exceeds the local block-validation profile"
-        );
+        let provisioned_shards = provisioned_block_snapshot_count(spec, profile)?;
         let job_id = ctx.job_id.to_string();
         let attempt_id = ctx.attempt_id.to_string();
         let domain_name = format!("sbgh-{attempt_id}");
@@ -897,7 +893,7 @@ impl LibvirtDriver {
                         &job_id,
                         &attempt_id,
                         ctx.fencing_generation,
-                        spec.requested_shards,
+                        provisioned_shards,
                     )
                     .await?,
                 );
@@ -922,6 +918,9 @@ impl LibvirtDriver {
                     arts.block_snapshots
                         .as_ref()
                         .expect("snapshot set was just provisioned"),
+                    profile.target_blocks_per_shard,
+                    profile.max_shards,
+                    profile.max_concurrency,
                     profile.mount_options.clone(),
                 )?;
                 std::fs::write(
@@ -1019,13 +1018,18 @@ impl LibvirtDriver {
             "repository": ctx.repository,
             "head_sha": ctx.commit,
             "chainstate_origin": snapshot_origin,
-            "observed_range": logical_output.map(|output| serde_json::json!({
-                "start": output.observed_range.start,
-                "end": output.observed_range.end,
+            "requested_selection": spec.selection,
+            "observed": logical_output.map(|output| serde_json::json!({
+                "pre_nakamoto_count": output.observed.pre_nakamoto_count,
+                "nakamoto_count": output.observed.nakamoto_count,
+            })),
+            "resolved_range": logical_output.map(|output| serde_json::json!({
+                "start": output.resolved_range.start,
+                "end": output.resolved_range.end,
             })),
             "snapshot_devices": snapshot_devices,
-            "shards": spec.requested_shards,
-            "max_concurrency": spec.max_concurrency,
+            "shards": logical_output.map(|output| output.shard_count),
+            "max_concurrency": logical_output.map(|output| output.max_concurrency),
             "valid": logical_output.map(|output| output.valid),
             "checked_blocks": logical_output.map(|output| output.checked_blocks),
             "invalid_block_count": logical_output.map(|output| output.invalid_blocks.len()),
@@ -2258,6 +2262,26 @@ impl LibvirtDriver {
         }
         all_clear
     }
+}
+
+fn provisioned_block_snapshot_count(
+    spec: &BlockValidationTaskSpec,
+    profile: &crate::BlockValidationProfile,
+) -> anyhow::Result<u32> {
+    anyhow::ensure!(profile.target_blocks_per_shard > 0, "target blocks per shard is zero");
+    let upper_bound = match &spec.selection {
+        BlockValidationSelection::Recent { block_count } => {
+            anyhow::ensure!(*block_count > 0, "recent block count is zero");
+            *block_count
+        }
+        BlockValidationSelection::Full => return Ok(profile.max_shards),
+        BlockValidationSelection::Range { range } => range
+            .end
+            .checked_sub(range.start)
+            .and_then(|span| span.checked_add(1))
+            .context("invalid or overflowing validation range")?,
+    };
+    planned_shard_count(upper_bound, profile.target_blocks_per_shard, profile.max_shards)
 }
 
 fn baseline_calibration_id_from_tmpfs(tmpfs: &ResultsTmpfs) -> Option<i64> {

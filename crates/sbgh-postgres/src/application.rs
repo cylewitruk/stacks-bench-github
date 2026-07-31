@@ -1,9 +1,8 @@
 use sbgh_core::models::{GithubInstallation, Job};
 use sbgh_core::models::{JobSource, TaskKind};
 use sbgh_core::reporting::{
-    BenchmarkReportView, BlockValidationReportView, BlockValidationVerdict, BuildOnlyReportView,
-    InclusiveReportRange, InvalidBlockReport, ReportArtifact, ReportIdentity, ReportLifecycle,
-    ReportLifecycleState, SubmissionReportView, TaskReport,
+    BenchmarkReportView, BlockValidationReportView, BuildOnlyReportView, ReportArtifact,
+    ReportIdentity, ReportLifecycle, ReportLifecycleState, SubmissionReportView, TaskReport,
 };
 use sbgh_fleet::{ArtifactDescriptor, TaskPayload, Validate};
 use sqlx::Row as _;
@@ -210,17 +209,12 @@ pub async fn submission_report(
                 .map_err(other)?
                 .map(parse_validation_request)
                 .transpose()?;
-            let requested_range = requested_payload
-                .as_ref()
-                .map(|payload| InclusiveReportRange {
-                    start: payload.range.start,
-                    end: payload.range.end,
-                });
             let result = sqlx::query(
                 r#"
                 SELECT valid, checked_blocks, chainstate_origin,
-                       observed_start, observed_end, invalid_blocks,
-                       artifact_manifest
+                       pre_nakamoto_count, nakamoto_count,
+                       resolved_start, resolved_end, epoch_segments,
+                       shard_count, max_concurrency, invalid_blocks, artifact_manifest
                   FROM block_validation_result
                  WHERE job_id = $1
                 "#,
@@ -244,24 +238,6 @@ pub async fn submission_report(
                     let valid: bool = row
                         .try_get("valid")
                         .map_err(other)?;
-                    let observed_start: Option<i64> = row
-                        .try_get("observed_start")
-                        .map_err(other)?;
-                    let observed_end: Option<i64> = row
-                        .try_get("observed_end")
-                        .map_err(other)?;
-                    let observed_range = match (observed_start, observed_end) {
-                        (Some(start), Some(end)) => Some(InclusiveReportRange {
-                            start: nonnegative_u64(start, "observed_start")?,
-                            end: nonnegative_u64(end, "observed_end")?,
-                        }),
-                        (None, None) => None,
-                        _ => {
-                            return Err(sbgh_core::Error::Other(anyhow::anyhow!(
-                                "block-validation result has a partial observed range"
-                            )));
-                        }
-                    };
                     let checked_blocks = nonnegative_u64(
                         row.try_get("checked_blocks")
                             .map_err(other)?,
@@ -270,43 +246,54 @@ pub async fn submission_report(
                     let chainstate_origin: String = row
                         .try_get("chainstate_origin")
                         .map_err(other)?;
-                    let detail = match observed_range {
-                        Some(range) => {
-                            let result = sbgh_fleet::BlockValidationResult {
-                                valid,
-                                checked_blocks,
-                                invalid_blocks: invalid,
-                                chainstate_origin,
-                                observed_range: sbgh_fleet::InclusiveRange {
-                                    start: range.start,
-                                    end: range.end,
-                                },
-                            };
-                            BlockValidationReportView::from_result(
-                                requested_payload.as_ref(),
-                                &result,
-                            )
-                        }
-                        None => BlockValidationReportView {
-                            requested_range,
-                            observed_range: None,
-                            verdict: Some(if valid {
-                                BlockValidationVerdict::Valid
-                            } else {
-                                BlockValidationVerdict::Invalid
-                            }),
-                            checked_blocks: Some(checked_blocks),
-                            chainstate_origin: Some(chainstate_origin),
-                            invalid_blocks: invalid
-                                .into_iter()
-                                .map(|entry| InvalidBlockReport {
-                                    shard: entry.shard,
-                                    block: entry.block,
-                                    reason: entry.reason,
-                                })
-                                .collect(),
+                    let segments = serde_json::from_value(
+                        row.try_get::<serde_json::Value, _>("epoch_segments")
+                            .map_err(other)?,
+                    )
+                    .map_err(other)?;
+                    let result = sbgh_fleet::BlockValidationResult {
+                        valid,
+                        checked_blocks,
+                        invalid_blocks: invalid,
+                        chainstate_origin,
+                        observed: sbgh_fleet::ObservedValidationIndex {
+                            pre_nakamoto_count: nonnegative_u64(
+                                row.try_get("pre_nakamoto_count")
+                                    .map_err(other)?,
+                                "pre_nakamoto_count",
+                            )?,
+                            nakamoto_count: nonnegative_u64(
+                                row.try_get("nakamoto_count")
+                                    .map_err(other)?,
+                                "nakamoto_count",
+                            )?,
                         },
+                        resolved_range: sbgh_fleet::InclusiveRange {
+                            start: nonnegative_u64(
+                                row.try_get("resolved_start")
+                                    .map_err(other)?,
+                                "resolved_start",
+                            )?,
+                            end: nonnegative_u64(
+                                row.try_get("resolved_end")
+                                    .map_err(other)?,
+                                "resolved_end",
+                            )?,
+                        },
+                        segments,
+                        shard_count: u32::try_from(
+                            row.try_get::<i32, _>("shard_count")
+                                .map_err(other)?,
+                        )
+                        .map_err(other)?,
+                        max_concurrency: u32::try_from(
+                            row.try_get::<i32, _>("max_concurrency")
+                                .map_err(other)?,
+                        )
+                        .map_err(other)?,
                     };
+                    let detail =
+                        BlockValidationReportView::from_result(requested_payload.as_ref(), &result);
                     (
                         TaskReport::BlockValidation(detail),
                         manifest
@@ -320,12 +307,7 @@ pub async fn submission_report(
                 }
                 None => (
                     TaskReport::BlockValidation(BlockValidationReportView {
-                        requested_range,
-                        observed_range: None,
-                        verdict: None,
-                        checked_blocks: None,
-                        chainstate_origin: None,
-                        invalid_blocks: Vec::new(),
+                        ..BlockValidationReportView::from_request(requested_payload.as_ref())
                     }),
                     Vec::new(),
                 ),

@@ -95,41 +95,73 @@ def probe(kind):
 pre = probe("index-range")
 if pre <= 0:
     raise RuntimeError("chainstate probe returned no pre-Nakamoto blocks")
-requested = plan["range"]
-if plan["epoch"] == "pre_nakamoto":
-    if requested["end"] >= pre:
-        raise RuntimeError("requested pre-Nakamoto range exceeds probed range")
-    epoch_offset = 0
-    range_kind = "index-range"
-    observed = {"start": 0, "end": pre - 1}
-elif plan["epoch"] == "nakamoto":
-    naka = probe("naka-index-range")
-    if naka <= 0:
-        raise RuntimeError("chainstate probe returned no Nakamoto blocks")
-    global_end = pre + naka - 1
-    if requested["start"] < pre or requested["end"] > global_end:
-        raise RuntimeError("requested Nakamoto range is outside probed range")
-    epoch_offset = pre
-    range_kind = "naka-index-range"
-    observed = {"start": pre, "end": global_end}
+naka = probe("naka-index-range")
+if naka <= 0:
+    raise RuntimeError("chainstate probe returned no Nakamoto blocks")
+total = pre + naka
+if total > 9223372036854775807:
+    raise RuntimeError("chainstate probe count exceeds the durable integer range")
+selection = plan["selection"]
+kind = selection.get("kind")
+if kind == "recent":
+    block_count = int(selection.get("block_count", 0))
+    if block_count <= 0:
+        raise RuntimeError("recent block count must be non-zero")
+    count = min(block_count, naka)
+    requested = {"start": total - count, "end": total - 1}
+elif kind == "full":
+    requested = {"start": 0, "end": total - 1}
+elif kind == "range":
+    requested = selection.get("range")
+    if not isinstance(requested, dict):
+        raise RuntimeError("range selector is missing its range")
+    if requested["start"] > requested["end"] or requested["end"] >= total:
+        raise RuntimeError("explicit validation range is outside probed coverage")
 else:
-    raise RuntimeError("unsupported validation epoch")
+    raise RuntimeError("unsupported validation selector")
+
+segments = []
+if requested["start"] < pre:
+    segment_end = min(requested["end"], pre - 1)
+    segments.append({
+        "epoch": "pre_nakamoto",
+        "global_range": {"start": requested["start"], "end": segment_end},
+        "local_range": {"start": requested["start"], "end": segment_end},
+    })
+if requested["end"] >= pre:
+    segment_start = max(requested["start"], pre)
+    segments.append({
+        "epoch": "nakamoto",
+        "global_range": {"start": segment_start, "end": requested["end"]},
+        "local_range": {"start": segment_start - pre, "end": requested["end"] - pre},
+    })
+if not segments:
+    raise RuntimeError("resolved range produced no epoch segments")
 
 count = requested["end"] - requested["start"] + 1
-shard_count = min(int(plan["requested_shards"]), count)
+target = int(plan["target_blocks_per_shard"])
+max_shards = int(plan["max_shards"])
+if target <= 0 or max_shards <= 0:
+    raise RuntimeError("invalid local shard policy")
+shard_count = min((count + target - 1) // target, max_shards)
+if shard_count <= 0 or shard_count > len(plan["devices"]):
+    raise RuntimeError("resolved shard count exceeds attached snapshot devices")
 base, remainder = divmod(count, shard_count)
 ranges = []
 cursor = requested["start"]
 for index in range(shard_count):
     length = base + (1 if index < remainder else 0)
     global_end = cursor + length - 1
-    ranges.append((
-        index,
-        cursor,
-        global_end,
-        cursor - epoch_offset,
-        global_end - epoch_offset,
-    ))
+    commands = []
+    if cursor < pre:
+        end = min(global_end, pre - 1)
+        commands.append(("index-range", cursor, end))
+    if global_end >= pre:
+        start = max(cursor, pre)
+        commands.append(("naka-index-range", start - pre, global_end - pre))
+    if not commands:
+        raise RuntimeError("shard produced no epoch-local command")
+    ranges.append((index, cursor, global_end, commands))
     cursor += length
 if cursor != requested["end"] + 1:
     raise RuntimeError("partition did not exactly cover requested range")
@@ -145,17 +177,18 @@ if limit <= 0:
 
 while pending or active:
     if time.monotonic() - started > int(plan["timeout_secs"]):
-        for process, stdout_handle, stderr_handle, _ in active.values():
-            os.killpg(process.pid, signal.SIGTERM)
-            stdout_handle.close()
-            stderr_handle.close()
+        for state in active.values():
+            os.killpg(state["process"].pid, signal.SIGTERM)
+            state["stdout"].close()
+            state["stderr"].close()
         raise RuntimeError("block validation timed out")
     while pending and len(active) < limit:
-        index, global_start, global_end, command_start, command_end = pending.pop(0)
+        index, global_start, global_end, commands = pending.pop(0)
         stdout_name = f"shard-{index}.stdout.log"
         stderr_name = f"shard-{index}.stderr.log"
         stdout_handle = open(RESULTS + "/" + stdout_name, "wb")
         stderr_handle = open(RESULTS + "/" + stderr_name, "wb")
+        range_kind, command_start, command_end = commands.pop(0)
         command = [
             BIN, "--network-config", "mainnet", "validate-block", mounts[index],
             range_kind, str(command_start), str(command_end + 1),
@@ -166,24 +199,45 @@ while pending or active:
             stderr=stderr_handle,
             start_new_session=True,
         )
-        active[index] = (
-            process,
-            stdout_handle,
-            stderr_handle,
-            (index, global_start, global_end, stdout_name, stderr_name),
-        )
+        active[index] = {
+            "process": process,
+            "stdout": stdout_handle,
+            "stderr": stderr_handle,
+            "record": (index, global_start, global_end, stdout_name, stderr_name),
+            "commands": commands,
+            "exit_codes": [],
+        }
     completed = []
-    for index, (process, stdout_handle, stderr_handle, record) in active.items():
-        exit_code = process.poll()
+    for index, state in active.items():
+        exit_code = state["process"].poll()
         if exit_code is None:
             continue
-        stdout_handle.close()
-        stderr_handle.close()
+        state["exit_codes"].append(exit_code)
+        if exit_code in (0, 1) and state["commands"]:
+            range_kind, command_start, command_end = state["commands"].pop(0)
+            command = [
+                BIN, "--network-config", "mainnet", "validate-block", mounts[index],
+                range_kind, str(command_start), str(command_end + 1),
+            ]
+            state["process"] = subprocess.Popen(
+                command,
+                stdout=state["stdout"],
+                stderr=state["stderr"],
+                start_new_session=True,
+            )
+            continue
+        state["stdout"].close()
+        state["stderr"].close()
+        record = state["record"]
+        final_exit = next(
+            (code for code in state["exit_codes"] if code not in (0, 1)),
+            1 if 1 in state["exit_codes"] else 0,
+        )
         finished.append({
             "index": record[0],
             "start": record[1],
             "end": record[2],
-            "exit_code": exit_code,
+            "exit_code": final_exit,
             "stdout_file": record[3],
             "stderr_file": record[4],
         })
@@ -214,9 +268,15 @@ result = {
     "attempt_id": plan["attempt_id"],
     "fencing_generation": plan["fencing_generation"],
     "chainstate_origin": plan["chainstate_origin"],
-    "epoch": plan["epoch"],
-    "requested_range": plan["range"],
-    "observed_range": observed,
+    "selection": selection,
+    "observed": {
+        "pre_nakamoto_count": pre,
+        "nakamoto_count": naka,
+    },
+    "resolved_range": requested,
+    "segments": segments,
+    "shard_count": shard_count,
+    "max_concurrency": limit,
     "shards": finished,
 }
 temporary = RESULTS + "/.block-validation-result.json.tmp"
