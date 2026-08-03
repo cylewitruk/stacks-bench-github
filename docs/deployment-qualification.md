@@ -192,6 +192,7 @@ Install and actively qualify the sandbox network:
 
 ```bash
 sudo ./scripts/install-sandbox-network.sh --install-only
+! systemctl list-dependencies sbgh-sandbox-egress.service | grep -q nftables.service
 sudoedit /etc/sbgh/network/protected-ipv4.conf
 sudo ./scripts/install-sandbox-network.sh
 sudo systemctl is-active --quiet sbgh-sandbox-egress.service
@@ -229,11 +230,11 @@ sudo umount /mnt/sbgh-chainstate-origin
 sudo lvchange -an vg0/mainnet-YYYY-MM-DD
 ```
 
-Install `/etc/sudoers.d/sbgh` from the exact allowlist in setup. Require both
-positive validation and denial of an unrelated root command:
+Install `/etc/sudoers.d/sbgh-worker` from the exact allowlist in setup. Require
+both positive validation and denial of an unrelated root command:
 
 ```bash
-sudo visudo -cf /etc/sudoers.d/sbgh
+sudo visudo -cf /etc/sudoers.d/sbgh-worker
 if sudo -u sbgh-worker sudo -n /bin/true; then
   echo "unexpected broad worker sudo authority" >&2
   exit 1

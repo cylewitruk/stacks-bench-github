@@ -170,6 +170,10 @@ The policy permits public dependency egress while denying the host,
 private/link-local/metadata destinations, configured public infrastructure
 CIDRs, and IPv6 fallback. Each VM also requests libvirt port isolation.
 Because public egress remains available, this is containment rather than DLP.
+The policy unit invokes `nft` directly and owns only the
+`inet sbgh_sandbox_egress` table; it must not start the host-wide
+`nftables.service`, which may flush nft-backed Docker, libvirt, or firewall
+rules.
 
 After a routing, firewall, nftables, libvirt, protected-CIDR, or golden-image
 change:

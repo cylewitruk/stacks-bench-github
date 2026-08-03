@@ -1,8 +1,8 @@
 [Unit]
 Description=stacks-bench sandbox-egress network policy
 Documentation=https://github.com/cylewitruk/stacks-bench-github
-Wants=libvirtd.service nftables.service
-After=libvirtd.service nftables.service
+Wants=libvirtd.service
+After=libvirtd.service
 Before=sbgh-worker@.service
 
 [Service]

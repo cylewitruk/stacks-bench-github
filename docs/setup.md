@@ -322,6 +322,11 @@ sudo journalctl -u sbgh-sandbox-egress.service -n 50 --no-pager
 sudo /usr/local/libexec/sbgh-check-sandbox-network
 ```
 
+The SBGH unit applies and owns only its dedicated nftables table. It does not
+start the distribution-wide `nftables.service`; doing so can flush nft-backed
+Docker, libvirt, or host-firewall rules on hosts whose `/etc/nftables.conf`
+begins with `flush ruleset`.
+
 Add public orchestrator, VPN, metadata-service, and other infrastructure CIDRs
 that guests must not reach to `protected-ipv4.conf`.
 
@@ -374,13 +379,14 @@ Grant only the fixed host commands used by the trusted adapter:
 sbgh-worker ALL=(root) NOPASSWD: /usr/sbin/lvcreate, /usr/sbin/lvremove, /usr/sbin/lvs
 sbgh-worker ALL=(root) NOPASSWD: /usr/sbin/mkfs.ext4, /usr/sbin/losetup
 sbgh-worker ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/chown
-sbgh-worker ALL=(root) NOPASSWD: /usr/bin/rmdir, /usr/bin/virsh
+sbgh-worker ALL=(root) NOPASSWD: /usr/bin/virsh
 sbgh-worker ALL=(root) NOPASSWD: /usr/local/libexec/sbgh-check-sandbox-network
 ```
 
-Install this as `/etc/sudoers.d/sbgh`, mode `0440`, and validate it with
-`visudo -cf /etc/sudoers.d/sbgh`. The daemon user receives no libvirt, LVM, or
-sudo authority.
+Install this as `/etc/sudoers.d/sbgh-worker`, mode `0440`, and validate it with
+`visudo -cf /etc/sudoers.d/sbgh-worker`. The daemon user receives no libvirt,
+LVM, or sudo authority. The adapter runs `rmdir` without privilege after it
+owns the target directory, so it is intentionally absent from this allowlist.
 
 `install-worker.sh` installs the worker unit template and its global hardening
 drop-in. It never installs control-plane artifacts and never starts an

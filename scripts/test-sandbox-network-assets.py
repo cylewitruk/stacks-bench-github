@@ -99,6 +99,15 @@ class SandboxNetworkAssetsTest(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("PrivateTmp=true", unit)
 
+    def test_policy_unit_does_not_start_the_host_nftables_loader(self) -> None:
+        unit = (ROOT / "systemd/sbgh-sandbox-egress.service").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Wants=libvirtd.service\n", unit)
+        self.assertIn("After=libvirtd.service\n", unit)
+        self.assertNotIn("nftables.service", unit)
+
     def test_noncanonical_operator_cidr_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "protected.conf"
