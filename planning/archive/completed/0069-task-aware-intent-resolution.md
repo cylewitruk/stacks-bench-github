@@ -7,7 +7,7 @@ block-validation intent and submit either task through the existing
 task-submission kernel.
 
 Continued by
-[v33](../../iterations/v33-dynamic-block-validation-planning.md), which
+[v33](0079-dynamic-block-validation-planning.md), which
 replaces v32's static validation default/range/resource policy without
 changing its task-aware Slack boundary.
 

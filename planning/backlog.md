@@ -555,8 +555,9 @@ Promoted to `v21-stacks-bench-schema-v1-native` →
 *`0038-isolated-benchmark-repetitions` shipped (iteration v15, 2026-06) →
 [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md).*
 
-*`0039-multi-variant-benchmark-comparisons` in progress (iteration v22) →
-[iterations/v22-multi-variant-benchmark-comparisons.md](iterations/v22-multi-variant-benchmark-comparisons.md).*
+*`0039-multi-variant-benchmark-comparisons` planned for real-host closure in
+v34 →
+[iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md).*
 
 *`0041-shared-benchmark-calibration` shipped (iteration v19, 2026-06) →
 [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md).*
@@ -646,14 +647,9 @@ documented if made default.
 Promoted to `v23-central-block-tx-index-cache` →
 [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md).
 
-### 0027 — Fine-grained bench progress (JSONL)
-
-- **id:** `0027-fine-grained-progress`
-- **status:** `in_progress`
-- **priority:** `medium`
-
-Promoted to `v20-fine-grained-bench-progress` →
-[iterations/v20-fine-grained-bench-progress.md](iterations/v20-fine-grained-bench-progress.md).
+*`0027-fine-grained-progress` implementation completed under v20; real-host
+closure is planned in v34 →
+[iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md).*
 
 ### 0028 — Results-summary restructure
 

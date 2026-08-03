@@ -1,12 +1,17 @@
 # v33: Dynamic Block-Validation Planning
 
 Successor to
-[v32](../archive/completed/0069-task-aware-intent-resolution.md). Replace
+[v32](0069-task-aware-intent-resolution.md). Replace
 static validation ranges and daemon-selected shard counts with
 chainstate-relative selection and worker-local execution planning.
 
-> **Status:** in_progress — implementation and local validation are complete;
-> first-deployment canaries remain open.
+Continued by
+[v34](../../iterations/v34-first-fleet-deployment-readiness.md), which owns the
+first real-host deployment, provider canaries, cancellation, and restart proof.
+
+> **Status:** shipped (2026-08-03) — implementation, review, and local
+> validation are complete. No v33 fleet was deployed; its hardware and
+> provider gates transfer to v34 rather than keeping implemented work open.
 >
 > v33 changes how block-validation demand is described and resolved. It does
 > not change pull scheduling, worker authorization, lifecycle controls, or
@@ -17,13 +22,13 @@ chainstate-relative selection and worker-local execution planning.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0079-dynamic-block-validation-planning` | primary: chainstate-relative selection and local shard planning | in_progress |
-| `0067-github-block-validation-submission` | co-primary: task-specific GitHub validation authorization and default trigger | in_progress |
+| `0079-dynamic-block-validation-planning` | primary: chainstate-relative selection and local shard planning | shipped |
+| `0067-github-block-validation-submission` | co-primary: task-specific GitHub validation authorization and default trigger | shipped |
 
 ## 0079 — Dynamic Block-Validation Planning
 
 - **id:** `0079-dynamic-block-validation-planning`
-- **status:** `in_progress`
+- **status:** `shipped`
 - **priority:** `high`
 - **depends_on:** `0019-block-validation-recipe`,
   `0063-libvirt-block-validation`, `0064-task-submission-kernel`,
@@ -71,7 +76,7 @@ epoch segments.
 ## 0067 — GitHub Block-Validation Submission
 
 - **id:** `0067-github-block-validation-submission`
-- **status:** `in_progress`
+- **status:** `shipped`
 - **priority:** `high`
 - **depends_on:** `0064-task-submission-kernel`,
   `0066-task-aware-reporting`
