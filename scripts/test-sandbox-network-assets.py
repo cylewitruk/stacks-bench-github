@@ -248,13 +248,35 @@ class SandboxNetworkAssetsTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "grep '^SBGH_NETWORK_QUALIFICATION=' \"$console\" | tail -1 || true",
+            "SBGH_NETWORK_QUALIFICATION={.*}",
             script,
         )
         self.assertIn("$report.failed-console.", script)
         self.assertIn('install -m 0644 "$console" "$failure_console"', script)
         self.assertIn("SBGH_NETWORK_QUALIFICATION_FAILURE=", script)
         self.assertIn('while virsh dominfo "$domain"', script)
+
+    def test_qualification_marker_pattern_accepts_serial_prefixes(self) -> None:
+        line = (
+            "sbgh-net-qualify login: "
+            'SBGH_NETWORK_QUALIFICATION={"allow": "https://example.test/"}\n'
+        )
+        result = subprocess.run(
+            [
+                "sed",
+                "-n",
+                r"s/^.*\(SBGH_NETWORK_QUALIFICATION={.*}\).*$/\1/p",
+            ],
+            input=line,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(
+            result.stdout,
+            'SBGH_NETWORK_QUALIFICATION={"allow": "https://example.test/"}\n',
+        )
 
 
 if __name__ == "__main__":

@@ -399,10 +399,16 @@ done
 created_domain=0
 sleep 1
 
-result=$(grep '^SBGH_NETWORK_QUALIFICATION=' "$console" | tail -1 || true)
+result=$(
+    sed -n 's/^.*\(SBGH_NETWORK_QUALIFICATION={.*}\).*$/\1/p' "$console" |
+        tail -1
+)
 [[ -n $result ]] || {
     echo "qualification VM emitted no success record" >&2
-    failure=$(grep '^SBGH_NETWORK_QUALIFICATION_FAILURE=' "$console" | tail -1 || true)
+    failure=$(
+        sed -n 's/^.*\(SBGH_NETWORK_QUALIFICATION_FAILURE={.*}\).*$/\1/p' "$console" |
+            tail -1
+    )
     [[ -z $failure ]] || echo "$failure" >&2
     failure_console="$report.failed-console.$(date -u +%Y%m%dT%H%M%SZ).log"
     mkdir -p "$(dirname "$failure_console")"
