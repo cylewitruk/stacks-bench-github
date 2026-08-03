@@ -253,6 +253,8 @@ class SandboxNetworkAssetsTest(unittest.TestCase):
         )
         self.assertIn("$report.failed-console.", script)
         self.assertIn('install -m 0644 "$console" "$failure_console"', script)
+        self.assertIn("SBGH_NETWORK_QUALIFICATION_FAILURE=", script)
+        self.assertIn('while virsh dominfo "$domain"', script)
 
 
 if __name__ == "__main__":

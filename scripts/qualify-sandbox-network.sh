@@ -276,34 +276,44 @@ deny = {deny!r}
 deny_tcp = {deny_tcp!r}
 result = {{"allow": allow, "denied": [], "denied_tcp": []}}
 
-with urllib.request.urlopen(allow, timeout=30) as response:
-    if not 200 <= response.status < 400:
-        raise RuntimeError(f"dependency egress returned HTTP {{response.status}}")
-    response.read(1)
+def emit(prefix, payload):
+    message = prefix + json.dumps(payload, sort_keys=True)
+    print(message, flush=True)
+    with open("/dev/ttyS0", "w", encoding="utf-8") as console:
+        console.write(message + "\\n")
 
-for url in deny:
-    try:
-        urllib.request.urlopen(url, timeout=3).read(1)
-    except (OSError, TimeoutError, urllib.error.URLError, socket.timeout):
-        result["denied"].append(url)
-    else:
-        raise RuntimeError(f"protected destination was reachable: {{url}}")
+try:
+    with urllib.request.urlopen(allow, timeout=30) as response:
+        if not 200 <= response.status < 400:
+            raise RuntimeError(f"dependency egress returned HTTP {{response.status}}")
+        response.read(1)
 
-for address, port in deny_tcp:
-    try:
-        with socket.create_connection((address, port), timeout=3):
-            pass
-    except (OSError, TimeoutError, socket.timeout):
-        result["denied_tcp"].append(f"{{address}}:{{port}}")
-    else:
-        raise RuntimeError(
-            f"operator-protected endpoint was reachable: {{address}}:{{port}}"
-        )
+    for url in deny:
+        try:
+            urllib.request.urlopen(url, timeout=3).read(1)
+        except (OSError, TimeoutError, urllib.error.URLError, socket.timeout):
+            result["denied"].append(url)
+        else:
+            raise RuntimeError(f"protected destination was reachable: {{url}}")
 
-message = "SBGH_NETWORK_QUALIFICATION=" + json.dumps(result, sort_keys=True)
-print(message, flush=True)
-with open("/dev/ttyS0", "w", encoding="utf-8") as console:
-    console.write(message + "\\n")
+    for address, port in deny_tcp:
+        try:
+            with socket.create_connection((address, port), timeout=3):
+                pass
+        except (OSError, TimeoutError, socket.timeout):
+            result["denied_tcp"].append(f"{{address}}:{{port}}")
+        else:
+            raise RuntimeError(
+                f"operator-protected endpoint was reachable: {{address}}:{{port}}"
+            )
+except Exception as error:
+    emit(
+        "SBGH_NETWORK_QUALIFICATION_FAILURE=",
+        {{"error_type": type(error).__name__, "message": str(error)}},
+    )
+    raise
+else:
+    emit("SBGH_NETWORK_QUALIFICATION=", result)
 """
 path.write_text(source, encoding="utf-8")
 PY
@@ -376,11 +386,24 @@ while virsh list --name | grep -qx "$domain"; do
         { echo "qualification VM did not stop within 300 seconds" >&2; exit 1; }
     sleep 2
 done
+
+# A transient domain can leave the active list just before libvirt finishes
+# releasing its file security metadata. Wait for the domain object to vanish,
+# then allow the final asynchronous cleanup to finish before removing files.
+release_deadline=$(( $(date +%s) + 30 ))
+while virsh dominfo "$domain" >/dev/null 2>&1; do
+    (( $(date +%s) < release_deadline )) ||
+        { echo "qualification VM resources were not released within 30 seconds" >&2; exit 1; }
+    sleep 1
+done
 created_domain=0
+sleep 1
 
 result=$(grep '^SBGH_NETWORK_QUALIFICATION=' "$console" | tail -1 || true)
 [[ -n $result ]] || {
     echo "qualification VM emitted no success record" >&2
+    failure=$(grep '^SBGH_NETWORK_QUALIFICATION_FAILURE=' "$console" | tail -1 || true)
+    [[ -z $failure ]] || echo "$failure" >&2
     failure_console="$report.failed-console.$(date -u +%Y%m%dT%H%M%SZ).log"
     mkdir -p "$(dirname "$failure_console")"
     install -m 0644 "$console" "$failure_console"
