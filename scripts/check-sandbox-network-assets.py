@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import pathlib
 import re
 import sys
@@ -177,7 +178,8 @@ def validate_nft(path: pathlib.Path) -> None:
         )
 
 
-def validate_protected(path: pathlib.Path) -> None:
+def read_protected(path: pathlib.Path) -> set[ipaddress.IPv4Network]:
+    networks: set[ipaddress.IPv4Network] = set()
     for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         value = raw.split("#", 1)[0].strip()
         if not value:
@@ -188,6 +190,83 @@ def validate_protected(path: pathlib.Path) -> None:
             fail(f"{path}:{line_number}: invalid CIDR: {error}")
         if network.version != 4:
             fail(f"{path}:{line_number}: only IPv4 CIDRs are supported")
+        networks.add(network)
+    return networks
+
+
+def validate_protected(path: pathlib.Path) -> None:
+    read_protected(path)
+
+
+def read_live_ipv4_set(
+    path: pathlib.Path, expected_name: str
+) -> set[ipaddress.IPv4Network]:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    objects = document.get("nftables") if isinstance(document, dict) else None
+    if not isinstance(objects, list):
+        fail(f"{path}: nft JSON has no nftables object list")
+    sets = [item["set"] for item in objects if isinstance(item, dict) and "set" in item]
+    if len(sets) != 1 or not isinstance(sets[0], dict):
+        fail(f"{path}: nft JSON must contain exactly one set")
+    live_set = sets[0]
+    expected_fields = {
+        "family": "inet",
+        "table": "sbgh_sandbox_egress",
+        "name": expected_name,
+        "type": "ipv4_addr",
+    }
+    for field, expected in expected_fields.items():
+        if live_set.get(field) != expected:
+            fail(f"{path}: live {expected_name} {field} must be {expected}")
+    if set(live_set.get("flags", [])) != {"interval"}:
+        fail(f"{path}: live {expected_name} must be an interval set")
+
+    elements = live_set.get("elem", [])
+    if not isinstance(elements, list):
+        fail(f"{path}: live {expected_name} elements must be a list")
+    networks: set[ipaddress.IPv4Network] = set()
+    for element in elements:
+        if isinstance(element, str):
+            value = element
+        elif isinstance(element, dict) and set(element) == {"prefix"}:
+            prefix = element["prefix"]
+            if not isinstance(prefix, dict) or set(prefix) != {"addr", "len"}:
+                fail(f"{path}: malformed prefix in live {expected_name}")
+            value = f"{prefix['addr']}/{prefix['len']}"
+        else:
+            fail(f"{path}: unsupported element in live {expected_name}: {element!r}")
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError as error:
+            fail(f"{path}: invalid element in live {expected_name}: {error}")
+        if network.version != 4:
+            fail(f"{path}: live {expected_name} contains a non-IPv4 element")
+        networks.add(network)
+    if len(networks) != len(elements):
+        fail(f"{path}: live {expected_name} contains duplicate elements")
+    return networks
+
+
+def validate_live_sets(
+    protected_json: pathlib.Path,
+    operator_json: pathlib.Path,
+    operator_config: pathlib.Path,
+) -> None:
+    actual_base = read_live_ipv4_set(protected_json, "protected_ipv4")
+    if actual_base != BASE_PROTECTED:
+        fail(
+            "live protected IPv4 set differs: "
+            f"missing={sorted(map(str, BASE_PROTECTED - actual_base))} "
+            f"extra={sorted(map(str, actual_base - BASE_PROTECTED))}"
+        )
+    expected_operator = read_protected(operator_config)
+    actual_operator = read_live_ipv4_set(operator_json, "operator_protected_ipv4")
+    if actual_operator != expected_operator:
+        fail(
+            "live operator-protected IPv4 set differs: "
+            f"missing={sorted(map(str, expected_operator - actual_operator))} "
+            f"extra={sorted(map(str, actual_operator - expected_operator))}"
+        )
 
 
 def main() -> int:
@@ -195,6 +274,8 @@ def main() -> int:
     parser.add_argument("--xml", type=pathlib.Path, required=True)
     parser.add_argument("--nft", type=pathlib.Path, required=True)
     parser.add_argument("--protected-ipv4", type=pathlib.Path)
+    parser.add_argument("--live-protected-json", type=pathlib.Path)
+    parser.add_argument("--live-operator-json", type=pathlib.Path)
     args = parser.parse_args()
 
     try:
@@ -202,6 +283,18 @@ def main() -> int:
         validate_nft(args.nft)
         if args.protected_ipv4 is not None:
             validate_protected(args.protected_ipv4)
+        live_paths = (args.live_protected_json, args.live_operator_json)
+        if any(path is not None for path in live_paths):
+            if args.protected_ipv4 is None or any(path is None for path in live_paths):
+                fail(
+                    "live set validation requires --protected-ipv4, "
+                    "--live-protected-json, and --live-operator-json"
+                )
+            validate_live_sets(
+                args.live_protected_json,
+                args.live_operator_json,
+                args.protected_ipv4,
+            )
     except (OSError, ET.ParseError, ValueError) as error:
         print(f"sandbox network policy invalid: {error}", file=sys.stderr)
         return 1

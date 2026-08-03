@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import subprocess
 import sys
@@ -21,6 +22,36 @@ SPEC.loader.exec_module(validator)
 
 
 class SandboxNetworkAssetsTest(unittest.TestCase):
+    @staticmethod
+    def write_live_set(
+        path: pathlib.Path, name: str, elements: list[object]
+    ) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "nftables": [
+                        {
+                            "metainfo": {
+                                "version": "1.0.9",
+                                "json_schema_version": 1,
+                            }
+                        },
+                        {
+                            "set": {
+                                "family": "inet",
+                                "name": name,
+                                "table": "sbgh_sandbox_egress",
+                                "type": "ipv4_addr",
+                                "flags": ["interval"],
+                                "elem": elements,
+                            }
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_checked_in_assets_are_valid(self) -> None:
         validator.validate_xml(ROOT / "network/sandbox-egress.xml")
         validator.validate_nft(ROOT / "network/sandbox-egress.nft")
@@ -107,6 +138,62 @@ class SandboxNetworkAssetsTest(unittest.TestCase):
         self.assertIn("Wants=libvirtd.service\n", unit)
         self.assertIn("After=libvirtd.service\n", unit)
         self.assertNotIn("nftables.service", unit)
+
+    def test_live_sets_accept_nft_1_0_9_prefix_and_address_forms(self) -> None:
+        base_elements = [
+            {"prefix": {"addr": str(network.network_address), "len": network.prefixlen}}
+            for network in sorted(validator.BASE_PROTECTED)
+        ]
+        self.assertIn(
+            {"prefix": {"addr": "240.0.0.0", "len": 4}}, base_elements
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            protected_json = root / "protected.json"
+            operator_json = root / "operator.json"
+            operator_config = root / "operator.conf"
+            self.write_live_set(protected_json, "protected_ipv4", base_elements)
+            self.write_live_set(
+                operator_json, "operator_protected_ipv4", ["144.76.56.188"]
+            )
+            operator_config.write_text("144.76.56.188/32\n", encoding="utf-8")
+
+            validator.validate_live_sets(
+                protected_json, operator_json, operator_config
+            )
+
+    def test_live_sets_reject_missing_terminal_protected_range(self) -> None:
+        base_elements = [
+            {"prefix": {"addr": str(network.network_address), "len": network.prefixlen}}
+            for network in sorted(validator.BASE_PROTECTED)
+            if str(network) != "240.0.0.0/4"
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            protected_json = root / "protected.json"
+            operator_json = root / "operator.json"
+            operator_config = root / "operator.conf"
+            self.write_live_set(protected_json, "protected_ipv4", base_elements)
+            self.write_live_set(operator_json, "operator_protected_ipv4", [])
+            operator_config.write_text("", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "missing=\\['240.0.0.0/4'\\]"
+            ):
+                validator.validate_live_sets(
+                    protected_json, operator_json, operator_config
+                )
+
+    def test_installer_reports_success_only_after_active_check(self) -> None:
+        installer = (ROOT / "scripts/install-sandbox-network.sh").read_text(
+            encoding="utf-8"
+        )
+
+        active_check = installer.index(
+            "systemctl is-active --quiet sbgh-sandbox-egress.service"
+        )
+        success = installer.index("installed and applied sandbox-egress policy")
+        self.assertLess(active_check, success)
 
     def test_noncanonical_operator_cidr_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

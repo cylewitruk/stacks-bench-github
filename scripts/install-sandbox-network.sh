@@ -77,6 +77,16 @@ systemctl daemon-reload
 if [[ $install_only -eq 1 ]]; then
     echo "installed sandbox-egress assets without applying them"
 else
-    systemctl enable --now sbgh-sandbox-egress.service
+    systemctl enable sbgh-sandbox-egress.service
+    if ! systemctl start sbgh-sandbox-egress.service; then
+        echo "failed to start sbgh-sandbox-egress.service" >&2
+        systemctl status sbgh-sandbox-egress.service --full --no-pager >&2 || true
+        exit 1
+    fi
+    if ! systemctl is-active --quiet sbgh-sandbox-egress.service; then
+        echo "sbgh-sandbox-egress.service did not reach active state" >&2
+        systemctl status sbgh-sandbox-egress.service --full --no-pager >&2 || true
+        exit 1
+    fi
     echo "installed and applied sandbox-egress policy"
 fi

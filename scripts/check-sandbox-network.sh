@@ -36,8 +36,12 @@ info=$(virsh net-info "$network_name")
     { echo "$network_name is not configured for autostart" >&2; exit 1; }
 
 virsh net-dumpxml "$network_name" >"$work/live.xml"
+nft -j list set inet sbgh_sandbox_egress protected_ipv4 >"$work/protected.json"
+nft -j list set inet sbgh_sandbox_egress operator_protected_ipv4 >"$work/operator.json"
 python3 -I "$validator" --xml "$work/live.xml" --nft "$nft_policy" \
-    --protected-ipv4 "$protected_ipv4" >/dev/null
+    --protected-ipv4 "$protected_ipv4" \
+    --live-protected-json "$work/protected.json" \
+    --live-operator-json "$work/operator.json" >/dev/null
 
 nft -s list table inet sbgh_sandbox_egress >"$work/live.nft"
 [[ $(grep -Ec '^[[:space:]]*chain (input_guard|forward_guard) \{' "$work/live.nft") -eq 2 ]] ||
@@ -68,31 +72,6 @@ do
     grep -Fq "$rule" "$work/live.nft" ||
         { echo "live nftables rule differs from the managed policy: $rule" >&2; exit 1; }
 done
-
-for cidr in \
-    0.0.0.0/8 \
-    10.0.0.0/8 \
-    100.64.0.0/10 \
-    127.0.0.0/8 \
-    169.254.0.0/16 \
-    172.16.0.0/12 \
-    192.0.0.0/24 \
-    192.168.0.0/16 \
-    198.18.0.0/15 \
-    224.0.0.0/4 \
-    240.0.0.0/4
-do
-    nft get element inet sbgh_sandbox_egress protected_ipv4 "{ $cidr }" >/dev/null ||
-        { echo "built-in protected CIDR is absent from live nftables: $cidr" >&2; exit 1; }
-done
-
-while IFS= read -r raw || [[ -n $raw ]]; do
-    cidr=${raw%%#*}
-    cidr=${cidr//[[:space:]]/}
-    [[ -n $cidr ]] || continue
-    nft get element inet sbgh_sandbox_egress operator_protected_ipv4 "{ $cidr }" >/dev/null ||
-        { echo "operator-protected CIDR is absent from live nftables: $cidr" >&2; exit 1; }
-done <"$protected_ipv4"
 
 [[ $(sysctl -n net.ipv4.ip_forward) == 1 ]] ||
     { echo "net.ipv4.ip_forward is disabled" >&2; exit 1; }
