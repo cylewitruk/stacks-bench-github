@@ -72,9 +72,9 @@ origin_attr=${origin_attr//[[:space:]]/}
     { echo "origin LV is not the exact read-only LV" >&2; exit 1; }
 
 mkdir -p "$(dirname "$report")"
-scratch=$(mktemp -d /run/sbgh-worker/.v26-lvm-smoke.XXXXXX)
+scratch=$(mktemp -d /run/sbgh-lvm-smoke.XXXXXX)
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-snapshot_prefix="sbgh-v26-smoke-${run_id}"
+snapshot_prefix="sbgh-lvm-smoke-${run_id}"
 declare -a snapshot_names=()
 declare -a mount_paths=()
 cleaned=0
@@ -128,7 +128,7 @@ done
 
 for index in 0 1; do
     other=$((1 - index))
-    marker=".sbgh-v26-isolation-${run_id}-${index}"
+    marker=".sbgh-lvm-isolation-${run_id}-${index}"
     printf 'attempt-scoped mutation from snapshot %d\n' "$index" \
         >"${mount_paths[$index]}/$marker"
     [[ ! -e "$origin_mount/$marker" ]] ||
@@ -142,7 +142,7 @@ leftovers=$(lvs --noheadings --options lv_name --select \
     "vg_name=$vg && lv_name=~^$snapshot_prefix" | xargs)
 [[ -z $leftovers ]] || { echo "smoke left snapshot LVs: $leftovers" >&2; exit 1; }
 {
-    echo "# v26 block-validation LVM isolation smoke"
+    echo "# SBGH block-validation LVM isolation qualification"
     echo
     echo "- captured_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "- host: $(hostname -f 2>/dev/null || hostname)"
