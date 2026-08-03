@@ -21,7 +21,8 @@ operator sbgh-cli ─────────────────┤
                    PostgreSQL GitHub/Slack    S3
                        |
                        | protobuf/gRPC over HTTP/2;
-                       | TLS 1.3 mutual X.509;
+                       | TLS 1.3: Web-PKI daemon identity
+                       | + worker P-256 proof-of-possession;
                        | workers poll outbound
                ┌───────┴────────┐
                v                v
@@ -258,6 +259,8 @@ infrastructure failures and may be retried according to fleet policy.
 
 - [setup.md](setup.md) installs the current system.
 - [worker-fleet-operations.md](worker-fleet-operations.md) covers routine
-  worker, certificate, maintenance, and recovery procedures.
+  worker identity, maintenance, and recovery procedures.
+- [deployment-qualification.md](deployment-qualification.md) is the ordered
+  first-deployment and worker-commissioning gate.
 - [daemon-api.md](daemon-api.md) documents the operator and ingest API.
 - [slack-setup.md](slack-setup.md) configures the optional Slack surface.

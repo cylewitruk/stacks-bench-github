@@ -394,6 +394,11 @@ enum JobsAction {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Print the canonical task-aware report for one submission as JSON.
+    Report {
+        #[arg(long)]
+        submission_id: String,
+    },
     /// Enqueue block validation on a fleet worker.
     ValidateBlocks {
         #[arg(long)]
@@ -1150,6 +1155,13 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
                 );
             }
         }
+        JobsAction::Report { submission_id } => {
+            let report = client
+                .submission_report(&submission_id)
+                .await
+                .with_context(|| format!("load report for submission {submission_id}"))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         JobsAction::ValidateBlocks {
             install_id,
             repo_id,
@@ -1490,6 +1502,25 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn submission_report_command_uses_task_neutral_identity() {
+        let parsed = Cli::try_parse_from([
+            "sbgh-cli",
+            "jobs",
+            "report",
+            "--submission-id",
+            "018f7f24-2c9d-7e31-8f9c-5d8f39b7ad11",
+        ])
+        .unwrap();
+        let Command::Jobs {
+            action: JobsAction::Report { submission_id },
+        } = parsed.command
+        else {
+            panic!("expected jobs report command");
+        };
+        assert_eq!(submission_id, "018f7f24-2c9d-7e31-8f9c-5d8f39b7ad11");
     }
 
     #[test]

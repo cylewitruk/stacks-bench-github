@@ -4,7 +4,9 @@ This runbook covers the current worker fleet after
 [setup](setup.md). One active `sbgh-daemon` owns scheduling, leases, durable
 events, artifacts, and provider reporting. Workers poll outbound and execute
 only registry-authorized capabilities. Control RPCs use generated protobuf over
-HTTP/2 with TLS 1.3 mutual X.509; artifact bodies use delegated HTTPS URLs.
+HTTP/2 with TLS 1.3: workers validate the daemon through Web PKI and prove
+possession of their enrolled P-256 keys. Artifact bodies use delegated HTTPS
+URLs.
 
 ## Routine status
 
@@ -294,9 +296,6 @@ The lease HMAC key must contain at least 32 random bytes and be readable only
 by the daemon. Rotate it only after all workers are drained and no attempt or
 cleanup obligation remains; replacement invalidates every outstanding lease.
 
-Keep the encrypted private CA key offline and backed up. Never copy it to the
-daemon or worker service directories.
-
 ## Deploy an application update
 
 The daemon and workers require exact worker-protocol compatibility. Use a full
@@ -308,11 +307,15 @@ drain:
 4. Take a database backup and retain the current binaries/configuration.
 5. Build and validate the new checkout with `just build`, `just lint`, and
    `just test`.
-6. Install binaries with `sudo ./scripts/install-daemon.sh --no-start`.
-7. Start the daemon; it applies forward-only migrations.
-8. Start workers from the same release.
-9. Verify mTLS identity, protocol, capabilities, preflight, and fleet state.
-10. Run benchmark and block-validation canaries, then undrain.
+6. On the control-plane host, install with
+   `sudo ./scripts/install-daemon.sh --no-start`.
+7. On every worker host, install with `sudo ./scripts/install-worker.sh`; the
+   installer leaves all instances stopped.
+8. Start the daemon; it applies forward-only migrations.
+9. Start workers from the same release.
+10. Verify worker key identity, TLS, protocol, capabilities, preflight, and
+    fleet state.
+11. Run benchmark and block-validation canaries, then undrain.
 
 Never run an older binary against a schema it was not designed to read.
 Rollback across a schema-changing deployment means stopping traffic and

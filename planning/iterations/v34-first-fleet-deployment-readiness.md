@@ -7,7 +7,8 @@ evidence-backed deployment on real hardware. This iteration also closes the
 remaining host-verification work from v20 and v22 against the current fleet and
 snapshot-reporting architecture.
 
-> **Status:** planned
+> **Status:** in_progress — host-independent inventory, packaging, config, and
+> playbook work is implemented locally; real-host gates remain open.
 >
 > v34 is a deployment-readiness and qualification iteration, not a new task
 > feature. Fixes discovered by the playbook are in scope; unrelated feature
@@ -17,14 +18,14 @@ snapshot-reporting architecture.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0080-first-fleet-deployment-qualification` | primary: installation, commissioning, canaries, and evidence | planned |
+| `0080-first-fleet-deployment-qualification` | primary: installation, commissioning, canaries, and evidence | in_progress |
 | `0027-fine-grained-progress` | co-primary: real-host progress verification | planned |
 | `0039-multi-variant-benchmark-comparisons` | co-primary: real-host comparison verification | planned |
 
 ## 0080 — First Fleet Deployment Qualification
 
 - **id:** `0080-first-fleet-deployment-qualification`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `high`
 - **depends_on:** `0004-worker-fleet`, `0017-generic-phase-events`,
   `0062-sandboxed-worker-execution`, `0063-libvirt-block-validation`,
@@ -222,6 +223,20 @@ HTTP/CLI and exact GitHub triggers remain provider-free.
 - A completed first-deployment qualification record with identifiers and
   cleanup evidence; secrets and tokens must never enter the record.
 
+## Host-Independent Progress
+
+- [x] Map every host action to a checked-in asset or explicit manual/external
+  prerequisite.
+- [x] Split daemon-only and worker-only installation with staging-root
+  ownership/idempotency tests.
+- [x] Apply the worker hardening drop-in to every worker profile.
+- [x] Add a parse-tested combined-capability worker example.
+- [x] Correct active docs to the public Web-PKI + worker-key identity model.
+- [x] Add the ordered deployment-qualification playbook and typed CLI report
+  view used by its canaries.
+- [x] Complete local build, lint, and test validation for this slice.
+- [ ] Execute the real-host gates below.
+
 ## Execution Playbook
 
 ### Phase 0: Host-Action Inventory
@@ -392,12 +407,12 @@ that the first fleet is live.
 
 ### Core Fleet-Live Gate (`0080`)
 
-- [ ] `just build --no-sccache`
-- [ ] `just lint --no-sccache`
-- [ ] `just test --summary --no-sccache`
-- [ ] `git diff --check`
-- [ ] Installer isolation/idempotency tests pass.
-- [ ] Daemon, benchmark-worker, block-validation-worker, and combined-worker
+- [x] `just build --no-sccache`
+- [x] `just lint --no-sccache`
+- [x] `just test --summary --no-sccache`
+- [x] `git diff --check`
+- [x] Installer isolation/idempotency tests pass.
+- [x] Daemon, benchmark-worker, block-validation-worker, and combined-worker
   examples remain parse-tested.
 - [ ] Sandbox policy service starts and its live post-start verifier passes.
 - [ ] Disposable-guest network and two-snapshot LVM ceremonies pass.

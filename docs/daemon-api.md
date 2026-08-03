@@ -313,6 +313,10 @@ sudo -u sbgh sbgh-cli jobs --help
 sudo -u sbgh sbgh-cli fleet --help
 ```
 
+`sbgh-cli jobs report --submission-id <uuid>` prints the canonical typed report
+used by the API, GitHub, and Slack renderers. It is the preferred operator view
+for qualification and incident diagnosis.
+
 Worker enrollment and identity commands print the canonical worker policy
 as JSON so setup and rotation scripts can consume UUIDs, identity digests, and
 timestamps without parsing log text.

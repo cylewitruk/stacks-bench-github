@@ -9,6 +9,9 @@ on a separate machine.
 For the security and component model, read [architecture.md](architecture.md).
 For routine operation after installation, use
 [worker-fleet-operations.md](worker-fleet-operations.md).
+For the first deployment and each newly commissioned worker, follow
+[deployment-qualification.md](deployment-qualification.md) after completing
+the relevant setup steps here.
 
 ## Deployment checklist
 
@@ -18,7 +21,8 @@ The required components are:
 - the host-side `sbgh-daemon` and operator `sbgh-cli`;
 - PostgreSQL plus the containerized webhook handler and smee forwarder;
 - S3-compatible object storage;
-- a private worker PKI and PostgreSQL-backed worker registry;
+- a public Web-PKI certificate for the daemon fleet endpoint, worker P-256
+  identity keys, and the PostgreSQL-backed worker registry;
 - at least one KVM/libvirt worker with the managed `sandbox-egress` network,
   a golden VM image, and a read-only LVM chainstate origin.
 
@@ -265,6 +269,14 @@ sudo ./scripts/install-daemon.sh --no-start
 
 ## 8. Prepare each execution worker
 
+Install only worker-owned artifacts. The installer deliberately leaves every
+profile stopped until configuration, preflight, enrollment, and policy are
+complete:
+
+```bash
+sudo ./scripts/install-worker.sh
+```
+
 ### LVM and chainstate
 
 Create or select an LVM thin pool. Publish chainstates as dated, read-only thin
@@ -340,10 +352,10 @@ sudo -u sbgh-worker sbgh-worker identity generate \
   > /tmp/sbgh-worker-public.pem
 ```
 
-Copy either
-[config.example.worker-benchmark.toml](../config.example.worker-benchmark.toml)
-or
-[config.example.worker-block-validation.toml](../config.example.worker-block-validation.toml)
+Copy
+[config.example.worker-benchmark.toml](../config.example.worker-benchmark.toml),
+[config.example.worker-block-validation.toml](../config.example.worker-block-validation.toml),
+or [config.example.worker-combined.toml](../config.example.worker-combined.toml)
 to `/etc/sbgh/worker/<profile>.toml`. Set the orchestrator URL, CPU placement,
 VM resources, LVM identifiers, and paths. Capabilities are inferred from the
 present `[benchmark]` and `[block_validation]` sections. Block validation uses
@@ -352,8 +364,8 @@ durable selector against the attached chainstate before sizing shards.
 
 ```bash
 sudo install -m 0600 -o sbgh-worker -g sbgh-worker \
-  config.example.worker-benchmark.toml /etc/sbgh/worker/benchmark.toml
-sudo -u sbgh-worker $EDITOR /etc/sbgh/worker/benchmark.toml
+  config.example.worker-combined.toml /etc/sbgh/worker/combined.toml
+sudo -u sbgh-worker $EDITOR /etc/sbgh/worker/combined.toml
 ```
 
 Grant only the fixed host commands used by the trusted adapter:
@@ -370,28 +382,18 @@ Install this as `/etc/sudoers.d/sbgh`, mode `0440`, and validate it with
 `visudo -cf /etc/sudoers.d/sbgh`. The daemon user receives no libvirt, LVM, or
 sudo authority.
 
-Install the binaries and units on a remote worker with
-`sudo ./scripts/install-daemon.sh --no-start`. For the dedicated block worker,
-install
-[sbgh-worker-block-validation-hardening.conf](../systemd/sbgh-worker-block-validation-hardening.conf)
-as `/etc/systemd/system/sbgh-worker@block-validation.service.d/hardening.conf`.
-
-```bash
-sudo install -d \
-  /etc/systemd/system/sbgh-worker@block-validation.service.d
-sudo install -m 0644 systemd/sbgh-worker-block-validation-hardening.conf \
-  /etc/systemd/system/sbgh-worker@block-validation.service.d/hardening.conf
-sudo systemctl daemon-reload
-```
+`install-worker.sh` installs the worker unit template and its global hardening
+drop-in. It never installs control-plane artifacts and never starts an
+instance.
 
 Run preflight before starting a profile:
 
 ```bash
 sudo -u sbgh-worker sbgh-worker \
-  --config /etc/sbgh/worker/benchmark.toml --preflight-only
+  --config /etc/sbgh/worker/combined.toml --preflight-only
 ```
 
-Use the corresponding block-validation profile on that host.
+Use the profile installed on that host.
 
 ## 9. Start the control plane, enroll workers, and start execution
 
@@ -403,15 +405,17 @@ sudo -u sbgh sbgh-cli status
 ```
 
 Enroll each worker through the admin API. New workers start disabled and
-draining; authorizing the public leaf and enabling the policy makes the
+draining; authorizing the public SPKI and enabling the policy makes the
 identity eligible to register without restarting the daemon:
 
 ```bash
 alias sbgh='sudo -u sbgh sbgh-cli'
 
 WORKER_ID=$(sbgh fleet add-worker \
-  --display-name "benchmark-fsn1-01" \
+  --display-name "combined-fsn1-01" \
   --capability benchmark \
+  --capability build_only \
+  --capability block_validation \
   --measurement-profile "hetzner-ax162" | jq -r .worker.worker_id)
 sbgh fleet authorize-identity \
   --worker-id "$WORKER_ID" \
@@ -432,13 +436,13 @@ Start the edge containers and the matching worker profile:
 docker compose -f docker/docker-compose.yml up -d --build
 curl --fail http://127.0.0.1:8080/health
 
-sudo systemctl enable --now sbgh-worker@benchmark.service
+sudo systemctl enable --now sbgh-worker@combined.service
 sbgh fleet status
 sbgh fleet undrain --worker-id "$WORKER_ID"
 ```
 
-On a separate block-validation host, start
-`sbgh-worker@block-validation.service` instead. Confirm that every worker
+Dedicated hosts may instead use the benchmark-only or block-validation-only
+example and matching systemd instance. Confirm that every worker
 registers with its expected identity, capability, and discovered CPU/memory.
 Adding, rotating, draining, disabling, or revoking a worker is a database/API
 operation and never requires editing daemon configuration.

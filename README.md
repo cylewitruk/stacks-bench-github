@@ -11,7 +11,7 @@ A single Cargo workspace (`crates/`):
 
 | Crate | Role |
 | ---- | ---- |
-| `sbgh-daemon` | The trusted orchestrator: owns Postgres, scheduling, reporting, the authenticated operator and mTLS worker APIs, and all GitHub/Slack/object-store credentials. It never executes jobs. |
+| `sbgh-daemon` | The trusted orchestrator: owns Postgres, scheduling, reporting, the authenticated operator API, the TLS-authenticated gRPC worker API, and all GitHub/Slack/object-store credentials. It never executes jobs. |
 | `sbgh-handler` | Thin edge: verifies the webhook HMAC and forwards each delivery to the daemon's `/api`. No DB, no App key. Runs in a container. |
 | `sbgh-cli` | Operator CLI — a pure `/api` client (cookie auth) for the installer/repo/policy/user allowlists plus read commands (`jobs list`, `webhook tail`, …). |
 | `sbgh-api` | Shared wire DTOs + a typed `reqwest` client used by the daemon (server) and both clients. |
@@ -37,6 +37,8 @@ the handler and CLI reach the daemon over `/api`.
   security model, and execution invariants.
 - [docs/worker-fleet-operations.md](docs/worker-fleet-operations.md) — routine
   fleet operation, maintenance, recovery, and qualification.
+- [docs/deployment-qualification.md](docs/deployment-qualification.md) — ordered
+  first-deployment and worker-commissioning gates.
 - [docs/daemon-api.md](docs/daemon-api.md) — operator and webhook API.
 - [docs/slack-setup.md](docs/slack-setup.md) — optional Slack bot.
 - [planning/index.md](planning/index.md) — **roadmap / backlog registry** (every
@@ -71,7 +73,8 @@ sbgh policy trigger add --on <owner>/<repo> --branch-push develop
 sbgh policy trigger add --on <owner>/<repo> --tag-created '^v\d+\.\d+\.\d+$'
 ```
 
-Roles: `admin` | `trigger-pr-benchmark` | `view-results`. Cross-account source
+Roles: `admin` | `trigger-pr-benchmark` | `trigger-block-validation` |
+`view-results`. Cross-account source
 trust (a fork into a different org's install) uses raw `--install-id`/`--repo-id`.
 
 | Read command | Shows |

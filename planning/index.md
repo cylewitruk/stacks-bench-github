@@ -97,7 +97,7 @@ need editing when an item's status or location changes.
 | `0077-worker-identity-and-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
 | `0078-slack-task-submission` | Slack task submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
 | `0079-dynamic-block-validation-planning` | Dynamic block-validation planning | `shipped` | [archive/completed/0079-dynamic-block-validation-planning.md](archive/completed/0079-dynamic-block-validation-planning.md) |
-| `0080-first-fleet-deployment-qualification` | First fleet deployment qualification | `planned` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
+| `0080-first-fleet-deployment-qualification` | First fleet deployment qualification | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
 
 ## Iterations
 
@@ -137,7 +137,7 @@ need editing when an item's status or location changes.
 | `v31-worker-identity-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
 | `v32-task-aware-slack-submission` | Task-aware Slack submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
 | `v33-dynamic-block-validation-planning` | Dynamic block-validation planning | `shipped` | [archive/completed/0079-dynamic-block-validation-planning.md](archive/completed/0079-dynamic-block-validation-planning.md) |
-| `v34-first-fleet-deployment-readiness` | First fleet deployment readiness | `planned` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
+| `v34-first-fleet-deployment-readiness` | First fleet deployment readiness | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
 
 ## Decisions
 

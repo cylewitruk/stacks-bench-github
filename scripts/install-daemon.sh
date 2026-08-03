@@ -1,106 +1,64 @@
 #!/usr/bin/env bash
-# Install the daemon binary + systemd unit into their canonical
-# system paths. Idempotent — safe to re-run after every change.
-#
-# Usage: from the repo root:
-#   sudo ./scripts/install-daemon.sh           # build + install
-#   sudo ./scripts/install-daemon.sh --no-build # use existing binary
-#   sudo ./scripts/install-daemon.sh --no-start # install before first-time config
-#
-# What it does:
-#   1. Builds target/release/{sbgh-daemon,sbgh-worker,sbgh-cli} as the invoking user
-#      (skipped with --no-build)
-#   2. Copies both to /usr/local/bin/ (the CLI is the operator's `/api`
-#      client — installer/repo/policy/user admin + read commands)
-#   3. Installs systemd/sbgh-daemon.service to /etc/systemd/system/
-#   4. systemctl daemon-reload
-#   5. systemctl enable + start (only on first install; subsequent runs
-#      just restart so the new binary takes effect)
+# Install the control-plane binary, operator CLI, and daemon systemd unit.
+# Idempotent and intentionally independent of execution-worker installation.
 
 set -euo pipefail
 
-REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BINARY_SRC="$REPO_ROOT/target/release/sbgh-daemon"
-BINARY_DEST=/usr/local/bin/sbgh-daemon
-CLI_SRC="$REPO_ROOT/target/release/sbgh-cli"
-CLI_DEST=/usr/local/bin/sbgh-cli
-WORKER_SRC="$REPO_ROOT/target/release/sbgh-worker"
-WORKER_DEST=/usr/local/bin/sbgh-worker
-UNIT_SRC="$REPO_ROOT/systemd/sbgh-daemon.service"
-UNIT_DEST=/etc/systemd/system/sbgh-daemon.service
-WORKER_UNIT_SRC="$REPO_ROOT/systemd/sbgh-worker@.service"
-WORKER_UNIT_DEST=/etc/systemd/system/sbgh-worker@.service
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=install-service-common.sh
+source "$repo_root/scripts/install-service-common.sh"
 
-DO_BUILD=1
-START_SERVICE=1
+do_build=1
+start_service=1
 for arg in "$@"; do
     case "$arg" in
-        --no-build) DO_BUILD=0 ;;
-        --no-start) START_SERVICE=0 ;;
-        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+        --no-build) do_build=0 ;;
+        --no-start) start_service=0 ;;
+        -h|--help)
+            echo "usage: sudo $0 [--no-build] [--no-start]"
+            echo "       DESTDIR=/staging/root $0 --no-build --no-start"
+            exit 0
+            ;;
+        *) echo "Unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
 
-if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "Must run as root (use sudo)." >&2
-    exit 1
-fi
+sbgh_install_init "$repo_root"
 
-for unit in "$UNIT_SRC" "$WORKER_UNIT_SRC"; do
-    if [[ ! -f "$unit" ]]; then
-        echo "Unit file not found at $unit." >&2
-        exit 1
-    fi
-done
+daemon_src="$repo_root/target/release/sbgh-daemon"
+cli_src="$repo_root/target/release/sbgh-cli"
+unit_src="$repo_root/systemd/sbgh-daemon.service"
 
-if [[ $DO_BUILD -eq 1 ]]; then
-    # Build as the invoking user so target/ stays owned by them — building
-    # as root would break subsequent `just build` runs with permission errors.
-    BUILD_USER="${SUDO_USER:-}"
-    if [[ -z "$BUILD_USER" || "$BUILD_USER" == "root" ]]; then
-        echo "Refusing to cargo build as root (would clobber target/ ownership)." >&2
-        echo "Either run via sudo from a non-root shell, or pass --no-build." >&2
-        exit 1
-    fi
-    echo "[1/5] Building release binaries as $BUILD_USER..."
-    sudo -u "$BUILD_USER" -H sh -c \
-        "cd '$REPO_ROOT' && cargo build --locked --release -p sbgh-daemon -p sbgh-worker -p sbgh-cli"
-else
-    echo "[1/5] Skipping build (--no-build)."
-fi
+sbgh_require_file "$unit_src" "Daemon unit"
 
-for src in "$BINARY_SRC" "$WORKER_SRC" "$CLI_SRC"; do
-    if [[ ! -x "$src" ]]; then
-        echo "Binary not found at $src after build step." >&2
-        exit 1
-    fi
-done
+echo "[1/5] Preparing control-plane release..."
+sbgh_build_release "$do_build" sbgh-daemon sbgh-cli
+sbgh_require_executable "$daemon_src" "Daemon binary"
+sbgh_require_executable "$cli_src" "Operator CLI"
 
-echo "[2/5] Installing binaries to /usr/local/bin..."
-install -m 0755 "$BINARY_SRC" "$BINARY_DEST"
-install -m 0755 "$WORKER_SRC" "$WORKER_DEST"
-install -m 0755 "$CLI_SRC" "$CLI_DEST"
+echo "[2/5] Installing control-plane artifacts..."
+sbgh_install_file 0755 "$daemon_src" /usr/local/bin/sbgh-daemon
+sbgh_install_file 0755 "$cli_src" /usr/local/bin/sbgh-cli
 
-echo "[3/5] Installing unit file to $UNIT_DEST..."
-install -m 0644 "$UNIT_SRC" "$UNIT_DEST"
-install -m 0644 "$WORKER_UNIT_SRC" "$WORKER_UNIT_DEST"
+echo "[3/5] Installing daemon unit..."
+sbgh_install_file 0644 "$unit_src" /etc/systemd/system/sbgh-daemon.service
 
 echo "[4/5] Reloading systemd..."
-systemctl daemon-reload
+sbgh_reload_systemd
 
-# First-install bring-up uses --no-start until users, configuration, secrets,
-# PKI, and object storage are in place. Upgrades retain the convenient restart.
-if [[ $START_SERVICE -eq 0 ]]; then
+if [[ -n "$SBGH_INSTALL_DESTDIR" ]]; then
+    echo "[5/5] Staging install complete; no service action was taken."
+elif [[ "$start_service" -eq 0 ]]; then
     echo "[5/5] Skipping service enable/restart (--no-start)."
 elif ! systemctl is-enabled --quiet sbgh-daemon.service; then
-    echo "[5/5] First install — enabling + starting service..."
+    echo "[5/5] Enabling and starting daemon service..."
     systemctl enable --now sbgh-daemon.service
 else
-    echo "[5/5] Restarting service to pick up the new binary..."
+    echo "[5/5] Restarting daemon service..."
     systemctl restart sbgh-daemon.service
 fi
 
 echo
-echo "Done. Tail logs with:  journalctl -u sbgh-daemon -f"
-echo "Status:                systemctl status sbgh-daemon"
-echo "Operator CLI:          sudo -u sbgh sbgh-cli status"
+echo "Done. Tail logs with: journalctl -u sbgh-daemon -f"
+echo "Status:               systemctl status sbgh-daemon"
+echo "Operator CLI:         sudo -u sbgh sbgh-cli status"

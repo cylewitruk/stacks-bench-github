@@ -226,6 +226,8 @@ mod tests {
             WorkerConfig::load(&root.join("config.example.worker-benchmark.toml")).unwrap();
         let block =
             WorkerConfig::load(&root.join("config.example.worker-block-validation.toml")).unwrap();
+        let combined =
+            WorkerConfig::load(&root.join("config.example.worker-combined.toml")).unwrap();
 
         assert_eq!(
             benchmark.advertised_capabilities(),
@@ -236,7 +238,22 @@ mod tests {
             BTreeSet::from([WorkerCapability::BlockValidation])
         );
         assert_eq!(
+            combined.advertised_capabilities(),
+            BTreeSet::from([
+                WorkerCapability::Benchmark,
+                WorkerCapability::BuildOnly,
+                WorkerCapability::BlockValidation,
+            ])
+        );
+        assert_eq!(
             benchmark
+                .libvirt_config()
+                .vm
+                .network,
+            "sandbox-egress"
+        );
+        assert_eq!(
+            combined
                 .libvirt_config()
                 .vm
                 .network,
