@@ -118,7 +118,7 @@ EOF
 fi
 
 [[ $EUID -eq 0 ]] || { echo "--execute must run as root" >&2; exit 2; }
-for command in virsh qemu-img cloud-localds ip python3 nft base64; do
+for command in virsh qemu-img cloud-localds ip python3 nft base64 install; do
     command -v "$command" >/dev/null ||
         { echo "required command is unavailable: $command" >&2; exit 2; }
 done
@@ -378,9 +378,13 @@ while virsh list --name | grep -qx "$domain"; do
 done
 created_domain=0
 
-result=$(grep '^SBGH_NETWORK_QUALIFICATION=' "$console" | tail -1)
+result=$(grep '^SBGH_NETWORK_QUALIFICATION=' "$console" | tail -1 || true)
 [[ -n $result ]] || {
     echo "qualification VM emitted no success record" >&2
+    failure_console="$report.failed-console.$(date -u +%Y%m%dT%H%M%SZ).log"
+    mkdir -p "$(dirname "$failure_console")"
+    install -m 0644 "$console" "$failure_console"
+    echo "preserved guest console at $failure_console" >&2
     tail -100 "$console" >&2
     exit 1
 }

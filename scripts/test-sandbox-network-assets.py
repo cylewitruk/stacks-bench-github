@@ -240,6 +240,20 @@ class SandboxNetworkAssetsTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--deny-tcp must be IPv4:PORT", result.stderr)
 
+    def test_qualification_preserves_console_when_success_marker_is_missing(
+        self,
+    ) -> None:
+        script = (ROOT / "scripts/qualify-sandbox-network.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "grep '^SBGH_NETWORK_QUALIFICATION=' \"$console\" | tail -1 || true",
+            script,
+        )
+        self.assertIn("$report.failed-console.", script)
+        self.assertIn('install -m 0644 "$console" "$failure_console"', script)
+
 
 if __name__ == "__main__":
     unittest.main()
