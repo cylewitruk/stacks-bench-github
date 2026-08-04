@@ -2,13 +2,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
-use sbgh_fleet::{ResourceFacts, WorkerCapability};
+use sbgh_fleet::WorkerCapability;
 use sbgh_libvirt::{
     BenchmarkProfile, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
 };
 use serde::Deserialize;
 
 use crate::BinaryCacheConfig;
+use crate::host_resources::{HostResources, parse_cpu_list};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,7 +20,7 @@ pub struct WorkerConfig {
     pub sandbox: SandboxConfig,
     pub commands: CommandsConfig,
     pub lvm: LvmConfig,
-    pub benchmark: Option<BenchmarkProfile>,
+    pub benchmark: Option<BenchmarkConfig>,
     pub block_validation: Option<BlockValidationProfile>,
     pub binary_cache: Option<BinaryCacheConfig>,
 }
@@ -50,6 +51,32 @@ pub struct CommandsConfig {
     pub qemu_img: PathBuf,
     pub cloud_localds: PathBuf,
     pub git: PathBuf,
+}
+
+/// Worker-owned benchmark resource and CPU-placement policy. Build and
+/// measurement phases are sequential and intentionally share one isolated CPU
+/// set on a single-assignment worker.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkConfig {
+    pub build_vcpus: u32,
+    pub bench_vcpus: u32,
+    pub build_memory_bytes: u64,
+    pub bench_memory_bytes: u64,
+    pub job_timeout_secs: u64,
+    pub cpu_set: String,
+}
+
+impl BenchmarkConfig {
+    fn libvirt_profile(&self) -> BenchmarkProfile {
+        BenchmarkProfile {
+            build_vcpus: self.build_vcpus,
+            bench_vcpus: self.bench_vcpus,
+            build_memory_bytes: self.build_memory_bytes,
+            bench_memory_bytes: self.bench_memory_bytes,
+            job_timeout_secs: self.job_timeout_secs,
+        }
+    }
 }
 
 impl WorkerConfig {
@@ -90,6 +117,13 @@ impl WorkerConfig {
                     && benchmark.bench_memory_bytes > 0,
                 "benchmark recipe requires non-zero build and execution resources"
             );
+            let cpus = parse_cpu_list(&benchmark.cpu_set, "benchmark.cpu_set")?;
+            ensure!(
+                usize::try_from(benchmark.build_vcpus).is_ok_and(|vcpus| vcpus <= cpus.len())
+                    && usize::try_from(benchmark.bench_vcpus)
+                        .is_ok_and(|vcpus| vcpus <= cpus.len()),
+                "benchmark.cpu_set must contain at least as many CPUs as each benchmark phase"
+            );
         }
         if let Some(block) = &self.block_validation {
             ensure!(
@@ -110,6 +144,40 @@ impl WorkerConfig {
                     && block.max_concurrency <= block.max_shards,
                 "invalid block-validation shard/concurrency limits"
             );
+            let cpus = parse_cpu_list(
+                block
+                    .cpu_set
+                    .as_deref()
+                    .context("block_validation.cpu_set is required")?,
+                "block_validation.cpu_set",
+            )?;
+            ensure!(
+                usize::try_from(block.vcpus).is_ok_and(|vcpus| vcpus <= cpus.len()),
+                "block_validation.cpu_set must contain at least as many CPUs as block_validation.vcpus"
+            );
+        }
+        if let Some(host_cpus) = &self.sandbox.host_cpus {
+            let host = parse_cpu_list(host_cpus, "sandbox.host_cpus")?;
+            if let Some(benchmark) = &self.benchmark {
+                let guest = parse_cpu_list(&benchmark.cpu_set, "benchmark.cpu_set")?;
+                ensure!(
+                    host.is_disjoint(&guest),
+                    "sandbox.host_cpus and benchmark.cpu_set must be disjoint"
+                );
+            }
+            if let Some(block) = &self.block_validation {
+                let guest = parse_cpu_list(
+                    block
+                        .cpu_set
+                        .as_deref()
+                        .context("block_validation.cpu_set is required")?,
+                    "block_validation.cpu_set",
+                )?;
+                ensure!(
+                    host.is_disjoint(&guest),
+                    "sandbox.host_cpus and block_validation.cpu_set must be disjoint"
+                );
+            }
         }
         Ok(())
     }
@@ -143,7 +211,8 @@ impl WorkerConfig {
             },
             benchmark: self
                 .benchmark
-                .clone()
+                .as_ref()
+                .map(BenchmarkConfig::libvirt_profile)
                 .unwrap_or_default(),
             paths: PathsConfig {
                 jobs_dir: self
@@ -184,22 +253,38 @@ impl WorkerConfig {
     /// Validate operator-selected guest profiles against measured host
     /// capacity. Build and execution VMs are sequential within an assignment,
     /// so each phase is checked independently rather than summed.
-    pub fn validate_host_resources(&self, resources: &ResourceFacts) -> anyhow::Result<()> {
+    pub fn validate_host_resources(&self, resources: &HostResources) -> anyhow::Result<()> {
+        let facts = resources.facts();
         ensure!(
-            resources.logical_cpus > 0 && resources.memory_bytes > 0,
+            facts.logical_cpus > 0 && facts.memory_bytes > 0,
             "discovered host resources require non-zero CPU and memory"
         );
         if let Some(benchmark) = &self.benchmark {
             ensure!(
-                benchmark.build_vcpus <= resources.logical_cpus
-                    && benchmark.build_memory_bytes <= resources.memory_bytes,
-                "benchmark build profile exceeds discovered host CPU or memory"
+                benchmark.build_vcpus <= facts.logical_cpus
+                    && benchmark.build_memory_bytes <= facts.memory_bytes,
+                "benchmark build profile exceeds discovered host resources: requested_vcpus={} \
+                 requested_memory_bytes={} online_cpus={} memory_bytes={}",
+                benchmark.build_vcpus,
+                benchmark.build_memory_bytes,
+                facts.logical_cpus,
+                facts.memory_bytes,
             );
             ensure!(
-                benchmark.bench_vcpus <= resources.logical_cpus
-                    && benchmark.bench_memory_bytes <= resources.memory_bytes,
-                "benchmark execution profile exceeds discovered host CPU or memory"
+                benchmark.bench_vcpus <= facts.logical_cpus
+                    && benchmark.bench_memory_bytes <= facts.memory_bytes,
+                "benchmark execution profile exceeds discovered host resources: \
+                 requested_vcpus={} requested_memory_bytes={} online_cpus={} memory_bytes={}",
+                benchmark.bench_vcpus,
+                benchmark.bench_memory_bytes,
+                facts.logical_cpus,
+                facts.memory_bytes,
             );
+            validate_online_cpu_set(
+                &benchmark.cpu_set,
+                "benchmark.cpu_set",
+                resources.online_cpus(),
+            )?;
         }
         if let Some(block) = &self.block_validation {
             let reserved_memory = block
@@ -207,17 +292,51 @@ impl WorkerConfig {
                 .checked_add(u64::from(block.results_tmpfs_mib) * 1024 * 1024)
                 .context("block-validation memory reservation overflows")?;
             ensure!(
-                block.vcpus <= resources.logical_cpus && reserved_memory <= resources.memory_bytes,
-                "block-validation profile exceeds discovered host CPU or memory"
+                block.vcpus <= facts.logical_cpus && reserved_memory <= facts.memory_bytes,
+                "block-validation profile exceeds discovered host resources: requested_vcpus={} \
+                 requested_memory_bytes={} online_cpus={} memory_bytes={}",
+                block.vcpus,
+                reserved_memory,
+                facts.logical_cpus,
+                facts.memory_bytes,
             );
+            validate_online_cpu_set(
+                block
+                    .cpu_set
+                    .as_deref()
+                    .context("block_validation.cpu_set is required")?,
+                "block_validation.cpu_set",
+                resources.online_cpus(),
+            )?;
+        }
+        if let Some(host_cpus) = &self.sandbox.host_cpus {
+            validate_online_cpu_set(host_cpus, "sandbox.host_cpus", resources.online_cpus())?;
         }
         Ok(())
     }
 }
 
+fn validate_online_cpu_set(
+    value: &str,
+    field: &str,
+    online_cpus: &BTreeSet<u32>,
+) -> anyhow::Result<()> {
+    let configured = parse_cpu_list(value, field)?;
+    let offline = configured
+        .difference(online_cpus)
+        .copied()
+        .collect::<Vec<_>>();
+    ensure!(offline.is_empty(), "{field} contains offline CPUs: {offline:?}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_resources(logical_cpus: u32, memory_bytes: u64) -> HostResources {
+        HostResources::new((0..logical_cpus).collect(), memory_bytes).unwrap()
+    }
 
     #[test]
     fn checked_in_worker_examples_stay_parseable() {
@@ -371,10 +490,7 @@ mod tests {
         let block =
             WorkerConfig::load(&root.join("config.example.worker-block-validation.toml")).unwrap();
 
-        let ample = ResourceFacts {
-            logical_cpus: 64,
-            memory_bytes: 256 * 1024 * 1024 * 1024,
-        };
+        let ample = host_resources(64, 256 * 1024 * 1024 * 1024);
         benchmark
             .validate_host_resources(&ample)
             .unwrap();
@@ -384,23 +500,54 @@ mod tests {
 
         assert!(
             benchmark
-                .validate_host_resources(&ResourceFacts {
-                    logical_cpus: 3,
-                    memory_bytes: ample.memory_bytes,
-                })
+                .validate_host_resources(&host_resources(3, ample.facts().memory_bytes))
                 .unwrap_err()
                 .to_string()
                 .contains("build profile")
         );
         assert!(
             block
-                .validate_host_resources(&ResourceFacts {
-                    logical_cpus: ample.logical_cpus,
-                    memory_bytes: 196 * 1024 * 1024 * 1024,
-                })
+                .validate_host_resources(&host_resources(64, 196 * 1024 * 1024 * 1024))
                 .unwrap_err()
                 .to_string()
                 .contains("block-validation profile")
+        );
+    }
+
+    #[test]
+    fn worker_owned_cpu_placement_must_be_online_and_disjoint() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config =
+            WorkerConfig::load(&root.join("config.example.worker-combined.toml")).unwrap();
+        let resources = host_resources(64, 256 * 1024 * 1024 * 1024);
+        config
+            .validate_host_resources(&resources)
+            .unwrap();
+
+        config
+            .benchmark
+            .as_mut()
+            .unwrap()
+            .cpu_set = "0-2,64".into();
+        assert!(
+            config
+                .validate_host_resources(&resources)
+                .unwrap_err()
+                .to_string()
+                .contains("offline CPUs: [64]")
+        );
+
+        config
+            .benchmark
+            .as_mut()
+            .unwrap()
+            .cpu_set = "48-51".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must be disjoint")
         );
     }
 }

@@ -194,6 +194,9 @@ HTTP/CLI and exact GitHub triggers remain provider-free.
 - **Fail closed between gates.** Do not enable provider-triggered demand until
   the preceding substrate and controlled canaries pass. A failed or ambiguous
   gate leaves the worker drained.
+- **Keep VM placement worker-owned.** Discover host VM capacity from Linux's
+  online CPU set rather than the housekeeping-confined adapter process. Validate
+  guest and emulator CPU sets locally and reject daemon-supplied placement.
 - **Use one dual-capability process first.** A checked-in combined profile
   proves capability inference and the common sandbox model. Dedicated workers
   remain an operator policy choice, not a separate code path.
@@ -235,6 +238,8 @@ HTTP/CLI and exact GitHub triggers remain provider-free.
 - [x] Add the ordered deployment-qualification playbook and typed CLI report
   view used by its canaries.
 - [x] Complete local build, lint, and test validation for this slice.
+- [x] Correct first-host CPU discovery and placement after isolated CPUs made
+  process-affinity capacity under-report the VM host.
 - [ ] Execute the real-host gates below.
 
 ## Execution Playbook

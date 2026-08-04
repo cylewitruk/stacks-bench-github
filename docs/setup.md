@@ -367,10 +367,22 @@ present `[benchmark]` and `[block_validation]` sections. Block validation uses
 `stacks-inspect`'s built-in mainnet network configuration and resolves the
 durable selector against the attached chainstate before sizing shards.
 
+CPU placement is worker-owned. Set `[benchmark].cpu_set` and
+`[block_validation].cpu_set` to online guest CPUs, and keep them disjoint from
+optional `[sandbox].host_cpus` used by QEMU emulator/I/O threads. The worker
+measures VM capacity from Linux's online CPU set rather than its own process
+affinity because an isolated host normally confines the adapter process to
+housekeeping CPUs. An orchestrator-supplied CPU placement is rejected.
+
 ```bash
 sudo install -m 0600 -o sbgh-worker -g sbgh-worker \
   config.example.worker-combined.toml /etc/sbgh/worker/combined.toml
 sudo -u sbgh-worker $EDITOR /etc/sbgh/worker/combined.toml
+
+# systemd normally creates this when the worker starts; create it explicitly
+# when preflighting a profile before its first start.
+sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker \
+  /run/sbgh-worker /run/sbgh-worker/jobs
 
 # This requires a SERVING response through the production TLS 1.3 connector,
 # but requires no registry enrollment.

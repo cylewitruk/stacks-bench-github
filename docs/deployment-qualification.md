@@ -248,6 +248,12 @@ sudo install -m 0600 -o sbgh-worker -g sbgh-worker \
 sudo -u sbgh-worker "$EDITOR" /etc/sbgh/worker/combined.toml
 ```
 
+Record `/sys/devices/system/cpu/online`, `isolated`, and `nohz_full`. Configure
+the benchmark and block-validation `cpu_set` values from online guest CPUs and
+keep them disjoint from `sandbox.host_cpus`. Do not size VMs from `nproc` when
+the adapter process inherits housekeeping-only affinity; the worker discovers
+host-wide online VM capacity itself and validates every configured set.
+
 Generate the identity once. Keep the private key on the worker and transfer
 only the public SPKI to the daemon administrator:
 
@@ -265,6 +271,8 @@ real HTTP/2 response, creates no worker session, and does not require registry
 enrollment:
 
 ```bash
+sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker \
+  /run/sbgh-worker /run/sbgh-worker/jobs
 sudo -u sbgh-worker sbgh-worker \
   --config /etc/sbgh/worker/combined.toml --preflight-only
 sudo -u sbgh-worker sbgh-worker \

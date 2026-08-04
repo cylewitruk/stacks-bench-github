@@ -150,6 +150,12 @@ Every repository revision is adversarial, regardless of source authorization.
 Build scripts and produced binaries execute only in disposable libvirt VMs.
 There is no direct host-process fallback.
 
+VM CPU placement is local worker policy. The worker measures host-wide online
+CPUs even when its trusted adapter process is confined to housekeeping CPUs,
+validates recipe and emulator sets against that topology, and rejects
+orchestrator-supplied CPU placement. This keeps measurement-host topology out
+of submission and scheduling policy.
+
 All chainstate workers maintain local read-only LVM origins under a shared
 naming prefix. For each attempt, the trusted adapter:
 

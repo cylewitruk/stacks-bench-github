@@ -107,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         }
         let resources =
             sbgh_worker::discover_host_resources().context("discovering worker host resources")?;
+        log_host_resources(&resources);
         let report = sbgh_worker::check_registration(&config, resources)
             .await
             .context("checking fleet registration")?;
@@ -134,14 +135,10 @@ async fn main() -> anyhow::Result<()> {
     }
     let resources =
         sbgh_worker::discover_host_resources().context("discovering worker host resources")?;
+    log_host_resources(&resources);
     config
         .validate_host_resources(&resources)
         .context("validating worker profiles against host resources")?;
-    tracing::info!(
-        logical_cpus = resources.logical_cpus,
-        memory_bytes = resources.memory_bytes,
-        "discovered worker host resources"
-    );
     if args.preflight_only {
         sbgh_worker::preflight_local_execution(&config)
             .await
@@ -169,6 +166,14 @@ async fn main() -> anyhow::Result<()> {
         signal.cancel();
     });
     sbgh_worker::run_fleet(config, resources, shutdown).await
+}
+
+fn log_host_resources(resources: &sbgh_worker::HostResources) {
+    tracing::info!(
+        logical_cpus = resources.facts().logical_cpus,
+        memory_bytes = resources.facts().memory_bytes,
+        "discovered worker host resources"
+    );
 }
 
 #[cfg(test)]

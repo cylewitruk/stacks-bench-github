@@ -1,5 +1,5 @@
 orchestrator_url = "https://fleet.internal.example:9443"
-identity_private_key = "/etc/sbgh/worker/client.key"
+identity_private_key = "/etc/sbgh/worker/identity.key"
 
 [binary_cache]
 enabled = true

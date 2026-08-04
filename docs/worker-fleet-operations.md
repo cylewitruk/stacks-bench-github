@@ -103,10 +103,21 @@ new comparison.
 Before enabling a worker profile, run:
 
 ```bash
+sudo install -d -m 0755 -o sbgh-worker -g sbgh-worker \
+  /run/sbgh-worker /run/sbgh-worker/jobs
 sudo -u sbgh-worker sbgh-worker \
   --config /etc/sbgh/worker/benchmark.toml \
   --preflight-only
 ```
+
+The worker reports host-wide online CPU count, not the adapter process's
+affinity count. This distinction is intentional on benchmark hosts where the
+adapter and OS are restricted to housekeeping CPUs while libvirt pins guest
+vCPUs onto isolated CPUs. Preflight requires every configured recipe CPU set
+and optional `sandbox.host_cpus` set to contain only online CPUs, requires
+enough CPUs for its VM, and rejects overlap between guest and housekeeping
+sets. CPU placement comes only from worker policy; the daemon cannot override
+it.
 
 Verify the endpoint from the worker host before enrollment. This calls the
 standard gRPC health service through the production TLS connector and requires
@@ -145,6 +156,7 @@ Use the block-validation profile on that host. Preflight opens no fleet
 session and checks:
 
 - worker config and profile resources against discovered CPU and memory;
+- worker-owned guest/housekeeping CPU placement against Linux online CPUs;
 - identity private key;
 - golden image and fixed host commands;
 - job, cache, result, and runtime paths;

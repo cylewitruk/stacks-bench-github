@@ -28,7 +28,7 @@ pub use fleet::run as run_fleet;
 pub use fleet::{
     FleetCheckReport, check_connectivity, check_registration, preflight_local_execution,
 };
-pub use host_resources::discover_host_resources;
+pub use host_resources::{HostResources, discover_host_resources};
 pub use sbgh_driver::{
     BenchmarkRunContext, BenchmarkTask, ExecutionContext, ExecutionPlacement, ExecutionRequest,
     ExecutionTask, Terminal, WorkerEvent,

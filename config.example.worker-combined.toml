@@ -45,6 +45,8 @@ bench_vcpus = 2
 build_memory_bytes = 17179869184
 bench_memory_bytes = 8589934592
 job_timeout_secs = 21600
+# Worker-owned isolated CPUs shared by the sequential build and benchmark VMs.
+cpu_set = "0-3"
 
 [block_validation]
 vcpus = 48
@@ -57,4 +59,3 @@ max_parallel_jobs = 1
 results_tmpfs_mib = 5120
 snapshot_prefix = "sbgh-block"
 mount_options = ["nouuid", "noatime"]
-

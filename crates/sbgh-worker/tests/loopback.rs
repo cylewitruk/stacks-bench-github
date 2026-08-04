@@ -12,7 +12,7 @@ use rcgen::{
 };
 use sbgh_fleet::{
     AttemptIdentity, LeaseToken, PollResponse, RegisterSessionResponse, RegistrationCheckResponse,
-    ResourceFacts, WorkOffer, WorkerCapability,
+    WorkOffer, WorkerCapability,
 };
 use sbgh_proto::Wire;
 use sbgh_proto::fleet::v1::worker_fleet_service_server::{
@@ -130,7 +130,12 @@ impl WorkerFleetService for MockFleet {
             request.advertised_capabilities,
             BTreeSet::from([WorkerCapability::Benchmark, WorkerCapability::BuildOnly])
         );
-        assert_eq!(request.resources, worker_resources());
+        assert_eq!(
+            request.resources,
+            worker_resources()
+                .facts()
+                .clone()
+        );
         Ok(Response::new(CheckRegistrationResponse::from_domain(RegistrationCheckResponse {
             protocol_version: sbgh_fleet::PROTOCOL_VERSION,
             worker_id: self.worker_id,
@@ -155,7 +160,12 @@ impl WorkerFleetService for MockFleet {
             registration.advertised_capabilities,
             BTreeSet::from([WorkerCapability::Benchmark, WorkerCapability::BuildOnly])
         );
-        assert_eq!(registration.resources, worker_resources());
+        assert_eq!(
+            registration.resources,
+            worker_resources()
+                .facts()
+                .clone()
+        );
         *self
             .session_id
             .lock()
@@ -351,11 +361,8 @@ fn worker_config(
     config
 }
 
-fn worker_resources() -> ResourceFacts {
-    ResourceFacts {
-        logical_cpus: 8,
-        memory_bytes: 32 * 1024 * 1024 * 1024,
-    }
+fn worker_resources() -> sbgh_worker::HostResources {
+    sbgh_worker::HostResources::new((0..8).collect(), 32 * 1024 * 1024 * 1024).unwrap()
 }
 
 fn now_millis() -> i64 {

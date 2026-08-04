@@ -1,5 +1,5 @@
 orchestrator_url = "https://fleet.internal.example:9443"
-identity_private_key = "/etc/sbgh/worker/client.key"
+identity_private_key = "/etc/sbgh/worker/identity.key"
 
 [binary_cache]
 enabled = true
@@ -18,6 +18,8 @@ bench_vcpus = 2
 build_memory_bytes = 17179869184
 bench_memory_bytes = 8589934592
 job_timeout_secs = 21600
+# Worker-owned isolated CPUs shared by the sequential build and benchmark VMs.
+cpu_set = "0-3"
 
 [workspace]
 jobs_dir = "/var/lib/sbgh-worker/jobs"

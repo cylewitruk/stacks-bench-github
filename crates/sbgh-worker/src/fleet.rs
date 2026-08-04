@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::config::WorkerConfig;
 use crate::remote_artifacts::RemoteArtifactSink;
 use crate::transport::{FleetClient, FleetClientError};
-use crate::{WorkerRuntime, build_binary_cache};
+use crate::{HostResources, WorkerRuntime, build_binary_cache};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
 const MAX_CLOCK_SKEW_MS: u64 = 30_000;
@@ -130,7 +130,7 @@ fn driver_block_result_to_wire(
 
 pub async fn run(
     config: WorkerConfig,
-    resources: ResourceFacts,
+    resources: HostResources,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     config
@@ -141,7 +141,7 @@ pub async fn run(
     let client = FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?;
     let request_started_ms = now_millis();
     let registration = client
-        .register(&registration_request(&config, resources, session_id))
+        .register(&registration_request(&config, resources.facts().clone(), session_id))
         .await
         .context("registering worker session")?;
     let request_finished_ms = now_millis();
@@ -252,13 +252,13 @@ pub async fn check_connectivity(config: &WorkerConfig) -> anyhow::Result<()> {
 /// or deregistering a worker session.
 pub async fn check_registration(
     config: &WorkerConfig,
-    resources: ResourceFacts,
+    resources: HostResources,
 ) -> anyhow::Result<FleetCheckReport> {
     config
         .validate_host_resources(&resources)
         .context("validating execution profiles against discovered host resources")?;
     let client = FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?;
-    let request = registration_check_request(config, resources);
+    let request = registration_check_request(config, resources.facts().clone());
     let request_started_ms = now_millis();
     let registration = client
         .check_registration(&request)
@@ -652,7 +652,7 @@ async fn execute_driver(
         .and_then(build_binary_cache);
     let shell = Arc::new(SystemShell::new(&libvirt.paths.sudo_binary));
     let built = WorkerRuntime::libvirt(libvirt, shell, artifacts, cache);
-    let request = execution_request(assignment, repository_token)?;
+    let request = execution_request(config, assignment, repository_token)?;
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let runtime = built.runtime;
     let execution_runtime = runtime.clone();
@@ -736,9 +736,17 @@ async fn execute_driver(
 }
 
 fn execution_request(
+    config: &WorkerConfig,
     assignment: &sbgh_fleet::Assignment,
     repository_token: &RepositoryToken,
 ) -> anyhow::Result<ExecutionRequest> {
+    let vcpu_cpuset = local_vcpu_cpuset(
+        config,
+        &assignment.payload,
+        assignment
+            .vcpu_cpuset
+            .as_deref(),
+    )?;
     let task = match &assignment.payload {
         TaskPayload::Benchmark(payload) => ExecutionTask::Benchmark(BenchmarkTask {
             args: payload.effective_args.clone(),
@@ -792,9 +800,34 @@ fn execution_request(
             repository_credential: Some(RepositoryCredential::new(repository_token.0.clone())),
         },
         task,
-        placement: ExecutionPlacement {
-            vcpu_cpuset: assignment.vcpu_cpuset.clone(),
-        },
+        placement: ExecutionPlacement { vcpu_cpuset },
+    })
+}
+
+fn local_vcpu_cpuset(
+    config: &WorkerConfig,
+    payload: &TaskPayload,
+    orchestrator_cpuset: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    ensure!(
+        orchestrator_cpuset.is_none(),
+        "orchestrator-supplied CPU placement is forbidden; VM placement is worker-owned"
+    );
+    Ok(match payload {
+        TaskPayload::Benchmark(_) | TaskPayload::BuildOnly => Some(
+            config
+                .benchmark
+                .as_ref()
+                .context("benchmark assignment has no local worker profile")?
+                .cpu_set
+                .clone(),
+        ),
+        TaskPayload::BlockValidation(_) => config
+            .block_validation
+            .as_ref()
+            .context("block-validation assignment has no local worker profile")?
+            .cpu_set
+            .clone(),
     })
 }
 
@@ -1054,12 +1087,15 @@ fn retry_delay(error: &anyhow::Error, fallback: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CLOCK_SKEW_MS, admit_offer, has_fleet_code, is_non_retryable, retry_delay,
-        validate_server_timing,
+        MAX_CLOCK_SKEW_MS, admit_offer, has_fleet_code, is_non_retryable, local_vcpu_cpuset,
+        retry_delay, validate_server_timing,
     };
     use crate::WorkerConfig;
     use crate::transport::FleetClientError;
-    use sbgh_fleet::{AttemptIdentity, LeaseToken, OfferRequirements, WorkOffer, WorkerCapability};
+    use sbgh_fleet::{
+        AttemptIdentity, BlockValidationPayload, BlockValidationSelection, LeaseToken,
+        OfferRequirements, TaskPayload, WorkOffer, WorkerCapability,
+    };
     use std::path::Path;
     use std::time::Duration;
     use uuid::Uuid;
@@ -1114,6 +1150,35 @@ mod tests {
             .is_err()
         );
         assert!(validate_server_timing(1, 5_000, 5_000, 10_050, 10_000, 10_100).is_err());
+    }
+
+    #[test]
+    fn execution_uses_worker_owned_cpu_placement_and_rejects_orchestrator_placement() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = WorkerConfig::load(&root.join("config.example.worker-combined.toml")).unwrap();
+
+        assert_eq!(
+            local_vcpu_cpuset(&config, &TaskPayload::BuildOnly, None).unwrap(),
+            Some("0-3".into())
+        );
+        assert_eq!(
+            local_vcpu_cpuset(
+                &config,
+                &TaskPayload::BlockValidation(BlockValidationPayload {
+                    selection: BlockValidationSelection::Recent { block_count: 1 },
+                    timeout_secs: 60,
+                }),
+                None,
+            )
+            .unwrap(),
+            Some("0-47".into())
+        );
+        assert!(
+            local_vcpu_cpuset(&config, &TaskPayload::BuildOnly, Some("48-49"))
+                .unwrap_err()
+                .to_string()
+                .contains("worker-owned")
+        );
     }
 
     #[tokio::test]
