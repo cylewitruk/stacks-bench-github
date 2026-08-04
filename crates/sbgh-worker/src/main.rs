@@ -26,6 +26,21 @@ enum Command {
         #[command(subcommand)]
         action: IdentityAction,
     },
+    /// Diagnose the worker-owned fleet transport.
+    Fleet {
+        #[command(subcommand)]
+        action: FleetAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FleetAction {
+    /// Check gRPC health, or read-only registration readiness.
+    Check {
+        /// Stop after the standard gRPC health response; enrollment is not required.
+        #[arg(long)]
+        connectivity_only: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -42,6 +57,16 @@ enum IdentityAction {
     },
 }
 
+impl Args {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !(self.preflight_only && self.command.is_some()),
+            "--preflight-only cannot be combined with a subcommand"
+        );
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -50,12 +75,13 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer().json())
         .init();
     let args = Args::parse();
-    if let Some(Command::Identity { action }) = args.command {
+    args.validate()?;
+    if let Some(Command::Identity { action }) = &args.command {
         let public = match action {
             IdentityAction::Generate { private_key } => {
-                sbgh_worker::identity::generate(&private_key)
+                sbgh_worker::identity::generate(private_key)
             }
-            IdentityAction::Public { private_key } => sbgh_worker::identity::public(&private_key),
+            IdentityAction::Public { private_key } => sbgh_worker::identity::public(private_key),
         }?;
         print!("{public}");
         return Ok(());
@@ -65,6 +91,47 @@ async fn main() -> anyhow::Result<()> {
         .context("--config is required when running the worker")?;
     let config =
         sbgh_worker::WorkerConfig::load(&config_path).context("loading worker configuration")?;
+    if let Some(Command::Fleet {
+        action: FleetAction::Check { connectivity_only },
+    }) = args.command
+    {
+        if connectivity_only {
+            sbgh_worker::check_connectivity(&config)
+                .await
+                .context("checking fleet connectivity")?;
+            println!(
+                "connectivity=ok endpoint={} transport=grpc+tls1.3 health=serving authorization=not_checked",
+                config.orchestrator_url
+            );
+            return Ok(());
+        }
+        let resources =
+            sbgh_worker::discover_host_resources().context("discovering worker host resources")?;
+        let report = sbgh_worker::check_registration(&config, resources)
+            .await
+            .context("checking fleet registration")?;
+        let registration = report.registration;
+        let effective_capabilities = registration
+            .effective_capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "connectivity=ok endpoint={} transport=grpc+tls1.3 registration=authorized worker_id={} protocol_version={} effective_capabilities={} measurement_profile={} draining={} clock_skew_ms={}",
+            config.orchestrator_url,
+            registration.worker_id,
+            registration.protocol_version,
+            effective_capabilities,
+            registration
+                .measurement_profile
+                .as_deref()
+                .unwrap_or("none"),
+            registration.draining,
+            report.clock_skew_ms,
+        );
+        return Ok(());
+    }
     let resources =
         sbgh_worker::discover_host_resources().context("discovering worker host resources")?;
     config
@@ -102,4 +169,62 @@ async fn main() -> anyhow::Result<()> {
         signal.cancel();
     });
     sbgh_worker::run_fleet(config, resources, shutdown).await
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Args, Command, FleetAction};
+
+    #[test]
+    fn fleet_check_supports_pre_enrollment_connectivity_mode() {
+        let args = Args::try_parse_from([
+            "sbgh-worker",
+            "--config",
+            "/etc/sbgh/worker/combined.toml",
+            "fleet",
+            "check",
+            "--connectivity-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Fleet {
+                action: FleetAction::Check { connectivity_only: true }
+            })
+        ));
+    }
+
+    #[test]
+    fn fleet_check_checks_registration_readiness_by_default() {
+        let args = Args::try_parse_from([
+            "sbgh-worker",
+            "--config",
+            "/etc/sbgh/worker/combined.toml",
+            "fleet",
+            "check",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Fleet {
+                action: FleetAction::Check { connectivity_only: false }
+            })
+        ));
+    }
+
+    #[test]
+    fn preflight_only_conflicts_with_fleet_diagnostics() {
+        let args = Args::try_parse_from([
+            "sbgh-worker",
+            "--config",
+            "/etc/sbgh/worker/combined.toml",
+            "--preflight-only",
+            "fleet",
+            "check",
+        ])
+        .unwrap();
+        assert!(args.validate().is_err());
+    }
 }

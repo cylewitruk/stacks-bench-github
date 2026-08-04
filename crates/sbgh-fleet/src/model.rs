@@ -12,11 +12,43 @@ pub enum WorkerCapability {
     BlockValidation,
 }
 
+impl WorkerCapability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Benchmark => "benchmark",
+            Self::BuildOnly => "build_only",
+            Self::BlockValidation => "block_validation",
+        }
+    }
+}
+
 /// Host capacity measured by the worker at process startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceFacts {
     pub logical_cpus: u32,
     pub memory_bytes: u64,
+}
+
+/// Read-only registration admission probe. Unlike `RegisterSessionRequest`,
+/// this carries no session identity and cannot replace a live worker process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationCheckRequest {
+    pub protocol_version: u16,
+    pub software_version: String,
+    pub advertised_capabilities: BTreeSet<WorkerCapability>,
+    pub resources: ResourceFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationCheckResponse {
+    pub protocol_version: u16,
+    pub worker_id: Uuid,
+    pub effective_capabilities: BTreeSet<WorkerCapability>,
+    pub measurement_profile: Option<String>,
+    pub draining: bool,
+    pub heartbeat_interval_ms: u64,
+    pub lease_ttl_ms: u64,
+    pub server_time_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

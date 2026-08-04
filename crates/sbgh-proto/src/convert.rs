@@ -602,6 +602,36 @@ impl Wire for wire::RegisterRequest {
     }
 }
 
+impl Wire for wire::CheckRegistrationRequest {
+    type Domain = domain::RegistrationCheckRequest;
+
+    fn into_domain(self) -> Result<Self::Domain, domain::ProtocolError> {
+        Ok(domain::RegistrationCheckRequest {
+            protocol_version: protocol_version(self.protocol_version)?,
+            software_version: self.software_version,
+            advertised_capabilities: self
+                .advertised_capabilities
+                .into_iter()
+                .map(capability)
+                .collect::<Result<BTreeSet<_>, _>>()?,
+            resources: required("resources", self.resources)?.into_domain()?,
+        })
+    }
+
+    fn from_domain(value: Self::Domain) -> Self {
+        Self {
+            protocol_version: u32::from(value.protocol_version),
+            software_version: value.software_version,
+            advertised_capabilities: value
+                .advertised_capabilities
+                .into_iter()
+                .map(capability_wire)
+                .collect(),
+            resources: Some(wire::ResourceFacts::from_domain(value.resources)),
+        }
+    }
+}
+
 impl Wire for wire::ResourceFacts {
     type Domain = domain::ResourceFacts;
 
@@ -709,6 +739,44 @@ impl Wire for wire::RegisterResponse {
     fn from_domain(value: Self::Domain) -> Self {
         Self {
             protocol_version: u32::from(value.protocol_version),
+            heartbeat_interval_ms: value.heartbeat_interval_ms,
+            lease_ttl_ms: value.lease_ttl_ms,
+            server_time_ms: value.server_time_ms,
+        }
+    }
+}
+
+impl Wire for wire::CheckRegistrationResponse {
+    type Domain = domain::RegistrationCheckResponse;
+
+    fn into_domain(self) -> Result<Self::Domain, domain::ProtocolError> {
+        Ok(domain::RegistrationCheckResponse {
+            protocol_version: protocol_version(self.protocol_version)?,
+            worker_id: uuid("worker_id", &self.worker_id)?,
+            effective_capabilities: self
+                .effective_capabilities
+                .into_iter()
+                .map(capability)
+                .collect::<Result<BTreeSet<_>, _>>()?,
+            measurement_profile: self.measurement_profile,
+            draining: self.draining,
+            heartbeat_interval_ms: self.heartbeat_interval_ms,
+            lease_ttl_ms: self.lease_ttl_ms,
+            server_time_ms: self.server_time_ms,
+        })
+    }
+
+    fn from_domain(value: Self::Domain) -> Self {
+        Self {
+            protocol_version: u32::from(value.protocol_version),
+            worker_id: value.worker_id.to_string(),
+            effective_capabilities: value
+                .effective_capabilities
+                .into_iter()
+                .map(capability_wire)
+                .collect(),
+            measurement_profile: value.measurement_profile,
+            draining: value.draining,
             heartbeat_interval_ms: value.heartbeat_interval_ms,
             lease_ttl_ms: value.lease_ttl_ms,
             server_time_ms: value.server_time_ms,
@@ -1199,12 +1267,41 @@ mod tests {
                 memory_bytes: 256 * 1024 * 1024 * 1024,
             },
         });
+        assert_wire_round_trip::<wire::CheckRegistrationRequest>(
+            domain::RegistrationCheckRequest {
+                protocol_version: domain::PROTOCOL_VERSION,
+                software_version: "v29-test".into(),
+                advertised_capabilities: BTreeSet::from([
+                    domain::WorkerCapability::Benchmark,
+                    domain::WorkerCapability::BuildOnly,
+                ]),
+                resources: domain::ResourceFacts {
+                    logical_cpus: 64,
+                    memory_bytes: 256 * 1024 * 1024 * 1024,
+                },
+            },
+        );
         assert_wire_round_trip::<wire::RegisterResponse>(domain::RegisterSessionResponse {
             protocol_version: domain::PROTOCOL_VERSION,
             heartbeat_interval_ms: 5_000,
             lease_ttl_ms: 30_000,
             server_time_ms: 1_700_000_000_000,
         });
+        assert_wire_round_trip::<wire::CheckRegistrationResponse>(
+            domain::RegistrationCheckResponse {
+                protocol_version: domain::PROTOCOL_VERSION,
+                worker_id: id("55555555-5555-4555-8555-555555555555"),
+                effective_capabilities: BTreeSet::from([
+                    domain::WorkerCapability::Benchmark,
+                    domain::WorkerCapability::BuildOnly,
+                ]),
+                measurement_profile: Some("zen4".into()),
+                draining: false,
+                heartbeat_interval_ms: 5_000,
+                lease_ttl_ms: 30_000,
+                server_time_ms: 1_700_000_000_000,
+            },
+        );
         assert_wire_round_trip::<wire::ListCleanupRequest>(domain::CleanupListRequest {
             worker_session_id: session_id,
         });

@@ -371,6 +371,12 @@ durable selector against the attached chainstate before sizing shards.
 sudo install -m 0600 -o sbgh-worker -g sbgh-worker \
   config.example.worker-combined.toml /etc/sbgh/worker/combined.toml
 sudo -u sbgh-worker $EDITOR /etc/sbgh/worker/combined.toml
+
+# This requires a SERVING response through the production TLS 1.3 connector,
+# but requires no registry enrollment.
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/combined.toml \
+  fleet check --connectivity-only
 ```
 
 Grant only the fixed host commands used by the trusted adapter:
@@ -428,6 +434,10 @@ sbgh fleet authorize-identity \
   --public-key /tmp/sbgh-worker-public.pem
 sbgh fleet enable-worker --worker-id "$WORKER_ID"
 sbgh fleet show-worker --worker-id "$WORKER_ID"
+
+# Check authorization and effective registration policy without creating a session.
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/combined.toml fleet check
 ```
 
 Use `--capability block_validation` without a measurement profile for a

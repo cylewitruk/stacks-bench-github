@@ -24,8 +24,10 @@ use tokio_util::sync::CancellationToken;
 pub use binary_cache::{BinaryCache, BinaryCacheConfig, build_binary_cache};
 pub use config::WorkerConfig;
 pub use execution::execute;
-pub use fleet::preflight_local_execution;
 pub use fleet::run as run_fleet;
+pub use fleet::{
+    FleetCheckReport, check_connectivity, check_registration, preflight_local_execution,
+};
 pub use host_resources::discover_host_resources;
 pub use sbgh_driver::{
     BenchmarkRunContext, BenchmarkTask, ExecutionContext, ExecutionPlacement, ExecutionRequest,

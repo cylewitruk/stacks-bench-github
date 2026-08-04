@@ -108,6 +108,39 @@ sudo -u sbgh-worker sbgh-worker \
   --preflight-only
 ```
 
+Verify the endpoint from the worker host before enrollment. This calls the
+standard gRPC health service through the production TLS connector and requires
+a `SERVING` response without creating a worker session:
+
+```bash
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/benchmark.toml \
+  fleet check --connectivity-only
+```
+
+After the public identity is authorized and the drained worker policy is
+enabled, verify registration readiness without polling or claiming work:
+
+```bash
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/benchmark.toml fleet check
+```
+
+The full check is read-only: it does not register, replace, fence, or deregister
+a worker session, so it is safe while the worker service is active. It verifies
+the server-derived worker identity, protocol revision, authorized capability
+intersection, drain/profile policy, fleet timing, and bounded daemon/worker
+clock skew. Use `sbgh-cli fleet status` and `show-worker` for the durable policy
+and live-session view.
+
+Worker startup and the full check reject daemon/worker wall-clock skew above 30
+seconds. This is fail-closed because wall time affects credential and delegated
+artifact expiry even though lease deadlines use a monotonic clock. The worker
+logs the measured `clock_skew_ms` after registration. If the check fails, verify
+the time-synchronization service on both hosts (for example,
+`timedatectl status`) before restarting the worker; do not relax the bound to
+mask a broken clock.
+
 Use the block-validation profile on that host. Preflight opens no fleet
 session and checks:
 

@@ -27,6 +27,12 @@ The operator API uses HTTP/1.1 and JSON. Request and response types are defined
 in `sbgh-api`, which also provides the typed Rust client used by the handler
 and CLI. This does not describe the protobuf/gRPC worker listener.
 
+The separate worker listener exposes the standard `grpc.health.v1.Health`
+service for pre-enrollment transport verification and the authenticated,
+non-mutating `WorkerFleetService.CheckRegistration` RPC for registration
+readiness. Neither endpoint creates a worker session; normal `Register` remains
+the session/fencing transition.
+
 ## Authentication
 
 Pass tokens as:

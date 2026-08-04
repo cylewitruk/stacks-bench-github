@@ -292,14 +292,6 @@ fn test_identity(worker_id: Uuid) -> [u8; 32] {
     digest
 }
 
-fn capability_name(capability: WorkerCapability) -> &'static str {
-    match capability {
-        WorkerCapability::Benchmark => "benchmark",
-        WorkerCapability::BuildOnly => "build_only",
-        WorkerCapability::BlockValidation => "block_validation",
-    }
-}
-
 fn capability(value: &str) -> sbgh_core::Result<WorkerCapability> {
     match value {
         "benchmark" => Ok(WorkerCapability::Benchmark),
@@ -314,7 +306,7 @@ fn capability(value: &str) -> sbgh_core::Result<WorkerCapability> {
 fn capability_names<'a>(values: impl IntoIterator<Item = &'a WorkerCapability>) -> Vec<String> {
     let mut names = values
         .into_iter()
-        .map(|value| capability_name(*value).to_owned())
+        .map(|value| value.as_str().to_owned())
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
@@ -4457,7 +4449,7 @@ mod tests {
             WorkerCapability::BlockValidation,
         ];
         for value in values {
-            assert_eq!(capability(capability_name(value)).unwrap(), value);
+            assert_eq!(capability(value.as_str()).unwrap(), value);
         }
     }
 

@@ -23,7 +23,7 @@ the action is intentionally environment-specific, not optional.
 | Artifact storage | configured S3-compatible provider client (`manual`) | daemon operator | qualification object put/head/get/checksum/delete succeeds |
 | Backup/restore | `scripts/pg-backup.sh`, `scripts/pg-restore-check.sh`, `systemd/sbgh-pg-backup.*` | daemon host root | one restored archive |
 | Daemon users, paths, secrets | [setup sections 2, 4–7](setup.md#2-create-service-identities-and-directories) (`manual`) | daemon host root | owners/modes and redacted config review |
-| Public DNS/TLS/firewall | operator DNS/ACME/firewall tooling (`manual`) | network operator | hostname-verified Web-PKI chain and restricted listener |
+| Public endpoint/TLS/firewall | operator DNS or IP-address ACME and firewall tooling (`manual`) | network operator | hostname- or IP-verified Web-PKI chain and restricted listener |
 | Worker users, paths, sudoers | [setup sections 2 and 8](setup.md#8-prepare-each-execution-worker) (`manual`) | worker host root | owners/modes, `visudo`, denied extra command |
 | Host inventory | `scripts/characterize-worker-host.sh` | worker operator | versioned Markdown record |
 | Sandbox network | `scripts/install-sandbox-network.sh`, `apply-`, `check-`, `qualify-sandbox-network.sh`, `sbgh-sandbox-egress.service` | worker host root | live verifier and disposable-guest record |
@@ -31,7 +31,7 @@ the action is intentionally environment-specific, not optional.
 | Chainstate origin | `scripts/download-chainstate.sh` or managed-node snapshot tooling | worker host root | newest matching LV inactive and read-only |
 | LVM isolation | `scripts/qualify-block-validation-lvm.sh` | worker host root | two writable snapshots isolated and removed |
 | Worker config/preflight | checked worker examples; `sbgh-worker --preflight-only` | worker service user | parsed profile, host-resource and substrate checks |
-| Worker identity/registry | `sbgh-worker identity`; `sbgh-cli fleet` | worker and daemon administrators | SPKI digest, stable worker UUID, authorized session |
+| Worker identity/registry | `sbgh-worker identity`, `sbgh-worker fleet check`; `sbgh-cli fleet` | worker and daemon administrators | SPKI digest, responding gRPC health service, stable worker UUID, authorized registration readiness |
 | Controlled canary | `sbgh-cli jobs validate-blocks`, `jobs report` | daemon administrator | submission/job/attempt IDs and typed report |
 | Provider canaries | GitHub comments and Slack Socket Mode | authorized users | canonical check/comment/message identities |
 
@@ -152,16 +152,12 @@ the credentials or a presigned URL. A provider-console existence check is not
 sufficient. Gate 5 separately proves that a worker can use delegated exact-key
 HTTPS grants without receiving these credentials.
 
-Now validate the running listener's public chain and hostname from a worker
-network:
-
-```bash
-openssl s_client \
-  -connect fleet.example.com:9443 \
-  -servername fleet.example.com \
-  -verify_hostname fleet.example.com \
-  -verify_return_error </dev/null
-```
+Gate 4 validates the listener from the worker network through the production
+worker TLS connector and standard gRPC health service. Use the
+`fleet check --connectivity-only` command in Gate 5; it waits for a `SERVING`
+response, so TLS client-proof rejection cannot be mistaken for a successful
+connection. `openssl s_client` remains useful for diagnosing a failed chain,
+hostname, IP SAN, or ALPN negotiation, but it is not the qualification gate.
 
 Install the backup units, run one backup, and restore it into the isolated
 restore-check target before provider traffic. Follow
@@ -250,8 +246,6 @@ placeholder:
 sudo install -m 0600 -o sbgh-worker -g sbgh-worker \
   config.example.worker-combined.toml /etc/sbgh/worker/combined.toml
 sudo -u sbgh-worker "$EDITOR" /etc/sbgh/worker/combined.toml
-sudo -u sbgh-worker sbgh-worker \
-  --config /etc/sbgh/worker/combined.toml --preflight-only
 ```
 
 Generate the identity once. Keep the private key on the worker and transfer
@@ -263,6 +257,19 @@ sudo -u sbgh-worker sbgh-worker identity generate \
   > /tmp/sbgh-worker-public.pem
 openssl pkey -pubin -in /tmp/sbgh-worker-public.pem -outform DER \
   | sha256sum
+```
+
+Run local substrate preflight, then call the standard gRPC health service
+through the production TLS 1.3 connector. Connectivity-only mode receives a
+real HTTP/2 response, creates no worker session, and does not require registry
+enrollment:
+
+```bash
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/combined.toml --preflight-only
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/combined.toml \
+  fleet check --connectivity-only
 ```
 
 On the daemon host, create server-owned policy and authorize that public key:
@@ -282,9 +289,20 @@ sbgh fleet enable-worker --worker-id "$WORKER_ID"
 sbgh fleet show-worker --worker-id "$WORKER_ID"
 ```
 
-The worker remains drained. Start the process and verify that the authenticated
-session advertises exactly the locally configured capabilities while effective
-capability is their intersection with registry policy:
+The worker remains drained. Before starting its polling loop, exercise the
+read-only registration check. It resolves the authenticated public key to the
+server-owned worker policy and validates the protocol, capability intersection,
+resource facts, fleet timing, and clock skew. It does not create, replace, or
+deregister a session and is safe to run while a worker process is active:
+
+```bash
+sudo -u sbgh-worker sbgh-worker \
+  --config /etc/sbgh/worker/combined.toml fleet check
+```
+
+Start the process and verify that the authenticated session advertises exactly
+the locally configured capabilities while effective capability is their
+intersection with registry policy:
 
 ```bash
 sudo systemctl enable --now sbgh-worker@combined.service

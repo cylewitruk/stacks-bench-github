@@ -41,6 +41,7 @@ futures.workspace = true
 tokio-stream.workspace = true
 prost.workspace = true
 tonic.workspace = true
+tonic-health.workspace = true
 
 # Daemon admin and webhook-ingest `/api` server.
 axum.workspace = true

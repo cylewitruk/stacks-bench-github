@@ -48,6 +48,7 @@ rcgen = "0.14.7"
 time.workspace = true
 futures.workspace = true
 tonic.workspace = true
+tonic-health.workspace = true
 hyper-util.workspace = true
 
 [dev-dependencies]

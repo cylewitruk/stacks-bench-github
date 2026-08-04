@@ -1,17 +1,18 @@
-use sbgh_proto::FleetRpcError;
 use sbgh_proto::Wire;
 use sbgh_proto::fleet::v1::worker_fleet_service_server::{
     WorkerFleetService, WorkerFleetServiceServer,
 };
 use sbgh_proto::fleet::v1::{
-    AcceptRequest, AcceptResponse, CompleteAttemptRequest, CompleteAttemptResponse,
-    CompleteCleanupRequest, CompleteCleanupResponse, DeregisterRequest, DeregisterResponse,
+    AcceptRequest, AcceptResponse, CheckRegistrationRequest, CheckRegistrationResponse,
+    CompleteAttemptRequest, CompleteAttemptResponse, CompleteCleanupRequest,
+    CompleteCleanupResponse, DeregisterRequest, DeregisterResponse,
     FetchRepositoryCredentialRequest, FetchRepositoryCredentialResponse, GrantArtifactRequest,
     GrantArtifactResponse, HeartbeatRequest, HeartbeatResponse, ListCleanupRequest,
     ListCleanupResponse, PollRequest, PollResponse, PublishProgressRequest,
     PublishProgressResponse, PublishReliableEventRequest, PublishReliableEventResponse,
     RegisterRequest, RegisterResponse,
 };
+use sbgh_proto::{FleetRpcError, FleetServiceMux, WORKER_FLEET_SERVICE_NAME};
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status};
 use tower::limit::GlobalConcurrencyLimitLayer;
@@ -79,6 +80,18 @@ fn service_error(error: ServiceError) -> Status {
 
 #[tonic::async_trait]
 impl WorkerFleetService for GrpcFleet {
+    async fn check_registration(
+        &self,
+        request: Request<CheckRegistrationRequest>,
+    ) -> Result<Response<CheckRegistrationResponse>, Status> {
+        let peer = peer(&request)?;
+        let response =
+            service::check_registration(&self.service, &peer, wire(request.into_inner())?)
+                .await
+                .map_err(service_error)?;
+        Ok(Response::new(CheckRegistrationResponse::from_domain(response)))
+    }
+
     async fn register(
         &self,
         request: Request<RegisterRequest>,
@@ -211,6 +224,15 @@ impl WorkerFleetService for GrpcFleet {
     }
 }
 
+async fn serving_health()
+-> tonic_health::pb::health_server::HealthServer<impl tonic_health::pb::health_server::Health> {
+    let (health_reporter, health) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_service_status(WORKER_FLEET_SERVICE_NAME, tonic_health::ServingStatus::Serving)
+        .await;
+    health
+}
+
 pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::Result<()> {
     let config = runtime
         .service
@@ -227,6 +249,7 @@ pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::
     let fleet = WorkerFleetServiceServer::new(grpc)
         .max_decoding_message_size(sbgh_fleet::MAX_REQUEST_BYTES)
         .max_encoding_message_size(sbgh_fleet::MAX_REQUEST_BYTES);
+    let health = serving_health().await;
 
     let maintenance_service = runtime.service.clone();
     let maintenance_shutdown = shutdown.clone();
@@ -238,7 +261,11 @@ pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::
     let serving = tonic::transport::Server::builder()
         .timeout(config.request_timeout())
         .layer(GlobalConcurrencyLimitLayer::new(request_limit))
-        .serve_with_incoming_shutdown(fleet, listener, shutdown.cancelled_owned())
+        .serve_with_incoming_shutdown(
+            FleetServiceMux::new(fleet, health),
+            listener,
+            shutdown.cancelled_owned(),
+        )
         .await;
     maintenance.abort();
     serving.map_err(anyhow::Error::from)
@@ -246,11 +273,54 @@ pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::future::{Ready, ready};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
     use prost::Message;
     use sbgh_proto::fleet::v1;
     use sbgh_proto::status_detail;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::body::Body;
+    use tonic::codegen::Service;
+    use tonic::codegen::http::{Request as HttpRequest, Response as HttpResponse, StatusCode};
+    use tonic::server::NamedService;
+    use tonic_health::pb::HealthCheckRequest;
+    use tonic_health::pb::health_check_response::ServingStatus;
+    use tonic_health::pb::health_client::HealthClient;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct FleetFallback {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl NamedService for FleetFallback {
+        const NAME: &'static str = WORKER_FLEET_SERVICE_NAME;
+    }
+
+    impl Service<HttpRequest<Body>> for FleetFallback {
+        type Response = HttpResponse<Body>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: HttpRequest<Body>) -> Self::Future {
+            self.calls
+                .fetch_add(1, Ordering::SeqCst);
+            ready(Ok(HttpResponse::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap()))
+        }
+    }
 
     #[test]
     fn structured_error_detail_is_machine_readable() {
@@ -266,5 +336,54 @@ mod tests {
         );
         assert!(!status.details().is_empty());
         assert!(v1::FleetErrorDetail::decode(status.details()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn daemon_composition_serves_check_only_health_for_the_fleet_service() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_calls = calls.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .serve_with_incoming_shutdown(
+                    FleetServiceMux::new(
+                        FleetFallback { calls: server_calls },
+                        serving_health().await,
+                    ),
+                    TcpListenerStream::new(listener),
+                    server_shutdown.cancelled_owned(),
+                )
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut health = HealthClient::new(channel);
+        let response = health
+            .check(HealthCheckRequest {
+                service: WORKER_FLEET_SERVICE_NAME.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.status, ServingStatus::Serving as i32);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let _ = health
+            .watch(HealthCheckRequest {
+                service: WORKER_FLEET_SERVICE_NAME.into(),
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        shutdown.cancel();
+        server.await.unwrap();
     }
 }

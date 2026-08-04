@@ -13,8 +13,9 @@ use sbgh_driver::{
 use sbgh_fleet::{
     AcceptOfferRequest, CompleteAttemptRequest, DesiredState, HeartbeatRequest, PROTOCOL_VERSION,
     PollRequest, PollResponse, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
-    ReliableEventEnvelope, ReliableEventPayload, RepositoryCredentialRequest, RepositoryToken,
-    ResourceFacts, TaskPayload, TerminalOutcome, Validate,
+    RegistrationCheckRequest, RegistrationCheckResponse, ReliableEventEnvelope,
+    ReliableEventPayload, RepositoryCredentialRequest, RepositoryToken, ResourceFacts, TaskPayload,
+    TerminalOutcome, Validate,
 };
 use sbgh_libvirt::SystemShell;
 use tokio::sync::{Mutex, mpsc};
@@ -27,6 +28,13 @@ use crate::transport::{FleetClient, FleetClientError};
 use crate::{WorkerRuntime, build_binary_cache};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
+const MAX_CLOCK_SKEW_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetCheckReport {
+    pub registration: RegistrationCheckResponse,
+    pub clock_skew_ms: u64,
+}
 
 /// Validate every advertised local sandbox recipe before registering a worker
 /// session.
@@ -129,21 +137,21 @@ pub async fn run(
         .validate_host_resources(&resources)
         .context("validating execution profiles against discovered host resources")?;
     preflight_local_execution(&config).await?;
-    let client = FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?;
     let session_id = Uuid::new_v4();
+    let client = FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?;
+    let request_started_ms = now_millis();
     let registration = client
-        .register(&RegisterSessionRequest {
-            protocol_version: PROTOCOL_VERSION,
-            worker_session_id: session_id,
-            software_version: env!("CARGO_PKG_VERSION").into(),
-            advertised_capabilities: config.advertised_capabilities(),
-            resources,
-        })
+        .register(&registration_request(&config, resources, session_id))
         .await
         .context("registering worker session")?;
-    ensure!(
-        registration.protocol_version == PROTOCOL_VERSION,
-        "orchestrator returned a mismatched protocol version"
+    let request_finished_ms = now_millis();
+    let clock_skew_ms =
+        validate_registration(&registration, request_started_ms, request_finished_ms)?;
+    tracing::info!(
+        session_id = %session_id,
+        protocol_version = registration.protocol_version,
+        clock_skew_ms,
+        "worker session timing validated"
     );
     cleanup_obligations(&config, &client, session_id).await?;
     let mut backoff = Duration::from_millis(250);
@@ -230,6 +238,145 @@ pub async fn run(
         tracing::warn!(%error, "worker deregistration failed");
     }
     Ok(())
+}
+
+/// Verify the production TLS 1.3 connector and receive a standard gRPC health
+/// response without requiring registry enrollment or creating a session.
+pub async fn check_connectivity(config: &WorkerConfig) -> anyhow::Result<()> {
+    FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?
+        .check_health()
+        .await
+}
+
+/// Evaluate registration authorization and policy without creating, replacing,
+/// or deregistering a worker session.
+pub async fn check_registration(
+    config: &WorkerConfig,
+    resources: ResourceFacts,
+) -> anyhow::Result<FleetCheckReport> {
+    config
+        .validate_host_resources(&resources)
+        .context("validating execution profiles against discovered host resources")?;
+    let client = FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?;
+    let request = registration_check_request(config, resources);
+    let request_started_ms = now_millis();
+    let registration = client
+        .check_registration(&request)
+        .await
+        .context("checking worker registration authorization")?;
+    let request_finished_ms = now_millis();
+    let clock_skew_ms = validate_registration_check(
+        &request,
+        &registration,
+        request_started_ms,
+        request_finished_ms,
+    )?;
+    Ok(FleetCheckReport { registration, clock_skew_ms })
+}
+
+fn registration_request(
+    config: &WorkerConfig,
+    resources: ResourceFacts,
+    worker_session_id: Uuid,
+) -> RegisterSessionRequest {
+    let facts = registration_check_request(config, resources);
+    RegisterSessionRequest {
+        protocol_version: facts.protocol_version,
+        worker_session_id,
+        software_version: facts.software_version,
+        advertised_capabilities: facts.advertised_capabilities,
+        resources: facts.resources,
+    }
+}
+
+fn registration_check_request(
+    config: &WorkerConfig,
+    resources: ResourceFacts,
+) -> RegistrationCheckRequest {
+    RegistrationCheckRequest {
+        protocol_version: PROTOCOL_VERSION,
+        software_version: env!("CARGO_PKG_VERSION").into(),
+        advertised_capabilities: config.advertised_capabilities(),
+        resources,
+    }
+}
+
+fn validate_registration(
+    registration: &sbgh_fleet::RegisterSessionResponse,
+    request_started_ms: i64,
+    request_finished_ms: i64,
+) -> anyhow::Result<u64> {
+    validate_server_timing(
+        registration.protocol_version,
+        registration.heartbeat_interval_ms,
+        registration.lease_ttl_ms,
+        registration.server_time_ms,
+        request_started_ms,
+        request_finished_ms,
+    )
+}
+
+fn validate_registration_check(
+    request: &RegistrationCheckRequest,
+    registration: &RegistrationCheckResponse,
+    request_started_ms: i64,
+    request_finished_ms: i64,
+) -> anyhow::Result<u64> {
+    ensure!(
+        !registration
+            .worker_id
+            .is_nil(),
+        "orchestrator returned a nil worker identity"
+    );
+    ensure!(
+        !registration
+            .effective_capabilities
+            .is_empty()
+            && registration
+                .effective_capabilities
+                .is_subset(&request.advertised_capabilities),
+        "orchestrator returned invalid effective capabilities"
+    );
+    validate_server_timing(
+        registration.protocol_version,
+        registration.heartbeat_interval_ms,
+        registration.lease_ttl_ms,
+        registration.server_time_ms,
+        request_started_ms,
+        request_finished_ms,
+    )
+}
+
+fn validate_server_timing(
+    protocol_version: u16,
+    heartbeat_interval_ms: u64,
+    lease_ttl_ms: u64,
+    server_time_ms: i64,
+    request_started_ms: i64,
+    request_finished_ms: i64,
+) -> anyhow::Result<u64> {
+    ensure!(
+        protocol_version == PROTOCOL_VERSION,
+        "orchestrator returned a mismatched protocol version"
+    );
+    ensure!(
+        heartbeat_interval_ms > 0 && lease_ttl_ms > heartbeat_interval_ms,
+        "orchestrator returned invalid fleet timing"
+    );
+    ensure!(server_time_ms > 0, "orchestrator returned an invalid server time");
+    ensure!(
+        request_finished_ms >= request_started_ms,
+        "local system clock moved backwards during registration"
+    );
+    let local_midpoint_ms =
+        i128::from(request_started_ms) + i128::from(request_finished_ms - request_started_ms) / 2;
+    let clock_skew_ms = local_midpoint_ms.abs_diff(i128::from(server_time_ms));
+    let clock_skew_ms = u64::try_from(clock_skew_ms).unwrap_or(u64::MAX);
+    ensure!(
+        clock_skew_ms <= MAX_CLOCK_SKEW_MS,
+        "orchestrator clock differs from the worker by {clock_skew_ms}ms (maximum {MAX_CLOCK_SKEW_MS}ms)"
+    );
+    Ok(clock_skew_ms)
 }
 
 async fn admit_offer(config: &WorkerConfig, offer: &sbgh_fleet::WorkOffer) -> anyhow::Result<()> {
@@ -906,7 +1053,10 @@ fn retry_delay(error: &anyhow::Error, fallback: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{admit_offer, has_fleet_code, is_non_retryable, retry_delay};
+    use super::{
+        MAX_CLOCK_SKEW_MS, admit_offer, has_fleet_code, is_non_retryable, retry_delay,
+        validate_server_timing,
+    };
     use crate::WorkerConfig;
     use crate::transport::FleetClientError;
     use sbgh_fleet::{AttemptIdentity, LeaseToken, OfferRequirements, WorkOffer, WorkerCapability};
@@ -947,6 +1097,23 @@ mod tests {
             ),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn registration_timing_checks_midpoint_clock_skew_and_lease_ordering() {
+        assert_eq!(validate_server_timing(1, 1_000, 5_000, 10_050, 10_000, 10_100).unwrap(), 0);
+        assert!(
+            validate_server_timing(
+                1,
+                1_000,
+                5_000,
+                10_050 + MAX_CLOCK_SKEW_MS as i64 + 1,
+                10_000,
+                10_100,
+            )
+            .is_err()
+        );
+        assert!(validate_server_timing(1, 5_000, 5_000, 10_050, 10_000, 10_100).is_err());
     }
 
     #[tokio::test]

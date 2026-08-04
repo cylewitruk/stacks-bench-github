@@ -306,9 +306,12 @@ disabled and drained.
    provider, artifact-store, lease, and public Web-PKI credentials.
 2. Generate the worker P-256 identity as the worker user; enroll only its public
    SPKI through the admin API.
-3. Create one disabled/drained registry row allowing benchmark, build-only, and
-   block-validation; configure a measurement profile for benchmark work.
-4. Install the worker separately, run preflight again, start its service, and
+3. Require a standard gRPC `SERVING` response through the production TLS 1.3
+   worker connector before enrollment, then create one disabled/drained
+   registry row allowing benchmark, build-only, and block-validation; configure
+   a measurement profile for benchmark work.
+4. Install the worker separately, run preflight again, verify read-only
+   registration readiness without creating a session, start its service, and
    verify authenticated gRPC registration, protocol revision, discovered
    resources, advertised/authorized capability intersection, and no offer while
    drained.

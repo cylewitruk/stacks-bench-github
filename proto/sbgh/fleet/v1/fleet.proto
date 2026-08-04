@@ -5,6 +5,10 @@ package sbgh.fleet.v1;
 // WorkerFleetService is a pull-based, worker-initiated control plane. Artifact
 // bytes stay out-of-band over delegated HTTPS URLs.
 service WorkerFleetService {
+  // CheckRegistration validates identity, protocol, capabilities, and resource
+  // facts without creating or replacing a worker session.
+  rpc CheckRegistration(CheckRegistrationRequest)
+      returns (CheckRegistrationResponse);
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Poll(PollRequest) returns (PollResponse);
   rpc Accept(AcceptRequest) returns (AcceptResponse);
@@ -56,6 +60,24 @@ message Empty {}
 message ResourceFacts {
   uint32 logical_cpus = 1;
   uint64 memory_bytes = 2;
+}
+
+message CheckRegistrationRequest {
+  uint32 protocol_version = 1;
+  string software_version = 2;
+  repeated WorkerCapability advertised_capabilities = 3;
+  ResourceFacts resources = 4;
+}
+
+message CheckRegistrationResponse {
+  uint32 protocol_version = 1;
+  string worker_id = 2;
+  repeated WorkerCapability effective_capabilities = 3;
+  optional string measurement_profile = 4;
+  bool draining = 5;
+  uint64 heartbeat_interval_ms = 6;
+  uint64 lease_ttl_ms = 7;
+  int64 server_time_ms = 8;
 }
 
 message RegisterRequest {

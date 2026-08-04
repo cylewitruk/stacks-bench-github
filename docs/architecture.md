@@ -118,6 +118,11 @@ unary long-poll, and automatic gRPC retries are disabled; the worker's explicit
 reconnect/resend loops and application idempotency own retry behavior. Artifact
 bytes remain outside gRPC.
 
+The listener also serves the standard gRPC health protocol for pre-enrollment
+transport checks. `WorkerFleetService.CheckRegistration` is a separate,
+authenticated, read-only admission preview: it resolves the TLS public key to
+server-owned policy but cannot create or replace a worker session.
+
 ### Task kinds
 
 - **Benchmark** submissions may contain variants, repetitions, calibration,

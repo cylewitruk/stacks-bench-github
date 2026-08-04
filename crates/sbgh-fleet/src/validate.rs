@@ -8,7 +8,7 @@ use crate::{
     BlockValidationPayload, BlockValidationResult, BlockValidationSelection,
     CleanupCompleteRequest, CleanupListRequest, CompleteAttemptRequest, DeregisterSessionRequest,
     HeartbeatRequest, InclusiveRange, PROTOCOL_VERSION, PollRequest, ProgressRequest,
-    RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload,
+    RegisterSessionRequest, RegistrationCheckRequest, ReliableEventEnvelope, ReliableEventPayload,
     RepositoryCredentialRequest, TaskPayload,
 };
 
@@ -277,7 +277,12 @@ impl Validate for InclusiveRange {
 
 impl Validate for RegisterSessionRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
-        version(self.protocol_version)?;
+        registration_facts(
+            self.protocol_version,
+            &self.software_version,
+            &self.advertised_capabilities,
+            &self.resources,
+        )?;
         if self
             .worker_session_id
             .is_nil()
@@ -287,24 +292,42 @@ impl Validate for RegisterSessionRequest {
                 reason: "UUID must not be nil".into(),
             });
         }
-        bounded("software_version", &self.software_version, MAX_VERSION, false)?;
-        if self
-            .advertised_capabilities
-            .is_empty()
-        {
-            return Err(ProtocolError::Invalid {
-                field: "advertised_capabilities",
-                reason: "at least one capability is required".into(),
-            });
-        }
-        if self.resources.logical_cpus == 0 || self.resources.memory_bytes == 0 {
-            return Err(ProtocolError::Invalid {
-                field: "resources",
-                reason: "logical_cpus and memory_bytes must be non-zero".into(),
-            });
-        }
         Ok(())
     }
+}
+
+impl Validate for RegistrationCheckRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        registration_facts(
+            self.protocol_version,
+            &self.software_version,
+            &self.advertised_capabilities,
+            &self.resources,
+        )
+    }
+}
+
+fn registration_facts(
+    protocol_version: u16,
+    software_version: &str,
+    advertised_capabilities: &BTreeSet<crate::WorkerCapability>,
+    resources: &crate::ResourceFacts,
+) -> Result<(), ProtocolError> {
+    version(protocol_version)?;
+    bounded("software_version", software_version, MAX_VERSION, false)?;
+    if advertised_capabilities.is_empty() {
+        return Err(ProtocolError::Invalid {
+            field: "advertised_capabilities",
+            reason: "at least one capability is required".into(),
+        });
+    }
+    if resources.logical_cpus == 0 || resources.memory_bytes == 0 {
+        return Err(ProtocolError::Invalid {
+            field: "resources",
+            reason: "logical_cpus and memory_bytes must be non-zero".into(),
+        });
+    }
+    Ok(())
 }
 
 impl Validate for CleanupListRequest {
@@ -799,8 +822,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CompleteAttemptRequest, HeartbeatRequest, LeaseToken, PROTOCOL_VERSION, ResourceFacts,
-        TerminalOutcome, WorkerCapability,
+        CompleteAttemptRequest, HeartbeatRequest, LeaseToken, PROTOCOL_VERSION,
+        RegistrationCheckRequest, ResourceFacts, TerminalOutcome, WorkerCapability,
     };
 
     #[test]
@@ -816,6 +839,36 @@ mod tests {
             },
         };
         assert!(request.validate().is_ok());
+
+        let check = RegistrationCheckRequest {
+            protocol_version: request.protocol_version,
+            software_version: request.software_version,
+            advertised_capabilities: request.advertised_capabilities,
+            resources: request.resources,
+        };
+        assert!(check.validate().is_ok());
+    }
+
+    #[test]
+    fn registration_check_reuses_registration_fact_validation() {
+        let mut request = RegistrationCheckRequest {
+            protocol_version: PROTOCOL_VERSION,
+            software_version: "test".into(),
+            advertised_capabilities: BTreeSet::from([WorkerCapability::Benchmark]),
+            resources: ResourceFacts {
+                logical_cpus: 1,
+                memory_bytes: 1,
+            },
+        };
+        request
+            .advertised_capabilities
+            .clear();
+        assert!(request.validate().is_err());
+        request
+            .advertised_capabilities
+            .insert(WorkerCapability::Benchmark);
+        request.resources.logical_cpus = 0;
+        assert!(request.validate().is_err());
     }
 
     #[test]

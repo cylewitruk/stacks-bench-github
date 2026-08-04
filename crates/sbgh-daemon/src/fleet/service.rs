@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration as StdDuration;
@@ -17,9 +17,9 @@ use sbgh_fleet::{
     ArtifactOperation, Assignment, AssignmentContext, CleanupCompleteRequest, CleanupItem,
     CleanupListRequest, CompleteAttemptRequest, CompleteAttemptResponse, DeregisterSessionRequest,
     HeartbeatRequest, HeartbeatResponse, PROTOCOL_VERSION, PollRequest, PollResponse,
-    ProgressRequest, RegisterSessionRequest, RegisterSessionResponse, ReliableEventAck,
-    ReliableEventEnvelope, RepositoryCredentialRequest, RepositoryCredentialResponse,
-    RepositoryToken, Validate,
+    ProgressRequest, RegisterSessionRequest, RegisterSessionResponse, RegistrationCheckRequest,
+    RegistrationCheckResponse, ReliableEventAck, ReliableEventEnvelope,
+    RepositoryCredentialRequest, RepositoryCredentialResponse, RepositoryToken, Validate,
 };
 use sbgh_github::InstallationTokenCache;
 use tokio_util::sync::CancellationToken;
@@ -133,22 +133,7 @@ pub(super) async fn register(
     let configured = authorized_worker(state, peer).await?;
     let worker_id = configured.worker_id;
     validate(&request)?;
-    if request
-        .advertised_capabilities
-        .iter()
-        .all(|capability| {
-            !configured
-                .allowed_capabilities
-                .contains(capability)
-        })
-    {
-        return Err(service_error(
-            ServiceCode::PermissionDenied,
-            "capability_not_authorized",
-            "worker advertises no server-authorized capability",
-            false,
-        ));
-    }
+    effective_capabilities(&configured, &request.advertised_capabilities)?;
     let session = state
         .store
         .register_session(
@@ -178,6 +163,72 @@ pub(super) async fn register(
             .as_millis() as u64,
         server_time_ms: Utc::now().timestamp_millis(),
     })
+}
+
+/// Validate everything required for registration without creating a session.
+/// This endpoint is safe to call while the same worker identity is active.
+pub(super) async fn check_registration(
+    state: &FleetService,
+    peer: &AuthenticatedPeer,
+    request: RegistrationCheckRequest,
+) -> ServiceResult<RegistrationCheckResponse> {
+    registration_readiness(state.registry.as_ref(), state.config.as_ref(), peer, request).await
+}
+
+async fn registration_readiness(
+    registry: &dyn WorkerRegistryStore,
+    config: &FleetConfig,
+    peer: &AuthenticatedPeer,
+    request: RegistrationCheckRequest,
+) -> ServiceResult<RegistrationCheckResponse> {
+    let configured = authorize_peer(registry, peer).await?;
+    validate(&request)?;
+    let effective_capabilities =
+        effective_capabilities(&configured, &request.advertised_capabilities)?;
+    tracing::info!(
+        worker_id = %configured.worker_id,
+        peer = %peer.socket_addr,
+        effective_capabilities = ?effective_capabilities,
+        measurement_profile = ?configured.measurement_profile,
+        draining = configured.draining,
+        "worker registration readiness checked"
+    );
+    Ok(RegistrationCheckResponse {
+        protocol_version: PROTOCOL_VERSION,
+        worker_id: configured.worker_id,
+        effective_capabilities,
+        measurement_profile: configured.measurement_profile,
+        draining: configured.draining,
+        heartbeat_interval_ms: config
+            .heartbeat_interval()
+            .as_millis() as u64,
+        lease_ttl_ms: config.lease_ttl().as_millis() as u64,
+        server_time_ms: Utc::now().timestamp_millis(),
+    })
+}
+
+fn effective_capabilities(
+    configured: &WorkerAuthorization,
+    advertised: &BTreeSet<sbgh_fleet::WorkerCapability>,
+) -> ServiceResult<BTreeSet<sbgh_fleet::WorkerCapability>> {
+    let effective = advertised
+        .iter()
+        .filter(|capability| {
+            configured
+                .allowed_capabilities
+                .contains(capability)
+        })
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if effective.is_empty() {
+        return Err(service_error(
+            ServiceCode::PermissionDenied,
+            "capability_not_authorized",
+            "worker advertises no server-authorized capability",
+            false,
+        ));
+    }
+    Ok(effective)
 }
 
 pub(super) async fn poll(
@@ -1191,12 +1242,14 @@ mod tests {
     };
     use sbgh_fleet::{
         ArtifactDescriptor, BlockValidationPayload, BlockValidationResult, InclusiveRange,
-        TaskPayload, TerminalOutcome, ValidationEpoch,
+        PROTOCOL_VERSION, RegistrationCheckRequest, ResourceFacts, TaskPayload, TerminalOutcome,
+        ValidationEpoch, WorkerCapability,
     };
 
     use super::{
         ActivePolls, ServiceCode, accept_event_ingest, artifact_staging_key, authorize_peer,
-        logical_artifacts, validate_terminal_for_assignment,
+        effective_capabilities, logical_artifacts, registration_readiness,
+        validate_terminal_for_assignment,
     };
     use sbgh_core::db::fleet::EventIngest;
 
@@ -1316,6 +1369,74 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ServiceCode::PermissionDenied);
         assert_eq!(error.stable_code, "worker_not_registered");
+    }
+
+    #[tokio::test]
+    async fn registration_readiness_returns_registry_policy_without_a_session_store() {
+        let registry = ToggleRegistry::default();
+        registry
+            .authorized
+            .store(true, Ordering::SeqCst);
+        let peer = crate::fleet::tls::AuthenticatedPeer {
+            identity_key_sha256: [0x55; 32],
+            socket_addr: "127.0.0.1:1234"
+                .parse()
+                .unwrap(),
+        };
+        let response = registration_readiness(
+            &registry,
+            &sbgh_core::config::FleetConfig::default(),
+            &peer,
+            RegistrationCheckRequest {
+                protocol_version: PROTOCOL_VERSION,
+                software_version: "test".into(),
+                advertised_capabilities: std::collections::BTreeSet::from([
+                    WorkerCapability::Benchmark,
+                    WorkerCapability::BuildOnly,
+                ]),
+                resources: ResourceFacts {
+                    logical_cpus: 8,
+                    memory_bytes: 32 * 1024 * 1024 * 1024,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.worker_id, uuid::Uuid::from_u128(1));
+        assert_eq!(
+            response.effective_capabilities,
+            std::collections::BTreeSet::from([WorkerCapability::BuildOnly])
+        );
+        assert!(!response.draining);
+        assert_eq!(response.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn registration_admission_returns_only_server_authorized_capabilities() {
+        let authorization = WorkerAuthorization {
+            worker_id: uuid::Uuid::from_u128(1),
+            allowed_capabilities: vec![
+                sbgh_fleet::WorkerCapability::BuildOnly,
+                sbgh_fleet::WorkerCapability::BlockValidation,
+            ],
+            measurement_profile: Some("zen4".into()),
+            draining: false,
+        };
+        let advertised = std::collections::BTreeSet::from([
+            sbgh_fleet::WorkerCapability::Benchmark,
+            sbgh_fleet::WorkerCapability::BuildOnly,
+        ]);
+        assert_eq!(
+            effective_capabilities(&authorization, &advertised).unwrap(),
+            std::collections::BTreeSet::from([sbgh_fleet::WorkerCapability::BuildOnly])
+        );
+        assert!(
+            effective_capabilities(
+                &authorization,
+                &std::collections::BTreeSet::from([sbgh_fleet::WorkerCapability::Benchmark]),
+            )
+            .is_err()
+        );
     }
 
     #[test]

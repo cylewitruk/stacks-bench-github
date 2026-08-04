@@ -16,23 +16,27 @@ use sbgh_fleet::{
     CleanupCompleteRequest, CleanupItem, CleanupListRequest, CompleteAttemptRequest,
     CompleteAttemptResponse, DeregisterSessionRequest, HeartbeatRequest, HeartbeatResponse,
     MAX_LONG_POLL_SECS, PollRequest, PollResponse, ProgressRequest, RegisterSessionRequest,
-    RegisterSessionResponse, ReliableEventAck, ReliableEventEnvelope, RepositoryCredentialRequest,
-    RepositoryCredentialResponse,
+    RegisterSessionResponse, RegistrationCheckRequest, RegistrationCheckResponse, ReliableEventAck,
+    ReliableEventEnvelope, RepositoryCredentialRequest, RepositoryCredentialResponse,
 };
-use sbgh_proto::Wire;
 use sbgh_proto::fleet::v1 as wire;
 use sbgh_proto::fleet::v1::worker_fleet_service_client::WorkerFleetServiceClient;
 use sbgh_proto::status_detail;
+use sbgh_proto::{WORKER_FLEET_SERVICE_NAME, Wire};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tonic::Code;
 use tonic::codegen::Service;
 use tonic::codegen::http::Uri;
 use tonic::transport::{Channel, Endpoint};
+use tonic_health::pb::HealthCheckRequest;
+use tonic_health::pb::health_check_response::ServingStatus;
+use tonic_health::pb::health_client::HealthClient;
 
 #[derive(Clone)]
 pub struct FleetClient {
     control: WorkerFleetServiceClient<Channel>,
+    health: HealthClient<Channel>,
     artifact_http: reqwest::Client,
 }
 
@@ -65,71 +69,84 @@ impl Service<Uri> for Tls13Connector {
     }
 
     fn call(&mut self, _request: Uri) -> Self::Future {
-        let host = self.host.clone();
-        let port = self.port;
-        let server_name = self.server_name.clone();
-        let tls = self.tls.clone();
+        let connector = self.clone();
         Box::pin(async move {
-            let tcp = TcpStream::connect((host.as_ref(), port)).await?;
-            tcp.set_nodelay(true)?;
-            tls.connect(server_name, tcp)
+            connector
+                .connect()
                 .await
-                .map_err(io::Error::other)
                 .map(TokioIo::new)
         })
     }
 }
 
+impl Tls13Connector {
+    async fn connect(&self) -> io::Result<TlsStream<TcpStream>> {
+        let tcp = TcpStream::connect((self.host.as_ref(), self.port)).await?;
+        tcp.set_nodelay(true)?;
+        self.tls
+            .connect(self.server_name.clone(), tcp)
+            .await
+            .map_err(io::Error::other)
+    }
+}
+
 impl FleetClient {
     pub fn build(base_url: &str, identity_private_key: &Path) -> anyhow::Result<Self> {
-        crate::identity::require_private_permissions(identity_private_key)?;
-        let private_key_pem = std::fs::read_to_string(identity_private_key).with_context(|| {
-            format!("reading worker identity key {}", identity_private_key.display())
-        })?;
-        let origin = reqwest::Url::parse(base_url).context("parsing fleet gRPC endpoint")?;
-        ensure!(
-            origin.scheme() == "https"
-                && origin.username().is_empty()
-                && origin.password().is_none()
-                && origin.query().is_none()
-                && origin.fragment().is_none()
-                && matches!(origin.path(), "" | "/"),
-            "fleet gRPC endpoint must be an HTTPS origin"
-        );
-        let host = origin
-            .host_str()
-            .context("fleet gRPC endpoint has no host")?
-            .to_owned();
-        let port = origin
-            .port_or_known_default()
-            .context("fleet gRPC endpoint has no port")?;
-        let public_uri: Uri = base_url
-            .trim_end_matches('/')
-            .parse()
-            .context("parsing fleet gRPC endpoint URI")?;
-        let authority = public_uri
-            .authority()
-            .context("fleet gRPC endpoint has no authority")?
-            .as_str();
+        let (authority, connector) = fleet_connector(base_url, identity_private_key)?;
         let endpoint = Endpoint::from_shared(format!("http://{authority}"))
             .context("parsing fleet gRPC endpoint")?
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(MAX_LONG_POLL_SECS + 15));
-        let connector = tls13_connector(&host, port, &private_key_pem)?;
         // The endpoint URI is deliberately `http` only to keep Tonic from
         // applying its TLS-1.2-capable convenience connector. Every socket is
         // wrapped by this TLS-1.3-only connector before HTTP/2 sees it.
-        let control =
-            WorkerFleetServiceClient::new(endpoint.connect_with_connector_lazy(connector))
-                .max_decoding_message_size(sbgh_fleet::MAX_REQUEST_BYTES)
-                .max_encoding_message_size(sbgh_fleet::MAX_REQUEST_BYTES);
+        let channel = endpoint.connect_with_connector_lazy(connector);
+        let control = WorkerFleetServiceClient::new(channel.clone())
+            .max_decoding_message_size(sbgh_fleet::MAX_REQUEST_BYTES)
+            .max_encoding_message_size(sbgh_fleet::MAX_REQUEST_BYTES);
+        let health = HealthClient::new(channel);
         let artifact_http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building delegated artifact client")?;
-        Ok(Self { control, artifact_http })
+        Ok(Self { control, health, artifact_http })
+    }
+
+    /// Require a response from the standard gRPC health service. Reaching this
+    /// point proves that the server accepted the TLS client proof and HTTP/2.
+    pub async fn check_health(&self) -> anyhow::Result<()> {
+        let mut client = self.health.clone();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.check(HealthCheckRequest {
+                service: WORKER_FLEET_SERVICE_NAME.into(),
+            }),
+        )
+        .await
+        .context("fleet gRPC health check timed out")?
+        .context("calling fleet gRPC health service")?
+        .into_inner();
+        ensure!(
+            response.status == ServingStatus::Serving as i32,
+            "fleet gRPC service is not serving"
+        );
+        Ok(())
+    }
+
+    pub async fn check_registration(
+        &self,
+        request: &RegistrationCheckRequest,
+    ) -> anyhow::Result<RegistrationCheckResponse> {
+        let mut client = self.control.clone();
+        client
+            .check_registration(wire::CheckRegistrationRequest::from_domain(request.clone()))
+            .await
+            .map_err(|status| fleet_error("CheckRegistration", status))?
+            .into_inner()
+            .into_domain()
+            .context("decoding CheckRegistration response")
     }
 
     pub async fn register(
@@ -287,12 +304,16 @@ impl FleetClient {
 
     pub async fn deregister(&self, session_id: uuid::Uuid) -> anyhow::Result<()> {
         let mut client = self.control.clone();
-        client
+        let deregistered = client
             .deregister(wire::DeregisterRequest::from_domain(DeregisterSessionRequest {
                 worker_session_id: session_id,
             }))
             .await
-            .map_err(|status| fleet_error("Deregister", status))?;
+            .map_err(|status| fleet_error("Deregister", status))?
+            .into_inner()
+            .into_domain()
+            .context("decoding Deregister response")?;
+        ensure!(deregistered, "fleet rejected deregistration without an RPC error");
         Ok(())
     }
 
@@ -350,6 +371,43 @@ impl FleetClient {
         tokio::fs::rename(part, destination).await?;
         Ok(())
     }
+}
+
+fn fleet_connector(
+    base_url: &str,
+    identity_private_key: &Path,
+) -> anyhow::Result<(String, Tls13Connector)> {
+    crate::identity::require_private_permissions(identity_private_key)?;
+    let private_key_pem = std::fs::read_to_string(identity_private_key).with_context(|| {
+        format!("reading worker identity key {}", identity_private_key.display())
+    })?;
+    let origin = reqwest::Url::parse(base_url).context("parsing fleet gRPC endpoint")?;
+    ensure!(
+        origin.scheme() == "https"
+            && origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.query().is_none()
+            && origin.fragment().is_none()
+            && matches!(origin.path(), "" | "/"),
+        "fleet gRPC endpoint must be an HTTPS origin"
+    );
+    let host = origin
+        .host_str()
+        .context("fleet gRPC endpoint has no host")?
+        .to_owned();
+    let port = origin
+        .port_or_known_default()
+        .context("fleet gRPC endpoint has no port")?;
+    let public_uri: Uri = base_url
+        .trim_end_matches('/')
+        .parse()
+        .context("parsing fleet gRPC endpoint URI")?;
+    let authority = public_uri
+        .authority()
+        .context("fleet gRPC endpoint has no authority")?
+        .as_str()
+        .to_owned();
+    Ok((authority, tls13_connector(&host, port, &private_key_pem)?))
 }
 
 fn tls13_connector(
@@ -446,12 +504,14 @@ fn fleet_error(path: &str, status: tonic::Status) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use sbgh_fleet::{
         ArtifactDescriptor, Assignment, AssignmentContext, AttemptIdentity, DesiredState,
-        HeaderValue as DomainHeaderValue, LeaseToken, PROTOCOL_VERSION, ReliableEventPayload,
-        RepositoryToken, ResourceFacts, TaskPayload, TerminalOutcome, WorkerCapability,
+        HeaderValue as DomainHeaderValue, LeaseToken, PROTOCOL_VERSION, RegistrationCheckRequest,
+        RegistrationCheckResponse, ReliableEventPayload, RepositoryToken, ResourceFacts,
+        TaskPayload, TerminalOutcome, WorkerCapability,
     };
     use sbgh_proto::FleetRpcError;
     use sbgh_proto::Wire;
@@ -465,9 +525,19 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct RecordingFleet {
         calls: Arc<Mutex<Vec<&'static str>>>,
+        deregistered: Arc<AtomicBool>,
+    }
+
+    impl Default for RecordingFleet {
+        fn default() -> Self {
+            Self {
+                calls: Arc::default(),
+                deregistered: Arc::new(AtomicBool::new(true)),
+            }
+        }
     }
 
     impl RecordingFleet {
@@ -506,6 +576,29 @@ mod tests {
 
     #[tonic::async_trait]
     impl WorkerFleetService for RecordingFleet {
+        async fn check_registration(
+            &self,
+            request: Request<wire::CheckRegistrationRequest>,
+        ) -> Result<Response<wire::CheckRegistrationResponse>, Status> {
+            self.record("CheckRegistration");
+            let request = request
+                .into_inner()
+                .into_domain()
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            Ok(Response::new(wire::CheckRegistrationResponse::from_domain(
+                RegistrationCheckResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    worker_id: Uuid::parse_str("55555555-5555-4555-8555-555555555555").unwrap(),
+                    effective_capabilities: request.advertised_capabilities,
+                    measurement_profile: Some("test".into()),
+                    draining: false,
+                    heartbeat_interval_ms: 1_000,
+                    lease_ttl_ms: 5_000,
+                    server_time_ms: 1_700_000_000_000,
+                },
+            )))
+        }
+
         async fn register(
             &self,
             request: Request<wire::RegisterRequest>,
@@ -684,7 +777,10 @@ mod tests {
                 .into_inner()
                 .into_domain()
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            Ok(Response::new(wire::DeregisterResponse::from_domain(true)))
+            Ok(Response::new(wire::DeregisterResponse::from_domain(
+                self.deregistered
+                    .load(Ordering::SeqCst),
+            )))
         }
     }
 
@@ -758,7 +854,8 @@ mod tests {
             .await
             .unwrap();
         let client = FleetClient {
-            control: WorkerFleetServiceClient::new(channel),
+            control: WorkerFleetServiceClient::new(channel.clone()),
+            health: HealthClient::new(channel),
             artifact_http: reqwest::Client::builder()
                 .build()
                 .unwrap(),
@@ -766,6 +863,20 @@ mod tests {
         let session_id = identity().worker_session_id;
         let trace_id = assignment().trace_id;
 
+        client
+            .check_registration(&RegistrationCheckRequest {
+                protocol_version: PROTOCOL_VERSION,
+                software_version: "test".into(),
+                advertised_capabilities: std::collections::BTreeSet::from([
+                    WorkerCapability::BuildOnly,
+                ]),
+                resources: ResourceFacts {
+                    logical_cpus: 8,
+                    memory_bytes: 32 * 1024 * 1024 * 1024,
+                },
+            })
+            .await
+            .unwrap();
         client
             .register(&RegisterSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -869,10 +980,23 @@ mod tests {
             .deregister(session_id)
             .await
             .unwrap();
+        fleet
+            .deregistered
+            .store(false, Ordering::SeqCst);
+        let error = client
+            .deregister(session_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("rejected deregistration")
+        );
 
         assert_eq!(
             *fleet.calls.lock().unwrap(),
             [
+                "CheckRegistration",
                 "Register",
                 "Poll",
                 "Accept",
@@ -884,6 +1008,7 @@ mod tests {
                 "CompleteAttempt",
                 "ListCleanup",
                 "CompleteCleanup",
+                "Deregister",
                 "Deregister",
             ]
         );

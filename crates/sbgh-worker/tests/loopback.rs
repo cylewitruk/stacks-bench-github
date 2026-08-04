@@ -11,23 +11,24 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use sbgh_fleet::{
-    AttemptIdentity, LeaseToken, PollResponse, RegisterSessionResponse, ResourceFacts, WorkOffer,
-    WorkerCapability,
+    AttemptIdentity, LeaseToken, PollResponse, RegisterSessionResponse, RegistrationCheckResponse,
+    ResourceFacts, WorkOffer, WorkerCapability,
 };
-use sbgh_proto::FleetRpcError;
 use sbgh_proto::Wire;
 use sbgh_proto::fleet::v1::worker_fleet_service_server::{
     WorkerFleetService, WorkerFleetServiceServer,
 };
 use sbgh_proto::fleet::v1::{
-    AcceptRequest, AcceptResponse, CompleteAttemptRequest, CompleteAttemptResponse,
-    CompleteCleanupRequest, CompleteCleanupResponse, DeregisterRequest, DeregisterResponse,
+    AcceptRequest, AcceptResponse, CheckRegistrationRequest, CheckRegistrationResponse,
+    CompleteAttemptRequest, CompleteAttemptResponse, CompleteCleanupRequest,
+    CompleteCleanupResponse, DeregisterRequest, DeregisterResponse,
     FetchRepositoryCredentialRequest, FetchRepositoryCredentialResponse, GrantArtifactRequest,
     GrantArtifactResponse, HeartbeatRequest, HeartbeatResponse, ListCleanupRequest,
     ListCleanupResponse, PollRequest, PollResponse as WirePollResponse, PublishProgressRequest,
     PublishProgressResponse, PublishReliableEventRequest, PublishReliableEventResponse,
     RegisterRequest, RegisterResponse as WireRegisterResponse,
 };
+use sbgh_proto::{FleetRpcError, FleetServiceMux};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
@@ -102,9 +103,11 @@ enum Mode {
 
 #[derive(Clone)]
 struct MockFleet {
+    worker_id: Uuid,
     mode: Mode,
     session_id: Arc<std::sync::Mutex<Option<Uuid>>>,
     polls: Arc<AtomicUsize>,
+    deregistrations: Arc<AtomicUsize>,
 }
 
 impl MockFleet {
@@ -115,6 +118,31 @@ impl MockFleet {
 
 #[tonic::async_trait]
 impl WorkerFleetService for MockFleet {
+    async fn check_registration(
+        &self,
+        request: Request<CheckRegistrationRequest>,
+    ) -> Result<Response<CheckRegistrationResponse>, Status> {
+        let request = request
+            .into_inner()
+            .into_domain()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        assert_eq!(
+            request.advertised_capabilities,
+            BTreeSet::from([WorkerCapability::Benchmark, WorkerCapability::BuildOnly])
+        );
+        assert_eq!(request.resources, worker_resources());
+        Ok(Response::new(CheckRegistrationResponse::from_domain(RegistrationCheckResponse {
+            protocol_version: sbgh_fleet::PROTOCOL_VERSION,
+            worker_id: self.worker_id,
+            effective_capabilities: request.advertised_capabilities,
+            measurement_profile: Some("loopback".into()),
+            draining: false,
+            heartbeat_interval_ms: 1_000,
+            lease_ttl_ms: 5_000,
+            server_time_ms: now_millis(),
+        })))
+    }
+
     async fn register(
         &self,
         request: Request<RegisterRequest>,
@@ -136,7 +164,7 @@ impl WorkerFleetService for MockFleet {
             protocol_version: sbgh_fleet::PROTOCOL_VERSION,
             heartbeat_interval_ms: 1_000,
             lease_ttl_ms: 5_000,
-            server_time_ms: 0,
+            server_time_ms: now_millis(),
         })))
     }
 
@@ -227,6 +255,8 @@ impl WorkerFleetService for MockFleet {
                 .lock()
                 .unwrap()
         );
+        self.deregistrations
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(DeregisterResponse::from_domain(true)))
     }
 
@@ -289,11 +319,15 @@ async fn serve_mock(
     shutdown: CancellationToken,
 ) {
     let identity = Identity::from_pem(server_certificate, server_key);
+    let (health_reporter, health) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<WorkerFleetServiceServer<MockFleet>>()
+        .await;
     Server::builder()
         .tls_config(ServerTlsConfig::new().identity(identity))
         .unwrap()
         .serve_with_incoming_shutdown(
-            WorkerFleetServiceServer::new(fleet),
+            FleetServiceMux::new(WorkerFleetServiceServer::new(fleet), health),
             TcpListenerStream::new(listener),
             shutdown.cancelled_owned(),
         )
@@ -322,6 +356,13 @@ fn worker_resources() -> ResourceFacts {
         logical_cpus: 8,
         memory_bytes: 32 * 1024 * 1024 * 1024,
     }
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 fn configure_sandbox_preflight_fixture(config: &mut sbgh_worker::WorkerConfig, directory: &Path) {
@@ -376,9 +417,11 @@ async fn run_case(mode: Mode) {
         .unwrap();
     let address = listener.local_addr().unwrap();
     let fleet = MockFleet {
+        worker_id,
         mode,
         session_id: Arc::new(std::sync::Mutex::new(None)),
         polls: Arc::new(AtomicUsize::new(0)),
+        deregistrations: Arc::new(AtomicUsize::new(0)),
     };
     let server_shutdown = CancellationToken::new();
     let server = tokio::spawn(serve_mock(
@@ -390,13 +433,43 @@ async fn run_case(mode: Mode) {
         server_shutdown.clone(),
     ));
 
-    sbgh_worker::run_fleet(
-        worker_config(worker_id, address, &pki),
-        worker_resources(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let config = worker_config(worker_id, address, &pki);
+    sbgh_worker::check_connectivity(&config)
+        .await
+        .unwrap();
+    let registration = sbgh_worker::check_registration(&config, worker_resources())
+        .await
+        .unwrap();
+    assert_eq!(
+        registration
+            .registration
+            .worker_id,
+        worker_id
+    );
+    assert_eq!(
+        registration
+            .registration
+            .protocol_version,
+        sbgh_fleet::PROTOCOL_VERSION
+    );
+    assert!(
+        fleet
+            .session_id
+            .lock()
+            .unwrap()
+            .is_none(),
+        "registration diagnostics must not create or replace a worker session"
+    );
+    assert_eq!(
+        fleet
+            .deregistrations
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    sbgh_worker::run_fleet(config, worker_resources(), CancellationToken::new())
+        .await
+        .unwrap();
     server_shutdown.cancel();
     server.await.unwrap();
 
@@ -412,6 +485,12 @@ async fn run_case(mode: Mode) {
             .polls
             .load(Ordering::SeqCst)
             >= 1
+    );
+    assert_eq!(
+        fleet
+            .deregistrations
+            .load(Ordering::SeqCst),
+        1
     );
 }
 
