@@ -22,6 +22,13 @@ struct TestJob {
     bench_args: Vec<String>,
 }
 
+fn create_bare_mirror(path: &Path) {
+    std::fs::create_dir_all(path.join("objects")).unwrap();
+    std::fs::create_dir_all(path.join("refs")).unwrap();
+    std::fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    std::fs::write(path.join("config"), b"[core]\n\tbare = true\n").unwrap();
+}
+
 /// A platform-neutral [`TaskContext`] borrowed from a fake job — the
 /// `run_benchmark` inputs the driver actually reads.
 fn ctx_of(job: &TestJob) -> TaskContext<'_> {
@@ -343,7 +350,7 @@ async fn enabled_cache_hit_uses_minimal_source_disk_and_skips_build_vm() {
 
     let cfg = Arc::new(cfg);
     let job = fake_job();
-    std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+    create_bare_mirror(&cfg.paths.git_mirror);
     let tmpfs_dir = cfg
         .paths
         .results_tmpfs_root
@@ -740,7 +747,7 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     let mut config = test_config(&tmp);
     enable_block_profile(&mut config);
     std::fs::write(&config.vm.golden_image, b"golden").unwrap();
-    std::fs::create_dir_all(&config.paths.git_mirror).unwrap();
+    create_bare_mirror(&config.paths.git_mirror);
 
     let job = fake_job();
     let toolchain = "[toolchain]\nchannel = \"1.95.0\"\n";
@@ -1193,7 +1200,7 @@ async fn build_only_skips_bench_and_fails_closed_without_cache() {
     let cfg = Arc::new(test_config(&tmp));
     let job = fake_job();
 
-    std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+    create_bare_mirror(&cfg.paths.git_mirror);
     let tmpfs_dir = cfg
         .paths
         .results_tmpfs_root
@@ -1278,7 +1285,7 @@ async fn end_to_end_happy_path_with_recording_shell() {
     // and pre-create the tmpfs mount dir + write a `.phase-log`
     // entry of `done` so the poll loop exits on its very first
     // iteration (the recording shell can't actually mount the tmpfs).
-    std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+    create_bare_mirror(&cfg.paths.git_mirror);
     let tmpfs_dir = cfg
         .paths
         .results_tmpfs_root
@@ -1432,7 +1439,7 @@ async fn vm_shutoff_without_phase_done_is_failure() {
     let cfg = Arc::new(test_config(&tmp));
     let job = fake_job();
 
-    std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+    create_bare_mirror(&cfg.paths.git_mirror);
     let tmpfs_dir = cfg
         .paths
         .results_tmpfs_root
@@ -1502,7 +1509,7 @@ async fn vm_phase_error_returns_failed_outcome_with_forensics() {
     let cfg = Arc::new(test_config(&tmp));
     let job = fake_job();
 
-    std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+    create_bare_mirror(&cfg.paths.git_mirror);
     let tmpfs_dir = cfg
         .paths
         .results_tmpfs_root
@@ -1556,7 +1563,7 @@ async fn cancellation_breaks_at_poll_loop_and_tears_down() {
     let tmp = TempDir::new().unwrap();
     let cfg = Arc::new(test_config(&tmp));
     let job = fake_job();
-    std::fs::create_dir_all(&cfg.paths.git_mirror).unwrap();
+    create_bare_mirror(&cfg.paths.git_mirror);
     std::fs::create_dir_all(
         cfg.paths
             .results_tmpfs_root

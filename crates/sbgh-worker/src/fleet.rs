@@ -15,7 +15,7 @@ use sbgh_fleet::{
     PollRequest, PollResponse, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
     RegistrationCheckRequest, RegistrationCheckResponse, ReliableEventEnvelope,
     ReliableEventPayload, RepositoryCredentialRequest, RepositoryToken, ResourceFacts, TaskPayload,
-    TerminalOutcome, Validate,
+    TerminalOutcome, Validate, normalize_terminal_text,
 };
 use sbgh_libvirt::SystemShell;
 use tokio::sync::{Mutex, mpsc};
@@ -713,16 +713,14 @@ async fn execute_driver(
                             summary,
                             block_validation: block_validation.map(driver_block_result_to_wire),
                         },
-                        Terminal::Failed { error, summary } => TerminalOutcome::Failed {
+                        Terminal::Failed { error, summary } => failed_outcome(
+                            assignment,
                             error,
-                            summary: Some(summary),
-                            retryable: true,
-                        },
-                        Terminal::SetupError { error } => TerminalOutcome::Failed {
-                            error,
-                            summary: None,
-                            retryable: true,
-                        },
+                            Some(summary),
+                        ),
+                        Terminal::SetupError { error } => {
+                            failed_outcome(assignment, error, None)
+                        }
                         Terminal::Aborted => TerminalOutcome::Cancelled {
                             reason: "execution cancelled".into(),
                         },
@@ -732,6 +730,24 @@ async fn execute_driver(
                 None => anyhow::bail!("execution event channel closed before terminal"),
             }
         }
+    }
+}
+
+fn failed_outcome(
+    assignment: &sbgh_fleet::Assignment,
+    error: String,
+    summary: Option<serde_json::Value>,
+) -> TerminalOutcome {
+    tracing::error!(
+        attempt_id = %assignment.identity.attempt_id,
+        job_id = %assignment.context.job_id,
+        error = %error,
+        "execution failed"
+    );
+    TerminalOutcome::Failed {
+        error: normalize_terminal_text(&error, "worker execution failed"),
+        summary,
+        retryable: true,
     }
 }
 
@@ -1087,14 +1103,15 @@ fn retry_delay(error: &anyhow::Error, fallback: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CLOCK_SKEW_MS, admit_offer, has_fleet_code, is_non_retryable, local_vcpu_cpuset,
-        retry_delay, validate_server_timing,
+        MAX_CLOCK_SKEW_MS, admit_offer, failed_outcome, has_fleet_code, is_non_retryable,
+        local_vcpu_cpuset, retry_delay, validate_server_timing,
     };
     use crate::WorkerConfig;
     use crate::transport::FleetClientError;
     use sbgh_fleet::{
-        AttemptIdentity, BlockValidationPayload, BlockValidationSelection, LeaseToken,
-        OfferRequirements, TaskPayload, WorkOffer, WorkerCapability,
+        Assignment, AssignmentContext, AttemptIdentity, BlockValidationPayload,
+        BlockValidationSelection, LeaseToken, OfferRequirements, TaskPayload, TerminalOutcome,
+        Validate, WorkOffer, WorkerCapability,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -1179,6 +1196,51 @@ mod tests {
                 .to_string()
                 .contains("worker-owned")
         );
+    }
+
+    #[test]
+    fn multiline_execution_errors_are_safe_for_the_terminal_protocol() {
+        let assignment = Assignment {
+            identity: AttemptIdentity {
+                worker_session_id: Uuid::new_v4(),
+                attempt_id: Uuid::new_v4(),
+                fencing_generation: 1,
+                lease_token: LeaseToken("a".repeat(64)),
+            },
+            trace_id: Uuid::new_v4(),
+            context: AssignmentContext {
+                job_id: Uuid::new_v4(),
+                repository: "owner/repo".into(),
+                commit: "a".repeat(40),
+            },
+            payload: TaskPayload::BuildOnly,
+            payload_hash: "ab".repeat(32),
+            vcpu_cpuset: None,
+        };
+        let raw = format!("git clone failed\n\tstderr={}\u{7}", "x".repeat(20_000));
+        let outcome = failed_outcome(&assignment, raw, None);
+        let TerminalOutcome::Failed { error, .. } = &outcome else {
+            panic!("expected failed outcome")
+        };
+
+        assert!(
+            !error
+                .chars()
+                .any(char::is_control)
+        );
+        assert!(error.len() <= sbgh_fleet::MAX_TERMINAL_TEXT_BYTES);
+        let terminal = sbgh_fleet::ReliableEventPayload::Terminal {
+            outcome_digest: sbgh_fleet::payload_digest(&outcome).unwrap(),
+        };
+        let request = sbgh_fleet::CompleteAttemptRequest {
+            identity: assignment.identity,
+            trace_id: assignment.trace_id,
+            terminal_reliable_seq: 1,
+            terminal_payload_digest: sbgh_fleet::payload_digest(&terminal).unwrap(),
+            outcome,
+            artifacts: Vec::new(),
+        };
+        request.validate().unwrap();
     }
 
     #[tokio::test]

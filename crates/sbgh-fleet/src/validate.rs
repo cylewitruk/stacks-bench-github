@@ -142,7 +142,7 @@ const MAX_REPOSITORY: usize = 512;
 const MAX_ARGS: usize = 256;
 const MAX_ARG_BYTES: usize = 16 * 1024;
 const MAX_ARTIFACTS: usize = 256;
-const MAX_OUTCOME_TEXT: usize = 16 * 1024;
+pub const MAX_TERMINAL_TEXT_BYTES: usize = 16 * 1024;
 const MAX_INVALID_BLOCKS: usize = 16_384;
 pub const MAX_VALIDATION_SHARDS: u32 = 4_096;
 pub const MAX_VALIDATION_CONCURRENCY: u32 = 1_024;
@@ -188,6 +188,45 @@ fn bounded(field: &'static str, value: &str, max: usize, empty: bool) -> Result<
         });
     }
     Ok(())
+}
+
+/// Convert local diagnostic text into the bounded, single-line form accepted
+/// by terminal protocol fields. Full-fidelity diagnostics belong in the
+/// worker's local logs; the wire carries a safe summary.
+pub fn normalize_terminal_text(value: &str, fallback: &str) -> String {
+    fn normalize(value: &str) -> String {
+        let mut output = String::with_capacity(
+            value
+                .len()
+                .min(MAX_TERMINAL_TEXT_BYTES),
+        );
+        let mut pending_space = false;
+        for character in value.chars() {
+            if character.is_control() || character.is_whitespace() {
+                pending_space = !output.is_empty();
+                continue;
+            }
+            if pending_space {
+                if output.len() == MAX_TERMINAL_TEXT_BYTES {
+                    break;
+                }
+                output.push(' ');
+                pending_space = false;
+            }
+            if output.len() + character.len_utf8() > MAX_TERMINAL_TEXT_BYTES {
+                break;
+            }
+            output.push(character);
+        }
+        output
+    }
+
+    let normalized = normalize(value);
+    if !normalized.is_empty() {
+        return normalized;
+    }
+    let fallback = normalize(fallback);
+    if fallback.is_empty() { "unspecified terminal outcome".into() } else { fallback }
 }
 
 fn sha256(field: &'static str, value: &str) -> Result<(), ProtocolError> {
@@ -796,10 +835,10 @@ impl Validate for CompleteAttemptRequest {
                 }
             }
             crate::TerminalOutcome::Failed { error, .. } => {
-                bounded("terminal.error", error, MAX_OUTCOME_TEXT, false)?;
+                bounded("terminal.error", error, MAX_TERMINAL_TEXT_BYTES, false)?;
             }
             crate::TerminalOutcome::Cancelled { reason } => {
-                bounded("terminal.reason", reason, MAX_OUTCOME_TEXT, false)?;
+                bounded("terminal.reason", reason, MAX_TERMINAL_TEXT_BYTES, false)?;
             }
         }
         let outcome_digest = crate::payload_digest(&self.outcome)?;
@@ -847,6 +886,21 @@ mod tests {
             resources: request.resources,
         };
         assert!(check.validate().is_ok());
+    }
+
+    #[test]
+    fn terminal_text_normalization_is_non_empty_single_line_and_byte_bounded() {
+        assert_eq!(normalize_terminal_text("first\n\tsecond\u{7}", "fallback"), "first second");
+        assert_eq!(normalize_terminal_text("\n\t", "local failure"), "local failure");
+
+        let normalized = normalize_terminal_text(&"é".repeat(MAX_TERMINAL_TEXT_BYTES), "fallback");
+        assert!(normalized.len() <= MAX_TERMINAL_TEXT_BYTES);
+        assert!(!normalized.is_empty());
+        assert!(
+            !normalized
+                .chars()
+                .any(char::is_control)
+        );
     }
 
     #[test]

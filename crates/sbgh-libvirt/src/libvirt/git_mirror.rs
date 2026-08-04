@@ -8,15 +8,18 @@
 //! state on the otherwise per-job execution path, so every mutation is
 //! serialized by [`struct@MIRROR_LOCK`].
 
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::PathsConfig;
+use anyhow::{Context, ensure};
 use tokio::sync::Mutex;
 
 use crate::libvirt::shell::{Shell, check, spec};
 
 /// Serializes mutations of the shared bare mirror across concurrent jobs. There
-/// is exactly one mirror per daemon, so a process-global lock is the natural
+/// is exactly one mirror per worker, so a process-global lock is the natural
 /// granularity.
 ///
 /// Without it, two jobs running at once could race `git` on one repo: a
@@ -27,10 +30,11 @@ use crate::libvirt::shell::{Shell, check, spec};
 /// already avoid ref *name* collisions; this closes the repo-level races.)
 ///
 /// **Scope:** process-local — it protects the mirror only within a single
-/// daemon. That matches the deployment model (one daemon per host owns its
-/// `paths.git_mirror`). Running *two* daemon processes against the same mirror
+/// worker. That matches the deployment model (one worker profile owns its
+/// `paths.git_mirror`). Running *two* worker processes against the same mirror
 /// path would need an OS-level file lock (`flock`) instead; out of scope today.
 static MIRROR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static MIRROR_CLONE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Ensure the bare mirror exists at `paths.git_mirror`. Idempotent.
 /// If absent, clone `repo_url` as a bare mirror.
@@ -44,28 +48,74 @@ pub async fn ensure(
     // clone into the same directory (TOCTOU).
     let _guard = MIRROR_LOCK.lock().await;
     if paths.git_mirror.exists() {
-        return Ok(());
+        return validate_bare_mirror(&paths.git_mirror);
     }
-    if let Some(parent) = paths.git_mirror.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut command = spec(
-        &paths.git_binary,
-        &[
-            "clone",
-            "--mirror",
-            repo_url,
-            &paths
-                .git_mirror
-                .display()
-                .to_string(),
-        ],
-    );
+    let parent = paths
+        .git_mirror
+        .parent()
+        .context("git mirror path has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let staging_root = staging_path(&paths.git_mirror)?;
+    std::fs::create_dir(&staging_root).with_context(|| {
+        format!("reserving git mirror staging directory {}", staging_root.display())
+    })?;
+    let staging = staging_root.join("mirror.git");
+    let mut command =
+        spec(&paths.git_binary, &["clone", "--mirror", repo_url, &staging.display().to_string()]);
     if let Some(token) = repository_token {
         command = command.with_repository_token(token);
     }
-    let out = shell.run(command).await?;
-    check(&out, &format!("git clone --mirror {repo_url}"))
+    let result = async {
+        let out = shell.run(command).await?;
+        check(&out, &format!("git clone --mirror {repo_url}"))?;
+        validate_bare_mirror(&staging)?;
+        std::fs::rename(&staging, &paths.git_mirror).with_context(|| {
+            format!(
+                "publishing staged git mirror {} as {}",
+                staging.display(),
+                paths.git_mirror.display()
+            )
+        })?;
+        let _ = std::fs::remove_dir(&staging_root);
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging_root);
+    }
+    result
+}
+
+fn staging_path(mirror: &Path) -> anyhow::Result<PathBuf> {
+    let parent = mirror
+        .parent()
+        .context("git mirror path has no parent directory")?;
+    let name = mirror
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("git mirror path has no UTF-8 file name")?;
+    Ok(parent.join(format!(
+        ".{name}.clone-{}-{}",
+        std::process::id(),
+        MIRROR_CLONE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )))
+}
+
+fn validate_bare_mirror(mirror: &Path) -> anyhow::Result<()> {
+    ensure!(mirror.is_dir(), "git mirror {} is not a directory", mirror.display());
+    ensure!(
+        mirror.join("HEAD").is_file()
+            && mirror
+                .join("config")
+                .is_file()
+            && mirror
+                .join("objects")
+                .is_dir()
+            && mirror.join("refs").is_dir(),
+        "git mirror {} is incomplete or is not a bare repository",
+        mirror.display()
+    );
+    Ok(())
 }
 
 /// Fetch a specific commit SHA into the mirror so we can clone it locally
@@ -122,11 +172,48 @@ pub async fn prune(shell: &dyn Shell, paths: &PathsConfig, job_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+    use std::sync::Mutex as StdMutex;
+
     use crate::PathsConfig;
+    use async_trait::async_trait;
     use tempfile::TempDir;
 
     use super::*;
     use crate::libvirt::shell::test_support::RecordingShell;
+
+    fn create_bare_mirror(path: &Path) {
+        std::fs::create_dir_all(path.join("objects")).unwrap();
+        std::fs::create_dir_all(path.join("refs")).unwrap();
+        std::fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(path.join("config"), b"[core]\n\tbare = true\n").unwrap();
+    }
+
+    #[derive(Default)]
+    struct CloneShell {
+        calls: StdMutex<Vec<crate::libvirt::shell::CommandSpec>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Shell for CloneShell {
+        async fn run(&self, command: crate::libvirt::shell::CommandSpec) -> anyhow::Result<Output> {
+            if !self.fail {
+                let destination = Path::new(command.args.last().unwrap());
+                create_bare_mirror(destination);
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push(command);
+            Ok(Output {
+                status: ExitStatus::from_raw(i32::from(self.fail) << 8),
+                stdout: Vec::new(),
+                stderr: if self.fail { b"clone failed\n".to_vec() } else { Vec::new() },
+            })
+        }
+    }
 
     fn paths_in(dir: &TempDir) -> PathsConfig {
         PathsConfig {
@@ -149,7 +236,7 @@ mod tests {
     async fn ensure_skips_when_mirror_exists() {
         let dir = TempDir::new().unwrap();
         let paths = paths_in(&dir);
-        std::fs::create_dir_all(&paths.git_mirror).unwrap();
+        create_bare_mirror(&paths.git_mirror);
         let shell = RecordingShell::new();
         ensure(&shell, &paths, "https://example/foo.git", None)
             .await
@@ -161,12 +248,11 @@ mod tests {
     async fn ensure_runs_clone_mirror_when_absent() {
         let dir = TempDir::new().unwrap();
         let paths = paths_in(&dir);
-        let shell = RecordingShell::new();
-        shell.expect_ok(1);
+        let shell = CloneShell::default();
         ensure(&shell, &paths, "https://example/foo.git", None)
             .await
             .unwrap();
-        let calls = shell.calls();
+        let calls = shell.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(
             calls[0]
@@ -178,6 +264,60 @@ mod tests {
                 .args
                 .contains(&"https://example/foo.git".to_string())
         );
+        assert!(paths.git_mirror.exists());
+        assert!(
+            !calls[0]
+                .args
+                .last()
+                .unwrap()
+                .ends_with("repo.git")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_clone_leaves_neither_final_nor_staging_mirror() {
+        let dir = TempDir::new().unwrap();
+        let paths = paths_in(&dir);
+        let shell = CloneShell {
+            fail: true,
+            ..CloneShell::default()
+        };
+
+        assert!(
+            ensure(&shell, &paths, "https://example/foo.git", None)
+                .await
+                .is_err()
+        );
+        assert!(!paths.git_mirror.exists());
+        assert_eq!(
+            std::fs::read_dir(
+                paths
+                    .git_mirror
+                    .parent()
+                    .unwrap()
+            )
+            .unwrap()
+            .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_existing_mirror_is_rejected_without_running_git() {
+        let dir = TempDir::new().unwrap();
+        let paths = paths_in(&dir);
+        std::fs::create_dir_all(&paths.git_mirror).unwrap();
+        let shell = RecordingShell::new();
+
+        let error = ensure(&shell, &paths, "https://example/foo.git", None)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete")
+        );
+        assert!(shell.calls().is_empty());
     }
 
     #[tokio::test]
