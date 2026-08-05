@@ -357,6 +357,9 @@ mod tests {
         assert!(rendered.contains("\"resolved_range\""));
         assert!(rendered.contains("\"segments\""));
         assert!(rendered.contains("chainstate_origin"));
+        assert!(rendered.contains("NETWORK_DATA_DIR = \"mainnet\""));
+        assert!(rendered.contains("database_paths[shard] = database_path"));
+        assert!(rendered.contains("stderr_tail={diagnostic_tail(completed.stderr)!r}"));
         assert!(!rendered.contains(".sbgh-dataset-manifest.json"));
         assert!(rendered.contains("block-validation-result.json"));
         assert!(rendered.contains("os.replace"));

@@ -52,6 +52,8 @@ import time
 RESULTS = "/results"
 PLAN_PATH = RESULTS + "/block-plan.json"
 BIN = "/opt/stacks-core/target/release/stacks-inspect"
+NETWORK_DATA_DIR = "mainnet"
+MAX_PROBE_DIAGNOSTIC_BYTES = 64 * 1024
 with open(PLAN_PATH, encoding="utf-8") as handle:
     plan = json.load(handle)
 if plan.get("schema_version") != 1:
@@ -73,7 +75,7 @@ def exact_device(serial):
         raise RuntimeError(f"serial {serial!r} resolved to {len(matches)} devices")
     return matches.pop()
 
-mounts = {}
+database_paths = {}
 for item in plan["devices"]:
     shard = int(item["shard"])
     mountpoint = item["mountpoint"]
@@ -83,14 +85,36 @@ for item in plan["devices"]:
          exact_device(item["serial"]), mountpoint],
         check=True,
     )
-    mounts[shard] = mountpoint
+    database_path = os.path.join(mountpoint, NETWORK_DATA_DIR)
+    required_databases = (
+        os.path.join(database_path, "chainstate", "vm", "index.sqlite"),
+        os.path.join(database_path, "chainstate", "blocks", "nakamoto.sqlite"),
+    )
+    missing = [path for path in required_databases if not os.path.isfile(path)]
+    if missing:
+        raise RuntimeError(
+            f"snapshot shard {shard} is missing required mainnet databases: {missing!r}"
+        )
+    database_paths[shard] = database_path
+
+def diagnostic_tail(value):
+    encoded = value.encode("utf-8", errors="replace")
+    return encoded[-MAX_PROBE_DIAGNOSTIC_BYTES:].decode("utf-8", errors="replace")
 
 def probe(kind):
-    output = subprocess.check_output(
-        [BIN, "--network-config", "mainnet", "validate-block", mounts[0], kind],
+    completed = subprocess.run(
+        [BIN, "--network-config", "mainnet", "validate-block", database_paths[0], kind],
         text=True,
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{kind} probe failed (exit={completed.returncode}): "
+            f"stdout_tail={diagnostic_tail(completed.stdout)!r} "
+            f"stderr_tail={diagnostic_tail(completed.stderr)!r}"
+        )
+    output = completed.stdout
     try:
         return int(output.split()[-1])
     except (IndexError, ValueError) as error:
@@ -194,7 +218,7 @@ while pending or active:
         stderr_handle = open(RESULTS + "/" + stderr_name, "wb")
         range_kind, command_start, command_end = commands.pop(0)
         command = [
-            BIN, "--network-config", "mainnet", "validate-block", mounts[index],
+            BIN, "--network-config", "mainnet", "validate-block", database_paths[index],
             range_kind, str(command_start), str(command_end + 1),
         ]
         process = subprocess.Popen(
@@ -220,7 +244,7 @@ while pending or active:
         if exit_code in (0, 1) and state["commands"]:
             range_kind, command_start, command_end = state["commands"].pop(0)
             command = [
-                BIN, "--network-config", "mainnet", "validate-block", mounts[index],
+                BIN, "--network-config", "mainnet", "validate-block", database_paths[index],
                 range_kind, str(command_start), str(command_end + 1),
             ]
             state["process"] = subprocess.Popen(
