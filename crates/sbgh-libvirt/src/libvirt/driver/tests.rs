@@ -518,8 +518,12 @@ fn block_diagnostic_collection_is_bounded_and_rejects_symlinks() {
         b"{}",
     )
     .unwrap();
-    std::fs::write(tmp.path().join("probe-index-range.stderr.log"), b"probe diagnostic")
-        .unwrap();
+    std::fs::write(
+        tmp.path()
+            .join("probe-index-range.stderr.log"),
+        b"probe diagnostic",
+    )
+    .unwrap();
     std::fs::write(
         tmp.path()
             .join("unrelated-secret"),

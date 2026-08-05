@@ -18,7 +18,7 @@ use crate::artifact_store::{ArtifactStore, SUBMISSION_SQLITE_RELATIVE, submissio
 use crate::job_source::{ProgressTarget, RunnableJob, RunnableJobStore};
 use crate::report::{ReportSurface, build_report_surface};
 use crate::report_event::PhaseLabel;
-use crate::reporter::{Reporter, ReporterDependencies};
+use crate::reporter::{Reporter, ReporterDependencies, fleet_reporting_ready};
 use crate::shutdown::Shutdown;
 use crate::slack_report::SlackSessionRegistry;
 
@@ -120,7 +120,11 @@ impl FleetCoordinator {
         for job in queued {
             if matches!(job.task_kind, TaskKind::BlockValidation) {
                 // Block-validation enqueue persists its typed payload in the
-                // same transaction as job creation.
+                // same transaction as job creation. Reporting identities are
+                // independent of payload preparation and must still be
+                // reconciled while the job waits for a worker.
+                self.ensure_reporting(job)
+                    .await;
                 continue;
             }
             if let Err(error) = self
@@ -135,12 +139,8 @@ impl FleetCoordinator {
         Ok(())
     }
 
-    async fn prepare_job(&self, mut job: RunnableJob) -> anyhow::Result<()> {
-        let commit = self
-            .freeze_submission_sources(&job)
-            .await?;
-        job.commit.clone_from(&commit);
-        let reporter = Reporter::new_with_dependencies(
+    fn reporter(&self, job: RunnableJob) -> Reporter {
+        Reporter::new_with_dependencies(
             self.config.clone(),
             ReporterDependencies {
                 jobs: self.jobs.clone(),
@@ -150,10 +150,23 @@ impl FleetCoordinator {
                 slack: self.slack.clone(),
                 slack_sessions: self.slack_sessions.clone(),
             },
-            job.clone(),
-        );
-        job = reporter
+            job,
+        )
+    }
+
+    async fn ensure_reporting(&self, job: RunnableJob) -> RunnableJob {
+        self.reporter(job)
             .ensure_fleet_reporting()
+            .await
+    }
+
+    async fn prepare_job(&self, mut job: RunnableJob) -> anyhow::Result<()> {
+        let commit = self
+            .freeze_submission_sources(&job)
+            .await?;
+        job.commit.clone_from(&commit);
+        job = self
+            .ensure_reporting(job)
             .await;
         let payload = payload_for(
             &job,
@@ -343,9 +356,22 @@ impl FleetCoordinator {
             else {
                 anyhow::bail!("fleet event references missing job {}", event.job_id);
             };
-            let surface = self
+            let surface = match self
                 .surface(event.attempt_id, &job)
-                .await;
+                .await
+            {
+                Ok(surface) => surface,
+                Err(error) => {
+                    tracing::warn!(
+                        attempt_id = %event.attempt_id,
+                        reliable_seq = event.reliable_seq,
+                        %error,
+                        "durable report identity reconciliation failed; leaving event pending"
+                    );
+                    blocked_attempts.insert(event.attempt_id);
+                    continue;
+                }
+            };
             let projection = match &event.payload {
                 ReliableEventPayload::Phase { label, .. } if label == "accepted" => surface
                     .started()
@@ -369,18 +395,7 @@ impl FleetCoordinator {
                         continue;
                     };
                     let terminal_job = job.clone();
-                    let reporter = Reporter::new_with_dependencies(
-                        self.config.clone(),
-                        ReporterDependencies {
-                            jobs: self.jobs.clone(),
-                            gh: self.gh.clone(),
-                            artifact_store: self.artifacts.clone(),
-                            app_id: self.app_id.clone(),
-                            slack: self.slack.clone(),
-                            slack_sessions: self.slack_sessions.clone(),
-                        },
-                        job,
-                    );
+                    let reporter = self.reporter(job);
                     self.plan_next_repeat(&terminal_job, &outcome)
                         .await?;
                     reporter
@@ -462,9 +477,23 @@ impl FleetCoordinator {
                 total: progress.update.total,
                 message: progress.update.message,
             };
-            if let Err(error) = self
+            let surface = match self
                 .surface(progress.attempt_id, &job)
                 .await
+            {
+                Ok(surface) => surface,
+                Err(error) => {
+                    tracing::warn!(
+                        attempt_id = %progress.attempt_id,
+                        progress_seq = progress.progress_seq,
+                        %error,
+                        "durable progress identity reconciliation failed; leaving update pending"
+                    );
+                    blocked_attempts.insert(progress.attempt_id);
+                    continue;
+                }
+            };
+            if let Err(error) = surface
                 .progress(&update)
                 .await
                 .context("projecting progress snapshot")
@@ -525,7 +554,11 @@ impl FleetCoordinator {
         Ok(())
     }
 
-    async fn surface(&self, attempt_id: Uuid, job: &RunnableJob) -> Arc<dyn ReportSurface> {
+    async fn surface(
+        &self,
+        attempt_id: Uuid,
+        job: &RunnableJob,
+    ) -> anyhow::Result<Arc<dyn ReportSurface>> {
         if let Some(surface) = self
             .surfaces
             .lock()
@@ -533,15 +566,23 @@ impl FleetCoordinator {
             .get(&attempt_id)
             .cloned()
         {
-            return surface;
+            return Ok(surface);
         }
+        let job = self
+            .ensure_reporting(job.clone())
+            .await;
+        anyhow::ensure!(
+            fleet_reporting_ready(&self.config, &job),
+            "configured reporting identities are incomplete for job {}",
+            job.id
+        );
         let surface: Arc<dyn ReportSurface> = Arc::from(build_report_surface(
             self.gh.clone(),
             self.jobs.clone(),
             self.artifacts.clone(),
             self.slack.as_ref(),
             &self.slack_sessions,
-            job,
+            &job,
         ));
         match self
             .fleet
@@ -560,10 +601,10 @@ impl FleetCoordinator {
         }
         let mut surfaces = self.surfaces.lock().await;
         if let Some(existing) = surfaces.get(&attempt_id) {
-            return existing.clone();
+            return Ok(existing.clone());
         }
         surfaces.insert(attempt_id, surface.clone());
-        surface
+        Ok(surface)
     }
 }
 

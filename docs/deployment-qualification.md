@@ -401,6 +401,13 @@ identity. Redeliver the same GitHub delivery or Slack envelope where the
 provider permits it. Require one canonical submission and one provider object,
 not merely two equivalent terminal results.
 
+For GitHub `/validate`, initially keep the compatible worker drained. Before
+assignment, require one persisted `stacks-block-validation` Check Run and one
+marked PR comment in the configured `pr_report` mode. Undrain the worker and
+require those same identities—not replacements—to converge through phase and
+terminal updates. A queued validation with no configured GitHub surface is a
+failed journey, even if execution later succeeds.
+
 ## Gate 7: Recovery and extended validation
 
 These gates close the first deployment after the four primary journeys:

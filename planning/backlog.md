@@ -286,6 +286,44 @@ before offering work.
 workers, daemon-pushed scheduling, multi-orchestrator HA, or requirement for a
 second worker implementation language.
 
+### 0081 — Cross-owner source-policy slug resolution
+
+- **id:** `0081-cross-owner-source-policy-slug-resolution`
+- **status:** `backlog`
+- **priority:** `medium`
+- **relates_to:** `0067-github-block-validation-submission`,
+  `0079-dynamic-block-validation-planning`,
+  `0080-first-fleet-deployment-qualification`
+- **source:** v34 first-fleet deployment qualification (2026-08)
+
+**Problem:** The CLI resolves GitHub slugs for user grants and same-owner
+policy operations, but authorizing a fork owned outside the target
+installation still requires raw installation and repository IDs. This makes a
+common upstream-target/fork-source operation harder to audit and easier to
+misconfigure.
+
+**Scope:** Add an explicit cross-owner form such as
+`policy source allow --for stacks-network/stacks-core --source
+cylewitruk-stacks/stacks-core`. Resolve the target installation and source
+repository independently through the daemon's GitHub boundary, verify their
+stored identities, and upsert the exact `(installation_id, source_repo_id)`
+policy. Retain the numeric-ID form as an emergency path when GitHub resolution
+is unavailable.
+
+**Acceptance:**
+
+- Cross-owner slugs create the intended source policy idempotently without
+  adding a repository membership or supported target-root record for the fork.
+- Missing, ambiguous, stale, or mismatched identities fail before any policy
+  write and return an actionable diagnostic.
+- Same-owner slug resolution and the existing numeric-ID path remain intact.
+- Tests cover cross-owner success, case/rename handling, resolver failure, and
+  no partial write on rejection.
+
+**Deferred / non-goals:** No generalized alias engine, inferred trust for all
+forks, automatic source-policy expansion, or removal of the numeric recovery
+path.
+
 *`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
 model: source / intent / task_kind / build_target / derived report; build-only
 proven) — as-built record in

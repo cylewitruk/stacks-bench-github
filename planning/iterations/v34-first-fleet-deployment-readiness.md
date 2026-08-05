@@ -364,6 +364,12 @@ task report, provider identity reuse, and promoted artifacts. Redeliver the
 same GitHub/Slack input and require no duplicate submission, check/comment, or
 Slack message.
 
+For the GitHub validation canary, keep the worker drained until the queued
+submission has created and persisted its configured `stacks-block-validation`
+Check Run and marked PR comment. Then undrain and require the same identities
+to receive phase and terminal updates. Missing pre-assignment identities or
+late duplicate surfaces fail the gate.
+
 ### Phase 6: v20 and v22 Benchmark Closure (Fast-Follow)
 
 1. During a real single-ref benchmark, inspect live fine progress and archived

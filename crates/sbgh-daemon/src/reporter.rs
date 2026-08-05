@@ -1148,6 +1148,34 @@ impl Reporter {
     }
 }
 
+/// Whether every GitHub identity required by the configured fleet-reporting
+/// surface is present on `job`. Slack identities are created by the connector,
+/// and silent jobs intentionally have no provider surface.
+pub(crate) fn fleet_reporting_ready(config: &DaemonConfig, job: &RunnableJob) -> bool {
+    match job.progress {
+        ProgressTarget::PullRequest { comment_id, check_run_id, .. } => {
+            (!config
+                .reporting
+                .pr_report
+                .wants_comment()
+                || comment_id.is_some())
+                && (!config
+                    .reporting
+                    .pr_report
+                    .wants_check()
+                    || check_run_id.is_some())
+        }
+        ProgressTarget::CommitCheck { check_run_id } => {
+            !config
+                .reporting
+                .baseline_report
+                .wants_check()
+                || check_run_id.is_some()
+        }
+        ProgressTarget::Slack { .. } | ProgressTarget::Silent => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1316,6 +1344,7 @@ mod tests {
             Ok(())
         }
         async fn set_comment_id(&self, _job: &RunnableJob, _id: i64) -> anyhow::Result<()> {
+            self.rec("set_comment_id");
             Ok(())
         }
         async fn set_check_run(
@@ -1324,6 +1353,7 @@ mod tests {
             _id: i64,
             _url: Option<&str>,
         ) -> anyhow::Result<()> {
+            self.rec("set_check_run");
             Ok(())
         }
         async fn set_plan_message_ts(
@@ -1413,6 +1443,113 @@ mod tests {
             slack: Default::default(),
             llm: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn fleet_block_validation_prepares_both_github_surfaces() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = no_report_config(&tmp);
+        config.reporting.pr_report = PrReport::Both;
+        let store = Arc::new(RecordingStore::default());
+        let gh = Arc::new(FakeGitHub::new());
+        let mut job = job_with(ProgressTarget::PullRequest {
+            pr_number: 42,
+            comment_id: None,
+            check_run_id: None,
+            check_run_url: None,
+        });
+        job.task_kind = TaskKind::BlockValidation;
+        job.build_target = BuildTarget::StacksInspect;
+        let submission_id = job.task_submission_id;
+
+        let prepared = Reporter::new(
+            Arc::new(config.clone()),
+            store.clone(),
+            gh.clone(),
+            Arc::new(OnceCell::new()),
+            None,
+            Default::default(),
+            job,
+        )
+        .ensure_fleet_reporting()
+        .await;
+
+        assert!(fleet_reporting_ready(&config, &prepared));
+        let ProgressTarget::PullRequest {
+            comment_id,
+            check_run_id,
+            check_run_url,
+            ..
+        } = prepared.progress
+        else {
+            panic!("expected PR reporting target")
+        };
+        assert_eq!(comment_id, Some(1000));
+        assert_eq!(check_run_id, Some(5000));
+        assert_eq!(check_run_url.as_deref(), Some("https://github.test/checks/5000"));
+        assert!(
+            store
+                .calls()
+                .contains(&"set_check_run")
+        );
+        assert!(
+            store
+                .calls()
+                .contains(&"set_comment_id")
+        );
+
+        let external_id = report_external_id(submission_id, TaskKind::BlockValidation);
+        let calls = gh.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(
+                    call,
+                    FakeCall::CreateCheckRun { name, external_id: actual, .. }
+                        if name == "stacks-block-validation" && actual == &external_id
+                ))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(
+                    call,
+                    FakeCall::CreateComment { body, .. }
+                        if body.contains("starting block validation")
+                            && body.contains(&pr_report_marker(submission_id))
+                ))
+        );
+    }
+
+    #[test]
+    fn fleet_reporting_readiness_requires_every_configured_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = no_report_config(&tmp);
+        config.reporting.pr_report = PrReport::Both;
+        let mut job = job_with(ProgressTarget::PullRequest {
+            pr_number: 42,
+            comment_id: None,
+            check_run_id: None,
+            check_run_url: None,
+        });
+        job.task_kind = TaskKind::BlockValidation;
+        job.build_target = BuildTarget::StacksInspect;
+
+        assert!(!fleet_reporting_ready(&config, &job));
+        job.progress = ProgressTarget::PullRequest {
+            pr_number: 42,
+            comment_id: Some(1000),
+            check_run_id: None,
+            check_run_url: None,
+        };
+        assert!(!fleet_reporting_ready(&config, &job));
+        job.progress = ProgressTarget::PullRequest {
+            pr_number: 42,
+            comment_id: Some(1000),
+            check_run_id: Some(5000),
+            check_run_url: Some("https://github.test/checks/5000".into()),
+        };
+        assert!(fleet_reporting_ready(&config, &job));
     }
 
     /// If the worker is gated to run but the event channel closes **without** a

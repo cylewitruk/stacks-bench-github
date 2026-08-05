@@ -260,7 +260,9 @@ pub fn reduce_result(
             .context("trusted plan is missing a shard device")?;
         let expected_commands = expected_commands(
             expected,
-            result.observed.pre_nakamoto_count,
+            result
+                .observed
+                .pre_nakamoto_count,
             &device.mountpoint,
         )?;
         ensure!(
@@ -268,7 +270,11 @@ pub fn reduce_result(
             "guest shard {} command count does not match the trusted plan",
             shard.index
         );
-        for (command, expected_command) in shard.commands.iter().zip(&expected_commands) {
+        for (command, expected_command) in shard
+            .commands
+            .iter()
+            .zip(&expected_commands)
+        {
             ensure!(
                 command.ordinal == expected_command.ordinal
                     && command.kind == expected_command.kind
@@ -515,18 +521,19 @@ fn verify_probes(
         .context("trusted plan is missing probe shard device zero")?;
     let database_path = format!(
         "{}/{}",
-        device.mountpoint.trim_end_matches('/'),
+        device
+            .mountpoint
+            .trim_end_matches('/'),
         STACKS_NETWORK_DATA_DIR
     );
     let expected = [
         (
             ValidationCommandKind::IndexRange,
-            result.observed.pre_nakamoto_count,
+            result
+                .observed
+                .pre_nakamoto_count,
         ),
-        (
-            ValidationCommandKind::NakaIndexRange,
-            result.observed.nakamoto_count,
-        ),
+        (ValidationCommandKind::NakaIndexRange, result.observed.nakamoto_count),
     ]
     .into_iter()
     .enumerate()
@@ -551,7 +558,11 @@ fn verify_probes(
         "guest probe count does not match the trusted plan"
     );
     let mut artifacts = Vec::with_capacity(expected.len() * 2);
-    for (probe, expected_probe) in result.probes.iter().zip(&expected) {
+    for (probe, expected_probe) in result
+        .probes
+        .iter()
+        .zip(&expected)
+    {
         ensure!(
             probe.ordinal == expected_probe.ordinal
                 && probe.kind == expected_probe.kind
@@ -594,11 +605,7 @@ fn expected_commands(
     pre_nakamoto_count: u64,
     mountpoint: &str,
 ) -> anyhow::Result<Vec<ExpectedCommand>> {
-    let database_path = format!(
-        "{}/{}",
-        mountpoint.trim_end_matches('/'),
-        STACKS_NETWORK_DATA_DIR
-    );
+    let database_path = format!("{}/{}", mountpoint.trim_end_matches('/'), STACKS_NETWORK_DATA_DIR);
     let mut ranges = Vec::with_capacity(2);
     if shard.start < pre_nakamoto_count {
         ranges.push((
@@ -612,7 +619,9 @@ fn expected_commands(
         ));
     }
     if shard.end >= pre_nakamoto_count {
-        let global_start = shard.start.max(pre_nakamoto_count);
+        let global_start = shard
+            .start
+            .max(pre_nakamoto_count);
         ranges.push((
             ValidationCommandKind::NakaIndexRange,
             global_start - pre_nakamoto_count,
@@ -698,7 +707,10 @@ fn parse_success_count(stdout: &str) -> Option<u64> {
         .filter_map(|segment| {
             let (_, remainder) = segment.split_once(PREFIX)?;
             let (count, _) = remainder.split_once(" blocks in ")?;
-            count.trim().parse::<u64>().ok()
+            count
+                .trim()
+                .parse::<u64>()
+                .ok()
         })
         .next_back()
 }
@@ -871,12 +883,16 @@ mod tests {
     fn probes(directory: &TempDir, pre: u64, naka: u64) -> serde_json::Value {
         for (kind, count) in [("index-range", pre), ("naka-index-range", naka)] {
             std::fs::write(
-                directory.path().join(format!("probe-{kind}.stdout.log")),
+                directory
+                    .path()
+                    .join(format!("probe-{kind}.stdout.log")),
                 format!("{count}\n"),
             )
             .unwrap();
             std::fs::write(
-                directory.path().join(format!("probe-{kind}.stderr.log")),
+                directory
+                    .path()
+                    .join(format!("probe-{kind}.stderr.log")),
                 "",
             )
             .unwrap();
@@ -923,8 +939,20 @@ mod tests {
     ) -> serde_json::Value {
         let stdout_file = format!("shard-{index}-command-{ordinal}.stdout.log");
         let stderr_file = format!("shard-{index}-command-{ordinal}.stderr.log");
-        std::fs::write(directory.path().join(&stdout_file), stdout).unwrap();
-        std::fs::write(directory.path().join(&stderr_file), stderr).unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join(&stdout_file),
+            stdout,
+        )
+        .unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join(&stderr_file),
+            stderr,
+        )
+        .unwrap();
         let database_path = format!("/var/lib/sbgh-chainstate/shard-{index:04}/mainnet");
         serde_json::json!({
             "ordinal": ordinal,
@@ -968,32 +996,9 @@ mod tests {
     }
 
     fn valid_shards(directory: &TempDir) -> serde_json::Value {
-        let first = command(
-            directory,
-            0,
-            0,
-            "index-range",
-            10,
-            12,
-            0,
-            &successful_output(2),
-            "",
-        );
-        let second = command(
-            directory,
-            1,
-            0,
-            "index-range",
-            12,
-            13,
-            0,
-            &successful_output(1),
-            "",
-        );
-        serde_json::json!([
-            shard(0, 10, 11, vec![first]),
-            shard(1, 12, 12, vec![second])
-        ])
+        let first = command(directory, 0, 0, "index-range", 10, 12, 0, &successful_output(2), "");
+        let second = command(directory, 1, 0, "index-range", 12, 13, 0, &successful_output(1), "");
+        serde_json::json!([shard(0, 10, 11, vec![first]), shard(1, 12, 12, vec![second])])
     }
 
     #[test]
@@ -1223,10 +1228,8 @@ mod tests {
     #[test]
     fn terminal_progress_parser_requires_a_complete_exact_count() {
         assert_eq!(
-            parse_terminal_progress_count(
-                "\rValidating: 50% (1/2)\rValidating: 100% (2/2)\n"
-            )
-            .unwrap(),
+            parse_terminal_progress_count("\rValidating: 50% (1/2)\rValidating: 100% (2/2)\n")
+                .unwrap(),
             2
         );
         assert!(parse_terminal_progress_count("Finished validating 2 blocks in 1s\n").is_err());
@@ -1244,28 +1247,8 @@ mod tests {
             "guest-controlled",
         )
         .unwrap();
-        let first = command(
-            &directory,
-            0,
-            0,
-            "index-range",
-            10,
-            12,
-            0,
-            &successful_output(2),
-            "",
-        );
-        let second = command(
-            &directory,
-            1,
-            0,
-            "index-range",
-            12,
-            13,
-            0,
-            &successful_output(1),
-            "",
-        );
+        let first = command(&directory, 0, 0, "index-range", 10, 12, 0, &successful_output(2), "");
+        let second = command(&directory, 1, 0, "index-range", 12, 13, 0, &successful_output(1), "");
         let result = write_result(
             &directory,
             serde_json::json!([shard(0, 10, 11, vec![first]), shard(1, 12, 12, vec![second])]),
@@ -1293,17 +1276,7 @@ mod tests {
     #[test]
     fn reducer_accepts_only_an_explicit_typed_negative() {
         let directory = TempDir::new().unwrap();
-        let first = command(
-            &directory,
-            0,
-            0,
-            "index-range",
-            10,
-            12,
-            0,
-            &successful_output(2),
-            "",
-        );
+        let first = command(&directory, 0, 0, "index-range", 10, 12, 0, &successful_output(2), "");
         let second = command(
             &directory,
             1,
@@ -1363,30 +1336,13 @@ mod tests {
             vec!["nouuid".into()],
         )
         .unwrap();
-        let pre = command(
-            &directory,
-            0,
-            0,
-            "index-range",
-            100,
-            101,
-            0,
-            &successful_output(1),
-            "",
-        );
-        let naka = command(
-            &directory,
-            0,
-            1,
-            "naka-index-range",
-            0,
-            1,
-            0,
-            &successful_output(1),
-            "",
-        );
+        let pre = command(&directory, 0, 0, "index-range", 100, 101, 0, &successful_output(1), "");
+        let naka =
+            command(&directory, 0, 1, "naka-index-range", 0, 1, 0, &successful_output(1), "");
         let probes = probes(&directory, 101, 1);
-        let result = directory.path().join("block-validation-result.json");
+        let result = directory
+            .path()
+            .join("block-validation-result.json");
         std::fs::write(
             &result,
             serde_json::to_vec(&serde_json::json!({
@@ -1433,7 +1389,12 @@ mod tests {
         let result = write_result(&directory, shards);
 
         let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
-        assert!(error.to_string().contains("trusted argv and range"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("trusted argv and range"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1445,12 +1406,28 @@ mod tests {
         value["probes"][0]["argv"][5] = serde_json::json!("naka-index-range");
         std::fs::write(&result, serde_json::to_vec(&value).unwrap()).unwrap();
         let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
-        assert!(error.to_string().contains("trusted argv"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("trusted argv"),
+            "{error:#}"
+        );
 
         let result = write_result(&directory, valid_shards(&directory));
-        std::fs::write(directory.path().join("probe-index-range.stdout.log"), "100\n").unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join("probe-index-range.stdout.log"),
+            "100\n",
+        )
+        .unwrap();
         let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
-        assert!(error.to_string().contains("reported 100"), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("reported 100"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1460,13 +1437,21 @@ mod tests {
             let mut shards = valid_shards(&directory);
             if duplicate {
                 let command = shards[0]["commands"][0].clone();
-                shards[0]["commands"].as_array_mut().unwrap().push(command);
+                shards[0]["commands"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(command);
             } else {
                 shards[0]["commands"] = serde_json::json!([]);
             }
             let result = write_result(&directory, shards);
             let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
-            assert!(error.to_string().contains("command count"), "{error:#}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("command count"),
+                "{error:#}"
+            );
         }
     }
 
@@ -1478,12 +1463,22 @@ mod tests {
         ] {
             let directory = TempDir::new().unwrap();
             let shards = valid_shards(&directory);
-            std::fs::write(directory.path().join("shard-0-command-0.stdout.log"), stdout).unwrap();
+            std::fs::write(
+                directory
+                    .path()
+                    .join("shard-0-command-0.stdout.log"),
+                stdout,
+            )
+            .unwrap();
             let result = write_result(&directory, shards);
             let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
             assert!(
-                error.to_string().contains("processed-block count")
-                    || error.to_string().contains("processed blocks"),
+                error
+                    .to_string()
+                    .contains("processed-block count")
+                    || error
+                        .to_string()
+                        .contains("processed blocks"),
                 "{error:#}"
             );
         }
@@ -1492,21 +1487,9 @@ mod tests {
     #[test]
     fn reducer_rejects_partial_or_infrastructure_results() {
         let directory = TempDir::new().unwrap();
-        let first = command(
-            &directory,
-            0,
-            0,
-            "index-range",
-            10,
-            12,
-            0,
-            &successful_output(2),
-            "",
-        );
-        let partial = write_result(
-            &directory,
-            serde_json::json!([shard(0, 10, 11, vec![first.clone()])]),
-        );
+        let first = command(&directory, 0, 0, "index-range", 10, 12, 0, &successful_output(2), "");
+        let partial =
+            write_result(&directory, serde_json::json!([shard(0, 10, 11, vec![first.clone()])]));
         assert!(
             reduce_result(&partial, directory.path(), &plan())
                 .unwrap_err()
@@ -1538,21 +1521,8 @@ mod tests {
     #[test]
     fn reducer_rejects_guest_reported_undercoverage() {
         let directory = TempDir::new().unwrap();
-        let first = command(
-            &directory,
-            0,
-            0,
-            "index-range",
-            10,
-            11,
-            0,
-            &successful_output(1),
-            "",
-        );
-        let result = write_result(
-            &directory,
-            serde_json::json!([shard(0, 10, 10, vec![first])]),
-        );
+        let first = command(&directory, 0, 0, "index-range", 10, 11, 0, &successful_output(1), "");
+        let result = write_result(&directory, serde_json::json!([shard(0, 10, 10, vec![first])]));
 
         let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
         assert!(
@@ -1571,10 +1541,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let result = write_result(
             &directory,
-            serde_json::json!([
-                shard(0, 10, 11, vec![]),
-                shard(1, 12, 12, vec![])
-            ]),
+            serde_json::json!([shard(0, 10, 11, vec![]), shard(1, 12, 12, vec![])]),
         );
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&result).unwrap()).unwrap();

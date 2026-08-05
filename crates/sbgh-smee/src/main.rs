@@ -135,7 +135,10 @@ fn build_sse_client() -> reqwest_sse::Result<reqwest_sse::Client> {
 fn channel_host(channel: &str) -> String {
     reqwest_sse::Url::parse(channel)
         .ok()
-        .and_then(|url| url.host_str().map(ToOwned::to_owned))
+        .and_then(|url| {
+            url.host_str()
+                .map(ToOwned::to_owned)
+        })
         .unwrap_or_else(|| "<invalid>".to_owned())
 }
 
@@ -185,7 +188,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral loopback listener");
-        let address = listener.local_addr().expect("read listener address");
+        let address = listener
+            .local_addr()
+            .expect("read listener address");
         drop(listener);
 
         let secret = "super-secret-channel";
