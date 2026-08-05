@@ -96,14 +96,6 @@ sbgh_install_file() {
     install -m "$mode" "$source" "$destination"
 }
 
-sbgh_install_directory() {
-    local mode=$1
-    local absolute_destination=$2
-    local destination
-    destination=$(sbgh_install_path "$absolute_destination")
-    install -d -m "$mode" "$destination"
-}
-
 sbgh_reload_systemd() {
     if [[ -n "$SBGH_INSTALL_DESTDIR" ]]; then
         echo "Skipping systemd reload for staging root $SBGH_INSTALL_DESTDIR."

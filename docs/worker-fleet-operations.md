@@ -48,10 +48,11 @@ authentication. Alert on:
 Do not hide the loss of a sole-capability worker by automatically moving
 comparison work to a different measurement environment.
 
-If an LVM mutation reports `Cannot archive volume group metadata ... to
-read-only filesystem`, reinstall the checked-in worker unit. Its hardening
-drop-in keeps `/etc` read-only except for the root-owned `/etc/lvm/archive` and
-`/etc/lvm/backup` paths required by LVM's standard metadata safety mechanism.
+If LVM reports a read-only metadata archive or a VM shuts down without any
+visible phase record, verify that the installed worker unit matches the
+checked-in unit. Filesystem-protection directives must not give the worker a
+private mount namespace: libvirt and `virtiofsd` need to see its per-attempt
+results tmpfs.
 
 The worker keeps a restrictive process umask. Its libvirt adapter explicitly
 makes only each ephemeral VM job directory execute-only to non-owners so QEMU

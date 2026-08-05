@@ -103,20 +103,35 @@ class InstallerTest(unittest.TestCase):
             installed["etc/systemd/system/sbgh-worker@.service.d/hardening.conf"][0],
             0o644,
         )
-        self.assertEqual(
-            stat.S_IMODE((destination / "etc/lvm/archive").stat().st_mode),
-            0o700,
-        )
-        self.assertEqual(
-            stat.S_IMODE((destination / "etc/lvm/backup").stat().st_mode),
-            0o700,
-        )
+        unit = (
+            destination / "etc/systemd/system/sbgh-worker@.service"
+        ).read_text(encoding="utf-8")
         hardening = (
             destination
             / "etc/systemd/system/sbgh-worker@.service.d/hardening.conf"
         ).read_text(encoding="utf-8")
-        self.assertIn("/etc/lvm/archive", hardening)
-        self.assertIn("/etc/lvm/backup", hardening)
+        self.assertIn("UMask=0077", unit)
+        self.assertIn("RestrictNamespaces=true", hardening)
+        combined_unit = unit + hardening
+        for private_mount_directive in (
+            "PrivateTmp=true",
+            "PrivateDevices=true",
+            "ProtectSystem=",
+            "ProtectHome=",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectKernelLogs=true",
+            "ProtectControlGroups=true",
+            "ProtectClock=true",
+            "ProtectHostname=true",
+            "ProtectProc=",
+            "ReadWritePaths=",
+            "ReadOnlyPaths=",
+            "InaccessiblePaths=",
+            "BindPaths=",
+            "BindReadOnlyPaths=",
+        ):
+            self.assertNotIn(private_mount_directive, combined_unit)
 
         before = installed
         self.run_installer("install-worker.sh", destination)
