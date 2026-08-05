@@ -2,7 +2,8 @@ use sbgh_core::models::{GithubInstallation, Job};
 use sbgh_core::models::{JobSource, TaskKind};
 use sbgh_core::reporting::{
     BenchmarkReportView, BlockValidationReportView, BuildOnlyReportView, ReportArtifact,
-    ReportIdentity, ReportLifecycle, ReportLifecycleState, SubmissionReportView, TaskReport,
+    ReportForensics, ReportIdentity, ReportLifecycle, ReportLifecycleState, SubmissionReportView,
+    TaskReport,
 };
 use sbgh_fleet::{ArtifactDescriptor, TaskPayload, Validate};
 use sqlx::Row as _;
@@ -191,8 +192,10 @@ pub async fn submission_report(
     .await
     .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?
     .flatten();
+    let terminal_artifacts = terminal_report_artifacts(pool, current_job_id).await?;
+    let forensics = terminal_report_forensics(pool, current_job_id).await?;
 
-    let (task, artifacts) = match task_kind {
+    let (task, task_artifacts) = match task_kind {
         TaskKind::Benchmark => (
             TaskReport::Benchmark(BenchmarkReportView {
                 requested_runs: requested_runs.max(0) as u32,
@@ -314,6 +317,7 @@ pub async fn submission_report(
             }
         }
     };
+    let artifacts = if terminal_artifacts.is_empty() { task_artifacts } else { terminal_artifacts };
 
     Ok(Some(SubmissionReportView {
         identity: ReportIdentity {
@@ -334,7 +338,104 @@ pub async fn submission_report(
         },
         task,
         artifacts,
+        forensics,
     }))
+}
+
+async fn terminal_report_forensics(pool: &Pool, job_id: Uuid) -> Result<Option<ReportForensics>> {
+    let summary: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"
+        SELECT CASE
+                 WHEN jsonb_typeof(detail->'summary') = 'object'
+                   THEN detail->'summary'
+                 ELSE detail
+               END
+          FROM job_event
+         WHERE job_id = $1
+           AND event_kind IN ('completed', 'failed')
+           AND detail IS NOT NULL
+      ORDER BY occurred_at DESC, id DESC
+         LIMIT 1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?
+    .flatten();
+    let Some(summary) = summary else {
+        return Ok(None);
+    };
+    let forensics = ReportForensics {
+        last_phase: summary
+            .get("last_phase")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        console_tail: summary
+            .get("console_tail")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        console_size_bytes: summary
+            .get("console_size_bytes")
+            .and_then(serde_json::Value::as_u64),
+        console_artifact_key: summary
+            .get("console_archived_path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    };
+    if forensics.last_phase.is_none()
+        && forensics
+            .console_tail
+            .is_none()
+        && forensics
+            .console_size_bytes
+            .is_none()
+        && forensics
+            .console_artifact_key
+            .is_none()
+    {
+        Ok(None)
+    } else {
+        Ok(Some(forensics))
+    }
+}
+
+/// Artifacts belong to the task-neutral attempt lifecycle. Read them from the
+/// latest terminal event so failed benchmark, build-only, and block-validation
+/// attempts expose the same operator forensics. The block-validation result's
+/// manifest remains a compatibility fallback for rows written before terminal
+/// event projection carried artifact descriptors.
+async fn terminal_report_artifacts(pool: &Pool, job_id: Uuid) -> Result<Vec<ReportArtifact>> {
+    let manifest: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"
+        SELECT detail->'artifacts'
+          FROM job_event
+         WHERE job_id = $1
+           AND event_kind IN ('completed', 'failed')
+           AND jsonb_typeof(detail->'artifacts') = 'array'
+      ORDER BY occurred_at DESC, id DESC
+         LIMIT 1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?
+    .flatten();
+    manifest
+        .map(serde_json::from_value::<Vec<ArtifactDescriptor>>)
+        .transpose()
+        .map_err(other)
+        .map(|artifacts| {
+            artifacts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|artifact| ReportArtifact {
+                    name: artifact.logical_key,
+                    key: artifact.key,
+                })
+                .collect()
+        })
 }
 
 fn parse_source(value: &str) -> Result<JobSource> {

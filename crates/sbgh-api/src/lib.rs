@@ -19,10 +19,10 @@ pub use dto::{
     FleetCancellationResponse, FleetOverview, FleetRecoveryRequest, FleetRecoveryResponse,
     FleetSummaryView, FleetWorkerView, GrantRoleResult, HealthResponse, InstallationView,
     InstallerView, InvalidBlockDetail, JobView, ObservedValidationIndexDetail, PinTriggerRequest,
-    PolicyView, RepoRootView, ReportArtifactView, ReportIdentityView, ReportLifecycleView,
-    ReportRange, ResolveRepoResponse, RoleRequest, RoleView, SubmissionReportView, TaskReportView,
-    TriggerView, UserView, ValidationEpochSegmentDetail, WebhookSubmitResponse, WebhookSummary,
-    WhoamiResponse, WorkerCreateRequest, WorkerDrainRequest, WorkerIdentityRequest,
-    WorkerIdentityView, WorkerPolicyView, WorkerUpdateRequest,
+    PolicyView, RepoRootView, ReportArtifactView, ReportForensicsView, ReportIdentityView,
+    ReportLifecycleView, ReportRange, ResolveRepoResponse, RoleRequest, RoleView,
+    SubmissionReportView, TaskReportView, TriggerView, UserView, ValidationEpochSegmentDetail,
+    WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerCreateRequest, WorkerDrainRequest,
+    WorkerIdentityRequest, WorkerIdentityView, WorkerPolicyView, WorkerUpdateRequest,
 };
 pub use error::{ApiError, ErrorBody};

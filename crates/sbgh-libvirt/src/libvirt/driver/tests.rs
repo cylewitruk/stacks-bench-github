@@ -798,6 +798,12 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
         .results_tmpfs_root
         .join(job.id.to_string());
     std::fs::create_dir_all(&results).unwrap();
+    let job_dir = config
+        .paths
+        .jobs_dir
+        .join(job.id.to_string());
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("console.log"), b"guest validation diagnostic").unwrap();
     std::fs::write(
         results.join(".phase-log"),
         b"1700000000 starting\n\
@@ -881,6 +887,7 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
         .expect_ok(1) // virsh define
         .expect_ok(1) // virsh start
         .reply(PreparedReply::with_stdout("shut off\n")) // phase=done + clean poweroff
+        .expect_ok(1) // recover the QEMU-owned serial console
         .expect_ok(1) // virsh destroy
         .expect_ok(1) // virsh undefine
         .expect_ok(1) // results tmpfs unmount
@@ -922,6 +929,24 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     );
     assert_eq!(output.resolved_range, InclusiveRange { start: 10, end: 12 });
     assert_eq!(outcome.summary["chainstate_origin"], "sbgh-vg/mainnet-origin");
+    assert_eq!(outcome.summary["console_tail"], "guest validation diagnostic");
+    assert_eq!(outcome.summary["console_size_bytes"], 27);
+    assert_eq!(
+        outcome.summary["console_archived_path"],
+        format!("{}/{}", job.id, forensics::CONSOLE_TAIL_RELATIVE)
+    );
+    assert_eq!(outcome.summary["console_archived_size_bytes"], 27);
+    assert_eq!(
+        std::fs::read_to_string(
+            config
+                .paths
+                .results_archive_dir
+                .join(job.id.to_string())
+                .join(forensics::CONSOLE_TAIL_RELATIVE)
+        )
+        .unwrap(),
+        "guest validation diagnostic"
+    );
     assert_eq!(
         *listener
             .progresses
@@ -1570,6 +1595,21 @@ async fn vm_phase_error_returns_failed_outcome_with_forensics() {
         outcome.summary["console_tail"]
             .as_str()
             .unwrap(),
+        "kernel panic at 0x..."
+    );
+    assert_eq!(
+        outcome.summary["console_archived_path"],
+        format!("{}/{}", job.id, forensics::CONSOLE_TAIL_RELATIVE)
+    );
+    assert_eq!(outcome.summary["console_archived_size_bytes"], 21);
+    assert_eq!(
+        std::fs::read_to_string(
+            cfg.paths
+                .results_archive_dir
+                .join(job.id.to_string())
+                .join(forensics::CONSOLE_TAIL_RELATIVE)
+        )
+        .unwrap(),
         "kernel panic at 0x..."
     );
 }

@@ -218,9 +218,15 @@ exhaustive tagged task detail:
       "invalid_blocks": []
     }
   },
-  "artifacts": []
+  "artifacts": [],
+  "forensics": null
 }
 ```
+
+After a VM reaches a terminal state, `forensics` may contain the last phase,
+the bounded final 1 MiB of its serial console, the original console byte size,
+and the promoted console-tail artifact key. This authenticated operator detail
+is not copied into GitHub or Slack rendering.
 
 The `read` scope is daemon-wide trusted-operator access, not a
 repository/tenant credential.

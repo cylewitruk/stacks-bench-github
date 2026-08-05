@@ -14,6 +14,10 @@ mkdir -p "$RESULTS" "$SRC" "$SCCACHE"
 mount -t virtiofs results "$RESULTS" || die "failed to mount results share"
 phase starting
 mount /dev/disk/by-label/sbgh-src "$SRC" || die "failed to mount source disk"
+# The host prepared this filesystem as the unprivileged worker account. The
+# guest runs as root, and Git rejects a checkout owned by another uid. Match the
+# proven benchmark-build handoff before invoking Git or Cargo.
+chown -R root:root "$SRC" || die "chown $SRC to root failed"
 # This cache is guest-local on the disposable boot overlay.
 export SCCACHE_DIR="$SCCACHE"
 export SCCACHE_CACHE_SIZE=20G

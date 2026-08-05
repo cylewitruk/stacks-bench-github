@@ -224,6 +224,87 @@ async fn validation_report_joins_frozen_request_without_fabricating_a_verdict() 
 }
 
 #[tokio::test]
+async fn failed_submission_report_exposes_terminal_forensic_artifacts() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let receipt = store
+        .persist_submission(&validation_submission())
+        .await
+        .unwrap();
+    let job_id = receipt.initial_job_ids[0];
+    sqlx::query("UPDATE job SET status = 'failed' WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO job_event (job_id, event_kind, event_status, remark, detail)
+        VALUES ($1, 'failed', 'fail', 'VM reported phase=error', $2)
+        "#,
+    )
+    .bind(job_id)
+    .bind(serde_json::json!({
+        "attempt_id": Uuid::new_v4(),
+        "artifacts": [{
+            "key": "job/console.tail.log",
+            "logical_key": "job/console.tail.log",
+            "size": 1024,
+            "sha256": "a".repeat(64),
+        }],
+        "summary": {
+            "last_phase": "build",
+            "console_tail": "compiler failed",
+            "console_size_bytes": 2048,
+            "console_archived_path": "job/console.tail.log",
+        },
+    }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = store
+        .submission_report(receipt.submission_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.lifecycle.state, ReportLifecycleState::Failed);
+    assert_eq!(
+        report
+            .lifecycle
+            .failure
+            .as_deref(),
+        Some("VM reported phase=error")
+    );
+    assert_eq!(report.artifacts.len(), 1);
+    assert_eq!(report.artifacts[0].name, "job/console.tail.log");
+    assert_eq!(report.artifacts[0].key, "job/console.tail.log");
+    let forensics = report
+        .forensics
+        .expect("terminal forensics");
+    assert_eq!(
+        forensics
+            .last_phase
+            .as_deref(),
+        Some("build")
+    );
+    assert_eq!(
+        forensics
+            .console_tail
+            .as_deref(),
+        Some("compiler failed")
+    );
+    assert_eq!(forensics.console_size_bytes, Some(2048));
+    assert_eq!(
+        forensics
+            .console_artifact_key
+            .as_deref(),
+        Some("job/console.tail.log")
+    );
+}
+
+#[tokio::test]
 async fn github_report_identity_is_submission_owned_and_conflicts_fail_closed() {
     let (_db, pool) = setup_pg_db().await;
     seed_install_repo(&pool).await;

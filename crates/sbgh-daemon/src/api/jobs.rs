@@ -6,8 +6,8 @@ use sbgh_api::{
     BenchmarkReportDetail, BlockValidationReportDetail, BlockValidationSelectionDetail,
     BlockValidationSelectionRequest, BuildOnlyReportDetail, EnqueueBlockValidationRequest,
     EnqueueJobResponse, InvalidBlockDetail, JobView, ObservedValidationIndexDetail,
-    ReportArtifactView, ReportIdentityView, ReportLifecycleView, ReportRange, SubmissionReportView,
-    TaskReportView, ValidationEpochSegmentDetail,
+    ReportArtifactView, ReportForensicsView, ReportIdentityView, ReportLifecycleView, ReportRange,
+    SubmissionReportView, TaskReportView, ValidationEpochSegmentDetail,
 };
 use sbgh_core::models::{BuildTarget, GitRefKind, Job, JobIntent, JobSource, TaskKind};
 use sbgh_core::submission::{
@@ -91,6 +91,7 @@ fn report_view(report: sbgh_core::reporting::SubmissionReportView) -> Submission
         lifecycle,
         task,
         artifacts,
+        forensics,
     } = report;
     let ReportIdentity {
         submission_id,
@@ -210,6 +211,12 @@ fn report_view(report: sbgh_core::reporting::SubmissionReportView) -> Submission
                 key: artifact.key,
             })
             .collect(),
+        forensics: forensics.map(|forensics| ReportForensicsView {
+            last_phase: forensics.last_phase,
+            console_tail: forensics.console_tail,
+            console_size_bytes: forensics.console_size_bytes,
+            console_artifact_key: forensics.console_artifact_key,
+        }),
     }
 }
 

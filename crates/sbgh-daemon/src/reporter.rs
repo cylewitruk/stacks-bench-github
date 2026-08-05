@@ -835,6 +835,7 @@ impl Reporter {
             },
             task,
             artifacts: Vec::new(),
+            forensics: None,
         }
     }
 
@@ -2032,6 +2033,7 @@ mod tests {
                 None, &result,
             )),
             artifacts: Vec::new(),
+            forensics: None,
         };
         let store = Arc::new(RecordingStore::with_report(report));
         let reporter = Reporter::new(

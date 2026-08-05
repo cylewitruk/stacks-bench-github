@@ -1070,6 +1070,7 @@ async fn terminal_write(
                 event_detail: Some(serde_json::json!({
                     "attempt_id": attempt_id,
                     "artifacts": logical_artifacts,
+                    "summary": summary,
                 })),
             })
         }
@@ -1237,8 +1238,8 @@ mod tests {
 
     use async_trait::async_trait;
     use sbgh_core::db::fleet::{
-        WorkerAuthorization, WorkerIdentityRecord, WorkerPolicyPatch, WorkerRegistration,
-        WorkerRegistryEntry, WorkerRegistryMutation, WorkerRegistryStore,
+        FleetTerminalWrite, WorkerAuthorization, WorkerIdentityRecord, WorkerPolicyPatch,
+        WorkerRegistration, WorkerRegistryEntry, WorkerRegistryMutation, WorkerRegistryStore,
     };
     use sbgh_fleet::{
         ArtifactDescriptor, BlockValidationPayload, BlockValidationResult, InclusiveRange,
@@ -1248,9 +1249,10 @@ mod tests {
 
     use super::{
         ActivePolls, ServiceCode, accept_event_ingest, artifact_staging_key, authorize_peer,
-        effective_capabilities, logical_artifacts, registration_readiness,
+        effective_capabilities, logical_artifacts, registration_readiness, terminal_write,
         validate_terminal_for_assignment,
     };
+    use crate::artifact_store::LocalFsStore;
     use sbgh_core::db::fleet::EventIngest;
 
     #[derive(Default)]
@@ -1557,5 +1559,31 @@ mod tests {
                 .unwrap()
                 .contains("staging/")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_retains_bounded_driver_forensics() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let summary = serde_json::json!({
+            "last_phase": "build",
+            "console_tail": "compiler failed",
+            "console_archived_path": "job/console.tail.log",
+        });
+        let write = terminal_write(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            &TerminalOutcome::Failed {
+                error: "VM reported phase=error".into(),
+                summary: Some(summary.clone()),
+                retryable: true,
+            },
+            &[],
+            &LocalFsStore::new(temp.path().to_path_buf()),
+        )
+        .await;
+        let FleetTerminalWrite::Failed(failure) = write else {
+            panic!("expected failed terminal write")
+        };
+        assert_eq!(failure.event_detail.unwrap()["summary"], summary);
     }
 }

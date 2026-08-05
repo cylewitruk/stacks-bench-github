@@ -991,6 +991,7 @@ mod tests {
             },
             task,
             artifacts: Vec::new(),
+            forensics: None,
         }
     }
 

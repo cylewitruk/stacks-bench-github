@@ -422,6 +422,7 @@ impl RunnableJobStore for FakeSource {
             },
             task,
             artifacts: Vec::new(),
+            forensics: None,
         }))
     }
     async fn set_comment_id(&self, _job: &RunnableJob, _comment_id: i64) -> anyhow::Result<()> {

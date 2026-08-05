@@ -14,6 +14,17 @@ pub struct SubmissionReportView {
     pub lifecycle: ReportLifecycle,
     pub task: TaskReport,
     pub artifacts: Vec<ReportArtifact>,
+    /// Authenticated operator diagnostics. Provider renderers deliberately do
+    /// not include untrusted guest output in GitHub or Slack messages.
+    pub forensics: Option<ReportForensics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportForensics {
+    pub last_phase: Option<String>,
+    pub console_tail: Option<String>,
+    pub console_size_bytes: Option<u64>,
+    pub console_artifact_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

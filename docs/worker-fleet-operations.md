@@ -58,6 +58,26 @@ The worker keeps a restrictive process umask. Its libvirt adapter explicitly
 makes only each ephemeral VM job directory execute-only to non-owners so QEMU
 can traverse to libvirt-owned disks without making job contents listable.
 
+### Failed VM forensics
+
+Inspect a terminal attempt through the authenticated operator API:
+
+```bash
+sbgh jobs report --submission-id <submission-uuid>
+```
+
+The report's `forensics` object contains the last phase, the final 1 MiB of the
+guest serial console, the original console size, and the promoted
+`console.tail.log` artifact key. The full QEMU console is intentionally not
+retained: an untrusted build may emit unlimited output, while the bounded tail
+normally contains the compiler or guest-shutdown failure. GitHub and Slack
+renderers do not publish this untrusted console text.
+
+While an attempt is still running, the same serial output is available only on
+that worker at `/var/lib/sbgh-worker/jobs/<attempt-id>/console.log`. Verified
+teardown removes the ephemeral attempt directory after archiving the bounded
+tail.
+
 ## Coordinated protocol deployment
 
 The current fleet requires an exact protocol revision at session registration.

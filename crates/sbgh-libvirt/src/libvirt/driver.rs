@@ -17,7 +17,7 @@
 //! provisioning has begun comes back as `Ok(BenchmarkOutcome { status: Failed,
 //! .. })` so the runner can still record forensics on the job row.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,6 +62,14 @@ const VM_JOB_DIRECTORY_MODE: u32 = 0o711;
 fn prepare_vm_job_directory(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(VM_JOB_DIRECTORY_MODE))
+}
+
+#[derive(Debug)]
+struct ConsoleForensics {
+    tail: Option<String>,
+    source_size_bytes: Option<u64>,
+    archived_path: Option<String>,
+    archived_size_bytes: Option<u64>,
 }
 
 /// Schema-v1 envelope written by
@@ -732,37 +740,9 @@ impl LibvirtDriver {
             .baseline_calibration_id
             .or_else(|| tmpfs.and_then(baseline_calibration_id_from_tmpfs));
 
-        // Chown the serial console log to sbgh before we try to read it.
-        // libvirt-qemu creates this file as itself (typically
-        // libvirt-qemu:libvirt-qemu mode 0600), so a plain open from
-        // sbgh hits EACCES and we lose the only artifact telling us
-        // what happened inside the VM. Best-effort — if the chown
-        // fails, forensics::console_tail will still log its EACCES
-        // warning and we proceed with whatever forensics we have.
-        let console_log = job_dir.join("console.log");
-        if console_log.exists() {
-            let owner = format!("{u}:{u}", u = self.config.service_user);
-            let console_s = console_log
-                .display()
-                .to_string();
-            match self
-                .shell
-                .run(spec_priv(Path::new("/usr/bin/chown"), &[&owner, &console_s]))
-                .await
-            {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => tracing::warn!(
-                    status = ?out.status,
-                    stderr = %String::from_utf8_lossy(&out.stderr),
-                    "chown console.log returned non-zero; forensics may be incomplete",
-                ),
-                Err(e) => {
-                    tracing::warn!(error = %e, "chown console.log failed; forensics may be incomplete")
-                }
-            }
-        }
-
-        let (console_tail, console_size_bytes) = forensics::console_tail(&console_log);
+        let console = self
+            .console_forensics(&job_id, &job_dir)
+            .await;
         let chainstate_origin = arts
             .chainstate
             .as_ref()
@@ -788,8 +768,10 @@ impl LibvirtDriver {
                 Err(_) => "setup_error",
             },
             "last_phase": last_phase,
-            "console_tail": console_tail,
-            "console_size_bytes": console_size_bytes,
+            "console_tail": console.tail,
+            "console_size_bytes": console.source_size_bytes,
+            "console_archived_path": console.archived_path,
+            "console_archived_size_bytes": console.archived_size_bytes,
             "archive_dir": store.job_dir(&job_id),
             "sqlite_archived_path": sqlite_archived_path,
             "sqlite_size_bytes": sqlite_size_bytes,
@@ -1022,6 +1004,9 @@ impl LibvirtDriver {
             .as_ref()
             .ok()
             .and_then(|(_, output)| output.as_ref());
+        let console = self
+            .console_forensics(&job_id, &job_dir)
+            .await;
         let mut summary = serde_json::json!({
             "task": "block_validation",
             "job_id": ctx.job_id,
@@ -1051,6 +1036,10 @@ impl LibvirtDriver {
                 Err(_) => "setup_error",
             },
             "last_phase": last_phase,
+            "console_tail": console.tail,
+            "console_size_bytes": console.source_size_bytes,
+            "console_archived_path": console.archived_path,
+            "console_archived_size_bytes": console.archived_size_bytes,
         });
         let cleanup_verified = self
             .teardown(arts, &domain_name, &attempt_id, &job_dir)
@@ -1079,6 +1068,77 @@ impl LibvirtDriver {
             Err(error) => (DriverStatus::Failed(format!("{error:#}")), DriverTaskOutput::None),
         };
         Ok(DriverOutcome { status, summary, output })
+    }
+
+    /// Capture the bounded serial-console tail before teardown. Libvirt creates
+    /// the file as its QEMU account, so ownership recovery is best-effort and
+    /// shared by every task recipe that uses the VM driver.
+    async fn console_forensics(&self, job_id: &str, job_dir: &Path) -> ConsoleForensics {
+        let console_log = job_dir.join("console.log");
+        if console_log.exists() {
+            let owner = format!("{u}:{u}", u = self.config.service_user);
+            let console_s = console_log
+                .display()
+                .to_string();
+            match self
+                .shell
+                .run(spec_priv(Path::new("/usr/bin/chown"), &[&owner, &console_s]))
+                .await
+            {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => tracing::warn!(
+                    status = ?out.status,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "chown console.log returned non-zero; forensics may be incomplete",
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "chown console.log failed; forensics may be incomplete"
+                ),
+            }
+        }
+        let (tail, source_size_bytes) = forensics::console_tail(&console_log);
+        let mut archived_path = None;
+        let mut archived_size_bytes = None;
+        if let Some(contents) = tail.as_deref() {
+            let tail_path = job_dir.join(forensics::CONSOLE_TAIL_RELATIVE);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tail_path)
+                .and_then(|mut file| {
+                    use std::io::Write as _;
+                    file.write_all(contents.as_bytes())
+                }) {
+                Ok(()) => {
+                    let key = artifact_key(job_id, forensics::CONSOLE_TAIL_RELATIVE);
+                    archived_size_bytes = self
+                        .artifact_store
+                        .put(&key, &tail_path)
+                        .await;
+                    if archived_size_bytes.is_some() {
+                        archived_path = Some(key);
+                    } else {
+                        tracing::warn!(
+                            path = %tail_path.display(),
+                            "archiving bounded console tail failed"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    path = %tail_path.display(),
+                    "writing bounded console-tail artifact failed"
+                ),
+            }
+        }
+        ConsoleForensics {
+            tail,
+            source_size_bytes,
+            archived_path,
+            archived_size_bytes,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -182,6 +182,16 @@ pub struct SubmissionReportView {
     pub lifecycle: ReportLifecycleView,
     pub task: TaskReportView,
     pub artifacts: Vec<ReportArtifactView>,
+    pub forensics: Option<ReportForensicsView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportForensicsView {
+    pub last_phase: Option<String>,
+    pub console_tail: Option<String>,
+    pub console_size_bytes: Option<u64>,
+    pub console_artifact_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

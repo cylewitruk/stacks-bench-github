@@ -13,7 +13,10 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-const CONSOLE_TAIL_BYTES: usize = 64 * 1024;
+/// Keep enough serial output to diagnose compiler and guest-startup failures
+/// without allowing an adversarial guest to turn terminal metadata or artifact
+/// storage into an unbounded sink.
+const CONSOLE_TAIL_BYTES: usize = 1024 * 1024;
 
 /// Per-job archive layout — each artifact lands at
 /// `<results_archive_dir>/<job_id>/<relative>`:
@@ -28,6 +31,7 @@ const CONSOLE_TAIL_BYTES: usize = 64 * 1024;
 ///   ├── calibration.json     ← raw JSON output from shared calibration
 ///   ├── calibration.progress.jsonl
 ///   │                         ← raw JSONL stderr progress from calibration
+///   ├── console.tail.log      ← final 1 MiB of the VM serial console
 ///   └── phase.log            ← in-VM phase journal (timestamped)
 /// ```
 ///
@@ -42,6 +46,7 @@ pub const RUN_JSON_RELATIVE: &str = "run.json";
 pub const RUN_PROGRESS_JSONL_RELATIVE: &str = "run.progress.jsonl";
 pub const CALIBRATION_JSON_RELATIVE: &str = "calibration.json";
 pub const CALIBRATION_PROGRESS_JSONL_RELATIVE: &str = "calibration.progress.jsonl";
+pub const CONSOLE_TAIL_RELATIVE: &str = "console.tail.log";
 pub const PHASE_LOG_RELATIVE: &str = "phase.log";
 
 /// Read the last `max_bytes` of a text file. Returns `None` if the file
@@ -75,7 +80,15 @@ pub fn console_tail(path: &Path) -> (Option<String>, Option<u64>) {
         tracing::warn!(error = %e, "read console.log failed");
         return (None, Some(size));
     }
-    (Some(String::from_utf8_lossy(&buf).into_owned()), Some(size))
+    let mut tail = String::from_utf8_lossy(&buf).into_owned();
+    if tail.len() > CONSOLE_TAIL_BYTES {
+        let mut start = tail.len() - CONSOLE_TAIL_BYTES;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.drain(..start);
+    }
+    (Some(tail), Some(size))
 }
 
 #[cfg(test)]
@@ -114,5 +127,14 @@ mod tests {
         std::fs::write(&p, b"hello world").unwrap();
         let (tail, _) = console_tail(&p);
         assert_eq!(tail.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn console_tail_remains_byte_bounded_after_lossy_utf8_conversion() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("c.log");
+        std::fs::write(&p, vec![0xff; CONSOLE_TAIL_BYTES]).unwrap();
+        let (tail, _) = console_tail(&p);
+        assert!(tail.unwrap().len() <= CONSOLE_TAIL_BYTES);
     }
 }
