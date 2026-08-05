@@ -36,6 +36,10 @@ sbgh_build_release "$do_build" sbgh-worker
 sbgh_require_executable "$binary_src" "Worker binary"
 
 echo "[2/4] Installing worker-owned artifacts..."
+# LVM writes its standard pre-mutation VG backups here. The unit exposes only
+# these root-owned directories through ProtectSystem=strict.
+sbgh_install_directory 0700 /etc/lvm/archive
+sbgh_install_directory 0700 /etc/lvm/backup
 sbgh_install_file 0755 "$binary_src" /usr/local/bin/sbgh-worker
 sbgh_install_file 0644 "$unit_src" /etc/systemd/system/sbgh-worker@.service
 sbgh_install_file 0644 "$hardening_src" \
@@ -48,4 +52,3 @@ echo "[4/4] Worker remains stopped pending config, preflight, and enrollment."
 echo
 echo "Next: sudo -u sbgh-worker sbgh-worker --config /etc/sbgh/worker/PROFILE.toml --preflight-only"
 echo "Then: sudo systemctl enable --now sbgh-worker@PROFILE.service"
-

@@ -48,6 +48,11 @@ authentication. Alert on:
 Do not hide the loss of a sole-capability worker by automatically moving
 comparison work to a different measurement environment.
 
+If an LVM mutation reports `Cannot archive volume group metadata ... to
+read-only filesystem`, reinstall the checked-in worker unit. Its hardening
+drop-in keeps `/etc` read-only except for the root-owned `/etc/lvm/archive` and
+`/etc/lvm/backup` paths required by LVM's standard metadata safety mechanism.
+
 ## Coordinated protocol deployment
 
 The current fleet requires an exact protocol revision at session registration.

@@ -103,6 +103,20 @@ class InstallerTest(unittest.TestCase):
             installed["etc/systemd/system/sbgh-worker@.service.d/hardening.conf"][0],
             0o644,
         )
+        self.assertEqual(
+            stat.S_IMODE((destination / "etc/lvm/archive").stat().st_mode),
+            0o700,
+        )
+        self.assertEqual(
+            stat.S_IMODE((destination / "etc/lvm/backup").stat().st_mode),
+            0o700,
+        )
+        hardening = (
+            destination
+            / "etc/systemd/system/sbgh-worker@.service.d/hardening.conf"
+        ).read_text(encoding="utf-8")
+        self.assertIn("/etc/lvm/archive", hardening)
+        self.assertIn("/etc/lvm/backup", hardening)
 
         before = installed
         self.run_installer("install-worker.sh", destination)

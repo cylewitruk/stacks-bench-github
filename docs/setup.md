@@ -405,6 +405,10 @@ Install this as `/etc/sudoers.d/sbgh-worker`, mode `0440`, and validate it with
 `visudo -cf /etc/sudoers.d/sbgh-worker`. The daemon user receives no libvirt,
 LVM, or sudo authority. The adapter runs `rmdir` without privilege after it
 owns the target directory, so it is intentionally absent from this allowlist.
+The worker installer also creates root-only `/etc/lvm/archive` and
+`/etc/lvm/backup`; the systemd unit exposes only those two paths through
+`ProtectSystem=strict` so allowlisted LVM mutations retain standard VG metadata
+backups.
 
 `install-worker.sh` installs the worker unit template and its global hardening
 drop-in. It never installs control-plane artifacts and never starts an
