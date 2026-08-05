@@ -3136,6 +3136,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "libc",
  "quick-xml 0.40.1",
  "sbgh-driver",

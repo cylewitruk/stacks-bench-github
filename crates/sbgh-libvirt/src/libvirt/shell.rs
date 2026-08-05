@@ -48,10 +48,18 @@ impl std::fmt::Debug for CommandSpec {
 
 impl CommandSpec {
     pub fn with_repository_token(mut self, token: &str) -> Self {
+        use base64::Engine as _;
+
+        // GitHub's smart-HTTP Git endpoint expects installation tokens as
+        // HTTP Basic credentials. Bearer authentication is for GitHub's API;
+        // using it here causes Git to fall back to an interactive username
+        // prompt, which fails closed in the non-interactive worker.
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         self.secret_env.extend([
             ("GIT_CONFIG_COUNT".into(), "1".into()),
             ("GIT_CONFIG_KEY_0".into(), "http.https://github.com/.extraheader".into()),
-            ("GIT_CONFIG_VALUE_0".into(), format!("Authorization: Bearer {token}")),
+            ("GIT_CONFIG_VALUE_0".into(), format!("Authorization: Basic {credentials}")),
         ]);
         self
     }
@@ -264,6 +272,8 @@ impl Shell for SystemShell {
 
 #[cfg(test)]
 mod credential_tests {
+    use base64::Engine as _;
+
     use super::spec;
 
     #[test]
@@ -276,6 +286,11 @@ mod credential_tests {
         assert!(!debug.contains(token));
         assert!(debug.contains("GIT_CONFIG_VALUE_0"));
         assert!(debug.contains("[REDACTED]"));
+
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+        assert_eq!(command.secret_env[2].0, "GIT_CONFIG_VALUE_0");
+        assert_eq!(command.secret_env[2].1, format!("Authorization: Basic {encoded}"));
     }
 }
 
