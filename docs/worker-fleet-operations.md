@@ -53,6 +53,10 @@ read-only filesystem`, reinstall the checked-in worker unit. Its hardening
 drop-in keeps `/etc` read-only except for the root-owned `/etc/lvm/archive` and
 `/etc/lvm/backup` paths required by LVM's standard metadata safety mechanism.
 
+The worker keeps a restrictive process umask. Its libvirt adapter explicitly
+makes only each ephemeral VM job directory execute-only to non-owners so QEMU
+can traverse to libvirt-owned disks without making job contents listable.
+
 ## Coordinated protocol deployment
 
 The current fleet requires an exact protocol revision at session registration.

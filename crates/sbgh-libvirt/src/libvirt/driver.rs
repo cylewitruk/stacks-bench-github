@@ -17,6 +17,7 @@
 //! provisioning has begun comes back as `Ok(BenchmarkOutcome { status: Failed,
 //! .. })` so the runner can still record forensics on the job row.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,6 +52,17 @@ use crate::libvirt::source::SourceDisk;
 use crate::libvirt::tmpfs::ResultsTmpfs;
 use crate::libvirt::virsh::{self, DomState};
 use crate::libvirt::{forensics, git_mirror};
+
+/// Libvirt changes ownership of attached files to its QEMU account, but that
+/// account must still be able to traverse the containing directory. Keep the
+/// worker-wide `UMask=0077` and open only this ephemeral boundary; execute-only
+/// access prevents other host users from listing job artifacts.
+const VM_JOB_DIRECTORY_MODE: u32 = 0o711;
+
+fn prepare_vm_job_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(VM_JOB_DIRECTORY_MODE))
+}
 
 /// Schema-v1 envelope written by
 /// `stacks-bench bench baseline calibrate --json`.
@@ -573,7 +585,7 @@ impl LibvirtDriver {
             .paths
             .jobs_dir
             .join(&resource_id);
-        std::fs::create_dir_all(&job_dir)?;
+        prepare_vm_job_directory(&job_dir)?;
 
         let mut arts = JobArtifacts::default();
         let started = Instant::now();
@@ -859,7 +871,7 @@ impl LibvirtDriver {
             .paths
             .jobs_dir
             .join(&attempt_id);
-        std::fs::create_dir_all(&job_dir)?;
+        prepare_vm_job_directory(&job_dir)?;
         let started = Instant::now();
         let mut arts = JobArtifacts::default();
         let inputs = RunInputs {

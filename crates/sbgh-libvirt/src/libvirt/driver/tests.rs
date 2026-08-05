@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -14,6 +15,25 @@ use crate::libvirt::shell::test_support::{PreparedReply, RecordingShell};
 use crate::{
     BenchmarkProfile, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
 };
+
+#[test]
+fn vm_job_directory_is_traversable_but_not_listable_by_other_users() {
+    let tmp = TempDir::new().unwrap();
+    let job_dir = tmp.path().join("attempt");
+    std::fs::create_dir(&job_dir).unwrap();
+    std::fs::set_permissions(&job_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    prepare_vm_job_directory(&job_dir).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(job_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        VM_JOB_DIRECTORY_MODE
+    );
+}
 
 struct TestJob {
     id: Uuid,
