@@ -20,8 +20,13 @@ futures.workspace = true
 
 reqwest = { workspace = true, features = ["rustls"] }
 # reqwest-eventsource 0.6 still targets Reqwest 0.12. Keep the direct client on
-# workspace Reqwest 0.13 and accept this isolated duplicate until its adapter
-# supports the current major version.
+# workspace Reqwest 0.13 and give its isolated Reqwest 0.12 transport explicit
+# TLS support until the adapter supports the current major version. Features do
+# not unify across those two Reqwest major versions.
+reqwest_sse = { package = "reqwest", version = "0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
 reqwest-eventsource.workspace = true
 rustls.workspace = true
 
