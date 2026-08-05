@@ -176,6 +176,11 @@ HTTP/CLI and exact GitHub triggers remain provider-free.
   writable snapshot of the read-only origin, run the actual numeric probes,
   validate a small range, reduce the result, and clean up before GitHub or
   Slack is introduced.
+- **Audit the executed validation commands.** Emit the exact argv before every
+  guest `stacks-inspect` spawn, retain command-specific logs, and have the
+  trusted reducer reconstruct the expected epoch-local half-open ranges. A
+  terminal result is valid only when every command and its reported processed
+  count exactly cover the trusted global plan.
 - **Keep processes and authority separate even on one machine.** The daemon and
   worker use different service users, configuration, units, filesystem
   ownership, and privileges. The daemon receives no libvirt, LVM, mount, or
@@ -333,9 +338,11 @@ logical identity while creating a new fenced session.
 2. Observe offer, accept, attempt, VM, snapshot, probe, validation, terminal,
    artifact promotion, and report projection using their canonical IDs.
 3. Confirm recorded pre-Nakamoto/Nakamoto counts are sane for the selected
-   origin and the resolved segment covers exactly one block.
+   origin and the resolved segment covers exactly one block. Retain the exact
+   command audit record and require its final processed count to be one.
 4. Submit a tiny range crossing the observed epoch boundary and require two
-   exact, gap-free segments.
+   exact, gap-free segments, two exact epoch-local command records, and summed
+   processed counts equal to the global range.
 5. Confirm domains, mounts, thin snapshots, temporary files, and staging
    artifacts are absent after both attempts.
 
@@ -425,7 +432,8 @@ that the first fleet is live.
 - [ ] Sandbox policy service starts and its live post-start verifier passes.
 - [ ] Disposable-guest network and two-snapshot LVM ceremonies pass.
 - [ ] Combined-worker preflight and database enrollment pass.
-- [ ] Controlled one-block and cross-epoch sandbox/probe canaries pass.
+- [ ] Controlled one-block and cross-epoch sandbox/probe canaries pass with
+  exact argv and processed-count audit evidence.
 - [ ] GitHub benchmark and validation canaries pass.
 - [ ] Slack benchmark and recent-validation canaries pass.
 - [ ] Full-history, cancellation, daemon restart, worker loss, and cleanup

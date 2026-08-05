@@ -352,6 +352,15 @@ HTTPS grant, promoted only after the accepted terminal result, and retrievable
 from the configured S3 bucket with its recorded size and SHA-256. The worker
 must have no S3 credentials.
 
+The guest emits `SBGH_STACKS_INSPECT_COMMAND` followed by one canonical JSON
+record immediately before each probe or validation process starts. Retain the
+bounded console artifact and per-command stdout/stderr artifacts. Require the trusted
+reducer to accept only the exact expected executable, network, database path,
+epoch mode, and half-open range, and to derive `checked_blocks` from the final
+`Validating: 100% (N/N)` count in each command rather than from the requested
+range alone. A missing, duplicate, reordered, or altered command record, or a
+reported count that differs from its trusted range, is a failed gate.
+
 Use the observed pre-Nakamoto count as the global epoch boundary. If it is
 `P`, submit the inclusive range `P-1..P` with a new idempotency key:
 
@@ -368,7 +377,8 @@ CROSS_SUBMISSION_ID=$(sbgh jobs validate-blocks \
 sbgh jobs report --submission-id "$CROSS_SUBMISSION_ID"
 ```
 
-Require two exact, adjacent epoch segments and two checked blocks. After each
+Require two exact, adjacent epoch segments, two command audit records (one
+`index-range`, one `naka-index-range`), and two checked blocks. After each
 terminal, require no attempt domain, mount, loop device, thin snapshot,
 temporary results directory, or unpromoted staging object remains. Investigate
 any matching resource rather than deleting it blindly.

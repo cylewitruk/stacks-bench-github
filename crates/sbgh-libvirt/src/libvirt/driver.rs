@@ -2409,7 +2409,7 @@ fn block_diagnostic_paths(results_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
             .into_string()
             .map_err(|_| anyhow::anyhow!("block diagnostic filename is not UTF-8"))?;
         let diagnostic = name == "block-validation-result.json"
-            || (name.starts_with("shard-")
+            || ((name.starts_with("shard-") || name.starts_with("probe-"))
                 && (name.ends_with(".stdout.log")
                     || name.ends_with(".stderr.log")
                     || name.ends_with(".error.log")));

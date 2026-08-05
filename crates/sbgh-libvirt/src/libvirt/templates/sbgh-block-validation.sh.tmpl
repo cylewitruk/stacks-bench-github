@@ -56,7 +56,7 @@ NETWORK_DATA_DIR = "mainnet"
 MAX_PROBE_DIAGNOSTIC_BYTES = 64 * 1024
 with open(PLAN_PATH, encoding="utf-8") as handle:
     plan = json.load(handle)
-if plan.get("schema_version") != 1:
+if plan.get("schema_version") != 2:
     raise RuntimeError("unsupported block plan schema")
 
 def phase(name):
@@ -101,13 +101,40 @@ def diagnostic_tail(value):
     encoded = value.encode("utf-8", errors="replace")
     return encoded[-MAX_PROBE_DIAGNOSTIC_BYTES:].decode("utf-8", errors="replace")
 
+probe_records = []
 def probe(kind):
+    ordinal = len(probe_records)
+    stdout_name = f"probe-{kind}.stdout.log"
+    stderr_name = f"probe-{kind}.stderr.log"
+    argv = [
+        BIN, "--network-config", "mainnet", "validate-block", database_paths[0], kind,
+    ]
+    audit = {
+        "ordinal": ordinal,
+        "kind": kind,
+        "argv": argv,
+        "stdout_file": stdout_name,
+        "stderr_file": stderr_name,
+    }
+    print("SBGH_STACKS_INSPECT_COMMAND " + json.dumps(
+        {"operation": "probe", **audit}, sort_keys=True, separators=(",", ":")
+    ), flush=True)
     completed = subprocess.run(
-        [BIN, "--network-config", "mainnet", "validate-block", database_paths[0], kind],
+        argv,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    with open(RESULTS + "/" + stdout_name, "w", encoding="utf-8") as handle:
+        handle.write(completed.stdout)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with open(RESULTS + "/" + stderr_name, "w", encoding="utf-8") as handle:
+        handle.write(completed.stderr)
+        handle.flush()
+        os.fsync(handle.fileno())
+    audit["exit_code"] = completed.returncode
+    probe_records.append(audit)
     if completed.returncode != 0:
         raise RuntimeError(
             f"{kind} probe failed (exit={completed.returncode}): "
@@ -203,6 +230,42 @@ limit = min(int(plan["max_concurrency"]), len(ranges))
 if limit <= 0:
     raise RuntimeError("max_concurrency must be non-zero")
 
+def start_command(state):
+    range_kind, command_start, command_end = state["pending_commands"].pop(0)
+    ordinal = len(state["commands"])
+    end_exclusive = command_end + 1
+    stdout_name = f"shard-{state['index']}-command-{ordinal}.stdout.log"
+    stderr_name = f"shard-{state['index']}-command-{ordinal}.stderr.log"
+    argv = [
+        BIN, "--network-config", "mainnet", "validate-block",
+        database_paths[state["index"]], range_kind,
+        str(command_start), str(end_exclusive),
+    ]
+    audit = {
+        "ordinal": ordinal,
+        "kind": range_kind,
+        "start": command_start,
+        "end_exclusive": end_exclusive,
+        "argv": argv,
+        "stdout_file": stdout_name,
+        "stderr_file": stderr_name,
+    }
+    print("SBGH_STACKS_INSPECT_COMMAND " + json.dumps(
+        {"operation": "validate", "shard": state["index"], **audit},
+        sort_keys=True, separators=(",", ":")
+    ), flush=True)
+    stdout_handle = open(RESULTS + "/" + stdout_name, "wb")
+    stderr_handle = open(RESULTS + "/" + stderr_name, "wb")
+    state["process"] = subprocess.Popen(
+        argv,
+        stdout=stdout_handle,
+        stderr=stderr_handle,
+        start_new_session=True,
+    )
+    state["stdout"] = stdout_handle
+    state["stderr"] = stderr_handle
+    state["current_command"] = audit
+
 while pending or active:
     if time.monotonic() - started > int(plan["timeout_secs"]):
         for state in active.values():
@@ -212,62 +275,33 @@ while pending or active:
         raise RuntimeError("block validation timed out")
     while pending and len(active) < limit:
         index, global_start, global_end, commands = pending.pop(0)
-        stdout_name = f"shard-{index}.stdout.log"
-        stderr_name = f"shard-{index}.stderr.log"
-        stdout_handle = open(RESULTS + "/" + stdout_name, "wb")
-        stderr_handle = open(RESULTS + "/" + stderr_name, "wb")
-        range_kind, command_start, command_end = commands.pop(0)
-        command = [
-            BIN, "--network-config", "mainnet", "validate-block", database_paths[index],
-            range_kind, str(command_start), str(command_end + 1),
-        ]
-        process = subprocess.Popen(
-            command,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            start_new_session=True,
-        )
-        active[index] = {
-            "process": process,
-            "stdout": stdout_handle,
-            "stderr": stderr_handle,
-            "record": (index, global_start, global_end, stdout_name, stderr_name),
-            "commands": commands,
-            "exit_codes": [],
+        state = {
+            "index": index,
+            "start": global_start,
+            "end": global_end,
+            "pending_commands": commands,
+            "commands": [],
         }
+        start_command(state)
+        active[index] = state
     completed = []
     for index, state in active.items():
         exit_code = state["process"].poll()
         if exit_code is None:
             continue
-        state["exit_codes"].append(exit_code)
-        if exit_code in (0, 1) and state["commands"]:
-            range_kind, command_start, command_end = state["commands"].pop(0)
-            command = [
-                BIN, "--network-config", "mainnet", "validate-block", database_paths[index],
-                range_kind, str(command_start), str(command_end + 1),
-            ]
-            state["process"] = subprocess.Popen(
-                command,
-                stdout=state["stdout"],
-                stderr=state["stderr"],
-                start_new_session=True,
-            )
-            continue
         state["stdout"].close()
         state["stderr"].close()
-        record = state["record"]
-        final_exit = next(
-            (code for code in state["exit_codes"] if code not in (0, 1)),
-            1 if 1 in state["exit_codes"] else 0,
-        )
+        command_record = state.pop("current_command")
+        command_record["exit_code"] = exit_code
+        state["commands"].append(command_record)
+        if exit_code in (0, 1) and state["pending_commands"]:
+            start_command(state)
+            continue
         finished.append({
-            "index": record[0],
-            "start": record[1],
-            "end": record[2],
-            "exit_code": final_exit,
-            "stdout_file": record[3],
-            "stderr_file": record[4],
+            "index": state["index"],
+            "start": state["start"],
+            "end": state["end"],
+            "commands": state["commands"],
         })
         completed.append(index)
     for index in completed:
@@ -291,7 +325,7 @@ while pending or active:
 
 finished.sort(key=lambda item: item["index"])
 result = {
-    "schema_version": 1,
+    "schema_version": 2,
     "job_id": plan["job_id"],
     "attempt_id": plan["attempt_id"],
     "fencing_generation": plan["fencing_generation"],
@@ -305,6 +339,7 @@ result = {
     "segments": segments,
     "shard_count": shard_count,
     "max_concurrency": limit,
+    "probes": probe_records,
     "shards": finished,
 }
 temporary = RESULTS + "/.block-validation-result.json.tmp"

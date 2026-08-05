@@ -13,9 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::libvirt::guest_file;
 use crate::libvirt::lvm::ChainstateSnapshotSet;
 
-pub const RESULT_SCHEMA_VERSION: u32 = 1;
+pub const RESULT_SCHEMA_VERSION: u32 = 2;
 const MAX_RESULT_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SHARD_DIAGNOSTIC_BYTES: u64 = 64 * 1024 * 1024;
+const STACKS_INSPECT_GUEST_PATH: &str = "/opt/stacks-core/target/release/stacks-inspect";
+const STACKS_NETWORK: &str = "mainnet";
+const STACKS_NETWORK_DATA_DIR: &str = "mainnet";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BlockGuestPlan {
@@ -119,7 +122,19 @@ struct GuestResult {
     segments: Vec<ValidationEpochSegment>,
     shard_count: u32,
     max_concurrency: u32,
+    probes: Vec<GuestProbe>,
     shards: Vec<GuestShard>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestProbe {
+    ordinal: u32,
+    kind: ValidationCommandKind,
+    argv: Vec<String>,
+    exit_code: i32,
+    stdout_file: String,
+    stderr_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -128,9 +143,57 @@ struct GuestShard {
     index: u32,
     start: u64,
     end: u64,
+    commands: Vec<GuestCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ValidationCommandKind {
+    IndexRange,
+    NakaIndexRange,
+}
+
+impl ValidationCommandKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexRange => "index-range",
+            Self::NakaIndexRange => "naka-index-range",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestCommand {
+    ordinal: u32,
+    kind: ValidationCommandKind,
+    start: u64,
+    end_exclusive: u64,
+    argv: Vec<String>,
     exit_code: i32,
     stdout_file: String,
     stderr_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedCommand {
+    ordinal: u32,
+    kind: ValidationCommandKind,
+    start: u64,
+    end_exclusive: u64,
+    argv: Vec<String>,
+    stdout_file: String,
+    stderr_file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedProbe {
+    ordinal: u32,
+    kind: ValidationCommandKind,
+    argv: Vec<String>,
+    stdout_file: String,
+    stderr_file: String,
+    count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,10 +240,10 @@ pub fn reduce_result(
     );
     let expected = partition(resolved.range, resolved.shard_count)?;
     ensure!(result.shards.len() == expected.len(), "guest result is partial");
+    let mut artifacts = verify_probes(results_dir, plan, &result)?;
     let mut shards = result.shards;
     shards.sort_by_key(|shard| shard.index);
     let mut invalid_blocks = Vec::new();
-    let mut artifacts = Vec::with_capacity(shards.len() * 2 + 2);
     let mut checked_blocks = 0_u64;
     let mut negative = false;
     for (shard, expected) in shards.iter().zip(&expected) {
@@ -190,37 +253,105 @@ pub fn reduce_result(
                 && shard.end == expected.end,
             "guest shard ranges are not an exact, gap-free partition"
         );
-        let stdout = safe_result_file(results_dir, &shard.stdout_file)?;
-        let stderr = safe_result_file(results_dir, &shard.stderr_file)?;
-        let stdout_text = guest_file::read_to_string_bounded(&stdout, MAX_SHARD_DIAGNOSTIC_BYTES)
-            .with_context(|| format!("reading shard stdout {}", stdout.display()))?;
-        let stderr_text = guest_file::read_to_string_bounded(&stderr, MAX_SHARD_DIAGNOSTIC_BYTES)
-            .with_context(|| format!("reading shard stderr {}", stderr.display()))?;
-        match shard.exit_code {
-            0 => {}
-            1 if explicit_validation_failure(&stdout_text, &stderr_text) => {
-                let parsed = parse_invalid_blocks(shard.index, &stdout_text, &stderr_text);
-                ensure!(
-                    !parsed.is_empty(),
-                    "negative shard {} reported no typed invalid-block details",
-                    shard.index
-                );
-                negative = true;
-                invalid_blocks.extend(parsed);
-            }
-            code => anyhow::bail!(
-                "stacks-inspect shard {} infrastructure failure (exit={code}): stdout={} stderr={}",
+        let device = plan
+            .devices
+            .iter()
+            .find(|device| device.shard == shard.index)
+            .context("trusted plan is missing a shard device")?;
+        let expected_commands = expected_commands(
+            expected,
+            result.observed.pre_nakamoto_count,
+            &device.mountpoint,
+        )?;
+        ensure!(
+            shard.commands.len() == expected_commands.len(),
+            "guest shard {} command count does not match the trusted plan",
+            shard.index
+        );
+        for (command, expected_command) in shard.commands.iter().zip(&expected_commands) {
+            ensure!(
+                command.ordinal == expected_command.ordinal
+                    && command.kind == expected_command.kind
+                    && command.start == expected_command.start
+                    && command.end_exclusive == expected_command.end_exclusive
+                    && command.argv == expected_command.argv
+                    && command.stdout_file == expected_command.stdout_file
+                    && command.stderr_file == expected_command.stderr_file,
+                "guest shard {} command {} does not match the trusted argv and range",
                 shard.index,
-                stdout_text.trim(),
-                stderr_text.trim()
-            ),
+                command.ordinal
+            );
+            let stdout = safe_result_file(results_dir, &command.stdout_file)?;
+            let stderr = safe_result_file(results_dir, &command.stderr_file)?;
+            let stdout_text =
+                guest_file::read_to_string_bounded(&stdout, MAX_SHARD_DIAGNOSTIC_BYTES)
+                    .with_context(|| format!("reading command stdout {}", stdout.display()))?;
+            let stderr_text =
+                guest_file::read_to_string_bounded(&stderr, MAX_SHARD_DIAGNOSTIC_BYTES)
+                    .with_context(|| format!("reading command stderr {}", stderr.display()))?;
+            if !matches!(command.exit_code, 0 | 1) {
+                anyhow::bail!(
+                    "stacks-inspect shard {} command {} infrastructure failure (exit={}): stdout={} stderr={}",
+                    shard.index,
+                    command.ordinal,
+                    command.exit_code,
+                    stdout_text.trim(),
+                    stderr_text.trim()
+                );
+            }
+            let expected_count = command
+                .end_exclusive
+                .checked_sub(command.start)
+                .context("trusted command range is reversed")?;
+            let reported_count = parse_terminal_progress_count(&stdout_text).with_context(|| {
+                format!(
+                    "stacks-inspect shard {} command {} did not report a terminal processed-block count",
+                    shard.index, command.ordinal
+                )
+            })?;
+            ensure!(
+                reported_count == expected_count,
+                "stacks-inspect shard {} command {} reported {reported_count} processed blocks; expected {expected_count}",
+                shard.index,
+                command.ordinal
+            );
+            match command.exit_code {
+                0 => ensure!(
+                    parse_success_count(&stdout_text) == Some(reported_count),
+                    "stacks-inspect shard {} command {} success summary does not match its processed-block count",
+                    shard.index,
+                    command.ordinal
+                ),
+                1 if explicit_validation_failure(&stdout_text, &stderr_text) => {
+                    let parsed = parse_invalid_blocks(shard.index, &stdout_text, &stderr_text);
+                    ensure!(
+                        !parsed.is_empty(),
+                        "negative shard {} command {} reported no typed invalid-block details",
+                        shard.index,
+                        command.ordinal
+                    );
+                    negative = true;
+                    invalid_blocks.extend(parsed);
+                }
+                _ => unreachable!("non-validation exit codes are rejected above"),
+            }
+            checked_blocks = checked_blocks
+                .checked_add(reported_count)
+                .context("checked-block count overflow")?;
+            artifacts.push(stdout);
+            artifacts.push(stderr);
         }
-        checked_blocks = checked_blocks
-            .checked_add(shard.end - shard.start + 1)
-            .context("checked-block count overflow")?;
-        artifacts.push(stdout);
-        artifacts.push(stderr);
     }
+    let trusted_checked_blocks = resolved
+        .range
+        .end
+        .checked_sub(resolved.range.start)
+        .and_then(|span| span.checked_add(1))
+        .context("trusted checked-block count overflow")?;
+    ensure!(
+        checked_blocks == trusted_checked_blocks,
+        "reported processed-block counts do not exactly cover the trusted range"
+    );
     ensure!(
         !negative || !invalid_blocks.is_empty(),
         "negative result has no typed invalid-block diagnostics"
@@ -372,6 +503,206 @@ fn epoch_segments(
     Ok(segments)
 }
 
+fn verify_probes(
+    results_dir: &Path,
+    plan: &BlockGuestPlan,
+    result: &GuestResult,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let device = plan
+        .devices
+        .iter()
+        .find(|device| device.shard == 0)
+        .context("trusted plan is missing probe shard device zero")?;
+    let database_path = format!(
+        "{}/{}",
+        device.mountpoint.trim_end_matches('/'),
+        STACKS_NETWORK_DATA_DIR
+    );
+    let expected = [
+        (
+            ValidationCommandKind::IndexRange,
+            result.observed.pre_nakamoto_count,
+        ),
+        (
+            ValidationCommandKind::NakaIndexRange,
+            result.observed.nakamoto_count,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ordinal, (kind, count))| ExpectedProbe {
+        ordinal: ordinal as u32,
+        kind,
+        argv: vec![
+            STACKS_INSPECT_GUEST_PATH.into(),
+            "--network-config".into(),
+            STACKS_NETWORK.into(),
+            "validate-block".into(),
+            database_path.clone(),
+            kind.as_str().into(),
+        ],
+        stdout_file: format!("probe-{}.stdout.log", kind.as_str()),
+        stderr_file: format!("probe-{}.stderr.log", kind.as_str()),
+        count,
+    })
+    .collect::<Vec<_>>();
+    ensure!(
+        result.probes.len() == expected.len(),
+        "guest probe count does not match the trusted plan"
+    );
+    let mut artifacts = Vec::with_capacity(expected.len() * 2);
+    for (probe, expected_probe) in result.probes.iter().zip(&expected) {
+        ensure!(
+            probe.ordinal == expected_probe.ordinal
+                && probe.kind == expected_probe.kind
+                && probe.argv == expected_probe.argv
+                && probe.stdout_file == expected_probe.stdout_file
+                && probe.stderr_file == expected_probe.stderr_file,
+            "guest probe {} does not match the trusted argv",
+            probe.ordinal
+        );
+        let stdout = safe_result_file(results_dir, &probe.stdout_file)?;
+        let stderr = safe_result_file(results_dir, &probe.stderr_file)?;
+        let stdout_text = guest_file::read_to_string_bounded(&stdout, MAX_SHARD_DIAGNOSTIC_BYTES)
+            .with_context(|| format!("reading probe stdout {}", stdout.display()))?;
+        let stderr_text = guest_file::read_to_string_bounded(&stderr, MAX_SHARD_DIAGNOSTIC_BYTES)
+            .with_context(|| format!("reading probe stderr {}", stderr.display()))?;
+        ensure!(
+            probe.exit_code == 0,
+            "stacks-inspect probe {} infrastructure failure (exit={}): stdout={} stderr={}",
+            probe.kind.as_str(),
+            probe.exit_code,
+            stdout_text.trim(),
+            stderr_text.trim()
+        );
+        let reported = parse_probe_count(&stdout_text)
+            .with_context(|| format!("parsing {} probe count", probe.kind.as_str()))?;
+        ensure!(
+            reported == expected_probe.count,
+            "stacks-inspect probe {} reported {reported}; guest result reported {}",
+            probe.kind.as_str(),
+            expected_probe.count
+        );
+        artifacts.push(stdout);
+        artifacts.push(stderr);
+    }
+    Ok(artifacts)
+}
+
+fn expected_commands(
+    shard: &ShardRange,
+    pre_nakamoto_count: u64,
+    mountpoint: &str,
+) -> anyhow::Result<Vec<ExpectedCommand>> {
+    let database_path = format!(
+        "{}/{}",
+        mountpoint.trim_end_matches('/'),
+        STACKS_NETWORK_DATA_DIR
+    );
+    let mut ranges = Vec::with_capacity(2);
+    if shard.start < pre_nakamoto_count {
+        ranges.push((
+            ValidationCommandKind::IndexRange,
+            shard.start,
+            shard
+                .end
+                .min(pre_nakamoto_count - 1)
+                .checked_add(1)
+                .context("pre-Nakamoto command range overflow")?,
+        ));
+    }
+    if shard.end >= pre_nakamoto_count {
+        let global_start = shard.start.max(pre_nakamoto_count);
+        ranges.push((
+            ValidationCommandKind::NakaIndexRange,
+            global_start - pre_nakamoto_count,
+            shard
+                .end
+                .checked_sub(pre_nakamoto_count)
+                .and_then(|end| end.checked_add(1))
+                .context("Nakamoto command range overflow")?,
+        ));
+    }
+    ensure!(!ranges.is_empty(), "trusted shard produced no validation commands");
+    ranges
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (kind, start, end_exclusive))| {
+            let ordinal = u32::try_from(ordinal)?;
+            Ok(ExpectedCommand {
+                ordinal,
+                kind,
+                start,
+                end_exclusive,
+                argv: vec![
+                    STACKS_INSPECT_GUEST_PATH.into(),
+                    "--network-config".into(),
+                    STACKS_NETWORK.into(),
+                    "validate-block".into(),
+                    database_path.clone(),
+                    kind.as_str().into(),
+                    start.to_string(),
+                    end_exclusive.to_string(),
+                ],
+                stdout_file: format!("shard-{}-command-{ordinal}.stdout.log", shard.index),
+                stderr_file: format!("shard-{}-command-{ordinal}.stderr.log", shard.index),
+            })
+        })
+        .collect()
+}
+
+fn parse_probe_count(stdout: &str) -> anyhow::Result<u64> {
+    stdout
+        .split_whitespace()
+        .next_back()
+        .context("probe output is empty")?
+        .parse::<u64>()
+        .context("probe output does not end with an unsigned count")
+}
+
+fn parse_terminal_progress_count(stdout: &str) -> anyhow::Result<u64> {
+    const PREFIX: &str = "Validating: 100% (";
+    let mut count = None;
+    for segment in stdout.split(['\r', '\n']) {
+        let Some((_, remainder)) = segment.split_once(PREFIX) else {
+            continue;
+        };
+        let pair = remainder
+            .split_once(')')
+            .map(|(pair, _)| pair)
+            .context("malformed terminal validation progress")?;
+        let (completed, total) = pair
+            .split_once('/')
+            .context("malformed terminal validation progress count")?;
+        let completed = completed
+            .trim()
+            .parse::<u64>()
+            .context("invalid completed-block count")?;
+        let total = total
+            .trim()
+            .parse::<u64>()
+            .context("invalid total-block count")?;
+        ensure!(
+            completed == total,
+            "terminal validation progress is incomplete ({completed}/{total})"
+        );
+        count = Some(total);
+    }
+    count.context("terminal validation progress is absent")
+}
+
+fn parse_success_count(stdout: &str) -> Option<u64> {
+    const PREFIX: &str = "Finished validating ";
+    stdout
+        .split(['\r', '\n'])
+        .filter_map(|segment| {
+            let (_, remainder) = segment.split_once(PREFIX)?;
+            let (count, _) = remainder.split_once(" blocks in ")?;
+            count.trim().parse::<u64>().ok()
+        })
+        .next_back()
+}
+
 fn safe_result_file(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
     ensure!(
         !name.is_empty()
@@ -506,13 +837,14 @@ mod tests {
     }
 
     fn write_result(directory: &TempDir, shards: serde_json::Value) -> PathBuf {
+        let probes = probes(directory, 101, 1);
         let result = directory
             .path()
             .join("block-validation-result.json");
         std::fs::write(
             &result,
             serde_json::to_vec(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "job_id": "job",
                 "attempt_id": "attempt",
                 "fencing_generation": 4,
@@ -527,6 +859,7 @@ mod tests {
                 }],
                 "shard_count": 2,
                 "max_concurrency": 2,
+                "probes": probes,
                 "shards": shards,
             }))
             .unwrap(),
@@ -535,15 +868,132 @@ mod tests {
         result
     }
 
-    fn shard(index: u32, start: u64, end: u64, exit_code: i32) -> serde_json::Value {
+    fn probes(directory: &TempDir, pre: u64, naka: u64) -> serde_json::Value {
+        for (kind, count) in [("index-range", pre), ("naka-index-range", naka)] {
+            std::fs::write(
+                directory.path().join(format!("probe-{kind}.stdout.log")),
+                format!("{count}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.path().join(format!("probe-{kind}.stderr.log")),
+                "",
+            )
+            .unwrap();
+        }
+        serde_json::json!([
+            {
+                "ordinal": 0,
+                "kind": "index-range",
+                "argv": [
+                    STACKS_INSPECT_GUEST_PATH,
+                    "--network-config", "mainnet", "validate-block",
+                    "/var/lib/sbgh-chainstate/shard-0000/mainnet", "index-range"
+                ],
+                "exit_code": 0,
+                "stdout_file": "probe-index-range.stdout.log",
+                "stderr_file": "probe-index-range.stderr.log"
+            },
+            {
+                "ordinal": 1,
+                "kind": "naka-index-range",
+                "argv": [
+                    STACKS_INSPECT_GUEST_PATH,
+                    "--network-config", "mainnet", "validate-block",
+                    "/var/lib/sbgh-chainstate/shard-0000/mainnet", "naka-index-range"
+                ],
+                "exit_code": 0,
+                "stdout_file": "probe-naka-index-range.stdout.log",
+                "stderr_file": "probe-naka-index-range.stderr.log"
+            }
+        ])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn command(
+        directory: &TempDir,
+        index: u32,
+        ordinal: u32,
+        kind: &str,
+        start: u64,
+        end_exclusive: u64,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+    ) -> serde_json::Value {
+        let stdout_file = format!("shard-{index}-command-{ordinal}.stdout.log");
+        let stderr_file = format!("shard-{index}-command-{ordinal}.stderr.log");
+        std::fs::write(directory.path().join(&stdout_file), stdout).unwrap();
+        std::fs::write(directory.path().join(&stderr_file), stderr).unwrap();
+        let database_path = format!("/var/lib/sbgh-chainstate/shard-{index:04}/mainnet");
+        serde_json::json!({
+            "ordinal": ordinal,
+            "kind": kind,
+            "start": start,
+            "end_exclusive": end_exclusive,
+            "argv": [
+                STACKS_INSPECT_GUEST_PATH,
+                "--network-config",
+                "mainnet",
+                "validate-block",
+                database_path,
+                kind,
+                start.to_string(),
+                end_exclusive.to_string(),
+            ],
+            "exit_code": exit_code,
+            "stdout_file": stdout_file,
+            "stderr_file": stderr_file,
+        })
+    }
+
+    fn shard(
+        index: u32,
+        start: u64,
+        end: u64,
+        commands: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
         serde_json::json!({
             "index": index,
             "start": start,
             "end": end,
-            "exit_code": exit_code,
-            "stdout_file": format!("shard-{index}.stdout.log"),
-            "stderr_file": format!("shard-{index}.stderr.log"),
+            "commands": commands,
         })
+    }
+
+    fn successful_output(count: u64) -> String {
+        format!(
+            "\rValidating: 100% ({count}/{count})\n\nFinished validating {count} blocks in 1s\n"
+        )
+    }
+
+    fn valid_shards(directory: &TempDir) -> serde_json::Value {
+        let first = command(
+            directory,
+            0,
+            0,
+            "index-range",
+            10,
+            12,
+            0,
+            &successful_output(2),
+            "",
+        );
+        let second = command(
+            directory,
+            1,
+            0,
+            "index-range",
+            12,
+            13,
+            0,
+            &successful_output(1),
+            "",
+        );
+        serde_json::json!([
+            shard(0, 10, 11, vec![first]),
+            shard(1, 12, 12, vec![second])
+        ])
     }
 
     #[test]
@@ -771,6 +1221,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_progress_parser_requires_a_complete_exact_count() {
+        assert_eq!(
+            parse_terminal_progress_count(
+                "\rValidating: 50% (1/2)\rValidating: 100% (2/2)\n"
+            )
+            .unwrap(),
+            2
+        );
+        assert!(parse_terminal_progress_count("Finished validating 2 blocks in 1s\n").is_err());
+        assert!(parse_terminal_progress_count("Validating: 100% (1/2)\n").is_err());
+        assert!(parse_terminal_progress_count("Validating: 100% (two/two)\n").is_err());
+    }
+
+    #[test]
     fn reducer_accepts_exact_positive_coverage() {
         let directory = TempDir::new().unwrap();
         std::fs::write(
@@ -780,24 +1244,32 @@ mod tests {
             "guest-controlled",
         )
         .unwrap();
-        for index in 0..2 {
-            std::fs::write(
-                directory
-                    .path()
-                    .join(format!("shard-{index}.stdout.log")),
-                "validation complete\n",
-            )
-            .unwrap();
-            std::fs::write(
-                directory
-                    .path()
-                    .join(format!("shard-{index}.stderr.log")),
-                "",
-            )
-            .unwrap();
-        }
-        let result =
-            write_result(&directory, serde_json::json!([shard(0, 10, 11, 0), shard(1, 12, 12, 0)]));
+        let first = command(
+            &directory,
+            0,
+            0,
+            "index-range",
+            10,
+            12,
+            0,
+            &successful_output(2),
+            "",
+        );
+        let second = command(
+            &directory,
+            1,
+            0,
+            "index-range",
+            12,
+            13,
+            0,
+            &successful_output(1),
+            "",
+        );
+        let result = write_result(
+            &directory,
+            serde_json::json!([shard(0, 10, 11, vec![first]), shard(1, 12, 12, vec![second])]),
+        );
         let reduced = reduce_result(&result, directory.path(), &plan()).unwrap();
         assert!(reduced.output.valid);
         assert_eq!(reduced.output.checked_blocks, 3);
@@ -821,36 +1293,32 @@ mod tests {
     #[test]
     fn reducer_accepts_only_an_explicit_typed_negative() {
         let directory = TempDir::new().unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-0.stdout.log"),
-            "ok\n",
-        )
-        .unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-0.stderr.log"),
+        let first = command(
+            &directory,
+            0,
+            0,
+            "index-range",
+            10,
+            12,
+            0,
+            &successful_output(2),
             "",
-        )
-        .unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-1.stdout.log"),
-            "Block outer: Failed processing block! block = aabb, error = bad parent\n",
-        )
-        .unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-1.stderr.log"),
+        );
+        let second = command(
+            &directory,
+            1,
+            0,
+            "index-range",
+            12,
+            13,
+            1,
+            "\rValidating: 100% (1/1)\nBlock outer: Failed processing block! block = aabb, error = bad parent\n",
             "",
-        )
-        .unwrap();
-        let result =
-            write_result(&directory, serde_json::json!([shard(0, 10, 11, 0), shard(1, 12, 12, 1)]));
+        );
+        let result = write_result(
+            &directory,
+            serde_json::json!([shard(0, 10, 11, vec![first]), shard(1, 12, 12, vec![second])]),
+        );
         let reduced = reduce_result(&result, directory.path(), &plan()).unwrap();
         assert!(!reduced.output.valid);
         assert_eq!(
@@ -864,23 +1332,181 @@ mod tests {
     }
 
     #[test]
+    fn reducer_accepts_a_cross_epoch_shard_only_with_both_exact_commands() {
+        let directory = TempDir::new().unwrap();
+        let spec = BlockValidationTaskSpec {
+            selection: BlockValidationSelection::Range {
+                range: InclusiveRange { start: 100, end: 101 },
+            },
+            timeout_secs: 60,
+        };
+        let snapshots = ChainstateSnapshotSet {
+            origin: "vg/origin".into(),
+            snapshots: vec![ShardSnapshot {
+                shard: 0,
+                vg: "vg".into(),
+                name: "snapshot-0".into(),
+                device: PathBuf::from("/dev/vg/snapshot-0"),
+                serial: "sbgh-block-0000".into(),
+            }],
+        };
+        let plan = BlockGuestPlan::new(
+            "job",
+            "attempt",
+            4,
+            "deadbeef",
+            &spec,
+            &snapshots,
+            2,
+            1,
+            1,
+            vec!["nouuid".into()],
+        )
+        .unwrap();
+        let pre = command(
+            &directory,
+            0,
+            0,
+            "index-range",
+            100,
+            101,
+            0,
+            &successful_output(1),
+            "",
+        );
+        let naka = command(
+            &directory,
+            0,
+            1,
+            "naka-index-range",
+            0,
+            1,
+            0,
+            &successful_output(1),
+            "",
+        );
+        let probes = probes(&directory, 101, 1);
+        let result = directory.path().join("block-validation-result.json");
+        std::fs::write(
+            &result,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "job_id": "job",
+                "attempt_id": "attempt",
+                "fencing_generation": 4,
+                "chainstate_origin": "vg/origin",
+                "selection": {"kind": "range", "range": {"start": 100, "end": 101}},
+                "observed": {"pre_nakamoto_count": 101, "nakamoto_count": 1},
+                "resolved_range": {"start": 100, "end": 101},
+                "segments": [
+                    {
+                        "epoch": "pre_nakamoto",
+                        "global_range": {"start": 100, "end": 100},
+                        "local_range": {"start": 100, "end": 100}
+                    },
+                    {
+                        "epoch": "nakamoto",
+                        "global_range": {"start": 101, "end": 101},
+                        "local_range": {"start": 0, "end": 0}
+                    }
+                ],
+                "shard_count": 1,
+                "max_concurrency": 1,
+                "probes": probes,
+                "shards": [shard(0, 100, 101, vec![pre, naka])],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let reduced = reduce_result(&result, directory.path(), &plan).unwrap();
+        assert!(reduced.output.valid);
+        assert_eq!(reduced.output.checked_blocks, 2);
+        assert_eq!(reduced.artifacts.len(), 10);
+    }
+
+    #[test]
+    fn reducer_rejects_argv_or_range_drift() {
+        let directory = TempDir::new().unwrap();
+        let mut shards = valid_shards(&directory);
+        shards[0]["commands"][0]["argv"][7] = serde_json::json!("999");
+        let result = write_result(&directory, shards);
+
+        let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
+        assert!(error.to_string().contains("trusted argv and range"), "{error:#}");
+    }
+
+    #[test]
+    fn reducer_rejects_probe_argv_or_observed_count_drift() {
+        let directory = TempDir::new().unwrap();
+        let result = write_result(&directory, valid_shards(&directory));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&result).unwrap()).unwrap();
+        value["probes"][0]["argv"][5] = serde_json::json!("naka-index-range");
+        std::fs::write(&result, serde_json::to_vec(&value).unwrap()).unwrap();
+        let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
+        assert!(error.to_string().contains("trusted argv"), "{error:#}");
+
+        let result = write_result(&directory, valid_shards(&directory));
+        std::fs::write(directory.path().join("probe-index-range.stdout.log"), "100\n").unwrap();
+        let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
+        assert!(error.to_string().contains("reported 100"), "{error:#}");
+    }
+
+    #[test]
+    fn reducer_rejects_missing_or_duplicate_command_records() {
+        for duplicate in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let mut shards = valid_shards(&directory);
+            if duplicate {
+                let command = shards[0]["commands"][0].clone();
+                shards[0]["commands"].as_array_mut().unwrap().push(command);
+            } else {
+                shards[0]["commands"] = serde_json::json!([]);
+            }
+            let result = write_result(&directory, shards);
+            let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
+            assert!(error.to_string().contains("command count"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn reducer_rejects_missing_or_mismatched_processed_counts() {
+        for stdout in [
+            "Finished validating 2 blocks in 1s\n",
+            "\rValidating: 100% (1/1)\n\nFinished validating 1 blocks in 1s\n",
+        ] {
+            let directory = TempDir::new().unwrap();
+            let shards = valid_shards(&directory);
+            std::fs::write(directory.path().join("shard-0-command-0.stdout.log"), stdout).unwrap();
+            let result = write_result(&directory, shards);
+            let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
+            assert!(
+                error.to_string().contains("processed-block count")
+                    || error.to_string().contains("processed blocks"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn reducer_rejects_partial_or_infrastructure_results() {
         let directory = TempDir::new().unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-0.stdout.log"),
-            "ok\n",
-        )
-        .unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-0.stderr.log"),
+        let first = command(
+            &directory,
+            0,
+            0,
+            "index-range",
+            10,
+            12,
+            0,
+            &successful_output(2),
             "",
-        )
-        .unwrap();
-        let partial = write_result(&directory, serde_json::json!([shard(0, 10, 11, 0)]));
+        );
+        let partial = write_result(
+            &directory,
+            serde_json::json!([shard(0, 10, 11, vec![first.clone()])]),
+        );
         assert!(
             reduce_result(&partial, directory.path(), &plan())
                 .unwrap_err()
@@ -888,22 +1514,21 @@ mod tests {
                 .contains("partial")
         );
 
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-1.stdout.log"),
+        let second = command(
+            &directory,
+            1,
+            0,
+            "index-range",
+            12,
+            13,
+            2,
             "",
-        )
-        .unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-1.stderr.log"),
             "database could not be opened\n",
-        )
-        .unwrap();
-        let infrastructure =
-            write_result(&directory, serde_json::json!([shard(0, 10, 11, 0), shard(1, 12, 12, 1)]));
+        );
+        let infrastructure = write_result(
+            &directory,
+            serde_json::json!([shard(0, 10, 11, vec![first]), shard(1, 12, 12, vec![second])]),
+        );
         assert!(
             format!("{:#}", reduce_result(&infrastructure, directory.path(), &plan()).unwrap_err())
                 .contains("infrastructure failure")
@@ -913,21 +1538,21 @@ mod tests {
     #[test]
     fn reducer_rejects_guest_reported_undercoverage() {
         let directory = TempDir::new().unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-0.stdout.log"),
-            "ok\n",
-        )
-        .unwrap();
-        std::fs::write(
-            directory
-                .path()
-                .join("shard-0.stderr.log"),
+        let first = command(
+            &directory,
+            0,
+            0,
+            "index-range",
+            10,
+            11,
+            0,
+            &successful_output(1),
             "",
-        )
-        .unwrap();
-        let result = write_result(&directory, serde_json::json!([shard(0, 10, 10, 0)]));
+        );
+        let result = write_result(
+            &directory,
+            serde_json::json!([shard(0, 10, 10, vec![first])]),
+        );
 
         let error = reduce_result(&result, directory.path(), &plan()).unwrap_err();
         assert!(
@@ -944,8 +1569,13 @@ mod tests {
     #[test]
     fn reducer_rejects_stale_attempt_identity_before_reading_artifacts() {
         let directory = TempDir::new().unwrap();
-        let result =
-            write_result(&directory, serde_json::json!([shard(0, 10, 11, 0), shard(1, 12, 12, 0)]));
+        let result = write_result(
+            &directory,
+            serde_json::json!([
+                shard(0, 10, 11, vec![]),
+                shard(1, 12, 12, vec![])
+            ]),
+        );
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&result).unwrap()).unwrap();
         value["attempt_id"] = serde_json::json!("stale-attempt");

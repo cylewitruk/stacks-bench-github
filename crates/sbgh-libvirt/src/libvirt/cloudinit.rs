@@ -348,7 +348,11 @@ mod tests {
                     .find("git rev-parse HEAD")
                     .unwrap()
         );
-        assert!(rendered.contains("[BIN, \"--network-config\", \"mainnet\", \"validate-block\""));
+        assert!(rendered.contains("BIN, \"--network-config\", \"mainnet\", \"validate-block\""));
+        assert!(rendered.contains("SBGH_STACKS_INSPECT_COMMAND"));
+        assert!(rendered.contains("probe-{kind}.stdout.log"));
+        assert!(rendered.contains("\"end_exclusive\""));
+        assert!(rendered.contains("shard-{state['index']}-command-{ordinal}.stdout.log"));
         assert!(!rendered.contains("--config"));
         assert!(!rendered.contains("chain-config.toml"));
         assert!(rendered.contains("/dev/disk/by-id/"));

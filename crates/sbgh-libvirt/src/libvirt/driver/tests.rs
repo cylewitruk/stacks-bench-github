@@ -518,6 +518,8 @@ fn block_diagnostic_collection_is_bounded_and_rejects_symlinks() {
         b"{}",
     )
     .unwrap();
+    std::fs::write(tmp.path().join("probe-index-range.stderr.log"), b"probe diagnostic")
+        .unwrap();
     std::fs::write(
         tmp.path()
             .join("unrelated-secret"),
@@ -526,7 +528,7 @@ fn block_diagnostic_collection_is_bounded_and_rejects_symlinks() {
     .unwrap();
 
     let paths = block_diagnostic_paths(tmp.path()).unwrap();
-    assert_eq!(paths.len(), 2);
+    assert_eq!(paths.len(), 3);
     assert!(
         paths
             .iter()
@@ -821,14 +823,26 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
 "#,
     )
     .unwrap();
-    for shard in 0..2 {
-        std::fs::write(results.join(format!("shard-{shard}.stdout.log")), b"").unwrap();
-        std::fs::write(results.join(format!("shard-{shard}.stderr.log")), b"").unwrap();
-    }
+    std::fs::write(
+        results.join("shard-0-command-0.stdout.log"),
+        b"\rValidating: 100% (2/2)\n\nFinished validating 2 blocks in 1s\n",
+    )
+    .unwrap();
+    std::fs::write(results.join("shard-0-command-0.stderr.log"), b"").unwrap();
+    std::fs::write(
+        results.join("shard-1-command-0.stdout.log"),
+        b"\rValidating: 100% (1/1)\n\nFinished validating 1 blocks in 1s\n",
+    )
+    .unwrap();
+    std::fs::write(results.join("shard-1-command-0.stderr.log"), b"").unwrap();
+    std::fs::write(results.join("probe-index-range.stdout.log"), b"101\n").unwrap();
+    std::fs::write(results.join("probe-index-range.stderr.log"), b"").unwrap();
+    std::fs::write(results.join("probe-naka-index-range.stdout.log"), b"1\n").unwrap();
+    std::fs::write(results.join("probe-naka-index-range.stderr.log"), b"").unwrap();
     std::fs::write(
         results.join("block-validation-result.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "job_id": job.id,
             "attempt_id": job.id,
             "fencing_generation": 0,
@@ -843,22 +857,72 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
             }],
             "shard_count": 2,
             "max_concurrency": 2,
+            "probes": [
+                {
+                    "ordinal": 0,
+                    "kind": "index-range",
+                    "argv": [
+                        "/opt/stacks-core/target/release/stacks-inspect",
+                        "--network-config", "mainnet", "validate-block",
+                        "/var/lib/sbgh-chainstate/shard-0000/mainnet", "index-range"
+                    ],
+                    "exit_code": 0,
+                    "stdout_file": "probe-index-range.stdout.log",
+                    "stderr_file": "probe-index-range.stderr.log"
+                },
+                {
+                    "ordinal": 1,
+                    "kind": "naka-index-range",
+                    "argv": [
+                        "/opt/stacks-core/target/release/stacks-inspect",
+                        "--network-config", "mainnet", "validate-block",
+                        "/var/lib/sbgh-chainstate/shard-0000/mainnet", "naka-index-range"
+                    ],
+                    "exit_code": 0,
+                    "stdout_file": "probe-naka-index-range.stdout.log",
+                    "stderr_file": "probe-naka-index-range.stderr.log"
+                }
+            ],
             "shards": [
                 {
                     "index": 0,
                     "start": 10,
                     "end": 11,
-                    "exit_code": 0,
-                    "stdout_file": "shard-0.stdout.log",
-                    "stderr_file": "shard-0.stderr.log",
+                    "commands": [{
+                        "ordinal": 0,
+                        "kind": "index-range",
+                        "start": 10,
+                        "end_exclusive": 12,
+                        "argv": [
+                            "/opt/stacks-core/target/release/stacks-inspect",
+                            "--network-config", "mainnet", "validate-block",
+                            "/var/lib/sbgh-chainstate/shard-0000/mainnet",
+                            "index-range", "10", "12"
+                        ],
+                        "exit_code": 0,
+                        "stdout_file": "shard-0-command-0.stdout.log",
+                        "stderr_file": "shard-0-command-0.stderr.log",
+                    }],
                 },
                 {
                     "index": 1,
                     "start": 12,
                     "end": 12,
-                    "exit_code": 0,
-                    "stdout_file": "shard-1.stdout.log",
-                    "stderr_file": "shard-1.stderr.log",
+                    "commands": [{
+                        "ordinal": 0,
+                        "kind": "index-range",
+                        "start": 12,
+                        "end_exclusive": 13,
+                        "argv": [
+                            "/opt/stacks-core/target/release/stacks-inspect",
+                            "--network-config", "mainnet", "validate-block",
+                            "/var/lib/sbgh-chainstate/shard-0001/mainnet",
+                            "index-range", "12", "13"
+                        ],
+                        "exit_code": 0,
+                        "stdout_file": "shard-1-command-0.stdout.log",
+                        "stderr_file": "shard-1-command-0.stderr.log",
+                    }],
                 },
             ],
         }))
@@ -1029,10 +1093,14 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     assert!(removed[1].ends_with("-s0000"));
 
     for name in [
-        "shard-0.stdout.log",
-        "shard-0.stderr.log",
-        "shard-1.stdout.log",
-        "shard-1.stderr.log",
+        "shard-0-command-0.stdout.log",
+        "shard-0-command-0.stderr.log",
+        "shard-1-command-0.stdout.log",
+        "shard-1-command-0.stderr.log",
+        "probe-index-range.stdout.log",
+        "probe-index-range.stderr.log",
+        "probe-naka-index-range.stdout.log",
+        "probe-naka-index-range.stderr.log",
         "block-validation-result.json",
         "invalid-blocks.json",
     ] {

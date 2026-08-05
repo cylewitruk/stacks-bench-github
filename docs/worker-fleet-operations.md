@@ -78,6 +78,14 @@ that worker at `/var/lib/sbgh-worker/jobs/<attempt-id>/console.log`. Verified
 teardown removes the ephemeral attempt directory after archiving the bounded
 tail.
 
+For block validation, each `stacks-inspect` launch writes an
+`SBGH_STACKS_INSPECT_COMMAND` JSON record to that console before spawning and
+uses separate `shard-<n>-command-<n>.stdout.log` and `.stderr.log` artifacts.
+The terminal reducer independently reconstructs the expected argv and requires
+the command's final `Validating: 100% (N/N)` count to equal its trusted
+half-open range. These records are audit evidence for accidental orchestration
+drift; they are not cryptographic attestation of repository-built guest code.
+
 ## Coordinated protocol deployment
 
 The current fleet requires an exact protocol revision at session registration.
