@@ -117,7 +117,9 @@ pub trait ReportSurface: Send + Sync {
     async fn restore(&self, _seed: &ReportProjectionSeed) {}
     /// Claimed → running.
     async fn started(&self) -> anyhow::Result<()>;
-    /// A worker phase transition (`label.is_terminal()` bypasses any debounce).
+    /// A durable worker phase transition. Every transition is externally
+    /// projected; callers may acknowledge the durable event only after this
+    /// succeeds, so silently debouncing one would permanently discard state.
     async fn phase(&self, label: &PhaseLabel, elapsed: Duration) -> anyhow::Result<()>;
     /// A periodic "still alive" tick within the current phase (best-effort).
     #[cfg(test)]
@@ -322,9 +324,11 @@ impl GitHubReportSurface {
             .map(|_| ())
     }
 
-    /// Per-phase comment + check update, debounced (from `ProgressSink`). The
-    /// reporter owns the check's terminal state, so a terminal phase skips the
-    /// check here (no flicker / redundant PATCH).
+    /// Comment + check update shared by durable phase transitions and
+    /// best-effort refreshes. `force` must be true for durable transitions;
+    /// only refresh-style updates may be debounced. The reporter owns the
+    /// check's terminal state, so a terminal phase skips the check here (no
+    /// flicker / redundant PATCH).
     async fn try_update(
         &self,
         label: &PhaseLabel,
@@ -538,8 +542,10 @@ impl ReportSurface for GitHubReportSurface {
     }
 
     async fn phase(&self, label: &PhaseLabel, elapsed: Duration) -> anyhow::Result<()> {
-        let force = label.is_terminal();
-        self.try_update(label, elapsed, force)
+        // This method consumes a durable phase event. Returning `Ok` tells the
+        // coordinator it may mark that event projected, so applying the
+        // refresh debounce here would lose rapid transitions permanently.
+        self.try_update(label, elapsed, true)
             .await
     }
 
@@ -1332,6 +1338,74 @@ mod tests {
                 .any(|c| matches!(c, FakeCall::UpdateCheckRun { .. })),
             "check updated"
         );
+    }
+
+    #[tokio::test]
+    async fn github_rapid_durable_phase_transitions_are_never_debounced() {
+        let gh = Arc::new(FakeGitHub::new());
+        let job = job_with(ProgressTarget::PullRequest {
+            pr_number: 7,
+            comment_id: Some(800),
+            check_run_id: Some(900),
+            check_run_url: None,
+        });
+        let surface = github(&gh, job);
+
+        for phase in ["starting", "build_cached", "probe", "validating"] {
+            surface
+                .phase(&PhaseLabel::new(phase, false), Duration::ZERO)
+                .await
+                .unwrap();
+        }
+
+        let calls = gh.calls();
+        let comments = calls
+            .iter()
+            .filter_map(|call| match call {
+                FakeCall::UpdateComment { body, .. } => Some(body.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let checks = calls
+            .iter()
+            .filter_map(|call| match call {
+                FakeCall::UpdateCheckRun { output, .. } => Some(output.title.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(comments.len(), 4, "every durable transition updates the comment");
+        assert_eq!(checks.len(), 4, "every durable transition updates the check");
+        assert!(
+            comments
+                .last()
+                .unwrap()
+                .contains("validating")
+        );
+        assert_eq!(checks.last().copied(), Some("validating"));
+    }
+
+    #[tokio::test]
+    async fn github_best_effort_heartbeat_refreshes_remain_debounced() {
+        let gh = Arc::new(FakeGitHub::new());
+        let surface = github(&gh, check_job(900));
+        let phase = PhaseLabel::new("validating", false);
+
+        surface
+            .heartbeat(&phase, Duration::from_secs(30))
+            .await
+            .unwrap();
+        surface
+            .heartbeat(&phase, Duration::from_secs(31))
+            .await
+            .unwrap();
+
+        let update_count = gh
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, FakeCall::UpdateCheckRun { .. }))
+            .count();
+        assert_eq!(update_count, 1);
     }
 
     #[tokio::test]

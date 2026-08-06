@@ -408,6 +408,10 @@ require those same identities—not replacements—to converge through phase and
 terminal updates. A queued validation with no configured GitHub surface is a
 failed journey, even if execution later succeeds.
 
+Rapid adjacent phase transitions must still converge both GitHub surfaces to
+the latest durable phase. Provider-update debouncing must not acknowledge and
+discard a durable transition.
+
 ## Gate 7: Recovery and extended validation
 
 These gates close the first deployment after the four primary journeys:

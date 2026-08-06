@@ -370,6 +370,10 @@ Check Run and marked PR comment. Then undrain and require the same identities
 to receive phase and terminal updates. Missing pre-assignment identities or
 late duplicate surfaces fail the gate.
 
+Rapid adjacent phase transitions must converge both GitHub surfaces to the
+latest durable phase; provider-update debouncing must not acknowledge and drop
+those transitions.
+
 ### Phase 6: v20 and v22 Benchmark Closure (Fast-Follow)
 
 1. During a real single-ref benchmark, inspect live fine progress and archived
