@@ -17,6 +17,11 @@ experimental = ["setup-scripts"]
 # first failure. (`fail-fast` lives on the profile, not an override.)
 fail-fast = false
 
+[test-groups.openai-live]
+# Keep real-model evaluations independently reportable without issuing the
+# entire prompt corpus concurrently and turning API throttling into test noise.
+max-threads = 1
+
 [scripts.setup.postgres]
 # Idempotent: a no-op when the container is already up, recreated by compose
 # only when this file changes. No `--force-recreate` — each test drops its
@@ -52,3 +57,7 @@ setup = "minio"
 [[profile.default.overrides]]
 filter = "package(=sbgh-postgres) | package(=sbgh-cli) | package(=sbgh-daemon)"
 retries = 2
+
+[[profile.default.overrides]]
+filter = "package(=sbgh-intent) & test(/openai_live_eval_/)"
+test-group = "openai-live"

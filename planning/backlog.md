@@ -443,27 +443,49 @@ useful.
 - **relates_to:** `0032-supersede-stale-pr-head-runs`,
   `0037-benchmark-group-run-model`, `0038-isolated-benchmark-repetitions`,
   `0039-multi-variant-benchmark-comparisons`
-- **source:** v13 Phase 4 follow-up
+- **source:** v13 Phase 4 follow-up; v34 intent-hardening follow-up (2026-08)
 
 **Problem:** GitHub PR comments still require explicit task grammars even after
 Slack proved schema-validated intent resolution. A PR natural-language request
-cannot choose between benchmarking and block validation.
+cannot choose between benchmarking and block validation. The current intent
+port receives only text, so contextual revisions such as "this branch" must
+fail even though the GitHub adapter can authoritatively resolve the enclosing
+PR head. Treating that phrase as a literal ref, silently dropping it, or
+resolving a mutable branch later would be unsafe.
 
 **Scope:** Add natural-language creation intent to PR comments after existing
 policy/authz checks. Reuse `0069`'s provider-neutral `UserIntent`, deterministic
 fast path, rate limiting, strict schema, and structured invalid diagnostics,
 then route resolved benchmark/validation requests through their shared daemon
 application services. Preserve explicit `/benchmark` and `/validate`
-compatibility. Resolve and freeze the PR head before enqueue.
+compatibility. Extend the intent request with structured, adapter-supplied PR
+context and represent revisions with a typed selector such as
+`Explicit(ref)` / `CurrentPullRequestHead`, including comparison variants;
+never encode context as a magic ref string. Resolve `CurrentPullRequestHead`
+through the existing PR lookup to the head repository and immutable head SHA
+before enqueue, while retaining the branch name only for display/provenance.
+Context-free callers such as Slack continue to reject "this branch", "this
+PR", and "current commit" rather than guessing.
 
 **Acceptance:** Equivalent PR and Slack creation requests resolve to the same
 typed task request and immutable payload; invalid input receives a clear PR
 reply without enqueue; off-policy users do not trigger provider calls; explicit
-commands remain deterministic and do not require an LLM.
+commands remain deterministic and do not require an LLM. In addition:
+
+- an authorized PR request such as "benchmark this branch on block 8123456"
+  resolves the contextual selector to the PR head SHA observed during intake;
+- the same wording without PR context is invalid, and an unresolved contextual
+  modifier can never be discarded while the remainder enqueues;
+- advancing or deleting the branch after enqueue cannot change the frozen
+  commit, and cross-fork PRs resolve through the recorded head repository; and
+- explicit single refs and comparisons remain supported, including a
+  comparison between the current PR head and one explicit ref.
 
 **Deferred / non-goals:** No new provider or model tools. Destructive
 cancel/restart/replace actions remain explicit commands from `0071`; free-form
-LLM output never independently selects work to terminate.
+LLM output never independently selects work to terminate. No delayed worker- or
+claim-time resolution of mutable branch names, and no contextual selector that
+the invoking adapter cannot prove from structured event/API data.
 
 ### 0052 — Managed stacks-node chainstate producer
 

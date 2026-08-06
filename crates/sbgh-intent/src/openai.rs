@@ -8,24 +8,9 @@ use crate::intent::{
     intent_response_text_format, validate_intent_resolution,
 };
 
-const INTENT_SYSTEM_PROMPT: &str = concat!(
-    "Resolve creation requests for either benchmarks or block validation into the provided JSON schema. ",
-    "Set exactly one task_kind. Reject cancel, restart, replace, supersede, scheduling, worker-selection, ",
-    "or mixed-task requests as invalid. ",
-    "For block_validation, rev and repository are optional source selectors. ",
-    "For block validation choose recent, full, or range. Recent may include a positive block count; ",
-    "range requires start and end; full carries none of those fields. ",
-    "Never choose shards, concurrency, timeout, resources, workers, or raw command arguments. ",
-    "Treat repetitions as clean daemon-orchestrated VM executions, not in-process CLI loops. ",
-    "A request that says `on <ref>` or `against <ref>` with one ref is a single-ref request: ",
-    "set rev to that ref and set variant_refs to null. ",
-    "Only emit variant_refs for explicit comparison wording such as compare, compared to, vs, ",
-    "versus, or between <ref> and <ref>, and only when exactly two refs are present. ",
-    "For comparison requests, emit exactly two refs in variant_refs and leave rev null; ",
-    "never emit raw CLI flags. ",
-    "Return status=invalid when required inputs or task identity are missing or ambiguous, ",
-    "with a concise reason and field-level issues. Never emit extra text."
-);
+/// The task-creation system prompt. Authored as Markdown so the resolution
+/// rules stay reviewable next to the schema they constrain.
+const INTENT_SYSTEM_PROMPT: &str = include_str!("../prompts/submission.md");
 
 pub struct OpenAiIntentResolver {
     client: reqwest::Client,
@@ -265,9 +250,14 @@ pub fn extract_openai_output_text(body: &Value) -> Result<&str, IntentProviderEr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use sbgh_core::workload::{BenchmarkRequest, BlockSelector, WorkloadSpec, WorkloadTarget};
+
     use crate::intent::{
-        EVAL_FIXTURES, EvalExpected, IntentEvalFixture, IntentResolutionJson, run_eval_fixtures,
+        EVAL_FIXTURES, EvalExpected, IntentEvalFixture, IntentResolutionJson, TaskCreationIntent,
+        UserIntent, run_eval_fixtures,
     };
 
     #[test]
@@ -275,18 +265,7 @@ mod tests {
         let body = openai_request_body("gpt-test", "bench block 1");
         assert_eq!(body["model"], "gpt-test");
         assert_eq!(body["input"][0]["role"], "system");
-        assert!(
-            body["input"][0]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("against <ref>` with one ref is a single-ref request")
-        );
-        assert!(
-            body["input"][0]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Never choose shards, concurrency, timeout")
-        );
+        assert_eq!(body["input"][0]["content"][0]["text"], INTENT_SYSTEM_PROMPT);
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][1]["content"][0]["text"], "bench block 1");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
@@ -298,6 +277,22 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    /// The prompt and the strict schema constrain the same response, so a field
+    /// added to one must be described by the other.
+    #[test]
+    fn prompt_documents_every_schema_field() {
+        let format = intent_response_text_format();
+        let properties = format["schema"]["properties"]
+            .as_object()
+            .expect("schema has properties");
+        for field in properties.keys() {
+            assert!(
+                INTENT_SYSTEM_PROMPT.contains(field.as_str()),
+                "system prompt never mentions the `{field}` schema field"
+            );
+        }
     }
 
     /// The request body is debug-logged, so it must never carry the API key
@@ -353,8 +348,23 @@ mod tests {
     }
 
     #[test]
-    fn eval_fixture_has_minimum_review_set() {
+    fn live_eval_cases_cover_fixture_set() {
         assert!(EVAL_FIXTURES.len() >= 15);
+        let fixture_names = EVAL_FIXTURES
+            .iter()
+            .map(|fixture| fixture.name)
+            .collect::<BTreeSet<_>>();
+        let test_names = OPENAI_LIVE_EVAL_NAMES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(fixture_names.len(), EVAL_FIXTURES.len(), "fixture names must be unique");
+        assert_eq!(
+            test_names.len(),
+            OPENAI_LIVE_EVAL_NAMES.len(),
+            "live test names must be unique"
+        );
+        assert_eq!(test_names, fixture_names);
         assert!(
             EVAL_FIXTURES
                 .iter()
@@ -379,14 +389,8 @@ mod tests {
         }
 
         let fixtures = [
-            IntentEvalFixture {
-                prompt: "bench block 1",
-                expected: EvalExpected::Resolved,
-            },
-            IntentEvalFixture {
-                prompt: "bench something",
-                expected: EvalExpected::Invalid,
-            },
+            IntentEvalFixture::resolved("unit_resolved", "bench block 1"),
+            IntentEvalFixture::invalid("unit_invalid", "bench something"),
         ];
         let report = run_eval_fixtures(&AlwaysInvalid, &fixtures)
             .await
@@ -394,6 +398,49 @@ mod tests {
         assert_eq!(report.total, 2);
         assert_eq!(report.passed, 1);
         assert_eq!(report.failures.len(), 1);
+    }
+
+    /// Status parity alone would pass a resolution that carries the wrong task
+    /// fields — the exact shape of the original Slack misresolution.
+    #[tokio::test]
+    async fn eval_runner_counts_wrong_task_fields_as_failure() {
+        struct AlwaysBenchmark;
+
+        #[async_trait]
+        impl IntentResolver for AlwaysBenchmark {
+            async fn resolve(&self, _text: &str) -> Result<IntentOutcome, IntentProviderError> {
+                Ok(IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+                    BenchmarkRequest::Single(WorkloadSpec {
+                        target: WorkloadTarget::Blocks(vec![BlockSelector::Height(10)]),
+                        clean_repetitions: 1,
+                        warmup: Some(0),
+                        rev: None,
+                    }),
+                ))))
+            }
+        }
+
+        fn expect_validation(intent: &UserIntent) -> Result<(), String> {
+            match intent {
+                UserIntent::Create(TaskCreationIntent::BlockValidation(_)) => Ok(()),
+                _ => Err("expected a block-validation intent".into()),
+            }
+        }
+
+        let fixtures = [IntentEvalFixture::resolved_as(
+            "unit_wrong_task_fields",
+            "validate the latest 10 blocks",
+            expect_validation,
+        )];
+        let report = run_eval_fixtures(&AlwaysBenchmark, &fixtures)
+            .await
+            .unwrap();
+        assert_eq!(report.passed, 0);
+        assert!(
+            report.failures[0].contains("expected a block-validation intent"),
+            "unexpected failure text: {}",
+            report.failures[0]
+        );
     }
 
     #[tokio::test]
@@ -432,9 +479,7 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    #[ignore = "requires SBGH_OPENAI_API_KEY and calls the real OpenAI Responses API"]
-    async fn openai_eval_fixture_set() {
+    async fn run_openai_live_eval(fixture_name: &str) {
         let api_key = std::env::var("SBGH_OPENAI_API_KEY")
             .expect("set SBGH_OPENAI_API_KEY to run the real-model eval");
         let model = std::env::var("SBGH_LLM_MODEL").unwrap_or_else(|_| "gpt-5-mini".to_string());
@@ -445,7 +490,12 @@ mod tests {
             std::time::Duration::from_secs(15),
         ))
         .unwrap();
-        let report = run_eval_fixtures(&resolver, EVAL_FIXTURES)
+        let fixture = EVAL_FIXTURES
+            .iter()
+            .find(|fixture| fixture.name == fixture_name)
+            .copied()
+            .expect("live eval fixture name is covered by the corpus guard");
+        let report = run_eval_fixtures(&resolver, std::slice::from_ref(&fixture))
             .await
             .unwrap();
         assert!(
@@ -456,4 +506,44 @@ mod tests {
             report.failures.join("\n")
         );
     }
+
+    macro_rules! openai_live_eval_cases {
+        ($($name:ident),+ $(,)?) => {
+            const OPENAI_LIVE_EVAL_NAMES: &[&str] = &[$(stringify!($name)),+];
+
+            $(
+                #[tokio::test]
+                #[ignore = "requires SBGH_OPENAI_API_KEY and calls the real OpenAI Responses API"]
+                async fn $name() {
+                    run_openai_live_eval(stringify!($name)).await;
+                }
+            )+
+        };
+    }
+
+    openai_live_eval_cases!(
+        openai_live_eval_benchmark_single_block_defaults,
+        openai_live_eval_benchmark_repetition_words,
+        openai_live_eval_benchmark_block_range_single_ref,
+        openai_live_eval_benchmark_compact_counts_and_warmup,
+        openai_live_eval_benchmark_run_range,
+        openai_live_eval_benchmark_txid,
+        openai_live_eval_invalid_contextual_tx,
+        openai_live_eval_invalid_bare_hash,
+        openai_live_eval_invalid_contextual_branch,
+        openai_live_eval_invalid_ambiguous_target,
+        openai_live_eval_invalid_comparison_without_target,
+        openai_live_eval_invalid_malformed_txid,
+        openai_live_eval_invalid_reversed_range,
+        openai_live_eval_invalid_zero_repetitions,
+        openai_live_eval_benchmark_txid_single_ref,
+        openai_live_eval_invalid_missing_benchmark_target,
+        openai_live_eval_block_validation_default_selection,
+        openai_live_eval_block_validation_recent_compact_count,
+        openai_live_eval_block_validation_recent_exact_commit,
+        openai_live_eval_block_validation_full,
+        openai_live_eval_block_validation_range,
+        openai_live_eval_invalid_contextual_validation,
+        openai_live_eval_invalid_mixed_task_request,
+    );
 }

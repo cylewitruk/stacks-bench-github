@@ -298,15 +298,21 @@ the qualification record required by this iteration.
   `e538271c-5646-4a43-94ef-fa81858b2a2e`, job
   `2db866d1-8351-414e-8e3a-975120a9a80e`, comment `5201711352`, and Check Run
   `92549878067`.
+- [x] Redelivered that GitHub webhook (`82403bb0-9168-11f1-954b-413c8d9eeec6`).
+  Ingress retained one processed webhook row and reused the same submission,
+  completed job, comment, Check Run, and external identity without enqueuing
+  duplicate work or creating another provider surface.
 
 ### Open or partial gates
 
 - [ ] Consolidate the redacted host evidence into one durable qualification
   record, including the direct S3 put/HEAD/get/checksum/delete ceremony and the
   exact deployed revision.
-- [ ] Deliberately redeliver the successful GitHub validation input and prove
-  that its submission, comment, and Check Run identities are not duplicated.
-- [ ] Complete the Slack recent-validation journey.
+- [ ] Complete the Slack recent-validation journey. The first attempt failed
+  closed before submission with `target_kind must be null`; the model mapped
+  “latest 10 blocks” onto the benchmark-only field. The intent prompt/schema
+  fix is implemented locally and must be deployed, then the same request must
+  be retried and carried through one in-place terminal Slack report.
 - [ ] Complete the required GitHub and Slack benchmark provider journeys. The
   v20/v22 benchmark-progress and comparison closure remains a separate
   fast-follow after these primary journeys.

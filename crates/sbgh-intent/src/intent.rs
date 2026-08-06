@@ -650,10 +650,12 @@ pub fn intent_response_text_format() -> Value {
                 },
                 "target_kind": {
                     "type": ["string", "null"],
-                    "enum": ["block", "block_range", "txids", null]
+                    "enum": ["block", "block_range", "txids", null],
+                    "description": "Benchmark target only. Must be null for block_validation, even when the request says blocks."
                 },
                 "block": {
                     "type": ["array", "null"],
+                    "description": "Benchmark block selectors only. Must be null for block_validation.",
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
@@ -667,6 +669,7 @@ pub fn intent_response_text_format() -> Value {
                 },
                 "block_range": {
                     "type": ["object", "null"],
+                    "description": "Benchmark block range only. Must be null for block_validation; use validation_start and validation_end instead.",
                     "additionalProperties": false,
                     "required": ["start", "end"],
                     "properties": {
@@ -676,10 +679,19 @@ pub fn intent_response_text_format() -> Value {
                 },
                 "txids": {
                     "type": ["array", "null"],
+                    "description": "Benchmark transaction selectors only. Must be null for block_validation.",
                     "items": { "type": "string" }
                 },
-                "repetitions": { "type": ["integer", "null"], "minimum": 1 },
-                "warmup": { "type": ["integer", "null"], "minimum": 0 },
+                "repetitions": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Benchmark-only repetition count. Must be null for block_validation."
+                },
+                "warmup": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Benchmark-only warmup count. Must be null for block_validation."
+                },
                 "rev": {
                     "type": ["string", "null"],
                     "description": "Single benchmark ref. Use this for one-ref requests phrased as on/against <ref>."
@@ -697,11 +709,24 @@ pub fn intent_response_text_format() -> Value {
                 },
                 "validation_selection": {
                     "type": ["string", "null"],
-                    "enum": ["recent", "full", "range", null]
+                    "enum": ["recent", "full", "range", null],
+                    "description": "Block-validation selector only. Must be null for benchmark."
                 },
-                "validation_block_count": { "type": ["integer", "null"], "minimum": 1 },
-                "validation_start": { "type": ["integer", "null"], "minimum": 0 },
-                "validation_end": { "type": ["integer", "null"], "minimum": 0 },
+                "validation_block_count": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Recent block-validation count. Use this, not target_kind, for requests such as latest 10 blocks."
+                },
+                "validation_start": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Inclusive block-validation range start; null outside range selection."
+                },
+                "validation_end": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Inclusive block-validation range end; null outside range selection."
+                },
                 "reason": { "type": ["string", "null"] },
                 "issues": {
                     "type": ["array", "null"],
@@ -762,11 +787,156 @@ pub enum EvalExpected {
     Invalid,
 }
 
+/// A resolved-intent assertion, run after normalization.
+///
+/// Status alone cannot catch a model that resolves the right task kind with the
+/// wrong fields, so the fixtures that guard known misresolutions carry one.
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub type IntentCheck = fn(&UserIntent) -> Result<(), String>;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
 pub struct IntentEvalFixture {
+    pub name: &'static str,
     pub prompt: &'static str,
     pub expected: EvalExpected,
+    pub check: Option<IntentCheck>,
+}
+
+#[cfg(test)]
+impl IntentEvalFixture {
+    pub const fn resolved(name: &'static str, prompt: &'static str) -> Self {
+        Self {
+            name,
+            prompt,
+            expected: EvalExpected::Resolved,
+            check: None,
+        }
+    }
+
+    pub const fn resolved_as(name: &'static str, prompt: &'static str, check: IntentCheck) -> Self {
+        Self {
+            name,
+            prompt,
+            expected: EvalExpected::Resolved,
+            check: Some(check),
+        }
+    }
+
+    pub const fn invalid(name: &'static str, prompt: &'static str) -> Self {
+        Self {
+            name,
+            prompt,
+            expected: EvalExpected::Invalid,
+            check: None,
+        }
+    }
+}
+
+#[cfg(test)]
+fn expect_block_validation(intent: &UserIntent) -> Result<&BlockValidationIntent, String> {
+    let UserIntent::Create(TaskCreationIntent::BlockValidation(validation)) = intent else {
+        return Err("expected a block-validation intent".into());
+    };
+    Ok(validation)
+}
+
+#[cfg(test)]
+fn expect_benchmark(intent: &UserIntent) -> Result<&BenchmarkRequest, String> {
+    let UserIntent::Create(TaskCreationIntent::Benchmark(benchmark)) = intent else {
+        return Err("expected a benchmark intent".into());
+    };
+    Ok(benchmark)
+}
+
+/// The v32 Slack misresolution: "latest 10 blocks" resolved as a ten-block
+/// benchmark target instead of a recent-block validation.
+#[cfg(test)]
+fn recent_ten_blocks_at_commit(intent: &UserIntent) -> Result<(), String> {
+    let validation = expect_block_validation(intent)?;
+    if validation.selection != (ValidationSelection::Recent { block_count: Some(10) }) {
+        return Err(format!("expected recent 10 blocks, got {:?}", validation.selection));
+    }
+    if validation
+        .source
+        .revision
+        .as_deref()
+        != Some("1ed2021d9209f1ba7d4d9c9a763296c41f9194bb")
+    {
+        return Err(format!("expected the requested commit, got {:?}", validation.source.revision));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn full_validation_at_commit(intent: &UserIntent) -> Result<(), String> {
+    let validation = expect_block_validation(intent)?;
+    if validation.selection != ValidationSelection::Full {
+        return Err(format!("expected a full validation, got {:?}", validation.selection));
+    }
+    if validation
+        .source
+        .revision
+        .as_deref()
+        != Some("abc123")
+    {
+        return Err(format!("expected commit abc123, got {:?}", validation.source.revision));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validation_index_range(intent: &UserIntent) -> Result<(), String> {
+    let validation = expect_block_validation(intent)?;
+    if validation.selection != (ValidationSelection::Range { start: 185_700, end: 186_000 }) {
+        return Err(format!("expected range 185700..186000, got {:?}", validation.selection));
+    }
+    Ok(())
+}
+
+/// "10k blocks from height 8500000" is an inclusive range, not a repetition
+/// count, and a single `against <ref>` is not a comparison.
+#[cfg(test)]
+fn ten_thousand_block_range_single_ref(intent: &UserIntent) -> Result<(), String> {
+    let BenchmarkRequest::Single(spec) = expect_benchmark(intent)? else {
+        return Err("expected a single-ref benchmark, not a comparison".into());
+    };
+    if spec.target
+        != (WorkloadTarget::BlockRange {
+            start: 8_500_000,
+            end: 8_509_999,
+        })
+    {
+        return Err(format!("expected an inclusive 10k block range, got {:?}", spec.target));
+    }
+    if spec.clean_repetitions != 2 || spec.warmup != Some(2_500) {
+        return Err(format!(
+            "expected 2 repetitions and 2500 warmup, got {} and {:?}",
+            spec.clean_repetitions, spec.warmup
+        ));
+    }
+    if spec.rev.as_deref() != Some("sb-integration/squash") {
+        return Err(format!("expected the requested ref, got {:?}", spec.rev));
+    }
+    Ok(())
+}
+
+/// An unqualified benchmark must still carry the documented run defaults.
+#[cfg(test)]
+fn single_block_with_default_runs(intent: &UserIntent) -> Result<(), String> {
+    let BenchmarkRequest::Single(spec) = expect_benchmark(intent)? else {
+        return Err("expected a single benchmark".into());
+    };
+    if spec.target != WorkloadTarget::Blocks(vec![BlockSelector::Height(8_123_456)]) {
+        return Err(format!("expected one block-height target, got {:?}", spec.target));
+    }
+    if spec.clean_repetitions != 1 || spec.warmup != Some(0) {
+        return Err(format!(
+            "expected the default 1 repetition and 0 warmup, got {} and {:?}",
+            spec.clean_repetitions, spec.warmup
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -774,97 +944,99 @@ pub const EVAL_FIXTURES: &[IntentEvalFixture] = &[
     // Resolved fixtures must include enough concrete information for the
     // current Slack surface. Contextual phrases like "this branch" stay invalid
     // until a future caller supplies PR/comment context.
-    IntentEvalFixture {
-        prompt: "bench block 8123456",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "profile block 8123456 ten times",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "bench blocks 8123456 to 8200000 on 3.4.0.0.3",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "bench 10k blocks from height 8500000, twice, with a 2.5k block warmup, against \
-                 sb-integration/squash",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "run 10 reps with 1000 warmup from 8123456 to 8200000",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "profile tx f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce twice",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "bench this tx with 2 warmup iterations",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "benchmark 0xc3b1aad400000000000000000000000000000000000000000000000000000000 on \
-                 develop",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "run this branch against block 8123456",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "bench something fast",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "compare main and develop",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "bench tx not-a-hash",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "bench block 8200000 to 8123456",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "bench block 8123456 zero times",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "bench tx f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce on \
-                 feat/stacks-bench",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "please run a benchmark",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "run block validation on commit abc123",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "validate the latest 500k blocks on commit abc123",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "run full block validation on commit abc123",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "validate global validation indices 185700 through 186000 on abc123",
-        expected: EvalExpected::Resolved,
-    },
-    IntentEvalFixture {
-        prompt: "validate this change",
-        expected: EvalExpected::Invalid,
-    },
-    IntentEvalFixture {
-        prompt: "cancel validation and benchmark the replacement",
-        expected: EvalExpected::Invalid,
-    },
+    IntentEvalFixture::resolved_as(
+        "openai_live_eval_benchmark_single_block_defaults",
+        "bench block 8123456",
+        single_block_with_default_runs,
+    ),
+    IntentEvalFixture::resolved(
+        "openai_live_eval_benchmark_repetition_words",
+        "profile block 8123456 ten times",
+    ),
+    IntentEvalFixture::resolved(
+        "openai_live_eval_benchmark_block_range_single_ref",
+        "bench blocks 8123456 to 8200000 on 3.4.0.0.3",
+    ),
+    IntentEvalFixture::resolved_as(
+        "openai_live_eval_benchmark_compact_counts_and_warmup",
+        "bench 10k blocks from height 8500000, twice, with a 2.5k block warmup, against \
+         sb-integration/squash",
+        ten_thousand_block_range_single_ref,
+    ),
+    IntentEvalFixture::resolved(
+        "openai_live_eval_benchmark_run_range",
+        "run 10 reps with 1000 warmup from 8123456 to 8200000",
+    ),
+    IntentEvalFixture::resolved(
+        "openai_live_eval_benchmark_txid",
+        "profile tx f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce twice",
+    ),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_contextual_tx",
+        "bench this tx with 2 warmup iterations",
+    ),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_bare_hash",
+        "benchmark 0xc3b1aad400000000000000000000000000000000000000000000000000000000 on develop",
+    ),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_contextual_branch",
+        "run this branch against block 8123456",
+    ),
+    IntentEvalFixture::invalid("openai_live_eval_invalid_ambiguous_target", "bench something fast"),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_comparison_without_target",
+        "compare main and develop",
+    ),
+    IntentEvalFixture::invalid("openai_live_eval_invalid_malformed_txid", "bench tx not-a-hash"),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_reversed_range",
+        "bench block 8200000 to 8123456",
+    ),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_zero_repetitions",
+        "bench block 8123456 zero times",
+    ),
+    IntentEvalFixture::resolved(
+        "openai_live_eval_benchmark_txid_single_ref",
+        "bench tx f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce on \
+         feat/stacks-bench",
+    ),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_missing_benchmark_target",
+        "please run a benchmark",
+    ),
+    IntentEvalFixture::resolved(
+        "openai_live_eval_block_validation_default_selection",
+        "run block validation on commit abc123",
+    ),
+    IntentEvalFixture::resolved(
+        "openai_live_eval_block_validation_recent_compact_count",
+        "validate the latest 500k blocks on commit abc123",
+    ),
+    IntentEvalFixture::resolved_as(
+        "openai_live_eval_block_validation_recent_exact_commit",
+        "validate the latest 10 blocks on commit 1ed2021d9209f1ba7d4d9c9a763296c41f9194bb",
+        recent_ten_blocks_at_commit,
+    ),
+    IntentEvalFixture::resolved_as(
+        "openai_live_eval_block_validation_full",
+        "run full block validation on commit abc123",
+        full_validation_at_commit,
+    ),
+    IntentEvalFixture::resolved_as(
+        "openai_live_eval_block_validation_range",
+        "validate global validation indices 185700 through 186000 on abc123",
+        validation_index_range,
+    ),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_contextual_validation",
+        "validate this change",
+    ),
+    IntentEvalFixture::invalid(
+        "openai_live_eval_invalid_mixed_task_request",
+        "cancel validation and benchmark the replacement",
+    ),
 ];
 
 #[cfg(test)]
@@ -885,15 +1057,24 @@ pub async fn run_eval_fixtures(
         let outcome = resolver
             .resolve(fixture.prompt)
             .await?;
+        let outcome_detail = format!("{outcome:?}");
         let actual = match outcome {
             IntentOutcome::Resolved(_) => EvalExpected::Resolved,
             IntentOutcome::Invalid(_) => EvalExpected::Invalid,
         };
         if actual != fixture.expected {
             failures.push(format!(
-                "prompt `{}` expected {:?}, got {:?}",
-                fixture.prompt, fixture.expected, actual
+                "prompt `{}` expected {:?}, got {outcome_detail}",
+                fixture.prompt, fixture.expected
             ));
+            continue;
+        }
+        // A structurally valid resolution can still carry the wrong task
+        // fields, so guarded fixtures assert the normalized intent too.
+        if let (Some(check), IntentOutcome::Resolved(intent)) = (fixture.check, &outcome)
+            && let Err(mismatch) = check(intent)
+        {
+            failures.push(format!("prompt `{}` resolved wrongly: {mismatch}", fixture.prompt));
         }
     }
     Ok(IntentEvalReport {
