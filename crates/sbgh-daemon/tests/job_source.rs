@@ -7,11 +7,19 @@
 
 use std::sync::Arc;
 
+use sbgh_core::db::SubmissionStore;
 use sbgh_core::models::{
-    GitRefKind, JobAxes, JobCreationRequest, JobKind, NewJob, NewPullRequestLink,
-    QueuedEventDetail, TriggerKind,
+    BuildTarget, GitRefKind, JobAxes, JobCreationRequest, JobIntent, JobKind,
+    JobSource as ModelJobSource, NewJob, NewPullRequestLink, QueuedEventDetail, TaskKind,
+    TriggerKind,
+};
+use sbgh_core::submission::{
+    BlockValidationPlan, PreparedSubmission, ProducerKey, ResolvedTaskSource,
+    SchedulingConstraints, SlackSubmissionProvenance, SubmissionActor, SubmissionCommand,
+    SubmissionProvenance, TaskPlan,
 };
 use sbgh_daemon::{JobSource, LocalFsStore, ProgressTarget, RunnableJobStore};
+use sbgh_fleet::{BlockValidationPayload, BlockValidationSelection, InclusiveRange};
 use sbgh_postgres::db::{
     JobCreationOutcome, JobStore, Pool, PostgresJobStore, PostgresPullRequestStore,
     PostgresRepoStore, setup_pg_db,
@@ -126,6 +134,65 @@ async fn enqueue_slack_adhoc(store: &PostgresJobStore, webhook_id: i64) -> Uuid 
         JobCreationOutcome::Created(created) => created.job.id,
         other => panic!("expected Created, got {other:?}"),
     }
+}
+
+async fn enqueue_slack_block_validation(store: &PostgresJobStore) -> (Uuid, Uuid) {
+    let commit = "b".repeat(40);
+    let selection = BlockValidationSelection::Range {
+        range: InclusiveRange { start: 10, end: 11 },
+    };
+    let receipt = store
+        .persist_submission(&PreparedSubmission {
+            command: SubmissionCommand {
+                actor: SubmissionActor::SlackUser {
+                    team_id: "T123".into(),
+                    user_id: "U123".into(),
+                },
+                producer_key: ProducerKey {
+                    namespace: "slack_request".into(),
+                    key: "block-validation-request".into(),
+                },
+                constraints: SchedulingConstraints::default(),
+                task: TaskPlan::BlockValidation(BlockValidationPlan {
+                    source: ResolvedTaskSource {
+                        github_installation_id: 100,
+                        github_repo_id: 10,
+                        source: ModelJobSource::Slack,
+                        intent: JobIntent::BlockValidation,
+                        task_kind: TaskKind::BlockValidation,
+                        build_target: BuildTarget::StacksInspect,
+                        git_ref_kind: GitRefKind::Commit,
+                        git_ref_display: commit.clone(),
+                        commit,
+                        committed_at: None,
+                        workload_key: None,
+                    },
+                    payload: BlockValidationPayload {
+                        selection: selection.clone(),
+                        timeout_secs: 60,
+                    },
+                }),
+                provenance: SubmissionProvenance {
+                    queued_event_detail: serde_json::to_value(QueuedEventDetail::BlockValidation {
+                        selection,
+                    })
+                    .unwrap(),
+                    github: None,
+                    slack: Some(SlackSubmissionProvenance {
+                        team_id: "T123".into(),
+                        channel_id: "C123".into(),
+                        request_message_ts: "1700000000.000100".into(),
+                        reporting_identity: "b".repeat(64),
+                        report_message_ts: None,
+                    }),
+                },
+            },
+            contract_version: 1,
+            request_digest: "c".repeat(64),
+        })
+        .await
+        .unwrap();
+    (receipt.submission_id, receipt.initial_job_ids[0])
 }
 
 /// Codex acceptance point (v5): a `slack_adhoc` job MUST assemble as
@@ -256,6 +323,73 @@ async fn slack_queued_card_ts_assembles_on_claim() {
         }
         other => panic!("expected Slack, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn slack_block_validation_uses_submission_reporting_provenance() {
+    let (_db, pool) = setup_pg_db().await;
+    seed(&pool, 100, 10).await;
+    let store = Arc::new(PostgresJobStore::new(pool.clone()));
+    let (submission_id, job_id) = enqueue_slack_block_validation(&store).await;
+    let archive_root = tempfile::tempdir().unwrap();
+    let source = JobSource::new(
+        store.clone(),
+        Arc::new(PostgresRepoStore::new(pool.clone())),
+        Arc::new(PostgresPullRequestStore::new(pool.clone())),
+        Arc::new(LocalFsStore::new(
+            archive_root
+                .path()
+                .to_path_buf(),
+        )),
+    );
+
+    let queued = store
+        .queued_event(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_value::<QueuedEventDetail>(queued.detail.unwrap()).unwrap(),
+        QueuedEventDetail::BlockValidation { .. }
+    ));
+
+    let job = source
+        .load_runnable(job_id)
+        .await
+        .unwrap()
+        .expect("Slack block validation must reconstruct");
+    assert_eq!(job.task_submission_id, submission_id);
+    match &job.progress {
+        ProgressTarget::Slack {
+            channel,
+            message_ts,
+            reporting_identity,
+            plan_message_ts,
+        } => {
+            assert_eq!(channel, "C123");
+            assert_eq!(message_ts, "1700000000.000100");
+            assert_eq!(reporting_identity, &"b".repeat(64));
+            assert_eq!(plan_message_ts, &None);
+        }
+        other => panic!("expected Slack progress, got {other:?}"),
+    }
+
+    source
+        .set_plan_message_ts(&job, "1700000000.000999")
+        .await
+        .unwrap();
+    let reloaded = source
+        .load_runnable(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        reloaded.progress,
+        ProgressTarget::Slack {
+            plan_message_ts: Some(ref ts),
+            ..
+        } if ts == "1700000000.000999"
+    ));
 }
 
 #[tokio::test]

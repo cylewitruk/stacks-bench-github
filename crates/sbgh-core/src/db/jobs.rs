@@ -42,7 +42,7 @@ use crate::models::{
 };
 #[cfg(feature = "testing")]
 use crate::models::{JobCreationRequest, NewJob};
-use crate::reporting::SubmissionGithubReportIdentity;
+use crate::reporting::{SubmissionGithubReportIdentity, SubmissionSlackReportIdentity};
 
 /// Slice 10: atomic "the run completed" write. Bundles the terminal
 /// status transition + the write-once outcome companions + the terminal
@@ -479,6 +479,15 @@ pub trait JobStore: crate::db::SubmissionStore + Send + Sync + 'static {
         &self,
         _submission_id: Uuid,
     ) -> Result<Option<SubmissionGithubReportIdentity>> {
+        Ok(None)
+    }
+
+    /// Submission-owned Slack routing and canonical message identity.
+    /// Production stores override this; the default preserves narrow fakes.
+    async fn submission_slack_report_identity(
+        &self,
+        _submission_id: Uuid,
+    ) -> Result<Option<SubmissionSlackReportIdentity>> {
         Ok(None)
     }
 

@@ -1950,6 +1950,35 @@ impl JobStore for PostgresJobStore {
         }))
     }
 
+    async fn submission_slack_report_identity(
+        &self,
+        submission_id: Uuid,
+    ) -> Result<Option<sbgh_core::reporting::SubmissionSlackReportIdentity>> {
+        let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT team_id, channel_id, request_message_ts,
+                   reporting_identity, report_message_ts
+              FROM task_submission_slack
+             WHERE task_submission_id = $1
+            "#,
+        )
+        .bind(submission_id)
+        .fetch_optional(&self.pool)
+        .await
+        .core()?;
+        Ok(row.map(
+            |(team_id, channel_id, request_message_ts, reporting_identity, report_message_ts)| {
+                sbgh_core::reporting::SubmissionSlackReportIdentity {
+                    team_id,
+                    channel_id,
+                    request_message_ts,
+                    reporting_identity,
+                    report_message_ts,
+                }
+            },
+        ))
+    }
+
     async fn record_submission_comment(&self, job_id: Uuid, comment_id: i64) -> Result<()> {
         let mut tx = self
             .pool

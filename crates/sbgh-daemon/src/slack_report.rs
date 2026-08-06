@@ -266,7 +266,7 @@ impl SlackReportSurface {
     pub async fn queue_position(&self, ahead: usize, total: usize) -> bool {
         match self
             .session
-            .try_mutate(PublishUrgency::Debounced, |view| {
+            .try_mutate(PublishUrgency::Immediate, |view| {
                 if view.status != SlackStatus::Queued {
                     return false;
                 }
@@ -275,7 +275,7 @@ impl SlackReportSurface {
             })
             .await
         {
-            Ok(_) => true,
+            Ok(updated) => updated,
             Err(error) => {
                 tracing::warn!(
                     job_id = %self.job.id,

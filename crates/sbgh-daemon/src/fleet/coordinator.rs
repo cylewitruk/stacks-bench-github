@@ -22,6 +22,12 @@ use crate::reporter::{Reporter, ReporterDependencies, fleet_reporting_ready};
 use crate::shutdown::Shutdown;
 use crate::slack_report::SlackSessionRegistry;
 
+const SLACK_REPORTING_ADMISSION_TIMEOUT_SECS: i64 = 5 * 60;
+const SLACK_REPORTING_TIMEOUT_REMARK: &str =
+    "Slack reporting admission timed out before a canonical message became durable";
+const SLACK_CONNECTOR_UNAVAILABLE_REMARK: &str =
+    "Slack reporting admission failed because the daemon has no Slack connector";
+
 pub struct FleetCoordinator {
     config: Arc<DaemonConfig>,
     fleet: Arc<dyn FleetStore>,
@@ -111,6 +117,29 @@ impl FleetCoordinator {
     }
 
     async fn prepare_queued(&self) -> anyhow::Result<()> {
+        let failed_slack_jobs = if self.slack.is_some() {
+            self.fleet
+                .expire_unreported_slack_jobs(
+                    chrono::Duration::seconds(SLACK_REPORTING_ADMISSION_TIMEOUT_SECS),
+                    SLACK_REPORTING_TIMEOUT_REMARK,
+                )
+                .await?
+        } else {
+            self.fleet
+                .fail_queued_slack_jobs_without_connector(SLACK_CONNECTOR_UNAVAILABLE_REMARK)
+                .await?
+        };
+        for job_id in failed_slack_jobs {
+            tracing::error!(
+                %job_id,
+                reason = if self.slack.is_some() {
+                    SLACK_REPORTING_TIMEOUT_REMARK
+                } else {
+                    SLACK_CONNECTOR_UNAVAILABLE_REMARK
+                },
+                "Slack job failed before scheduling because reporting admission did not complete",
+            );
+        }
         let queued = self
             .jobs
             .list_queued()
@@ -202,7 +231,7 @@ impl FleetCoordinator {
         let total = in_flight + queued.len();
         let mut seen = HashSet::new();
         for (index, job) in queued.iter().enumerate() {
-            let ProgressTarget::Slack { plan_message_ts: Some(_), .. } = &job.progress else {
+            let ProgressTarget::Slack { .. } = &job.progress else {
                 continue;
             };
             if job.task_run_index != 0 {
@@ -349,12 +378,33 @@ impl FleetCoordinator {
                 // external side effect rather than trusting the batch snapshot.
                 continue;
             }
-            let Some(job) = self
+            let job = match self
                 .jobs
                 .load_runnable(event.job_id)
-                .await?
-            else {
-                anyhow::bail!("fleet event references missing job {}", event.job_id);
+                .await
+            {
+                Ok(Some(job)) => job,
+                Ok(None) => {
+                    tracing::warn!(
+                        attempt_id = %event.attempt_id,
+                        job_id = %event.job_id,
+                        reliable_seq = event.reliable_seq,
+                        "fleet event references missing job; leaving event pending"
+                    );
+                    blocked_attempts.insert(event.attempt_id);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        attempt_id = %event.attempt_id,
+                        job_id = %event.job_id,
+                        reliable_seq = event.reliable_seq,
+                        %error,
+                        "fleet event job reconstruction failed; leaving event pending"
+                    );
+                    blocked_attempts.insert(event.attempt_id);
+                    continue;
+                }
             };
             let surface = match self
                 .surface(event.attempt_id, &job)
@@ -439,12 +489,33 @@ impl FleetCoordinator {
             {
                 continue;
             }
-            let Some(job) = self
+            let job = match self
                 .jobs
                 .load_runnable(progress.job_id)
-                .await?
-            else {
-                anyhow::bail!("fleet progress references missing job {}", progress.job_id);
+                .await
+            {
+                Ok(Some(job)) => job,
+                Ok(None) => {
+                    tracing::warn!(
+                        attempt_id = %progress.attempt_id,
+                        job_id = %progress.job_id,
+                        progress_seq = progress.progress_seq,
+                        "fleet progress references missing job; leaving update pending"
+                    );
+                    blocked_attempts.insert(progress.attempt_id);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        attempt_id = %progress.attempt_id,
+                        job_id = %progress.job_id,
+                        progress_seq = progress.progress_seq,
+                        %error,
+                        "fleet progress job reconstruction failed; leaving update pending"
+                    );
+                    blocked_attempts.insert(progress.attempt_id);
+                    continue;
+                }
             };
             let workflow_step = match progress
                 .update

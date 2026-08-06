@@ -1148,11 +1148,10 @@ impl Reporter {
     }
 }
 
-/// Whether every GitHub identity required by the configured fleet-reporting
-/// surface is present on `job`. Slack identities are created by the connector,
-/// and silent jobs intentionally have no provider surface.
+/// Whether every provider identity required by the configured fleet-reporting
+/// surface is present on `job`. Silent jobs intentionally have no surface.
 pub(crate) fn fleet_reporting_ready(config: &DaemonConfig, job: &RunnableJob) -> bool {
-    match job.progress {
+    match &job.progress {
         ProgressTarget::PullRequest { comment_id, check_run_id, .. } => {
             (!config
                 .reporting
@@ -1172,7 +1171,8 @@ pub(crate) fn fleet_reporting_ready(config: &DaemonConfig, job: &RunnableJob) ->
                 .wants_check()
                 || check_run_id.is_some()
         }
-        ProgressTarget::Slack { .. } | ProgressTarget::Silent => true,
+        ProgressTarget::Slack { plan_message_ts, .. } => plan_message_ts.is_some(),
+        ProgressTarget::Silent => true,
     }
 }
 
@@ -1548,6 +1548,24 @@ mod tests {
             comment_id: Some(1000),
             check_run_id: Some(5000),
             check_run_url: Some("https://github.test/checks/5000".into()),
+        };
+        assert!(fleet_reporting_ready(&config, &job));
+
+        job.progress = ProgressTarget::Slack {
+            channel: "C1".into(),
+            message_ts: "1.0".into(),
+            reporting_identity: "a".repeat(64),
+            plan_message_ts: None,
+        };
+        assert!(
+            !fleet_reporting_ready(&config, &job),
+            "Slack work must not start before its canonical message is durable"
+        );
+        job.progress = ProgressTarget::Slack {
+            channel: "C1".into(),
+            message_ts: "1.0".into(),
+            reporting_identity: "a".repeat(64),
+            plan_message_ts: Some("1.1".into()),
         };
         assert!(fleet_reporting_ready(&config, &job));
     }

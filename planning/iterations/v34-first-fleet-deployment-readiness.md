@@ -308,11 +308,20 @@ the qualification record required by this iteration.
 - [ ] Consolidate the redacted host evidence into one durable qualification
   record, including the direct S3 put/HEAD/get/checksum/delete ceremony and the
   exact deployed revision.
-- [ ] Complete the Slack recent-validation journey. The first attempt failed
-  closed before submission with `target_kind must be null`; the model mapped
-  “latest 10 blocks” onto the benchmark-only field. The intent prompt/schema
-  fix is implemented locally and must be deployed, then the same request must
-  be retried and carried through one in-place terminal Slack report.
+- [ ] Complete the Slack recent-validation journey. The intent prompt/schema
+  correction is deployed and a contextual-revision canary now fails closed
+  without enqueueing. A subsequent one-block request resolved and started job
+  `e7407b2d-cb81-4823-8340-c21761b7e5d3`, but was cancelled after exposing two
+  reporting prerequisites: the installed Slack app lacked the checked-in
+  history scopes, and Slack block validation reconstructed provider routing
+  from task-specific queued detail instead of submission provenance. The
+  daemon fix now reads `task_submission_slack`, gates offers on a durable
+  canonical message, isolates malformed projections, and fails an unreported
+  admission after five minutes rather than leaving immortal queued demand. A
+  daemon without a Slack connector fails new unreported Slack work immediately;
+  queue-position writes are synchronous so failed writes remain retryable.
+  Reinstall the app, deploy the fix, and retry through one in-place terminal
+  Slack report.
 - [ ] Complete the required GitHub and Slack benchmark provider journeys. The
   v20/v22 benchmark-progress and comparison closure remains a separate
   fast-follow after these primary journeys.

@@ -146,9 +146,8 @@ pub(crate) fn log_nonfatal_projection(job_id: uuid::Uuid, result: anyhow::Result
 }
 
 /// Build the one reporting surface for `job`: the Slack snapshot for a Slack
-/// job with a wired client; an explicit **no-op** for a Slack job *without* one
-/// (preserving today's silent degrade — Decision 6 — rather than leaning on a
-/// GitHub surface coincidentally no-opping on a comment/check-less target);
+/// job with a wired client; an explicit **no-op** for already-running legacy
+/// Slack work recovered without one (new queued Slack work fails admission);
 /// else the GitHub comment+check surface.
 pub fn build_report_surface(
     gh: Arc<dyn GitHubApi>,

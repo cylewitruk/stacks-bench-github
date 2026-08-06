@@ -58,7 +58,8 @@ Rules:
   content is invalid.
 - `repetitions` are clean, separately orchestrated VM executions — not in-process loops.
 - **Single ref:** `on <ref>` or `against <ref>` naming one ref sets `rev`, and `variant_refs` stays
-  null.
+  null. Refs may contain `/`, as in `sb-integration/squash`; preserve the complete ref verbatim in
+  `rev` rather than treating it as a repository selector or dropping it.
 - **Comparison:** only explicit comparison wording (`compare`, `compared to`, `vs`, `versus`,
   `between <ref> and <ref>`) with exactly two refs sets `variant_refs` to both refs, and `rev` stays
   null. A comparison still needs a target; two refs alone are not a benchmark.

@@ -247,3 +247,14 @@ pub struct SubmissionGithubReportIdentity {
     pub check_name: Option<String>,
     pub external_id: Option<String>,
 }
+
+/// Submission-owned Slack reporting identity. Task-specific queued-event
+/// payloads deliberately do not carry provider routing metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionSlackReportIdentity {
+    pub team_id: String,
+    pub channel_id: String,
+    pub request_message_ts: String,
+    pub reporting_identity: String,
+    pub report_message_ts: Option<String>,
+}

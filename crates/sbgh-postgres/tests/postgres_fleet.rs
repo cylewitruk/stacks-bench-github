@@ -599,6 +599,45 @@ async fn enqueue_benchmark(store: &PostgresFleetStore, job_id: Uuid) {
         .unwrap();
 }
 
+async fn enqueue_slack_block_validation(store: &PostgresFleetStore, job_id: Uuid) {
+    let selection = sbgh_fleet::BlockValidationSelection::Range {
+        range: InclusiveRange { start: 100, end: 101 },
+    };
+    let payload = TaskPayload::BlockValidation(BlockValidationPayload {
+        selection: selection.clone(),
+        timeout_secs: 60,
+    });
+    store
+        .enqueue_prepared_job(
+            job_id,
+            &NewJob {
+                github_installation_id: 100,
+                github_repo_id: 10,
+                axes: JobAxes {
+                    source: JobSource::Slack,
+                    intent: JobIntent::BlockValidation,
+                    task_kind: TaskKind::BlockValidation,
+                    build_target: BuildTarget::StacksInspect,
+                },
+                git_ref_kind: GitRefKind::Commit,
+                git_ref_display: "1111111111111111111111111111111111111111".into(),
+                git_commit_hash: Some("1111111111111111111111111111111111111111".into()),
+                git_committed_at: None,
+                workload_key: None,
+            },
+            &serde_json::to_value(QueuedEventDetail::BlockValidation { selection }).unwrap(),
+            &PreparedExecution {
+                job_id,
+                commit: "1111111111111111111111111111111111111111".into(),
+                payload: payload.clone(),
+                payload_hash: sbgh_fleet::payload_digest(&payload).unwrap(),
+            },
+            &PreparedJobProvenance::default(),
+        )
+        .await
+        .unwrap();
+}
+
 async fn running_attempt(
     store: &PostgresFleetStore,
     worker_id: Uuid,
@@ -1706,6 +1745,230 @@ async fn capability_routes_only_to_a_compatible_worker() {
     .await
     .unwrap();
     assert_eq!(persisted, ("vg0/mainnet-2026-07-28".into(), 100, 901, 100, 4, 4));
+}
+
+#[tokio::test]
+async fn slack_job_is_not_offered_until_canonical_report_message_is_durable() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    store
+        .seed_worker(&WorkerRegistration {
+            worker_id,
+            display_name: "block".into(),
+            allowed_capabilities: vec![WorkerCapability::BlockValidation],
+            measurement_profile: None,
+            enabled: true,
+            draining: false,
+        })
+        .await
+        .unwrap();
+    store
+        .register_session(
+            worker_id,
+            &RegisterSessionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                worker_session_id: session_id,
+                software_version: env!("CARGO_PKG_VERSION").into(),
+                advertised_capabilities: BTreeSet::from([WorkerCapability::BlockValidation]),
+                resources: ResourceFacts {
+                    logical_cpus: 64,
+                    memory_bytes: 256 * 1024 * 1024 * 1024,
+                },
+            },
+            Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+
+    let job_id = Uuid::new_v4();
+    enqueue_slack_block_validation(&store, job_id).await;
+    assert!(
+        store
+            .poll_offer(worker_id, session_id, Duration::seconds(30), Duration::seconds(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "Slack work without submission reporting provenance must stay queued"
+    );
+
+    let submission_id: Uuid =
+        sqlx::query_scalar("SELECT task_submission_id FROM job WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO task_submission_slack
+            (task_submission_id, team_id, channel_id, request_message_ts,
+             reporting_identity, report_message_ts)
+        VALUES ($1, 'T1', 'C1', '1.0', $2, NULL)
+        "#,
+    )
+    .bind(submission_id)
+    .bind("d".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        store
+            .poll_offer(worker_id, session_id, Duration::seconds(30), Duration::seconds(60))
+            .await
+            .unwrap()
+            .is_none(),
+        "routing provenance without a canonical report message must stay queued"
+    );
+
+    sqlx::query(
+        "UPDATE task_submission_slack SET report_message_ts = '1.1' \
+         WHERE task_submission_id = $1",
+    )
+    .bind(submission_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let offered = store
+        .poll_offer(worker_id, session_id, Duration::seconds(30), Duration::seconds(60))
+        .await
+        .unwrap()
+        .expect("durably reportable Slack job should be offered");
+    assert_eq!(offered.offer.job_id, job_id);
+}
+
+#[tokio::test]
+async fn unreported_slack_admission_expires_but_a_durable_message_wins() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let fleet = PostgresFleetStore::new(pool.clone());
+
+    let expired_job_id = Uuid::new_v4();
+    enqueue_slack_block_validation(&fleet, expired_job_id).await;
+    let expired_submission_id: Uuid =
+        sqlx::query_scalar("SELECT task_submission_id FROM job WHERE id = $1")
+            .bind(expired_job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO task_submission_slack
+            (task_submission_id, team_id, channel_id, request_message_ts,
+             reporting_identity)
+        VALUES ($1, 'T1', 'C1', '1.0', $2)
+        "#,
+    )
+    .bind(expired_submission_id)
+    .bind("e".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        fleet
+            .expire_unreported_slack_jobs(Duration::minutes(5), "reporting timed out")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a fresh Slack admission must retain its grace period"
+    );
+    sqlx::query("UPDATE job SET created_at = NOW() - INTERVAL '6 minutes' WHERE id = $1")
+        .bind(expired_job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        fleet
+            .expire_unreported_slack_jobs(Duration::minutes(5), "reporting timed out")
+            .await
+            .unwrap(),
+        vec![expired_job_id]
+    );
+    let terminal: (String, String) = sqlx::query_as(
+        "SELECT job.status::text, event.remark
+           FROM job
+           JOIN job_event event ON event.job_id = job.id
+          WHERE job.id = $1 AND event.event_kind = 'failed'",
+    )
+    .bind(expired_job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(terminal, ("failed".into(), "reporting timed out".into()));
+
+    let reportable_job_id = Uuid::new_v4();
+    enqueue_slack_block_validation(&fleet, reportable_job_id).await;
+    let reportable_submission_id: Uuid =
+        sqlx::query_scalar("SELECT task_submission_id FROM job WHERE id = $1")
+            .bind(reportable_job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO task_submission_slack
+            (task_submission_id, team_id, channel_id, request_message_ts,
+             reporting_identity, report_message_ts)
+        VALUES ($1, 'T1', 'C1', '2.0', $2, '2.1')
+        "#,
+    )
+    .bind(reportable_submission_id)
+    .bind("f".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE job SET created_at = NOW() - INTERVAL '6 minutes' WHERE id = $1")
+        .bind(reportable_job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        fleet
+            .expire_unreported_slack_jobs(Duration::zero(), "connector unavailable")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a durable canonical message must defeat admission expiry"
+    );
+    let status: String = sqlx::query_scalar("SELECT status::text FROM job WHERE id = $1")
+        .bind(reportable_job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "queued");
+    assert_eq!(
+        fleet
+            .fail_queued_slack_jobs_without_connector("connector unavailable")
+            .await
+            .unwrap(),
+        vec![reportable_job_id],
+        "missing connector fails even work whose initial message was persisted"
+    );
+}
+
+#[tokio::test]
+async fn missing_slack_provenance_is_bounded_by_reporting_admission() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let fleet = PostgresFleetStore::new(pool.clone());
+    let job_id = Uuid::new_v4();
+    enqueue_slack_block_validation(&fleet, job_id).await;
+
+    assert_eq!(
+        fleet
+            .expire_unreported_slack_jobs(Duration::zero(), "connector unavailable")
+            .await
+            .unwrap(),
+        vec![job_id]
+    );
+    let status: String = sqlx::query_scalar("SELECT status::text FROM job WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "failed");
 }
 
 #[tokio::test]

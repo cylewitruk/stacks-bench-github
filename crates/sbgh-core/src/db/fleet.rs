@@ -370,6 +370,23 @@ pub trait FleetStore: Send + Sync + 'static {
 
     async fn request_cancel(&self, job_id: Uuid) -> Result<bool>;
 
+    /// Fail Slack-sourced work that has remained queued without a durable
+    /// canonical report message for at least `admission_timeout`.
+    ///
+    /// The store serializes this transition against persistence of the Slack
+    /// message timestamp. A publisher that wins that race makes the job
+    /// schedulable; an expiry that wins records a normal terminal failure.
+    async fn expire_unreported_slack_jobs(
+        &self,
+        admission_timeout: Duration,
+        remark: &str,
+    ) -> Result<Vec<Uuid>>;
+
+    /// Fail every still-queued Slack job when the daemon cannot construct its
+    /// required reporting surface. Already-running work is left to its normal
+    /// lease and recovery contract.
+    async fn fail_queued_slack_jobs_without_connector(&self, remark: &str) -> Result<Vec<Uuid>>;
+
     async fn set_all_workers_draining(&self, draining: bool) -> Result<u64>;
 
     async fn request_cancel_all(&self) -> Result<u64>;

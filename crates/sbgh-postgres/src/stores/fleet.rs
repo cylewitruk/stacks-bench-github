@@ -437,6 +437,39 @@ async fn insert_job_event(
     Ok(())
 }
 
+async fn fail_locked_queued_jobs(
+    tx: &mut Transaction<'_, Postgres>,
+    job_ids: Vec<Uuid>,
+    remark: &str,
+) -> sbgh_core::Result<Vec<Uuid>> {
+    let mut failed = Vec::with_capacity(job_ids.len());
+    for job_id in job_ids {
+        let updated = sqlx::query(
+            "UPDATE job
+                SET status = 'failed', updated_at = NOW()
+              WHERE id = $1 AND status = 'queued'",
+        )
+        .bind(job_id)
+        .execute(&mut **tx)
+        .await
+        .core()?;
+        if updated.rows_affected() != 1 {
+            continue;
+        }
+        insert_job_event(
+            tx,
+            job_id,
+            JobEventKind::Failed,
+            JobEventStatus::Fail,
+            Some(remark),
+            None,
+        )
+        .await?;
+        failed.push(job_id);
+    }
+    Ok(failed)
+}
+
 async fn expire_worker_leases(
     tx: &mut Transaction<'_, Postgres>,
     worker_id: Uuid,
@@ -1793,6 +1826,15 @@ impl FleetStore for PostgresFleetStore {
              WHERE j.status = 'queued'
                AND j.execution_payload IS NOT NULL
                AND j.git_commit_hash IS NOT NULL
+               AND (
+                   j.source <> 'slack'
+                   OR EXISTS (
+                       SELECT 1
+                         FROM task_submission_slack slack
+                        WHERE slack.task_submission_id = submission.id
+                          AND slack.report_message_ts IS NOT NULL
+                   )
+               )
                AND j.required_capability::text = ANY($1::text[])
                AND (
                    submission.required_worker_id IS NULL
@@ -2435,6 +2477,99 @@ impl FleetStore for PostgresFleetStore {
         }
         tx.commit().await.core()?;
         Ok(cancelled.rows_affected() == 1)
+    }
+
+    async fn expire_unreported_slack_jobs(
+        &self,
+        admission_timeout: Duration,
+        remark: &str,
+    ) -> sbgh_core::Result<Vec<Uuid>> {
+        let timeout_seconds = admission_timeout
+            .num_milliseconds()
+            .max(0) as f64
+            / 1_000.0;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+
+        // Lock canonical Slack provenance before the job. Message identity
+        // persistence updates the same provenance row, so exactly one side of
+        // the admission-vs-expiry race wins.
+        let mut job_ids: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT job.id
+              FROM task_submission_slack slack
+              JOIN job ON job.task_submission_id = slack.task_submission_id
+             WHERE job.source = 'slack'
+               AND job.status = 'queued'
+               AND slack.report_message_ts IS NULL
+               AND job.created_at <= NOW() - make_interval(secs => $1)
+             ORDER BY job.created_at, job.id
+             FOR UPDATE OF slack, job SKIP LOCKED
+            "#,
+        )
+        .bind(timeout_seconds)
+        .fetch_all(&mut *tx)
+        .await
+        .core()?;
+
+        // A Slack job without submission provenance is malformed and can
+        // never become reportable. It has no Slack row to race, so locking the
+        // job is sufficient.
+        let malformed: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT job.id
+              FROM job
+             WHERE job.source = 'slack'
+               AND job.status = 'queued'
+               AND job.created_at <= NOW() - make_interval(secs => $1)
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM task_submission_slack slack
+                    WHERE slack.task_submission_id = job.task_submission_id
+               )
+             ORDER BY job.created_at, job.id
+             FOR UPDATE OF job SKIP LOCKED
+            "#,
+        )
+        .bind(timeout_seconds)
+        .fetch_all(&mut *tx)
+        .await
+        .core()?;
+        job_ids.extend(malformed);
+
+        let expired = fail_locked_queued_jobs(&mut tx, job_ids, remark).await?;
+        tx.commit().await.core()?;
+        Ok(expired)
+    }
+
+    async fn fail_queued_slack_jobs_without_connector(
+        &self,
+        remark: &str,
+    ) -> sbgh_core::Result<Vec<Uuid>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let job_ids: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id
+              FROM job
+             WHERE source = 'slack'
+               AND status = 'queued'
+             ORDER BY created_at, id
+             FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .core()?;
+        let failed = fail_locked_queued_jobs(&mut tx, job_ids, remark).await?;
+        tx.commit().await.core()?;
+        Ok(failed)
     }
 
     async fn set_all_workers_draining(&self, draining: bool) -> sbgh_core::Result<u64> {

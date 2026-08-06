@@ -480,6 +480,10 @@ mod tests {
     }
 
     async fn run_openai_live_eval(fixture_name: &str) {
+        // Keep semantic prompt evaluation independent from the production
+        // request-latency policy and occasional provider latency spikes.
+        const LIVE_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
         let api_key = std::env::var("SBGH_OPENAI_API_KEY")
             .expect("set SBGH_OPENAI_API_KEY to run the real-model eval");
         let model = std::env::var("SBGH_LLM_MODEL").unwrap_or_else(|_| "gpt-5-mini".to_string());
@@ -487,7 +491,7 @@ mod tests {
             api_key,
             model,
             1_000,
-            std::time::Duration::from_secs(15),
+            LIVE_EVAL_TIMEOUT,
         ))
         .unwrap();
         let fixture = EVAL_FIXTURES

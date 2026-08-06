@@ -55,13 +55,15 @@ pub enum ProgressTarget {
     /// `None` until created / read back on re-claim, and stays `None` when
     /// `baseline_report = none` (the "report nothing" case).
     CommitCheck { check_run_id: Option<i64> },
-    /// Slack ad-hoc job (`slack_adhoc`, v5/0002) — reports into the thread on
+    /// Slack-sourced job — reports into the thread on
     /// the user's request message: `channel` is the Slack channel and
     /// `message_ts` the request's timestamp (the thread anchor + the
     /// message the status reaction is added to). No GitHub surface. Assembled
-    /// at claim time from a `slack_adhoc` job's `SlackAdhoc` queued detail.
+    /// from submission-owned Slack provenance, with a legacy queued-detail
+    /// fallback used only while assembling already-live pre-migration work.
+    /// New scheduling requires submission provenance at the fleet-store gate.
     /// `plan_message_ts` is the canonical bot message timestamp (the field
-    /// keeps its historical name), read back from `plan_message_sent` so a
+    /// keeps its historical name), read from submission-owned provenance so a
     /// reclaimed job updates the same message.
     Slack {
         channel: String,
@@ -679,43 +681,61 @@ impl JobSource {
         let progress = if job.task_kind == sbgh_core::models::TaskKind::BuildOnly {
             ProgressTarget::Silent
         } else if job.source == sbgh_core::models::JobSource::Slack {
-            // `channel`/`message_ts` are reporting provenance in the
-            // `SlackAdhoc` queued detail — a `slack_adhoc` job MUST carry it (and
-            // never falls through to a commit check).
-            let (channel, message_ts, reporting_identity) = queued
-                .as_ref()
-                .and_then(|e| e.detail.as_ref())
-                .and_then(|d| serde_json::from_value::<QueuedEventDetail>(d.clone()).ok())
-                .and_then(|d| match d {
-                    QueuedEventDetail::SlackAdhoc {
-                        channel,
-                        message_ts,
-                        reporting_identity,
-                        ..
-                    } => Some((
-                        channel.clone(),
-                        message_ts.clone(),
-                        reporting_identity.unwrap_or_else(|| {
-                            sbgh_slack::ReportingIdentity::for_request("", &channel, &message_ts)
-                                .as_str()
-                                .to_string()
-                        }),
-                    )),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "slack_adhoc job {} is missing its SlackAdhoc queued detail \
-                         (channel/message_ts)",
-                        job.id
-                    )
-                })?;
-            // Read back the canonical message timestamp so a reclaimed job
-            // resumes updating it instead of posting a duplicate.
-            let plan_message_ts = self
+            // Provider routing belongs to the submission, independently of
+            // the task-specific queued audit payload. Retain the legacy
+            // SlackAdhoc fallback only for rows predating task_submission_slack.
+            let identity = self
                 .jobs
-                .latest_plan_message_ts(job.id)
+                .submission_slack_report_identity(job.task_submission_id)
                 .await?;
+            let (channel, message_ts, reporting_identity, plan_message_ts) =
+                if let Some(identity) = identity {
+                    (
+                        identity.channel_id,
+                        identity.request_message_ts,
+                        identity.reporting_identity,
+                        identity.report_message_ts,
+                    )
+                } else {
+                    let (channel, message_ts, reporting_identity) = queued
+                        .as_ref()
+                        .and_then(|event| event.detail.as_ref())
+                        .and_then(|detail| {
+                            serde_json::from_value::<QueuedEventDetail>(detail.clone()).ok()
+                        })
+                        .and_then(|detail| match detail {
+                            QueuedEventDetail::SlackAdhoc {
+                                channel,
+                                message_ts,
+                                reporting_identity,
+                                ..
+                            } => Some((
+                                channel.clone(),
+                                message_ts.clone(),
+                                reporting_identity.unwrap_or_else(|| {
+                                    sbgh_slack::ReportingIdentity::for_request(
+                                        "",
+                                        &channel,
+                                        &message_ts,
+                                    )
+                                    .as_str()
+                                    .to_string()
+                                }),
+                            )),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Slack job {} is missing submission reporting provenance",
+                                job.id
+                            )
+                        })?;
+                    let plan_message_ts = self
+                        .jobs
+                        .latest_plan_message_ts(job.id)
+                        .await?;
+                    (channel, message_ts, reporting_identity, plan_message_ts)
+                };
             ProgressTarget::Slack {
                 channel,
                 message_ts,
