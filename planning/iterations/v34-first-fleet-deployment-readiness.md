@@ -7,8 +7,10 @@ evidence-backed deployment on real hardware. This iteration also closes the
 remaining host-verification work from v20 and v22 against the current fleet and
 snapshot-reporting architecture.
 
-> **Status:** in_progress — host-independent inventory, packaging, config, and
-> playbook work is implemented locally; real-host gates remain open.
+> **Status:** in_progress — host-independent work and the same-host substrate,
+> registration, controlled-validation, and GitHub `/validate` paths are proven.
+> Remaining provider journeys, recovery/identity drills, protocol-baseline
+> pinning, and the explicitly deferred benchmark closure remain open.
 >
 > v34 is a deployment-readiness and qualification iteration, not a new task
 > feature. Fixes discovered by the playbook are in scope; unrelated feature
@@ -247,6 +249,84 @@ HTTP/CLI and exact GitHub triggers remain provider-free.
   process-affinity capacity under-report the VM host.
 - [ ] Execute the real-host gates below.
 
+## Real-Host Progress — 2026-08-06
+
+The first deployment is a separate-process, same-host daemon/worker topology on
+`stacks-bench`. Evidence is distributed across the protected host rollback,
+backup, and worker-qualification directories; it still needs consolidation into
+the qualification record required by this iteration.
+
+### Completed evidence
+
+- [x] Created a protected rollback bundle, verified a restorable PostgreSQL
+  backup, rehearsed every pending migration against a scratch restore, and
+  retained an off-host checksum-matched backup copy.
+- [x] Installed daemon-only and worker-only artifacts without crossing their
+  ownership boundaries; the daemon has no worker libvirt/LVM/sudo authority.
+- [x] Installed a public Web-PKI IP-address certificate, verified TLS 1.3 +
+  HTTP/2 through the production worker connector, and passed Certbot's renewal
+  dry run plus the daemon certificate deployment hook.
+- [x] Qualified the managed sandbox network from a disposable guest, including
+  dependency egress and host/private/metadata/operator-address denial.
+- [x] Qualified two simultaneous writable LVM snapshots, origin and peer write
+  isolation, complete snapshot cleanup, and an inactive read-only chainstate
+  origin (`vg0/mainnet-2026-07-04`).
+- [x] Passed the combined worker's production preflight, enrolled one P-256
+  identity, and registered worker
+  `11db06ad-fe64-457b-ac2b-b495c6628989` with the intended capability
+  intersection and measurement profile.
+- [x] Completed the controlled one-block canary with one resolved Nakamoto
+  block, one processed block, promoted checksum-verified artifacts, and no
+  leaked execution resources (submission
+  `fd86d74d-5eba-4c39-80ff-48a6f2410621`, job
+  `0c9350c3-349a-4d18-9965-8b795d5b572a`, attempt
+  `33386a78-e2c3-49d8-af59-782209ad334c`).
+- [x] Completed recent block-validation canaries with exact command records,
+  command-specific stdout/stderr artifacts, trusted processed-count reduction,
+  delegated artifact upload, terminal promotion, and resource cleanup. The
+  audit canary used submission `0958e0d7-2736-4336-abee-02ee4b4bafc6`, job
+  `7a01427a-7a84-49f6-8fee-74712bdb3c14`, and attempt
+  `007d9f97-e6c7-4123-a90c-51a0cda52385`.
+- [x] Completed an explicit two-block cross-epoch canary with adjacent Epoch 2
+  and Nakamoto segments and exact trusted coverage (submission
+  `58a16d6b-eef2-4261-834f-aa710f2e2496`, job
+  `407adf75-9b59-47a0-a9db-b155c64a1c58`).
+- [x] Completed GitHub `/validate` intake from an allowed fork. Its marked PR
+  comment and `stacks-block-validation` Check Run were persisted before
+  assignment, updated in place through execution, and converged to success.
+  Canonical identities include submission
+  `e538271c-5646-4a43-94ef-fa81858b2a2e`, job
+  `2db866d1-8351-414e-8e3a-975120a9a80e`, comment `5201711352`, and Check Run
+  `92549878067`.
+
+### Open or partial gates
+
+- [ ] Consolidate the redacted host evidence into one durable qualification
+  record, including the direct S3 put/HEAD/get/checksum/delete ceremony and the
+  exact deployed revision.
+- [ ] Deliberately redeliver the successful GitHub validation input and prove
+  that its submission, comment, and Check Run identities are not duplicated.
+- [ ] Complete the Slack recent-validation journey.
+- [ ] Complete the required GitHub and Slack benchmark provider journeys. The
+  v20/v22 benchmark-progress and comparison closure remains a separate
+  fast-follow after these primary journeys.
+- [ ] Run full-history validation, cancellation, active-attempt and
+  post-terminal daemon-restart drills, worker loss during execution/cleanup,
+  and cleanup-obligation recovery.
+- [ ] Complete overlapping-key rotation, normal/emergency revocation,
+  capability/profile intersection, and restart-persistence drills.
+- [ ] Pin the first deployed protobuf semantic-digest vectors.
+- [ ] Commission a second worker host, or record its explicit deferral without
+  claiming multi-machine readiness.
+
+### Accepted finding carried into v35
+
+- [ ] Normal daemon restart does not preserve `draining`: revision-1 shutdown
+  persists a global drain and idle workers exit successfully. v34 records the
+  conservative behavior and its fencing/replay evidence; v35 (`0082`) owns the
+  non-destructive lifecycle change. This v34 deviation must be explicitly
+  rescheduled in the final qualification record rather than marked passed.
+
 ## Execution Playbook
 
 ### Phase 0: Host-Action Inventory
@@ -407,6 +487,10 @@ that the first fleet is live.
    visible cleanup obligation, and no unsafe automatic cross-worker comparison
    continuation.
 
+The daemon-restart drill records the conservative revision-1 baseline and its
+fencing/replay evidence. It does not endorse global drain/abort as the durable
+operations contract; v35 (`0082`) supersedes that lifecycle behavior.
+
 ### Phase 8: Identity and Dynamic Registry Drills
 
 - Authorize an overlapping replacement public key, restart under it, verify the
@@ -439,10 +523,10 @@ that the first fleet is live.
 - [x] Installer isolation/idempotency tests pass.
 - [x] Daemon, benchmark-worker, block-validation-worker, and combined-worker
   examples remain parse-tested.
-- [ ] Sandbox policy service starts and its live post-start verifier passes.
-- [ ] Disposable-guest network and two-snapshot LVM ceremonies pass.
-- [ ] Combined-worker preflight and database enrollment pass.
-- [ ] Controlled one-block and cross-epoch sandbox/probe canaries pass with
+- [x] Sandbox policy service starts and its live post-start verifier passes.
+- [x] Disposable-guest network and two-snapshot LVM ceremonies pass.
+- [x] Combined-worker preflight and database enrollment pass.
+- [x] Controlled one-block and cross-epoch sandbox/probe canaries pass with
   exact argv and processed-count audit evidence.
 - [ ] GitHub benchmark and validation canaries pass.
 - [ ] Slack benchmark and recent-validation canaries pass.

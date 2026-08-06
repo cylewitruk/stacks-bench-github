@@ -249,43 +249,6 @@ from older generations.
 surface command, task-specific result rendering, or redesign of the worker
 event protocol.
 
-### 0075 — Rolling worker protocol compatibility
-
-- **id:** `0075-rolling-worker-protocol-compatibility`
-- **status:** `candidate`
-- **priority:** `medium`
-- **depends_on:** `0074-protobuf-fleet-protocol`
-- **source:** v29 protocol-scope simplification (2026-07)
-
-**Problem:** v29 establishes the first published protobuf/gRPC worker contract
-with exact protocol-version matching. Once independently operated workers may
-lag a protocol-changing central deployment, exact matching would make those
-workers unavailable until upgraded.
-
-**Scope:** Before the first incompatible change to the shipped protobuf
-contract, add a bounded current/previous compatibility window, protocol
-revision and additive-feature negotiation, server-first rollout policy,
-previous-worker runtime fixtures, and schema breaking-change enforcement
-against the published v29 baseline. Persist the negotiated contract on each
-worker session and require both task capability and protocol feature support
-before offering work.
-
-**Acceptance:**
-
-- The current daemon completes the compatible fleet lifecycle with the current
-  and immediately previous supported worker.
-- An older or incompatible worker is rejected before assignment with an
-  actionable non-retryable upgrade response.
-- A worker is never offered task semantics it did not advertise.
-- CI rejects field-number reuse and other wire-breaking schema changes against
-  the published baseline.
-- Operator documentation defines the support window, server-first rollout,
-  convergence check, compatibility-floor advancement, and rollback.
-
-**Deferred / non-goals:** No indefinite support for arbitrary historical
-workers, daemon-pushed scheduling, multi-orchestrator HA, or requirement for a
-second worker implementation language.
-
 ### 0081 — Cross-owner source-policy slug resolution
 
 - **id:** `0081-cross-owner-source-policy-slug-resolution`
@@ -323,6 +286,42 @@ is unavailable.
 **Deferred / non-goals:** No generalized alias engine, inferred trust for all
 forks, automatic source-policy expansion, or removal of the numeric recovery
 path.
+
+### 0083 — Multi-orchestrator high availability
+
+- **id:** `0083-multi-orchestrator-high-availability`
+- **status:** `candidate`
+- **priority:** `medium`
+- **depends_on:** `0075-rolling-worker-protocol-compatibility`,
+  `0082-seamless-fleet-lifecycle-maintenance`
+- **source:** v35 seamless fleet lifecycle planning (2026-08)
+
+**Problem:** v35 removes fleet-wide side effects from a daemon restart, but one
+central daemon still creates a brief intake, heartbeat, and reporting outage.
+Longer daemon or host failures may exceed worker leases even when the database
+remains healthy.
+
+**Scope:** Run at least two API/gRPC daemon replicas behind one stable endpoint
+with PostgreSQL-backed leader election for singleton coordinator duties.
+Define ownership and failover for scheduling, expiry, webhook processing,
+provider projection, Slack Socket Mode, certificate rotation, and schema
+migration. Preserve the pull protocol, database fencing, and provider
+idempotency contracts.
+
+**Acceptance:**
+
+- Removing the active daemon replica does not lapse healthy worker leases or
+  make authenticated intake unavailable.
+- Exactly one leader performs singleton scheduling/expiry duties at a time,
+  and failover cannot duplicate offers, terminals, or provider mutations.
+- A rolling daemon deployment keeps at least one compatible replica ready and
+  advances schema/protocol floors only after every serving replica is safe.
+- Operations documentation covers replica health, leadership, failover,
+  certificate handling, rollback, and split-brain diagnostics.
+
+**Deferred / non-goals:** No PostgreSQL HA, multi-region consensus, active
+worker push, or replacement of the database as the authority for leases and
+fencing.
 
 *`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
 model: source / intent / task_kind / build_target / derived report; build-only

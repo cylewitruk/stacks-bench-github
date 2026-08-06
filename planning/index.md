@@ -92,13 +92,15 @@ need editing when an item's status or location changes.
 | `0072-pre-attempt-terminal-projection` | Pre-attempt terminal projection | `candidate` | [backlog.md](backlog.md) |
 | `0073-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
 | `0074-protobuf-fleet-protocol` | Protobuf worker protocol | `shipped` | [archive/completed/0074-protobuf-fleet-protocol.md](archive/completed/0074-protobuf-fleet-protocol.md) |
-| `0075-rolling-worker-protocol-compatibility` | Rolling worker protocol compatibility | `candidate` | [backlog.md](backlog.md) |
+| `0075-rolling-worker-protocol-compatibility` | Rolling worker protocol compatibility | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0076-database-backed-worker-registry` | Database-backed worker registry | `shipped` | [archive/completed/0076-database-backed-worker-registry.md](archive/completed/0076-database-backed-worker-registry.md) |
 | `0077-worker-identity-and-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
 | `0078-slack-task-submission` | Slack task submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
 | `0079-dynamic-block-validation-planning` | Dynamic block-validation planning | `shipped` | [archive/completed/0079-dynamic-block-validation-planning.md](archive/completed/0079-dynamic-block-validation-planning.md) |
 | `0080-first-fleet-deployment-qualification` | First fleet deployment qualification | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
 | `0081-cross-owner-source-policy-slug-resolution` | Cross-owner source-policy slug resolution | `backlog` | [backlog.md](backlog.md) |
+| `0082-seamless-fleet-lifecycle-maintenance` | Seamless fleet lifecycle and maintenance | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
+| `0083-multi-orchestrator-high-availability` | Multi-orchestrator high availability | `candidate` | [backlog.md](backlog.md) |
 
 ## Iterations
 
@@ -139,6 +141,7 @@ need editing when an item's status or location changes.
 | `v32-task-aware-slack-submission` | Task-aware Slack submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
 | `v33-dynamic-block-validation-planning` | Dynamic block-validation planning | `shipped` | [archive/completed/0079-dynamic-block-validation-planning.md](archive/completed/0079-dynamic-block-validation-planning.md) |
 | `v34-first-fleet-deployment-readiness` | First fleet deployment readiness | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
+| `v35-seamless-fleet-lifecycle` | Seamless fleet lifecycle and rolling maintenance | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 
 ## Decisions
 
@@ -149,6 +152,7 @@ need editing when an item's status or location changes.
 | `0003-artifact-export-failure-not-benchmark-failure` | Export-fail ≠ bench-fail | `accepted` | [decisions/0003-artifact-export-failure-not-benchmark-failure.md](decisions/0003-artifact-export-failure-not-benchmark-failure.md) |
 | `0004-protobuf-fleet-protocol` | Protobuf/gRPC worker fleet protocol | `accepted` | [decisions/0004-protobuf-fleet-protocol.md](decisions/0004-protobuf-fleet-protocol.md) |
 | `0005-public-key-worker-identities` | Public-key worker identities | `accepted` | [decisions/0005-public-key-worker-identities.md](decisions/0005-public-key-worker-identities.md) |
+| `0006-fleet-lifecycle-state-separation` | Fleet lifecycle state separation | `draft` | [decisions/0006-fleet-lifecycle-state-separation.md](decisions/0006-fleet-lifecycle-state-separation.md) |
 
 > Migration complete: every `docs/roadmap-vN.md` is a tombstone. Living designs
 > remain under `design/`; shipped records live in the completed archive.

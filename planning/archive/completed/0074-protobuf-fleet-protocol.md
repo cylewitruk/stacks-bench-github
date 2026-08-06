@@ -11,8 +11,8 @@ preserve the pull scheduler and attempt state machine.
 > v29 establishes the transport for the current centrally coordinated fleet.
 > Daemon and workers continue to require one exact protocol version.
 > Rolling multi-version compatibility is deferred to
-> [`0075`](../../backlog.md) and is required before the first incompatible change
-> to the published protobuf contract.
+> `0075-rolling-worker-protocol-compatibility` and is required before the first
+> incompatible change to the published protobuf contract.
 
 ## Item
 
