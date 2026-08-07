@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{FoundMessage, ReportingIdentity, Result, SlackClient, SlackError, SlackMessageTarget};
 
@@ -43,16 +43,27 @@ impl WebApiClient {
             .json(&body)
             .send()
             .await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(SlackError::HttpStatus {
-                method: method.to_string(),
-                status,
-            });
-        }
-        let parsed: SlackApiResponse = response.json().await?;
-        validate_envelope(method, parsed.ok, parsed.error.as_deref())?;
-        Ok(parsed)
+        parse_response(method, response).await
+    }
+
+    async fn call_get(&self, method: &str, query: &RepliesRequest<'_>) -> Result<SlackApiResponse> {
+        let mut url = reqwest::Url::parse(&format!("{}/{method}", self.api_base))
+            .map_err(|error| SlackError::Protocol(format!("invalid Slack API URL: {error}")))?;
+        url.query_pairs_mut()
+            .append_pair("channel", query.channel)
+            .append_pair("ts", query.ts)
+            .append_pair("limit", &query.limit.to_string())
+            .append_pair(
+                "include_all_metadata",
+                if query.include_all_metadata { "true" } else { "false" },
+            );
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await?;
+        parse_response(method, response).await
     }
 
     async fn bot_user_id(&self) -> Result<String> {
@@ -61,6 +72,19 @@ impl WebApiClient {
             .user_id
             .ok_or_else(|| SlackError::Protocol("auth.test returned ok but no user_id".into()))
     }
+}
+
+async fn parse_response(method: &str, response: reqwest::Response) -> Result<SlackApiResponse> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(SlackError::HttpStatus {
+            method: method.to_string(),
+            status,
+        });
+    }
+    let parsed: SlackApiResponse = response.json().await?;
+    validate_envelope(method, parsed.ok, parsed.error.as_deref())?;
+    Ok(parsed)
 }
 
 fn validate_envelope(method: &str, ok: bool, error: Option<&str>) -> Result<()> {
@@ -86,13 +110,21 @@ fn metadata(identity: &ReportingIdentity, snapshot_version: u64) -> serde_json::
     })
 }
 
-fn replies_request(target: &SlackMessageTarget) -> serde_json::Value {
-    serde_json::json!({
-        "channel": target.channel,
-        "ts": target.thread_ts,
-        "limit": REPLIES_PAGE_LIMIT,
-        "include_all_metadata": true,
-    })
+#[derive(Debug, Serialize)]
+struct RepliesRequest<'a> {
+    channel: &'a str,
+    ts: &'a str,
+    limit: u64,
+    include_all_metadata: bool,
+}
+
+fn replies_request(target: &SlackMessageTarget) -> RepliesRequest<'_> {
+    RepliesRequest {
+        channel: &target.channel,
+        ts: &target.thread_ts,
+        limit: REPLIES_PAGE_LIMIT,
+        include_all_metadata: true,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,7 +229,7 @@ impl SlackClient for WebApiClient {
     ) -> Result<Vec<FoundMessage>> {
         let bot_user_id = self.bot_user_id().await?;
         let response = self
-            .call("conversations.replies", replies_request(target))
+            .call_get("conversations.replies", &replies_request(target))
             .await?;
         if response.has_more {
             return Err(SlackError::Reconciliation(format!(
@@ -248,7 +280,40 @@ impl SlackClient for WebApiClient {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
     use super::*;
+
+    fn serve_json(listener: &TcpListener, body: &str) -> String {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .unwrap();
+        loop {
+            let mut header = String::new();
+            reader
+                .read_line(&mut header)
+                .unwrap();
+            if header == "\r\n" || header.is_empty() {
+                break;
+            }
+        }
+        write!(
+            reader.get_mut(),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        request_line
+            .trim_end()
+            .to_string()
+    }
 
     #[test]
     fn logical_api_failure_preserves_method_and_error_code() {
@@ -283,13 +348,60 @@ mod tests {
             thread_ts: "1.2".into(),
         };
         assert_eq!(
-            replies_request(&target),
+            serde_json::to_value(replies_request(&target)).unwrap(),
             serde_json::json!({
                 "channel": "C1",
                 "ts": "1.2",
                 "limit": 15,
                 "include_all_metadata": true,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn replies_lookup_uses_get_with_query_parameters() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let auth = serve_json(&listener, r#"{"ok":true,"user_id":"B1"}"#);
+            let replies = serve_json(&listener, r#"{"ok":true,"messages":[],"has_more":false}"#);
+            (auth, replies)
+        });
+        let client = WebApiClient {
+            http: reqwest::Client::new(),
+            bot_token: "xoxb-test".into(),
+            api_base: format!("http://{address}"),
+        };
+        let target = SlackMessageTarget {
+            channel: "C1".into(),
+            thread_ts: "1.2".into(),
+        };
+
+        assert_eq!(
+            client
+                .find_messages(&target, &ReportingIdentity::for_request("T1", "C1", "1.2"),)
+                .await
+                .unwrap(),
+            Vec::<FoundMessage>::new()
+        );
+
+        let (auth, replies) = server.join().unwrap();
+        assert_eq!(auth, "POST /auth.test HTTP/1.1");
+        let request_target = replies
+            .strip_prefix("GET ")
+            .and_then(|line| line.strip_suffix(" HTTP/1.1"))
+            .expect("conversations.replies must use GET");
+        let url = reqwest::Url::parse(&format!("http://slack.test{request_target}")).unwrap();
+        assert_eq!(url.path(), "/conversations.replies");
+        assert_eq!(
+            url.query_pairs()
+                .collect::<std::collections::HashMap<_, _>>(),
+            std::collections::HashMap::from([
+                ("channel".into(), "C1".into()),
+                ("ts".into(), "1.2".into()),
+                ("limit".into(), "15".into()),
+                ("include_all_metadata".into(), "true".into()),
+            ])
         );
     }
 }
