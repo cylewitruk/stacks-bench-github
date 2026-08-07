@@ -391,6 +391,27 @@ cleanup obligation remains; replacement invalidates every outstanding lease.
 
 ## Deploy an application update
 
+### Worker-only update
+
+For a wire-compatible worker update on a host that also has authenticated
+operator CLI access, run from the updated checkout:
+
+```bash
+sudo ./scripts/update-worker-host.sh
+```
+
+The script derives the configured worker identity, drains only that worker,
+waits for its attempt plus fleet cleanup and reliable events to quiesce, stops
+the local instance, builds and installs `sbgh-worker`, runs preflight and the
+production registration check while still drained, then undrains and verifies
+the worker is online. Failure after draining leaves it drained and, once
+quiescent, stopped. Use `--profile NAME` for another local instance,
+`--timeout-secs N` for long-running attempts, or `--no-build` for an existing
+release binary.
+
+This workflow does not update or restart the daemon. Use the coordinated update
+for protocol, schema, or daemon-and-worker changes.
+
 ### Daemon-only update on the combined host
 
 For a daemon-only, wire-compatible update while the deployment has exactly one
