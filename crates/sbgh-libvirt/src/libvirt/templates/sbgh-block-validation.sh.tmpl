@@ -49,6 +49,8 @@ import signal
 import subprocess
 import time
 
+{{ block_validation_progress }}
+
 RESULTS = "/results"
 PLAN_PATH = RESULTS + "/block-plan.json"
 BIN = "/opt/stacks-core/target/release/stacks-inspect"
@@ -226,6 +228,10 @@ pending = list(ranges)
 active = {}
 finished = []
 started = time.monotonic()
+last_progress_blocks = -1
+last_progress_shards = -1
+last_progress_emit = 0.0
+progress_emit_interval = 5.0
 limit = min(int(plan["max_concurrency"]), len(ranges))
 if limit <= 0:
     raise RuntimeError("max_concurrency must be non-zero")
@@ -265,6 +271,84 @@ def start_command(state):
     state["stdout"] = stdout_handle
     state["stderr"] = stderr_handle
     state["current_command"] = audit
+    state["progress_offset"] = 0
+    state["progress_pending"] = b""
+    state["current_command_progress"] = 0
+    state["saw_live_progress"] = False
+
+def drain_command_progress(state, drain_all=False):
+    audit = state["current_command"]
+    expected_total = audit["end_exclusive"] - audit["start"]
+    path = RESULTS + "/" + audit["stdout_file"]
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(state["progress_offset"])
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                state["progress_offset"] += len(chunk)
+                pending_tail, current = parse_progress_chunk(
+                    state["progress_pending"], chunk, expected_total
+                )
+                state["progress_pending"] = pending_tail
+                if current is not None:
+                    state["saw_live_progress"] = True
+                    state["current_command_progress"] = max(
+                        state["current_command_progress"], current
+                    )
+                if not drain_all:
+                    break
+    except FileNotFoundError:
+        return
+
+def warn_missing_live_progress(state, command_record):
+    if command_record["exit_code"] not in (0, 1) or state["saw_live_progress"]:
+        return
+    print("SBGH_BLOCK_VALIDATION_PROGRESS_WARNING " + json.dumps({
+        "shard": state["index"],
+        "ordinal": command_record["ordinal"],
+        "kind": command_record["kind"],
+        "expected_total": command_record["end_exclusive"] - command_record["start"],
+        "reason": "no parseable live progress samples",
+    }, sort_keys=True, separators=(",", ":")), flush=True)
+
+def emit_progress(force=False):
+    global last_progress_blocks, last_progress_shards, last_progress_emit
+    finished_ranges = [
+        (item["start"], item["end"])
+        for item in finished
+        if all(command["exit_code"] in (0, 1) for command in item["commands"])
+    ]
+    active_counts = [
+        state["completed_command_blocks"] + state["current_command_progress"]
+        for state in active.values()
+    ]
+    current = aggregate_block_progress(finished_ranges, active_counts, count)
+    completed_shards = len(finished_ranges)
+    now = time.monotonic()
+    if current < last_progress_blocks:
+        current = last_progress_blocks
+    if current == last_progress_blocks and completed_shards == last_progress_shards:
+        return
+    if not force and now - last_progress_emit < progress_emit_interval:
+        return
+    with open(RESULTS + "/run.progress.jsonl", "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "schema_version": 1,
+            "event_type": "progress",
+            "event_version": 1,
+            "progress": {
+                "phase": "validate",
+                "current": current,
+                "total": count,
+                "message": f"shards {completed_shards}/{len(ranges)} complete",
+            },
+        }, separators=(",", ":")) + "\n")
+        handle.flush()
+    last_progress_blocks = current
+    last_progress_shards = completed_shards
+    last_progress_emit = now
 
 while pending or active:
     if time.monotonic() - started > int(plan["timeout_secs"]):
@@ -281,20 +365,27 @@ while pending or active:
             "end": global_end,
             "pending_commands": commands,
             "commands": [],
+            "completed_command_blocks": 0,
         }
         start_command(state)
         active[index] = state
     completed = []
     for index, state in active.items():
+        drain_command_progress(state)
         exit_code = state["process"].poll()
         if exit_code is None:
             continue
         state["stdout"].close()
         state["stderr"].close()
+        drain_command_progress(state, drain_all=True)
         command_record = state.pop("current_command")
         command_record["exit_code"] = exit_code
         state["commands"].append(command_record)
+        warn_missing_live_progress(state, command_record)
         if exit_code in (0, 1) and state["pending_commands"]:
+            state["completed_command_blocks"] += (
+                command_record["end_exclusive"] - command_record["start"]
+            )
             start_command(state)
             continue
         finished.append({
@@ -307,20 +398,9 @@ while pending or active:
     for index in completed:
         del active[index]
     if completed:
-        checked = sum(item["end"] - item["start"] + 1 for item in finished)
-        with open(RESULTS + "/run.progress.jsonl", "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({
-                "schema_version": 1,
-                "event_type": "progress",
-                "event_version": 1,
-                "progress": {
-                    "phase": "validate",
-                    "current": len(finished),
-                    "total": len(ranges),
-                    "message": f"checked {checked} blocks",
-                },
-            }, separators=(",", ":")) + "\n")
+        emit_progress(force=True)
     else:
+        emit_progress()
         time.sleep(0.2)
 
 finished.sort(key=lambda item: item["index"])

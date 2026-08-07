@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use crate::{FoundMessage, Result, SlackClient, SlackError};
 
 const BAR_WIDTH: u64 = 20;
+const MAX_PROGRESS_MESSAGE_CHARS: usize = 160;
 const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Stable opaque identity embedded in Slack message metadata.
@@ -100,6 +101,7 @@ pub struct SlackProgress {
     pub label: String,
     pub current: u64,
     pub total: Option<u64>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,23 +174,40 @@ pub fn render_snapshot(view: &SlackProgressView) -> String {
     }
 
     if view.phase.is_some() || view.progress.is_some() {
-        out.push_str("\n```text\n");
+        out.push_str("\n```\n");
         if let Some(progress) = &view.progress {
             let (current, total) = bounded_progress(progress.current, progress.total);
             let label = fixed_label(&progress.label);
             match total {
                 Some(total) => {
-                    let filled = current.saturating_mul(BAR_WIDTH) / total.max(1);
+                    let filled = u64::try_from(
+                        u128::from(current).saturating_mul(u128::from(BAR_WIDTH))
+                            / u128::from(total),
+                    )
+                    .unwrap_or(BAR_WIDTH)
+                    .min(BAR_WIDTH);
+                    let percentage =
+                        u64::try_from(u128::from(current).saturating_mul(100) / u128::from(total))
+                            .unwrap_or(100);
                     let _ = writeln!(
                         out,
-                        "{label} [{}{}] {current}/{total}",
+                        "{label} [{}{}] {}/{} ({percentage}%)",
                         "█".repeat(filled as usize),
                         "░".repeat((BAR_WIDTH - filled) as usize),
+                        thousands(current),
+                        thousands(total),
                     );
                 }
                 None => {
                     let _ = writeln!(out, "{label} {}", thousands(current));
                 }
+            }
+            if let Some(message) = progress.message.as_deref() {
+                let message: String = literal_code(message)
+                    .chars()
+                    .take(MAX_PROGRESS_MESSAGE_CHARS)
+                    .collect();
+                let _ = writeln!(out, "{:<16} {message}", "Detail");
             }
         } else if let Some(phase) = view.phase.as_deref() {
             let _ = writeln!(out, "{:<16} {}", "Phase", literal_code(phase));
@@ -698,6 +717,7 @@ mod tests {
                 label: "replay".into(),
                 current: 25,
                 total: Some(100),
+                message: Some("shards 1/4 complete".into()),
             }),
             run: Some(RunPosition { current: 1, total: 2 }),
             details: vec!["@channel done".into()],
@@ -717,8 +737,9 @@ mod tests {
     fn renderer_is_deterministic_aligned_and_literal() {
         let rendered = render_snapshot(&view(1, SlackStatus::Running));
         assert_eq!(rendered, render_snapshot(&view(1, SlackStatus::Running)));
-        assert!(rendered.contains("```text\n"));
-        assert!(rendered.contains("[█████░░░░░░░░░░░░░░░] 25/100"));
+        assert!(!rendered.contains("```text\n"));
+        assert!(rendered.contains("[█████░░░░░░░░░░░░░░░] 25/100 (25%)"));
+        assert!(rendered.contains("Detail           shards 1/4 complete"));
         assert!(!rendered.contains("<@U1>"));
         assert!(!rendered.contains("@channel"));
         assert_eq!(
@@ -750,6 +771,30 @@ mod tests {
                 "{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn renderer_bounds_and_sanitizes_progress_detail() {
+        let mut snapshot = view(1, SlackStatus::Running);
+        snapshot
+            .progress
+            .as_mut()
+            .unwrap()
+            .message = Some(format!("{}<!channel>\n```", "x".repeat(200)));
+
+        let rendered = render_snapshot(&snapshot);
+        let detail = rendered
+            .lines()
+            .find(|line| line.starts_with("Detail"))
+            .unwrap();
+        assert_eq!(detail.chars().count(), 16 + 1 + MAX_PROGRESS_MESSAGE_CHARS);
+        assert!(!rendered.contains("<!channel>"));
+        assert_eq!(
+            rendered
+                .matches("```")
+                .count(),
+            2
+        );
     }
 
     #[test]

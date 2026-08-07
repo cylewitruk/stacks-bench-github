@@ -822,8 +822,8 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     .unwrap();
     std::fs::write(
         results.join("run.progress.jsonl"),
-        br#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":1,"total":2,"message":"checked 2 blocks"}}
-{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":2,"total":2,"message":"checked 3 blocks"}}
+        br#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":2,"total":3,"message":"shards 1/2 complete"}}
+{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":3,"total":3,"message":"shards 2/2 complete"}}
 "#,
     )
     .unwrap();
@@ -1026,18 +1026,18 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
                 run_index: 0,
                 requested_run_count: 1,
                 phase: "validate".into(),
-                progress: 1,
-                total: Some(2),
-                message: Some("checked 2 blocks".into()),
+                progress: 2,
+                total: Some(3),
+                message: Some("shards 1/2 complete".into()),
             },
             ProgressUpdate {
                 workflow_step: WorkflowStep::Run,
                 run_index: 0,
                 requested_run_count: 1,
                 phase: "validate".into(),
-                progress: 2,
-                total: Some(2),
-                message: Some("checked 3 blocks".into()),
+                progress: 3,
+                total: Some(3),
+                message: Some("shards 2/2 complete".into()),
             },
         ]
     );

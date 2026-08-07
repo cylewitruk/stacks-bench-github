@@ -55,6 +55,7 @@ const BUILD_SCRIPT: &str = include_str!("templates/sbgh-build.sh.tmpl");
 const CALIBRATE_SCRIPT: &str = include_str!("templates/sbgh-calibrate.sh.tmpl");
 const BENCH_SCRIPT: &str = include_str!("templates/sbgh-bench.sh.tmpl");
 const BLOCK_VALIDATION_SCRIPT: &str = include_str!("templates/sbgh-block-validation.sh.tmpl");
+const BLOCK_VALIDATION_PROGRESS: &str = include_str!("templates/block_validation_progress.py");
 
 impl CloudInitArtifacts {
     pub async fn build(
@@ -115,12 +116,14 @@ pub async fn build_block_validation_iso(
     job_dir: &Path,
     attempt_id: &str,
 ) -> anyhow::Result<PathBuf> {
+    let script = BLOCK_VALIDATION_SCRIPT
+        .replace("{{ block_validation_progress }}", BLOCK_VALIDATION_PROGRESS);
     pack_iso(
         shell,
         paths,
         job_dir,
         "block-validation",
-        &wrap_in_cloud_config(BLOCK_VALIDATION_SCRIPT, "sbgh-block-validation.sh"),
+        &wrap_in_cloud_config(&script, "sbgh-block-validation.sh"),
         &meta_data_for_phase(attempt_id, "block-validation"),
     )
     .await
@@ -337,7 +340,9 @@ mod tests {
 
     #[test]
     fn block_validation_guest_script_enforces_the_sandbox_contract() {
-        let rendered = wrap_in_cloud_config(BLOCK_VALIDATION_SCRIPT, "sbgh-block-validation.sh");
+        let script = BLOCK_VALIDATION_SCRIPT
+            .replace("{{ block_validation_progress }}", BLOCK_VALIDATION_PROGRESS);
+        let rendered = wrap_in_cloud_config(&script, "sbgh-block-validation.sh");
         assert!(rendered.contains("cargo build --locked --release --package stacks-inspect"));
         assert!(rendered.contains("chown -R root:root \"$SRC\""));
         assert!(
@@ -364,6 +369,13 @@ mod tests {
         assert!(rendered.contains("NETWORK_DATA_DIR = \"mainnet\""));
         assert!(rendered.contains("database_paths[shard] = database_path"));
         assert!(rendered.contains("stderr_tail={diagnostic_tail(completed.stderr)!r}"));
+        assert!(rendered.contains("parse_progress_chunk"));
+        assert!(rendered.contains("aggregate_block_progress"));
+        assert!(rendered.contains("drain_command_progress(state, drain_all=True)"));
+        assert!(rendered.contains("command_record[\"end_exclusive\"] - command_record[\"start\"]"));
+        assert!(rendered.contains("SBGH_BLOCK_VALIDATION_PROGRESS_WARNING"));
+        assert!(rendered.contains("shards {completed_shards}/{len(ranges)} complete"));
+        assert!(!rendered.contains("{{ block_validation_progress }}"));
         assert!(!rendered.contains(".sbgh-dataset-manifest.json"));
         assert!(rendered.contains("block-validation-result.json"));
         assert!(rendered.contains("os.replace"));

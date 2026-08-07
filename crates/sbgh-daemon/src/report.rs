@@ -55,6 +55,7 @@ const PR_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INVALID_BLOCKS: usize = 20;
 const MAX_INVALID_BLOCK_CHARS: usize = 96;
 const MAX_INVALID_REASON_CHARS: usize = 240;
+const MAX_PROGRESS_MESSAGE_CHARS: usize = 160;
 
 pub(crate) fn check_name(task_kind: TaskKind) -> Option<&'static str> {
     match task_kind {
@@ -907,12 +908,42 @@ fn humanize_phase(label: &PhaseLabel) -> String {
 }
 
 fn format_progress_summary(progress: &ProgressUpdate) -> String {
-    match progress.total {
+    let summary = match progress.total {
         Some(total) if total > 0 => {
-            format!("{}: {} / {}", progress.phase, thousands(progress.progress), thousands(total))
+            let current = progress.progress.min(total);
+            let percentage =
+                u64::try_from(u128::from(current).saturating_mul(100) / u128::from(total))
+                    .unwrap_or(100);
+            format!(
+                "{}: {} / {} ({}%)",
+                progress.phase,
+                thousands(current),
+                thousands(total),
+                percentage,
+            )
         }
         _ => format!("{}: {}", progress.phase, thousands(progress.progress)),
+    };
+    match progress
+        .message
+        .as_deref()
+        .map(safe_progress_message)
+        .filter(|message| !message.is_empty())
+    {
+        Some(message) => format!("{summary} — `{message}`"),
+        None => summary,
     }
+}
+
+fn safe_progress_message(message: &str) -> String {
+    message
+        .replace(['\r', '\n'], " ")
+        .replace('`', "'")
+        .replace('<', "‹")
+        .replace('>', "›")
+        .chars()
+        .take(MAX_PROGRESS_MESSAGE_CHARS)
+        .collect()
 }
 
 /// Trim an error chain to something safe to show a PR author: the first
@@ -1468,13 +1499,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| matches!(c, FakeCall::UpdateComment { body, .. } if body.contains("replay: 42 / 100"))),
+            .any(|c| matches!(c, FakeCall::UpdateComment { body, .. } if body.contains("replay: 42 / 100 (42%) — `Replaying measured entries`"))),
             "comment updated with latest progress"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| matches!(c, FakeCall::UpdateCheckRun { output, .. } if output.summary.contains("replay: 42 / 100"))),
+            .any(|c| matches!(c, FakeCall::UpdateCheckRun { output, .. } if output.summary.contains("replay: 42 / 100 (42%) — `Replaying measured entries`"))),
             "check updated with latest progress"
         );
     }

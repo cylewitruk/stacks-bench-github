@@ -85,6 +85,12 @@ The terminal reducer independently reconstructs the expected argv and requires
 the command's final `Validating: 100% (N/N)` count to equal its trusted
 half-open range. These records are audit evidence for accidental orchestration
 drift; they are not cryptographic attestation of repository-built guest code.
+While validation runs, the guest tails each command's bounded stdout and emits
+monotonic, block-weighted progress across all active shards. GitHub and Slack
+show `processed/selected (percent)` plus completed shards. This live telemetry
+is best effort; only the terminal reducer determines the validation result.
+If a completed command contains no parseable live samples, its console records
+one `SBGH_BLOCK_VALIDATION_PROGRESS_WARNING` for canary diagnostics.
 
 ## Coordinated protocol deployment
 

@@ -402,6 +402,7 @@ impl ReportSurface for SlackReportSurface {
                     label: progress.phase.clone(),
                     current: progress.progress,
                     total: progress.total,
+                    message: progress.message.clone(),
                 });
             }
         }
@@ -451,6 +452,7 @@ impl ReportSurface for SlackReportSurface {
             label: progress.phase.clone(),
             current: progress.progress,
             total: progress.total,
+            message: progress.message.clone(),
         };
         self.session
             // Fine progress is explicitly best-effort and may coalesce behind
