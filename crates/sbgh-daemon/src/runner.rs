@@ -860,8 +860,16 @@ impl Coordinator {
                 .clone(),
             job,
         )
-        .queue_position(ahead, total)
+        .try_queue_position(ahead, total)
         .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                job_id = %job.id,
+                error = ?error,
+                "queue-position: Slack snapshot update failed (non-fatal)"
+            );
+            false
+        })
     }
 
     /// Create-or-update the queued job's position Check Run (`in_progress`

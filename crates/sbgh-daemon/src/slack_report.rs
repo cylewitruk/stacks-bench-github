@@ -263,9 +263,8 @@ impl SlackReportSurface {
     /// Refresh a pre-claim queue position through the same versioned session
     /// used by the reporter. If claim/start wins the race, the status check
     /// refuses to project queued state over a newer lifecycle phase.
-    pub async fn queue_position(&self, ahead: usize, total: usize) -> bool {
-        match self
-            .session
+    pub async fn try_queue_position(&self, ahead: usize, total: usize) -> sbgh_slack::Result<bool> {
+        self.session
             .try_mutate(PublishUrgency::Immediate, |view| {
                 if view.status != SlackStatus::Queued {
                     return false;
@@ -274,17 +273,6 @@ impl SlackReportSurface {
                 true
             })
             .await
-        {
-            Ok(updated) => updated,
-            Err(error) => {
-                tracing::warn!(
-                    job_id = %self.job.id,
-                    error = ?error,
-                    "queue-position: Slack snapshot update failed (non-fatal)"
-                );
-                false
-            }
-        }
     }
 
     async fn react(&self, remove: &str, add: &str) {

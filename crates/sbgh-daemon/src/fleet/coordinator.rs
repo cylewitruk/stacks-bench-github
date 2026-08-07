@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use sbgh_core::bench_args::{ResolvedBenchArgs, resolve_bench_args, workload_key};
@@ -27,6 +27,46 @@ const SLACK_REPORTING_TIMEOUT_REMARK: &str =
     "Slack reporting admission timed out before a canonical message became durable";
 const SLACK_CONNECTOR_UNAVAILABLE_REMARK: &str =
     "Slack reporting admission failed because the daemon has no Slack connector";
+const SLACK_QUEUE_RETRY_INITIAL: Duration = Duration::from_secs(15);
+const SLACK_QUEUE_RETRY_MAX: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct SlackQueueProjectionState {
+    last_successful_position: Option<usize>,
+    consecutive_failures: u32,
+    retry_not_before: Option<Instant>,
+}
+
+impl SlackQueueProjectionState {
+    fn should_attempt(&self, position: usize, now: Instant) -> bool {
+        if self.last_successful_position == Some(position) {
+            return false;
+        }
+        self.retry_not_before
+            .is_none_or(|retry_at| now >= retry_at)
+    }
+
+    fn record_success(&mut self, position: usize) {
+        self.last_successful_position = Some(position);
+        self.consecutive_failures = 0;
+        self.retry_not_before = None;
+    }
+
+    fn record_failure(&mut self, now: Instant) -> Duration {
+        self.consecutive_failures = self
+            .consecutive_failures
+            .saturating_add(1);
+        let shift = self
+            .consecutive_failures
+            .saturating_sub(1)
+            .min(2);
+        let delay = SLACK_QUEUE_RETRY_INITIAL
+            .saturating_mul(1_u32 << shift)
+            .min(SLACK_QUEUE_RETRY_MAX);
+        self.retry_not_before = Some(now + delay);
+        delay
+    }
+}
 
 pub struct FleetCoordinator {
     config: Arc<DaemonConfig>,
@@ -40,7 +80,7 @@ pub struct FleetCoordinator {
     app_id: Arc<OnceCell<i64>>,
     slack_sessions: Arc<SlackSessionRegistry>,
     surfaces: Mutex<HashMap<Uuid, Arc<dyn ReportSurface>>>,
-    last_queue_positions: Mutex<HashMap<Uuid, usize>>,
+    slack_queue_projection: Mutex<HashMap<Uuid, SlackQueueProjectionState>>,
 }
 
 pub struct FleetCoordinatorDependencies {
@@ -67,7 +107,7 @@ impl FleetCoordinator {
             app_id: Arc::new(OnceCell::new()),
             slack_sessions: Arc::new(SlackSessionRegistry::new()),
             surfaces: Mutex::new(HashMap::new()),
-            last_queue_positions: Mutex::new(HashMap::new()),
+            slack_queue_projection: Mutex::new(HashMap::new()),
         }
     }
 
@@ -239,35 +279,49 @@ impl FleetCoordinator {
             }
             let ahead = in_flight + index;
             seen.insert(job.id);
-            if self
-                .last_queue_positions
+            let now = Instant::now();
+            if !self
+                .slack_queue_projection
                 .lock()
                 .await
                 .get(&job.id)
-                == Some(&ahead)
+                .is_none_or(|state| state.should_attempt(ahead, now))
             {
                 continue;
             }
             let Some(slack) = &self.slack else {
                 continue;
             };
-            let updated = crate::slack_report::build_slack_surface(
+            let result = crate::slack_report::build_slack_surface(
                 slack.clone(),
                 self.slack_sessions.clone(),
                 self.jobs.clone(),
                 self.artifacts.clone(),
                 job,
             )
-            .queue_position(ahead, total)
+            .try_queue_position(ahead, total)
             .await;
-            if updated {
-                self.last_queue_positions
-                    .lock()
-                    .await
-                    .insert(job.id, ahead);
+            let mut projection = self
+                .slack_queue_projection
+                .lock()
+                .await;
+            let state = projection
+                .entry(job.id)
+                .or_default();
+            match result {
+                Ok(_) => state.record_success(ahead),
+                Err(error) => {
+                    let retry_after = state.record_failure(Instant::now());
+                    tracing::warn!(
+                        job_id = %job.id,
+                        retry_after_secs = retry_after.as_secs(),
+                        error = ?error,
+                        "queue-position: Slack snapshot update failed; backing off",
+                    );
+                }
             }
         }
-        self.last_queue_positions
+        self.slack_queue_projection
             .lock()
             .await
             .retain(|job_id, _| seen.contains(job_id));
@@ -730,5 +784,48 @@ fn sqlite_seed_key(job: &RunnableJob) -> Option<String> {
         Some(submission_artifact_key(&job.submission_artifact_prefix, SUBMISSION_SQLITE_RELATIVE))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slack_queue_projection_retries_with_bounded_backoff() {
+        let started = Instant::now();
+        let mut state = SlackQueueProjectionState::default();
+
+        assert!(state.should_attempt(0, started));
+        assert_eq!(state.record_failure(started), Duration::from_secs(15));
+        assert!(!state.should_attempt(0, started + Duration::from_secs(14)));
+        assert!(state.should_attempt(0, started + Duration::from_secs(15)));
+
+        assert_eq!(
+            state.record_failure(started + Duration::from_secs(15)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            state.record_failure(started + Duration::from_secs(45)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            state.record_failure(started + Duration::from_secs(105)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn successful_slack_queue_projection_suppresses_unchanged_positions() {
+        let now = Instant::now();
+        let mut state = SlackQueueProjectionState::default();
+
+        state.record_failure(now);
+        state.record_success(2);
+
+        assert!(!state.should_attempt(2, now));
+        assert!(state.should_attempt(3, now));
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.retry_not_before, None);
     }
 }

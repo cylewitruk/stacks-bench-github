@@ -102,7 +102,9 @@ monotonic snapshot version. It contains no repository, user input, or secret.
 If the timestamp was not persisted, reconciliation searches only the
 originating thread and adopts exactly one matching message from the configured
 bot. Lookup failure or multiple matches fail closed and retry without posting a
-duplicate.
+duplicate. Reconciliation uses Slack's 15-message page limit. Provider failures
+retry with bounded backoff, and a canonical message that remains unavailable
+for five minutes fails admission without offering work to a worker.
 
 Denied or malformed requests receive an ephemeral reply and create no task.
 Benchmark and block-validation creation can be authorized independently. A

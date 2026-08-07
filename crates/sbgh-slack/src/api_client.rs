@@ -11,6 +11,10 @@ const SLACK_API_BASE: &str = "https://slack.com/api";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_EVENT_TYPE: &str = "sbgh_progress";
+// Slack limits conversations.replies to 15 messages for affected
+// non-Marketplace installations. Keep the request valid for that tier and
+// fail closed on `has_more` rather than creating beside an unseen match.
+const REPLIES_PAGE_LIMIT: u64 = 15;
 
 pub struct WebApiClient {
     http: reqwest::Client,
@@ -79,6 +83,15 @@ fn metadata(identity: &ReportingIdentity, snapshot_version: u64) -> serde_json::
             "reporting_identity": identity.as_str(),
             "snapshot_version": snapshot_version,
         }
+    })
+}
+
+fn replies_request(target: &SlackMessageTarget) -> serde_json::Value {
+    serde_json::json!({
+        "channel": target.channel,
+        "ts": target.thread_ts,
+        "limit": REPLIES_PAGE_LIMIT,
+        "include_all_metadata": true,
     })
 }
 
@@ -184,20 +197,12 @@ impl SlackClient for WebApiClient {
     ) -> Result<Vec<FoundMessage>> {
         let bot_user_id = self.bot_user_id().await?;
         let response = self
-            .call(
-                "conversations.replies",
-                serde_json::json!({
-                    "channel": target.channel,
-                    "ts": target.thread_ts,
-                    "limit": 100,
-                    "include_all_metadata": true,
-                }),
-            )
+            .call("conversations.replies", replies_request(target))
             .await?;
         if response.has_more {
             return Err(SlackError::Reconciliation(format!(
-                "conversations.replies exceeded the bounded page for {}/{}",
-                target.channel, target.thread_ts
+                "conversations.replies exceeded the bounded {REPLIES_PAGE_LIMIT}-message page for {}/{}",
+                target.channel, target.thread_ts,
             )));
         }
         Ok(response
@@ -267,6 +272,23 @@ mod tests {
                     "reporting_identity": identity.as_str(),
                     "snapshot_version": 42,
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn replies_request_uses_slacks_smallest_supported_page_limit() {
+        let target = SlackMessageTarget {
+            channel: "C1".into(),
+            thread_ts: "1.2".into(),
+        };
+        assert_eq!(
+            replies_request(&target),
+            serde_json::json!({
+                "channel": "C1",
+                "ts": "1.2",
+                "limit": 15,
+                "include_all_metadata": true,
             })
         );
     }
