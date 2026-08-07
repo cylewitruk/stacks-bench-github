@@ -72,6 +72,10 @@ pub struct BlockDeviceSpec<'a> {
     pub path: &'a Path,
     pub target_dev: &'a str,
     pub serial: &'a str,
+    /// Explicit SCSI target on controller 0. Keeping every snapshot on a
+    /// distinct target avoids libvirt's target-name-derived LUN allocation,
+    /// which spills the fifth `sdd`-based disk onto an implicit controller.
+    pub scsi_target: u32,
 }
 
 pub fn render(spec: &DomainSpec<'_>) -> anyhow::Result<String> {
@@ -246,6 +250,7 @@ fn block_disk(w: &mut W, dev: &Path, target_dev: &str) -> std::io::Result<()> {
 }
 
 fn scsi_block_disk(w: &mut W, spec: &BlockDeviceSpec<'_>) -> std::io::Result<()> {
+    let scsi_target = spec.scsi_target.to_string();
     w.create_element("disk")
         .with_attribute(("type", "block"))
         .with_attribute(("device", "disk"))
@@ -268,6 +273,17 @@ fn scsi_block_disk(w: &mut W, spec: &BlockDeviceSpec<'_>) -> std::io::Result<()>
             )?;
             empty(w, "target", &[("dev", spec.target_dev), ("bus", "scsi")])?;
             text(w, "serial", spec.serial)?;
+            empty(
+                w,
+                "address",
+                &[
+                    ("type", "drive"),
+                    ("controller", "0"),
+                    ("bus", "0"),
+                    ("target", &scsi_target),
+                    ("unit", "0"),
+                ],
+            )?;
             Ok(())
         })?;
     Ok(())
@@ -399,11 +415,31 @@ mod tests {
                 path: Path::new("/dev/vg0/attempt-shard-0"),
                 target_dev: "sdd",
                 serial: "sbgh-block-0000",
+                scsi_target: 0,
             },
             BlockDeviceSpec {
                 path: Path::new("/dev/vg0/attempt-shard-1"),
                 target_dev: "sde",
                 serial: "sbgh-block-0001",
+                scsi_target: 1,
+            },
+            BlockDeviceSpec {
+                path: Path::new("/dev/vg0/attempt-shard-2"),
+                target_dev: "sdf",
+                serial: "sbgh-block-0002",
+                scsi_target: 2,
+            },
+            BlockDeviceSpec {
+                path: Path::new("/dev/vg0/attempt-shard-3"),
+                target_dev: "sdg",
+                serial: "sbgh-block-0003",
+                scsi_target: 3,
+            },
+            BlockDeviceSpec {
+                path: Path::new("/dev/vg0/attempt-shard-4"),
+                target_dev: "sdh",
+                serial: "sbgh-block-0004",
+                scsi_target: 4,
             },
         ];
         let spec = DomainSpec {
@@ -420,15 +456,45 @@ mod tests {
         assert!(xml.contains("model=\"virtio-scsi\""));
         assert!(xml.contains("dev=\"sdd\" bus=\"scsi\""));
         assert!(xml.contains("<serial>sbgh-block-0000</serial>"));
-        assert!(xml.contains("/dev/vg0/attempt-shard-1"));
+        for target in 0..5 {
+            assert!(xml.contains(&format!(
+                "<address type=\"drive\" controller=\"0\" bus=\"0\" target=\"{target}\" unit=\"0\"/>"
+            )));
+        }
+        assert!(xml.contains("/dev/vg0/attempt-shard-4"));
+        assert!(xml.contains("<serial>sbgh-block-0004</serial>"));
         assert!(xml.contains("network=\"sandbox-egress\""));
         assert!(xml.contains("cpuset=\"0-47\""));
         assert!(!xml.contains("sbgh-job1-chainstate"));
         assert_eq!(
             xml.matches("type=\"block\" device=\"disk\"")
                 .count(),
-            2
+            5
         );
+        assert_eq!(
+            xml.matches("<controller type=\"scsi\"")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn block_validation_scsi_target_supports_worker_shard_ceiling() {
+        let device = BlockDeviceSpec {
+            path: Path::new("/dev/vg0/attempt-shard-63"),
+            target_dev: "sdbn",
+            serial: "sbgh-block-0063",
+            scsi_target: 63,
+        };
+        let spec = DomainSpec {
+            chainstate_dev_path: None,
+            block_devices: std::slice::from_ref(&device),
+            ..sample()
+        };
+        let xml = render(&spec).unwrap();
+        assert!(xml.contains(
+            "<address type=\"drive\" controller=\"0\" bus=\"0\" target=\"63\" unit=\"0\"/>"
+        ));
     }
 
     /// No pinning by default: plain `<vcpu>`, no `<cputune>` (Phase 5).

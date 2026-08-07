@@ -168,7 +168,9 @@ fn unix_now() -> u64 {
 
 fn scsi_target_dev(index: u32) -> String {
     // Reserve sda for the SATA cloud-init CD-ROM. Linux/libvirt target names
-    // continue as sdz, sdaa, sdab, … for larger shard sets.
+    // continue as sdz, sdaa, sdab, … for larger shard sets. The name is only a
+    // unique XML identifier; an explicit SCSI target keeps every disk on the
+    // declared virtio-scsi controller.
     let mut value = index + 3;
     let mut suffix = String::new();
     loop {
@@ -1693,6 +1695,7 @@ impl LibvirtDriver {
                         path: snapshot.device.as_path(),
                         target_dev: target,
                         serial: &snapshot.serial,
+                        scsi_target: snapshot.shard,
                     })
                     .collect::<Vec<_>>()
             })

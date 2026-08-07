@@ -8,9 +8,10 @@ remaining host-verification work from v20 and v22 against the current fleet and
 snapshot-reporting architecture.
 
 > **Status:** in_progress — host-independent work and the same-host substrate,
-> registration, controlled-validation, and GitHub `/validate` paths are proven.
-> Remaining provider journeys, recovery/identity drills, protocol-baseline
-> pinning, and the explicitly deferred benchmark closure remain open.
+> registration, controlled-validation, GitHub `/validate`, and Slack recent
+> validation paths are proven. Remaining benchmark provider journeys,
+> recovery/identity drills, protocol-baseline pinning, and the explicitly
+> deferred benchmark closure remain open.
 >
 > v34 is a deployment-readiness and qualification iteration, not a new task
 > feature. Fixes discovered by the playbook are in scope; unrelated feature
@@ -249,7 +250,7 @@ HTTP/CLI and exact GitHub triggers remain provider-free.
   process-affinity capacity under-report the VM host.
 - [ ] Execute the real-host gates below.
 
-## Real-Host Progress — 2026-08-06
+## Real-Host Progress — 2026-08-07
 
 The first deployment is a separate-process, same-host daemon/worker topology on
 `stacks-bench`. Evidence is distributed across the protected host rollback,
@@ -302,29 +303,53 @@ the qualification record required by this iteration.
   Ingress retained one processed webhook row and reused the same submission,
   completed job, comment, Check Run, and external identity without enqueuing
   duplicate work or creating another provider surface.
+- [x] Completed a natural-language Slack recent-validation canary against an
+  immutable commit. One canonical threaded snapshot was created before work
+  was offered, updated in place through queued/running phases, and converged to
+  the terminal block-validation result without an event transcript or a second
+  message.
+- [x] Proved live block-weighted validation progress from guest
+  `stacks-inspect` output through worker aggregation, protobuf fleet progress,
+  daemon projection, and the same Slack snapshot. The 1,000-block canary
+  (submission `42a67e3d-878d-4ada-8024-994f49186ff1`, job
+  `fa66a893-cf19-454e-9fce-78429e1fcbdf`, attempt
+  `92fe7501-dc92-4270-89c4-db2440df1b3f`) produced monotonic exact-block
+  updates and converged the same Slack snapshot to a valid terminal result:
+  `1,000/1,000` blocks, range `8476060..=8477059`, one shard, one concurrent
+  validator, and origin `vg0/mainnet-2026-07-04`.
+- [x] Retained deterministic Slack retry/idempotency coverage instead of
+  fault-injecting the production Socket Mode connection. Duplicate dispatch of
+  one stable request identity, a lost post response, and failure to persist the
+  returned message timestamp are tested to reconcile to one submission and one
+  canonical message. The live canary independently proved that normal Socket
+  Mode delivery created and updated only that message.
 
 ### Open or partial gates
 
 - [ ] Consolidate the redacted host evidence into one durable qualification
   record, including the direct S3 put/HEAD/get/checksum/delete ceremony and the
   exact deployed revision.
-- [ ] Complete the Slack recent-validation journey. The intent prompt/schema
-  correction is deployed and a contextual-revision canary now fails closed
-  without enqueueing. A subsequent one-block request resolved and started job
-  `e7407b2d-cb81-4823-8340-c21761b7e5d3`, but was cancelled after exposing two
-  reporting prerequisites: the installed Slack app lacked the checked-in
-  history scopes, and Slack block validation reconstructed provider routing
-  from task-specific queued detail instead of submission provenance. The
-  daemon fix now reads `task_submission_slack`, gates offers on a durable
-  canonical message, isolates malformed projections, and fails an unreported
-  admission after five minutes rather than leaving immortal queued demand. A
-  daemon without a Slack connector fails new unreported Slack work immediately;
-  queue-position writes are synchronous so failed writes remain retryable.
-  Reinstall the app, deploy the fix, and retry through one in-place terminal
-  Slack report.
 - [ ] Complete the required GitHub and Slack benchmark provider journeys. The
   v20/v22 benchmark-progress and comparison closure remains a separate
   fast-follow after these primary journeys.
+- [ ] Distinguish the long first-block chainstate range-discovery/initialization
+  scan from steady-state block validation in provider UX. Until the first
+  processed-block sample exists, report initialization rather than implying a
+  time-linear `0%`; derive any ETA only from stable post-initialization samples.
+  The 1,000-block canary spent about 883 seconds reaching its first processed
+  block, then accelerated through the remaining range. This reporting
+  refinement does not weaken terminal reduction or block the already-proven
+  Slack validation journey.
+- [ ] Force a five-shard recent-validation canary by temporarily setting
+  `target_blocks_per_shard = 2000`, `max_shards = 5`, and
+  `max_concurrency = 4`, then requesting exactly 10,000 blocks. Require four
+  concurrent shards plus one rollover shard, monotonic block-weighted progress,
+  exact gap-free command ranges and processed counts, one valid 10,000-block
+  reduction, promoted per-command artifacts, and complete five-snapshot
+  cleanup. The first attempt exposed implicit libvirt SCSI addressing spilling
+  shard 4 onto an unavailable second controller; the worker fix now assigns
+  each shard an explicit target on controller 0. Rerun this gate, then restore
+  and re-qualify the production profile.
 - [ ] Run full-history validation, cancellation, active-attempt and
   post-terminal daemon-restart drills, worker loss during execution/cleanup,
   and cleanup-obligation recovery.
@@ -456,8 +481,11 @@ Run and retain evidence for:
 For each, verify immutable commit resolution, source-specific authorization,
 one canonical submission, compatible pull placement, VM isolation, terminal
 task report, provider identity reuse, and promoted artifacts. Redeliver the
-same GitHub/Slack input and require no duplicate submission, check/comment, or
-Slack message.
+same GitHub webhook and require no duplicate submission, check, or comment.
+Socket Mode has no operator redelivery control: retain deterministic automated
+coverage for duplicate dispatch, lost post responses, and report-identity
+persistence failures, while live Slack evidence must contain one canonical
+message rather than an event transcript.
 
 For the GitHub validation canary, keep the worker drained until the queued
 submission has created and persisted its configured `stacks-block-validation`
@@ -488,17 +516,24 @@ that the first fleet is live.
 
 ### Phase 7: Extended Validation and Recovery
 
-1. Run default recent validation and confirm it saturates against the observed
+1. Temporarily configure a 2,000-block shard target, five-shard ceiling, and
+   four-way concurrency, then run a 10,000-block recent validation. Require
+   five exact 2,000-block ranges, four concurrent validators followed by the
+   fifth shard, block-weighted live progress across active and completed
+   shards, a 10,000-block terminal reduction, and cleanup of every snapshot and
+   result directory. Restore the commissioned worker profile and rerun
+   preflight afterward.
+2. Run default recent validation and confirm it saturates against the observed
    Nakamoto count when necessary.
-2. Run full-history validation and require both epoch segments and a negative
+3. Run full-history validation and require both epoch segments and a negative
    verdict only after every shard exits normally.
-3. Run another explicit cross-epoch range and verify exact shard-plan/reducer
+4. Run another explicit cross-epoch range and verify exact shard-plan/reducer
    agreement.
-4. Cancel a running validation with the admin fleet command; require prompt VM
+5. Cancel a running validation with the admin fleet command; require prompt VM
    stop, complete teardown, a fenced cancelled terminal, and converged report.
-5. Restart the daemon during an active attempt and again after terminal event
+6. Restart the daemon during an active attempt and again after terminal event
    acceptance; require session/lease recovery and replay convergence.
-6. Kill a worker during execution and during cleanup; require expiry/fencing,
+7. Kill a worker during execution and during cleanup; require expiry/fencing,
    visible cleanup obligation, and no unsafe automatic cross-worker comparison
    continuation.
 
@@ -543,8 +578,20 @@ operations contract; v35 (`0082`) supersedes that lifecycle behavior.
 - [x] Combined-worker preflight and database enrollment pass.
 - [x] Controlled one-block and cross-epoch sandbox/probe canaries pass with
   exact argv and processed-count audit evidence.
-- [ ] GitHub benchmark and validation canaries pass.
-- [ ] Slack benchmark and recent-validation canaries pass.
+- [x] GitHub validation canary passes with one marked comment and one Check Run
+  updated in place through terminal success.
+- [ ] GitHub benchmark canary passes.
+- [x] Slack recent-validation canary passes with one canonical threaded
+  snapshot updated in place through terminal success.
+- [x] Slack retry/idempotency paths reconcile duplicate dispatch and ambiguous
+  post/persistence outcomes to one submission and snapshot in deterministic
+  automated tests; the live canary creates no duplicate message.
+- [ ] Slack benchmark canary passes.
+- [x] Live block-validation progress reaches the protobuf/snapshot path as
+  monotonic exact-block counts without changing terminal authority.
+- [ ] A forced 10,000-block canary executes as five exact shards with four-way
+  concurrency and proves live aggregation, terminal reduction, artifacts, and
+  five-snapshot cleanup end to end.
 - [ ] Full-history, cancellation, daemon restart, worker loss, and cleanup
   recovery canaries pass.
 - [ ] Identity rotation/revocation and restart persistence pass.
