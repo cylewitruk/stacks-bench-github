@@ -385,6 +385,29 @@ cleanup obligation remains; replacement invalidates every outstanding lease.
 
 ## Deploy an application update
 
+### Daemon-only update on the combined host
+
+For a daemon-only, wire-compatible update while the deployment has exactly one
+registered worker, run from the updated checkout:
+
+```bash
+sudo ./scripts/update-combined-host.sh
+```
+
+The script derives the `combined` worker identity from its authenticated fleet
+check, drains it, waits for attempts and cleanup to reach zero, backs up
+Postgres, installs and restarts the daemon, verifies the API and production
+worker TLS path, and returns the worker online. A failure after draining leaves
+the worker drained and, once quiescent, stopped. Use `--profile NAME` for a
+different local instance and `--no-build` for already-built release binaries.
+
+This path does not install a worker binary. Do not use it for worker-protocol,
+worker-runtime, or migration compatibility changes; use the coordinated update
+below. It also refuses multi-worker fleets because the current daemon shutdown
+path globally drains workers.
+
+### Coordinated daemon and worker update
+
 The daemon and workers require exact worker-protocol compatibility. Use a full
 drain:
 

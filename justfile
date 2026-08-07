@@ -86,6 +86,7 @@ lint *args:
         --protected-ipv4 network/protected-ipv4.conf.example
     python3 scripts/test-sandbox-network-assets.py
     python3 scripts/test-installers.py
+    python3 scripts/test-update-combined-host.py
     for script in scripts/*.sh; do bash -n "$script"; done
     cargo machete --with-metadata
     RUST_LOG=warn cargo --locked clippy --all-targets -- -D warnings
