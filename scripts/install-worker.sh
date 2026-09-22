@@ -25,6 +25,7 @@ done
 sbgh_install_init "$repo_root"
 
 binary_src="$repo_root/target/release/sbgh-worker"
+ripcat_src="$repo_root/target/release/ripcat"
 unit_src="$repo_root/systemd/sbgh-worker@.service"
 hardening_src="$repo_root/systemd/sbgh-worker-hardening.conf"
 
@@ -32,11 +33,13 @@ sbgh_require_file "$unit_src" "Worker unit template"
 sbgh_require_file "$hardening_src" "Worker hardening drop-in"
 
 echo "[1/4] Preparing worker release..."
-sbgh_build_release "$do_build" sbgh-worker
+sbgh_build_release "$do_build" sbgh-worker ripcat
 sbgh_require_executable "$binary_src" "Worker binary"
+sbgh_require_executable "$ripcat_src" "ripcat binary"
 
 echo "[2/4] Installing worker-owned artifacts..."
 sbgh_install_file 0755 "$binary_src" /usr/local/bin/sbgh-worker
+sbgh_install_file 0755 "$ripcat_src" /usr/local/bin/ripcat
 sbgh_install_file 0644 "$unit_src" /etc/systemd/system/sbgh-worker@.service
 sbgh_install_file 0644 "$hardening_src" \
     /etc/systemd/system/sbgh-worker@.service.d/hardening.conf

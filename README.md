@@ -26,6 +26,7 @@ A single Cargo workspace (`crates/`):
 | `sbgh-proto` | Generated `sbgh.fleet.v1` protobuf messages and gRPC client/server adapters. |
 | `sbgh-worker` | Separately deployed pull worker for benchmark/libvirt, build-only, and block-validation capabilities. |
 | `sbgh-smee` | smee.io → handler webhook forwarder. |
+| `ripcat` | Bounded, disk-backed parallel HTTP range downloader that emits one ordered stream. |
 
 Postgres is the only persistent state, and the **daemon is its sole client**;
 the handler and CLI reach the daemon over `/api`.

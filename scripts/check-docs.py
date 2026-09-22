@@ -334,7 +334,10 @@ def check_workspace_inventory(errors: list[str], metadata: dict) -> None:
     }
     readme = (ROOT / "README.md").read_text()
     architecture = (ROOT / "docs/architecture.md").read_text()
-    documented = set(re.findall(r"`(sbgh-[a-z-]+)`", readme + architecture))
+    documentation = readme + architecture
+    documented = {
+        name for name in packages | binaries if f"`{name}`" in documentation
+    }
     missing = sorted((packages | binaries) - documented)
     if missing:
         errors.append(f"workspace packages/targets missing from docs: {', '.join(missing)}")

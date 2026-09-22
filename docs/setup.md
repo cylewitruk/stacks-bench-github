@@ -300,9 +300,16 @@ The downloader creates, verifies, populates, and publishes a suitable origin:
 
 ```bash
 sudo ./scripts/download-chainstate.sh \
-  --vg vg0 --thinpool thinpool --prefix mainnet-
+  --stream --vg vg0 --thinpool thinpool --prefix mainnet-
 sudo lvs -o vg_name,lv_name,lv_attr,origin,data_percent,metadata_percent
 ```
+
+Streaming uses `ripcat`, installed with the worker, to fetch retryable HTTP
+ranges concurrently into a bounded disk-backed window. The ordered compressed
+bytes are hashed and decompressed directly into the new LV; no complete archive
+is retained. The default 1 TiB virtual LV does not reserve 1 TiB of thin-pool
+data, but the pool still needs enough physical headroom for the extracted
+chainstate and worker snapshots.
 
 Schedule the same command nightly or on demand on every chainstate worker.
 Keep the naming prefix identical across worker profiles. The worker validates

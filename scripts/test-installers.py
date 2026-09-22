@@ -44,7 +44,7 @@ class InstallerTest(unittest.TestCase):
             "sbgh-worker-hardening.conf",
         ):
             shutil.copy2(ROOT / "systemd" / name, self.root / "systemd" / name)
-        for name in ("sbgh-daemon", "sbgh-cli", "sbgh-worker"):
+        for name in ("ripcat", "sbgh-daemon", "sbgh-cli", "sbgh-worker"):
             binary = self.root / "target/release" / name
             binary.write_text(f"#!/bin/sh\necho {name}\n", encoding="utf-8")
             binary.chmod(0o755)
@@ -93,11 +93,13 @@ class InstallerTest(unittest.TestCase):
             {
                 "etc/systemd/system/sbgh-worker@.service",
                 "etc/systemd/system/sbgh-worker@.service.d/hardening.conf",
+                "usr/local/bin/ripcat",
                 "usr/local/bin/sbgh-worker",
             },
         )
         installed = digest_tree(destination)
         self.assertEqual(installed["usr/local/bin/sbgh-worker"][0], 0o755)
+        self.assertEqual(installed["usr/local/bin/ripcat"][0], 0o755)
         self.assertEqual(installed["etc/systemd/system/sbgh-worker@.service"][0], 0o644)
         self.assertEqual(
             installed["etc/systemd/system/sbgh-worker@.service.d/hardening.conf"][0],

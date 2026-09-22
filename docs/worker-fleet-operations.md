@@ -219,14 +219,17 @@ read-only LVM origin under the configured prefix:
 
 ```bash
 sudo ./scripts/download-chainstate.sh \
-  --vg vg0 --thinpool thinpool --prefix mainnet-
+  --stream --vg vg0 --thinpool thinpool --prefix mainnet-
 sudo lvs -o vg_name,lv_name,lv_attr,origin,data_percent,metadata_percent
 ```
 
 Run this nightly or on demand. The new LV is published only after checksum
 verification and extraction complete, then set read-only and deactivated.
 The worker selects the lexicographically newest matching name when preparing
-an attempt.
+an attempt. Streaming keeps only a bounded temporary range window, retries a
+failed range from its first missing byte, and does not retain the complete
+compressed archive. A process or host restart therefore starts the archive
+again from byte zero.
 
 The downloader removes older origins only when they have no active snapshots.
 Use `--keep-old` when retaining history or diagnosing a change. Never make a

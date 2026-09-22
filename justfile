@@ -86,6 +86,7 @@ lint *args:
         --protected-ipv4 network/protected-ipv4.conf.example
     python3 scripts/test-sandbox-network-assets.py
     python3 scripts/test-installers.py
+    python3 scripts/test-download-chainstate.py
     python3 scripts/test-update-combined-host.py
     python3 scripts/test-update-worker-host.py
     python3 scripts/test-block-validation-progress.py

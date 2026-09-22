@@ -60,6 +60,7 @@ leader election are not implemented.
 | `sbgh-worker` | Worker transport, recipes, execution, and cleanup |
 | `sbgh-daemon` | Orchestration, API, scheduling, event projection, and reporting |
 | `sbgh-cli` | Local operator client |
+| `ripcat` | Ordered HTTP range streaming for chainstate ingestion |
 
 The package DAG check enforces dependency direction across all features and
 build dependencies. Provider and persistence crates implement narrow ports;

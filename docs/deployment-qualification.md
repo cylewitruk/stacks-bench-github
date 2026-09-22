@@ -208,7 +208,7 @@ current read-only chainstate origin:
 sudo ./scripts/build-golden-image.sh \
   /var/lib/libvirt/images/sbgh-golden-ubuntu24.qcow2
 sudo ./scripts/download-chainstate.sh \
-  --vg vg0 --thinpool thinpool --prefix mainnet-
+  --stream --vg vg0 --thinpool thinpool --prefix mainnet-
 sudo lvs -o vg_name,lv_name,lv_attr,origin,data_percent,metadata_percent
 ```
 

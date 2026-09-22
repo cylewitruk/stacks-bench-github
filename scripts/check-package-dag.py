@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 ALLOWED_INTERNAL = {
+    "ripcat": set(),
     "sbgh-api": set(),
     "sbgh-cli": {"sbgh-api"},
     "sbgh-core": {"sbgh-fleet"},
