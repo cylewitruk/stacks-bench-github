@@ -1,6 +1,6 @@
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -71,11 +71,12 @@ impl ProgressMeter {
             (u128::from(progress.emitted_bytes) * 100 / u128::from(progress.total_bytes)) as u64;
         let transferred = format_transfer(progress.emitted_bytes, progress.total_bytes);
         format!(
-            "ripcat: {percent:3}% {transferred} ({}/{} bytes) speed={:.1} MiB/s eta={eta} chunks={} retries={}",
+            "ripcat: {percent:3}% {transferred} ({}/{} bytes) speed={:.1} MiB/s eta={eta} chunks={} active_chunks={} retries={}",
             progress.emitted_bytes,
             progress.total_bytes,
             bytes_per_second / MIB,
             progress.completed_chunks,
+            progress.active_chunks,
             progress.retries
         )
     }
@@ -144,8 +145,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spool_dir: args.spool_dir,
         ..DownloadOptions::default()
     };
-    let latest_progress = Cell::new(None::<DownloadProgress>);
-    let progress = |value: DownloadProgress| latest_progress.set(Some(value));
+    let latest_progress = Mutex::new(None::<DownloadProgress>);
+    let progress = |value: DownloadProgress| {
+        *latest_progress
+            .lock()
+            .expect("progress state poisoned") = Some(value);
+    };
 
     let mut stdout = tokio::io::stdout();
     let mut meter = ProgressMeter::new(Instant::now());
@@ -160,7 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             result = &mut download => break result?,
             _ = ticker.tick(), if !args.quiet => {
-                if let Some(line) = meter.update(latest_progress.get(), Instant::now()) {
+                let latest = *latest_progress.lock().expect("progress state poisoned");
+                if let Some(line) = meter.update(latest, Instant::now()) {
                     eprintln!("{line}");
                 }
             }
@@ -208,6 +214,7 @@ mod tests {
             total_bytes: 100 * 1024 * 1024,
             completed_chunks: 1,
             total_chunks: 20,
+            active_chunks: 3,
             retries: 0,
         };
 
@@ -222,6 +229,7 @@ mod tests {
             .update(Some(progress(10 * 1024 * 1024)), started + PROGRESS_INTERVAL)
             .unwrap();
         assert!(first.contains("10.0 MiB / 100.0 MiB"), "{first}");
+        assert!(first.contains("chunks=1 active_chunks=3 retries=0"), "{first}");
         assert!(first.contains("speed=2.0 MiB/s eta=00:00:45"), "{first}");
         for second in 6..10 {
             assert!(

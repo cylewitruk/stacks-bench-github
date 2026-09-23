@@ -161,10 +161,16 @@ async fn retries_partial_ranges_and_emits_in_order() {
         spool_dir: Some(spool_parent.path().to_owned()),
         ..ripcat::DownloadOptions::default()
     };
+    let progress = Mutex::new(Vec::<ripcat::DownloadProgress>::new());
 
-    let report = ripcat::stream_url(&url, &mut output, options)
-        .await
-        .unwrap();
+    let report = ripcat::stream_url_with_progress(&url, &mut output, options, |snapshot| {
+        progress
+            .lock()
+            .unwrap()
+            .push(snapshot);
+    })
+    .await
+    .unwrap();
     drop(output);
     server.abort();
 
@@ -176,6 +182,24 @@ async fn retries_partial_ranges_and_emits_in_order() {
     );
     assert_eq!(report.bytes, 2 * 1024 * 1024);
     assert!(report.retries >= 1);
+    let progress = progress.into_inner().unwrap();
+    assert!(
+        progress
+            .iter()
+            .any(|snapshot| snapshot.active_chunks > 1)
+    );
+    assert!(
+        progress
+            .iter()
+            .all(|snapshot| snapshot.active_chunks <= 4)
+    );
+    assert_eq!(
+        progress
+            .last()
+            .unwrap()
+            .active_chunks,
+        0
+    );
     assert!(
         observations
             .max_active

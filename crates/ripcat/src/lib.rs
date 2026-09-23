@@ -95,7 +95,7 @@ impl DownloadOptions {
     }
 }
 
-/// Monotonic progress emitted after an ordered chunk reaches the consumer.
+/// Current transfer state, emitted when downloads or ordered output change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadProgress {
     /// Bytes emitted to the consumer.
@@ -106,6 +106,8 @@ pub struct DownloadProgress {
     pub completed_chunks: usize,
     /// Total ordered chunks.
     pub total_chunks: usize,
+    /// Chunks currently being downloaded, including ranges waiting to retry.
+    pub active_chunks: usize,
     /// Range retries observed so far.
     pub retries: u64,
 }
@@ -135,7 +137,7 @@ where
     stream_url_with_progress(url, writer, options, |_| {}).await
 }
 
-/// Stream a remote object to `writer` and report ordered-consumer progress.
+/// Stream a remote object to `writer` and report current transfer state.
 pub async fn stream_url_with_progress<W, F>(
     url: impl AsRef<str>,
     writer: &mut W,
@@ -144,7 +146,7 @@ pub async fn stream_url_with_progress<W, F>(
 ) -> Result<DownloadReport>
 where
     W: AsyncWrite + Unpin,
-    F: Fn(DownloadProgress),
+    F: Fn(DownloadProgress) + Send + Sync,
 {
     source::stream_url_with_progress(url.as_ref(), writer, options, progress).await
 }

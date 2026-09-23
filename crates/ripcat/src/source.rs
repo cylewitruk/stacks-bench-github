@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::{StreamExt, stream};
@@ -260,7 +261,7 @@ pub async fn stream_url_with_progress<W, F>(
 ) -> Result<DownloadReport>
 where
     W: AsyncWrite + Unpin,
-    F: Fn(DownloadProgress),
+    F: Fn(DownloadProgress) + Send + Sync,
 {
     options.validate()?;
     let source = HttpSource::probe(url, &options).await?;
@@ -275,6 +276,19 @@ where
             .prefix("ripcat-")
             .tempdir()?,
     };
+    let progress_state = Mutex::new(DownloadProgress {
+        emitted_bytes: 0,
+        total_bytes: source.len(),
+        completed_chunks: 0,
+        total_chunks,
+        active_chunks: 0,
+        retries: 0,
+    });
+    progress(
+        *progress_state
+            .lock()
+            .expect("progress state poisoned"),
+    );
 
     let downloads = stream::iter(
         ranges
@@ -285,10 +299,19 @@ where
                 let path = spool
                     .path()
                     .join(format!("chunk-{index:08}"));
+                let progress_state = &progress_state;
+                let progress = &progress;
                 async move {
-                    source
+                    report_progress(progress_state, progress, |state| {
+                        state.active_chunks += 1;
+                    });
+                    let result = source
                         .download_to(index, range, path)
-                        .await
+                        .await;
+                    report_progress(progress_state, progress, |state| {
+                        state.active_chunks -= 1;
+                    });
+                    result
                 }
             }),
     )
@@ -312,12 +335,10 @@ where
         emitted_bytes += copied;
         retries += u64::from(downloaded.retries);
         completed_chunks += 1;
-        progress(DownloadProgress {
-            emitted_bytes,
-            total_bytes: source.len(),
-            completed_chunks,
-            total_chunks,
-            retries,
+        report_progress(&progress_state, &progress, |state| {
+            state.emitted_bytes = emitted_bytes;
+            state.completed_chunks = completed_chunks;
+            state.retries = retries;
         });
     }
     writer.flush().await?;
@@ -334,6 +355,24 @@ where
         retries,
         etag: source.etag().to_owned(),
     })
+}
+
+/// Publish a consistent snapshot after one transfer-state change.
+fn report_progress<F>(
+    state: &Mutex<DownloadProgress>,
+    progress: &F,
+    update: impl FnOnce(&mut DownloadProgress),
+) where
+    F: Fn(DownloadProgress),
+{
+    let current = {
+        let mut current = state
+            .lock()
+            .expect("progress state poisoned");
+        update(&mut current);
+        *current
+    };
+    progress(current);
 }
 
 fn plan_ranges(total_bytes: u64, chunk_bytes: u64) -> Vec<Range> {

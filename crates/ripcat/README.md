@@ -27,4 +27,5 @@ the full compressed object.
 Progress on stderr reports ordered output speed and ETA from the latest 60
 one-second samples, or fewer during startup. It prints at most once every five
 seconds. The line includes a readable transferred/total amount and exact byte
-counts. Samples without completed chunks lower the speed during a stall.
+counts, plus the currently active chunk downloads. Samples without completed
+chunks lower the speed during a stall.
