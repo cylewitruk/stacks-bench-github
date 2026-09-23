@@ -81,6 +81,17 @@ tail.
 For block validation, each `stacks-inspect` launch writes an
 `SBGH_STACKS_INSPECT_COMMAND` JSON record to that console before spawning and
 uses separate `shard-<n>-command-<n>.stdout.log` and `.stderr.log` artifacts.
+Use the job UUID from `jobs list` or `jobs report` to inspect promoted artifacts
+without S3 credentials on the operator shell:
+
+```bash
+sbgh jobs artifacts ls <job-uuid>
+sbgh jobs artifacts cat <job-uuid> block-validation/block-validation-result.json | jq .
+```
+
+`cat` writes only artifact bytes to stdout. The daemon authorizes the admin
+cookie, resolves the name against that job's terminal manifest, and reads from
+its configured artifact store. It does not accept an arbitrary store key.
 The terminal reducer independently reconstructs the expected argv and requires
 the command's final `Validating: 100% (N/N)` count to equal its trusted
 half-open range. These records are audit evidence for accidental orchestration

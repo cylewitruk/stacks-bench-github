@@ -297,6 +297,18 @@ pub struct ReportArtifactView {
     pub key: String,
 }
 
+/// One artifact recorded for a terminal job, addressed by its job-relative name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobArtifactView {
+    /// Path relative to the job's artifact prefix.
+    pub name: String,
+    /// Recorded terminal-manifest byte length.
+    pub size: u64,
+    /// Recorded SHA-256 digest of the artifact body.
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetSummaryView {
     pub registered_workers: u64,

@@ -1,15 +1,18 @@
 use std::path::Path;
 use std::time::Duration;
 
+use futures::StreamExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+
 use crate::dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
     DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest,
     EnqueueBlockValidationRequest, EnqueueJobResponse, FleetCancellationResponse, FleetOverview,
     FleetRecoveryRequest, FleetRecoveryResponse, FleetWorkerView, GrantRoleResult, HealthResponse,
-    InstallationView, InstallerView, JobView, PinTriggerRequest, PolicyView, RepoRootView,
-    ResolveRepoResponse, RoleRequest, RoleView, SubmissionReportView, TriggerView, UserView,
-    WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerCreateRequest, WorkerDrainRequest,
-    WorkerIdentityRequest, WorkerPolicyView, WorkerUpdateRequest,
+    InstallationView, InstallerView, JobArtifactView, JobView, PinTriggerRequest, PolicyView,
+    RepoRootView, ResolveRepoResponse, RoleRequest, RoleView, SubmissionReportView, TriggerView,
+    UserView, WebhookSubmitResponse, WebhookSummary, WhoamiResponse, WorkerCreateRequest,
+    WorkerDrainRequest, WorkerIdentityRequest, WorkerPolicyView, WorkerUpdateRequest,
 };
 use crate::error::ApiError;
 
@@ -18,6 +21,9 @@ use crate::error::ApiError;
 pub enum ClientError {
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
+    /// Writing a streamed artifact to the caller's output failed.
+    #[error("output: {0}")]
+    Output(#[from] std::io::Error),
     /// The server returned a non-2xx status. `code`/`message` come from the
     /// [`ApiError`] envelope when present, else the raw body.
     #[error("api error {status} ({code}): {message}")]
@@ -37,6 +43,8 @@ impl Client {
     /// endpoints (which do server-side GitHub resolution, itself bounded at
     /// ~10s) while still bounding a hung daemon.
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Long artifact reads stream incrementally instead of using the API default.
+    const ARTIFACT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
     /// `base_url` is the API root (e.g. `http://127.0.0.1:8787`). `token`
     /// is the bearer presented on every request — the cookie for
@@ -308,6 +316,44 @@ impl Client {
             .await
     }
 
+    /// List promoted terminal artifacts for one job UUID.
+    pub async fn list_job_artifacts(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<JobArtifactView>, ClientError> {
+        self.get(&format!("/api/jobs/{job_id}/artifacts"))
+            .await
+    }
+
+    /// Copy one job-relative artifact to an async writer without buffering it.
+    pub async fn copy_job_artifact<W: AsyncWrite + Unpin>(
+        &self,
+        job_id: &str,
+        name: &str,
+        output: &mut W,
+    ) -> Result<(), ClientError> {
+        let mut request = self
+            .http
+            .get(format!("{}/api/jobs/{job_id}/artifacts/content", self.base_url))
+            .query(&[("name", name)])
+            .timeout(Self::ARTIFACT_TIMEOUT);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(decode_error(response).await);
+        }
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            output
+                .write_all(&chunk?)
+                .await?;
+        }
+        output.flush().await?;
+        Ok(())
+    }
+
     pub async fn fleet_overview(&self) -> Result<FleetOverview, ClientError> {
         self.get("/api/fleet").await
     }
@@ -472,16 +518,20 @@ impl Client {
 /// Map a response into `T` (on 2xx) or a [`ClientError::Api`] — parsing the
 /// [`ApiError`] envelope, falling back to the raw body if it isn't one.
 async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T, ClientError> {
-    let status = resp.status();
-    if status.is_success() {
+    if resp.status().is_success() {
         return Ok(resp.json::<T>().await?);
     }
+    Err(decode_error(resp).await)
+}
+
+async fn decode_error(resp: reqwest::Response) -> ClientError {
+    let status = resp.status();
     let code = status.as_u16();
     let body = resp
         .text()
         .await
         .unwrap_or_default();
-    Err(match serde_json::from_str::<ApiError>(&body) {
+    match serde_json::from_str::<ApiError>(&body) {
         Ok(e) => ClientError::Api {
             status: code,
             code: e.error.code,
@@ -492,7 +542,7 @@ async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Resu
             code: "unknown".into(),
             message: body,
         },
-    })
+    }
 }
 
 /// Build the `install_id` query param (or empty when `None`).

@@ -60,6 +60,12 @@ impl ApiErr {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "db_unavailable", "database unavailable")
             .with_detail(detail)
     }
+
+    /// An artifact manifest or backing-store read failed after authorization.
+    pub fn artifact(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "artifact_unavailable", "artifact unavailable")
+            .with_detail(detail)
+    }
 }
 
 impl IntoResponse for ApiErr {

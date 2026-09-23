@@ -399,6 +399,11 @@ enum JobsAction {
         #[arg(long)]
         submission_id: String,
     },
+    /// List or stream a terminal job's promoted artifacts.
+    Artifacts {
+        #[command(subcommand)]
+        action: ArtifactsAction,
+    },
     /// Enqueue block validation on a fleet worker.
     ValidateBlocks {
         #[arg(long)]
@@ -421,6 +426,23 @@ enum JobsAction {
         range_start: Option<u64>,
         #[arg(long)]
         range_end: Option<u64>,
+    },
+}
+
+/// Read-only operations on artifacts recorded for a job UUID.
+#[derive(Subcommand, Debug)]
+enum ArtifactsAction {
+    /// List artifact names and byte sizes.
+    Ls {
+        /// Job UUID from `jobs list` or a submission report.
+        job_id: String,
+    },
+    /// Stream an artifact to stdout (for example, pipe JSON into `jq`).
+    Cat {
+        /// Job UUID from `jobs list` or a submission report.
+        job_id: String,
+        /// Job-relative name shown by `artifacts ls`.
+        name: String,
     },
 }
 
@@ -1162,6 +1184,26 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
                 .with_context(|| format!("load report for submission {submission_id}"))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        JobsAction::Artifacts { action } => match action {
+            ArtifactsAction::Ls { job_id } => {
+                let artifacts = client
+                    .list_job_artifacts(&job_id)
+                    .await
+                    .with_context(|| format!("list artifacts for job {job_id}"))?;
+                if artifacts.is_empty() {
+                    println!("(no artifacts)");
+                }
+                for artifact in artifacts {
+                    println!("{:>12}  {}", artifact.size, artifact.name);
+                }
+            }
+            ArtifactsAction::Cat { job_id, name } => {
+                client
+                    .copy_job_artifact(&job_id, &name, &mut tokio::io::stdout())
+                    .await
+                    .with_context(|| format!("read artifact {name:?} for job {job_id}"))?;
+            }
+        },
         JobsAction::ValidateBlocks {
             install_id,
             repo_id,
@@ -1444,6 +1486,37 @@ fn load_env(explicit: Option<&Path>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_commands_accept_job_id_and_relative_name() {
+        let job_id = "b045c950-05b8-41f6-b1ef-e1ca512ad7a0";
+        let listed = Cli::try_parse_from(["sbgh-cli", "jobs", "artifacts", "ls", job_id]).unwrap();
+        std::assert_matches!(
+            listed.command,
+            Command::Jobs {
+                action: JobsAction::Artifacts {
+                    action: ArtifactsAction::Ls { job_id: parsed }
+                }
+            } if parsed == job_id
+        );
+        let read = Cli::try_parse_from([
+            "sbgh-cli",
+            "jobs",
+            "artifacts",
+            "cat",
+            job_id,
+            "block-validation/block-validation-result.json",
+        ])
+        .unwrap();
+        std::assert_matches!(
+            read.command,
+            Command::Jobs {
+                action: JobsAction::Artifacts {
+                    action: ArtifactsAction::Cat { job_id: parsed, name }
+                }
+            } if parsed == job_id && name == "block-validation/block-validation-result.json"
+        );
+    }
 
     #[test]
     fn block_validation_role_cli_name_maps_to_api_wire_name() {

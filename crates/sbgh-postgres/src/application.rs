@@ -406,6 +406,33 @@ async fn terminal_report_forensics(pool: &Pool, job_id: Uuid) -> Result<Option<R
 /// manifest remains a compatibility fallback for rows written before terminal
 /// event projection carried artifact descriptors.
 async fn terminal_report_artifacts(pool: &Pool, job_id: Uuid) -> Result<Vec<ReportArtifact>> {
+    Ok(terminal_artifact_descriptors(pool, job_id)
+        .await?
+        .into_iter()
+        .map(|artifact| ReportArtifact {
+            name: artifact.logical_key,
+            key: artifact.key,
+        })
+        .collect())
+}
+
+/// Return a job's recorded terminal artifacts, or `None` for an unknown job.
+pub async fn job_artifacts(pool: &Pool, job_id: Uuid) -> Result<Option<Vec<ArtifactDescriptor>>> {
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM job WHERE id = $1)")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
+    if !exists {
+        return Ok(None);
+    }
+    Ok(Some(terminal_artifact_descriptors(pool, job_id).await?))
+}
+
+async fn terminal_artifact_descriptors(
+    pool: &Pool,
+    job_id: Uuid,
+) -> Result<Vec<ArtifactDescriptor>> {
     let manifest: Option<serde_json::Value> = sqlx::query_scalar(
         r#"
         SELECT detail->'artifacts'
@@ -426,16 +453,7 @@ async fn terminal_report_artifacts(pool: &Pool, job_id: Uuid) -> Result<Vec<Repo
         .map(serde_json::from_value::<Vec<ArtifactDescriptor>>)
         .transpose()
         .map_err(other)
-        .map(|artifacts| {
-            artifacts
-                .unwrap_or_default()
-                .into_iter()
-                .map(|artifact| ReportArtifact {
-                    name: artifact.logical_key,
-                    key: artifact.key,
-                })
-                .collect()
-        })
+        .map(Option::unwrap_or_default)
 }
 
 fn parse_source(value: &str) -> Result<JobSource> {

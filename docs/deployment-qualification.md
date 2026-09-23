@@ -358,6 +358,15 @@ selects the newest non-orphaned block by height. Do not accept a tail
 `naka-index-range` command as evidence of recency: it orders by block hash and
 scans a deep index offset.
 
+Read the promoted manifest directly through the operator CLI, using the job UUID
+from the report:
+
+```bash
+sbgh jobs artifacts ls <job-uuid>
+sbgh jobs artifacts cat <job-uuid> block-validation/block-validation-result.json |
+  jq '{schema_version, job_id, attempt_id, commands: [.shards[].commands[] | {kind, argv}]}'
+```
+
 The guest emits `SBGH_STACKS_INSPECT_COMMAND` followed by one canonical JSON
 record immediately before each probe or validation process starts. Retain the
 bounded console artifact and per-command stdout/stderr artifacts. Require the trusted

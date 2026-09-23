@@ -8,6 +8,7 @@ use sbgh_core::submission::{
     SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionProvenance, TaskPlan,
 };
 use sbgh_fleet::{BlockValidationPayload, InclusiveRange};
+use sbgh_postgres::application::job_artifacts;
 use sbgh_postgres::db::{Pool, PostgresJobStore, setup_pg_db};
 use uuid::Uuid;
 
@@ -302,6 +303,58 @@ async fn failed_submission_report_exposes_terminal_forensic_artifacts() {
             .as_deref(),
         Some("job/console.tail.log")
     );
+}
+
+#[tokio::test]
+async fn job_artifacts_are_scoped_to_a_recorded_terminal_manifest() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let store = PostgresJobStore::new(pool.clone());
+    let receipt = store
+        .persist_submission(&validation_submission())
+        .await
+        .unwrap();
+    let job_id = receipt.initial_job_ids[0];
+    assert!(
+        job_artifacts(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        job_artifacts(&pool, job_id)
+            .await
+            .unwrap(),
+        Some(vec![])
+    );
+
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO job_event (job_id, event_kind, event_status, detail) \
+         VALUES ($1, 'completed', 'success', $2)",
+    )
+    .bind(job_id)
+    .bind(serde_json::json!({"artifacts": [{
+        "key": format!("{job_id}/block-validation/result.json"),
+        "logical_key": format!("{job_id}/block-validation/result.json"),
+        "size": 2,
+        "sha256": "a".repeat(64),
+    }]}))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let artifacts = job_artifacts(&pool, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].logical_key, format!("{job_id}/block-validation/result.json"));
+    assert_eq!(artifacts[0].size, 2);
 }
 
 #[tokio::test]

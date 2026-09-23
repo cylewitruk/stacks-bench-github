@@ -18,7 +18,7 @@ path = "src/main.rs"
 # The CLI is a pure daemon `/api` client.
 sbgh-api.workspace = true
 
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread"] }
 anyhow.workspace = true
 tracing-subscriber.workspace = true
 rustls.workspace = true

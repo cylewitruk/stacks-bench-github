@@ -78,6 +78,8 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
     );
     let admin = auth::protect(
         Router::new()
+            .route("/api/jobs/{id}/artifacts", get(jobs::list_artifacts))
+            .route("/api/jobs/{id}/artifacts/content", get(jobs::cat_artifact))
             .route("/api/installers", post(installers::allow))
             .route("/api/installers/disable", post(installers::disable))
             .route("/api/repos", post(repos::allow))
@@ -202,6 +204,9 @@ mod tests {
         ApiState {
             pool: pool.clone(),
             ingest: Arc::new(sbgh_postgres::PostgresIngestStore::new(pool)),
+            artifacts: Arc::new(crate::artifact_store::LocalFsStore::new(
+                std::env::temp_dir().join("sbgh-api-unit-unused"),
+            )),
             gh_api_base: "https://api.github.com".into(),
             block_validation: None,
         }

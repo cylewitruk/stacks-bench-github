@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use sbgh_daemon::LocalFsStore;
 use sbgh_daemon::api::{ApiState, ApiTokens, build_router};
 use sbgh_postgres::db::PostgresIngestStore;
 use tower::ServiceExt;
@@ -13,6 +14,9 @@ async fn production_api_router_exposes_public_health() {
         .unwrap();
     let state = ApiState {
         ingest: Arc::new(PostgresIngestStore::new(pool.clone())),
+        artifacts: Arc::new(LocalFsStore::new(
+            std::env::temp_dir().join("sbgh-composition-unused"),
+        )),
         pool,
         gh_api_base: "https://api.github.invalid".into(),
         block_validation: None,

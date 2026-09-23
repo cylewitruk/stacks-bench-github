@@ -10,12 +10,36 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use sbgh_core::db::SubmissionStore;
+use sbgh_core::models::{
+    BuildTarget, GitRefKind, JobIntent, JobSource, QueuedEventDetail, TaskKind,
+};
+use sbgh_core::submission::{
+    BlockValidationPlan, PreparedSubmission, ProducerKey, ResolvedTaskSource,
+    SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionProvenance, TaskPlan,
+};
+use sbgh_fleet::{BlockValidationPayload, BlockValidationSelection};
+use sbgh_postgres::db::PostgresJobStore;
 use sbgh_postgres::db::{Pool, PostgresIngestStore, setup_pg_db};
 use tower::ServiceExt;
 
 use super::{ApiState, ApiTokens, build_router};
 
 fn router_with(pool: Pool, gh_api_base: String) -> Router {
+    router_with_artifacts(
+        pool,
+        gh_api_base,
+        Arc::new(crate::artifact_store::LocalFsStore::new(
+            std::env::temp_dir().join("sbgh-api-endpoint-unused"),
+        )),
+    )
+}
+
+fn router_with_artifacts(
+    pool: Pool,
+    gh_api_base: String,
+    artifacts: Arc<dyn crate::artifact_store::ArtifactStore>,
+) -> Router {
     let tokens = Arc::new(
         ApiTokens::new("admintok".into(), Some("ingesttok".into()), Some("readtok".into()))
             .unwrap(),
@@ -23,10 +47,191 @@ fn router_with(pool: Pool, gh_api_base: String) -> Router {
     let state = ApiState {
         pool: pool.clone(),
         ingest: Arc::new(PostgresIngestStore::new(pool)),
+        artifacts,
         gh_api_base,
         block_validation: None,
     };
     build_router(state, tokens)
+}
+
+#[tokio::test]
+async fn job_artifacts_require_admin_and_stream_only_recorded_names() {
+    let (_db, pool) = setup_pg_db().await;
+    for query in [
+        "INSERT INTO allowed_installer (github_account_id, account_login, account_type) \
+         VALUES (100, 'octo', 'organization')",
+        "INSERT INTO github_installation (id, github_account_id, account_login, account_type) \
+         VALUES (100, 100, 'octo', 'organization')",
+        "INSERT INTO github_repo (id, owner, name) VALUES (10, 'o', 'r')",
+        "INSERT INTO github_installation_repo (github_installation_id, github_repo_id) \
+         VALUES (100, 10)",
+    ] {
+        sqlx::query(query)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let commit = "a".repeat(40);
+    let prepared = PreparedSubmission {
+        command: SubmissionCommand {
+            actor: SubmissionActor::System,
+            producer_key: ProducerKey {
+                namespace: "artifact-api-test".into(),
+                key: "one".into(),
+            },
+            constraints: SchedulingConstraints::default(),
+            task: TaskPlan::BlockValidation(BlockValidationPlan {
+                source: ResolvedTaskSource {
+                    github_installation_id: 100,
+                    github_repo_id: 10,
+                    source: JobSource::Cli,
+                    intent: JobIntent::BlockValidation,
+                    task_kind: TaskKind::BlockValidation,
+                    build_target: BuildTarget::StacksInspect,
+                    git_ref_kind: GitRefKind::Commit,
+                    git_ref_display: commit.clone(),
+                    commit,
+                    committed_at: None,
+                    workload_key: None,
+                },
+                payload: BlockValidationPayload {
+                    selection: BlockValidationSelection::Recent { block_count: 1 },
+                    timeout_secs: 60,
+                },
+            }),
+            provenance: SubmissionProvenance {
+                queued_event_detail: serde_json::to_value(QueuedEventDetail::BlockValidation {
+                    selection: BlockValidationSelection::Recent { block_count: 1 },
+                })
+                .unwrap(),
+                github: None,
+                slack: None,
+            },
+        },
+        contract_version: 1,
+        request_digest: "1".repeat(64),
+    };
+    let receipt = PostgresJobStore::new(pool.clone())
+        .persist_submission(&prepared)
+        .await
+        .unwrap();
+    let job_id = receipt.initial_job_ids[0];
+    let root = tempfile::tempdir().unwrap();
+    let key = format!("{job_id}/block-validation/result.json");
+    let path = root.path().join(&key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"{}\n").unwrap();
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO job_event (job_id, event_kind, event_status, detail) \
+         VALUES ($1, 'completed', 'success', $2)",
+    )
+    .bind(job_id)
+    .bind(serde_json::json!({"artifacts": [{
+        "key": key,
+        "logical_key": key,
+        "size": 3,
+        "sha256": "a".repeat(64),
+    }]}))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = router_with_artifacts(
+        pool,
+        "http://unused".into(),
+        Arc::new(crate::artifact_store::LocalFsStore::new(root.path().into())),
+    );
+    let list_uri = format!("/api/jobs/{job_id}/artifacts");
+    let (status, _) = send(&router, "GET", &list_uri, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(&router, "GET", &list_uri, Some("readtok"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, list) = send(&router, "GET", &list_uri, Some("admintok"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["name"], "block-validation/result.json");
+    assert_eq!(list[0]["size"], 3);
+    let unknown_uri = format!("/api/jobs/{}/artifacts", uuid::Uuid::new_v4());
+    let (status, _) = send(&router, "GET", &unknown_uri, Some("admintok"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let cat_uri =
+        format!("/api/jobs/{job_id}/artifacts/content?name=block-validation%2Fresult.json");
+    let (status, _) = send(&router, "GET", &cat_uri, Some("readtok"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &router,
+        "GET",
+        &format!("/api/jobs/{job_id}/artifacts/content?name=other"),
+        Some("admintok"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        &router,
+        "GET",
+        &format!("/api/jobs/{job_id}/artifacts/content?name=..%2Fother"),
+        Some("admintok"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(cat_uri)
+                .header("authorization", "Bearer admintok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"{}\n");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .unwrap()
+    });
+    let client = sbgh_api::Client::new(format!("http://{address}"), Some("admintok".into()));
+    let listed = client
+        .list_job_artifacts(&job_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(listed[0].name, "block-validation/result.json");
+    let downloaded = root
+        .path()
+        .join("downloaded.json");
+    let mut output = tokio::fs::File::create(&downloaded)
+        .await
+        .unwrap();
+    client
+        .copy_job_artifact(&job_id.to_string(), "block-validation/result.json", &mut output)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::fs::read(downloaded)
+            .await
+            .unwrap(),
+        b"{}\n"
+    );
+    server.abort();
 }
 
 /// A pool that never connects — fine for auth-rejection cases (the layer

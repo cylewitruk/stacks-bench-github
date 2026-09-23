@@ -216,6 +216,9 @@ mod tests {
         let state = ApiState {
             pool: pool.clone(),
             ingest: Arc::new(PostgresIngestStore::new(pool.clone())),
+            artifacts: Arc::new(crate::artifact_store::LocalFsStore::new(
+                std::env::temp_dir().join("sbgh-webhooks-test-unused"),
+            )),
             gh_api_base: "https://api.github.com".into(),
             block_validation: None,
         };

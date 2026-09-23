@@ -13,5 +13,7 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-reqwest = { workspace = true, features = ["rustls", "json", "query"] }
+reqwest = { workspace = true, features = ["rustls", "json", "query", "stream"] }
 thiserror.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["io-util"] }

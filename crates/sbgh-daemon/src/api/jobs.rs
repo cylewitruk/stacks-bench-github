@@ -1,21 +1,30 @@
 //! `/api/jobs` — benchmark run visibility.
 
+use std::collections::HashSet;
+use std::path::{self, Component};
+
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
+use axum::http::{HeaderValue, header};
+use axum::response::Response;
 use sbgh_api::{
     BenchmarkReportDetail, BlockValidationReportDetail, BlockValidationSelectionDetail,
     BlockValidationSelectionRequest, BuildOnlyReportDetail, EnqueueBlockValidationRequest,
-    EnqueueJobResponse, InvalidBlockDetail, JobView, ObservedValidationIndexDetail,
-    ReportArtifactView, ReportForensicsView, ReportIdentityView, ReportLifecycleView, ReportRange,
-    SubmissionReportView, TaskReportView, ValidationEpochSegmentDetail,
+    EnqueueJobResponse, InvalidBlockDetail, JobArtifactView, JobView,
+    ObservedValidationIndexDetail, ReportArtifactView, ReportForensicsView, ReportIdentityView,
+    ReportLifecycleView, ReportRange, SubmissionReportView, TaskReportView,
+    ValidationEpochSegmentDetail,
 };
 use sbgh_core::models::{BuildTarget, GitRefKind, Job, JobIntent, JobSource, TaskKind};
 use sbgh_core::submission::{
     ProducerKey, ResolvedTaskSource, SchedulingConstraints, SubmissionActor, SubmissionDisposition,
     SubmissionProvenance,
 };
+use sbgh_fleet::ArtifactDescriptor;
 use sbgh_intent::ValidationSelection;
 use serde::Deserialize;
+use tokio_util::io::ReaderStream;
 
 use crate::api::conv::enum_str;
 use crate::api::error::ApiErr;
@@ -79,6 +88,117 @@ pub async fn report(
         .await?
         .ok_or_else(|| ApiErr::not_found(format!("submission {submission_id} not found")))?;
     Ok(Json(report_view(report)))
+}
+
+/// Query selector for an artifact's job-relative name.
+#[derive(Debug, Deserialize)]
+pub struct ArtifactName {
+    /// Exact name returned by the job artifact listing.
+    name: String,
+}
+
+/// List a job's promoted terminal artifacts by job-relative name.
+pub async fn list_artifacts(
+    State(state): State<ApiState>,
+    Path(job_id): Path<uuid::Uuid>,
+) -> Result<Json<Vec<JobArtifactView>>, ApiErr> {
+    let artifacts = recorded_artifacts(&state, job_id).await?;
+    Ok(Json(
+        artifacts
+            .into_iter()
+            .map(|(name, artifact)| JobArtifactView {
+                name,
+                size: artifact.size,
+                sha256: artifact.sha256,
+            })
+            .collect(),
+    ))
+}
+
+/// Stream one recorded artifact; user input never becomes a store key.
+pub async fn cat_artifact(
+    State(state): State<ApiState>,
+    Path(job_id): Path<uuid::Uuid>,
+    Query(request): Query<ArtifactName>,
+) -> Result<Response, ApiErr> {
+    let artifact = recorded_artifacts(&state, job_id)
+        .await?
+        .into_iter()
+        .find(|(name, _)| name == &request.name)
+        .map(|(_, artifact)| artifact)
+        .ok_or_else(|| {
+            ApiErr::not_found(format!("artifact {:?} not found for job {job_id}", request.name))
+        })?;
+    let path = state
+        .artifacts
+        .get(&artifact.key)
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                ApiErr::not_found(format!("artifact {:?} is missing", request.name))
+            }
+            _ => ApiErr::artifact(error.to_string()),
+        })?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|error| ApiErr::artifact(error.to_string()))?;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|error| ApiErr::artifact(error.to_string()))?
+        .len();
+    if size != artifact.size {
+        return Err(ApiErr::artifact(format!(
+            "artifact {:?} has size {size}, expected {}",
+            request.name, artifact.size
+        )));
+    }
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&size.to_string()).expect("u64 is a valid content length"),
+    );
+    Ok(response)
+}
+
+async fn recorded_artifacts(
+    state: &ApiState,
+    job_id: uuid::Uuid,
+) -> Result<Vec<(String, ArtifactDescriptor)>, ApiErr> {
+    let artifacts = sbgh_postgres::application::job_artifacts(&state.pool, job_id)
+        .await?
+        .ok_or_else(|| ApiErr::not_found(format!("job {job_id} not found")))?;
+    let prefix = format!("{job_id}/");
+    let mut names = HashSet::new();
+    let mut listed: Vec<_> = artifacts
+        .into_iter()
+        .map(|artifact| {
+            let name = artifact
+                .logical_key
+                .strip_prefix(&prefix)
+                .ok_or_else(|| ApiErr::artifact(format!("artifact key is outside job {job_id}")))?;
+            if name.is_empty()
+                || !path::Path::new(name)
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                || artifact.key != artifact.logical_key
+                || !names.insert(name.to_string())
+            {
+                return Err(ApiErr::artifact(format!(
+                    "invalid artifact manifest for job {job_id}"
+                )));
+            }
+            Ok((name.to_string(), artifact))
+        })
+        .collect::<Result<_, _>>()?;
+    listed.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(listed)
 }
 
 fn report_view(report: sbgh_core::reporting::SubmissionReportView) -> SubmissionReportView {

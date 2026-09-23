@@ -35,16 +35,15 @@ services:
   # fixture, not a service. Host-only on 127.0.0.1:9100 (→ container 9000) to
   # avoid clashing with a dev's local MinIO on 9000.
   #
-  # PINNED, not `:latest`: the MinIO project was archived in 2026 and stopped
-  # publishing images after this release, so `RELEASE.2025-09-07T16-13-09Z` is
-  # the last/newest stable build — pinning keeps CI reproducible and immune to
-  # any future `latest` relicensing/drift. We use only the server's S3 API
+  # PINNED, not `:latest`: use MinIO's Quay image because its Docker Hub
+  # repository is no longer available. Pinning keeps CI reproducible. We use
+  # only the server's S3 API
   # (path-style PUT/GET/HEAD + SigV4 presigned), which this AGPL release serves
   # fully and which needs no upstream maintenance. The image ships its own
   # HEALTHCHECK, so `up --wait` blocks until it's ready; the test also creates
   # its own bucket (idempotent), so no init container is needed.
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: sbgh-test-minio
     restart: "no"
     environment:

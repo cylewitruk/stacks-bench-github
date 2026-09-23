@@ -12,6 +12,8 @@ use sbgh_postgres::Pool;
 pub struct ApiState {
     pub pool: Pool,
     pub ingest: Arc<dyn IngestStore>,
+    /// Configured artifact store used for authenticated operator reads.
+    pub artifacts: Arc<dyn crate::artifact_store::ArtifactStore>,
     /// GitHub API base for the admin endpoints' server-side
     /// login/owner-name → id resolution.
     pub gh_api_base: String,
