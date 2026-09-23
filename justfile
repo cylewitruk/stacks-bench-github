@@ -89,6 +89,7 @@ lint *args:
     python3 scripts/test-download-chainstate.py
     python3 scripts/test-update-combined-host.py
     python3 scripts/test-update-worker-host.py
+    python3 scripts/test-pg-restore-check.py
     python3 scripts/test-block-validation-progress.py
     for script in scripts/*.sh; do bash -n "$script"; done
     cargo machete --with-metadata

@@ -5,15 +5,13 @@
 #
 # Two jobs in one pass:
 #   1. Proves the backup is actually restorable (zstd intact + pg_restore clean).
-#   2. Doubles as the v14 (0037) migration dry-run: if the restored copy predates
-#      v14 (no `benchmark_group` table), it applies the v14 migration to the
-#      scratch copy and then runs the group->spec->run checklist on REAL data —
-#      the exact backfill the test suite can't exercise. If the backup already
-#      carries the v14 schema, it just validates it as-is.
+#   2. Validates the submission->spec->run relationships using either the
+#      current task-neutral names or the pre-v27 benchmark names. For a backup
+#      predating v14, it can still apply the v14 migration before validation.
 #
-# Checklist (all must hold): no NULL group/spec/run FK columns; jobs == groups
-# == specs; build_steps == jobs; run_steps == measured (non-build_only) jobs; no
-# orphan specs/runs.
+# Checklist (all must hold): jobs have submission/spec/run identities; every
+# submission has a job; build/run steps match their specs; and no relationship
+# is orphaned or crosses submission identities.
 #
 # Auth: every psql/pg_restore runs INSIDE the container over the local socket
 # (trust), same as pg-backup.sh — no password handling.
@@ -52,7 +50,8 @@ Usage: pg-restore-check.sh [--container N] [--user U] [--db D] [--dir PATH]
 
 Restores BACKUP (a pg-backup.sh .tar.zst; default: newest in --dir) into a
 throwaway scratch DB inside the container, optionally dry-runs the v14
-migration, and runs the group->spec->run checklist. Never touches the live db.
+migration, and checks submission/spec/run relationships. Never touches the
+live db.
 EOF
 }
 
@@ -132,11 +131,32 @@ fi
 echo "  restored cleanly."
 
 echo "[2/4] Checking schema state..."
+has_submission=$(psql_scratch "SELECT to_regclass('public.task_submission') IS NOT NULL")
 has_group=$(psql_scratch "SELECT to_regclass('public.benchmark_group') IS NOT NULL")
-if [[ "$has_group" == "t" ]]; then
-    echo "  backup already carries the v14 schema — validating as-is."
+if [[ "$has_submission" == "t" ]]; then
+    echo "  backup carries the current task-submission schema — validating as-is."
+    submission_table=task_submission
+    spec_table=task_spec
+    step_table=task_workflow_step
+    job_submission_column=task_submission_id
+    job_spec_column=task_spec_id
+    job_run_column=task_run_index
+    spec_submission_column=task_submission_id
+    step_submission_column=task_submission_id
+    step_spec_column=task_spec_id
+elif [[ "$has_group" == "t" ]]; then
+    echo "  backup carries the legacy v14-v26 schema — validating as-is."
+    submission_table=benchmark_group
+    spec_table=benchmark_spec
+    step_table=benchmark_workflow_step
+    job_submission_column=benchmark_group_id
+    job_spec_column=benchmark_spec_id
+    job_run_column=benchmark_run_index
+    spec_submission_column=benchmark_group_id
+    step_submission_column=benchmark_group_id
+    step_spec_column=benchmark_spec_id
 elif (( NO_MIGRATE == 1 )); then
-    echo "  pre-v14 backup and --no-migrate set; nothing to validate. Done."
+    echo "  pre-v14 backup and --no-migrate set; restore passed but relationship validation is unavailable."
     exit 0
 else
     [[ -f "$MIGRATION" ]] || { echo "error: migration file not found: $MIGRATION" >&2; exit 1; }
@@ -152,30 +172,73 @@ else
         exit 1
     fi
     echo "  v14 migration applied to $jobs_before jobs."
+    submission_table=benchmark_group
+    spec_table=benchmark_spec
+    step_table=benchmark_workflow_step
+    job_submission_column=benchmark_group_id
+    job_spec_column=benchmark_spec_id
+    job_run_column=benchmark_run_index
+    spec_submission_column=benchmark_group_id
+    step_submission_column=benchmark_group_id
+    step_spec_column=benchmark_spec_id
 fi
 
-echo "[3/4] Running group -> spec -> run checklist..."
+echo "[3/4] Running submission -> spec -> run checklist..."
 counts=$(psql_scratch "
-SELECT 'ungrouped='   ||count(*) FROM job WHERE benchmark_group_id IS NULL OR benchmark_spec_id IS NULL OR benchmark_run_index IS NULL
-UNION ALL SELECT 'jobs='        ||count(*) FROM job
-UNION ALL SELECT 'groups='      ||count(*) FROM benchmark_group
-UNION ALL SELECT 'specs='       ||count(*) FROM benchmark_spec
-UNION ALL SELECT 'build_steps=' ||count(*) FROM benchmark_workflow_step WHERE step_kind='build'
-UNION ALL SELECT 'run_steps='   ||count(*) FROM benchmark_workflow_step WHERE step_kind='run'
-UNION ALL SELECT 'measured='    ||count(*) FROM job WHERE task_kind <> 'build_only'
-UNION ALL SELECT 'orphan_specs='||count(*) FROM benchmark_spec s LEFT JOIN benchmark_group g ON g.id=s.benchmark_group_id WHERE g.id IS NULL
-UNION ALL SELECT 'orphan_runs=' ||count(*) FROM job j LEFT JOIN benchmark_spec s ON s.id=j.benchmark_spec_id WHERE s.id IS NULL
+SELECT 'unlinked_jobs=' ||count(*) FROM job
+ WHERE $job_submission_column IS NULL OR $job_spec_column IS NULL OR $job_run_column IS NULL
+UNION ALL SELECT 'jobs=' ||count(*) FROM job
+UNION ALL SELECT 'submissions=' ||count(*) FROM $submission_table
+UNION ALL SELECT 'specs=' ||count(*) FROM $spec_table
+UNION ALL SELECT 'build_steps=' ||count(*) FROM $step_table WHERE step_kind='build'
+UNION ALL SELECT 'run_steps=' ||count(*) FROM $step_table WHERE step_kind='run'
+UNION ALL SELECT 'runnable_specs=' ||count(*) FROM $spec_table WHERE task_kind <> 'build_only'
+UNION ALL SELECT 'empty_submissions=' ||count(*)
+  FROM $submission_table submission
+  LEFT JOIN job ON job.$job_submission_column = submission.id
+ WHERE job.id IS NULL
+UNION ALL SELECT 'orphan_specs=' ||count(*)
+  FROM $spec_table spec
+  LEFT JOIN $submission_table submission ON submission.id = spec.$spec_submission_column
+ WHERE submission.id IS NULL
+UNION ALL SELECT 'orphan_jobs=' ||count(*)
+  FROM job
+  LEFT JOIN $submission_table submission ON submission.id = job.$job_submission_column
+  LEFT JOIN $spec_table spec ON spec.id = job.$job_spec_column
+ WHERE submission.id IS NULL OR spec.id IS NULL
+UNION ALL SELECT 'cross_submission_jobs=' ||count(*)
+  FROM job
+  JOIN $spec_table spec ON spec.id = job.$job_spec_column
+ WHERE spec.$spec_submission_column <> job.$job_submission_column
+UNION ALL SELECT 'orphan_steps=' ||count(*)
+  FROM $step_table step
+  LEFT JOIN $submission_table submission ON submission.id = step.$step_submission_column
+  LEFT JOIN $spec_table spec ON spec.id = step.$step_spec_column
+ WHERE submission.id IS NULL OR (step.$step_spec_column IS NOT NULL AND spec.id IS NULL)
+UNION ALL SELECT 'cross_submission_steps=' ||count(*)
+  FROM $step_table step
+  JOIN $spec_table spec ON spec.id = step.$step_spec_column
+ WHERE spec.$spec_submission_column <> step.$step_submission_column
 ")
-
-# A single query returns all 9 rows together, so if 'jobs=' is present they all
-# are — guard against a failed/empty read silently passing as 0==0.
-[[ "$counts" == *"jobs="* ]] || { echo "FAIL: could not read counts from scratch DB" >&2; exit 1; }
 
 declare -A C
 while IFS='=' read -r k v; do [[ -n "$k" ]] && C[$k]="$v"; done <<<"$counts"
 
-printf '  counts: jobs=%s groups=%s specs=%s | build_steps=%s | run_steps=%s measured=%s\n' \
-    "${C[jobs]}" "${C[groups]}" "${C[specs]}" "${C[build_steps]}" "${C[run_steps]}" "${C[measured]}"
+required_counts=(
+    unlinked_jobs jobs submissions specs build_steps run_steps runnable_specs
+    empty_submissions orphan_specs orphan_jobs cross_submission_jobs
+    orphan_steps cross_submission_steps
+)
+for key in "${required_counts[@]}"; do
+    [[ -n "${C[$key]+set}" ]] || {
+        echo "FAIL: relationship query omitted '$key'" >&2
+        exit 1
+    }
+done
+
+printf '  counts: submissions=%s specs=%s jobs=%s | build_steps=%s | run_steps=%s runnable_specs=%s\n' \
+    "${C[submissions]}" "${C[specs]}" "${C[jobs]}" "${C[build_steps]}" \
+    "${C[run_steps]}" "${C[runnable_specs]}"
 if [[ "${C[jobs]}" == "0" ]]; then
     echo "  note: 0 jobs in this backup — invariants hold trivially (near-empty DB)."
 fi
@@ -185,20 +248,21 @@ overall_ok=1
 report() { # label, bool(1=pass)
     if (( $2 )); then echo "  [PASS] $1"; else echo "  [FAIL] $1"; overall_ok=0; fi
 }
-# Bare array refs in $(( … )); an unset element is 0, but the guard above
-# guarantees every key is present here.
-report "no NULL group/spec/run columns (ungrouped=${C[ungrouped]})"     "$(( C[ungrouped]==0 ))"
-report "jobs == groups (${C[jobs]} == ${C[groups]})"                    "$(( C[jobs]==C[groups] ))"
-report "jobs == specs  (${C[jobs]} == ${C[specs]})"                     "$(( C[jobs]==C[specs] ))"
-report "build_steps == jobs (${C[build_steps]} == ${C[jobs]})"          "$(( C[build_steps]==C[jobs] ))"
-report "run_steps == measured (${C[run_steps]} == ${C[measured]})"      "$(( C[run_steps]==C[measured] ))"
-report "no orphan specs (orphan_specs=${C[orphan_specs]})"              "$(( C[orphan_specs]==0 ))"
-report "no orphan runs  (orphan_runs=${C[orphan_runs]})"                "$(( C[orphan_runs]==0 ))"
+# Bare array refs in $(( … )); the guard above guarantees every key is present.
+report "all jobs have submission/spec/run identities (unlinked_jobs=${C[unlinked_jobs]})" "$(( C[unlinked_jobs]==0 ))"
+report "every submission has a job (empty_submissions=${C[empty_submissions]})" "$(( C[empty_submissions]==0 ))"
+report "build_steps == specs (${C[build_steps]} == ${C[specs]})" "$(( C[build_steps]==C[specs] ))"
+report "run_steps == runnable_specs (${C[run_steps]} == ${C[runnable_specs]})" "$(( C[run_steps]==C[runnable_specs] ))"
+report "no orphan specs (orphan_specs=${C[orphan_specs]})" "$(( C[orphan_specs]==0 ))"
+report "no orphan jobs (orphan_jobs=${C[orphan_jobs]})" "$(( C[orphan_jobs]==0 ))"
+report "jobs and specs share submission identity (cross_submission_jobs=${C[cross_submission_jobs]})" "$(( C[cross_submission_jobs]==0 ))"
+report "no orphan workflow steps (orphan_steps=${C[orphan_steps]})" "$(( C[orphan_steps]==0 ))"
+report "steps and specs share submission identity (cross_submission_steps=${C[cross_submission_steps]})" "$(( C[cross_submission_steps]==0 ))"
 
 echo
 echo "[4/4] Result:"
 if (( overall_ok == 1 )); then
-    echo "  PASS — backup restores and the v14 group/spec/run model is consistent."
+    echo "  PASS — backup restores and the submission/spec/run model is consistent."
     exit 0
 else
     echo "  FAIL — see the [FAIL] lines above." >&2
