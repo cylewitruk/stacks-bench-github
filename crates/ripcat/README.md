@@ -23,3 +23,8 @@ ripcat --connections 8 --window-mib 512 \
 The tool can retry individual range failures without restarting its consumer.
 It cannot resume an interrupted process because it deliberately does not retain
 the full compressed object.
+
+Progress on stderr reports ordered output speed and ETA from the latest 60
+one-second samples, or fewer during startup. It prints at most once every five
+seconds. The line includes a readable transferred/total amount and exact byte
+counts. Samples without completed chunks lower the speed during a stall.
