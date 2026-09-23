@@ -352,11 +352,17 @@ HTTPS grant, promoted only after the accepted terminal result, and retrievable
 from the configured S3 bucket with its recorded size and SHA-256. The worker
 must have no S3 credentials.
 
+For `recent`, require one shard and an audited `stacks-inspect last 1` command.
+The reported range is a logical ordinal accounting range; the upstream command
+selects the newest non-orphaned block by height. Do not accept a tail
+`naka-index-range` command as evidence of recency: it orders by block hash and
+scans a deep index offset.
+
 The guest emits `SBGH_STACKS_INSPECT_COMMAND` followed by one canonical JSON
 record immediately before each probe or validation process starts. Retain the
 bounded console artifact and per-command stdout/stderr artifacts. Require the trusted
 reducer to accept only the exact expected executable, network, database path,
-epoch mode, and half-open range, and to derive `checked_blocks` from the final
+selection mode, and count or half-open range, and to derive `checked_blocks` from the final
 `Validating: 100% (N/N)` count in each command rather than from the requested
 range alone. A missing, duplicate, reordered, or altered command record, or a
 reported count that differs from its trusted range, is a failed gate.
@@ -416,8 +422,9 @@ discard a durable transition.
 
 These gates close the first deployment after the four primary journeys:
 
-- Run `recent` with normal policy and verify resolution against the observed
-  Nakamoto tail.
+- Run `recent` with normal policy and verify a height-ordered `last N` command,
+  one shard, and the expected processed-block count. Its single-shard execution
+  may limit practical request size until height-based sharding is available.
 - Run `full` and require both epoch segments. A negative verdict is valid only
   after every shard exits normally.
 - Repeat an explicit range crossing the observed epoch boundary and require

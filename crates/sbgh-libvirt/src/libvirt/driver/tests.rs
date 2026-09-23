@@ -634,6 +634,23 @@ fn enable_block_profile(config: &mut LibvirtConfig) {
     });
 }
 
+#[test]
+fn recent_validation_provisions_one_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = test_config(&tmp);
+    enable_block_profile(&mut config);
+    let profile = config
+        .block_validation
+        .as_ref()
+        .unwrap();
+    let spec = BlockValidationTaskSpec {
+        selection: BlockValidationSelection::Recent { block_count: 100 },
+        timeout_secs: 60,
+    };
+
+    assert_eq!(provisioned_block_snapshot_count(&spec, profile).unwrap(), 1);
+}
+
 fn prepare_sandbox_preflight_files(config: &mut LibvirtConfig, tmp: &TempDir) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -846,7 +863,7 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     std::fs::write(
         results.join("block-validation-result.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schema_version": 2,
+            "schema_version": crate::libvirt::block_validation::RESULT_SCHEMA_VERSION,
             "job_id": job.id,
             "attempt_id": job.id,
             "fencing_generation": 0,

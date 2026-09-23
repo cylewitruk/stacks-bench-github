@@ -382,6 +382,8 @@ mod tests {
         assert!(rendered.contains("start_new_session=True"));
         assert!(BLOCK_VALIDATION_SCRIPT.contains("segments = []"));
         assert!(BLOCK_VALIDATION_SCRIPT.contains("commands.append((\"naka-index-range\""));
+        assert!(BLOCK_VALIDATION_SCRIPT.contains("commands.append((\"last\""));
+        assert!(BLOCK_VALIDATION_SCRIPT.contains("if range_kind == \"last\":"));
         assert!(!rendered.contains("\"effective_range\""));
         assert!(!rendered.contains("mount -t virtiofs sccache"));
         assert!(!rendered.contains("lease_token"));

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::libvirt::guest_file;
 use crate::libvirt::lvm::ChainstateSnapshotSet;
 
-pub const RESULT_SCHEMA_VERSION: u32 = 2;
+pub const RESULT_SCHEMA_VERSION: u32 = 3;
 const MAX_RESULT_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SHARD_DIAGNOSTIC_BYTES: u64 = 64 * 1024 * 1024;
 const STACKS_INSPECT_GUEST_PATH: &str = "/opt/stacks-core/target/release/stacks-inspect";
@@ -151,6 +151,8 @@ struct GuestShard {
 enum ValidationCommandKind {
     IndexRange,
     NakaIndexRange,
+    /// Height-ordered Nakamoto tail, selected by `stacks-inspect last`.
+    Last,
 }
 
 impl ValidationCommandKind {
@@ -158,6 +160,7 @@ impl ValidationCommandKind {
         match self {
             Self::IndexRange => "index-range",
             Self::NakaIndexRange => "naka-index-range",
+            Self::Last => "last",
         }
     }
 }
@@ -260,6 +263,7 @@ pub fn reduce_result(
             .context("trusted plan is missing a shard device")?;
         let expected_commands = expected_commands(
             expected,
+            &plan.selection,
             result
                 .observed
                 .pre_nakamoto_count,
@@ -454,7 +458,13 @@ pub fn resolve_execution_plan(
         .checked_sub(range.start)
         .and_then(|span| span.checked_add(1))
         .context("resolved block count overflow")?;
-    let shard_count = planned_shard_count(count, target_blocks_per_shard, max_shards)?;
+    // `last N` selects by block height. Unlike index ranges, it cannot be
+    // partitioned without changing which blocks the upstream CLI selects.
+    let shard_count = if matches!(selection, BlockValidationSelection::Recent { .. }) {
+        1
+    } else {
+        planned_shard_count(count, target_blocks_per_shard, max_shards)?
+    };
     let concurrency = shard_count.min(max_concurrency);
     Ok(ResolvedExecutionPlan {
         range,
@@ -602,12 +612,24 @@ fn verify_probes(
 
 fn expected_commands(
     shard: &ShardRange,
+    selection: &BlockValidationSelection,
     pre_nakamoto_count: u64,
     mountpoint: &str,
 ) -> anyhow::Result<Vec<ExpectedCommand>> {
     let database_path = format!("{}/{}", mountpoint.trim_end_matches('/'), STACKS_NETWORK_DATA_DIR);
     let mut ranges = Vec::with_capacity(2);
-    if shard.start < pre_nakamoto_count {
+    if matches!(selection, BlockValidationSelection::Recent { .. }) {
+        ensure!(shard.start >= pre_nakamoto_count, "recent shard crosses the epoch boundary");
+        ranges.push((
+            ValidationCommandKind::Last,
+            shard.start - pre_nakamoto_count,
+            shard
+                .end
+                .checked_sub(pre_nakamoto_count)
+                .and_then(|end| end.checked_add(1))
+                .context("recent command range overflow")?,
+        ));
+    } else if shard.start < pre_nakamoto_count {
         ranges.push((
             ValidationCommandKind::IndexRange,
             shard.start,
@@ -618,7 +640,9 @@ fn expected_commands(
                 .context("pre-Nakamoto command range overflow")?,
         ));
     }
-    if shard.end >= pre_nakamoto_count {
+    if !matches!(selection, BlockValidationSelection::Recent { .. })
+        && shard.end >= pre_nakamoto_count
+    {
         let global_start = shard
             .start
             .max(pre_nakamoto_count);
@@ -638,21 +662,31 @@ fn expected_commands(
         .enumerate()
         .map(|(ordinal, (kind, start, end_exclusive))| {
             let ordinal = u32::try_from(ordinal)?;
+            let mut argv = vec![
+                STACKS_INSPECT_GUEST_PATH.into(),
+                "--network-config".into(),
+                STACKS_NETWORK.into(),
+                "validate-block".into(),
+                database_path.clone(),
+                kind.as_str().into(),
+            ];
+            if kind == ValidationCommandKind::Last {
+                argv.push(
+                    end_exclusive
+                        .checked_sub(start)
+                        .context("recent command range is reversed")?
+                        .to_string(),
+                );
+            } else {
+                argv.push(start.to_string());
+                argv.push(end_exclusive.to_string());
+            }
             Ok(ExpectedCommand {
                 ordinal,
                 kind,
                 start,
                 end_exclusive,
-                argv: vec![
-                    STACKS_INSPECT_GUEST_PATH.into(),
-                    "--network-config".into(),
-                    STACKS_NETWORK.into(),
-                    "validate-block".into(),
-                    database_path.clone(),
-                    kind.as_str().into(),
-                    start.to_string(),
-                    end_exclusive.to_string(),
-                ],
+                argv,
                 stdout_file: format!("shard-{}-command-{ordinal}.stdout.log", shard.index),
                 stderr_file: format!("shard-{}-command-{ordinal}.stderr.log", shard.index),
             })
@@ -856,7 +890,7 @@ mod tests {
         std::fs::write(
             &result,
             serde_json::to_vec(&serde_json::json!({
-                "schema_version": 2,
+                "schema_version": RESULT_SCHEMA_VERSION,
                 "job_id": "job",
                 "attempt_id": "attempt",
                 "fencing_generation": 4,
@@ -954,12 +988,18 @@ mod tests {
         )
         .unwrap();
         let database_path = format!("/var/lib/sbgh-chainstate/shard-{index:04}/mainnet");
-        serde_json::json!({
-            "ordinal": ordinal,
-            "kind": kind,
-            "start": start,
-            "end_exclusive": end_exclusive,
-            "argv": [
+        let argv = if kind == "last" {
+            serde_json::json!([
+                STACKS_INSPECT_GUEST_PATH,
+                "--network-config",
+                "mainnet",
+                "validate-block",
+                database_path,
+                kind,
+                (end_exclusive - start).to_string(),
+            ])
+        } else {
+            serde_json::json!([
                 STACKS_INSPECT_GUEST_PATH,
                 "--network-config",
                 "mainnet",
@@ -968,7 +1008,14 @@ mod tests {
                 kind,
                 start.to_string(),
                 end_exclusive.to_string(),
-            ],
+            ])
+        };
+        serde_json::json!({
+            "ordinal": ordinal,
+            "kind": kind,
+            "start": start,
+            "end_exclusive": end_exclusive,
+            "argv": argv,
             "exit_code": exit_code,
             "stdout_file": stdout_file,
             "stderr_file": stderr_file,
@@ -1037,7 +1084,7 @@ mod tests {
                 local_range: InclusiveRange { start: 400, end: 899 },
             }]
         );
-        assert_eq!((recent.shard_count, recent.max_concurrency), (5, 4));
+        assert_eq!((recent.shard_count, recent.max_concurrency), (1, 1));
 
         let saturated = resolve_execution_plan(
             &BlockValidationSelection::Recent { block_count: 2_000 },
@@ -1346,7 +1393,7 @@ mod tests {
         std::fs::write(
             &result,
             serde_json::to_vec(&serde_json::json!({
-                "schema_version": 2,
+                "schema_version": RESULT_SCHEMA_VERSION,
                 "job_id": "job",
                 "attempt_id": "attempt",
                 "fencing_generation": 4,
@@ -1379,6 +1426,79 @@ mod tests {
         assert!(reduced.output.valid);
         assert_eq!(reduced.output.checked_blocks, 2);
         assert_eq!(reduced.artifacts.len(), 10);
+    }
+
+    #[test]
+    fn recent_reducer_requires_height_ordered_last_command() {
+        let directory = TempDir::new().unwrap();
+        let spec = BlockValidationTaskSpec {
+            selection: BlockValidationSelection::Recent { block_count: 2 },
+            timeout_secs: 60,
+        };
+        let snapshots = ChainstateSnapshotSet {
+            origin: "vg/origin".into(),
+            snapshots: vec![ShardSnapshot {
+                shard: 0,
+                vg: "vg".into(),
+                name: "snapshot-0".into(),
+                device: PathBuf::from("/dev/vg/snapshot-0"),
+                serial: "sbgh-block-0000".into(),
+            }],
+        };
+        let plan = BlockGuestPlan::new(
+            "job",
+            "attempt",
+            4,
+            "deadbeef",
+            &spec,
+            &snapshots,
+            1,
+            4,
+            4,
+            vec!["nouuid".into()],
+        )
+        .unwrap();
+        let command = command(&directory, 0, 0, "last", 1, 3, 0, &successful_output(2), "");
+        let probes = probes(&directory, 101, 3);
+        let mut manifest = serde_json::json!({
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "job_id": "job",
+            "attempt_id": "attempt",
+            "fencing_generation": 4,
+            "chainstate_origin": "vg/origin",
+            "selection": {"kind": "recent", "block_count": 2},
+            "observed": {"pre_nakamoto_count": 101, "nakamoto_count": 3},
+            "resolved_range": {"start": 102, "end": 103},
+            "segments": [{
+                "epoch": "nakamoto",
+                "global_range": {"start": 102, "end": 103},
+                "local_range": {"start": 1, "end": 2}
+            }],
+            "shard_count": 1,
+            "max_concurrency": 1,
+            "probes": probes,
+            "shards": [shard(0, 102, 103, vec![command])],
+        });
+        let result = directory
+            .path()
+            .join("block-validation-result.json");
+        std::fs::write(&result, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let reduced = reduce_result(&result, directory.path(), &plan).unwrap();
+        assert!(reduced.output.valid);
+        assert_eq!(reduced.output.checked_blocks, 2);
+        assert_eq!(manifest["shards"][0]["commands"][0]["argv"][5], "last");
+        assert_eq!(manifest["shards"][0]["commands"][0]["argv"][6], "2");
+
+        manifest["shards"][0]["commands"][0]["argv"][5] = "naka-index-range".into();
+        std::fs::write(&result, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let error = reduce_result(&result, directory.path(), &plan).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("trusted argv and range"),
+            "{error:#}"
+        );
     }
 
     #[test]

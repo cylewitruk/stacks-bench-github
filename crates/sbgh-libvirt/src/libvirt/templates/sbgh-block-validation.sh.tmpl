@@ -58,7 +58,7 @@ NETWORK_DATA_DIR = "mainnet"
 MAX_PROBE_DIAGNOSTIC_BYTES = 64 * 1024
 with open(PLAN_PATH, encoding="utf-8") as handle:
     plan = json.load(handle)
-if plan.get("schema_version") != 2:
+if plan.get("schema_version") != 3:
     raise RuntimeError("unsupported block plan schema")
 
 def phase(name):
@@ -200,7 +200,7 @@ target = int(plan["target_blocks_per_shard"])
 max_shards = int(plan["max_shards"])
 if target <= 0 or max_shards <= 0:
     raise RuntimeError("invalid local shard policy")
-shard_count = min((count + target - 1) // target, max_shards)
+shard_count = (1 if kind == "recent" else min((count + target - 1) // target, max_shards))
 if shard_count <= 0 or shard_count > len(plan["devices"]):
     raise RuntimeError("resolved shard count exceeds attached snapshot devices")
 base, remainder = divmod(count, shard_count)
@@ -210,10 +210,14 @@ for index in range(shard_count):
     length = base + (1 if index < remainder else 0)
     global_end = cursor + length - 1
     commands = []
-    if cursor < pre:
+    if kind == "recent":
+        # The upstream `last N` mode selects by height. Its index-range mode
+        # orders by block hash and incurs a deep OFFSET for the tail.
+        commands.append(("last", cursor - pre, global_end - pre))
+    elif cursor < pre:
         end = min(global_end, pre - 1)
         commands.append(("index-range", cursor, end))
-    if global_end >= pre:
+    if kind != "recent" and global_end >= pre:
         start = max(cursor, pre)
         commands.append(("naka-index-range", start - pre, global_end - pre))
     if not commands:
@@ -245,8 +249,11 @@ def start_command(state):
     argv = [
         BIN, "--network-config", "mainnet", "validate-block",
         database_paths[state["index"]], range_kind,
-        str(command_start), str(end_exclusive),
     ]
+    if range_kind == "last":
+        argv.append(str(end_exclusive - command_start))
+    else:
+        argv.extend((str(command_start), str(end_exclusive)))
     audit = {
         "ordinal": ordinal,
         "kind": range_kind,
@@ -405,7 +412,7 @@ while pending or active:
 
 finished.sort(key=lambda item: item["index"])
 result = {
-    "schema_version": 2,
+    "schema_version": 3,
     "job_id": plan["job_id"],
     "attempt_id": plan["attempt_id"],
     "fencing_generation": plan["fencing_generation"],

@@ -256,10 +256,13 @@ sudo lvchange --permission r vg0/mainnet-YYYY-MM-DD
 
 The selected origin, guest-observed epoch counts, resolved global range,
 epoch-local segments, shard count, and concurrency are recorded with block
-validation results. `recent` saturates at the observed Nakamoto count; `full`
-covers both epochs. A worker whose local chainstate cannot cover an explicit
-range fails the attempt as infrastructure; it must not fabricate a partial
-verdict.
+validation results. `recent` saturates at the observed Nakamoto count and uses
+`stacks-inspect last N` to select by block height, not by hash-ordered index
+offset. It runs on one shard because that upstream mode cannot be partitioned
+without changing the selected set. Its reported range is a logical ordinal
+accounting range, not a block-height range. `full` covers both epochs. A worker
+whose local chainstate cannot cover an explicit range fails the attempt as
+infrastructure; it must not fabricate a partial verdict.
 
 ## Sandbox network
 

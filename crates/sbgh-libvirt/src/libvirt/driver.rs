@@ -2347,7 +2347,7 @@ fn provisioned_block_snapshot_count(
     let upper_bound = match &spec.selection {
         BlockValidationSelection::Recent { block_count } => {
             anyhow::ensure!(*block_count > 0, "recent block count is zero");
-            *block_count
+            return Ok(1);
         }
         BlockValidationSelection::Full => return Ok(profile.max_shards),
         BlockValidationSelection::Range { range } => range
