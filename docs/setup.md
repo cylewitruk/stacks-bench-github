@@ -69,8 +69,7 @@ Install these additional packages on every execution worker:
 sudo apt install -y \
   qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients \
   virtinst virtiofsd cloud-image-utils libguestfs-tools \
-  git lvm2 util-linux e2fsprogs xfsprogs nftables iproute2 \
-  aria2 zstd
+  git lvm2 util-linux e2fsprogs xfsprogs nftables iproute2
 sudo systemctl enable --now libvirtd nftables
 ```
 
@@ -300,7 +299,7 @@ The downloader creates, verifies, populates, and publishes a suitable origin:
 
 ```bash
 sudo ./scripts/download-chainstate.sh \
-  --stream --vg vg0 --thinpool thinpool --prefix mainnet-
+  --vg vg0 --thinpool thinpool --prefix mainnet-
 sudo lvs -o vg_name,lv_name,lv_attr,origin,data_percent,metadata_percent
 ```
 
@@ -311,10 +310,24 @@ is retained. The default 1 TiB virtual LV does not reserve 1 TiB of thin-pool
 data, but the pool still needs enough physical headroom for the extracted
 chainstate and worker snapshots.
 
-Schedule the same command nightly or on demand on every chainstate worker.
-Keep the naming prefix identical across worker profiles. The worker validates
-requested block coverage inside the selected snapshot; centralized dataset
-coordination is not required.
+The worker installer also installs `sbgh-chainstate-refresh.service` and
+`.timer`, but does not enable the timer. Once any prior host schedule is
+retired and no refresh is running, enable the daily timer (04:00–04:15 local
+time):
+
+```bash
+sudo systemctl enable --now sbgh-chainstate-refresh.timer
+systemctl list-timers --all sbgh-chainstate-refresh.timer
+```
+
+The timer does not catch up missed runs after activation or downtime; it runs
+at the next scheduled time.
+
+Adjust the service's `ExecStart` with a systemd drop-in if the host does not
+use the default VG, thin pool, prefix, or base size. Keep the naming prefix
+identical across worker profiles. The worker validates requested block
+coverage inside the selected snapshot; centralized dataset coordination is
+not required.
 
 ### Sandbox network and golden image
 

@@ -28,9 +28,20 @@ binary_src="$repo_root/target/release/sbgh-worker"
 ripcat_src="$repo_root/target/release/ripcat"
 unit_src="$repo_root/systemd/sbgh-worker@.service"
 hardening_src="$repo_root/systemd/sbgh-worker-hardening.conf"
+chainstate_src="$repo_root/scripts/download-chainstate.sh"
+chainstate_service_src="$repo_root/systemd/sbgh-chainstate-refresh.service"
+chainstate_timer_src="$repo_root/systemd/sbgh-chainstate-refresh.timer"
 
 sbgh_require_file "$unit_src" "Worker unit template"
 sbgh_require_file "$hardening_src" "Worker hardening drop-in"
+sbgh_require_file "$chainstate_src" "Chainstate downloader"
+sbgh_require_file "$chainstate_service_src" "Chainstate refresh service"
+sbgh_require_file "$chainstate_timer_src" "Chainstate refresh timer"
+if [[ -z "$SBGH_INSTALL_DESTDIR" ]] \
+    && systemctl is-active --quiet sbgh-chainstate-refresh.service; then
+    echo "Chainstate refresh is running; wait for it to finish before installing." >&2
+    exit 1
+fi
 
 echo "[1/4] Preparing worker release..."
 sbgh_build_release "$do_build" sbgh-worker ripcat
@@ -43,6 +54,11 @@ sbgh_install_file 0755 "$ripcat_src" /usr/local/bin/ripcat
 sbgh_install_file 0644 "$unit_src" /etc/systemd/system/sbgh-worker@.service
 sbgh_install_file 0644 "$hardening_src" \
     /etc/systemd/system/sbgh-worker@.service.d/hardening.conf
+sbgh_install_file 0755 "$chainstate_src" /usr/local/sbin/sbgh-download-chainstate
+sbgh_install_file 0644 "$chainstate_service_src" \
+    /etc/systemd/system/sbgh-chainstate-refresh.service
+sbgh_install_file 0644 "$chainstate_timer_src" \
+    /etc/systemd/system/sbgh-chainstate-refresh.timer
 
 echo "[3/4] Reloading systemd..."
 sbgh_reload_systemd
@@ -51,3 +67,4 @@ echo "[4/4] Worker remains stopped pending config, preflight, and enrollment."
 echo
 echo "Next: sudo -u sbgh-worker sbgh-worker --config /etc/sbgh/worker/PROFILE.toml --preflight-only"
 echo "Then: sudo systemctl enable --now sbgh-worker@PROFILE.service"
+echo "Chainstate timer remains disabled until the previous schedule is retired."

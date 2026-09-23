@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh the Stacks mainnet chainstate origin
+Documentation=https://github.com/cylewitruk/stacks-bench-github
+Wants=network-online.target
+After=network-online.target local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/sbgh-download-chainstate
+TimeoutStartSec=infinity
+UMask=0077
+StandardOutput=journal
+StandardError=journal

@@ -219,11 +219,25 @@ read-only LVM origin under the configured prefix:
 
 ```bash
 sudo ./scripts/download-chainstate.sh \
-  --stream --vg vg0 --thinpool thinpool --prefix mainnet-
+  --vg vg0 --thinpool thinpool --prefix mainnet-
 sudo lvs -o vg_name,lv_name,lv_attr,origin,data_percent,metadata_percent
 ```
 
-Run this nightly or on demand. The new LV is published only after checksum
+For scheduled refreshes, first retire any previous cron or systemd schedule
+and let an in-progress manual download finish. The worker installer installs
+the service and timer without enabling them. Verify the installed command,
+then enable the daily timer (04:00–04:15 local time):
+
+```bash
+sudo systemctl cat sbgh-chainstate-refresh.service
+sudo systemctl enable --now sbgh-chainstate-refresh.timer
+systemctl list-timers --all sbgh-chainstate-refresh.timer
+journalctl -u sbgh-chainstate-refresh.service -n 50 --no-pager
+```
+
+Missed runs are not caught up; the timer starts at the next scheduled time.
+
+The new LV is published only after checksum
 verification and extraction complete, then set read-only and deactivated.
 The worker selects the lexicographically newest matching name when preparing
 an attempt. Streaming keeps only a bounded temporary range window, retries a

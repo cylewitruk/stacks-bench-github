@@ -36,12 +36,15 @@ class InstallerTest(unittest.TestCase):
             "install-service-common.sh",
             "install-daemon.sh",
             "install-worker.sh",
+            "download-chainstate.sh",
         ):
             shutil.copy2(ROOT / "scripts" / name, self.root / "scripts" / name)
         for name in (
             "sbgh-daemon.service",
             "sbgh-worker@.service",
             "sbgh-worker-hardening.conf",
+            "sbgh-chainstate-refresh.service",
+            "sbgh-chainstate-refresh.timer",
         ):
             shutil.copy2(ROOT / "systemd" / name, self.root / "systemd" / name)
         for name in ("ripcat", "sbgh-daemon", "sbgh-cli", "sbgh-worker"):
@@ -93,14 +96,20 @@ class InstallerTest(unittest.TestCase):
             {
                 "etc/systemd/system/sbgh-worker@.service",
                 "etc/systemd/system/sbgh-worker@.service.d/hardening.conf",
+                "etc/systemd/system/sbgh-chainstate-refresh.service",
+                "etc/systemd/system/sbgh-chainstate-refresh.timer",
                 "usr/local/bin/ripcat",
                 "usr/local/bin/sbgh-worker",
+                "usr/local/sbin/sbgh-download-chainstate",
             },
         )
         installed = digest_tree(destination)
         self.assertEqual(installed["usr/local/bin/sbgh-worker"][0], 0o755)
         self.assertEqual(installed["usr/local/bin/ripcat"][0], 0o755)
+        self.assertEqual(installed["usr/local/sbin/sbgh-download-chainstate"][0], 0o755)
         self.assertEqual(installed["etc/systemd/system/sbgh-worker@.service"][0], 0o644)
+        self.assertEqual(installed["etc/systemd/system/sbgh-chainstate-refresh.service"][0], 0o644)
+        self.assertEqual(installed["etc/systemd/system/sbgh-chainstate-refresh.timer"][0], 0o644)
         self.assertEqual(
             installed["etc/systemd/system/sbgh-worker@.service.d/hardening.conf"][0],
             0o644,
@@ -113,6 +122,17 @@ class InstallerTest(unittest.TestCase):
             / "etc/systemd/system/sbgh-worker@.service.d/hardening.conf"
         ).read_text(encoding="utf-8")
         self.assertIn("UMask=0077", unit)
+        refresh_service = (
+            destination / "etc/systemd/system/sbgh-chainstate-refresh.service"
+        ).read_text(encoding="utf-8")
+        refresh_timer = (
+            destination / "etc/systemd/system/sbgh-chainstate-refresh.timer"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ExecStart=/usr/local/sbin/sbgh-download-chainstate", refresh_service)
+        self.assertIn("User=root", refresh_service)
+        self.assertIn("TimeoutStartSec=infinity", refresh_service)
+        self.assertIn("Persistent=false", refresh_timer)
+        self.assertIn("WantedBy=timers.target", refresh_timer)
         self.assertIn("RestrictNamespaces=true", hardening)
         combined_unit = unit + hardening
         for private_mount_directive in (

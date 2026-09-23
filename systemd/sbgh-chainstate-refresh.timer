@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Stacks mainnet chainstate refresh
+Documentation=https://github.com/cylewitruk/stacks-bench-github
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=false
+RandomizedDelaySec=900
+Unit=sbgh-chainstate-refresh.service
+
+[Install]
+WantedBy=timers.target
