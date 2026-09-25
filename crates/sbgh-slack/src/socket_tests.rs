@@ -45,6 +45,7 @@ impl IntentResolver for FixedResolver {
                 target: WorkloadTarget::Blocks(vec![BlockSelector::Height(184_231)]),
                 clean_repetitions: 1,
                 warmup: None,
+                repository: None,
                 rev: None,
             }),
         ))))

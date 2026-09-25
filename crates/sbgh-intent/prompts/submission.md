@@ -28,7 +28,8 @@ never invent a target, ref, count, or range the user did not supply — an under
 and `warmup` defaults.
 
 The two task kinds own nearly disjoint field sets: each must null out the fields owned by the other.
-Only `rev` is shared, and it means the same thing in both — the source revision to build.
+`rev` and `repository` are shared source selectors. Leave `repository` null only when the user did
+not identify a repository; the server then uses its configured default.
 
 ### Benchmark Requests
 
@@ -46,7 +47,8 @@ Set `task_kind` to `benchmark` and:
 | `warmup` | required; warmup blocks, 0 or more; default 0 |
 | `rev` | the ref for a single-ref request, else null |
 | `variant_refs` | exactly two refs for a comparison request, else null |
-| `repository`, every `validation_*` | always null |
+| `repository` | explicit `owner/name` repository, else null |
+| every `validation_*` | always null |
 
 Rules:
 
@@ -57,6 +59,11 @@ Rules:
 - Hashes and txids are 64 hex characters, with or without a `0x` prefix. Any other length or non-hex
   content is invalid.
 - `repetitions` are clean, separately orchestrated VM executions — not in-process loops.
+- Preserve an explicit `owner/name` repository, account, or fork as `repository`. If the user writes
+  `owner/name/branch/path`, the first two segments are the repository and the remainder is `rev`.
+  Do not treat a branch containing `/` as a repository when no `owner/name` was supplied.
+- Repository authorization is checked by the server; do not silently replace an explicit repository
+  with the configured default.
 - **Single ref:** `on <ref>` or `against <ref>` naming one ref sets `rev`, and `variant_refs` stays
   null. Refs may contain `/`, as in `sb-integration/squash`; preserve the complete ref verbatim in
   `rev` rather than treating it as a repository selector or dropping it.
@@ -147,6 +154,12 @@ inapplicable fields explicitly `null`.
 
 ```json
 {"status":"resolved","task_kind":"benchmark","target_kind":"block_range","block":null,"block_range":{"start":8500000,"end":8509999},"txids":null,"repetitions":2,"warmup":2500,"rev":"sb-integration/squash","variant_refs":null,"repository":null,"validation_selection":null,"validation_block_count":null,"validation_start":null,"validation_end":null,"reason":null,"issues":null}
+```
+
+**`benchmark 20k blocks starting at 7800000 from cylewitruk/stacks-core on perf/optimized-stacks-bench-integration`**
+
+```json
+{"status":"resolved","task_kind":"benchmark","target_kind":"block_range","block":null,"block_range":{"start":7800000,"end":7819999},"txids":null,"repetitions":1,"warmup":0,"rev":"perf/optimized-stacks-bench-integration","variant_refs":null,"repository":"cylewitruk/stacks-core","validation_selection":null,"validation_block_count":null,"validation_start":null,"validation_end":null,"reason":null,"issues":null}
 ```
 
 **`profile tx f426738843949f576e4eff5ffbb148de9e1a638d20a03c6447cc70490f5156ce twice`**

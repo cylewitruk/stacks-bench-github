@@ -303,7 +303,6 @@ fn validate_resolved_intent(
 fn validate_resolved_benchmark(
     intent: IntentResolutionJson,
 ) -> Result<IntentOutcome, IntentValidationError> {
-    require_absent(intent.repository, "repository")?;
     require_absent(intent.validation_selection, "validation_selection")?;
     require_absent(intent.validation_block_count, "validation_block_count")?;
     require_absent(intent.validation_start, "validation_start")?;
@@ -323,6 +322,7 @@ fn validate_resolved_benchmark(
     }
     let warmup = required(intent.warmup, "warmup")?;
     let rev = normalize_optional_text(intent.rev);
+    let repository = normalize_bounded_selector(intent.repository, "repository")?;
     let variant_refs = normalize_variant_refs(intent.variant_refs)?;
 
     let target = match target_kind {
@@ -380,6 +380,7 @@ fn validate_resolved_benchmark(
         target,
         clean_repetitions: repetitions,
         warmup: Some(warmup),
+        repository,
         rev,
     };
     if let Some(variants) = variant_refs {
@@ -705,7 +706,7 @@ pub fn intent_response_text_format() -> Value {
                 },
                 "repository": {
                     "type": ["string", "null"],
-                    "description": "Optional repository selector for block validation; null uses configured repository."
+                    "description": "Optional owner/name repository for benchmark or block validation; null uses configured default. Preserve explicit forks."
                 },
                 "validation_selection": {
                     "type": ["string", "null"],
@@ -921,6 +922,28 @@ fn ten_thousand_block_range_single_ref(intent: &UserIntent) -> Result<(), String
     Ok(())
 }
 
+#[cfg(test)]
+fn explicit_fork_benchmark(intent: &UserIntent) -> Result<(), String> {
+    let BenchmarkRequest::Single(spec) = expect_benchmark(intent)? else {
+        return Err("expected a single-ref benchmark".into());
+    };
+    if spec.repository.as_deref() != Some("cylewitruk/stacks-core") {
+        return Err(format!("expected explicit fork, got {:?}", spec.repository));
+    }
+    if spec.rev.as_deref() != Some("perf/optimized-stacks-bench-integration") {
+        return Err(format!("expected explicit branch, got {:?}", spec.rev));
+    }
+    if spec.target
+        != (WorkloadTarget::BlockRange {
+            start: 7_800_000,
+            end: 7_819_999,
+        })
+    {
+        return Err(format!("expected 20k-block range, got {:?}", spec.target));
+    }
+    Ok(())
+}
+
 /// An unqualified benchmark must still carry the documented run defaults.
 #[cfg(test)]
 fn single_block_with_default_runs(intent: &UserIntent) -> Result<(), String> {
@@ -966,6 +989,12 @@ pub const EVAL_FIXTURES: &[IntentEvalFixture] = &[
     IntentEvalFixture::resolved(
         "openai_live_eval_benchmark_run_range",
         "run 10 reps with 1000 warmup from 8123456 to 8200000",
+    ),
+    IntentEvalFixture::resolved_as(
+        "openai_live_eval_benchmark_explicit_fork",
+        "benchmark 20k blocks starting at 7800000 from cylewitruk/stacks-core on \
+         perf/optimized-stacks-bench-integration",
+        explicit_fork_benchmark,
     ),
     IntentEvalFixture::resolved(
         "openai_live_eval_benchmark_txid",
@@ -1168,6 +1197,22 @@ mod tests {
         assert_eq!(spec.target, WorkloadTarget::BlockRange { start: 10, end: 12 });
         assert_eq!(spec.to_bench_args(), vec!["--start-at", "10", "--count", "3", "--warmup", "2"]);
         assert_eq!(spec.rev.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn preserves_explicit_benchmark_repository() {
+        let mut intent = resolved_base(TargetKind::BlockRange);
+        intent.block_range = Some(IntentBlockRangeJson { start: 100, end: 199 });
+        intent.repository = Some(" cylewitruk/stacks-core ".into());
+        intent.rev = Some("perf/optimized-stacks-bench-integration".into());
+        let IntentOutcome::Resolved(UserIntent::Create(TaskCreationIntent::Benchmark(
+            BenchmarkRequest::Single(spec),
+        ))) = validate_intent_resolution(intent).unwrap()
+        else {
+            panic!("expected resolved benchmark");
+        };
+        assert_eq!(spec.repository.as_deref(), Some("cylewitruk/stacks-core"));
+        assert_eq!(spec.rev.as_deref(), Some("perf/optimized-stacks-bench-integration"));
     }
 
     #[test]

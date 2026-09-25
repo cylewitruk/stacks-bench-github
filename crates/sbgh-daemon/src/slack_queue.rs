@@ -13,18 +13,19 @@ use sbgh_core::submission::{
     SubmissionReceipt, TaskPlan,
 };
 use sbgh_github::GitHubApi;
-use sbgh_slack::{SlackJobTarget, SlackSubmissionActor, TaskSubmissionPort, TaskSubmissionRequest};
+use sbgh_slack::{SlackSubmissionActor, TaskSubmissionPort, TaskSubmissionRequest};
 
 use crate::block_validation_submission::{
     BlockValidationSubmission, BlockValidationSubmissionService,
 };
+use crate::slack_target::SlackRepositoryResolver;
 
 pub struct SlackTaskSubmissionAdapter {
     jobs: Arc<dyn SubmissionStore>,
     github: Arc<dyn GitHubApi>,
     validation: Option<Arc<BlockValidationSubmissionService>>,
-    target: SlackJobTarget,
-    repository: String,
+    repositories: Arc<dyn SlackRepositoryResolver>,
+    default_repository: String,
     default_rev: String,
 }
 
@@ -33,16 +34,16 @@ impl SlackTaskSubmissionAdapter {
         jobs: Arc<dyn SubmissionStore>,
         github: Arc<dyn GitHubApi>,
         validation: Option<Arc<BlockValidationSubmissionService>>,
-        target: SlackJobTarget,
-        repository: impl Into<String>,
+        repositories: Arc<dyn SlackRepositoryResolver>,
+        default_repository: impl Into<String>,
         default_rev: impl Into<String>,
     ) -> Self {
         Self {
             jobs,
             github,
             validation,
-            target,
-            repository: repository.into(),
+            repositories,
+            default_repository: default_repository.into(),
             default_rev: default_rev.into(),
         }
     }
@@ -89,21 +90,29 @@ impl TaskSubmissionPort for SlackTaskSubmissionAdapter {
     ) -> sbgh_core::Result<SubmissionReceipt> {
         match request {
             TaskSubmissionRequest::Benchmark {
+                repository,
                 variants: requested_variants,
                 effective_args,
                 clean_repetitions,
             } => {
+                let repository = repository
+                    .as_deref()
+                    .unwrap_or(&self.default_repository);
+                let target = self
+                    .repositories
+                    .resolve(repository)
+                    .await?;
                 let mut variants = Vec::with_capacity(requested_variants.len());
                 for variant in &requested_variants {
                     let resolved = self
                         .github
-                        .resolve_commit(self.target.installation_id, &self.repository, &variant.rev)
+                        .resolve_commit(target.installation_id, repository, &variant.rev)
                         .await
                         .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
                     variants.push(BenchmarkVariant {
                         source: ResolvedTaskSource {
-                            github_installation_id: self.target.installation_id,
-                            github_repo_id: self.target.repo_id,
+                            github_installation_id: target.installation_id,
+                            github_repo_id: target.repo_id,
                             source: JobSource::Slack,
                             intent: JobIntent::AdhocBenchmark,
                             task_kind: TaskKind::Benchmark,
@@ -118,7 +127,7 @@ impl TaskSubmissionPort for SlackTaskSubmissionAdapter {
                         baseline_calibration_id: None,
                     });
                 }
-                let detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
+                let mut detail = serde_json::to_value(QueuedEventDetail::SlackAdhoc {
                     channel: actor.channel_id.into(),
                     message_ts: actor
                         .request_message_ts
@@ -132,6 +141,7 @@ impl TaskSubmissionPort for SlackTaskSubmissionAdapter {
                     clean_repetitions,
                 })
                 .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
+                detail["effective_args"] = serde_json::json!(&effective_args);
                 let command = SubmissionCommand {
                     actor: SubmissionActor::SlackUser {
                         team_id: actor.team_id.into(),
@@ -155,16 +165,15 @@ impl TaskSubmissionPort for SlackTaskSubmissionAdapter {
                             "block-validation submission is not configured".into(),
                         )
                     })?;
-                if request
+                let repository = request
                     .source
                     .repository
                     .as_deref()
-                    .is_some_and(|repository| repository != self.repository)
-                {
-                    return Err(sbgh_core::Error::Config(
-                        "Slack block validation is restricted to the configured repository".into(),
-                    ));
-                }
+                    .unwrap_or(&self.default_repository);
+                let target = self
+                    .repositories
+                    .resolve(repository)
+                    .await?;
                 let revision = request
                     .source
                     .revision
@@ -174,15 +183,15 @@ impl TaskSubmissionPort for SlackTaskSubmissionAdapter {
                     .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
                 let resolved = self
                     .github
-                    .resolve_commit(self.target.installation_id, &self.repository, &revision)
+                    .resolve_commit(target.installation_id, repository, &revision)
                     .await
                     .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
                 let detail = validation.queued_detail(&selection)?;
                 validation
                     .submit(BlockValidationSubmission {
                         source: ResolvedTaskSource {
-                            github_installation_id: self.target.installation_id,
-                            github_repo_id: self.target.repo_id,
+                            github_installation_id: target.installation_id,
+                            github_repo_id: target.repo_id,
                             source: JobSource::Slack,
                             intent: JobIntent::BlockValidation,
                             task_kind: TaskKind::BlockValidation,
@@ -221,12 +230,28 @@ mod tests {
     use sbgh_fleet::BlockValidationSelection;
     use sbgh_github::test_support::FakeGitHub;
     use sbgh_intent::{BlockValidationIntent, RequestedSource, ValidationSelection};
+    use sbgh_slack::{BenchmarkVariantRequest, SlackJobTarget};
     use uuid::Uuid;
 
     use super::*;
 
     #[derive(Default)]
     struct RecordingStore(Mutex<Vec<PreparedSubmission>>);
+
+    struct FakeRepositories;
+
+    #[async_trait]
+    impl SlackRepositoryResolver for FakeRepositories {
+        async fn resolve(&self, repository: &str) -> sbgh_core::Result<SlackJobTarget> {
+            match repository {
+                "stacks-network/stacks-core" => {
+                    Ok(SlackJobTarget { installation_id: 1, repo_id: 2 })
+                }
+                "cylewitruk/stacks-core" => Ok(SlackJobTarget { installation_id: 3, repo_id: 4 }),
+                _ => Err(sbgh_core::Error::Unauthorized("repository not allowed".into())),
+            }
+        }
+    }
 
     #[async_trait]
     impl SubmissionStore for RecordingStore {
@@ -251,6 +276,7 @@ mod tests {
         let store = Arc::new(RecordingStore::default());
         let github = Arc::new(FakeGitHub::new());
         github.set_commit("stacks-network/stacks-core", "candidate", &"a".repeat(40), None);
+        github.set_commit("cylewitruk/stacks-core", "candidate", &"b".repeat(40), None);
         let validation = Arc::new(BlockValidationSubmissionService::new(
             store.clone(),
             BlockValidationTaskConfig {
@@ -265,7 +291,7 @@ mod tests {
             store.clone(),
             github,
             Some(validation),
-            SlackJobTarget { installation_id: 1, repo_id: 2 },
+            Arc::new(FakeRepositories),
             "stacks-network/stacks-core",
             "develop",
         );
@@ -303,6 +329,40 @@ mod tests {
             );
         }
 
+        adapter
+            .submit(
+                TaskSubmissionRequest::BlockValidation(BlockValidationIntent {
+                    source: RequestedSource {
+                        repository: Some("cylewitruk/stacks-core".into()),
+                        revision: Some("candidate".into()),
+                    },
+                    selection: ValidationSelection::Recent { block_count: None },
+                }),
+                None,
+                SlackSubmissionActor {
+                    team_id: "T1",
+                    user_id: "U1",
+                    channel_id: "C1",
+                    request_message_ts: "1.4",
+                    reporting_identity: "fork",
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let records = store.0.lock().unwrap();
+            let TaskPlan::BlockValidation(plan) = &records[1].command.task else {
+                panic!("expected validation plan");
+            };
+            assert_eq!(
+                plan.source
+                    .github_installation_id,
+                3
+            );
+            assert_eq!(plan.source.github_repo_id, 4);
+            assert_eq!(plan.source.commit, "b".repeat(40));
+        }
+
         let error = adapter
             .submit(
                 TaskSubmissionRequest::BlockValidation(BlockValidationIntent {
@@ -326,8 +386,65 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("configured repository")
+                .contains("repository not allowed")
         );
-        assert_eq!(store.0.lock().unwrap().len(), 1);
+        assert_eq!(store.0.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn benchmark_uses_explicit_repository_and_default_only_when_omitted() {
+        let store = Arc::new(RecordingStore::default());
+        let github = Arc::new(FakeGitHub::new());
+        github.set_commit("stacks-network/stacks-core", "develop", &"a".repeat(40), None);
+        github.set_commit("cylewitruk/stacks-core", "candidate", &"b".repeat(40), None);
+        let adapter = SlackTaskSubmissionAdapter::new(
+            store.clone(),
+            github,
+            None,
+            Arc::new(FakeRepositories),
+            "stacks-network/stacks-core",
+            "develop",
+        );
+        let actor = SlackSubmissionActor {
+            team_id: "T1",
+            user_id: "U1",
+            channel_id: "C1",
+            request_message_ts: "1.2",
+            reporting_identity: "opaque",
+        };
+        for (repository, rev) in
+            [(None, "develop"), (Some("cylewitruk/stacks-core".into()), "candidate")]
+        {
+            let effective_args = vec!["run".into(), "--count".into(), "1".into()];
+            adapter
+                .submit(
+                    TaskSubmissionRequest::Benchmark {
+                        repository,
+                        variants: vec![BenchmarkVariantRequest {
+                            rev: rev.into(),
+                            workload_key: sbgh_core::bench_args::workload_key(&effective_args),
+                            requested_run_count: 1,
+                        }],
+                        effective_args,
+                        clean_repetitions: 1,
+                    },
+                    None,
+                    actor,
+                )
+                .await
+                .unwrap();
+        }
+        let records = store.0.lock().unwrap();
+        for (record, installation_id, repo_id, commit) in
+            [(&records[0], 1, 2, "a"), (&records[1], 3, 4, "b")]
+        {
+            let TaskPlan::Benchmark(plan) = &record.command.task else {
+                panic!("expected benchmark plan");
+            };
+            let source = &plan.variants[0].source;
+            assert_eq!(source.github_installation_id, installation_id);
+            assert_eq!(source.github_repo_id, repo_id);
+            assert_eq!(source.commit, commit.repeat(40));
+        }
     }
 }

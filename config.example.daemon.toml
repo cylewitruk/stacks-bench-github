@@ -213,7 +213,7 @@ enabled = false
 
 # When enabled, ALL of the following are required:
 #   enabled            = true
-#   default_repository = "stacks-network/stacks-core"  # the constant code under test
+#   default_repository = "stacks-network/stacks-core"  # fallback if none named
 #   default_rev        = "develop"                      # its default branch/tag/sha
 #   allowed_team_ids   = ["T0123ABCD"]                  # allowlisted workspaces (non-empty)
 #   allowed_user_ids   = ["U0123ABCD", "U0456WXYZ"]     # allowlisted users (non-empty)

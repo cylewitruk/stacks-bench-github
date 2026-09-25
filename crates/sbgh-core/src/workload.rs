@@ -35,9 +35,8 @@ pub enum WorkloadTarget {
     },
 }
 
-/// A validated ad-hoc workload: the target plus the run parameters. The **code
-/// under test** is *not* here — `rev` only *overrides* the configured default;
-/// the connector resolves repo/rev separately.
+/// A validated ad-hoc workload with optional code-under-test selectors.
+/// The connector resolves repository and revision separately from bench args.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadSpec {
     pub target: WorkloadTarget,
@@ -46,6 +45,8 @@ pub struct WorkloadSpec {
     pub clean_repetitions: u32,
     /// `--warmup` — warmup iterations before measurement. `None` → default.
     pub warmup: Option<u32>,
+    /// Repository containing the code under test; `None` uses the Slack default.
+    pub repository: Option<String>,
     /// `--rev` — override the code-under-test rev (branch/tag/sha). `None` →
     /// the `[slack].default_rev`. **Not** a `stacks-bench` arg (see
     /// [`Self::to_bench_args`]).
@@ -274,6 +275,7 @@ mod tests {
             target: WorkloadTarget::BlockRange { start: 100, end: 102 },
             clean_repetitions: 3,
             warmup: Some(2),
+            repository: None,
             rev: Some("candidate".into()),
         };
         assert_eq!(
@@ -287,6 +289,7 @@ mod tests {
             ]),
             clean_repetitions: 7,
             warmup: None,
+            repository: None,
             rev: None,
         };
         assert_eq!(
@@ -309,6 +312,7 @@ mod tests {
                 target: WorkloadTarget::Blocks(vec![BlockSelector::Height(1)]),
                 clean_repetitions: 5,
                 warmup: None,
+                repository: None,
                 rev: None,
             },
             variants: vec![
@@ -334,6 +338,7 @@ mod tests {
                 target: WorkloadTarget::Blocks(vec![BlockSelector::Height(1)]),
                 clean_repetitions: 6,
                 warmup: None,
+                repository: None,
                 rev: None,
             },
             variants: vec![
@@ -354,6 +359,7 @@ mod tests {
                 target: WorkloadTarget::Blocks(vec![BlockSelector::Height(1)]),
                 clean_repetitions: 1,
                 warmup: None,
+                repository: None,
                 rev: None,
             },
             variants: vec![
@@ -371,6 +377,7 @@ mod tests {
                 target: WorkloadTarget::Blocks(vec![BlockSelector::Height(1)]),
                 clean_repetitions: 5,
                 warmup: None,
+                repository: None,
                 rev: None,
             },
             variants: vec![

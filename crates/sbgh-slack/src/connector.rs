@@ -119,6 +119,8 @@ pub trait TaskSubmissionPort: Send + Sync + 'static {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskSubmissionRequest {
     Benchmark {
+        /// Explicit code repository, or `None` for the configured default.
+        repository: Option<String>,
         variants: Vec<BenchmarkVariantRequest>,
         effective_args: Vec<String>,
         clean_repetitions: u32,
@@ -271,7 +273,7 @@ impl SlackConnector {
         // 3. Enqueue an ad-hoc benchmark submission. A singleton request creates one spec; a
         //    comparison request creates one ordered spec per variant and queues only
         //    spec 0/run 0. Later specs are materialized by the DB-backed lazy chain.
-        let (rev_label, bench_args, clean_repetitions, specs) = match request {
+        let (repository, rev_label, bench_args, clean_repetitions, specs) = match request {
             BenchmarkRequest::Single(spec) => {
                 let rev = spec
                     .rev
@@ -281,6 +283,7 @@ impl SlackConnector {
                 let bench_args = spec.to_bench_args();
                 let workload_key = workload_key(&bench_args);
                 (
+                    spec.repository.clone(),
                     rev.clone(),
                     bench_args,
                     clean_repetitions,
@@ -313,11 +316,21 @@ impl SlackConnector {
                         requested_run_count: clean_repetitions as i32,
                     })
                     .collect();
-                (revs.join(" vs "), bench_args, clean_repetitions, specs)
+                (
+                    comparison
+                        .workload
+                        .repository
+                        .clone(),
+                    revs.join(" vs "),
+                    bench_args,
+                    clean_repetitions,
+                    specs,
+                )
             }
         };
         tracing::info!(
             rev = %rev_label,
+            repository = ?repository,
             variants = specs.len(),
             clean_repetitions,
             "slack: workload resolved — enqueuing"
@@ -325,11 +338,20 @@ impl SlackConnector {
         tracing::debug!(bench_args = ?bench_args, "slack: resolved bench args");
         let reporting_identity =
             ReportingIdentity::for_request(&event.team_id, &event.channel, &event.message_ts);
+        let source_label = repository
+            .as_ref()
+            .map(|repository| format!("{repository}@{rev_label}"))
+            .unwrap_or(rev_label);
         // 3a. Reconcile or post before creating the job. The identity is stable
         //     across Socket Mode redelivery, so a lost post response can be
         //     adopted rather than duplicated when the reporter takes over.
         let queued_snapshot = self
-            .post_queued_snapshot(&event, &rev_label, clean_repetitions, reporting_identity.clone())
+            .post_queued_snapshot(
+                &event,
+                &source_label,
+                clean_repetitions,
+                reporting_identity.clone(),
+            )
             .await;
         let posted = queued_snapshot
             .publisher
@@ -343,6 +365,7 @@ impl SlackConnector {
             .jobs
             .submit(
                 TaskSubmissionRequest::Benchmark {
+                    repository,
                     variants: specs,
                     effective_args: bench_args,
                     clean_repetitions,
@@ -364,7 +387,12 @@ impl SlackConnector {
                 // Turn the orphaned queued snapshot into a visible failure.
                 self.fail_queued_snapshot(&queued_snapshot)
                     .await;
-                self.reject_after_ack(&event, "couldn't enqueue the benchmark — please retry")
+                let message = if matches!(e, sbgh_core::Error::Unauthorized(_)) {
+                    "repository is not authorized for Slack benchmarks"
+                } else {
+                    "couldn't enqueue the benchmark — please retry"
+                };
+                self.reject_after_ack(&event, message)
                     .await;
                 return;
             }
@@ -400,13 +428,19 @@ impl SlackConnector {
             .revision
             .as_deref()
             .unwrap_or(&self.cfg.default_rev);
+        let source_label = request
+            .source
+            .repository
+            .as_ref()
+            .map(|repository| format!("{repository}@{reference}"))
+            .unwrap_or_else(|| reference.to_owned());
         let reporting_identity =
             ReportingIdentity::for_request(&event.team_id, &event.channel, &event.message_ts);
         let queued_snapshot = self
             .post_queued_task_snapshot(
                 event,
                 "Block validation",
-                reference,
+                &source_label,
                 reporting_identity.clone(),
             )
             .await;
@@ -434,7 +468,12 @@ impl SlackConnector {
                 tracing::error!(error = %error, "slack: block-validation enqueue failed");
                 self.fail_queued_snapshot(&queued_snapshot)
                     .await;
-                self.reject_after_ack(event, "couldn't enqueue block validation — please retry")
+                let message = if matches!(error, sbgh_core::Error::Unauthorized(_)) {
+                    "repository is not authorized for Slack block validation"
+                } else {
+                    "couldn't enqueue block validation — please retry"
+                };
+                self.reject_after_ack(event, message)
                     .await;
                 return;
             }

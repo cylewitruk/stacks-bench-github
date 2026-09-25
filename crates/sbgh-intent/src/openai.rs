@@ -414,6 +414,7 @@ mod tests {
                         target: WorkloadTarget::Blocks(vec![BlockSelector::Height(10)]),
                         clean_repetitions: 1,
                         warmup: Some(0),
+                        repository: None,
                         rev: None,
                     }),
                 ))))
@@ -531,6 +532,7 @@ mod tests {
         openai_live_eval_benchmark_block_range_single_ref,
         openai_live_eval_benchmark_compact_counts_and_warmup,
         openai_live_eval_benchmark_run_range,
+        openai_live_eval_benchmark_explicit_fork,
         openai_live_eval_benchmark_txid,
         openai_live_eval_invalid_contextual_tx,
         openai_live_eval_invalid_bare_hash,

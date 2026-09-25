@@ -51,8 +51,10 @@ allowed_user_ids = ["U0123ABCD"]
 block_validation_user_ids = ["U0123ABCD"]
 ```
 
-The default repository must already be known to the daemon. Startup fails
-closed if required IDs, repository state, or tokens are missing.
+The default repository is used only when a request omits one. It must already
+be known to the daemon. Every selected repository must have an active GitHub
+App installation, enabled supported lineage, and enabled target and source
+policies. Startup fails closed if the default does not satisfy these checks.
 Block-validation selector limits and timeout come from
 `[tasks.block_validation]`; Slack input cannot choose workers, shards,
 concurrency, or timeouts. Users may naturally request recent coverage (with an
@@ -88,6 +90,7 @@ submission.
 
    ```text
    @BenchBot benchmark block <height> on <branch-or-commit>
+   @BenchBot benchmark blocks 7800000 through 7819999 from cylewitruk/stacks-core on perf/optimized-stacks-bench-integration
    @BenchBot validate the latest 500k blocks on <branch-or-commit>
    @BenchBot run block validation on commit <branch-or-commit>
    ```

@@ -253,6 +253,7 @@ pub struct RecordingTaskSubmissionPort {
 
 struct RecordedQueueCall {
     job: Job,
+    repository: Option<String>,
     reporting_identity: String,
     variants: Vec<BenchmarkVariantRequest>,
     queued_event_detail: serde_json::Value,
@@ -272,6 +273,16 @@ impl RecordingTaskSubmissionPort {
             .iter()
             .map(|call| call.job.clone())
             .collect()
+    }
+
+    /// Return the explicit repository selector recorded for a submission.
+    pub fn repository_for_submission(&self, submission_id: Uuid) -> Option<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|call| call.job.task_submission_id == submission_id)
+            .and_then(|call| call.repository.clone())
     }
 
     pub fn requested_variants_for_submission(
@@ -317,6 +328,13 @@ impl TaskSubmissionPort for RecordingTaskSubmissionPort {
         plan_message_ts: Option<&str>,
         actor: crate::SlackSubmissionActor<'_>,
     ) -> sbgh_core::Result<sbgh_core::submission::SubmissionReceipt> {
+        let repository = match &request {
+            TaskSubmissionRequest::Benchmark { repository, .. } => repository.clone(),
+            TaskSubmissionRequest::BlockValidation(request) => request
+                .source
+                .repository
+                .clone(),
+        };
         if let Some(existing) = self
             .calls
             .lock()
@@ -341,6 +359,7 @@ impl TaskSubmissionPort for RecordingTaskSubmissionPort {
         let (variants, queued_event_detail, git_ref_display, intent, task_kind, build_target, key) =
             match request {
                 TaskSubmissionRequest::Benchmark {
+                    repository: _,
                     variants,
                     effective_args,
                     clean_repetitions,
@@ -426,6 +445,7 @@ impl TaskSubmissionPort for RecordingTaskSubmissionPort {
             .unwrap()
             .push(RecordedQueueCall {
                 job: job.clone(),
+                repository,
                 reporting_identity: actor
                     .reporting_identity
                     .into(),

@@ -231,8 +231,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // and the socket connector (replies/reactions). `jobs_store` is cloned for
     // the connector before it moves into the `JobSource` below.
     let slack_runtime = if config.slack.enabled {
-        let target = slack_target::resolve_target(
-            &pool,
+        let repositories =
+            Arc::new(slack_target::PostgresSlackRepositoryResolver::new(pool.clone()));
+        let target = slack_target::SlackRepositoryResolver::resolve(
+            repositories.as_ref(),
             &config
                 .slack
                 .default_repository,
@@ -288,7 +290,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                 jobs_store.clone(),
                 gh.clone(),
                 block_validation_service.clone(),
-                target,
+                repositories,
                 config
                     .slack
                     .default_repository

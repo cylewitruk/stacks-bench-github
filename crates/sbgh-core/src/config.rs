@@ -470,10 +470,9 @@ pub struct S3Config {
 
 /// Slack task-creation connector. Disabled by default; when `enabled`, the
 /// orchestrator opens a Socket Mode connection and serves benchmark and
-/// block-validation mentions. The code under test is a **constant**
-/// (`default_repository`/`default_rev`); the workload is the variable (the
-/// resolved conversational request). Tokens are **env-only**; identities are
-/// allowlisted.
+/// block-validation mentions. `default_repository` is used only when a request
+/// does not name a repository; explicit repositories must pass installation and
+/// operator-policy checks. Tokens are **env-only**; identities are allowlisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlackConfig {
     /// Gate the connector — `false` (default) means it never starts, so the
@@ -487,8 +486,7 @@ pub struct SlackConfig {
     /// Bot token (`xoxb-…`) authorizing Web API calls (post / react / upload).
     /// **Env-only** (`SBGH_SLACK_BOT_TOKEN`). `Some` iff enabled.
     pub bot_token: Option<String>,
-    /// The constant code under test: `owner/name` repo a Slack bench runs
-    /// against. Resolved to a commit via the existing claim-time path.
+    /// Fallback `owner/name` repository when a Slack request omits one.
     pub default_repository: String,
     /// Default rev (branch/tag/sha) of `default_repository`, overridable per
     /// request via `--rev`.

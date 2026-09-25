@@ -108,8 +108,29 @@ fn natural_language_spec() -> WorkloadSpec {
         target: WorkloadTarget::Blocks(vec![BlockSelector::Height(10)]),
         clean_repetitions: 1,
         warmup: Some(0),
+        repository: None,
         rev: Some("feature/natural-language".into()),
     }
+}
+
+#[tokio::test]
+async fn explicit_benchmark_repository_reaches_submission_port() {
+    let queue = Arc::new(RecordingTaskSubmissionPort::default());
+    let slack = Arc::new(FakeSlackClient::default());
+    let mut spec = natural_language_spec();
+    spec.repository = Some("cylewitruk/stacks-core".into());
+    connector(queue.clone(), slack)
+        .with_intent_resolver(Arc::new(FakeIntentResolver::resolved(spec)), 60)
+        .handle_mention(event("<@BOT> benchmark cylewitruk/stacks-core on perf/test"))
+        .await;
+
+    let job = &queue.jobs()[0];
+    assert_eq!(
+        queue
+            .repository_for_submission(job.task_submission_id)
+            .as_deref(),
+        Some("cylewitruk/stacks-core")
+    );
 }
 
 #[tokio::test]
@@ -334,6 +355,7 @@ async fn provider_comparison_enqueues_ordered_variants() {
             target: WorkloadTarget::BlockRange { start: 100, end: 102 },
             clean_repetitions: 1,
             warmup: None,
+            repository: None,
             rev: None,
         },
         variants: vec![

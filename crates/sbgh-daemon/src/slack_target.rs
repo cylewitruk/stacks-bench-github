@@ -1,17 +1,83 @@
-//! Resolve `[slack].default_repository` ("owner/name") to the FK ids a Slack
-//! ad-hoc job is enqueued against (item `0002`, v5 wiring).
-//!
-//! A pure two-row lookup against the daemon's OWN tables — no GitHub call —
-//! mirroring `/api/resolve`: the install is the active (non-deleted,
-//! non-suspended) one on `owner`'s account; the repo is the `github_repo` row
-//! for `owner/name`, materialised once the daemon has seen it (install / PR
-//! event). Run ONCE at startup so a misconfigured `default_repository` fails
-//! fast — before the Socket Mode receive loop accepts any mention.
+//! Resolve Slack `owner/name` repositories to installed targets and enforce
+//! operator policy. The configured default is checked at startup; every
+//! submission is checked again so revocations take effect without restart.
 
 use std::fmt;
 
+use async_trait::async_trait;
 use sbgh_postgres::Pool;
 use sbgh_slack::SlackJobTarget;
+
+/// Resolves a Slack code repository and enforces its current operator policy.
+#[async_trait]
+pub trait SlackRepositoryResolver: Send + Sync {
+    /// Resolve a repository only when its current installation and policies allow it.
+    async fn resolve(&self, repository: &str) -> sbgh_core::Result<SlackJobTarget>;
+}
+
+/// Postgres-backed repository resolver; policy is checked for every request.
+pub struct PostgresSlackRepositoryResolver {
+    pool: Pool,
+}
+
+impl PostgresSlackRepositoryResolver {
+    /// Build a resolver against the daemon's database.
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl SlackRepositoryResolver for PostgresSlackRepositoryResolver {
+    async fn resolve(&self, repository: &str) -> sbgh_core::Result<SlackJobTarget> {
+        let target = resolve_target(&self.pool, repository)
+            .await
+            .map_err(|error| sbgh_core::Error::Unauthorized(error.to_string()))?;
+        let allowed: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                  FROM github_installation i
+                  JOIN allowed_installer a
+                    ON a.github_account_id = i.github_account_id
+                  JOIN github_installation_repo m
+                    ON m.github_installation_id = i.id
+                  JOIN github_repo r
+                    ON r.id = m.github_repo_id
+                  JOIN target_repo_policy t
+                    ON t.github_installation_id = i.id
+                   AND t.github_repo_id = r.id
+                  JOIN source_repo_policy s
+                    ON s.github_installation_id = i.id
+                   AND s.github_repo_id = r.id
+                  JOIN supported_repo_root root
+                    ON root.github_repo_id = r.id
+                    OR root.github_repo_id = r.fork_root_github_repo_id
+                 WHERE i.id = $1
+                   AND r.id = $2
+                   AND i.deleted_at IS NULL
+                   AND i.suspended_at IS NULL
+                   AND a.is_enabled
+                   AND m.revoked_at IS NULL
+                   AND t.is_enabled
+                   AND s.is_enabled
+                   AND root.is_enabled
+            )
+            "#,
+        )
+        .bind(target.installation_id)
+        .bind(target.repo_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
+        if !allowed {
+            return Err(sbgh_core::Error::Unauthorized(format!(
+                "Slack repository `{repository}` requires an active allowed installation, enabled supported lineage, and enabled target and source policies"
+            )));
+        }
+        Ok(target)
+    }
+}
 
 /// Why resolving `[slack].default_repository` failed — each maps to an
 /// actionable misconfiguration (mirrors `/api/resolve`'s 400/404/409). A
@@ -133,6 +199,11 @@ pub async fn resolve_target(
 
 #[cfg(test)]
 mod tests {
+    use sbgh_core::db::{InstallationStore, NewInstallation, RepoStore};
+    use sbgh_core::models::GithubAccountType;
+    use sbgh_postgres::test_support::setup_pg_db;
+    use sbgh_postgres::{PostgresInstallationStore, PostgresPolicyStore, PostgresRepoStore};
+
     use super::*;
 
     #[test]
@@ -150,5 +221,108 @@ mod tests {
                 "expected `{bad}` to be rejected"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_repository_requires_current_installation_and_policies() {
+        let (_db, pool) = setup_pg_db().await;
+        let installations = PostgresInstallationStore::new(pool.clone());
+        let repos = PostgresRepoStore::new(pool.clone());
+        let policies = PostgresPolicyStore::new(pool.clone());
+        installations
+            .seed_allowed(1, "octo", GithubAccountType::Organization, true)
+            .await;
+        installations
+            .upsert_installation(&NewInstallation {
+                id: 2,
+                github_account_id: 1,
+                account_login: "octo".into(),
+                account_type: GithubAccountType::Organization,
+            })
+            .await
+            .unwrap();
+        repos
+            .seed_supported_root(3, "octo", "core", true)
+            .await;
+        installations
+            .add_or_restore_membership(2, 3)
+            .await
+            .unwrap();
+        policies
+            .seed_target(2, 3, true)
+            .await;
+        policies
+            .seed_source(2, 3, true)
+            .await;
+
+        let resolver = PostgresSlackRepositoryResolver::new(pool);
+        let target = resolver
+            .resolve("octo/core")
+            .await
+            .unwrap();
+        assert_eq!(target.installation_id, 2);
+        assert_eq!(target.repo_id, 3);
+
+        policies
+            .seed_source(2, 3, false)
+            .await;
+        assert!(
+            resolver
+                .resolve("octo/core")
+                .await
+                .is_err()
+        );
+        policies
+            .seed_source(2, 3, true)
+            .await;
+        policies
+            .seed_target(2, 3, false)
+            .await;
+        assert!(
+            resolver
+                .resolve("octo/core")
+                .await
+                .is_err()
+        );
+        policies
+            .seed_target(2, 3, true)
+            .await;
+        repos
+            .disable_supported_root(3)
+            .await
+            .unwrap();
+        assert!(
+            resolver
+                .resolve("octo/core")
+                .await
+                .is_err()
+        );
+        repos
+            .upsert_supported_root(3, None)
+            .await
+            .unwrap();
+        installations
+            .revoke_membership(2, 3)
+            .await
+            .unwrap();
+        assert!(
+            resolver
+                .resolve("octo/core")
+                .await
+                .is_err()
+        );
+        installations
+            .add_or_restore_membership(2, 3)
+            .await
+            .unwrap();
+        installations
+            .seed_allowed(1, "octo", GithubAccountType::Organization, false)
+            .await;
+        assert!(
+            resolver
+                .resolve("octo/core")
+                .await
+                .is_err()
+        );
     }
 }
