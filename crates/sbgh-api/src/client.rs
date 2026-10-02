@@ -15,6 +15,7 @@ use crate::dto::{
     WorkerDrainRequest, WorkerIdentityRequest, WorkerPolicyView, WorkerUpdateRequest,
 };
 use crate::error::ApiError;
+use crate::{SubmissionSummaryView, WorkSnapshotView};
 
 /// Errors from a `/api` call.
 #[derive(Debug, thiserror::Error)]
@@ -313,6 +314,30 @@ impl Client {
         submission_id: &str,
     ) -> Result<SubmissionReportView, ClientError> {
         self.get(&format!("/api/submissions/{submission_id}/report"))
+            .await
+    }
+
+    /// List request summaries, filtered before the server applies its row limit.
+    pub async fn list_submissions(
+        &self,
+        status: Option<&str>,
+        active: bool,
+        limit: Option<u32>,
+    ) -> Result<Vec<SubmissionSummaryView>, ClientError> {
+        let mut query = vec![("active", active.to_string())];
+        if let Some(status) = status {
+            query.push(("status", status.to_owned()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        self.get_query("/api/submissions", &query)
+            .await
+    }
+
+    /// Resolve a job/submission UUID or unique prefix and observe its work.
+    pub async fn inspect_work(&self, id: &str) -> Result<WorkSnapshotView, ClientError> {
+        self.get_query("/api/work", &[("id", id.to_owned())])
             .await
     }
 

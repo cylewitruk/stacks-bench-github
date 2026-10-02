@@ -9,6 +9,7 @@
 mod client;
 mod dto;
 mod error;
+mod inspection;
 
 pub use client::{Client, ClientError, read_cookie};
 pub use dto::{
@@ -27,3 +28,7 @@ pub use dto::{
     WorkerPolicyView, WorkerUpdateRequest,
 };
 pub use error::{ApiError, ErrorBody};
+pub use inspection::{
+    AttemptInspectionView, BenchmarkMetricsView, JobInspectionView, ProgressInspectionView,
+    SubmissionSummaryView, WorkSnapshotView, WorkTargetView,
+};

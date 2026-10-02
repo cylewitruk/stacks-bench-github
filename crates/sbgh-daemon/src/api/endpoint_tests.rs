@@ -141,11 +141,43 @@ async fn job_artifacts_require_admin_and_stream_only_recorded_names() {
     .await
     .unwrap();
     let router = router_with_artifacts(
-        pool,
+        pool.clone(),
         "http://unused".into(),
         Arc::new(crate::artifact_store::LocalFsStore::new(root.path().into())),
     );
     let list_uri = format!("/api/jobs/{job_id}/artifacts");
+    let work_uri = format!("/api/work/{job_id}");
+    let (status, _) = send(&router, "GET", &work_uri, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(&router, "GET", &work_uri, Some("ingesttok"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, work) = send(&router, "GET", &work_uri, Some("readtok"), None).await;
+    assert_eq!(status, StatusCode::OK, "{work}");
+    assert_eq!(work["target"]["job_id"], job_id.to_string());
+    assert_eq!(
+        work["target"]["submission_id"],
+        receipt
+            .submission_id
+            .to_string()
+    );
+    assert_eq!(work["jobs"][0]["status"], "completed");
+    let (status, _) = send(&router, "GET", "/api/work/short", Some("readtok"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) =
+        send(&router, "GET", &format!("/api/work/{}", uuid::Uuid::new_v4()), Some("readtok"), None)
+            .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, summaries) =
+        send(&router, "GET", "/api/submissions?status=completed&limit=1", Some("readtok"), None)
+            .await;
+    assert_eq!(status, StatusCode::OK, "{summaries}");
+    assert_eq!(
+        summaries[0]["id"],
+        receipt
+            .submission_id
+            .to_string()
+    );
+    assert_eq!(summaries[0]["repository"], "o/r");
     let (status, _) = send(&router, "GET", &list_uri, None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = send(&router, "GET", &list_uri, Some("readtok"), None).await;
@@ -210,6 +242,31 @@ async fn job_artifacts_require_admin_and_stream_only_recorded_names() {
             .unwrap()
     });
     let client = sbgh_api::Client::new(format!("http://{address}"), Some("admintok".into()));
+    let work = client
+        .inspect_work(&job_id.to_string()[..8])
+        .await
+        .unwrap();
+    assert_eq!(work.target.job_id, Some(job_id.to_string()));
+    let work = client
+        .inspect_work(&format!("submission:{}", receipt.submission_id))
+        .await
+        .unwrap();
+    assert_eq!(work.target.job_id, None);
+    let summaries = client
+        .list_submissions(None, false, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        summaries[0].id,
+        receipt
+            .submission_id
+            .to_string()
+    );
+    let error = client
+        .inspect_work("../../jobs")
+        .await
+        .unwrap_err();
+    std::assert_matches!(error, sbgh_api::ClientError::Api { status: 400, .. });
     let listed = client
         .list_job_artifacts(&job_id.to_string())
         .await
@@ -231,6 +288,39 @@ async fn job_artifacts_require_admin_and_stream_only_recorded_names() {
             .unwrap(),
         b"{}\n"
     );
+    sqlx::query(
+        "INSERT INTO job (id, task_submission_id, task_spec_id, task_run_index,
+        github_installation_id, github_repo_id, source, intent, task_kind, build_target,
+        git_ref_kind, git_ref_display, git_commit_hash, required_capability)
+        SELECT $1, task_submission_id, task_spec_id, 1, github_installation_id, github_repo_id,
+        source, intent, task_kind, build_target, git_ref_kind, git_ref_display, git_commit_hash,
+        required_capability FROM job WHERE id = $2",
+    )
+    .bind(receipt.submission_id)
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = client
+        .inspect_work(
+            &receipt
+                .submission_id
+                .to_string(),
+        )
+        .await
+        .unwrap_err();
+    std::assert_matches!(error, sbgh_api::ClientError::Api { status: 409, .. });
+    let resolved = client
+        .inspect_work(&format!("submission:{}", receipt.submission_id))
+        .await
+        .unwrap();
+    assert!(
+        resolved
+            .target
+            .job_id
+            .is_none()
+    );
+    assert_eq!(resolved.jobs.len(), 2);
     server.abort();
 }
 

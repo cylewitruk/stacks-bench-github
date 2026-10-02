@@ -18,12 +18,18 @@ path = "src/main.rs"
 # The CLI is a pure daemon `/api` client.
 sbgh-api.workspace = true
 
-tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread", "signal", "time", "fs"] }
 anyhow.workspace = true
 tracing-subscriber.workspace = true
 rustls.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+tempfile.workspace = true
 # Flag an expired `pinned_until` in `policy trigger list`.
 chrono.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["net", "process"] }

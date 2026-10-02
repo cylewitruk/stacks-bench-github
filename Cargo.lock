@@ -2980,12 +2980,15 @@ name = "sbgh-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "dotenvy",
  "rustls",
  "sbgh-api",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]

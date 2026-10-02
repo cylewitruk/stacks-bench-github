@@ -12,6 +12,9 @@ use uuid::Uuid;
 use crate::mapping::{Db, IntoDomain};
 use crate::{Pool, Result};
 
+mod inspection;
+pub use inspection::{inspect_work, list_submissions, resolve_work};
+
 pub async fn list_installations(pool: &Pool) -> Result<Vec<GithubInstallation>> {
     let rows = sqlx::query_as::<_, Db<GithubInstallation>>(
         "SELECT id, github_account_id, account_login, account_type, suspended_at, deleted_at, \
@@ -107,7 +110,18 @@ pub async fn submission_report(
         )));
     }
     let current = jobs
-        .last()
+        .iter()
+        .find(|row| {
+            row.try_get::<String, _>("status")
+                .is_ok_and(|status| matches!(status.as_str(), "claimed" | "running"))
+        })
+        .or_else(|| {
+            jobs.iter().find(|row| {
+                row.try_get::<String, _>("status")
+                    .is_ok_and(|status| status == "queued")
+            })
+        })
+        .or_else(|| jobs.last())
         .expect("non-empty checked above");
     let current_job_id: Uuid = current
         .try_get("id")

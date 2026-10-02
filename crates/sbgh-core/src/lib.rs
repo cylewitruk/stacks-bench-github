@@ -2,6 +2,7 @@ pub mod bench_args;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod inspection;
 pub mod memory;
 pub mod models;
 pub mod reporting;

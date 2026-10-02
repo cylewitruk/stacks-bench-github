@@ -201,7 +201,7 @@ async fn recorded_artifacts(
     Ok(listed)
 }
 
-fn report_view(report: sbgh_core::reporting::SubmissionReportView) -> SubmissionReportView {
+pub fn report_view(report: sbgh_core::reporting::SubmissionReportView) -> SubmissionReportView {
     use sbgh_core::reporting::{
         BlockValidationVerdict, ReportIdentity, ReportLifecycle, TaskReport,
     };

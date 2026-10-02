@@ -1,14 +1,16 @@
 use sbgh_core::db::{JobStore, SubmissionStore};
+use sbgh_core::inspection::WorkTarget;
 use sbgh_core::models::{
     BuildTarget, GitRefKind, JobIntent, JobSource, QueuedEventDetail, TaskKind,
 };
 use sbgh_core::reporting::{ReportLifecycleState, TaskReport};
 use sbgh_core::submission::{
-    BlockValidationPlan, PreparedSubmission, ProducerKey, ResolvedTaskSource,
-    SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionProvenance, TaskPlan,
+    BenchmarkPlan, BenchmarkVariant, BlockValidationPlan, PreparedSubmission, ProducerKey,
+    ResolvedTaskSource, SchedulingConstraints, SubmissionActor, SubmissionCommand,
+    SubmissionProvenance, TaskPlan,
 };
 use sbgh_fleet::{BlockValidationPayload, InclusiveRange};
-use sbgh_postgres::application::job_artifacts;
+use sbgh_postgres::application::{inspect_work, job_artifacts, list_submissions, resolve_work};
 use sbgh_postgres::db::{Pool, PostgresJobStore, setup_pg_db};
 use uuid::Uuid;
 
@@ -89,6 +91,426 @@ fn validation_submission() -> PreparedSubmission {
         contract_version: 1,
         request_digest: "1".repeat(64),
     }
+}
+
+/// Add a second queued repeat without changing the original fixture identity.
+async fn add_repeat(pool: &Pool, original: Uuid, id: Uuid) {
+    sqlx::query(
+        "INSERT INTO job (id, task_submission_id, task_spec_id, task_run_index,
+             github_installation_id, github_repo_id, source, intent, task_kind, build_target,
+             git_ref_kind, git_ref_display, git_commit_hash, required_capability)
+         SELECT $1, task_submission_id, task_spec_id, task_run_index + 1,
+                github_installation_id, github_repo_id, source, intent, task_kind, build_target,
+                git_ref_kind, git_ref_display, git_commit_hash, required_capability FROM job WHERE id = $2",
+    )
+    .bind(id)
+    .bind(original)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn work_inspection_resolves_ids_and_preserves_job_scope_with_ambiguous_matches() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let receipt = PostgresJobStore::new(pool.clone())
+        .persist_submission(&validation_submission())
+        .await
+        .unwrap();
+    let job_id = receipt.initial_job_ids[0];
+    let matches = resolve_work(&pool, &job_id.to_string()[..8], None)
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].job_id, Some(job_id));
+    assert_eq!(matches[0].submission_id, receipt.submission_id);
+    let snapshot = inspect_work(&pool, matches[0].clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.target.job_id, Some(job_id));
+    assert_eq!(snapshot.jobs[0].status, "queued");
+    assert!(
+        snapshot.jobs[0]
+            .progress
+            .is_none()
+    );
+    assert!(
+        snapshot.jobs[0]
+            .attempt
+            .is_none()
+    );
+    assert!(
+        resolve_work(&pool, &Uuid::new_v4().to_string(), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // UUID namespaces can overlap. Unqualified selection must remain ambiguous.
+    add_repeat(&pool, job_id, receipt.submission_id).await;
+    let selector = receipt
+        .submission_id
+        .to_string();
+    assert_eq!(
+        resolve_work(&pool, &selector, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let job = resolve_work(&pool, &selector, Some("job"))
+        .await
+        .unwrap();
+    let submission = resolve_work(&pool, &selector, Some("submission"))
+        .await
+        .unwrap();
+    assert_eq!(job[0].job_id, Some(receipt.submission_id));
+    assert_eq!(submission[0].job_id, None);
+    let snapshot = inspect_work(&pool, submission[0].clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.jobs.len(), 2);
+    assert_eq!(
+        snapshot
+            .report
+            .lifecycle
+            .total_jobs,
+        2
+    );
+}
+
+#[tokio::test]
+async fn work_inspection_browses_aggregate_state_and_selects_running_repeat() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let receipt = PostgresJobStore::new(pool.clone())
+        .persist_submission(&validation_submission())
+        .await
+        .unwrap();
+    let job_id = receipt.initial_job_ids[0];
+    add_repeat(&pool, job_id, Uuid::new_v4()).await;
+    sqlx::query("UPDATE job SET status = 'running' WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let snapshot = inspect_work(
+        &pool,
+        WorkTarget {
+            submission_id: receipt.submission_id,
+            job_id: None,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        snapshot
+            .report
+            .identity
+            .current_job_id,
+        Some(job_id)
+    );
+    assert_eq!(
+        snapshot
+            .report
+            .lifecycle
+            .state,
+        ReportLifecycleState::Running
+    );
+    let summaries = list_submissions(&pool, None, true, 1)
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].repository, "o/r");
+    assert_eq!(summaries[0].total_jobs, 2);
+    assert!(
+        list_submissions(&pool, Some("completed"), false, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    sqlx::query("UPDATE job SET status = 'completed'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        list_submissions(&pool, None, true, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let completed = list_submissions(&pool, Some("completed"), false, 1)
+        .await
+        .unwrap();
+    assert_eq!(completed[0].completed_jobs, 2);
+}
+
+/// Place a running attempt with its own worker session.
+async fn inspection_attempt(pool: &Pool, job_id: Uuid, generation: i64) -> Uuid {
+    sqlx::query("UPDATE job SET status = 'running' WHERE id = $1")
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let worker_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let attempt_id = Uuid::new_v4();
+    let identity = vec![generation as u8; 32];
+    sqlx::query(
+        "INSERT INTO worker_registry (worker_id, display_name, allowed_capabilities)
+        VALUES ($1, 'inspection worker', ARRAY['block_validation']::worker_capability[])",
+    )
+    .bind(worker_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO worker_identity_key (identity_key_sha256, worker_id) VALUES ($1, $2)")
+        .bind(&identity)
+        .bind(worker_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO worker_session (worker_session_id, worker_id, status, protocol_version,
+        software_version, advertised_capabilities, effective_capabilities, resource_facts,
+        expires_at, identity_key_sha256) VALUES ($1, $2, 'running', 3, 'test',
+        ARRAY['block_validation']::worker_capability[], ARRAY['block_validation']::worker_capability[],
+        '{}', NOW() + INTERVAL '1 hour', $3)")
+        .bind(session_id).bind(worker_id).bind(&identity).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO worker_attempt (attempt_id, job_id, task_submission_id, worker_id,
+        worker_session_id, status, fencing_generation, execution_generation, claim_token, trace_id,
+        capability, payload_hash, offer_expires_at, lease_expires_at, accepted_at)
+        SELECT $1, job.id, job.task_submission_id, $2, $3, 'running', $4, 1, $5, $6,
+        'block_validation', repeat('a', 64), NOW() + INTERVAL '1 minute', NOW() + INTERVAL '5 minutes', NOW()
+        FROM job WHERE id = $7")
+        .bind(attempt_id).bind(worker_id).bind(session_id).bind(generation)
+        .bind(Uuid::new_v4()).bind(Uuid::new_v4()).bind(job_id).execute(pool).await.unwrap();
+    attempt_id
+}
+
+#[tokio::test]
+async fn work_inspection_progress_is_scoped_to_latest_attempt_and_current_phase() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let receipt = PostgresJobStore::new(pool.clone())
+        .persist_submission(&validation_submission())
+        .await
+        .unwrap();
+    let job_id = receipt.initial_job_ids[0];
+    let old = inspection_attempt(&pool, job_id, 1).await;
+    sqlx::query("UPDATE worker_attempt SET status = 'fenced' WHERE attempt_id = $1")
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let current = inspection_attempt(&pool, job_id, 2).await;
+    for (id, sequence, count) in [(old, 999_i64, 999_u64), (current, 1, 42), (current, 2, 43)] {
+        sqlx::query(
+            "INSERT INTO worker_attempt_progress (attempt_id, progress_seq, trace_id, update)
+            VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(sequence)
+        .bind(Uuid::new_v4())
+        .bind(serde_json::json!({"workflow_step":"run", "run_index":0, "requested_run_count":1,
+                "phase":"validate", "progress":count, "total":100, "message":"validating"}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let target = WorkTarget {
+        submission_id: receipt.submission_id,
+        job_id: Some(job_id),
+    };
+    let snapshot = inspect_work(&pool, target.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let job = &snapshot.jobs[0];
+    assert_eq!(
+        job.attempt
+            .as_ref()
+            .unwrap()
+            .id,
+        current
+    );
+    assert_eq!(
+        job.attempt
+            .as_ref()
+            .unwrap()
+            .worker_name,
+        "inspection worker"
+    );
+    assert_eq!(
+        job.progress
+            .as_ref()
+            .unwrap()
+            .current,
+        43
+    );
+    assert_eq!(
+        job.progress
+            .as_ref()
+            .unwrap()
+            .sequence,
+        2
+    );
+    assert!(
+        job.progress
+            .as_ref()
+            .unwrap()
+            .received_at
+            <= chrono::Utc::now()
+    );
+    sqlx::query(
+        "INSERT INTO worker_attempt_event (attempt_id, reliable_seq, trace_id,
+        payload_kind, payload, payload_digest) VALUES ($1, 1, $2, 'phase',
+        '{\"kind\":\"phase\",\"label\":\"archiving\",\"elapsed_ms\":500}', repeat('a', 64))",
+    )
+    .bind(current)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let snapshot = inspect_work(&pool, target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.jobs[0]
+            .phase
+            .as_deref(),
+        Some("archiving")
+    );
+    assert!(
+        snapshot.jobs[0]
+            .progress
+            .is_none(),
+        "previous-phase progress must not look current"
+    );
+}
+
+#[tokio::test]
+async fn work_inspection_preserves_planned_repeats_and_promoted_benchmark_results() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool).await;
+    let mut prepared = validation_submission();
+    let mut source = prepared
+        .command
+        .task
+        .first_source()
+        .unwrap()
+        .clone();
+    source.intent = JobIntent::AdhocBenchmark;
+    source.task_kind = TaskKind::Benchmark;
+    source.build_target = BuildTarget::StacksBench;
+    let effective_args =
+        vec!["--count".to_owned(), "25000".to_owned(), "--warmup".to_owned(), "5000".to_owned()];
+    prepared.command.task = TaskPlan::Benchmark(BenchmarkPlan {
+        variants: vec![BenchmarkVariant {
+            source,
+            requested_run_count: 3,
+            baseline_calibration_id: None,
+        }],
+        effective_args: effective_args.clone(),
+    });
+    prepared
+        .command
+        .provenance
+        .queued_event_detail = serde_json::json!({"effective_args":effective_args});
+    let receipt = PostgresJobStore::new(pool.clone())
+        .persist_submission(&prepared)
+        .await
+        .unwrap();
+    let job_id = receipt.initial_job_ids[0];
+    sqlx::query("INSERT INTO job_metric (job_id, envelope_duration_us, replay_duration_us, total_duration_us,
+        setup_duration_us, execution_duration_us, commit_duration_us, clarity_runtime, transactions,
+        read_length, write_length, measured_blocks, warmup_blocks)
+        VALUES ($1, 2000000, 1000000, 900000, 100000, 200000, 600000, 42, 60702, 1234, 5678, 20000, 5000)")
+        .bind(job_id).execute(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO job_result (job_id, run_json, archive_dir) VALUES ($1, $2, 'results/job')",
+    )
+    .bind(job_id)
+    .bind(serde_json::json!({"success":true,"result":{"measured_entries":20000}}))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO job_event (job_id, event_kind, event_status, detail)
+        VALUES ($1, 'completed', 'success', $2)",
+    )
+    .bind(job_id)
+    .bind(serde_json::json!({"summary":{"chainstate_origin":"vg0/bench-canonical"}}))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE job SET status = 'completed' WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let snapshot = inspect_work(
+        &pool,
+        WorkTarget {
+            submission_id: receipt.submission_id,
+            job_id: None,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        snapshot
+            .report
+            .lifecycle
+            .completed_jobs,
+        1
+    );
+    assert_eq!(
+        snapshot
+            .report
+            .lifecycle
+            .total_jobs,
+        3
+    );
+    assert_eq!(
+        snapshot
+            .report
+            .lifecycle
+            .state,
+        ReportLifecycleState::Queued
+    );
+    let job = &snapshot.jobs[0];
+    assert_eq!(job.effective_args, effective_args);
+    assert_eq!(
+        job.chainstate_origin
+            .as_deref(),
+        Some("vg0/bench-canonical")
+    );
+    assert_eq!(
+        job.metrics
+            .as_ref()
+            .unwrap()
+            .measured_blocks,
+        20000
+    );
+    assert_eq!(
+        job.metrics
+            .as_ref()
+            .unwrap()
+            .warmup_blocks,
+        5000
+    );
+    assert_eq!(job.result.as_ref().unwrap()["success"], true);
+    let active = list_submissions(&pool, None, true, 1)
+        .await
+        .unwrap();
+    assert_eq!(active[0].total_jobs, 3);
+    assert_eq!(active[0].completed_jobs, 1);
 }
 
 #[tokio::test]
@@ -222,6 +644,36 @@ async fn validation_report_joins_frozen_request_without_fabricating_a_verdict() 
     );
     assert_eq!(detail.invalid_blocks[0].block, "15");
     assert_eq!(report.artifacts[0].key, "reports/full.json");
+    let observed = inspect_work(
+        &pool,
+        WorkTarget {
+            submission_id: receipt.submission_id,
+            job_id: Some(job_id),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        observed.jobs[0]
+            .chainstate_origin
+            .as_deref(),
+        Some("nightly-mainnet")
+    );
+    assert_eq!(
+        observed.jobs[0]
+            .result
+            .as_ref()
+            .unwrap()["valid"],
+        false
+    );
+    assert_eq!(
+        observed.jobs[0]
+            .result
+            .as_ref()
+            .unwrap()["checked_blocks"],
+        11
+    );
 }
 
 #[tokio::test]

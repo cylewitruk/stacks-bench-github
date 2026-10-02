@@ -16,10 +16,42 @@ Run operator commands as the daemon user:
 alias sbgh='sudo -u sbgh sbgh-cli'
 
 sbgh status
+sbgh submissions list --active
 sbgh jobs list
 sbgh fleet status
 sbgh webhook tail --limit 20
 ```
+
+Follow a request or a particular execution using the ID from a CLI listing,
+GitHub comment, or Slack report:
+
+```bash
+sbgh show <job-or-submission-id>
+sbgh watch <job-or-submission-id>
+sbgh results <job-or-submission-id>
+sbgh artifacts ls <job-or-submission-id>
+sbgh artifacts get <job-id> appdata/stacks-bench.db --output ./stacks-bench.db
+```
+
+Full UUIDs and unique prefixes of at least eight characters are accepted.
+Ambiguous IDs require a longer prefix or `job:<uuid>` / `submission:<uuid>`.
+A job selector follows that execution; a submission selector includes all its
+variants and repeats. Artifact reads from a multi-job submission require a job
+selector if several jobs contain the requested name. Downloads stream into a
+temporary file and publish the destination only on success, without overwriting
+an existing file.
+
+`show`, `watch`, `results`, `submissions list`, `artifacts ls`, and `artifacts get`
+accept a local `--json` option. `watch --json` emits JSON Lines; other structured
+responses emit one JSON value. `artifacts cat` always emits the original bytes.
+The same observation commands are available under `jobs` and `submissions`.
+
+`watch` polls every five seconds (`--interval` changes this), refreshes in place
+on a terminal, and emits timestamped changes when redirected. It displays task
+progress and worker heartbeat freshness separately. Ctrl-C stops observation
+without cancelling work. Completion exits successfully; failure or cancellation
+exits unsuccessfully. Guest console streaming is not yet available; use service
+logs while running and promoted console artifacts after termination.
 
 `fleet status` is the primary view for registered identities, current
 sessions, discovered CPU/memory, active attempts, lease state, traces, and
@@ -63,8 +95,12 @@ can traverse to libvirt-owned disks without making job contents listable.
 Inspect a terminal attempt through the authenticated operator API:
 
 ```bash
-sbgh jobs report --submission-id <submission-uuid>
+sbgh jobs report <job-or-submission-id>
 ```
+
+This command retains its JSON submission-report output. The explicit
+`--submission-id` form remains supported; `--job-id` resolves a job's containing
+submission. Use `show` or `results` for job-scoped human output.
 
 The report's `forensics` object contains the last phase, the final 1 MiB of the
 guest serial console, the original console size, and the promoted

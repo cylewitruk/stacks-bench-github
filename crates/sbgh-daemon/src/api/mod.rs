@@ -21,6 +21,7 @@ mod resolve;
 mod state;
 mod users;
 mod webhooks;
+mod work;
 
 #[cfg(test)]
 mod endpoint_tests;
@@ -69,6 +70,9 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/users", get(users::list_users))
             .route("/api/roles", get(users::list_roles))
             .route("/api/jobs", get(jobs::list))
+            .route("/api/submissions", get(work::list))
+            .route("/api/work", get(work::show_query))
+            .route("/api/work/{id}", get(work::show))
             .route("/api/submissions/{id}/report", get(jobs::report))
             .route("/api/fleet", get(fleet::overview))
             .route("/api/fleet/workers/{id}", get(fleet::show_worker))

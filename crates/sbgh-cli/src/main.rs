@@ -26,6 +26,12 @@ use sbgh_api::{
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod output;
+mod work;
+
+use output::OutputArgs;
+use work::{InspectionArgs, SubmissionsAction, WatchArgs};
+
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_COOKIE_PATH: &str = "/etc/sbgh/daemon/.cookie";
 
@@ -104,6 +110,27 @@ enum Command {
     Jobs {
         #[command(subcommand)]
         action: JobsAction,
+    },
+
+    /// Browse requests, including comparisons and repeated executions.
+    Submissions {
+        #[command(subcommand)]
+        action: SubmissionsAction,
+    },
+
+    /// Explain a job or submission UUID (unique prefixes are accepted).
+    Show(InspectionArgs),
+
+    /// Follow selected work through completion; Ctrl-C stops watching only.
+    Watch(WatchArgs),
+
+    /// Show recorded benchmark measurements or validation verdicts.
+    Results(InspectionArgs),
+
+    /// List, read, or download execution artifacts.
+    Artifacts {
+        #[command(subcommand)]
+        action: ArtifactsAction,
     },
 
     /// Inspect, drain, and deliberately recover worker-fleet placement.
@@ -396,9 +423,22 @@ enum JobsAction {
     },
     /// Print the canonical task-aware report for one submission as JSON.
     Report {
-        #[arg(long)]
-        submission_id: String,
+        /// Job/submission UUID or unique prefix; reports are submission-wide.
+        #[arg(group = "report_target", required_unless_present_any = ["submission_id", "job_id"])]
+        id: Option<String>,
+        /// Submission selector retained for existing scripts.
+        #[arg(long, group = "report_target")]
+        submission_id: Option<String>,
+        /// Resolve a job to its containing submission report.
+        #[arg(long, group = "report_target")]
+        job_id: Option<String>,
     },
+    /// Explain a job or submission.
+    Show(InspectionArgs),
+    /// Follow selected work through completion.
+    Watch(WatchArgs),
+    /// Show recorded task results.
+    Results(InspectionArgs),
     /// List or stream a terminal job's promoted artifacts.
     Artifacts {
         #[command(subcommand)]
@@ -429,20 +469,36 @@ enum JobsAction {
     },
 }
 
-/// Read-only operations on artifacts recorded for a job UUID.
+/// Read-only operations on recorded artifacts, selected by job or submission.
 #[derive(Subcommand, Debug)]
 enum ArtifactsAction {
     /// List artifact names and byte sizes.
     Ls {
-        /// Job UUID from `jobs list` or a submission report.
+        /// Job/submission UUID or unique prefix.
         job_id: String,
+        /// Response presentation.
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Stream an artifact to stdout (for example, pipe JSON into `jq`).
     Cat {
-        /// Job UUID from `jobs list` or a submission report.
+        /// Job/submission UUID or unique prefix.
         job_id: String,
         /// Job-relative name shown by `artifacts ls`.
         name: String,
+    },
+    /// Download an artifact without overwriting an existing destination.
+    Get {
+        /// Job/submission UUID or unique prefix.
+        job_id: String,
+        /// Exact job-relative artifact name.
+        name: String,
+        /// Destination file; its parent directory must exist.
+        #[arg(long = "output", value_name = "PATH")]
+        destination: PathBuf,
+        /// Response presentation for the download receipt.
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
@@ -575,6 +631,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Installation { action } => run_installation(&mk_client()?, action).await,
         Command::Webhook { action } => run_webhook(&mk_client()?, action).await,
         Command::Jobs { action } => run_jobs(&mk_client()?, action).await,
+        Command::Submissions { action } => work::run_submissions(&mk_client()?, action).await,
+        Command::Show(args) => work::show(&mk_client()?, args).await,
+        Command::Watch(args) => work::watch(&mk_client()?, args).await,
+        Command::Results(args) => work::results(&mk_client()?, args).await,
+        Command::Artifacts { action } => run_artifacts(&mk_client()?, action).await,
         Command::Fleet { action } => run_fleet(&mk_client()?, action).await,
         Command::Status => run_status(&mk_client()?).await,
     }
@@ -1177,33 +1238,26 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
                 );
             }
         }
-        JobsAction::Report { submission_id } => {
-            let report = client
-                .submission_report(&submission_id)
+        JobsAction::Report { id, submission_id, job_id } => {
+            let selector = id
+                .or_else(|| submission_id.map(|id| format!("submission:{id}")))
+                .or_else(|| job_id.map(|id| format!("job:{id}")))
+                .context("provide a job or submission ID")?;
+            let target = client
+                .inspect_work(&selector)
                 .await
-                .with_context(|| format!("load report for submission {submission_id}"))?;
+                .context("resolve report ID")?
+                .target;
+            let report = client
+                .submission_report(&target.submission_id)
+                .await
+                .with_context(|| format!("load report for submission {}", target.submission_id))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        JobsAction::Artifacts { action } => match action {
-            ArtifactsAction::Ls { job_id } => {
-                let artifacts = client
-                    .list_job_artifacts(&job_id)
-                    .await
-                    .with_context(|| format!("list artifacts for job {job_id}"))?;
-                if artifacts.is_empty() {
-                    println!("(no artifacts)");
-                }
-                for artifact in artifacts {
-                    println!("{:>12}  {}", artifact.size, artifact.name);
-                }
-            }
-            ArtifactsAction::Cat { job_id, name } => {
-                client
-                    .copy_job_artifact(&job_id, &name, &mut tokio::io::stdout())
-                    .await
-                    .with_context(|| format!("read artifact {name:?} for job {job_id}"))?;
-            }
-        },
+        JobsAction::Show(args) => work::show(client, args).await?,
+        JobsAction::Watch(args) => work::watch(client, args).await?,
+        JobsAction::Results(args) => work::results(client, args).await?,
+        JobsAction::Artifacts { action } => run_artifacts(client, action).await?,
         JobsAction::ValidateBlocks {
             install_id,
             repo_id,
@@ -1245,6 +1299,28 @@ async fn run_jobs(client: &Client, action: JobsAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Handle raw artifact content separately from structured listings and receipts.
+async fn run_artifacts(client: &Client, action: ArtifactsAction) -> anyhow::Result<()> {
+    match action {
+        ArtifactsAction::Ls { job_id, output } => {
+            work::list_artifacts(client, &job_id, output).await
+        }
+        ArtifactsAction::Cat { job_id, name } => {
+            let job_id = work::artifact_job(client, &job_id, Some(&name)).await?;
+            client
+                .copy_job_artifact(&job_id, &name, &mut tokio::io::stdout())
+                .await
+                .with_context(|| format!("read artifact {name:?} for job {job_id}"))
+        }
+        ArtifactsAction::Get {
+            job_id,
+            name,
+            destination,
+            output,
+        } => work::download(client, &job_id, &name, destination, output).await,
+    }
 }
 
 async fn run_status(client: &Client) -> anyhow::Result<()> {
@@ -1495,7 +1571,7 @@ mod tests {
             listed.command,
             Command::Jobs {
                 action: JobsAction::Artifacts {
-                    action: ArtifactsAction::Ls { job_id: parsed }
+                    action: ArtifactsAction::Ls { job_id: parsed, .. }
                 }
             } if parsed == job_id
         );
@@ -1534,6 +1610,54 @@ mod tests {
         // commands), and would panic on a typo'd id.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn work_commands_accept_prefixes_and_shared_output_options() {
+        for command in ["show", "results"] {
+            assert!(Cli::try_parse_from(["sbgh-cli", command, "88ed079a", "--json"]).is_ok());
+            assert!(
+                Cli::try_parse_from(["sbgh-cli", "jobs", command, "88ed079a", "--json"]).is_ok()
+            );
+        }
+        assert!(Cli::try_parse_from(["sbgh-cli", "watch", "88ed079a", "--interval", "0"]).is_err());
+        assert!(Cli::try_parse_from(["sbgh-cli", "watch", "88ed079a", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["sbgh-cli", "submissions", "list", "--active", "--json"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sbgh-cli",
+                "submissions",
+                "list",
+                "--active",
+                "--status",
+                "queued"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["sbgh-cli", "jobs", "report", "88ed079a"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["sbgh-cli", "jobs", "report", "--job-id", "88ed079a"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["sbgh-cli", "jobs", "report"]).is_err());
+        assert!(
+            Cli::try_parse_from(["sbgh-cli", "jobs", "report", "88ed079a", "--job-id", "other"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sbgh-cli",
+                "artifacts",
+                "get",
+                "88ed079a",
+                "run.json",
+                "--output",
+                "run.json",
+                "--json"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1588,12 +1712,12 @@ mod tests {
         ])
         .unwrap();
         let Command::Jobs {
-            action: JobsAction::Report { submission_id },
+            action: JobsAction::Report { submission_id, .. },
         } = parsed.command
         else {
             panic!("expected jobs report command");
         };
-        assert_eq!(submission_id, "018f7f24-2c9d-7e31-8f9c-5d8f39b7ad11");
+        assert_eq!(submission_id.as_deref(), Some("018f7f24-2c9d-7e31-8f9c-5d8f39b7ad11"));
     }
 
     #[test]

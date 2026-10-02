@@ -69,6 +69,21 @@ cookie satisfies all read routes.
 
 ## Routes
 
+Operator work observation uses `GET /api/submissions` and
+`GET /api/work?id=<selector>` (also available as `/api/work/<selector>`), both
+requiring `read` scope. Submission listing accepts `status`, `active`, and
+`limit` (1–500). Work selectors accept job/submission UUIDs, unique prefixes of
+at least eight characters, and explicit `job:` / `submission:` qualifiers.
+Unknown selectors return `404`; ambiguous selectors return `409` with candidate
+identities; malformed selectors return `400`.
+
+The observation response retains the selected scope, the aggregate submission
+report, and each materialized job's phase, latest attempt, heartbeat, accepted
+progress receipt time, frozen arguments, recorded chainstate origin, and
+promoted results. Progress is best-effort and never borrowed from a previous
+attempt. Console forensics remain on the existing report/artifact endpoints.
+Artifact bytes still require `admin` scope.
+
 ### Health and identity
 
 | Method | Path | Scope | Purpose |
