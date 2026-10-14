@@ -643,8 +643,8 @@ Promoted to `v21-stacks-bench-schema-v1-native` →
 [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md).*
 
 *`0039-multi-variant-benchmark-comparisons` planned for real-host closure in
-v34 →
-[iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md).*
+v35 →
+[iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md).*
 
 *`0041-shared-benchmark-calibration` shipped (iteration v19, 2026-06) →
 [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md).*
@@ -710,8 +710,8 @@ documented if made default.
 [v23](iterations/v23-central-block-tx-index-cache.md).*
 
 *`0027-fine-grained-progress` implementation completed under v20; real-host
-closure is planned in v34 →
-[iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md).*
+closure continues in v35 →
+[iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md).*
 
 ### 0028 — Results-summary restructure
 

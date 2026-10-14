@@ -16,10 +16,10 @@ need editing when an item's status or location changes.
 
 ## Items
 
-Current priority (2026-10-14): v35 lifecycle implementation, with v34's remaining
-qualification work explicitly scheduled in the
-[evidence record](qualification/2026-10-14-first-fleet.md). v34 remains open;
-v35–v37 are planned, and Decisions 0006/0007 remain drafts.
+Current priority (2026-10-14): v35 is active and owns lifecycle implementation
+and the [carried qualification](iterations/v35-seamless-fleet-lifecycle.md#carried-qualification).
+v34 is closed as superseded, not fully qualified. Lifecycle implementation and
+v36–v37 remain planned; Decisions 0006/0007 remain drafts.
 
 | ID | Name | Status | Location |
 | ---- | ---- | ------ | -------- |
@@ -49,7 +49,7 @@ v35–v37 are planned, and Decisions 0006/0007 remain drafts.
 | `0024-slack-card-stage-timings` | Slack card stage timings | `shipped` | [archive/completed/0024-slack-card-stage-timings.md](archive/completed/0024-slack-card-stage-timings.md) |
 | `0025-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
 | `0026-central-block-index-cache` | Central chainstate index ledger | `parked` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
-| `0027-fine-grained-progress` | Fine-grained bench progress | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
+| `0027-fine-grained-progress` | Fine-grained bench progress | `in_progress` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
@@ -61,7 +61,7 @@ v35–v37 are planned, and Decisions 0006/0007 remain drafts.
 | `0036-pr-comment-llm-intent` | PR-comment task-intent resolution | `backlog` | [backlog.md](backlog.md) |
 | `0037-benchmark-group-run-model` | Benchmark group/run model | `shipped` | [archive/completed/0037-benchmark-group-run-model.md](archive/completed/0037-benchmark-group-run-model.md) |
 | `0038-isolated-benchmark-repetitions` | Isolated benchmark repetitions | `shipped` | [archive/completed/0038-isolated-benchmark-repetitions.md](archive/completed/0038-isolated-benchmark-repetitions.md) |
-| `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `planned` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
+| `0039-multi-variant-benchmark-comparisons` | Multi-variant benchmark comparisons | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0040-slack-queue-receipt-before-stream` | Slack queue receipt before claimed stream | `superseded` | [archive/superseded/0040-slack-stream-followups.md](archive/superseded/0040-slack-stream-followups.md) |
 | `0041-shared-benchmark-calibration` | Shared benchmark calibration pass | `shipped` | [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md) |
 | `0042-cache-hit-minimal-source-disk` | Cache-hit minimal source disk | `shipped` | [archive/completed/0042-cache-hit-minimal-source-disk.md](archive/completed/0042-cache-hit-minimal-source-disk.md) |
@@ -102,7 +102,7 @@ v35–v37 are planned, and Decisions 0006/0007 remain drafts.
 | `0077-worker-identity-and-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
 | `0078-slack-task-submission` | Slack task submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
 | `0079-dynamic-block-validation-planning` | Dynamic block-validation planning | `shipped` | [archive/completed/0079-dynamic-block-validation-planning.md](archive/completed/0079-dynamic-block-validation-planning.md) |
-| `0080-first-fleet-deployment-qualification` | First fleet deployment qualification | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
+| `0080-first-fleet-deployment-qualification` | First fleet deployment qualification | `in_progress` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0081-cross-owner-source-policy-slug-resolution` | Cross-owner source-policy slug resolution | `backlog` | [backlog.md](backlog.md) |
 | `0082-seamless-fleet-lifecycle-maintenance` | Seamless fleet lifecycle and maintenance | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0083-multi-orchestrator-high-availability` | Multi-orchestrator high availability | `candidate` | [backlog.md](backlog.md) |
@@ -149,8 +149,8 @@ v35–v37 are planned, and Decisions 0006/0007 remain drafts.
 | `v31-worker-identity-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
 | `v32-task-aware-slack-submission` | Task-aware Slack submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |
 | `v33-dynamic-block-validation-planning` | Dynamic block-validation planning | `shipped` | [archive/completed/0079-dynamic-block-validation-planning.md](archive/completed/0079-dynamic-block-validation-planning.md) |
-| `v34-first-fleet-deployment-readiness` | First fleet deployment readiness | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
-| `v35-seamless-fleet-lifecycle` | Seamless fleet lifecycle and rolling maintenance | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
+| `v34-first-fleet-deployment-readiness` | First fleet deployment readiness | `superseded` | [archive/superseded/v34-first-fleet-deployment-readiness.md](archive/superseded/v34-first-fleet-deployment-readiness.md) |
+| `v35-seamless-fleet-lifecycle` | Seamless fleet lifecycle and rolling maintenance | `in_progress` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `v36-distributed-block-validation` | Distributed block validation | `planned` | [iterations/v36-distributed-block-validation.md](iterations/v36-distributed-block-validation.md) |
 | `v37-community-worker-validation-trust` | Community worker validation trust | `planned` | [iterations/v37-community-worker-validation-trust.md](iterations/v37-community-worker-validation-trust.md) |
 

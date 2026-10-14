@@ -5,9 +5,10 @@ Successor to
 static validation ranges and daemon-selected shard counts with
 chainstate-relative selection and worker-local execution planning.
 
-Continued by
-[v34](../../iterations/v34-first-fleet-deployment-readiness.md), which owns the
-first real-host deployment, provider canaries, cancellation, and restart proof.
+Initially continued by
+[v34](../superseded/v34-first-fleet-deployment-readiness.md) for first real-host
+deployment qualification. Remaining provider, recovery, and host evidence now
+belongs to [v35](../../iterations/v35-seamless-fleet-lifecycle.md#carried-qualification).
 
 > **Status:** shipped (2026-08-03) — implementation, review, and local
 > validation are complete. No v33 fleet was deployed; its hardware and

@@ -1,40 +1,44 @@
 # v35: Seamless Fleet Lifecycle and Rolling Maintenance
 
 Successor to
-[v34](v34-first-fleet-deployment-readiness.md). Convert the conservative
+[v34](../archive/superseded/v34-first-fleet-deployment-readiness.md). Convert the conservative
 first-fleet shutdown behavior exposed by real-host qualification into an
 operator-safe lifecycle for a centralized daemon and independently maintained
 workers. Normal daemon restarts must not drain or stop the fleet; targeted
 worker maintenance and bounded protocol upgrades must preserve availability,
 leases, fencing, and auditability.
 
-> **Status:** planned — next implementation priority as of 2026-10-14. v34's
-> remaining gates now have an explicit schedule; lifecycle implementation may
-> begin without claiming v34 is fully qualified. Decision 0006 is still draft
-> and no v35 implementation/qualification gate has passed.
+> **Status:** in_progress — active iteration from 2026-10-14, including the
+> carried first-fleet qualification. Lifecycle implementation is the next
+> priority and has not started. Decision 0006 remains draft; no lifecycle or
+> protocol gate is marked passed by this handoff.
 >
 > v35 owns lifecycle separation and a bounded current/previous protocol rollout
 > window. Multi-orchestrator HA is captured separately as `0083`.
 
 ## Qualification Handoff — 2026-10-14
 
-The [v34 evidence record](../qualification/2026-10-14-first-fleet.md#explicit-follow-up-schedule)
-assigns active/post-terminal restart, worker-loss, and cleanup-recovery drills
-to Phases 2–3/7; identity rotation/revocation, capability/profile policy changes,
-and persistence to Phases 6–7. Retain v34 Phase 8's acceptance checks. Commission
-the second physical worker by Phase 6's maintenance ceremony; no second host
-has yet been qualified in the available evidence.
+v34 is closed as a superseded iteration. This document owns the remaining
+`0080`, `0027`, and `0039` item definitions and qualification checks.
+Completed evidence remains in the
+[qualification record](../qualification/2026-10-14-first-fleet.md) and the
+[v34 archive](../archive/superseded/v34-first-fleet-deployment-readiness.md).
+
+**Implementation entry:** the proven same-host substrate, authenticated
+transport, controlled validation, and GitHub benchmark execution are the
+prerequisites for lifecycle work. Completion of carried `0080` is not an entry
+dependency: its restart and maintenance checks require v35 itself.
 
 Start Phase 1 by reviewing Decision 0006, recording deployed heartbeat/lease/
 session timings, and pinning the deployed revision-1 semantic-digest baseline
 before protocol changes in Phase 5. Then implement Phase 2 server-first and
-Phase 3 daemon quiescence. Successful quiescent updates, manual undrain/restart,
-and the newer CLI inspection commands do not satisfy these lifecycle gates.
+Phase 3 daemon quiescence. Manual undrain/restart and quiescent updates do not
+satisfy those new lifecycle gates.
 
-The `0080` dependency below requires its proven substrate and this explicit
-handoff for implementation entry. v34 retains its remaining provider,
-full-history, progress/comparison, and evidence-completion work; neither
-iteration is declared complete by rescheduling it.
+Run provider/progress/comparison checks alongside the relevant v35 canaries.
+Recovery belongs to Phases 2–3/7, identity drills to Phases 6–7, and second-host
+commissioning to Phase 6. No second physical host has yet been qualified in the
+available evidence.
 
 ## Items
 
@@ -42,6 +46,9 @@ iteration is declared complete by rescheduling it.
 | ---- | ---- | ------ |
 | `0082-seamless-fleet-lifecycle-maintenance` | primary: daemon, scheduler, worker, and host lifecycle separation | planned |
 | `0075-rolling-worker-protocol-compatibility` | co-primary: bounded server-first worker upgrades | planned |
+| `0080-first-fleet-deployment-qualification` | carried: remaining host/provider/recovery evidence | in_progress |
+| `0027-fine-grained-progress` | carried: real-host progress verification | in_progress |
+| `0039-multi-variant-benchmark-comparisons` | carried: real-host comparison verification | planned |
 
 ## 0082 — Seamless Fleet Lifecycle and Maintenance
 
@@ -49,9 +56,9 @@ iteration is declared complete by rescheduling it.
 - **status:** `planned`
 - **priority:** `high`
 - **depends_on:** `0004-worker-fleet`, `0074-protobuf-fleet-protocol`,
-  `0076-database-backed-worker-registry`,
+  `0076-database-backed-worker-registry`
+- **relates_to:** `0075-rolling-worker-protocol-compatibility`,
   `0080-first-fleet-deployment-qualification`
-- **relates_to:** `0075-rolling-worker-protocol-compatibility`
 - **unblocks:** `0083-multi-orchestrator-high-availability`
 - **source:** v34 live daemon-restart and worker-drain qualification (2026-08)
 
@@ -145,6 +152,192 @@ the live-cordon behavior itself remains owned by that item.
 **Deferred / non-goals:** No indefinite support for arbitrary historical
 workers, daemon-pushed scheduling or binaries, multi-orchestrator HA, or
 requirement for a second worker implementation language.
+
+## Carried Qualification
+
+These items retain their existing status and acceptance criteria. The archived
+v34 evidence supplies the completed checks; the checklist below owns the
+remaining work. Lifecycle implementation remains first in execution order.
+
+### 0080 — First Fleet Deployment Qualification
+
+- **id:** `0080-first-fleet-deployment-qualification`
+- **status:** `in_progress`
+- **priority:** `high`
+- **depends_on:** `0004-worker-fleet`, `0017-generic-phase-events`,
+  `0062-sandboxed-worker-execution`, `0063-libvirt-block-validation`,
+  `0066-task-aware-reporting`, `0067-github-block-validation-submission`,
+  `0074-protobuf-fleet-protocol`, `0076-database-backed-worker-registry`,
+  `0077-worker-identity-and-config-simplification`,
+  `0079-dynamic-block-validation-planning`
+- **relates_to:** `0027-fine-grained-progress`,
+  `0039-multi-variant-benchmark-comparisons`,
+  `0075-rolling-worker-protocol-compatibility`
+- **source:** first-deployment readiness review after v33 (2026-08)
+
+**Problem:** Submission, fleet execution, sandboxing, identity, and reporting
+originally lacked separately managed daemon/worker deployment evidence.
+Installer separation and first-host execution are now proven; this item retains
+the remaining provider, recovery, identity, and evidence-completion gates.
+
+**Scope:** Separate daemon and worker installation, provide one parse-tested
+dual-capability worker example, correct current identity documentation, and
+publish a rerunnable qualification playbook. Commission one same-machine
+daemon/worker topology, prove the sandbox before provider traffic, exercise
+benchmark and block-validation submission from GitHub and Slack, verify
+reporting/replay/cancellation, and then repeat worker commissioning on a second
+machine using the same protocol revision.
+
+**Acceptance:**
+
+- Daemon-only installation never installs or starts a worker; worker-only
+  installation never installs or starts the daemon or operator CLI.
+- A combined worker example advertises benchmark, build-only, and
+  block-validation capability from its recipe sections and passes preflight.
+- Setup and operations docs describe public Web-PKI server authentication plus
+  worker P-256 proof-of-possession and database authorization; no private
+  worker CA or certificate enrollment remains.
+- The managed network, golden image, LVM snapshots, read-only chainstate
+  origin, guest probes, cleanup, public-key enrollment, and gRPC session all
+  pass on the real host before provider canaries.
+- GitHub and Slack can each submit and report a benchmark and a block
+  validation without duplicate work or provider messages.
+- Recent, full-history, explicit cross-epoch, cancellation, and daemon-restart
+  canaries preserve fencing, exact coverage, cleanup, and report convergence.
+- A second worker can be installed, enrolled, authorized, and scheduled without
+  a daemon restart or a static fleet file.
+- Every gate records the command/revision, timestamp, outcome, and relevant
+  submission/job/attempt/provider identities in a durable qualification record.
+
+**Deferred / non-goals:** No lifecycle UX (`0065`, `0070`, `0071`), watched-ref
+automation (`0068`), rolling multi-revision protocol support (`0075`), package
+repository, auto-enrollment, common chainstate distribution, multi-orchestrator
+HA, performance certification, or new task kind.
+
+### 0027 — Fine-Grained Benchmark Progress: Real-Host Closure
+
+- **id:** `0027-fine-grained-progress`
+- **status:** `in_progress`
+- **priority:** `medium`
+- **depends_on:** `0017-generic-phase-events`,
+  `0060-slack-snapshot-reporting`, `0074-protobuf-fleet-protocol`
+- **relates_to:** `0039-multi-variant-benchmark-comparisons`
+- **source:** v20 implementation audit during v34 planning (2026-08)
+
+**Problem:** Fine-grained `stacks-bench` JSONL parsing, bounded delivery,
+archiving, fleet transport, and reporting are implemented and tested. Real
+benchmark jobs now retain `run.progress.jsonl`; live attribution, calibration/
+repeat handling, total-less events, and final-line drain still need explicit
+host evidence.
+
+**Scope:** Exercise the existing production path during benchmark canaries.
+Confirm workflow-step and run-index attribution, bounded/debounced snapshot
+updates, optional fallback for a silent or older producer, raw JSONL artifact
+retention, and terminal precedence. Record whether calibration emits progress
+and whether guest shutdown loses a final best-effort line; fix only defects
+that violate the current contract.
+
+**Acceptance:**
+
+- A real benchmark emits parseable progress from the guest and reaches the
+  daemon through the protobuf fleet path without delaying reliable phase or
+  terminal events.
+- Calibration and measured-run events, when emitted upstream, carry the correct
+  workflow step and repeat index; a silent calibration remains a supported
+  coarse-phase fallback.
+- Slack renders bounded canonical snapshots rather than an event transcript;
+  GitHub/check reporting remains bounded and terminal state wins over delayed
+  progress.
+- Archived `run.progress.jsonl` and, when present,
+  `calibration.progress.jsonl` match the executed attempt and remain useful for
+  forensics.
+- Missing, malformed, unknown-version, total-less, or backpressured progress
+  never changes the task terminal outcome.
+
+**Deferred / non-goals:** No return to Slack streaming/append semantics, no
+reconstruction from console text, no change to upstream `stacks-bench`, and no
+native result-envelope cleanup (`0050`).
+
+### 0039 — Multi-Variant Benchmark Comparisons: Real-Host Closure
+
+- **id:** `0039-multi-variant-benchmark-comparisons`
+- **status:** `planned`
+- **priority:** `high`
+- **depends_on:** `0041-shared-benchmark-calibration`,
+  `0060-slack-snapshot-reporting`, `0064-task-submission-kernel`,
+  `0066-task-aware-reporting`
+- **relates_to:** `0027-fine-grained-progress`
+- **source:** v22 implementation audit during v34 planning (2026-08)
+
+**Problem:** Two-variant request validation, atomic multi-spec persistence,
+serial fleet execution, per-variant calibration, artifact carry-forward,
+noise-aware comparison, and one-message reporting are implemented and tested.
+They have not completed together on real hardware.
+
+**Scope:** Submit a natural-language Slack comparison for one small workload
+and two explicit refs, first with one measured run and then with two clean
+repeats if the first canary is healthy. Prove same-worker serial placement,
+one calibration per variant, per-variant calibration reuse, shared SQLite
+carry-forward, bounded progress, comparison aggregation, artifact provenance,
+and one final Slack snapshot.
+
+**Acceptance:**
+
+- One request creates one submission with two ordered specs and never executes
+  variants or repeats concurrently.
+- Each variant receives its own calibration identity; repeats reuse only their
+  variant's identity and run in fresh VMs.
+- Variant 1 receives the carried submission database rather than a fresh file,
+  while artifacts and metrics remain attributable to their spec/run.
+- The terminal task-aware report and Slack snapshot identify both refs,
+  calibration provenance, completed/missing runs, metric deltas, and the
+  conservative noise-aware verdict.
+- Redelivery does not duplicate the submission or Slack message, and daemon
+  restart reconstructs the same aggregate report.
+
+**Deferred / non-goals:** No deterministic Slack flag grammar, variant matrix,
+parallel variants, automatic ref discovery, or cross-worker comparison-group
+recovery. Slack benchmark intake remains natural-language/LLM-only; typed
+HTTP/CLI and exact GitHub triggers remain provider-free.
+
+### Remaining Qualification Checks
+
+- [ ] `0080`: retrieve missing submission/attempt/provider identities,
+  deployed release/image/tool versions, artifact checksums, and protected host
+  reports; complete the dated evidence record and operator sign-off.
+- [ ] `0080`: record direct S3 put/HEAD/get/checksum/delete.
+- [ ] `0080`: run one natural-language Slack benchmark with immutable commit,
+  authorized placement, one canonical report, promoted artifacts, and cleanup.
+- [ ] `0080`: qualify full-history validation in a maintenance window, covering
+  both epochs; accept a negative verdict only after every shard exits normally
+  and the reducer proves exact coverage.
+- [ ] `0080`: complete active-attempt and post-terminal daemon restart, worker
+  loss during execution/cleanup, and cleanup-obligation recovery in Phases 2–3/7.
+- [ ] `0080`: complete overlapping-key rotation, normal/emergency revocation
+  on an open connection, capability/profile intersection, and registry-policy
+  persistence in Phases 6–7.
+- [ ] `0080`: pin deployed revision-1 semantic-digest vectors and binary
+  provenance in Phase 1 before Phase 5's protocol changes.
+- [ ] `0080`: commission a second physical worker by Phase 6: worker-only
+  install, independent sandbox/LVM/preflight, distinct authorized key, compatible
+  protocol, capability-aware placement, independent cordon/revocation, and
+  targeted maintenance while the other worker continues serving work.
+- [ ] `0027`: inspect live guest-to-fleet/provider progress and archived JSONL;
+  verify calibration/repeat attribution, debounce, optional fallback,
+  total-less/backpressured progress, and terminal precedence.
+- [ ] `0039`: run two explicit refs on one compatible worker/snapshot, first
+  once each and then with two clean repeats per variant. Prove serial fresh
+  VMs, per-variant calibration/reuse, carried DB, result/noise aggregation,
+  artifact provenance, and one final Slack snapshot.
+- [ ] `0039`: prove redelivery idempotency and aggregate/provider identity
+  preservation after daemon restart, alongside Phase 7 recovery qualification.
+- [ ] Carried reporting finding: distinguish validation initialization/range
+  discovery from steady-state processed-block progress; derive ETA only after
+  stable post-initialization samples.
+
+The separate 20,000-block baseline and optimized runs do not satisfy the
+integrated `0039` gate. Existing `run.progress.jsonl` artifact listings prove
+retention, not all `0027` live behavior.
 
 ## State Model
 
@@ -551,6 +744,14 @@ infrastructure.
   cleanup, session, protocol, audit, and provider identities.
 
 ## Final Validation
+
+v35 completes when its lifecycle/protocol checks and carried qualification
+items below pass. Closing v34 did not complete any of those items.
+
+- [ ] `0080` remaining qualification checks pass with a completed evidence
+  record, operator sign-off, and two-host commissioning evidence.
+- [ ] `0027` real-host progress acceptance passes.
+- [ ] `0039` integrated comparison/repeat acceptance passes.
 
 - [ ] Decision 0006 is accepted and reflected in active operations docs.
 - [ ] Ordinary daemon restart is worker-transparent while short-outage lease

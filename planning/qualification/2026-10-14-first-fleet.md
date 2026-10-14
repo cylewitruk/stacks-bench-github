@@ -1,13 +1,13 @@
 # First Fleet Qualification — Reconciled 2026-10-14
 
-Evidence record for [v34](../iterations/v34-first-fleet-deployment-readiness.md).
+Evidence record for [v34](../archive/superseded/v34-first-fleet-deployment-readiness.md).
 This is a partial qualification, not a release sign-off or a live host audit.
 
 ## Evidence Basis
 
 September–October evidence below comes from operator-pasted commands, result
 JSON, and GitHub screenshots in the fleet-resumption conversation. August
-evidence remains in v34's [dated record](../iterations/v34-first-fleet-deployment-readiness.md#real-host-progress--2026-08-07).
+evidence remains in v34's [dated record](../archive/superseded/v34-first-fleet-deployment-readiness.md#real-host-progress--2026-08-07).
 Those historical checks are retained, not rerun or independently reverified.
 Host paths and artifact keys are retrieval references; their current existence
 and checksums have not been rechecked for this reconciliation.
@@ -133,22 +133,24 @@ were supplied; local receipt and checksum verification were not reported.
 ## Explicit Follow-Up Schedule
 
 Unchecked means not demonstrated; rescheduling does not mark a gate passed.
-v34/`0080` remains `in_progress`. v35 is the next implementation priority;
-its lifecycle work may begin while the following bounded evidence work remains.
+v34 is closed as superseded. Its unfinished `0080`, `0027`, and `0039` checks
+now belong to [v35's carried qualification](../iterations/v35-seamless-fleet-lifecycle.md#carried-qualification),
+with their existing item statuses preserved. Lifecycle implementation comes first;
+closure requires the carried evidence as well.
 
 | Remaining gate | Owner and next checkpoint |
 | ---- | ---- |
-| Raw evidence completion | v34: retrieve benchmark submission/attempt/provider identities, exact deployed release/image/tool versions, and artifact checksums; retain host reports and operator sign-off before final qualification |
-| Direct S3 ceremony | v34: record put/HEAD/get/checksum/delete before final qualification; existing artifact reads are partial evidence |
-| Slack benchmark journey | v34: one small natural-language benchmark with one canonical report and cleanup evidence; not proven by Slack parser tests |
-| Fine benchmark progress (`0027`) | v34 fast-follow: inspect live guest-to-provider progress and archived JSONL, then calibration/repeat/debounce/fallback cases |
-| Integrated comparison (`0039`) | v34 fast-follow: two refs on one compatible snapshot/worker, then clean repeats and per-variant calibration/DB carry-forward; combine restart portion with v35 |
-| Full-history validation | v34: schedule an explicit maintenance window and retain complete coverage/reduction/artifact/cleanup evidence before final qualification |
+| Raw evidence completion | v35 carried qualification: retrieve benchmark submission/attempt/provider identities, exact deployed release/image/tool versions, and artifact checksums; retain host reports and operator sign-off before final qualification |
+| Direct S3 ceremony | v35 carried qualification: record put/HEAD/get/checksum/delete before final qualification; existing artifact reads are partial evidence |
+| Slack benchmark journey | v35 carried qualification: one small natural-language benchmark with one canonical report and cleanup evidence; not proven by Slack parser tests |
+| Fine benchmark progress (`0027`) | v35 carried qualification: inspect live guest-to-provider progress and archived JSONL, then calibration/repeat/debounce/fallback cases |
+| Integrated comparison (`0039`) | v35 carried qualification: two refs on one compatible snapshot/worker, then clean repeats and per-variant calibration/DB carry-forward; combine restart portion with v35 |
+| Full-history validation | v35 carried qualification: schedule an explicit maintenance window and retain complete coverage/reduction/artifact/cleanup evidence before final qualification |
 | Active/post-terminal daemon restart, worker loss, cleanup recovery | Rescheduled to v35 Phases 2–3 and 7; test the new lifecycle and retain revision-1 behavior as the reference, not as a passed transparent-restart gate |
 | Identity rotation/revocation, capability/profile changes, policy persistence | Rescheduled to v35 Phases 6–7; retain the original v34 Phase 8 acceptance checks |
 | Deployed revision-1 semantic-digest vectors | v35 Phase 1 prerequisite to protocol changes; pin the deployed baseline before Phase 5 negotiation |
 | Second physical host | Explicitly deferred from v34; commission by v35 Phase 6's two-worker maintenance gate, then use v36's snapshot-bootstrap contract; no multi-machine claim yet |
-| Validation initialization/progress distinction | v34 follow-up; retain the observed scan delay as v36 timing input, not a measured placement model |
+| Validation initialization/progress distinction | v35 carried qualification; retain the observed scan delay as v36 timing input, not a measured placement model |
 
 ## Next Implementation Checkpoint
 

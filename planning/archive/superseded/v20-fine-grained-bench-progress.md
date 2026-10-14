@@ -11,7 +11,7 @@ and [`0074-protobuf-fleet-protocol`](../completed/0074-protobuf-fleet-protocol.m
 
 The current `0027-fine-grained-progress` item and its still-relevant real-host
 acceptance moved to
-[v34](../../iterations/v34-first-fleet-deployment-readiness.md). v34 validates
+[v35](../../iterations/v35-seamless-fleet-lifecycle.md), carried from v34. v35 validates
 the production snapshot/fleet path rather than reviving v20's historical Slack
 model.
 

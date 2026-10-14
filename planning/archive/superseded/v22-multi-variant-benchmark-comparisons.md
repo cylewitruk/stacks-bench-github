@@ -12,7 +12,7 @@ HTTP/CLI and exact GitHub triggers remain provider-free.
 
 The current `0039-multi-variant-benchmark-comparisons` item and its relevant
 hardware/integration acceptance moved to
-[v34](../../iterations/v34-first-fleet-deployment-readiness.md). v34 validates
+[v35](../../iterations/v35-seamless-fleet-lifecycle.md), carried from v34. v35 validates
 the current production path rather than the retired syntax or scheduling
 assumptions.
 
