@@ -17,6 +17,11 @@ blocks/transactions.
 > export/import boundary, while sbgh adds the Postgres ledger, an exclusive
 > `chainstate-index` job type, and benchmark pre-seed orchestration. The spike
 > and manual-tooling phases keep that scope controlled before daemon automation.
+>
+> [v36](v36-distributed-block-validation.md) now owns the shared canonical block
+> identity and worker snapshot-compatibility layer (`0084`). This parked
+> iteration reuses that layer and retains transaction facts, index jobs,
+> workload import packs, and benchmark pre-seeding.
 
 ## Items
 

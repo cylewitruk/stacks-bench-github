@@ -5,7 +5,8 @@
 - **depends_on:** `0015-resource-aware-admission`
 - **relates_to:** `0026-central-block-index-cache`,
   `0039-multi-variant-benchmark-comparisons`,
-  `0063-libvirt-block-validation`
+  `0063-libvirt-block-validation`,
+  `0084-canonical-chainstate-worker-inventory`
 - **source:** chainstate freshness/provenance design discussion (2026-06)
 
 Run a real `stacks-node` under sbgh control so chainstate freshness, snapshot

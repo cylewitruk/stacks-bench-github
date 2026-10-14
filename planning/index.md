@@ -16,6 +16,11 @@ need editing when an item's status or location changes.
 
 ## Items
 
+Current priority (2026-10-14): v35 lifecycle implementation, with v34's remaining
+qualification work explicitly scheduled in the
+[evidence record](qualification/2026-10-14-first-fleet.md). v34 remains open;
+v35–v37 are planned, and Decisions 0006/0007 remain drafts.
+
 | ID | Name | Status | Location |
 | ---- | ---- | ------ | -------- |
 | `0001-artifact-store` | Artifact store | `shipped` | [archive/completed/0001-artifact-store.md](archive/completed/0001-artifact-store.md) |
@@ -32,7 +37,7 @@ need editing when an item's status or location changes.
 | `0012-api-fronted-daemon` | API-fronted daemon | `shipped` | [archive/completed/0012-api-fronted-daemon.md](archive/completed/0012-api-fronted-daemon.md) |
 | `0013-drop-legacy-jobs-table` | Drop legacy `jobs` table | `backlog` | [backlog.md](backlog.md) |
 | `0014-preclaim-placeholder-checks` | PR placeholder and skipped checks | `backlog` | [backlog.md](backlog.md) |
-| `0015-resource-aware-admission` | Resource-aware admission | `backlog` | [backlog.md](backlog.md) |
+| `0015-resource-aware-admission` | Resource-aware validation admission | `planned` | [iterations/v36-distributed-block-validation.md](iterations/v36-distributed-block-validation.md) |
 | `0016-db-enforced-same-sha-dedup` | DB-enforced same-SHA dedup | `parked` | [backlog.md](backlog.md) |
 | `0017-generic-phase-events` | Task-neutral durable worker events | `shipped` | [archive/completed/0017-generic-phase-events.md](archive/completed/0017-generic-phase-events.md) |
 | `0018-auto-rerun-confidence-gate` | Auto-rerun confidence gate | `parked` | [backlog.md](backlog.md) |
@@ -44,7 +49,7 @@ need editing when an item's status or location changes.
 | `0024-slack-card-stage-timings` | Slack card stage timings | `shipped` | [archive/completed/0024-slack-card-stage-timings.md](archive/completed/0024-slack-card-stage-timings.md) |
 | `0025-baseline-binary-cache` | Release-baseline binary cache | `shipped` | [archive/completed/0025-baseline-binary-cache.md](archive/completed/0025-baseline-binary-cache.md) |
 | `0026-central-block-index-cache` | Central chainstate index ledger | `parked` | [iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md) |
-| `0027-fine-grained-progress` | Fine-grained bench progress | `planned` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
+| `0027-fine-grained-progress` | Fine-grained bench progress | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
 | `0028-results-summary-restructure` | Results-summary restructure | `backlog` | [backlog.md](backlog.md) |
 | `0029-per-block-timing-detail` | Per-block / per-tx timing detail | `backlog` | [backlog.md](backlog.md) |
 | `0030-results-qa-agent` | Results Q&A agent | `backlog` | [backlog.md](backlog.md) |
@@ -101,6 +106,10 @@ need editing when an item's status or location changes.
 | `0081-cross-owner-source-policy-slug-resolution` | Cross-owner source-policy slug resolution | `backlog` | [backlog.md](backlog.md) |
 | `0082-seamless-fleet-lifecycle-maintenance` | Seamless fleet lifecycle and maintenance | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0083-multi-orchestrator-high-availability` | Multi-orchestrator high availability | `candidate` | [backlog.md](backlog.md) |
+| `0084-canonical-chainstate-worker-inventory` | Canonical chainstate and worker inventory | `planned` | [iterations/v36-distributed-block-validation.md](iterations/v36-distributed-block-validation.md) |
+| `0085-distributed-block-validation-orchestration` | Distributed block-validation orchestration | `planned` | [iterations/v36-distributed-block-validation.md](iterations/v36-distributed-block-validation.md) |
+| `0086-community-worker-validation-trust` | Community worker validation trust | `planned` | [iterations/v37-community-worker-validation-trust.md](iterations/v37-community-worker-validation-trust.md) |
+| `0087-general-resource-lane-topology` | General resource-lane topology | `backlog` | [backlog.md](backlog.md) |
 
 ## Iterations
 
@@ -142,6 +151,8 @@ need editing when an item's status or location changes.
 | `v33-dynamic-block-validation-planning` | Dynamic block-validation planning | `shipped` | [archive/completed/0079-dynamic-block-validation-planning.md](archive/completed/0079-dynamic-block-validation-planning.md) |
 | `v34-first-fleet-deployment-readiness` | First fleet deployment readiness | `in_progress` | [iterations/v34-first-fleet-deployment-readiness.md](iterations/v34-first-fleet-deployment-readiness.md) |
 | `v35-seamless-fleet-lifecycle` | Seamless fleet lifecycle and rolling maintenance | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
+| `v36-distributed-block-validation` | Distributed block validation | `planned` | [iterations/v36-distributed-block-validation.md](iterations/v36-distributed-block-validation.md) |
+| `v37-community-worker-validation-trust` | Community worker validation trust | `planned` | [iterations/v37-community-worker-validation-trust.md](iterations/v37-community-worker-validation-trust.md) |
 
 ## Decisions
 
@@ -153,6 +164,7 @@ need editing when an item's status or location changes.
 | `0004-protobuf-fleet-protocol` | Protobuf/gRPC worker fleet protocol | `accepted` | [decisions/0004-protobuf-fleet-protocol.md](decisions/0004-protobuf-fleet-protocol.md) |
 | `0005-public-key-worker-identities` | Public-key worker identities | `accepted` | [decisions/0005-public-key-worker-identities.md](decisions/0005-public-key-worker-identities.md) |
 | `0006-fleet-lifecycle-state-separation` | Fleet lifecycle state separation | `draft` | [decisions/0006-fleet-lifecycle-state-separation.md](decisions/0006-fleet-lifecycle-state-separation.md) |
+| `0007-daemon-owned-distributed-validation-plans` | Daemon-owned distributed validation plans | `draft` | [decisions/0007-daemon-owned-distributed-validation-plans.md](decisions/0007-daemon-owned-distributed-validation-plans.md) |
 
 > Migration complete: every `docs/roadmap-vN.md` is a tombstone. Living designs
 > remain under `design/`; shipped records live in the completed archive.

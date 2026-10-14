@@ -323,6 +323,33 @@ idempotency contracts.
 worker push, or replacement of the database as the authority for leases and
 fencing.
 
+### 0087 — General resource-lane topology
+
+- **id:** `0087-general-resource-lane-topology`
+- **status:** `backlog`
+- **priority:** `medium`
+- **depends_on:** `0015-resource-aware-admission`
+- **relates_to:** `0039-multi-variant-benchmark-comparisons`,
+  `0052-managed-stacks-node-chainstate-producer`
+- **source:** v36 distributed block-validation scope review (2026-08)
+
+**Problem:** v36 intentionally models only block-validation slot counts and
+benchmark exclusion. That cannot safely express hosts with independently
+isolated CPU, memory, storage, or I/O capacity for mixed workloads.
+
+**Scope:** Add operator-approved resource lanes and exclusion domains, dynamic
+availability, atomic reservations, and qualification evidence for task-class
+co-scheduling. Keep discovered topology observational until the operator adopts
+it as policy.
+
+**Acceptance:** Concurrent offers cannot exceed any lane or exclusion-domain
+budget under scheduler races; status explains reservations and exclusions; and
+benchmark/validation co-scheduling is enabled only for a profile with proven
+CPU, memory, storage, and I/O isolation.
+
+**Deferred / non-goals:** No automatic trust in discovered hardware topology,
+cross-worker resource pooling, or universal co-scheduling requirement.
+
 *`0005-task-kind-platform` **shipped** as iteration **v10** (the multi-axis job
 model: source / intent / task_kind / build_target / derived report; build-only
 proven) — as-built record in
@@ -494,7 +521,8 @@ the invoking adapter cannot prove from structured event/API data.
 - **priority:** `medium`
 - **depends_on:** `0015-resource-aware-admission`
 - **relates_to:** `0026-central-block-index-cache`,
-  `0039-multi-variant-benchmark-comparisons`
+  `0039-multi-variant-benchmark-comparisons`,
+  `0084-canonical-chainstate-worker-inventory`
 - **source:** chainstate freshness/provenance design discussion (2026-06)
 - **design:**
   [design/0052-managed-stacks-node-chainstate-producer.md](design/0052-managed-stacks-node-chainstate-producer.md)
@@ -621,28 +649,8 @@ v34 →
 *`0041-shared-benchmark-calibration` shipped (iteration v19, 2026-06) →
 [archive/completed/0041-shared-benchmark-calibration.md](archive/completed/0041-shared-benchmark-calibration.md).*
 
-### 0015 — Resource-aware admission / budgets
-
-- **id:** `0015-resource-aware-admission`
-- **status:** `backlog`
-- **priority:** `low`
-- **relates_to:** `0038-isolated-benchmark-repetitions`,
-  `0039-multi-variant-benchmark-comparisons`
-- **source:** `archive/completed/0008` (v5 Phase 5.2/5.4)
-
-**Problem:** Admission is a flat `max_concurrent_jobs` count, ignoring
-heterogeneous per-job resource shapes.
-
-**Scope:** Admit by Σ(per-job vCPU/memory) ≤ host capacity + in-flight position
-reporting.
-
-**Acceptance:** Concurrent admission respects host capacity, not just a count,
-and can account for group fan-out (`variants × clean_repetitions`) once
-`0038`/`0039` land. Admission treats a benchmark submission as a host-pinned unit
-whose total expected duration/resource footprint may monopolize that host until
-the group completes.
-
-**Deferred / non-goals:** Only pays off at `max_concurrent > 1`.
+*`0015-resource-aware-admission` is planned in
+[v36](iterations/v36-distributed-block-validation.md).*
 
 ### 0013 — Drop legacy `jobs` table
 
@@ -698,13 +706,8 @@ today's literal `stable` behavior.
 implicit bug fix. This is a policy choice and should be opt-in or clearly
 documented if made default.
 
-### 0026 — Central chainstate index ledger (pre-seed)
-
-- **id:** `0026-central-block-index-cache`
-- **status:** `in_progress`
-
-Promoted to `v23-central-block-tx-index-cache` →
-[iterations/v23-central-block-tx-index-cache.md](iterations/v23-central-block-tx-index-cache.md).
+*`0026-central-block-index-cache` is parked in
+[v23](iterations/v23-central-block-tx-index-cache.md).*
 
 *`0027-fine-grained-progress` implementation completed under v20; real-host
 closure is planned in v34 →

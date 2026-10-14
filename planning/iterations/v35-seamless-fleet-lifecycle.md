@@ -8,12 +8,33 @@ workers. Normal daemon restarts must not drain or stop the fleet; targeted
 worker maintenance and bounded protocol upgrades must preserve availability,
 leases, fencing, and auditability.
 
-> **Status:** planned — architecture and acceptance are defined; implementation
-> starts after v34 qualification is closed or its remaining gates are
-> explicitly rescheduled.
+> **Status:** planned — next implementation priority as of 2026-10-14. v34's
+> remaining gates now have an explicit schedule; lifecycle implementation may
+> begin without claiming v34 is fully qualified. Decision 0006 is still draft
+> and no v35 implementation/qualification gate has passed.
 >
 > v35 owns lifecycle separation and a bounded current/previous protocol rollout
 > window. Multi-orchestrator HA is captured separately as `0083`.
+
+## Qualification Handoff — 2026-10-14
+
+The [v34 evidence record](../qualification/2026-10-14-first-fleet.md#explicit-follow-up-schedule)
+assigns active/post-terminal restart, worker-loss, and cleanup-recovery drills
+to Phases 2–3/7; identity rotation/revocation, capability/profile policy changes,
+and persistence to Phases 6–7. Retain v34 Phase 8's acceptance checks. Commission
+the second physical worker by Phase 6's maintenance ceremony; no second host
+has yet been qualified in the available evidence.
+
+Start Phase 1 by reviewing Decision 0006, recording deployed heartbeat/lease/
+session timings, and pinning the deployed revision-1 semantic-digest baseline
+before protocol changes in Phase 5. Then implement Phase 2 server-first and
+Phase 3 daemon quiescence. Successful quiescent updates, manual undrain/restart,
+and the newer CLI inspection commands do not satisfy these lifecycle gates.
+
+The `0080` dependency below requires its proven substrate and this explicit
+handoff for implementation entry. v34 retains its remaining provider,
+full-history, progress/comparison, and evidence-completion work; neither
+iteration is declared complete by rescheduling it.
 
 ## Items
 
@@ -239,6 +260,8 @@ before changing shutdown behavior.
 - [ ] Failure matrix and transition table complete
 - [ ] Reviewed (Codex)
 - [ ] Validation cases pinned before implementation
+- [ ] Deployed revision-1 semantic-digest vectors and binary provenance pinned
+  for Phase 5 compatibility fixtures
 
 **Acceptance & Validation:**
 
@@ -493,6 +516,9 @@ infrastructure.
   creation, artifact promotion, and provider projection.
 - Run expired-session recovery, startup-grace, paused long-maintenance, and
   emergency-abort drills.
+- Complete the carried v34 identity drills: overlapping key rotation, normal
+  and emergency revocation on an open connection, capability/profile
+  intersection, and registry-policy persistence across restart.
 - Roll current and previous worker cohorts, then advance the compatibility
   floor deliberately.
 

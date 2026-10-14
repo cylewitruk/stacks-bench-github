@@ -7,11 +7,16 @@ evidence-backed deployment on real hardware. This iteration also closes the
 remaining host-verification work from v20 and v22 against the current fleet and
 snapshot-reporting architecture.
 
-> **Status:** in_progress — host-independent work and the same-host substrate,
-> registration, controlled-validation, GitHub `/validate`, and Slack recent
-> validation paths are proven. Remaining benchmark provider journeys,
-> recovery/identity drills, protocol-baseline pinning, and the explicitly
-> deferred benchmark closure remain open.
+> **Status:** in_progress — reconciled 2026-10-14. Same-host substrate,
+> registration, controlled validation, GitHub `/validate` and `/benchmark`,
+> Slack recent validation, cancellation, and local five-shard execution have
+> evidence. Slack benchmark, full-history, and carried feature qualification
+> remain open. Recovery/identity drills and protocol-baseline pinning are
+> explicitly scheduled with v35; second-host commissioning is deferred to its
+> two-worker maintenance gate. No full qualification or multi-machine claim.
+>
+> [Consolidated evidence and follow-up schedule](../qualification/2026-10-14-first-fleet.md)
+> distinguish completed checks, partial evidence, and unverified operations.
 >
 > v34 is a deployment-readiness and qualification iteration, not a new task
 > feature. Fixes discovered by the playbook are in scope; unrelated feature
@@ -22,7 +27,7 @@ snapshot-reporting architecture.
 | Item | Role | Status |
 | ---- | ---- | ------ |
 | `0080-first-fleet-deployment-qualification` | primary: installation, commissioning, canaries, and evidence | in_progress |
-| `0027-fine-grained-progress` | co-primary: real-host progress verification | planned |
+| `0027-fine-grained-progress` | co-primary: real-host progress verification | in_progress |
 | `0039-multi-variant-benchmark-comparisons` | co-primary: real-host comparison verification | planned |
 
 ## 0080 — First Fleet Deployment Qualification
@@ -42,11 +47,9 @@ snapshot-reporting architecture.
 - **source:** first-deployment readiness review after v33 (2026-08)
 
 **Problem:** Submission, fleet execution, sandboxing, identity, and reporting
-are locally validated but have not run as separately managed daemon and worker
-processes on a production-like host. Installation currently couples control
-plane and worker artifacts, a few identity instructions still describe the
-retired private-CA model, and the libvirt/LVM/probe contracts have no real-host
-evidence.
+originally lacked separately managed daemon/worker deployment evidence.
+Installer separation and first-host execution are now proven; this item retains
+the remaining provider, recovery, identity, and evidence-completion gates.
 
 **Scope:** Separate daemon and worker installation, provide one parse-tested
 dual-capability worker example, correct current identity documentation, and
@@ -85,7 +88,7 @@ HA, performance certification, or new task kind.
 ## 0027 — Fine-Grained Benchmark Progress: Real-Host Closure
 
 - **id:** `0027-fine-grained-progress`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `medium`
 - **depends_on:** `0017-generic-phase-events`,
   `0060-slack-snapshot-reporting`, `0074-protobuf-fleet-protocol`
@@ -93,10 +96,10 @@ HA, performance certification, or new task kind.
 - **source:** v20 implementation audit during v34 planning (2026-08)
 
 **Problem:** Fine-grained `stacks-bench` JSONL parsing, bounded delivery,
-archiving, fleet transport, and reporting are implemented and tested, but the
-current pinned binary has not proven the complete path inside a real libvirt
-guest. Calibration/repeat attribution, total-less events, and final-line drain
-remain empirical.
+archiving, fleet transport, and reporting are implemented and tested. Real
+benchmark jobs now retain `run.progress.jsonl`; live attribution, calibration/
+repeat handling, total-less events, and final-line drain still need explicit
+host evidence.
 
 **Scope:** Exercise the existing production path during benchmark canaries.
 Confirm workflow-step and run-index attribution, bounded/debounced snapshot
@@ -253,9 +256,9 @@ HTTP/CLI and exact GitHub triggers remain provider-free.
 ## Real-Host Progress — 2026-08-07
 
 The first deployment is a separate-process, same-host daemon/worker topology on
-`stacks-bench`. Evidence is distributed across the protected host rollback,
-backup, and worker-qualification directories; it still needs consolidation into
-the qualification record required by this iteration.
+`stacks-bench`. This historical record is retained as reported. The
+[October reconciliation](../qualification/2026-10-14-first-fleet.md) adds later
+evidence and identifies missing raw records; it does not rerun these checks.
 
 ### Completed evidence
 
@@ -317,6 +320,22 @@ the qualification record required by this iteration.
   updates and converged the same Slack snapshot to a valid terminal result:
   `1,000/1,000` blocks, range `8476060..=8477059`, one shard, one concurrent
   validator, and origin `vg0/mainnet-2026-07-04`.
+- [x] Completed the forced five-shard recent-validation canary under the
+  temporary 2,000-block shard target and five-shard/four-concurrent ceiling.
+  Job `195ac363-9ab1-491c-9d65-c998f4f319ab` and attempt
+  `518bf860-8c61-4b62-846f-e72b8b40be1d` validated the exact 10,000-block
+  range `8467060..=8477059` with a valid five-shard reduction and one canonical
+  Slack snapshot. The trusted reducer accepted the exact gap-free command
+  partition and processed counts; all 17 command/result/console artifacts were
+  checksum-verified and promoted. All five snapshots, mounts, tmpfs/job
+  directories, attempts, cleanup obligations, and reliable-event gaps cleared.
+  The production profile was restored and the worker returned online and idle.
+- [x] Cancelled an active Slack block-validation canary through the admin fleet
+  command. Job `c953da9c-34dd-46c9-a661-84c8152690fa` and attempt
+  `cb00a2fa-328f-4dfd-80c6-86d953cad538` reached `validating`, observed the
+  durable cancellation, stopped the VM, completed teardown, and updated the
+  canonical Slack reply in place to `Cancelled`. The fleet subsequently
+  returned to zero attempts, cleanup obligations, and reliable-event gaps.
 - [x] Retained deterministic Slack retry/idempotency coverage instead of
   fault-injecting the production Socket Mode connection. Duplicate dispatch of
   one stable request identity, a lost post response, and failure to persist the
@@ -324,14 +343,28 @@ the qualification record required by this iteration.
   canonical message. The live canary independently proved that normal Socket
   Mode delivery created and updated only that message.
 
+## Reconciliation — 2026-10-14
+
+- [x] Record September's scratch backup restore and submission/spec/run
+  consistency checks, quiescent updates, and production transport/preflight.
+- [x] Record successful one-block validation on the newer September chainstate,
+  the schema-v3 command artifact, and observed attempt/resource cleanup.
+- [x] Complete the GitHub benchmark journey: September 24/25 jobs posted their
+  terminal results, retained DB/summary/progress artifacts, and returned the
+  fleet to idle with zero attempts/cleanup/gaps.
+- [x] Record `develop2` baseline execution and the later 20,000-measured-block
+  baseline/optimized pair. These are separate jobs, not the `0039` integrated
+  comparison canary.
+- [x] Consolidate the available August–October evidence and give every remaining
+  gate an owner/checkpoint in the [qualification record](../qualification/2026-10-14-first-fleet.md).
+
 ### Open or partial gates
 
-- [ ] Consolidate the redacted host evidence into one durable qualification
-  record, including the direct S3 put/HEAD/get/checksum/delete ceremony and the
-  exact deployed revision.
-- [ ] Complete the required GitHub and Slack benchmark provider journeys. The
-  v20/v22 benchmark-progress and comparison closure remains a separate
-  fast-follow after these primary journeys.
+- [ ] Complete raw evidence references and operator sign-off, including exact
+  deployed release/image/tool versions, missing benchmark provider/attempt
+  identities, checksums, and the direct S3 put/HEAD/get/checksum/delete ceremony.
+- [ ] Complete the Slack benchmark provider journey. The v20/v22 benchmark
+  progress and integrated comparison closure remains a separate fast-follow.
 - [ ] Distinguish the long first-block chainstate range-discovery/initialization
   scan from steady-state block validation in provider UX. Until the first
   processed-block sample exists, report initialization rather than implying a
@@ -340,32 +373,23 @@ the qualification record required by this iteration.
   block, then accelerated through the remaining range. This reporting
   refinement does not weaken terminal reduction or block the already-proven
   Slack validation journey.
-- [ ] Force a five-shard recent-validation canary by temporarily setting
-  `target_blocks_per_shard = 2000`, `max_shards = 5`, and
-  `max_concurrency = 4`, then requesting exactly 10,000 blocks. Require four
-  concurrent shards plus one rollover shard, monotonic block-weighted progress,
-  exact gap-free command ranges and processed counts, one valid 10,000-block
-  reduction, promoted per-command artifacts, and complete five-snapshot
-  cleanup. The first attempt exposed implicit libvirt SCSI addressing spilling
-  shard 4 onto an unavailable second controller; the worker fix now assigns
-  each shard an explicit target on controller 0. Rerun this gate, then restore
-  and re-qualify the production profile.
-- [ ] Run full-history validation, cancellation, active-attempt and
-  post-terminal daemon-restart drills, worker loss during execution/cleanup,
-  and cleanup-obligation recovery.
-- [ ] Complete overlapping-key rotation, normal/emergency revocation,
-  capability/profile intersection, and restart-persistence drills.
-- [ ] Pin the first deployed protobuf semantic-digest vectors.
-- [ ] Commission a second worker host, or record its explicit deferral without
-  claiming multi-machine readiness.
+- [ ] Run full-history validation in an explicitly scheduled maintenance window.
+- [ ] Recovery drills: rescheduled to v35 Phases 2–3 and 7 (active/post-terminal
+  restart, worker loss during execution/cleanup, and cleanup-obligation recovery).
+- [ ] Identity drills: rescheduled to v35 Phases 6–7 (overlapping keys,
+  normal/emergency revocation, capability/profile changes, policy persistence).
+- [ ] Protocol baseline: capture deployed semantic-digest vectors in v35 Phase 1
+  before Phase 5 changes protocol negotiation.
+- [x] Explicitly defer second-machine commissioning to v35 Phase 6. Actual
+  two-host operation remains unproven and is required before claiming readiness.
 
 ### Accepted finding carried into v35
 
-- [ ] Normal daemon restart does not preserve `draining`: revision-1 shutdown
+- [x] Reschedule the lifecycle finding to v35: revision-1 shutdown
   persists a global drain and idle workers exit successfully. v34 records the
-  conservative behavior and its fencing/replay evidence; v35 (`0082`) owns the
-  non-destructive lifecycle change. This v34 deviation must be explicitly
-  rescheduled in the final qualification record rather than marked passed.
+  conservative behavior; v35 (`0082`) owns the non-destructive lifecycle change
+  and its recovery qualification. This checkbox records the handoff, not a
+  successful transparent restart.
 
 ## Execution Playbook
 
@@ -580,7 +604,8 @@ operations contract; v35 (`0082`) supersedes that lifecycle behavior.
   exact argv and processed-count audit evidence.
 - [x] GitHub validation canary passes with one marked comment and one Check Run
   updated in place through terminal success.
-- [ ] GitHub benchmark canary passes.
+- [x] GitHub benchmark canary passes (September 24/25 evidence in the
+  [qualification record](../qualification/2026-10-14-first-fleet.md#github-benchmark-evidence)).
 - [x] Slack recent-validation canary passes with one canonical threaded
   snapshot updated in place through terminal success.
 - [x] Slack retry/idempotency paths reconcile duplicate dispatch and ambiguous
@@ -589,18 +614,23 @@ operations contract; v35 (`0082`) supersedes that lifecycle behavior.
 - [ ] Slack benchmark canary passes.
 - [x] Live block-validation progress reaches the protobuf/snapshot path as
   monotonic exact-block counts without changing terminal authority.
-- [ ] A forced 10,000-block canary executes as five exact shards with four-way
+- [x] A forced 10,000-block canary executes as five exact shards with four-way
   concurrency and proves live aggregation, terminal reduction, artifacts, and
   five-snapshot cleanup end to end.
-- [ ] Full-history, cancellation, daemon restart, worker loss, and cleanup
-  recovery canaries pass.
-- [ ] Identity rotation/revocation and restart persistence pass.
-- [ ] First deployed protobuf revision has pinned semantic-digest vectors.
+- [x] Controlled active-attempt cancellation converges the canonical provider
+  report and leaves no VM, snapshot, mount, cleanup obligation, or event gap.
+- [ ] Full-history validation passes (v34 maintenance-window gate).
+- [ ] Daemon restart, worker loss, and cleanup recovery pass (v35 Phases 2–3/7).
+- [ ] Identity rotation/revocation and restart persistence pass (v35 Phases 6–7).
+- [ ] First deployed protobuf revision has pinned semantic-digest vectors
+  (v35 Phase 1 prerequisite to Phase 5).
 
 ### Carried Feature Closure (`0027` / `0039`)
 
-- [ ] Real `stacks-bench` progress reaches the current snapshot/fleet path and
-  its raw JSONL is retained.
+- [x] Completed real benchmark jobs retain `run.progress.jsonl` as a promoted
+  artifact (September 24/25 listings).
+- [ ] Live `stacks-bench` progress is observed through the fleet and provider
+  snapshot path with correct attribution; archived JSONL is inspected.
 - [ ] Calibration/repeat attribution, optional fallback, debounce, and terminal
   precedence pass on the host.
 - [ ] A two-variant comparison proves serial execution, per-variant
@@ -608,8 +638,9 @@ operations contract; v35 (`0082`) supersedes that lifecycle behavior.
 
 ### Multi-Machine Readiness
 
-- [ ] Second-machine commissioning passes, or is explicitly deferred without
-  claiming multi-machine readiness.
+- [x] Second-machine commissioning is explicitly deferred to v35 Phase 6.
+- [ ] Second-machine commissioning passes; multi-machine readiness remains
+  unclaimed until this gate has real evidence.
 
 ## Stop and Rollback Rules
 
@@ -626,6 +657,11 @@ operations contract; v35 (`0082`) supersedes that lifecycle behavior.
   or mix comparison measurements across worker generations to make a gate pass.
 
 ## Completion
+
+As reconciled on 2026-10-14, v34 and `0080` remain open. The explicit schedule
+above permits v35 lifecycle implementation to begin; it does not waive any
+remaining gate or mark a rescheduled check as passed. v35 evidence may satisfy
+the transferred recovery/identity gates when it is recorded here by reference.
 
 The first fleet may be declared live and `0080` archived once Phases 0–5, 7,
 and 8 have durable evidence and the daemon plus at least one worker run as
