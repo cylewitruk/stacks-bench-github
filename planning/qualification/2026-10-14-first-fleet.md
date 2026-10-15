@@ -1,6 +1,7 @@
 # First Fleet Qualification — Reconciled 2026-10-14
 
-Evidence record for [v34](../archive/superseded/v34-first-fleet-deployment-readiness.md).
+Evidence record for [v34](../archive/superseded/v34-first-fleet-deployment-readiness.md)
+and its [v35 continuation](../iterations/v35-seamless-fleet-lifecycle.md).
 This is a partial qualification, not a release sign-off or a live host audit.
 
 ## Evidence Basis
@@ -12,9 +13,11 @@ Those historical checks are retained, not rerun or independently reverified.
 Host paths and artifact keys are retrieval references; their current existence
 and checksums have not been rechecked for this reconciliation.
 
-The repository reviewed was `e8417f5` plus the outstanding planning edits.
+The repository reviewed on October 14 was `e8417f5` plus the outstanding planning edits.
 That is not proof of the currently deployed release. There was no host mutation
-or new canary during this documentation pass.
+or new canary during that documentation pass. The October 15 addendum below
+records subsequent operator-executed deployment and canaries, not an independent
+host audit.
 
 ## Deployment Identity
 
@@ -27,11 +30,102 @@ or new canary during this documentation pass.
 | Transport | Production connector reported `grpc+tls1.3`, authorized registration, protocol revision 1 |
 | Qualification directories | `/var/lib/sbgh/qualification/20260922T114642Z` and `/var/lib/sbgh-worker/qualification/20260922T114642Z` |
 | Regular origin | `vg0/mainnet-2026-09-21`; `mainnet-` prefix and read-only origin verified on October 5 |
-| Latest confirmed return to service | October 5: online, undrained, idle; attempts/cleanup/gaps/staged bytes all zero |
+| Latest confirmed return to service | October 15 at 09:30:33 UTC: online, undrained, idle; attempts/cleanup/gaps/staged bytes all zero |
 
 On October 12 the operator reported the worker offline and drained again.
-Undrain/restart instructions were supplied, but no subsequent status was pasted.
-The cause and current service state are therefore unconfirmed.
+The cause was not established. The October 15 observations below supersede that
+service-state uncertainty, without attributing the earlier drain.
+
+## v35 Deployment and Restart Qualification — 2026-10-15
+
+Evidence: operator-pasted installation, API, systemd, executable-hash, and job
+report output in this conversation. Times below are UTC. This qualifies one
+combined host and one CLI block-validation attempt, not provider convergence or
+multi-host operation.
+
+### Release and Rollback Provenance
+
+- Clean host checkout: `d0b6852` (`feat(fleet): add resident recovery and
+  non-destructive daemon shutdown`); `just build --release` succeeded.
+- Quiescent server-first installation: explicitly drain/stop the worker, back
+  up, install/restart the daemon and CLI, then install/preflight the worker.
+  Both unit verification checks passed. The worker was explicitly undrained
+  and started once after installation; no worker intervention occurred during
+  the subsequent restart canaries.
+- Installed binaries matched the build. Running daemon and worker executable
+  hashes also matched after deployment.
+
+| Binary | SHA-256 |
+| ---- | ---- |
+| `sbgh-daemon` | `972e36fae3c51ae460fcf39edce1c5ef76096200e024682d9f6362b7a59bd78f` |
+| `sbgh-cli` | `0a5159c575bbe6c1fa325da1c5f567bdd0ca4d61a6e0a3bf979ac32a67fde935` |
+| `sbgh-worker` | `e533946ccb450de0580ed62e570e26e89864f1edb8bc2ed9f442e961fa6a89fb` |
+
+Rollback archive:
+`/var/lib/sbgh/backups/pre-v35.hZJvSnOm/installed-files.tar`, SHA-256
+`ef87fe25e6fb6ca78d686a8a0758dcabe6378c7c7300c9f8b86c556caafc2aaa`.
+Postgres backup service succeeded and produced
+`/var/lib/sbgh/backups/sbgh-sbgh-20261015T081703Z.tar.zst`.
+Neither restoration of this backup nor rollback was exercised.
+
+Reported timing configuration: heartbeat 10s, lease 45s, session 90s, offer
+30s, long poll 20s, request timeout 120s. These are operator-reported settings,
+not an independent effective-runtime configuration dump. Preflight passed;
+transport reported authorized TLS 1.3, protocol 1. The worker retained the
+`mainnet-` chainstate prefix.
+
+### Restart Results
+
+Shared worker identity throughout the captured restart checks:
+
+| Field | Value |
+| ---- | ---- |
+| Session | `a7c111fc-9269-41df-a9b8-56d91204b7a6` |
+| PID | `437078` |
+| systemd invocation | `4f8e6cc4828a40ff8d1d4288eef39a80` |
+| Automatic restarts | `0` |
+
+1. **Short idle restart: passed.** Daemon restart start/return timestamps both
+   read `08:24:50` (whole-second resolution). At `08:25:15` the API was healthy
+   and worker online, idle, undrained, with unchanged process/invocation and
+   zero backlog. The subsequent session observation retained the original UUID.
+2. **Expired idle session: passed.** The operator ran the prescribed daemon
+   stop / 110-second wait / start procedure, exceeding the reported 90-second
+   session TTL. Exact stop/start timestamps were not supplied. At `08:56:49`
+   the same session UUID was idle with fresh heartbeat and expiry `08:58:19`;
+   PID, invocation and restart count were unchanged. No manual worker recovery
+   was needed.
+3. **Active validation restart through completion: passed.** Before restart,
+   the attempt below was validating with heartbeat `09:06:41`. After restart,
+   daemon PID `448539` was active and the API responded; at `09:11:38` the same
+   attempt was still validating with a fresh fleet heartbeat. Worker PID,
+   invocation and restart count were unchanged. The terminal report retained
+   that attempt and reported `completed` / `done`, `valid`, one checked block,
+   no invalid blocks and no failure. At `09:30:33` the worker was idle and
+   undrained with attempts/cleanup/gaps/staged bytes all zero. Exact active
+   restart timing was not captured, so this is continuity evidence, not a
+   measured maximum outage or startup-grace boundary test.
+
+| Active canary identity | Value |
+| ---- | ---- |
+| Submission | `82d3b27d-7f0d-4cff-8f96-224f9271be68` |
+| Job | `9b79b6a0-1efa-4725-be6a-67dcedfdb096` |
+| Attempt | `c64efab2-b901-4a53-9108-7bed38572c8f` |
+| Source | CLI; `stacks-network/stacks-core` at `e2b39b01c70fde056b7018cd1e7ce83d022e7f15` |
+| Selection | Recent 1; global index `9050635`, Nakamoto local index `8865005` |
+| Origin | `vg0/mainnet-2026-09-21` |
+
+During inspection, the operator reported an apparently slow command block and
+supplied local libvirt monitoring logs. A bounded API check returned success,
+and the subsequent report confirmed a fresh authoritative fleet heartbeat.
+The apparent inspection delay was not attributed; local VM log messages alone
+were not treated as proof of lease renewal.
+
+These checks do not qualify active lease-loss teardown/requeue, successor
+fencing on the host, duplicate cleanup acknowledgement, post-terminal provider
+replay, forced shutdown, rollback, or previous-version interoperability. No
+fresh host filesystem/VM cleanup inventory or terminal artifact checksum was
+supplied for this canary; zero cleanup counters are the recorded cleanup evidence.
 
 ## Release, Storage, and Recovery Evidence
 
@@ -146,7 +240,7 @@ closure requires the carried evidence as well.
 | Fine benchmark progress (`0027`) | v35 carried qualification: inspect live guest-to-provider progress and archived JSONL, then calibration/repeat/debounce/fallback cases |
 | Integrated comparison (`0039`) | v35 carried qualification: two refs on one compatible snapshot/worker, then clean repeats and per-variant calibration/DB carry-forward; combine restart portion with v35 |
 | Full-history validation | v35 carried qualification: schedule an explicit maintenance window and retain complete coverage/reduction/artifact/cleanup evidence before final qualification |
-| Active/post-terminal daemon restart, worker loss, cleanup recovery | Rescheduled to v35 Phases 2–3 and 7; test the new lifecycle and retain revision-1 behavior as the reference, not as a passed transparent-restart gate |
+| Post-terminal daemon restart, worker loss, cleanup recovery | October 15 idle and active validation restart checks passed above; v35 Phases 2–3 and 7 still require active lease-loss cleanup/requeue, provider replay, and the remaining failure matrix |
 | Identity rotation/revocation, capability/profile changes, policy persistence | Rescheduled to v35 Phases 6–7; retain the original v34 Phase 8 acceptance checks |
 | Deployed revision-1 semantic-digest vectors | v35 Phase 1 prerequisite to protocol changes; pin the deployed baseline before Phase 5 negotiation |
 | Second physical host | Explicitly deferred from v34; commission by v35 Phase 6's two-worker maintenance gate, then use v36's snapshot-bootstrap contract; no multi-machine claim yet |
@@ -157,12 +251,14 @@ closure requires the carried evidence as well.
 The first v35 implementation now has local evidence for conservative lease
 deadlines, resident session/cleanup recovery, and process-local daemon shutdown.
 See the [failure matrix and validation record](../design/0082-fleet-lifecycle-failure-matrix.md#local-implementation--2026-10-14).
-Next: quiescent server-first deployment, followed by bounded restart and cleanup
-canaries. Retain running-build provenance and pin the revision-1 protocol
-baseline before negotiation changes. Existing manual undrain/restart operations
-do not prove the new semantics have shipped.
+The October 15 server-first deployment and three restart checks above now
+provide host evidence for idle recovery and active-attempt continuity. Next:
+an explicitly scheduled disposable active lease-expiry canary, proving local
+teardown, cleanup acknowledgement, and safe retry. Provider replay and the
+remaining failure matrix stay open. Pin the revision-1 protocol baseline before
+negotiation changes.
 
 Decision 0006 was accepted on 2026-10-14; Decision 0007 remains draft.
-Local v35 tests are separate from this host record; no new production lifecycle
-gate is passed. Neither a canonical ledger nor cross-worker validation has been
-demonstrated.
+Local v35 tests remain separate from the bounded host evidence above; v35 as a
+whole is not qualified. Neither a canonical ledger nor cross-worker validation
+has been demonstrated.

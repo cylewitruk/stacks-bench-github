@@ -491,8 +491,9 @@ cleanup convergence.
 periodic cleanup, idempotent cleanup acknowledgement, and independent lease
 deadlines are locally tested. Recovery requires the additive
 `session_recovery_required` server response; previous-daemon `stale_session`
-remains fail-closed. These tests do not substitute for live VM teardown and
-restart qualification; the acceptance checklist remains open until that run.
+remains fail-closed. The [October 15 host checks](../qualification/2026-10-14-first-fleet.md#v35-deployment-and-restart-qualification--2026-10-15)
+qualify idle same-session recovery after a reported 110-second daemon outage.
+Live lease-loss teardown and cleanup-recovery qualification remain open.
 
 **Scope:**
 
@@ -529,7 +530,7 @@ restart qualification; the acceptance checklist remains open until that run.
 - [ ] An obligation inserted after worker startup is discovered, executed, and
   acknowledged without process restart; its job is requeued exactly once only
   after acknowledgement.
-- [ ] An idle expired session reactivates its original session ID in process
+- [x] An idle expired session reactivates its original session ID in process
   while keeping the same worker identity and policy.
 - [ ] A transient connection failure never creates a successor session; tests
   pin same-session recovery, rejection when a live successor exists, and the
@@ -560,7 +561,10 @@ session and lease bounds.
 **Implementation evidence (2026-10-14):** signal handling and coordinator exit
 are process-local, shutdown grace is H, and startup expiry sweeping begins after
 2H. Database lease-expiry predicates are unchanged: an already-expired lease
-cannot be renewed during grace. Local tests pass; active-host restart and
+cannot be renewed during grace. Local tests pass; the
+[October 15 host checks](../qualification/2026-10-14-first-fleet.md#v35-deployment-and-restart-qualification--2026-10-15)
+also prove idle restart/recovery and active validation continuity through a
+successful terminal result under the same attempt. Startup-grace boundary and
 provider-convergence checks remain open. Existing job cancellation and emergency
 worker disable/revoke remain available; a new audited fleet-wide abort control
 is not implemented by this slice.
@@ -587,10 +591,10 @@ is not implemented by this slice.
 
 **Acceptance & Validation:**
 
-- [ ] Restarting inside the session TTL reuses the active idle session; an
+- [x] Restarting inside the session TTL reuses the active idle session; an
   outage beyond it uses Phase 2 same-session recovery. Neither path needs worker
   undrain or systemd start.
-- [ ] Restarting during an active attempt inside its confirmed lease preserves
+- [x] Restarting during an active attempt inside its confirmed lease preserves
   its authoritative generation and terminal result.
 - [ ] A healthy worker heartbeat during startup grace preserves its attempt;
   silence beyond the grace expires it once without renewing authority.
