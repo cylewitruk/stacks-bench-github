@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 use sbgh_driver::{
@@ -13,16 +13,18 @@ use sbgh_driver::{
 use sbgh_fleet::{
     AcceptOfferRequest, CompleteAttemptRequest, DesiredState, HeartbeatRequest, PROTOCOL_VERSION,
     PollRequest, PollResponse, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
-    RegistrationCheckRequest, RegistrationCheckResponse, ReliableEventEnvelope,
-    ReliableEventPayload, RepositoryCredentialRequest, RepositoryToken, ResourceFacts, TaskPayload,
-    TerminalOutcome, Validate, normalize_terminal_text,
+    RegisterSessionResponse, RegistrationCheckRequest, RegistrationCheckResponse,
+    ReliableEventEnvelope, ReliableEventPayload, RepositoryCredentialRequest, RepositoryToken,
+    ResourceFacts, TaskPayload, TerminalOutcome, Validate, normalize_terminal_text,
 };
 use sbgh_libvirt::SystemShell;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::WorkerConfig;
+use crate::lease::{Lease, ServerClock};
 use crate::remote_artifacts::RemoteArtifactSink;
 use crate::transport::{FleetClient, FleetClientError};
 use crate::{HostResources, WorkerRuntime, build_binary_cache};
@@ -140,10 +142,13 @@ pub async fn run(
     let session_id = Uuid::new_v4();
     let client = FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?;
     let request_started_ms = now_millis();
-    let registration = client
-        .register(&registration_request(&config, resources.facts().clone(), session_id))
+    let registration_facts = registration_request(&config, resources.facts().clone(), session_id);
+    let registration_started = Instant::now();
+    let mut registration = client
+        .register(&registration_facts)
         .await
         .context("registering worker session")?;
+    let mut server_clock = ServerClock::new(registration_started, registration.server_time_ms);
     let request_finished_ms = now_millis();
     let clock_skew_ms =
         validate_registration(&registration, request_started_ms, request_finished_ms)?;
@@ -153,19 +158,34 @@ pub async fn run(
         clock_skew_ms,
         "worker session timing validated"
     );
-    cleanup_obligations(&config, &client, session_id).await?;
     let mut backoff = Duration::from_millis(250);
     let mut draining = false;
+    let mut cleanup_ack = None;
     while !shutdown.is_cancelled() && !draining {
-        let poll = client
-            .poll(&PollRequest { worker_session_id: session_id })
-            .await;
+        let poll = async {
+            cleanup_obligations(&config, &client, session_id, &mut cleanup_ack).await?;
+            client
+                .poll(&PollRequest { worker_session_id: session_id })
+                .await
+        };
+        let poll = tokio::select! {
+            () = shutdown.cancelled() => break,
+            response = poll => response,
+        };
         let response = match poll {
             Ok(response) => {
                 backoff = Duration::from_millis(250);
                 response
             }
             Err(error) => {
+                if has_fleet_code(&error, "session_recovery_required") {
+                    (registration, server_clock) =
+                        recover_session(&registration_facts, &shutdown, async |facts| {
+                            client.register(facts).await
+                        })
+                        .await?;
+                    continue;
+                }
                 if is_non_retryable(&error) {
                     return Err(error).context("worker poll rejected permanently");
                 }
@@ -190,6 +210,7 @@ pub async fn run(
             }
             PollResponse::Offer { offer } => {
                 admit_offer(&config, &offer).await?;
+                let accept_started = Instant::now();
                 let accepted = match client
                     .accept(&AcceptOfferRequest {
                         identity: offer.identity.clone(),
@@ -224,7 +245,11 @@ pub async fn run(
                     &client,
                     accepted.assignment,
                     Duration::from_millis(registration.heartbeat_interval_ms),
-                    Duration::from_millis(registration.lease_ttl_ms),
+                    Lease::new(
+                        accept_started,
+                        Duration::from_millis(registration.lease_ttl_ms),
+                        server_clock,
+                    ),
                     &shutdown,
                 )
                 .await?;
@@ -238,6 +263,52 @@ pub async fn run(
         tracing::warn!(%error, "worker deregistration failed");
     }
     Ok(())
+}
+
+/// Recover only after a supporting server explicitly requests same-UUID recovery.
+async fn recover_session<F>(
+    facts: &RegisterSessionRequest,
+    shutdown: &CancellationToken,
+    register: F,
+) -> anyhow::Result<(RegisterSessionResponse, ServerClock)>
+where
+    F: AsyncFn(&RegisterSessionRequest) -> anyhow::Result<RegisterSessionResponse>,
+{
+    let mut backoff = Duration::from_millis(250);
+    let mut failures = 0;
+    loop {
+        let started = now_millis();
+        let monotonic_started = Instant::now();
+        let result = tokio::select! {
+            () = shutdown.cancelled() => anyhow::bail!("shutdown during session recovery"),
+            result = register(facts) => result,
+        };
+        match result {
+            Ok(registration) => {
+                validate_registration(&registration, started, now_millis())?;
+                let clock = ServerClock::new(monotonic_started, registration.server_time_ms);
+                return Ok((registration, clock));
+            }
+            Err(error) if is_non_retryable(&error) => return Err(error),
+            Err(error) => {
+                if has_fleet_code(&error, "session_recovery_pending") {
+                    failures = 0;
+                } else {
+                    failures += 1;
+                    ensure!(
+                        failures < 8,
+                        "same-session recovery did not converge; refusing to replace session"
+                    );
+                }
+                tracing::warn!(%error, "same-session recovery deferred");
+                tokio::select! {
+                    () = shutdown.cancelled() => anyhow::bail!("shutdown during session recovery"),
+                    () = tokio::time::sleep(retry_delay(&error, backoff)) => {}
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
 }
 
 /// Verify the production TLS 1.3 connector and receive a standard gRPC health
@@ -423,7 +494,7 @@ async fn execute_assignment(
     client: &FleetClient,
     assignment: sbgh_fleet::Assignment,
     heartbeat_interval: Duration,
-    lease_ttl: Duration,
+    lease: Lease,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<bool> {
     let attempt_cancel = shutdown.child_token();
@@ -441,22 +512,40 @@ async fn execute_assignment(
         lease_lost.clone(),
     ));
     let drain_requested = Arc::new(AtomicBool::new(false));
+    let (confirmed_tx, confirmed_rx) = oneshot::channel();
     let heartbeat = HeartbeatSupervisor::spawn(
         client.clone(),
         HeartbeatContext {
             identity: assignment.identity.clone(),
             heartbeat_interval,
-            lease_ttl,
+            lease,
             cancel: attempt_cancel.clone(),
             reliable: reliable.clone(),
             drain_requested: drain_requested.clone(),
-            lease_lost,
+            lease_lost: lease_lost.clone(),
+            confirmed: Some(confirmed_tx),
+            stop: CancellationToken::new(),
         },
     );
+    // Confirm the server's current expiry before launching any execution.
+    let confirmed = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        result = confirmed_rx => result.is_ok(),
+    };
+    if !confirmed {
+        heartbeat.stop().await?;
+        return Ok(false);
+    }
     let started = Instant::now();
-    reliable
+    let accepted = reliable
         .phase("accepted", started.elapsed())
-        .await?;
+        .await;
+    if lease_lost.load(Ordering::Acquire) {
+        heartbeat.stop().await?;
+        return Ok(false);
+    }
+    accepted?;
     let credential = fetch_repository_credential(client, &assignment, &attempt_cancel).await?;
 
     let terminal = match credential {
@@ -476,10 +565,20 @@ async fn execute_assignment(
             .await?
         }
     };
+    if lease_lost.load(Ordering::Acquire) {
+        // execute_driver has joined execution and verified teardown before returning.
+        heartbeat.stop().await?;
+        return Ok(false);
+    }
     let outcome_digest = sbgh_fleet::payload_digest(&terminal)?;
     let terminal_event = reliable
         .send(ReliableEventPayload::Terminal { outcome_digest })
-        .await?;
+        .await;
+    if lease_lost.load(Ordering::Acquire) {
+        heartbeat.stop().await?;
+        return Ok(false);
+    }
+    let terminal_event = terminal_event?;
     let manifest = artifacts.manifest().await;
     let completion = CompleteAttemptRequest {
         identity: assignment.identity.clone(),
@@ -490,7 +589,12 @@ async fn execute_assignment(
         artifacts: manifest,
     };
     completion.validate()?;
-    let response = retry_terminal(client, &completion, shutdown).await?;
+    let response = retry_terminal(client, &completion, shutdown).await;
+    if lease_lost.load(Ordering::Acquire) {
+        heartbeat.stop().await?;
+        return Ok(false);
+    }
+    let response = response?;
     ensure!(response.accepted, "orchestrator rejected terminal outcome");
     heartbeat.stop().await?;
     Ok(drain_requested.load(Ordering::Acquire))
@@ -554,66 +658,98 @@ async fn fetch_repository_credential(
 struct HeartbeatContext {
     identity: sbgh_fleet::AttemptIdentity,
     heartbeat_interval: Duration,
-    lease_ttl: Duration,
+    lease: Lease,
     cancel: CancellationToken,
     reliable: Arc<ReliableSender>,
     drain_requested: Arc<AtomicBool>,
     lease_lost: Arc<AtomicBool>,
+    confirmed: Option<oneshot::Sender<()>>,
+    stop: CancellationToken,
 }
 
-async fn heartbeat_loop(client: FleetClient, context: HeartbeatContext) {
+async fn heartbeat_loop(client: FleetClient, mut context: HeartbeatContext) {
     let mut interval = tokio::time::interval(context.heartbeat_interval);
-    let mut lease_deadline = Instant::now() + context.lease_ttl;
     loop {
-        tokio::select! {
-            () = context.cancel.cancelled() => return,
-            _ = interval.tick() => {
-                match client.heartbeat(&HeartbeatRequest {
+        if context
+            .lease
+            .during(&context.stop, interval.tick())
+            .await
+            .is_none()
+        {
+            break;
+        }
+        let request_started = Instant::now();
+        let response = context
+            .lease
+            .during(
+                &context.stop,
+                client.heartbeat(&HeartbeatRequest {
                     identity: context.identity.clone(),
-                    reliable_buffer_len: context.reliable.unacknowledged_len(),
-                }).await {
-                    Ok(heartbeat) => {
-                        lease_deadline = Instant::now() + context.lease_ttl;
-                        match heartbeat.desired_state {
-                            DesiredState::Continue => {}
-                            DesiredState::Cancel => context.cancel.cancel(),
-                            DesiredState::Drain => {
-                                context.drain_requested.store(true, Ordering::Release);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            attempt_id = %context.identity.attempt_id,
-                            %error,
-                            "attempt heartbeat failed"
-                        );
-                        if Instant::now() >= lease_deadline {
-                            tracing::error!(
-                                attempt_id = %context.identity.attempt_id,
-                                "lease confirmation expired; cancelling local execution"
-                            );
-                            context.lease_lost.store(true, Ordering::Release);
-                            context.cancel.cancel();
-                            return;
-                        }
+                    reliable_buffer_len: context
+                        .reliable
+                        .unacknowledged_len(),
+                }),
+            )
+            .await;
+        match response {
+            Some(Ok(heartbeat)) => {
+                if !context
+                    .lease
+                    .renew(request_started, heartbeat.lease_expires_at_ms)
+                {
+                    break;
+                }
+                match heartbeat.desired_state {
+                    DesiredState::Continue => {}
+                    DesiredState::Cancel => context.cancel.cancel(),
+                    DesiredState::Drain => {
+                        context
+                            .drain_requested
+                            .store(true, Ordering::Release);
                     }
                 }
+                if let Some(confirmed) = context.confirmed.take() {
+                    let _ = confirmed.send(());
+                }
             }
+            Some(Err(error)) => {
+                tracing::warn!(
+                    attempt_id = %context.identity.attempt_id,
+                    %error,
+                    "attempt heartbeat failed"
+                );
+                if is_non_retryable(&error) {
+                    break;
+                }
+            }
+            None => break,
         }
+    }
+    if !context.stop.is_cancelled() {
+        tracing::error!(attempt_id = %context.identity.attempt_id, "lease authority lost; cancelling local execution");
+        context
+            .lease_lost
+            .store(true, Ordering::Release);
+        context.cancel.cancel();
     }
 }
 
 struct HeartbeatSupervisor {
     cancel: CancellationToken,
+    execution_cancel: CancellationToken,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HeartbeatSupervisor {
     fn spawn(client: FleetClient, context: HeartbeatContext) -> Self {
-        let cancel = context.cancel.clone();
+        let cancel = context.stop.clone();
+        let execution_cancel = context.cancel.clone();
         let handle = tokio::spawn(heartbeat_loop(client, context));
-        Self { cancel, handle: Some(handle) }
+        Self {
+            cancel,
+            execution_cancel,
+            handle: Some(handle),
+        }
     }
 
     async fn stop(mut self) -> anyhow::Result<()> {
@@ -630,6 +766,7 @@ impl HeartbeatSupervisor {
 impl Drop for HeartbeatSupervisor {
     fn drop(&mut self) {
         self.cancel.cancel();
+        self.execution_cancel.cancel();
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
@@ -663,11 +800,17 @@ async fn execute_driver(
             .await;
     });
     let mut progress_seq = 0_u64;
+    let mut delivery_error = None;
     loop {
         tokio::select! {
             event = events_rx.recv() => match event {
                 Some(WorkerEvent::Phase { label, elapsed }) => {
-                    reliable.phase(&label.to_string(), elapsed).await?;
+                    if delivery_error.is_none() && !reliable.lease_lost.load(Ordering::Acquire) {
+                        if let Err(error) = reliable.phase(&label.to_string(), elapsed).await {
+                            cancel.cancel();
+                            delivery_error = Some(error);
+                        }
+                    }
                 }
                 Some(WorkerEvent::Heartbeat { label, elapsed }) => {
                     tracing::debug!(
@@ -678,6 +821,9 @@ async fn execute_driver(
                     );
                 }
                 Some(WorkerEvent::Progress(progress)) => {
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
                     progress_seq = progress_seq.saturating_add(1);
                     let _ = client.progress(&ProgressRequest {
                         identity: assignment.identity.clone(),
@@ -725,6 +871,11 @@ async fn execute_driver(
                             reason: "execution cancelled".into(),
                         },
                     };
+                    if !reliable.lease_lost.load(Ordering::Acquire) {
+                        if let Some(error) = delivery_error {
+                            return Err(error);
+                        }
+                    }
                     return Ok(outcome);
                 }
                 None => anyhow::bail!("execution event channel closed before terminal"),
@@ -995,7 +1146,17 @@ async fn cleanup_obligations(
     config: &WorkerConfig,
     client: &FleetClient,
     session_id: Uuid,
+    pending_ack: &mut Option<i64>,
 ) -> anyhow::Result<()> {
+    // Preserve verified teardown across session recovery or acknowledgement loss.
+    // A process restart may repeat cleanup, but a slow teardown in this process
+    // must not restart on each session expiry and prevent acknowledgement forever.
+    if let Some(id) = *pending_ack {
+        client
+            .complete_cleanup(session_id, id)
+            .await?;
+        *pending_ack = None;
+    }
     for obligation in client
         .cleanup(session_id)
         .await?
@@ -1034,9 +1195,11 @@ async fn cleanup_obligations(
                 .await;
         }
         if cleaned {
+            *pending_ack = Some(obligation.id);
             client
                 .complete_cleanup(session_id, obligation.id)
                 .await?;
+            *pending_ack = None;
         } else {
             anyhow::bail!("cleanup obligation {} could not be satisfied", obligation.id);
         }
@@ -1104,7 +1267,7 @@ fn retry_delay(error: &anyhow::Error, fallback: Duration) -> Duration {
 mod tests {
     use super::{
         MAX_CLOCK_SKEW_MS, admit_offer, failed_outcome, has_fleet_code, is_non_retryable,
-        local_vcpu_cpuset, retry_delay, validate_server_timing,
+        local_vcpu_cpuset, now_millis, recover_session, retry_delay, validate_server_timing,
     };
     use crate::WorkerConfig;
     use crate::transport::FleetClientError;
@@ -1113,9 +1276,144 @@ mod tests {
         BlockValidationSelection, LeaseToken, OfferRequirements, TaskPayload, TerminalOutcome,
         Validate, WorkOffer, WorkerCapability,
     };
+    use sbgh_fleet::{
+        PROTOCOL_VERSION, RegisterSessionRequest, RegisterSessionResponse, ResourceFacts,
+    };
+    use std::cell::Cell;
     use std::path::Path;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    /// Registration facts retained unchanged across resident recovery.
+    fn recovery_facts() -> RegisterSessionRequest {
+        RegisterSessionRequest {
+            protocol_version: PROTOCOL_VERSION,
+            worker_session_id: Uuid::new_v4(),
+            software_version: "test".into(),
+            advertised_capabilities: [WorkerCapability::BuildOnly].into(),
+            resources: ResourceFacts {
+                logical_cpus: 2,
+                memory_bytes: 8 << 30,
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_recovery_retries_with_identical_facts_and_uuid() {
+        let facts = recovery_facts();
+        let calls = Cell::new(0);
+        let recovered = recover_session(&facts, &CancellationToken::new(), async |received| {
+            assert_eq!(received, &facts);
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                anyhow::bail!("response lost");
+            }
+            Ok(RegisterSessionResponse {
+                protocol_version: PROTOCOL_VERSION,
+                heartbeat_interval_ms: 10_000,
+                lease_ttl_ms: 45_000,
+                server_time_ms: now_millis(),
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(recovered.0.lease_ttl_ms, 45_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_recovery_exits_without_retrying_or_replacing_identity() {
+        let calls = Cell::new(0);
+        let error = recover_session(&recovery_facts(), &CancellationToken::new(), async |_| {
+            calls.set(calls.get() + 1);
+            Err(client_error("session_superseded", false, None))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(has_fleet_code(&error, "session_superseded"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_recovery_outlives_startup_grace_without_changing_session() {
+        for heartbeat in [10_u64, 15, 30] {
+            let facts = recovery_facts();
+            let calls = Cell::new(0);
+            let ready = tokio::time::Instant::now() + Duration::from_secs(2 * heartbeat + 10);
+            let recovered = recover_session(&facts, &CancellationToken::new(), async |received| {
+                assert_eq!(received, &facts);
+                calls.set(calls.get() + 1);
+                if tokio::time::Instant::now() < ready {
+                    return Err(client_error(
+                        "session_recovery_pending",
+                        true,
+                        Some(Duration::from_secs(1)),
+                    ));
+                }
+                Ok(RegisterSessionResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    heartbeat_interval_ms: heartbeat * 1_000,
+                    lease_ttl_ms: heartbeat * 4_000,
+                    server_time_ms: now_millis(),
+                })
+            })
+            .await
+            .unwrap();
+            assert!(calls.get() > 8);
+            assert_eq!(
+                recovered
+                    .0
+                    .heartbeat_interval_ms,
+                heartbeat * 1_000
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_recovery_remains_interruptible_by_shutdown() {
+        let shutdown = CancellationToken::new();
+        let calls = Cell::new(0);
+        let result = recover_session(&recovery_facts(), &shutdown, async |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 12 {
+                shutdown.cancel();
+            }
+            Err(client_error("session_recovery_pending", true, None))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 12);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_recovery_stops_when_a_successor_takes_over() {
+        let calls = Cell::new(0);
+        let error = recover_session(&recovery_facts(), &CancellationToken::new(), async |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() <= 12 {
+                Err(client_error("session_recovery_pending", true, None))
+            } else {
+                Err(client_error("session_superseded", false, None))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 13);
+        assert!(has_fleet_code(&error, "session_superseded"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_recovery_cannot_loop_forever() {
+        let calls = Cell::new(0);
+        let result = recover_session(&recovery_facts(), &CancellationToken::new(), async |_| {
+            calls.set(calls.get() + 1);
+            anyhow::bail!("old server cannot reactivate this UUID")
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 8);
+    }
 
     fn client_error(code: &str, retryable: bool, retry_after: Option<Duration>) -> anyhow::Error {
         anyhow::Error::new(FleetClientError {

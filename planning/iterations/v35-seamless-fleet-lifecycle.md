@@ -9,9 +9,10 @@ worker maintenance and bounded protocol upgrades must preserve availability,
 leases, fencing, and auditability.
 
 > **Status:** in_progress — active iteration from 2026-10-14, including the
-> carried first-fleet qualification. Lifecycle implementation is the next
-> priority and has not started. Decision 0006 remains draft; no lifecycle or
-> protocol gate is marked passed by this handoff.
+> carried first-fleet qualification. Decision 0006 was accepted on 2026-10-14.
+> Conservative lease deadlines, resident recovery, and process-local daemon
+> shutdown are implemented and locally tested. Host qualification, audited
+> maintenance controls, and protocol negotiation remain open.
 >
 > v35 owns lifecycle separation and a bounded current/previous protocol rollout
 > window. Multi-orchestrator HA is captured separately as `0083`.
@@ -29,11 +30,10 @@ transport, controlled validation, and GitHub benchmark execution are the
 prerequisites for lifecycle work. Completion of carried `0080` is not an entry
 dependency: its restart and maintenance checks require v35 itself.
 
-Start Phase 1 by reviewing Decision 0006, recording deployed heartbeat/lease/
-session timings, and pinning the deployed revision-1 semantic-digest baseline
-before protocol changes in Phase 5. Then implement Phase 2 server-first and
-Phase 3 daemon quiescence. Manual undrain/restart and quiescent updates do not
-satisfy those new lifecycle gates.
+Deploy and qualify the locally tested Phase 2/3 implementation server-first.
+Retain Phase 1's unresolved running-build provenance and pin deployed revision-1
+semantic-digest vectors before Phase 5 protocol changes. Manual undrain/restart
+and quiescent updates do not satisfy transparent-restart qualification.
 
 Run provider/progress/comparison checks alongside the relevant v35 canaries.
 Recovery belongs to Phases 2–3/7, identity drills to Phases 6–7, and second-host
@@ -44,7 +44,7 @@ available evidence.
 
 | Item | Role | Status |
 | ---- | ---- | ------ |
-| `0082-seamless-fleet-lifecycle-maintenance` | primary: daemon, scheduler, worker, and host lifecycle separation | planned |
+| `0082-seamless-fleet-lifecycle-maintenance` | primary: daemon, scheduler, worker, and host lifecycle separation | in_progress |
 | `0075-rolling-worker-protocol-compatibility` | co-primary: bounded server-first worker upgrades | planned |
 | `0080-first-fleet-deployment-qualification` | carried: remaining host/provider/recovery evidence | in_progress |
 | `0027-fine-grained-progress` | carried: real-host progress verification | in_progress |
@@ -53,7 +53,7 @@ available evidence.
 ## 0082 — Seamless Fleet Lifecycle and Maintenance
 
 - **id:** `0082-seamless-fleet-lifecycle-maintenance`
-- **status:** `planned`
+- **status:** `in_progress`
 - **priority:** `high`
 - **depends_on:** `0004-worker-fleet`, `0074-protobuf-fleet-protocol`,
   `0076-database-backed-worker-registry`
@@ -438,9 +438,17 @@ never silently become fleet-wide maintenance commands.
 **Goal:** Freeze the desired/observed state boundaries and transition rules
 before changing shutdown behavior.
 
+Working contract: [failure matrix and timing bounds](../design/0082-fleet-lifecycle-failure-matrix.md).
+Source defaults, operator-reported host configuration, and installed binary
+hashes are recorded separately; effective runtime overrides, running executable
+identities, and exact source/build provenance remain open.
+Lease, recovery, and local-shutdown cases now have executable local coverage;
+see [implementation evidence](../design/0082-fleet-lifecycle-failure-matrix.md#local-implementation--2026-10-14).
+The full matrix and physical-host timing bounds remain unqualified.
+
 **Scope:**
 
-- Accept Decision 0006 after review.
+- Implement the direction accepted in Decision 0006 on 2026-10-14.
 - Specify normal stop, short outage, long outage, explicit pause, emergency
   abort, worker cordon, worker stop, and worker-loss transitions.
 - Define invariants for leases, fencing, cleanup, replay, and provider updates.
@@ -449,7 +457,7 @@ before changing shutdown behavior.
 
 **Status:**
 
-- [ ] Decision 0006 accepted
+- [x] Decision 0006 accepted
 - [ ] Failure matrix and transition table complete
 - [ ] Reviewed (Codex)
 - [ ] Validation cases pinned before implementation
@@ -471,11 +479,20 @@ before changing shutdown behavior.
 **Tests:**
 
 - State-transition table tests for valid, idempotent, and rejected mutations.
+- Stalled and delayed heartbeat responses cannot extend local execution past
+  its confirmed lease; cancellation is independent of RPC completion.
 
 ### Phase 2: Resident Session and Cleanup Recovery
 
 **Goal:** Remove process restart as an implicit prerequisite for session and
 cleanup convergence.
+
+**Implementation evidence (2026-10-14):** same-UUID recovery, successor fencing,
+periodic cleanup, idempotent cleanup acknowledgement, and independent lease
+deadlines are locally tested. Recovery requires the additive
+`session_recovery_required` server response; previous-daemon `stale_session`
+remains fail-closed. These tests do not substitute for live VM teardown and
+restart qualification; the acceptance checklist remains open until that run.
 
 **Scope:**
 
@@ -484,8 +501,8 @@ cleanup convergence.
   Do not add cleanup fields to heartbeat/poll responses before Phase 5.
 - Reactivate an idle expired session UUID in process only when the authenticated
   worker and registration facts match and no live successor session exists.
-- Treat `stale_session` as a recoverable lifecycle condition only after proving
-  that no authoritative local attempt remains.
+- Treat `session_recovery_required` as recoverable only after proving no
+  authoritative local attempt remains; legacy `stale_session` still exits.
 - After active lease loss, cancel and verify local teardown before reactivating
   the session, reconciling cleanup, or polling for work.
 - Phase 2 never creates a new session UUID for recovery. Retry transient
@@ -501,9 +518,10 @@ cleanup convergence.
 
 **Status:**
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
+- [x] Core implementation
+- [x] Unit/integration tests, if applicable
+- [x] Review closed — Opus round 2 found all round-1 findings resolved and
+  nothing blocking; final query/status consistency nits addressed
 - [ ] Validated — the acceptance checks below were run
 
 **Acceptance & Validation:**
@@ -538,6 +556,14 @@ cleanup convergence.
 
 **Goal:** Make a compatible single-daemon restart transparent within explicit
 session and lease bounds.
+
+**Implementation evidence (2026-10-14):** signal handling and coordinator exit
+are process-local, shutdown grace is H, and startup expiry sweeping begins after
+2H. Database lease-expiry predicates are unchanged: an already-expired lease
+cannot be renewed during grace. Local tests pass; active-host restart and
+provider-convergence checks remain open. Existing job cancellation and emergency
+worker disable/revoke remain available; a new audited fleet-wide abort control
+is not implemented by this slice.
 
 **Scope:**
 

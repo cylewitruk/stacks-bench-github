@@ -16,6 +16,20 @@ use uuid::Uuid;
 use crate::Result;
 use crate::models::{JobMetric, JobResult};
 
+/// Registration failures with stable lifecycle meaning across storage and RPC.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionRegistrationError {
+    /// This UUID cannot replace a successor or an explicitly ended session.
+    #[error("worker session has been superseded or deregistered")]
+    Superseded,
+    /// Registration facts are immutable for an existing session UUID.
+    #[error("worker session registration facts changed")]
+    FactsChanged,
+    /// Expiry must fence active attempts before a session may recover.
+    #[error("worker session recovery is waiting for attempt expiry")]
+    RecoveryPending,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerRegistration {
     pub worker_id: Uuid,
@@ -471,6 +485,9 @@ pub trait FleetStore: Send + Sync + 'static {
         worker_session_id: Uuid,
     ) -> Result<Vec<CleanupObligation>>;
 
+    /// Acknowledge verified teardown once; completed obligations also succeed.
+    /// Returns false for an invalid obligation and `FleetSessionInactive` when
+    /// the caller must recover its session before retrying the acknowledgement.
     async fn complete_cleanup(
         &self,
         worker_id: Uuid,

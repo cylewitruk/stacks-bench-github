@@ -5,11 +5,12 @@ use std::time::Duration as StdDuration;
 
 use anyhow::Context;
 use chrono::{Duration, Utc};
+use sbgh_core::Error as CoreError;
 use sbgh_core::config::FleetConfig;
 use sbgh_core::db::fleet::{
     ArtifactGrantRecord, EventIngest, FleetCompletion, FleetFailure, FleetStore,
-    FleetTerminalSubmission, FleetTerminalWrite, TerminalAcceptance, WorkerAuthorization,
-    WorkerRegistryStore,
+    FleetTerminalSubmission, FleetTerminalWrite, SessionRegistrationError, TerminalAcceptance,
+    WorkerAuthorization, WorkerRegistryStore,
 };
 use sbgh_core::models::JobResult;
 use sbgh_fleet::{
@@ -90,6 +91,7 @@ pub(super) struct FleetService {
     signer: LeaseSigner,
     config: Arc<FleetConfig>,
     active_polls: Arc<ActivePolls>,
+    quiescing: CancellationToken,
 }
 
 pub struct FleetRuntime {
@@ -103,6 +105,7 @@ impl FleetRuntime {
         registry: Arc<dyn WorkerRegistryStore>,
         artifacts: Arc<dyn ArtifactStore>,
         github_tokens: InstallationTokenCache,
+        quiescing: CancellationToken,
     ) -> anyhow::Result<Self> {
         let signer = LeaseSigner::load(&config.lease_hmac_key)?;
         Ok(Self {
@@ -114,6 +117,7 @@ impl FleetRuntime {
                 signer,
                 config: Arc::new(config),
                 active_polls: Arc::new(ActivePolls::default()),
+                quiescing,
             },
         })
     }
@@ -143,7 +147,7 @@ pub(super) async fn register(
             chrono_duration(state.config.session_ttl())?,
         )
         .await
-        .map_err(internal)?;
+        .map_err(fleet_store_error)?;
     tracing::info!(
         worker_id = %worker_id,
         session_id = %session.worker_session_id,
@@ -246,12 +250,7 @@ pub(super) async fn poll(
         .await
         .map_err(internal)?
     {
-        return Err(service_error(
-            ServiceCode::FailedPrecondition,
-            "stale_session",
-            "worker session is not active",
-            false,
-        ));
+        return Err(fleet_store_error(CoreError::FleetSessionInactive));
     }
     let _poll_guard = state
         .active_polls
@@ -269,6 +268,9 @@ pub(super) async fn poll(
             .config
             .long_poll_timeout();
     loop {
+        if state.quiescing.is_cancelled() {
+            return Ok(PollResponse::NoWork { retry_after_ms: 1_000 });
+        }
         if let Some(mut offered) = state
             .store
             .poll_offer(
@@ -321,17 +323,15 @@ pub(super) async fn poll(
             .await
             .map_err(internal)?
         {
-            return Err(service_error(
-                ServiceCode::PermissionDenied,
-                "worker_session_inactive",
-                "worker session is expired, disabled, or superseded",
-                false,
-            ));
+            return Err(fleet_store_error(CoreError::FleetSessionInactive));
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(PollResponse::NoWork { retry_after_ms: 1_000 });
         }
-        tokio::time::sleep(StdDuration::from_millis(250)).await;
+        tokio::select! {
+            () = state.quiescing.cancelled() => return Ok(PollResponse::NoWork { retry_after_ms: 1_000 }),
+            () = tokio::time::sleep(StdDuration::from_millis(250)) => {}
+        }
     }
 }
 
@@ -892,7 +892,7 @@ pub(super) async fn cleanup_complete(
         .store
         .complete_cleanup(worker_id, request.worker_session_id, request.obligation_id)
         .await
-        .map_err(internal)?;
+        .map_err(fleet_store_error)?;
     if !completed {
         return Err(stale_attempt());
     }
@@ -1216,6 +1216,27 @@ fn internal(error: impl std::fmt::Display) -> ServiceError {
     service_error(ServiceCode::Internal, "internal_error", "worker fleet operation failed", true)
 }
 
+/// Preserve typed lifecycle failures instead of treating them as server faults.
+fn fleet_store_error(error: CoreError) -> ServiceError {
+    match &error {
+        CoreError::FleetSessionInactive => service_error(
+            ServiceCode::FailedPrecondition,
+            "session_recovery_required",
+            "worker session is not active",
+            false,
+        ),
+        CoreError::SessionRegistration(reason) => {
+            let (code, retryable) = match reason {
+                SessionRegistrationError::Superseded => ("session_superseded", false),
+                SessionRegistrationError::FactsChanged => ("session_facts_changed", false),
+                SessionRegistrationError::RecoveryPending => ("session_recovery_pending", true),
+            };
+            service_error(ServiceCode::FailedPrecondition, code, &reason.to_string(), retryable)
+        }
+        _ => internal(error),
+    }
+}
+
 fn service_error(
     status: ServiceCode,
     code: &'static str,
@@ -1249,11 +1270,27 @@ mod tests {
 
     use super::{
         ActivePolls, ServiceCode, accept_event_ingest, artifact_staging_key, authorize_peer,
-        effective_capabilities, logical_artifacts, registration_readiness, terminal_write,
-        validate_terminal_for_assignment,
+        effective_capabilities, fleet_store_error, logical_artifacts, registration_readiness,
+        terminal_write, validate_terminal_for_assignment,
     };
     use crate::artifact_store::LocalFsStore;
     use sbgh_core::db::fleet::EventIngest;
+    use sbgh_core::{Error as CoreError, db::fleet::SessionRegistrationError};
+
+    #[test]
+    fn lifecycle_store_errors_preserve_recovery_and_permanent_rejections() {
+        for (source, code, retryable) in [
+            (CoreError::FleetSessionInactive, "session_recovery_required", false),
+            (SessionRegistrationError::RecoveryPending.into(), "session_recovery_pending", true),
+            (SessionRegistrationError::Superseded.into(), "session_superseded", false),
+            (SessionRegistrationError::FactsChanged.into(), "session_facts_changed", false),
+        ] {
+            let error = fleet_store_error(source);
+            assert_eq!(error.code, ServiceCode::FailedPrecondition);
+            assert_eq!(error.stable_code, code);
+            assert_eq!(error.retryable, retryable);
+        }
+    }
 
     #[derive(Default)]
     struct ToggleRegistry {

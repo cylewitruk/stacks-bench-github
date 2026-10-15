@@ -154,13 +154,15 @@ closure requires the carried evidence as well.
 
 ## Next Implementation Checkpoint
 
-Start [v35 Phase 1](../iterations/v35-seamless-fleet-lifecycle.md#phase-1-lifecycle-contract-and-failure-matrix):
-review Decision 0006, capture deployed heartbeat/lease/session timing and the
-revision-1 protocol baseline, and freeze the failure matrix. Then implement
-resident-session/cleanup recovery server-first, followed by process-local
-daemon shutdown. Existing manual undrain/restart operations are evidence of the
-problem, not evidence that these new semantics have shipped.
+The first v35 implementation now has local evidence for conservative lease
+deadlines, resident session/cleanup recovery, and process-local daemon shutdown.
+See the [failure matrix and validation record](../design/0082-fleet-lifecycle-failure-matrix.md#local-implementation--2026-10-14).
+Next: quiescent server-first deployment, followed by bounded restart and cleanup
+canaries. Retain running-build provenance and pin the revision-1 protocol
+baseline before negotiation changes. Existing manual undrain/restart operations
+do not prove the new semantics have shipped.
 
-Decisions 0006/0007 remain drafts. No v35–v37 implementation gates are checked
-by this reconciliation, and neither a canonical ledger nor cross-worker
-validation has been demonstrated.
+Decision 0006 was accepted on 2026-10-14; Decision 0007 remains draft.
+Local v35 tests are separate from this host record; no new production lifecycle
+gate is passed. Neither a canonical ledger nor cross-worker validation has been
+demonstrated.

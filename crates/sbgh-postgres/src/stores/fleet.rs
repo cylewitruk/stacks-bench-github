@@ -10,10 +10,10 @@ use sbgh_core::db::fleet::{
     ArtifactGrantRecord, AttemptHeartbeat, AuthorizedSession, CleanupObligation, EventIngest,
     FleetCompletion, FleetFailure, FleetSnapshot, FleetStore, FleetTerminalSubmission,
     FleetTerminalWrite, OfferedAssignment, PendingArtifactPromotion, PreparedExecution,
-    ProjectedReportMutation, ReportProjectionSeed, ResolvedSpecSource, StoredAttemptEvent,
-    StoredProgress, SubmissionRecovery, TerminalAcceptance, WorkerAuthorization,
-    WorkerIdentityRecord, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryEntry,
-    WorkerRegistryMutation, WorkerRegistryStore,
+    ProjectedReportMutation, ReportProjectionSeed, ResolvedSpecSource, SessionRegistrationError,
+    StoredAttemptEvent, StoredProgress, SubmissionRecovery, TerminalAcceptance,
+    WorkerAuthorization, WorkerIdentityRecord, WorkerPolicyPatch, WorkerRegistration,
+    WorkerRegistryEntry, WorkerRegistryMutation, WorkerRegistryStore,
 };
 use sbgh_core::models::{JobEventKind, JobEventStatus};
 #[cfg(feature = "testing")]
@@ -1303,11 +1303,12 @@ impl FleetStore for PostgresFleetStore {
                    protocol_version,
                    software_version,
                    resource_facts,
-                   identity_key_sha256
+                   identity_key_sha256,
+                   status::text AS status,
+                   expires_at <= NOW() AS expired
               FROM worker_session
              WHERE worker_id = $1
                AND worker_session_id = $2
-               AND status IN ('registered', 'idle', 'offered', 'running', 'draining')
              FOR UPDATE
             "#,
         )
@@ -1339,10 +1340,44 @@ impl FleetStore for PostgresFleetStore {
                     .as_deref()
                     == Some(identity_key_sha256.as_slice());
             if !same {
-                return Err(sbgh_core::Error::Config(
-                    "a worker session UUID cannot be reused with different registration facts"
-                        .into(),
-                ));
+                return Err(SessionRegistrationError::FactsChanged.into());
+            }
+            let status: String = existing
+                .try_get("status")
+                .core()?;
+            let superseded: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM worker_session other
+                    JOIN worker_session current ON current.worker_session_id = $2
+                    WHERE other.worker_id = $1 AND other.worker_session_id <> $2
+                      AND (other.started_at >= current.started_at
+                           OR (other.ended_at IS NULL AND other.expires_at > NOW()))
+                 )",
+            )
+            .bind(worker_id)
+            .bind(request.worker_session_id)
+            .fetch_one(&mut *tx)
+            .await
+            .core()?;
+            if status == "deregistered" || superseded {
+                return Err(SessionRegistrationError::Superseded.into());
+            }
+            let recovering = status == "offline"
+                || existing
+                    .try_get::<bool, _>("expired")
+                    .core()?;
+            if recovering {
+                let active: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM worker_attempt WHERE worker_id = $1
+                     AND status IN ('offered', 'running', 'cancel_requested'))",
+                )
+                .bind(worker_id)
+                .fetch_one(&mut *tx)
+                .await
+                .core()?;
+                if active {
+                    return Err(SessionRegistrationError::RecoveryPending.into());
+                }
             }
             sqlx::query(
                 r#"
@@ -1355,8 +1390,10 @@ impl FleetStore for PostgresFleetStore {
                        ),
                        status = CASE
                            WHEN $3 THEN 'draining'::worker_session_status
+                           WHEN $5 THEN 'idle'::worker_session_status
                            ELSE status
-                       END
+                       END,
+                       ended_at = NULL
                  WHERE worker_session_id = $1
                 "#,
             )
@@ -1364,6 +1401,7 @@ impl FleetStore for PostgresFleetStore {
             .bind(expires_at)
             .bind(draining)
             .bind(&effective)
+            .bind(recovering)
             .execute(&mut *tx)
             .await
             .core()?;
@@ -4178,8 +4216,26 @@ impl FleetStore for PostgresFleetStore {
         .await
         .core()?;
         let Some(row) = row else {
+            let (active, completed): (bool, bool) = sqlx::query_as(
+                "SELECT
+                    EXISTS (SELECT 1 FROM worker_session
+                            WHERE worker_id = $1 AND worker_session_id = $2
+                              AND status IN ('registered', 'idle', 'offered', 'running', 'draining')
+                              AND expires_at > NOW()),
+                    EXISTS (SELECT 1 FROM worker_cleanup_obligation
+                            WHERE worker_id = $1 AND id = $3 AND status = 'completed')",
+            )
+            .bind(worker_id)
+            .bind(worker_session_id)
+            .bind(obligation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .core()?;
             tx.rollback().await.core()?;
-            return Ok(false);
+            if !active {
+                return Err(sbgh_core::Error::FleetSessionInactive);
+            }
+            return Ok(completed);
         };
         let job_id: Uuid = row.try_get("job_id").core()?;
         let requeue_job: bool = row

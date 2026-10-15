@@ -95,10 +95,16 @@ fn pki_fixture() -> PkiFixture {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Drain,
     RejectFirstOffer,
+    Recover,
+    OldDaemon,
+    Superseded,
+    PeriodicCleanup,
+    CleanupRecovery,
+    LeaseLoss,
 }
 
 #[derive(Clone)]
@@ -108,9 +114,27 @@ struct MockFleet {
     session_id: Arc<std::sync::Mutex<Option<Uuid>>>,
     polls: Arc<AtomicUsize>,
     deregistrations: Arc<AtomicUsize>,
+    registrations: Arc<AtomicUsize>,
+    cleanup_calls: Arc<AtomicUsize>,
+    cleanup_acks: Arc<AtomicUsize>,
+    heartbeats: Arc<AtomicUsize>,
+    attempt_id: Uuid,
+    job_id: Uuid,
+    trace_id: Uuid,
 }
 
 impl MockFleet {
+    /// Return a typed non-retryable server lifecycle response.
+    fn lifecycle_error(code: &str) -> Status {
+        FleetRpcError {
+            status: Code::FailedPrecondition,
+            code: code.into(),
+            message: code.into(),
+            retryable: false,
+            retry_after_ms: None,
+        }
+        .into_status()
+    }
     fn unimplemented<T>() -> Result<Response<T>, Status> {
         Err(Status::unimplemented("not used by this test"))
     }
@@ -166,10 +190,20 @@ impl WorkerFleetService for MockFleet {
                 .facts()
                 .clone()
         );
-        *self
+        let previous = self
+            .registrations
+            .fetch_add(1, Ordering::SeqCst);
+        let mut session = self
             .session_id
             .lock()
-            .unwrap() = Some(registration.worker_session_id);
+            .unwrap();
+        if let Some(id) = *session {
+            assert_eq!(id, registration.worker_session_id, "recovery must preserve UUID");
+        }
+        if self.mode == Mode::Superseded && previous > 0 {
+            return Err(Self::lifecycle_error("session_superseded"));
+        }
+        *session = Some(registration.worker_session_id);
         Ok(Response::new(WireRegisterResponse::from_domain(RegisterSessionResponse {
             protocol_version: sbgh_fleet::PROTOCOL_VERSION,
             heartbeat_interval_ms: 1_000,
@@ -197,19 +231,43 @@ impl WorkerFleetService for MockFleet {
             .polls
             .fetch_add(1, Ordering::SeqCst);
         let response = match (self.mode, index) {
-            (Mode::RejectFirstOffer, 0) => PollResponse::Offer {
+            (Mode::Recover | Mode::Superseded, 0) => {
+                return Err(Self::lifecycle_error("session_recovery_required"));
+            }
+            (Mode::OldDaemon, 0) => return Err(Self::lifecycle_error("stale_session")),
+            (Mode::CleanupRecovery, _) => {
+                assert_eq!(
+                    self.cleanup_acks
+                        .load(Ordering::SeqCst),
+                    3,
+                    "acknowledgement must precede polling"
+                );
+                PollResponse::Drain
+            }
+            (Mode::PeriodicCleanup, 0) => PollResponse::NoWork { retry_after_ms: 0 },
+            (Mode::PeriodicCleanup, _) => {
+                assert_eq!(
+                    self.cleanup_acks
+                        .load(Ordering::SeqCst),
+                    1,
+                    "cleanup must precede next poll"
+                );
+                PollResponse::Drain
+            }
+            (Mode::RejectFirstOffer | Mode::LeaseLoss, 0) => PollResponse::Offer {
                 offer: Box::new(WorkOffer {
                     identity: AttemptIdentity {
                         worker_session_id: poll.worker_session_id,
-                        attempt_id: Uuid::new_v4(),
+                        attempt_id: self.attempt_id,
                         fencing_generation: 1,
                         lease_token: LeaseToken("a".repeat(64)),
                     },
-                    job_id: Uuid::new_v4(),
-                    trace_id: Uuid::new_v4(),
+                    job_id: self.job_id,
+                    trace_id: self.trace_id,
                     capability: WorkerCapability::BuildOnly,
                     requirements: sbgh_fleet::OfferRequirements::BuildOnly,
-                    payload_hash: "ab".repeat(32),
+                    payload_hash: sbgh_fleet::payload_digest(&sbgh_fleet::TaskPayload::BuildOnly)
+                        .unwrap(),
                     offer_expires_at_ms: i64::MAX,
                 }),
             },
@@ -220,8 +278,31 @@ impl WorkerFleetService for MockFleet {
 
     async fn accept(
         &self,
-        _request: Request<AcceptRequest>,
+        request: Request<AcceptRequest>,
     ) -> Result<Response<AcceptResponse>, Status> {
+        if self.mode == Mode::LeaseLoss {
+            let accepted = request
+                .into_inner()
+                .into_domain()
+                .unwrap();
+            let payload = sbgh_fleet::TaskPayload::BuildOnly;
+            return Ok(Response::new(AcceptResponse::from_domain(
+                sbgh_fleet::AcceptOfferResponse {
+                    assignment: sbgh_fleet::Assignment {
+                        identity: accepted.identity,
+                        trace_id: self.trace_id,
+                        context: sbgh_fleet::AssignmentContext {
+                            job_id: self.job_id,
+                            repository: "test/repo".into(),
+                            commit: "1".repeat(40),
+                        },
+                        payload_hash: sbgh_fleet::payload_digest(&payload).unwrap(),
+                        payload,
+                        vcpu_cpuset: None,
+                    },
+                },
+            )));
+        }
         Err(FleetRpcError {
             status: Code::FailedPrecondition,
             code: "stale_attempt".into(),
@@ -247,7 +328,30 @@ impl WorkerFleetService for MockFleet {
                 .lock()
                 .unwrap()
         );
-        Ok(Response::new(ListCleanupResponse::from_domain(Vec::new())))
+        let count = self
+            .cleanup_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if self.mode == Mode::CleanupRecovery && count > 0 {
+            assert_eq!(
+                self.cleanup_acks
+                    .load(Ordering::SeqCst),
+                3,
+                "retry the verified teardown acknowledgement before listing or repeating cleanup"
+            );
+        }
+        let obligations = if (self.mode == Mode::PeriodicCleanup && count == 1)
+            || (self.mode == Mode::CleanupRecovery && count == 0)
+        {
+            vec![sbgh_fleet::CleanupItem {
+                id: 1,
+                attempt_id: Uuid::new_v4(),
+                job_id: Uuid::new_v4(),
+                reason: "inserted after startup".into(),
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(ListCleanupResponse::from_domain(obligations)))
     }
 
     async fn deregister(
@@ -274,6 +378,9 @@ impl WorkerFleetService for MockFleet {
         &self,
         _request: Request<FetchRepositoryCredentialRequest>,
     ) -> Result<Response<FetchRepositoryCredentialResponse>, Status> {
+        if self.mode == Mode::LeaseLoss {
+            return std::future::pending().await;
+        }
         Self::unimplemented()
     }
 
@@ -281,13 +388,41 @@ impl WorkerFleetService for MockFleet {
         &self,
         _request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        if self.mode == Mode::LeaseLoss {
+            if self
+                .heartbeats
+                .fetch_add(1, Ordering::SeqCst)
+                > 0
+            {
+                return std::future::pending().await;
+            }
+            return Ok(Response::new(HeartbeatResponse::from_domain(
+                sbgh_fleet::HeartbeatResponse {
+                    desired_state: sbgh_fleet::DesiredState::Continue,
+                    lease_expires_at_ms: now_millis() + 5_000,
+                    highest_contiguous_reliable_seq: 0,
+                },
+            )));
+        }
         Self::unimplemented()
     }
 
     async fn publish_reliable_event(
         &self,
-        _request: Request<PublishReliableEventRequest>,
+        request: Request<PublishReliableEventRequest>,
     ) -> Result<Response<PublishReliableEventResponse>, Status> {
+        if self.mode == Mode::LeaseLoss {
+            let event = request
+                .into_inner()
+                .into_domain()
+                .unwrap();
+            std::assert_matches!(event.payload, sbgh_fleet::ReliableEventPayload::Phase { .. });
+            return Ok(Response::new(PublishReliableEventResponse::from_domain(
+                sbgh_fleet::ReliableEventAck {
+                    highest_contiguous_reliable_seq: event.reliable_seq,
+                },
+            )));
+        }
         Self::unimplemented()
     }
 
@@ -314,9 +449,27 @@ impl WorkerFleetService for MockFleet {
 
     async fn complete_cleanup(
         &self,
-        _request: Request<CompleteCleanupRequest>,
+        request: Request<CompleteCleanupRequest>,
     ) -> Result<Response<CompleteCleanupResponse>, Status> {
-        Self::unimplemented()
+        let request = request
+            .into_inner()
+            .into_domain()
+            .unwrap();
+        assert_eq!(
+            Some(request.worker_session_id),
+            *self
+                .session_id
+                .lock()
+                .unwrap()
+        );
+        assert_eq!(request.obligation_id, 1);
+        let previous = self
+            .cleanup_acks
+            .fetch_add(1, Ordering::SeqCst);
+        if self.mode == Mode::CleanupRecovery && previous < 2 {
+            return Err(Self::lifecycle_error("session_recovery_required"));
+        }
+        Ok(Response::new(CompleteCleanupResponse::from_domain(true)))
     }
 }
 
@@ -429,6 +582,13 @@ async fn run_case(mode: Mode) {
         session_id: Arc::new(std::sync::Mutex::new(None)),
         polls: Arc::new(AtomicUsize::new(0)),
         deregistrations: Arc::new(AtomicUsize::new(0)),
+        registrations: Arc::new(AtomicUsize::new(0)),
+        cleanup_calls: Arc::new(AtomicUsize::new(0)),
+        cleanup_acks: Arc::new(AtomicUsize::new(0)),
+        heartbeats: Arc::new(AtomicUsize::new(0)),
+        attempt_id: Uuid::new_v4(),
+        job_id: Uuid::new_v4(),
+        trace_id: Uuid::new_v4(),
     };
     let server_shutdown = CancellationToken::new();
     let server = tokio::spawn(serve_mock(
@@ -474,9 +634,18 @@ async fn run_case(mode: Mode) {
         0
     );
 
-    sbgh_worker::run_fleet(config, worker_resources(), CancellationToken::new())
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sbgh_worker::run_fleet(config, worker_resources(), CancellationToken::new()),
+    )
+    .await
+    .unwrap();
+    let rejected = matches!(mode, Mode::OldDaemon | Mode::Superseded);
+    if rejected {
+        assert!(result.is_err());
+    } else {
+        result.unwrap();
+    }
     server_shutdown.cancel();
     server.await.unwrap();
 
@@ -497,7 +666,17 @@ async fn run_case(mode: Mode) {
         fleet
             .deregistrations
             .load(Ordering::SeqCst),
-        1
+        usize::from(!rejected)
+    );
+    assert_eq!(
+        fleet
+            .registrations
+            .load(Ordering::SeqCst),
+        match mode {
+            Mode::Recover | Mode::Superseded => 2,
+            Mode::CleanupRecovery => 3,
+            _ => 1,
+        }
     );
 }
 
@@ -509,4 +688,34 @@ async fn real_worker_registers_polls_drain_and_deregisters_over_mtls_grpc() {
 #[tokio::test]
 async fn cancellation_winning_before_accept_never_starts_execution() {
     run_case(Mode::RejectFirstOffer).await;
+}
+
+#[tokio::test]
+async fn resident_worker_recovers_same_session_over_grpc() {
+    run_case(Mode::Recover).await;
+}
+
+#[tokio::test]
+async fn previous_daemon_stale_session_still_fails_closed() {
+    run_case(Mode::OldDaemon).await;
+}
+
+#[tokio::test]
+async fn superseded_worker_exits_without_minting_another_session() {
+    run_case(Mode::Superseded).await;
+}
+
+#[tokio::test]
+async fn cleanup_inserted_after_startup_is_acknowledged_before_polling_again() {
+    run_case(Mode::PeriodicCleanup).await;
+}
+
+#[tokio::test]
+async fn expired_cleanup_session_recovers_and_retries_ack_without_repeating_teardown() {
+    run_case(Mode::CleanupRecovery).await;
+}
+
+#[tokio::test]
+async fn stalled_heartbeat_cancels_credential_wait_and_worker_remains_resident() {
+    run_case(Mode::LeaseLoss).await;
 }

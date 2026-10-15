@@ -215,12 +215,14 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let fleet_store: Arc<dyn sbgh_core::db::fleet::FleetStore> = Arc::new(postgres_fleet.clone());
     let worker_registry: Arc<dyn sbgh_core::db::fleet::WorkerRegistryStore> =
         Arc::new(postgres_fleet);
+    let shutdown = shutdown::Shutdown::new();
     let fleet_runtime = fleet::FleetRuntime::build(
         fleet_config,
         fleet_store.clone(),
         worker_registry,
         artifact_store.clone(),
         tokens,
+        shutdown.exit.clone(),
     )
     .await
     .context("building worker fleet control plane")?;
@@ -383,70 +385,70 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     };
     let api_router = api::build_router(api_state, api_tokens);
 
-    // A `SIGINT` drains (stop claiming, finish in-flight), while a second
-    // `SIGINT` or `SIGTERM` aborts. The
-    // coordinator owns drain completion and fires `exit`, which stops the other
-    // arms so the `try_join!` returns and the process exits cleanly.
-    let shutdown = shutdown::Shutdown::new();
-
-    tokio::try_join!(
-        async {
-            // Stop processing webhooks once shutdown is underway; any in-flight
-            // claim is reclaimed by the processor's own sweep on the next boot.
-            tokio::select! {
-                r = processor.run() => r.map_err(anyhow::Error::from),
-                _ = shutdown.exit.cancelled() => Ok(()),
-            }
-        },
-        api::serve(&api_listen, api_router, shutdown.exit.clone()),
-        fleet::run(fleet_runtime, shutdown.exit.clone()),
-        fleet_coordinator.run(shutdown.clone()),
-        shutdown::watch_signals(shutdown.clone()),
-        async {
-            // Slack socket-mode receive loop, only when enabled. It
-            // stops accepting mentions at drain start; a startup failure (bad
-            // app token, TLS) is logged but never crashes the daemon — Slack is
-            // an optional surface. This arm then idles until full exit so it
-            // never collapses the `try_join!` early.
-            if let Some((
-                cfg,
-                jobs,
-                web_client,
-                intent_resolver,
-                intent_rate_limit,
-                max_clean_repetitions,
-                max_variants,
-                max_comparison_lifecycles,
-                binary_cache_enabled,
-            )) = slack_runtime
-            {
-                if let Err(e) = sbgh_slack::run(
+    // Local process shutdown never changes remote worker policy or attempts.
+    let shutdown_grace = config
+        .fleet
+        .heartbeat_interval();
+    let services = async {
+        tokio::try_join!(
+            async {
+                // Stop processing webhooks once shutdown is underway; any in-flight
+                // claim is reclaimed by the processor's own sweep on the next boot.
+                tokio::select! {
+                    r = processor.run() => r.map_err(anyhow::Error::from),
+                    _ = shutdown.exit.cancelled() => Ok(()),
+                }
+            },
+            api::serve(&api_listen, api_router, shutdown.exit.clone()),
+            fleet::run(fleet_runtime, shutdown.exit.clone()),
+            fleet_coordinator.run(shutdown.clone()),
+            async {
+                // Slack socket-mode receive loop, only when enabled. It
+                // stops accepting mentions at drain start; a startup failure (bad
+                // app token, TLS) is logged but never crashes the daemon — Slack is
+                // an optional surface. This arm then idles until full exit so it
+                // never collapses the `try_join!` early.
+                if let Some((
                     cfg,
                     jobs,
                     web_client,
                     intent_resolver,
-                    sbgh_slack::SocketRunOptions {
-                        intent_rate_limit_per_minute: intent_rate_limit,
-                        max_clean_repetitions,
-                        max_variants,
-                        max_comparison_lifecycles,
-                        binary_cache_enabled,
-                    },
-                    shutdown.draining.clone(),
-                )
-                .await
+                    intent_rate_limit,
+                    max_clean_repetitions,
+                    max_variants,
+                    max_comparison_lifecycles,
+                    binary_cache_enabled,
+                )) = slack_runtime
                 {
-                    tracing::error!(error = ?e, "slack: socket mode failed; continuing without Slack");
+                    if let Err(e) = sbgh_slack::run(
+                        cfg,
+                        jobs,
+                        web_client,
+                        intent_resolver,
+                        sbgh_slack::SocketRunOptions {
+                            intent_rate_limit_per_minute: intent_rate_limit,
+                            max_clean_repetitions,
+                            max_variants,
+                            max_comparison_lifecycles,
+                            binary_cache_enabled,
+                        },
+                        shutdown.draining.clone(),
+                    )
+                    .await
+                    {
+                        tracing::error!(error = ?e, "slack: socket mode failed; continuing without Slack");
+                    }
                 }
-            }
-            shutdown
-                .exit
-                .cancelled()
-                .await;
-            Ok::<(), anyhow::Error>(())
-        },
-    )?;
-    Ok(())
+                shutdown
+                    .exit
+                    .cancelled()
+                    .await;
+                Ok::<(), anyhow::Error>(())
+            },
+        )?;
+        Ok(())
+    };
+    shutdown::supervise(shutdown.clone(), shutdown_grace, services).await
 }
 
 pub use artifact_store::{

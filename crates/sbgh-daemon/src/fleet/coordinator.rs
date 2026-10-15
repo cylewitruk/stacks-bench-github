@@ -114,22 +114,19 @@ impl FleetCoordinator {
     pub async fn run(self, shutdown: Shutdown) -> anyhow::Result<()> {
         let mut prepare_interval = tokio::time::interval(Duration::from_secs(1));
         let mut projection_interval = tokio::time::interval(Duration::from_millis(250));
-        let mut expiry_interval = tokio::time::interval(Duration::from_secs(2));
-        let mut draining = false;
-        let mut abort_requested = false;
+        // One heartbeat interval plus one interval of transport/scheduling allowance.
+        // This delays sweeping, never the database's lease-expiry predicates.
+        let grace = self
+            .config
+            .fleet
+            .heartbeat_interval()
+            .saturating_mul(2);
+        let mut expiry_interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + grace, Duration::from_secs(2));
         loop {
             tokio::select! {
-                () = shutdown.draining.cancelled(), if !draining => {
-                    draining = true;
-                    self.fleet.set_all_workers_draining(true).await?;
-                    tracing::info!("fleet drain requested; workers will stop claiming");
-                }
-                () = shutdown.abort.cancelled(), if !abort_requested => {
-                    abort_requested = true;
-                    self.fleet.request_cancel_all().await?;
-                    tracing::warn!("fleet abort requested; active attempts will cancel");
-                }
-                _ = prepare_interval.tick(), if !draining => {
+                () = shutdown.exit.cancelled() => return Ok(()),
+                _ = prepare_interval.tick(), if !shutdown.draining.is_cancelled() => {
                     if let Err(error) = self.prepare_queued().await {
                         tracing::error!(%error, "fleet enqueue preparation failed");
                     }
@@ -137,10 +134,6 @@ impl FleetCoordinator {
                 _ = projection_interval.tick() => {
                     if let Err(error) = self.project_events().await {
                         tracing::error!(%error, "fleet event projection failed");
-                    }
-                    if draining && self.fleet.fleet_snapshot().await?.active_attempts == 0 {
-                        shutdown.exit.cancel();
-                        return Ok(());
                     }
                 }
                 _ = expiry_interval.tick() => {
@@ -790,6 +783,192 @@ fn sqlite_seed_key(job: &RunnableJob) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact_store::LocalFsStore;
+    use crate::job_source::JobSource;
+    use sbgh_core::db::fleet::WorkerRegistration;
+    use sbgh_core::models::{
+        GithubAccountType, JobAxes, JobIntent, JobSource as ModelJobSource, NewJob,
+    };
+    use sbgh_fleet::{
+        PROTOCOL_VERSION, RegisterSessionRequest, ResourceFacts, WorkerCapability, payload_digest,
+    };
+    use sbgh_github::test_support::FakeGitHub;
+    use sbgh_postgres::db::{
+        InstallationStore, NewInstallation, Pool, PostgresInstallationStore, setup_pg_db,
+    };
+    use sbgh_postgres::{
+        PostgresFleetStore, PostgresJobStore, PostgresPullRequestStore, PostgresRepoStore,
+        PreparedJobProvenance,
+    };
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn local_shutdown_preserves_persisted_worker_policy_and_active_attempt() {
+        let (_db, pool) = setup_pg_db().await;
+        let fleet = Arc::new(PostgresFleetStore::new(pool.clone()));
+        let worker = Uuid::new_v4();
+        fleet
+            .seed_worker(&WorkerRegistration {
+                worker_id: worker,
+                display_name: "shutdown-test".into(),
+                allowed_capabilities: vec![WorkerCapability::BuildOnly],
+                measurement_profile: None,
+                enabled: true,
+                draining: false,
+            })
+            .await
+            .unwrap();
+        let attempt = seed_active_attempt(&pool, &fleet, worker).await;
+        let before: serde_json::Value =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM worker_attempt a WHERE attempt_id = $1")
+                .bind(attempt)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let jobs = Arc::new(PostgresJobStore::new(pool.clone()));
+        let repos = Arc::new(PostgresRepoStore::new(pool.clone()));
+        let pulls = Arc::new(PostgresPullRequestStore::new(pool.clone()));
+        let directory = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(LocalFsStore::new(directory.path().to_path_buf()));
+        let source =
+            Arc::new(JobSource::new(jobs.clone(), repos.clone(), pulls, artifacts.clone()));
+        let example = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.daemon.toml"),
+        )
+        .unwrap();
+        let config_path = directory
+            .path()
+            .join("daemon.toml");
+        std::fs::write(&config_path, example.replace("kind = \"s3\"", "kind = \"local\"")).unwrap();
+        let config = DaemonConfig::load_layered(Some(&config_path)).unwrap();
+        let coordinator = FleetCoordinator::new(
+            Arc::new(config),
+            FleetCoordinatorDependencies {
+                fleet,
+                jobs: source,
+                repeat_jobs: jobs,
+                repos,
+                gh: Arc::new(FakeGitHub::new()),
+                artifacts,
+                slack: None,
+            },
+        );
+        let shutdown = Shutdown::new();
+        shutdown.draining.cancel();
+        shutdown.exit.cancel();
+        tokio::time::timeout(Duration::from_secs(1), coordinator.run(shutdown))
+            .await
+            .unwrap()
+            .unwrap();
+        let policy: (bool, bool) =
+            sqlx::query_as("SELECT enabled, draining FROM worker_registry WHERE worker_id = $1")
+                .bind(worker)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(policy, (true, false));
+        let after: serde_json::Value =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM worker_attempt a WHERE attempt_id = $1")
+                .bind(attempt)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after, "local exit must not cancel or fence the active attempt");
+    }
+
+    /// Create an accepted attempt through production stores for shutdown assertions.
+    async fn seed_active_attempt(pool: &Pool, fleet: &PostgresFleetStore, worker: Uuid) -> Uuid {
+        sqlx::query("INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES (100, 'test', 'organization')")
+            .execute(pool).await.unwrap();
+        let installations = PostgresInstallationStore::new(pool.clone());
+        installations
+            .upsert_installation(&NewInstallation {
+                id: 100,
+                github_account_id: 100,
+                account_login: "test".into(),
+                account_type: GithubAccountType::Organization,
+            })
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (10, 'test', 'repo')")
+            .execute(pool)
+            .await
+            .unwrap();
+        installations
+            .add_or_restore_membership(100, 10)
+            .await
+            .unwrap();
+        let session = Uuid::new_v4();
+        fleet
+            .register_session(
+                worker,
+                &RegisterSessionRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    worker_session_id: session,
+                    software_version: "test".into(),
+                    advertised_capabilities: [WorkerCapability::BuildOnly].into(),
+                    resources: ResourceFacts {
+                        logical_cpus: 2,
+                        memory_bytes: 8 << 30,
+                    },
+                },
+                chrono::Duration::seconds(90),
+            )
+            .await
+            .unwrap();
+        let job_id = Uuid::new_v4();
+        let commit = "1111111111111111111111111111111111111111";
+        let payload = TaskPayload::BuildOnly;
+        fleet
+            .enqueue_prepared_job(
+                job_id,
+                &NewJob {
+                    github_installation_id: 100,
+                    github_repo_id: 10,
+                    axes: JobAxes {
+                        source: ModelJobSource::Daemon,
+                        intent: JobIntent::CacheWarm,
+                        task_kind: TaskKind::BuildOnly,
+                        build_target: BuildTarget::StacksBench,
+                    },
+                    git_ref_kind: GitRefKind::Commit,
+                    git_ref_display: commit.into(),
+                    git_commit_hash: Some(commit.into()),
+                    git_committed_at: None,
+                    workload_key: None,
+                },
+                &serde_json::json!({}),
+                &PreparedExecution {
+                    job_id,
+                    commit: commit.into(),
+                    payload_hash: payload_digest(&payload).unwrap(),
+                    payload,
+                },
+                &PreparedJobProvenance::default(),
+            )
+            .await
+            .unwrap();
+        let offer = fleet
+            .poll_offer(
+                worker,
+                session,
+                chrono::Duration::seconds(30),
+                chrono::Duration::seconds(45),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fleet
+                .accept_offer(worker, &offer.offer.identity, chrono::Duration::seconds(45))
+                .await
+                .unwrap()
+        );
+        offer
+            .offer
+            .identity
+            .attempt_id
+    }
 
     #[test]
     fn slack_queue_projection_retries_with_bounded_backoff() {

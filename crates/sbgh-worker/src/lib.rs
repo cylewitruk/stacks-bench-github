@@ -10,6 +10,7 @@ mod execution;
 mod fleet;
 mod host_resources;
 pub mod identity;
+mod lease;
 mod recipe;
 mod remote_artifacts;
 mod transport;

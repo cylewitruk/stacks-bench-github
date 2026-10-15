@@ -18,8 +18,8 @@ need editing when an item's status or location changes.
 
 Current priority (2026-10-14): v35 is active and owns lifecycle implementation
 and the [carried qualification](iterations/v35-seamless-fleet-lifecycle.md#carried-qualification).
-v34 is closed as superseded, not fully qualified. Lifecycle implementation and
-v36–v37 remain planned; Decisions 0006/0007 remain drafts.
+v34 is closed as superseded, not fully qualified. Lifecycle implementation is
+in progress; v36–v37 remain planned. Decision 0006 is accepted; Decision 0007 remains draft.
 
 | ID | Name | Status | Location |
 | ---- | ---- | ------ | -------- |
@@ -104,7 +104,7 @@ v36–v37 remain planned; Decisions 0006/0007 remain drafts.
 | `0079-dynamic-block-validation-planning` | Dynamic block-validation planning | `shipped` | [archive/completed/0079-dynamic-block-validation-planning.md](archive/completed/0079-dynamic-block-validation-planning.md) |
 | `0080-first-fleet-deployment-qualification` | First fleet deployment qualification | `in_progress` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0081-cross-owner-source-policy-slug-resolution` | Cross-owner source-policy slug resolution | `backlog` | [backlog.md](backlog.md) |
-| `0082-seamless-fleet-lifecycle-maintenance` | Seamless fleet lifecycle and maintenance | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
+| `0082-seamless-fleet-lifecycle-maintenance` | Seamless fleet lifecycle and maintenance | `in_progress` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0083-multi-orchestrator-high-availability` | Multi-orchestrator high availability | `candidate` | [backlog.md](backlog.md) |
 | `0084-canonical-chainstate-worker-inventory` | Canonical chainstate and worker inventory | `planned` | [iterations/v36-distributed-block-validation.md](iterations/v36-distributed-block-validation.md) |
 | `0085-distributed-block-validation-orchestration` | Distributed block-validation orchestration | `planned` | [iterations/v36-distributed-block-validation.md](iterations/v36-distributed-block-validation.md) |
@@ -163,7 +163,7 @@ v36–v37 remain planned; Decisions 0006/0007 remain drafts.
 | `0003-artifact-export-failure-not-benchmark-failure` | Export-fail ≠ bench-fail | `accepted` | [decisions/0003-artifact-export-failure-not-benchmark-failure.md](decisions/0003-artifact-export-failure-not-benchmark-failure.md) |
 | `0004-protobuf-fleet-protocol` | Protobuf/gRPC worker fleet protocol | `accepted` | [decisions/0004-protobuf-fleet-protocol.md](decisions/0004-protobuf-fleet-protocol.md) |
 | `0005-public-key-worker-identities` | Public-key worker identities | `accepted` | [decisions/0005-public-key-worker-identities.md](decisions/0005-public-key-worker-identities.md) |
-| `0006-fleet-lifecycle-state-separation` | Fleet lifecycle state separation | `draft` | [decisions/0006-fleet-lifecycle-state-separation.md](decisions/0006-fleet-lifecycle-state-separation.md) |
+| `0006-fleet-lifecycle-state-separation` | Fleet lifecycle state separation | `accepted` | [decisions/0006-fleet-lifecycle-state-separation.md](decisions/0006-fleet-lifecycle-state-separation.md) |
 | `0007-daemon-owned-distributed-validation-plans` | Daemon-owned distributed validation plans | `draft` | [decisions/0007-daemon-owned-distributed-validation-plans.md](decisions/0007-daemon-owned-distributed-validation-plans.md) |
 
 > Migration complete: every `docs/roadmap-vN.md` is a tombstone. Living designs

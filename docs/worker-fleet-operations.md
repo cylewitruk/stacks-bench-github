@@ -458,6 +458,45 @@ cleanup obligation remains; replacement invalidates every outstanding lease.
 
 ## Deploy an application update
 
+### Daemon lifecycle and server-first rollout
+
+With the v35 lifecycle implementation, daemon SIGTERM and first SIGINT stop
+local intake/listeners without persisting worker drain or cancelling attempts.
+A second SIGINT forces local exit. Local graceful shutdown is bounded by one
+configured heartbeat interval (10 seconds with the recorded host settings).
+The coordinator no longer waits for remote jobs to finish before daemon exit.
+
+Workers with the recovery implementation reconnect using the same session.
+They check cleanup before every new poll, and safely recover an expired idle
+session only when no successor owns the identity. Older daemons return the
+legacy stale-session error; upgraded workers still fail closed against them.
+Superseded sessions never mint a replacement UUID automatically.
+
+Install the daemon change first, while the fleet is quiescent, then update
+workers using the existing controlled update scripts. The old daemon being
+stopped still has the old drain/abort behavior. Do not use an active-job restart
+as the first upgrade ceremony. No schema or protobuf message change is required.
+
+After both sides are upgraded, a short compatible daemon restart can preserve
+active jobs only inside their **remaining confirmed lease**, including reconnect
+and renewal time. The recorded 45-second TTL is not a guaranteed outage budget.
+Workers cancel at a conservative monotonic deadline independently of blocked
+heartbeat RPCs; reassignment remains gated on verified cleanup. Startup waits
+two heartbeat intervals before its first expiry sweep but never renews expired
+authority. Keep timing settings unchanged during an active-job restart canary.
+
+For longer outages, first prevent new submissions/assignments and reach zero
+attempts and cleanup obligations through the existing drain workflow. Explicit
+revision-1 `fleet drain` still exits the worker after idle; undrain plus service
+start remains necessary for that deliberate action. Resident cordon, scheduler
+pause, and negotiated rolling versions are later v35 work, not implemented by
+this shutdown change. Use authenticated job cancellation or emergency worker
+disable/revoke for destructive actions, never OS signals as a fleet abort.
+
+Live-host restart, provider convergence, and rollback qualification remain
+required before calling this deployment-qualified. See the
+[v35 evidence and handoff](../planning/design/0082-fleet-lifecycle-failure-matrix.md).
+
 ### Worker-only update
 
 For a wire-compatible worker update on a host that also has authenticated

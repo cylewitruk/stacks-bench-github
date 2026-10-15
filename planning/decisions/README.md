@@ -54,6 +54,7 @@ into an ADR as we work the related item (skeleton phase — not yet extracted):
 *Established for the worker fleet:* `0004-protobuf-fleet-protocol`,
 `0005-public-key-worker-identities`.
 
-*Draft fleet successors (not yet accepted):*
-`0006-fleet-lifecycle-state-separation`,
+*Accepted lifecycle successor:* `0006-fleet-lifecycle-state-separation`.
+
+*Draft fleet successor (not yet accepted):*
 `0007-daemon-owned-distributed-validation-plans`.

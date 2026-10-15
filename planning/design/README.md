@@ -14,7 +14,8 @@ planning/design/0003-results-portal.md
 
 > **Current contents:** living design docs for the unshipped items —
 > [`0003-results-portal`](0003-results-portal.md) and
-> [`0052-managed-stacks-node-chainstate-producer`](0052-managed-stacks-node-chainstate-producer.md).
+> [`0052-managed-stacks-node-chainstate-producer`](0052-managed-stacks-node-chainstate-producer.md), and
+> [`0082-fleet-lifecycle-failure-matrix`](0082-fleet-lifecycle-failure-matrix.md).
 > Shipped items
 > keep **no** live design here: on ship, each is folded into
 > [archive/completed/](../archive/completed/) and removed (per the rule below);

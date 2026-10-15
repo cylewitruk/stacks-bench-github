@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 
 use chrono::{Duration, Utc};
+use sbgh_core::Error as CoreError;
 use sbgh_core::db::JobStore;
 use sbgh_core::db::fleet::{
     ArtifactGrantRecord, EventIngest, FleetCompletion, FleetStore, FleetTerminalSubmission,
     FleetTerminalWrite, PreparedExecution, ProjectedReportMutation, ResolvedSpecSource,
-    TerminalAcceptance, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryMutation,
-    WorkerRegistryStore,
+    SessionRegistrationError, TerminalAcceptance, WorkerPolicyPatch, WorkerRegistration,
+    WorkerRegistryMutation, WorkerRegistryStore,
 };
 use sbgh_core::models::{
     BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobIntent, JobResult, JobSource, NewJob,
@@ -23,6 +24,92 @@ use sbgh_postgres::db::{
 };
 use sbgh_postgres::{PostgresFleetStore, PostgresJobStore, PreparedJobProvenance};
 use uuid::Uuid;
+
+#[tokio::test]
+async fn expired_session_recovers_same_identity_without_replacing_successor() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker = Uuid::new_v4();
+    store
+        .seed_worker(&registration(worker))
+        .await
+        .unwrap();
+    let first = session(worker, Uuid::new_v4());
+    store
+        .register_session(worker, &first, Duration::seconds(90))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_session SET status = 'offline', ended_at = NOW(), expires_at = NOW() - INTERVAL '1 second' WHERE worker_session_id = $1")
+        .bind(first.worker_session_id).execute(&pool).await.unwrap();
+    let recovered = store
+        .register_session(worker, &first, Duration::seconds(90))
+        .await
+        .unwrap();
+    assert_eq!(recovered.worker_session_id, first.worker_session_id);
+    assert!(
+        store
+            .session_is_active(worker, first.worker_session_id)
+            .await
+            .unwrap()
+    );
+    let successor = session(worker, Uuid::new_v4());
+    store
+        .register_session(worker, &successor, Duration::seconds(90))
+        .await
+        .unwrap();
+    let error = store
+        .register_session(worker, &first, Duration::seconds(90))
+        .await
+        .unwrap_err();
+    std::assert_matches!(
+        error,
+        CoreError::SessionRegistration(SessionRegistrationError::Superseded)
+    );
+    assert!(
+        store
+            .session_is_active(worker, successor.worker_session_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn session_recovery_rejects_changed_facts_and_explicit_deregistration() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker = Uuid::new_v4();
+    store
+        .seed_worker(&registration(worker))
+        .await
+        .unwrap();
+    let original = session(worker, Uuid::new_v4());
+    store
+        .register_session(worker, &original, Duration::seconds(90))
+        .await
+        .unwrap();
+    let mut changed = original.clone();
+    changed
+        .software_version
+        .push_str("-changed");
+    let error = store
+        .register_session(worker, &changed, Duration::seconds(90))
+        .await
+        .unwrap_err();
+    std::assert_matches!(
+        error,
+        CoreError::SessionRegistration(SessionRegistrationError::FactsChanged)
+    );
+    sqlx::query("UPDATE worker_session SET status = 'deregistered', ended_at = NOW() WHERE worker_session_id = $1")
+        .bind(original.worker_session_id).execute(&pool).await.unwrap();
+    let error = store
+        .register_session(worker, &original, Duration::seconds(90))
+        .await
+        .unwrap_err();
+    std::assert_matches!(
+        error,
+        CoreError::SessionRegistration(SessionRegistrationError::Superseded)
+    );
+}
 
 async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
     sqlx::query(
@@ -53,6 +140,182 @@ async fn seed_install_repo(pool: &Pool, install_id: i64, repo_id: i64) {
         .add_or_restore_membership(install_id, repo_id)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_recovery_cannot_fence_a_successor_session() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker = Uuid::new_v4();
+    store
+        .seed_worker(&registration(worker))
+        .await
+        .unwrap();
+    let old = session(worker, Uuid::new_v4());
+    store
+        .register_session(worker, &old, Duration::seconds(90))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_session SET expires_at = NOW() - INTERVAL '1 second' WHERE worker_session_id = $1")
+        .bind(old.worker_session_id).execute(&pool).await.unwrap();
+    let next = session(worker, Uuid::new_v4());
+    let (_, successor) = tokio::join!(
+        store.register_session(worker, &old, Duration::seconds(90)),
+        store.register_session(worker, &next, Duration::seconds(90)),
+    );
+    successor.unwrap();
+    assert!(
+        store
+            .session_is_active(worker, next.worker_session_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .session_is_active(worker, old.worker_session_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn recovery_waits_for_active_attempt_expiry_and_cleanup_gates_requeue() {
+    let (_db, pool) = setup_pg_db().await;
+    seed_install_repo(&pool, 100, 10).await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let worker = Uuid::new_v4();
+    store
+        .seed_worker(&registration(worker))
+        .await
+        .unwrap();
+    let facts = session(worker, Uuid::new_v4());
+    store
+        .register_session(worker, &facts, Duration::seconds(90))
+        .await
+        .unwrap();
+    let job = Uuid::new_v4();
+    enqueue_build(&store, job).await;
+    let offered = store
+        .poll_offer(worker, facts.worker_session_id, Duration::seconds(30), Duration::seconds(45))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .accept_offer(worker, &offered.offer.identity, Duration::seconds(45))
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE worker_session SET expires_at = NOW() - INTERVAL '1 second' WHERE worker_session_id = $1")
+        .bind(facts.worker_session_id).execute(&pool).await.unwrap();
+    let error = store
+        .register_session(worker, &facts, Duration::seconds(90))
+        .await
+        .unwrap_err();
+    std::assert_matches!(
+        error,
+        CoreError::SessionRegistration(SessionRegistrationError::RecoveryPending)
+    );
+    sqlx::query("UPDATE worker_attempt SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE attempt_id = $1")
+        .bind(offered.offer.identity.attempt_id).execute(&pool).await.unwrap();
+    store
+        .expire_stale_attempts()
+        .await
+        .unwrap();
+    store
+        .register_session(worker, &facts, Duration::seconds(90))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .poll_offer(
+                worker,
+                facts.worker_session_id,
+                Duration::seconds(30),
+                Duration::seconds(45)
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let pending = store
+        .cleanup_obligations(worker, facts.worker_session_id)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    // Teardown may outlast the session TTL. Its acknowledgement must recover
+    // the session without losing the obligation or requeueing work early.
+    sqlx::query("UPDATE worker_session SET expires_at = NOW() - INTERVAL '1 second' WHERE worker_session_id = $1")
+        .bind(facts.worker_session_id).execute(&pool).await.unwrap();
+    std::assert_matches!(
+        store
+            .complete_cleanup(worker, facts.worker_session_id, pending[0].id)
+            .await
+            .unwrap_err(),
+        CoreError::FleetSessionInactive
+    );
+    let status: String = sqlx::query_scalar("SELECT status::text FROM job WHERE id = $1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "running");
+    store
+        .register_session(worker, &facts, Duration::seconds(90))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .cleanup_obligations(worker, facts.worker_session_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        !store
+            .complete_cleanup(worker, facts.worker_session_id, i64::MAX)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_cleanup(worker, facts.worker_session_id, pending[0].id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_cleanup(worker, facts.worker_session_id, pending[0].id)
+            .await
+            .unwrap()
+    );
+    let next = store
+        .poll_offer(worker, facts.worker_session_id, Duration::seconds(30), Duration::seconds(45))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.offer.job_id, job);
+    assert_ne!(
+        next.offer.identity.attempt_id,
+        offered
+            .offer
+            .identity
+            .attempt_id
+    );
+    // A lost acknowledgement retried after new work starts cannot requeue it.
+    assert!(
+        store
+            .complete_cleanup(worker, facts.worker_session_id, pending[0].id)
+            .await
+            .unwrap()
+    );
+    let status: String = sqlx::query_scalar("SELECT status::text FROM job WHERE id = $1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "claimed");
 }
 
 #[tokio::test]
@@ -939,12 +1202,12 @@ async fn response_loss_and_successor_session_are_safely_fenced() {
         .await
         .unwrap();
     assert_eq!(obligations.len(), 1);
-    assert!(
-        !store
+    std::assert_matches!(
+        store
             .complete_cleanup(worker_id, Uuid::new_v4(), obligations[0].id)
             .await
-            .unwrap(),
-        "cleanup requires the current authorized session"
+            .unwrap_err(),
+        CoreError::FleetSessionInactive
     );
     assert!(
         store

@@ -13,8 +13,8 @@ ExecStart=/usr/local/bin/sbgh-daemon
 Restart=on-failure
 RestartSec=10s
 
-# SIGINT requests a graceful fleet drain; SIGTERM is the bounded abort path.
-KillSignal=SIGINT
+# Signals stop this daemon only; fleet cancellation is an explicit API action.
+KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 KillMode=control-group
 TimeoutStopSec=180s

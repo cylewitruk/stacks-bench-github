@@ -1,7 +1,9 @@
 # Decision 0006: Fleet Lifecycle State Separation
 
-- **status:** draft
+- **status:** accepted
 - **date:** 2026-08
+- **accepted:** 2026-10-14 — operator approved the lifecycle separation direction;
+  deployed timing bounds and executable failure cases remain v35 Phase 1 gates.
 - **related items:** `0004-worker-fleet`,
   `0075-rolling-worker-protocol-compatibility`,
   `0082-seamless-fleet-lifecycle-maintenance`,
