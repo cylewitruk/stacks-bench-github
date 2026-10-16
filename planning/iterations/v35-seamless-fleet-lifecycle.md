@@ -494,6 +494,11 @@ deadlines are locally tested. Recovery requires the additive
 remains fail-closed. The [October 15 host checks](../qualification/2026-10-14-first-fleet.md#v35-deployment-and-restart-qualification--2026-10-15)
 qualify idle same-session recovery after a reported 110-second daemon outage.
 Live lease-loss teardown and cleanup-recovery qualification remain open.
+The [October 16 canary](../qualification/2026-10-14-first-fleet.md#active-lease-expiry-canary--2026-10-16-resident-recovery-failed)
+cancelled and cleaned the old execution, but an unstructured gRPC `Unknown`
+reconnect error terminated the worker. Systemd recovery is not a pass for this
+phase. A transport-classification fix and regression tests are local; corrected
+build deployment and a repeat host canary are required.
 
 **Scope:**
 

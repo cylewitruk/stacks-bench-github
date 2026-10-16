@@ -105,6 +105,14 @@ enum Mode {
     PeriodicCleanup,
     CleanupRecovery,
     LeaseLoss,
+    LeaseLossTransportRecovery,
+}
+
+impl Mode {
+    /// Exercise local lease expiry while a credential RPC remains pending.
+    fn loses_lease(self) -> bool {
+        matches!(self, Self::LeaseLoss | Self::LeaseLossTransportRecovery)
+    }
 }
 
 #[derive(Clone)]
@@ -254,23 +262,40 @@ impl WorkerFleetService for MockFleet {
                 );
                 PollResponse::Drain
             }
-            (Mode::RejectFirstOffer | Mode::LeaseLoss, 0) => PollResponse::Offer {
-                offer: Box::new(WorkOffer {
-                    identity: AttemptIdentity {
-                        worker_session_id: poll.worker_session_id,
-                        attempt_id: self.attempt_id,
-                        fencing_generation: 1,
-                        lease_token: LeaseToken("a".repeat(64)),
-                    },
-                    job_id: self.job_id,
-                    trace_id: self.trace_id,
-                    capability: WorkerCapability::BuildOnly,
-                    requirements: sbgh_fleet::OfferRequirements::BuildOnly,
-                    payload_hash: sbgh_fleet::payload_digest(&sbgh_fleet::TaskPayload::BuildOnly)
+            (Mode::LeaseLossTransportRecovery, 1) => {
+                assert_eq!(
+                    self.registrations
+                        .load(Ordering::SeqCst),
+                    2
+                );
+                assert_eq!(
+                    self.cleanup_acks
+                        .load(Ordering::SeqCst),
+                    1
+                );
+                PollResponse::Drain
+            }
+            (Mode::RejectFirstOffer | Mode::LeaseLoss | Mode::LeaseLossTransportRecovery, 0) => {
+                PollResponse::Offer {
+                    offer: Box::new(WorkOffer {
+                        identity: AttemptIdentity {
+                            worker_session_id: poll.worker_session_id,
+                            attempt_id: self.attempt_id,
+                            fencing_generation: 1,
+                            lease_token: LeaseToken("a".repeat(64)),
+                        },
+                        job_id: self.job_id,
+                        trace_id: self.trace_id,
+                        capability: WorkerCapability::BuildOnly,
+                        requirements: sbgh_fleet::OfferRequirements::BuildOnly,
+                        payload_hash: sbgh_fleet::payload_digest(
+                            &sbgh_fleet::TaskPayload::BuildOnly,
+                        )
                         .unwrap(),
-                    offer_expires_at_ms: i64::MAX,
-                }),
-            },
+                        offer_expires_at_ms: i64::MAX,
+                    }),
+                }
+            }
             _ => PollResponse::Drain,
         };
         Ok(Response::new(WirePollResponse::from_domain(response)))
@@ -280,7 +305,7 @@ impl WorkerFleetService for MockFleet {
         &self,
         request: Request<AcceptRequest>,
     ) -> Result<Response<AcceptResponse>, Status> {
-        if self.mode == Mode::LeaseLoss {
+        if self.mode.loses_lease() {
             let accepted = request
                 .into_inner()
                 .into_domain()
@@ -331,6 +356,13 @@ impl WorkerFleetService for MockFleet {
         let count = self
             .cleanup_calls
             .fetch_add(1, Ordering::SeqCst);
+        if self.mode == Mode::LeaseLossTransportRecovery {
+            match count {
+                1 => return Err(Status::unknown("transport error")),
+                2 => return Err(Self::lifecycle_error("session_recovery_required")),
+                _ => {}
+            }
+        }
         if self.mode == Mode::CleanupRecovery && count > 0 {
             assert_eq!(
                 self.cleanup_acks
@@ -341,11 +373,12 @@ impl WorkerFleetService for MockFleet {
         }
         let obligations = if (self.mode == Mode::PeriodicCleanup && count == 1)
             || (self.mode == Mode::CleanupRecovery && count == 0)
+            || (self.mode == Mode::LeaseLossTransportRecovery && count == 3)
         {
             vec![sbgh_fleet::CleanupItem {
                 id: 1,
-                attempt_id: Uuid::new_v4(),
-                job_id: Uuid::new_v4(),
+                attempt_id: self.attempt_id,
+                job_id: self.job_id,
                 reason: "inserted after startup".into(),
             }]
         } else {
@@ -378,7 +411,7 @@ impl WorkerFleetService for MockFleet {
         &self,
         _request: Request<FetchRepositoryCredentialRequest>,
     ) -> Result<Response<FetchRepositoryCredentialResponse>, Status> {
-        if self.mode == Mode::LeaseLoss {
+        if self.mode.loses_lease() {
             return std::future::pending().await;
         }
         Self::unimplemented()
@@ -388,7 +421,7 @@ impl WorkerFleetService for MockFleet {
         &self,
         _request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        if self.mode == Mode::LeaseLoss {
+        if self.mode.loses_lease() {
             if self
                 .heartbeats
                 .fetch_add(1, Ordering::SeqCst)
@@ -411,7 +444,7 @@ impl WorkerFleetService for MockFleet {
         &self,
         request: Request<PublishReliableEventRequest>,
     ) -> Result<Response<PublishReliableEventResponse>, Status> {
-        if self.mode == Mode::LeaseLoss {
+        if self.mode.loses_lease() {
             let event = request
                 .into_inner()
                 .into_domain()
@@ -673,7 +706,7 @@ async fn run_case(mode: Mode) {
             .registrations
             .load(Ordering::SeqCst),
         match mode {
-            Mode::Recover | Mode::Superseded => 2,
+            Mode::Recover | Mode::Superseded | Mode::LeaseLossTransportRecovery => 2,
             Mode::CleanupRecovery => 3,
             _ => 1,
         }
@@ -718,4 +751,10 @@ async fn expired_cleanup_session_recovers_and_retries_ack_without_repeating_tear
 #[tokio::test]
 async fn stalled_heartbeat_cancels_credential_wait_and_worker_remains_resident() {
     run_case(Mode::LeaseLoss).await;
+}
+
+/// Reconnect errors after lease loss must not force a process/session replacement.
+#[tokio::test]
+async fn lease_loss_transport_error_recovers_same_session_and_acknowledges_cleanup() {
+    run_case(Mode::LeaseLossTransportRecovery).await;
 }

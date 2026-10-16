@@ -30,7 +30,7 @@ host audit.
 | Transport | Production connector reported `grpc+tls1.3`, authorized registration, protocol revision 1 |
 | Qualification directories | `/var/lib/sbgh/qualification/20260922T114642Z` and `/var/lib/sbgh-worker/qualification/20260922T114642Z` |
 | Regular origin | `vg0/mainnet-2026-09-21`; `mainnet-` prefix and read-only origin verified on October 5 |
-| Latest confirmed return to service | October 15 at 09:30:33 UTC: online, undrained, idle; attempts/cleanup/gaps/staged bytes all zero |
+| Latest confirmed return to service | October 16 at 07:28:41 UTC: online, undrained, idle; attempts/cleanup/gaps/staged bytes all zero; queue empty |
 
 On October 12 the operator reported the worker offline and drained again.
 The cause was not established. The October 15 observations below supersede that
@@ -126,6 +126,70 @@ fencing on the host, duplicate cleanup acknowledgement, post-terminal provider
 replay, forced shutdown, rollback, or previous-version interoperability. No
 fresh host filesystem/VM cleanup inventory or terminal artifact checksum was
 supplied for this canary; zero cleanup counters are the recorded cleanup evidence.
+
+## Active Lease-Expiry Canary — 2026-10-16: Resident Recovery Failed
+
+Operator-pasted journals and inventories for deployed `d0b6852` show safe local
+cancellation and subsequent cleanup-gated replacement, but **not resident
+recovery**. Preserve this failed gate; a successful replacement does not erase
+the worker restart.
+
+| Identity | Value |
+| ---- | ---- |
+| Submission | `e3f8a643-8a60-48a2-865b-f6875c16cdf6` |
+| Job | `d54835c2-2ae6-4006-8ab2-1487b28510a5` |
+| Original attempt | `a26e0166-9299-408d-b790-157d397b40fa` |
+| Replacement attempt | `10f824c2-21cf-477f-a6b1-fcdb805ab03f` |
+| Source | Same upstream commit and recent-one-block selection as October 15 |
+
+Observed timeline (UTC):
+
+- `07:12:24`: daemon stopped; worker PID `437078` remained running.
+- `07:13:09.782`: worker logged lease authority loss and cancelled execution.
+- `07:13:11`: driver reported aborted execution and performed cleanup; worker
+  resumed retrying `ListCleanup` while the daemon was unavailable.
+- `07:13:24` and `07:14:15`: resource snapshots showed no canary VM, thin
+  snapshots, or attempt mounts. The worker still had its original PID and
+  invocation, with zero systemd restarts.
+- `07:14:15`: daemon returned. The earlier CLI refusal at `07:14:12` preceded
+  the scheduled restart; it was not evidence that automatic restoration failed.
+- `07:14:15.580`: `ListCleanup` returned `Unknown: transport error`; worker
+  classified it as permanent and exited with status 1.
+- `07:14:25`: systemd restarted the worker: PID `784068`, invocation
+  `8cf9b9862ef94571a4f9d6f894f9cafa`, `NRestarts=1`.
+- `07:14:26`: new session `8e326949-d983-4e84-b921-b13558a4bece` registered.
+  Cleanup obligation `9` had reason `worker process registered a successor
+  session`; acknowledgement at `.298` preceded the new offer at `.311` and
+  acceptance at `.546`.
+- `07:18:16`: replacement attempt was validating with a fresh heartbeat.
+- `07:27:04.249`: replacement attempt finished; the subsequent report showed
+  `completed` / `done`, one of one jobs complete, and no failure. The validation
+  verdict/artifact was not included in this excerpt.
+- `07:28:41`: worker online, undrained and idle, all fleet backlog counters zero,
+  and no queued jobs. This establishes successful replacement completion, not
+  same-process recovery of the interrupted attempt.
+
+The daemon also logged a TLS `BadEncoding` rejection during reconnect. The
+underlying handshake cause is not established. The actionable worker defect
+is classifying an unstructured gRPC `Unknown` transport failure as permanent.
+Fix and test that retry classification without weakening typed authorization,
+supersession, or lease-expiry rejection. Then repeat this host canary on the
+corrected build. Durable attempt/cleanup query results remain outstanding.
+
+Local follow-up: unstructured `Unknown` now uses the transport retry fallback;
+structured fleet errors retain their explicit retry policy. Authorization and
+protocol rejections remain non-retryable, and lease deadlines are unchanged.
+Before the fix, both the classification regression and TLS loopback lease-loss
+test reproduced the permanent `ListCleanup` exit. After the fix, all 67 worker
+tests passed, including same-UUID recovery and cleanup acknowledgement before
+the next poll. That loopback test cancels a stalled credential RPC and uses
+stubbed host tools; it does not qualify real VM teardown or reproduce the
+underlying TLS handshake failure.
+
+Full nextest run `108e65ce-abff-482b-8870-18d72e5651bd`: **1,029 passed,
+24 skipped** (`just test --no-sccache --failures`). `just lint --no-sccache`,
+documentation checks, and `git diff --check` passed. Production deployment of
+the correction and requalification are outstanding.
 
 ## Release, Storage, and Recovery Evidence
 

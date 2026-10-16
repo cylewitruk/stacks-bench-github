@@ -4,8 +4,11 @@ Working Phase 1 contract for [v35](../iterations/v35-seamless-fleet-lifecycle.md
 implementing [Decision 0006](../decisions/0006-fleet-lifecycle-state-separation.md).
 Direction accepted 2026-10-14. The matrix states required behavior; the local
 implementation section records the tested subset. Host configuration and installed binary hashes were operator-reported
-on 2026-10-14; effective runtime overrides, running executable identities, and
-exact source/build provenance remain unconfirmed.
+on 2026-10-14. The subsequent
+[October 15 qualification](../qualification/2026-10-14-first-fleet.md#v35-deployment-and-restart-qualification--2026-10-15)
+records the deployed release, running executable hashes, idle recovery, and
+active validation continuity. Effective runtime overrides and previous-release
+compatibility fixtures remain open.
 
 ## Source Baseline
 
@@ -256,3 +259,71 @@ lease, cleanup/requeue convergence, and post-terminal provider projection.
 Audited scheduler pause, resident cordon/shutdown-after-idle, protocol negotiation,
 previous-revision fixtures, fleet-wide abort controls, and second-host operation
 remain later v35 work; the full iteration is not complete.
+
+## Execution Sequence — 2026-10-16
+
+The operator requested end-to-end v35 closure in this order:
+
+1. Qualify F04 active lease loss and cleanup-gated retry on the deployed release.
+2. Implement and qualify persistent audited scheduler pause/resume.
+3. Pin revision-1 fixtures and implement current/previous protocol negotiation.
+4. Implement negotiated resident cordon and separate shutdown-after-idle.
+5. Commission a second physical worker and complete the remaining maintenance,
+   provider, progress, comparison, identity-policy, and rollback checks in v35.
+
+### Next Gate: Disposable Active Lease-Expiry Canary
+
+This is a deliberate interruption, not a transparent-restart test. Before
+enqueuing, capture fresh fleet/queue state, process/session identity, running
+binary hashes, and chainstate prefix. Proceed only in an operator-confirmed
+maintenance window with no unrelated attempts or queued work. Existing global
+scheduler pause is not yet available; a quiet queue alone does not prevent new
+provider submissions.
+
+Use the previously successful one-block validation commit on the regular
+mainnet origin with a new idempotency key. Once validating, capture its
+submission/job/attempt IDs and a fresh heartbeat. Stop only the daemon for a
+bounded interval exceeding the reported 45-second lease and 90-second session
+TTL; retain a daemon restart recovery path. Do not drain or restart the worker.
+
+Capture timestamped local cancellation and VM/mount/snapshot teardown evidence
+during the outage. After daemon recovery, inspect durable attempt and cleanup
+records as well as current CLI state. Acceptance requires:
+
+- The original attempt loses authority and cannot submit an accepted success.
+- Local execution stops and teardown is verified before replacement execution.
+- The original session/process recovers without a systemd restart.
+- One logical cleanup obligation is acknowledged before requeue; retries do
+  not cause duplicate requeues.
+- The same job runs under a new fenced attempt, completes successfully, and
+  returns the fleet to zero cleanup debt.
+
+An idle final fleet alone does not establish ordering or physical teardown.
+If any check fails, preserve journals and database evidence; do not manually
+remove resources, abandon cleanup, or restart the worker to make the test pass.
+The [October 16 execution](../qualification/2026-10-14-first-fleet.md#active-lease-expiry-canary--2026-10-16-resident-recovery-failed)
+showed cancellation and resource teardown, but failed resident recovery because
+an unstructured `Unknown` reconnect error was treated as permanent. Keep F04–F07
+host recovery open until the corrected build passes a repeat canary.
+
+Use [the read-only recovery inspection query](../../scripts/inspect-fleet-recovery.sql)
+before interruption and after recovery to retain all attempt generations and
+cleanup rows, not just the currently selected attempt. On the combined host,
+from the repository root, with `job_id` set to the captured job UUID:
+
+```bash
+sudo docker exec -i sbgh-postgres psql -X -U sbgh -d sbgh \
+  -v ON_ERROR_STOP=1 -v job_id="$job_id" \
+  < scripts/inspect-fleet-recovery.sql
+```
+
+The query uses a bounded read-only transaction and excludes credential/payload
+contents. An absent job is reported explicitly; empty rows are not a pass.
+Pair these records with timestamped journals and local resource inventories;
+database timestamps alone do not prove the physical teardown boundary.
+
+Local query smoke check (2026-10-16): applied all repository migrations to a
+fresh local Postgres database, executed all inspection queries successfully for
+an absent UUID (`job_exists = false`), and confirmed malformed UUID input fails.
+The isolated database was dropped afterward. This validates schema compatibility
+and input rejection, not a populated recovery history or the production canary.

@@ -484,7 +484,9 @@ fn delegated_artifact_url(raw: &str) -> anyhow::Result<reqwest::Url> {
 fn fleet_error(path: &str, status: tonic::Status) -> anyhow::Error {
     let detail = status_detail(&status);
     let retryable = detail.as_ref().map_or_else(
-        || matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded),
+        // Tonic can surface reconnect failures as Unknown, not only Unavailable.
+        // Structured fleet rejections remain authoritative; retry grants no lease.
+        || matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded | Code::Unknown),
         |detail| detail.retryable,
     );
     let code = detail
@@ -819,13 +821,59 @@ mod tests {
 
     #[test]
     fn unstructured_transport_status_uses_retryable_grpc_classification() {
-        let error = fleet_error("Poll", Status::unavailable("connection lost"));
+        for code in [Code::Unavailable, Code::DeadlineExceeded, Code::Unknown] {
+            let error = fleet_error("ListCleanup", Status::new(code, "transport error"));
+            let error = error
+                .downcast_ref::<FleetClientError>()
+                .unwrap();
+            assert_eq!(error.code, format!("{code:?}"));
+            assert!(error.retryable, "{code:?} must allow resident reconnection");
+            assert_eq!(error.retry_after, None);
+        }
+    }
+
+    /// Explicit application rejections take precedence over transport fallback.
+    #[test]
+    fn structured_unknown_rejection_is_not_retried() {
+        let error = fleet_error(
+            "ListCleanup",
+            FleetRpcError {
+                status: Code::Unknown,
+                code: "permanent_rejection".into(),
+                message: "transport error".into(),
+                retryable: false,
+                retry_after_ms: None,
+            }
+            .into_status(),
+        );
         let error = error
             .downcast_ref::<FleetClientError>()
             .unwrap();
-        assert_eq!(error.code, "Unavailable");
-        assert!(error.retryable);
-        assert_eq!(error.retry_after, None);
+        assert!(!error.retryable);
+        assert_eq!(error.code, "permanent_rejection");
+    }
+
+    /// Transport retry must not weaken authorization or protocol rejection.
+    #[test]
+    fn unstructured_permanent_statuses_remain_non_retryable() {
+        for code in [
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::FailedPrecondition,
+            Code::InvalidArgument,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::DataLoss,
+        ] {
+            let error = fleet_error("ListCleanup", Status::new(code, "transport error"));
+            assert!(
+                !error
+                    .downcast_ref::<FleetClientError>()
+                    .unwrap()
+                    .retryable,
+                "{code:?}"
+            );
+        }
     }
 
     #[tokio::test]
