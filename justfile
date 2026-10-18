@@ -9,11 +9,13 @@ build *args:
     set -- {{args}}
 
     profile_args=()
+    target_args=(--all-targets)
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --release)
                 profile_args=(--release)
+                target_args=(--workspace --bins)
                 shift
                 ;;
             --no-sccache)
@@ -25,7 +27,8 @@ build *args:
                     'Usage: just build [--release] [--no-sccache]' \
                     '' \
                     'Options:' \
-                    '  --release     Build with Cargo'\''s release profile. Defaults to dev.' \
+                    '  --release     Build workspace binaries only (including ripcat), using the release profile.' \
+                    '                Without --release, build all targets using the dev profile.' \
                     '  --no-sccache  Clear RUSTC_WRAPPER for sandboxed agent runs.'
                 exit 0
                 ;;
@@ -36,7 +39,7 @@ build *args:
         esac
     done
 
-    cargo --locked build --all-targets "${profile_args[@]}"
+    cargo --locked build "${target_args[@]}" "${profile_args[@]}"
 
 fmt:
     cargo --locked fmt --all
