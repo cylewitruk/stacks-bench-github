@@ -82,8 +82,14 @@ async fn watch_signals(shutdown: Shutdown) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     loop {
         tokio::select! {
-            _ = sigint.recv() => shutdown.interrupt(),
-            _ = sigterm.recv() => shutdown.quiesce(),
+            _ = sigint.recv() => {
+                tracing::info!(signal = "SIGINT", forced = shutdown.exit.is_cancelled(), "daemon shutdown signal received");
+                shutdown.interrupt();
+            },
+            _ = sigterm.recv() => {
+                tracing::info!(signal = "SIGTERM", forced = false, "daemon shutdown signal received");
+                shutdown.quiesce();
+            },
         }
     }
 }

@@ -223,8 +223,17 @@ impl FleetCoordinator {
     }
 
     async fn prepare_job(&self, mut job: RunnableJob) -> anyhow::Result<()> {
+        let policy = self
+            .fleet
+            .scheduler_policy()
+            .await?;
+        if policy.paused {
+            self.ensure_reporting(job)
+                .await;
+            return Ok(());
+        }
         let commit = self
-            .freeze_submission_sources(&job)
+            .freeze_submission_sources(&job, policy.generation)
             .await?;
         job.commit.clone_from(&commit);
         job = self
@@ -240,6 +249,7 @@ impl FleetCoordinator {
         let payload_hash = sbgh_fleet::payload_digest(&payload)?;
         self.fleet
             .prepare_execution(&PreparedExecution {
+                scheduler_generation: policy.generation,
                 job_id: job.id,
                 commit,
                 payload,
@@ -355,7 +365,11 @@ impl FleetCoordinator {
             .sweep_abandoned(Duration::from_secs(300), &active_submissions);
     }
 
-    async fn freeze_submission_sources(&self, job: &RunnableJob) -> anyhow::Result<String> {
+    async fn freeze_submission_sources(
+        &self,
+        job: &RunnableJob,
+        scheduler_generation: i64,
+    ) -> anyhow::Result<String> {
         let specs = self
             .jobs
             .submission_specs(job.task_submission_id)
@@ -393,9 +407,9 @@ impl FleetCoordinator {
         }
         anyhow::ensure!(
             self.fleet
-                .freeze_submission_sources(job.task_submission_id, &sources)
+                .freeze_submission_sources(job.task_submission_id, &sources, scheduler_generation)
                 .await?,
-            "benchmark submission {} changed while source refs were being frozen",
+            "benchmark submission {} or scheduler admission changed while source refs were being frozen",
             job.task_submission_id
         );
         sources
@@ -782,25 +796,59 @@ fn sqlite_seed_key(job: &RunnableJob) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod recovery;
+    mod startup;
     use super::*;
     use crate::artifact_store::LocalFsStore;
+    use crate::fleet::test_support::seed_active_attempt;
     use crate::job_source::JobSource;
     use sbgh_core::db::fleet::WorkerRegistration;
-    use sbgh_core::models::{
-        GithubAccountType, JobAxes, JobIntent, JobSource as ModelJobSource, NewJob,
-    };
-    use sbgh_fleet::{
-        PROTOCOL_VERSION, RegisterSessionRequest, ResourceFacts, WorkerCapability, payload_digest,
-    };
+    use sbgh_fleet::WorkerCapability;
     use sbgh_github::test_support::FakeGitHub;
-    use sbgh_postgres::db::{
-        InstallationStore, NewInstallation, Pool, PostgresInstallationStore, setup_pg_db,
-    };
+    use sbgh_postgres::db::{Pool, setup_pg_db};
     use sbgh_postgres::{
         PostgresFleetStore, PostgresJobStore, PostgresPullRequestStore, PostgresRepoStore,
-        PreparedJobProvenance,
     };
     use std::path::Path;
+    use tempfile::TempDir;
+
+    /// Reconstruct coordinator caches and adapters over an existing test database.
+    fn test_coordinator(pool: &Pool, directory: &TempDir, gh: Arc<FakeGitHub>) -> FleetCoordinator {
+        let jobs = Arc::new(PostgresJobStore::new(pool.clone()));
+        let repos = Arc::new(PostgresRepoStore::new(pool.clone()));
+        let artifacts = Arc::new(LocalFsStore::new(
+            directory
+                .path()
+                .join("artifacts"),
+        ));
+        let source = Arc::new(JobSource::new(
+            jobs.clone(),
+            repos.clone(),
+            Arc::new(PostgresPullRequestStore::new(pool.clone())),
+            artifacts.clone(),
+        ));
+        let example = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.daemon.toml"),
+        )
+        .unwrap();
+        let config_path = directory
+            .path()
+            .join("daemon.toml");
+        std::fs::write(&config_path, example.replace("kind = \"s3\"", "kind = \"local\"")).unwrap();
+        let config = DaemonConfig::load_layered(Some(&config_path)).unwrap();
+        FleetCoordinator::new(
+            Arc::new(config),
+            FleetCoordinatorDependencies {
+                fleet: Arc::new(PostgresFleetStore::new(pool.clone())),
+                jobs: source,
+                repeat_jobs: jobs,
+                repos,
+                gh,
+                artifacts,
+                slack: None,
+            },
+        )
+    }
 
     #[tokio::test]
     async fn local_shutdown_preserves_persisted_worker_policy_and_active_attempt() {
@@ -818,41 +866,18 @@ mod tests {
             })
             .await
             .unwrap();
-        let attempt = seed_active_attempt(&pool, &fleet, worker).await;
+        let attempt = seed_active_attempt(&pool, &fleet, worker, TaskPayload::BuildOnly)
+            .await
+            .identity
+            .attempt_id;
         let before: serde_json::Value =
             sqlx::query_scalar("SELECT to_jsonb(a) FROM worker_attempt a WHERE attempt_id = $1")
                 .bind(attempt)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let jobs = Arc::new(PostgresJobStore::new(pool.clone()));
-        let repos = Arc::new(PostgresRepoStore::new(pool.clone()));
-        let pulls = Arc::new(PostgresPullRequestStore::new(pool.clone()));
         let directory = tempfile::tempdir().unwrap();
-        let artifacts = Arc::new(LocalFsStore::new(directory.path().to_path_buf()));
-        let source =
-            Arc::new(JobSource::new(jobs.clone(), repos.clone(), pulls, artifacts.clone()));
-        let example = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.daemon.toml"),
-        )
-        .unwrap();
-        let config_path = directory
-            .path()
-            .join("daemon.toml");
-        std::fs::write(&config_path, example.replace("kind = \"s3\"", "kind = \"local\"")).unwrap();
-        let config = DaemonConfig::load_layered(Some(&config_path)).unwrap();
-        let coordinator = FleetCoordinator::new(
-            Arc::new(config),
-            FleetCoordinatorDependencies {
-                fleet,
-                jobs: source,
-                repeat_jobs: jobs,
-                repos,
-                gh: Arc::new(FakeGitHub::new()),
-                artifacts,
-                slack: None,
-            },
-        );
+        let coordinator = test_coordinator(&pool, &directory, Arc::new(FakeGitHub::new()));
         let shutdown = Shutdown::new();
         shutdown.draining.cancel();
         shutdown.exit.cancel();
@@ -874,100 +899,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(before, after, "local exit must not cancel or fence the active attempt");
-    }
-
-    /// Create an accepted attempt through production stores for shutdown assertions.
-    async fn seed_active_attempt(pool: &Pool, fleet: &PostgresFleetStore, worker: Uuid) -> Uuid {
-        sqlx::query("INSERT INTO allowed_installer (github_account_id, account_login, account_type) VALUES (100, 'test', 'organization')")
-            .execute(pool).await.unwrap();
-        let installations = PostgresInstallationStore::new(pool.clone());
-        installations
-            .upsert_installation(&NewInstallation {
-                id: 100,
-                github_account_id: 100,
-                account_login: "test".into(),
-                account_type: GithubAccountType::Organization,
-            })
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO github_repo (id, owner, name) VALUES (10, 'test', 'repo')")
-            .execute(pool)
-            .await
-            .unwrap();
-        installations
-            .add_or_restore_membership(100, 10)
-            .await
-            .unwrap();
-        let session = Uuid::new_v4();
-        fleet
-            .register_session(
-                worker,
-                &RegisterSessionRequest {
-                    protocol_version: PROTOCOL_VERSION,
-                    worker_session_id: session,
-                    software_version: "test".into(),
-                    advertised_capabilities: [WorkerCapability::BuildOnly].into(),
-                    resources: ResourceFacts {
-                        logical_cpus: 2,
-                        memory_bytes: 8 << 30,
-                    },
-                },
-                chrono::Duration::seconds(90),
-            )
-            .await
-            .unwrap();
-        let job_id = Uuid::new_v4();
-        let commit = "1111111111111111111111111111111111111111";
-        let payload = TaskPayload::BuildOnly;
-        fleet
-            .enqueue_prepared_job(
-                job_id,
-                &NewJob {
-                    github_installation_id: 100,
-                    github_repo_id: 10,
-                    axes: JobAxes {
-                        source: ModelJobSource::Daemon,
-                        intent: JobIntent::CacheWarm,
-                        task_kind: TaskKind::BuildOnly,
-                        build_target: BuildTarget::StacksBench,
-                    },
-                    git_ref_kind: GitRefKind::Commit,
-                    git_ref_display: commit.into(),
-                    git_commit_hash: Some(commit.into()),
-                    git_committed_at: None,
-                    workload_key: None,
-                },
-                &serde_json::json!({}),
-                &PreparedExecution {
-                    job_id,
-                    commit: commit.into(),
-                    payload_hash: payload_digest(&payload).unwrap(),
-                    payload,
-                },
-                &PreparedJobProvenance::default(),
-            )
-            .await
-            .unwrap();
-        let offer = fleet
-            .poll_offer(
-                worker,
-                session,
-                chrono::Duration::seconds(30),
-                chrono::Duration::seconds(45),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            fleet
-                .accept_offer(worker, &offer.offer.identity, chrono::Duration::seconds(45))
-                .await
-                .unwrap()
-        );
-        offer
-            .offer
-            .identity
-            .attempt_id
     }
 
     #[test]

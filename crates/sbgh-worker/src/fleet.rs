@@ -11,11 +11,13 @@ use sbgh_driver::{
     InclusiveRange, RepositoryCredential, Terminal, ValidationEpoch, WorkerEvent,
 };
 use sbgh_fleet::{
-    AcceptOfferRequest, CompleteAttemptRequest, DesiredState, HeartbeatRequest, PROTOCOL_VERSION,
-    PollRequest, PollResponse, ProgressRequest, ProgressUpdate, RegisterSessionRequest,
-    RegisterSessionResponse, RegistrationCheckRequest, RegistrationCheckResponse,
-    ReliableEventEnvelope, ReliableEventPayload, RepositoryCredentialRequest, RepositoryToken,
-    ResourceFacts, TaskPayload, TerminalOutcome, Validate, normalize_terminal_text,
+    AcceptOfferRequest, CompleteAttemptRequest, DesiredState, HeartbeatRequest,
+    NEGOTIATED_PROTOCOL_REVISION, PREVIOUS_PROTOCOL_REVISION, PollRequest, PollResponse,
+    PreflightReport, ProgressRequest, ProgressUpdate, ProtocolFeature, ProtocolOffer,
+    RegisterSessionRequest, RegisterSessionResponse, RegistrationCheckRequest,
+    RegistrationCheckResponse, ReliableEventEnvelope, ReliableEventPayload,
+    RepositoryCredentialRequest, RepositoryToken, ResourceFacts, TaskPayload, TerminalOutcome,
+    Validate, normalize_terminal_text,
 };
 use sbgh_libvirt::SystemShell;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -27,7 +29,7 @@ use crate::config::WorkerConfig;
 use crate::lease::{Lease, ServerClock};
 use crate::remote_artifacts::RemoteArtifactSink;
 use crate::transport::{FleetClient, FleetClientError};
-use crate::{HostResources, WorkerRuntime, build_binary_cache};
+use crate::{HostResources, WorkerRuntime, build_binary_cache, preflight_report};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
 const MAX_CLOCK_SKEW_MS: u64 = 30_000;
@@ -135,14 +137,12 @@ pub async fn run(
     resources: HostResources,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    config
-        .validate_host_resources(&resources)
-        .context("validating execution profiles against discovered host resources")?;
-    preflight_local_execution(&config).await?;
+    let preflight = preflight_report(&config, &resources).await?;
     let session_id = Uuid::new_v4();
     let client = FleetClient::build(&config.orchestrator_url, &config.identity_private_key)?;
     let request_started_ms = now_millis();
-    let registration_facts = registration_request(&config, resources.facts().clone(), session_id);
+    let registration_facts =
+        registration_request(&config, resources.facts().clone(), session_id, preflight);
     let registration_started = Instant::now();
     let mut registration = client
         .register(&registration_facts)
@@ -150,8 +150,24 @@ pub async fn run(
         .context("registering worker session")?;
     let mut server_clock = ServerClock::new(registration_started, registration.server_time_ms);
     let request_finished_ms = now_millis();
-    let clock_skew_ms =
-        validate_registration(&registration, request_started_ms, request_finished_ms)?;
+    let clock_skew_ms = validate_registration(
+        &registration_facts,
+        &registration,
+        request_started_ms,
+        request_finished_ms,
+    )?;
+    let protocol_offer = ProtocolOffer::registration(
+        registration_facts.protocol_version,
+        registration_facts
+            .protocol_offer
+            .as_ref(),
+    )?;
+    let session_contract = protocol_offer.response(
+        registration.protocol_version,
+        registration
+            .protocol_contract
+            .as_ref(),
+    )?;
     tracing::info!(
         session_id = %session_id,
         protocol_version = registration.protocol_version,
@@ -184,6 +200,15 @@ pub async fn run(
                             client.register(facts).await
                         })
                         .await?;
+                    ensure!(
+                        protocol_offer.response(
+                            registration.protocol_version,
+                            registration
+                                .protocol_contract
+                                .as_ref()
+                        )? == session_contract,
+                        "orchestrator changed the protocol contract during same-session recovery"
+                    );
                     continue;
                 }
                 if is_non_retryable(&error) {
@@ -208,7 +233,29 @@ pub async fn run(
             PollResponse::Drain => {
                 draining = true;
             }
+            PollResponse::ShutdownAfterIdle => {
+                ensure!(
+                    session_contract
+                        .features
+                        .contains(&ProtocolFeature::ShutdownAfterIdle),
+                    "orchestrator requested unnegotiated shutdown semantics"
+                );
+                return shutdown_after_idle(
+                    &config,
+                    &client,
+                    session_id,
+                    &mut cleanup_ack,
+                    &shutdown,
+                )
+                .await;
+            }
             PollResponse::Offer { offer } => {
+                ensure!(
+                    session_contract
+                        .features
+                        .contains(&ProtocolFeature::for_capability(offer.capability)),
+                    "work offer requires unnegotiated task semantics"
+                );
                 admit_offer(&config, &offer).await?;
                 let accept_started = Instant::now();
                 let accepted = match client
@@ -230,6 +277,10 @@ pub async fn run(
                 accepted
                     .assignment
                     .validate()?;
+                ensure!(
+                    session_contract.supports_payload(&accepted.assignment.payload),
+                    "assignment requires unnegotiated task semantics"
+                );
                 ensure!(
                     accepted
                         .assignment
@@ -265,6 +316,40 @@ pub async fn run(
     Ok(())
 }
 
+/// Exit only after cleanup is acknowledged and deregistration succeeds.
+async fn shutdown_after_idle(
+    config: &WorkerConfig,
+    client: &FleetClient,
+    session_id: Uuid,
+    cleanup_ack: &mut Option<i64>,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<()> {
+    loop {
+        // Retry deregistration first: its previous successful response may have been lost.
+        let result = tokio::select! {
+            () = shutdown.cancelled() => anyhow::bail!("process interrupted idle shutdown acknowledgement"),
+            result = client.deregister(session_id) => result,
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if is_non_retryable(&error) => return Err(error),
+            Err(error) => tracing::warn!(%error, "idle shutdown awaiting deregistration"),
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => anyhow::bail!("process interrupted idle shutdown cleanup"),
+            result = cleanup_obligations(config, client, session_id, cleanup_ack) => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "idle shutdown cleanup retry pending");
+                }
+            }
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => anyhow::bail!("process interrupted idle shutdown retry"),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
 /// Recover only after a supporting server explicitly requests same-UUID recovery.
 async fn recover_session<F>(
     facts: &RegisterSessionRequest,
@@ -285,7 +370,7 @@ where
         };
         match result {
             Ok(registration) => {
-                validate_registration(&registration, started, now_millis())?;
+                validate_registration(facts, &registration, started, now_millis())?;
                 let clock = ServerClock::new(monotonic_started, registration.server_time_ms);
                 return Ok((registration, clock));
             }
@@ -349,10 +434,13 @@ fn registration_request(
     config: &WorkerConfig,
     resources: ResourceFacts,
     worker_session_id: Uuid,
+    preflight: PreflightReport,
 ) -> RegisterSessionRequest {
     let facts = registration_check_request(config, resources);
     RegisterSessionRequest {
+        preflight: Some(preflight),
         protocol_version: facts.protocol_version,
+        protocol_offer: facts.protocol_offer,
         worker_session_id,
         software_version: facts.software_version,
         advertised_capabilities: facts.advertised_capabilities,
@@ -365,7 +453,8 @@ fn registration_check_request(
     resources: ResourceFacts,
 ) -> RegistrationCheckRequest {
     RegistrationCheckRequest {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: NEGOTIATED_PROTOCOL_REVISION,
+        protocol_offer: Some(ProtocolOffer::current()),
         software_version: env!("CARGO_PKG_VERSION").into(),
         advertised_capabilities: config.advertised_capabilities(),
         resources,
@@ -373,10 +462,23 @@ fn registration_check_request(
 }
 
 fn validate_registration(
+    request: &RegisterSessionRequest,
     registration: &sbgh_fleet::RegisterSessionResponse,
     request_started_ms: i64,
     request_finished_ms: i64,
 ) -> anyhow::Result<u64> {
+    ProtocolOffer::registration(
+        request.protocol_version,
+        request
+            .protocol_offer
+            .as_ref(),
+    )?
+    .response(
+        registration.protocol_version,
+        registration
+            .protocol_contract
+            .as_ref(),
+    )?;
     validate_server_timing(
         registration.protocol_version,
         registration.heartbeat_interval_ms,
@@ -393,6 +495,18 @@ fn validate_registration_check(
     request_started_ms: i64,
     request_finished_ms: i64,
 ) -> anyhow::Result<u64> {
+    ProtocolOffer::registration(
+        request.protocol_version,
+        request
+            .protocol_offer
+            .as_ref(),
+    )?
+    .response(
+        registration.protocol_version,
+        registration
+            .protocol_contract
+            .as_ref(),
+    )?;
     ensure!(
         !registration
             .worker_id
@@ -427,7 +541,7 @@ fn validate_server_timing(
     request_finished_ms: i64,
 ) -> anyhow::Result<u64> {
     ensure!(
-        protocol_version == PROTOCOL_VERSION,
+        (PREVIOUS_PROTOCOL_REVISION..=NEGOTIATED_PROTOCOL_REVISION).contains(&protocol_version),
         "orchestrator returned a mismatched protocol version"
     );
     ensure!(
@@ -1288,7 +1402,9 @@ mod tests {
     /// Registration facts retained unchanged across resident recovery.
     fn recovery_facts() -> RegisterSessionRequest {
         RegisterSessionRequest {
+            preflight: None,
             protocol_version: PROTOCOL_VERSION,
+            protocol_offer: None,
             worker_session_id: Uuid::new_v4(),
             software_version: "test".into(),
             advertised_capabilities: [WorkerCapability::BuildOnly].into(),
@@ -1311,6 +1427,7 @@ mod tests {
             }
             Ok(RegisterSessionResponse {
                 protocol_version: PROTOCOL_VERSION,
+                protocol_contract: None,
                 heartbeat_interval_ms: 10_000,
                 lease_ttl_ms: 45_000,
                 server_time_ms: now_millis(),
@@ -1353,6 +1470,7 @@ mod tests {
                 }
                 Ok(RegisterSessionResponse {
                     protocol_version: PROTOCOL_VERSION,
+                    protocol_contract: None,
                     heartbeat_interval_ms: heartbeat * 1_000,
                     lease_ttl_ms: heartbeat * 4_000,
                     server_time_ms: now_millis(),

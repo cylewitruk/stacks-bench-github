@@ -590,6 +590,7 @@ mod tests {
             Ok(Response::new(wire::CheckRegistrationResponse::from_domain(
                 RegistrationCheckResponse {
                     protocol_version: PROTOCOL_VERSION,
+                    protocol_contract: None,
                     worker_id: Uuid::parse_str("55555555-5555-4555-8555-555555555555").unwrap(),
                     effective_capabilities: request.advertised_capabilities,
                     measurement_profile: Some("test".into()),
@@ -613,6 +614,7 @@ mod tests {
             assert_eq!(request.protocol_version, PROTOCOL_VERSION);
             Ok(Response::new(wire::RegisterResponse::from_domain(RegisterSessionResponse {
                 protocol_version: PROTOCOL_VERSION,
+                protocol_contract: None,
                 heartbeat_interval_ms: 1_000,
                 lease_ttl_ms: 5_000,
                 server_time_ms: 1_700_000_000_000,
@@ -914,6 +916,7 @@ mod tests {
         client
             .check_registration(&RegistrationCheckRequest {
                 protocol_version: PROTOCOL_VERSION,
+                protocol_offer: None,
                 software_version: "test".into(),
                 advertised_capabilities: std::collections::BTreeSet::from([
                     WorkerCapability::BuildOnly,
@@ -927,7 +930,9 @@ mod tests {
             .unwrap();
         client
             .register(&RegisterSessionRequest {
+                preflight: None,
                 protocol_version: PROTOCOL_VERSION,
+                protocol_offer: None,
                 worker_session_id: session_id,
                 software_version: "test".into(),
                 advertised_capabilities: std::collections::BTreeSet::from([

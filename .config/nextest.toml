@@ -44,11 +44,10 @@ command = "docker compose -f docker/docker-compose.test.yml up --wait -d minio"
 filter = "package(=sbgh-postgres) | package(=sbgh-cli) | package(=sbgh-daemon)"
 setup = "postgres"
 
-# MinIO for the S3 round-trip test. Scoped to that one integration-test binary,
-# so unrelated targeted daemon-test runs don't pull/start MinIO — only a run
-# that includes `s3_round_trip` does.
+# MinIO for S3 round trips and fleet artifact-recovery composition tests.
+# Unrelated targeted daemon tests do not pull/start MinIO.
 [[profile.default.scripts]]
-filter = "binary(=s3_round_trip)"
+filter = "binary(=s3_round_trip) | binary(=daemon_lifecycle) | (package(=sbgh-daemon) & test(fleet::service::tests::artifacts::))"
 setup = "minio"
 
 # A couple of retries for the DB-backed packages — transient shared-server

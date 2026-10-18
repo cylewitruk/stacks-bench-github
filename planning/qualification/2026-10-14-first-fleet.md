@@ -30,7 +30,7 @@ host audit.
 | Transport | Production connector reported `grpc+tls1.3`, authorized registration, protocol revision 1 |
 | Qualification directories | `/var/lib/sbgh/qualification/20260922T114642Z` and `/var/lib/sbgh-worker/qualification/20260922T114642Z` |
 | Regular origin | `vg0/mainnet-2026-09-21`; `mainnet-` prefix and read-only origin verified on October 5 |
-| Latest confirmed return to service | October 16 at 07:28:41 UTC: online, undrained, idle; attempts/cleanup/gaps/staged bytes all zero; queue empty |
+| Latest confirmed return to service | October 16 at 09:49:30 UTC: online, undrained, idle; attempts/cleanup/gaps/staged bytes all zero |
 
 On October 12 the operator reported the worker offline and drained again.
 The cause was not established. The October 15 observations below supersede that
@@ -188,8 +188,58 @@ underlying TLS handshake failure.
 
 Full nextest run `108e65ce-abff-482b-8870-18d72e5651bd`: **1,029 passed,
 24 skipped** (`just test --no-sccache --failures`). `just lint --no-sccache`,
-documentation checks, and `git diff --check` passed. Production deployment of
-the correction and requalification are outstanding.
+documentation checks, and `git diff --check` passed. Deployment and the repeat
+canary are recorded below; the original failed run remains failure evidence.
+
+## Active Lease-Expiry Repeat — 2026-10-16: Passed
+
+The operator deployed `0f18950` using the worker-only update workflow. Preflight
+and production registration checks passed; the daemon was not updated. Build,
+installed, and running worker executable SHA-256 all matched:
+`9e5e484de7ba032de8674c35c9e1309fa2a046be744d6ccb8c2518e083154501`.
+
+| Identity | Value |
+| ---- | ---- |
+| Submission | `c8921af3-347c-417d-940e-fefe53fdaaab` |
+| Job | `2eb775c1-a50b-4e72-b13b-2cdaaea3d2bf` |
+| Expired attempt / fence | `9a21026b-8814-4eef-bb27-c379226651ac` / 1 |
+| Completed attempt / fence | `ae71051f-7c38-4148-be71-811db2c26de3` / 2 |
+| Session, unchanged | `08f3e493-2990-462c-93ef-8f7234fbcef1` |
+| Worker PID / restarts | `808295` / `0` |
+| systemd invocation, unchanged | `08039929315e4ce0a27613ddae48e812` |
+| Source | `stacks-network/stacks-core` at `e2b39b01c70fde056b7018cd1e7ce83d022e7f15`; recent 1 |
+
+Operator-pasted resource inventories and the read-only recovery query establish
+this sequence (UTC):
+
+- `07:55:38`: daemon stopped; the attempt's last persisted lease expiry was
+  `07:56:19.758673` (later than the earlier pre-outage query's expiry).
+- `07:56:38` and `07:57:28`: no canary VM, snapshots, or attempt mounts remained.
+  Worker PID, invocation, and restart count were unchanged. These observations
+  bound when resources were absent, not the exact cancellation instant.
+- `07:57:28`: daemon restarted after the 110-second outage.
+- `07:57:48.376425`: original attempt became `expired`; its terminal timestamp,
+  reliable sequence and digest remained null. Obligation `10` was created for
+  lease expiry with `requeue_job=true`.
+- `07:57:51.961475`: obligation `10` completed.
+- `07:57:51.975259`: replacement attempt created, then accepted at
+  `07:57:52.196205`, after cleanup acknowledgement and under the same session.
+- `08:10:08.768803`: replacement attempt and job completed. Terminal reliable
+  sequence was `8`, digest
+  `9d271c1cdc95c91a57d6598c0f25276cc0498d1c0863f66b5c3d0097f46be56f`.
+- `09:49:30`: same worker process and session idle, undrained, with zero fleet
+  backlog counters. Session `ended_at` remained null. The query contained
+  exactly two attempts and one completed cleanup obligation for this job.
+
+Both attempts retained execution generation 1; the fencing generation advanced
+from 1 to 2. This is a retry within the same execution, not a new submission or
+execution generation. No systemd restart or manual cleanup was needed.
+
+This passes the observed active lease-loss, physical cleanup, same-session
+recovery, cleanup-gated single retry, and replacement completion path. It does
+not qualify injected duplicate acknowledgements, concurrent successor races,
+provider replay, or a universal teardown timing bound. The repeated run's
+validation verdict and artifact contents were not included in the supplied SQL.
 
 ## Release, Storage, and Recovery Evidence
 
@@ -304,23 +354,43 @@ closure requires the carried evidence as well.
 | Fine benchmark progress (`0027`) | v35 carried qualification: inspect live guest-to-provider progress and archived JSONL, then calibration/repeat/debounce/fallback cases |
 | Integrated comparison (`0039`) | v35 carried qualification: two refs on one compatible snapshot/worker, then clean repeats and per-variant calibration/DB carry-forward; combine restart portion with v35 |
 | Full-history validation | v35 carried qualification: schedule an explicit maintenance window and retain complete coverage/reduction/artifact/cleanup evidence before final qualification |
-| Post-terminal daemon restart, worker loss, cleanup recovery | October 15 idle and active validation restart checks passed above; v35 Phases 2–3 and 7 still require active lease-loss cleanup/requeue, provider replay, and the remaining failure matrix |
+| Post-terminal daemon restart, worker loss, cleanup recovery | October 15 restart checks and October 16 corrected active lease-loss/cleanup/retry passed above; provider replay and the remaining v35 Phases 2–3/7 failure matrix stay open |
 | Identity rotation/revocation, capability/profile changes, policy persistence | Rescheduled to v35 Phases 6–7; retain the original v34 Phase 8 acceptance checks |
-| Deployed revision-1 semantic-digest vectors | v35 Phase 1 prerequisite to protocol changes; pin the deployed baseline before Phase 5 negotiation |
+| Previous-protocol runtime qualification | The deployed `0f18950` schema/digests/hash and source-pinned local TLS/RPC probes pass; real-task mixed-cohort and host qualification remain open. Operator approved backup/restore-only daemon rollback on 2026-10-17, preferring roll-forward; host restore/reconciliation remains unqualified |
 | Second physical host | Explicitly deferred from v34; commission by v35 Phase 6's two-worker maintenance gate, then use v36's snapshot-bootstrap contract; no multi-machine claim yet |
-| Validation initialization/progress distinction | v35 carried qualification; retain the observed scan delay as v36 timing input, not a measured placement model |
+| Validation initialization/progress distinction | Locally implemented and tested, including conservative processing-only ETA; live guest/provider qualification remains open. Retain the scan delay as v36 timing input, not a measured placement model |
 
 ## Next Implementation Checkpoint
 
 The first v35 implementation now has local evidence for conservative lease
 deadlines, resident session/cleanup recovery, and process-local daemon shutdown.
 See the [failure matrix and validation record](../design/0082-fleet-lifecycle-failure-matrix.md#local-implementation--2026-10-14).
-The October 15 server-first deployment and three restart checks above now
-provide host evidence for idle recovery and active-attempt continuity. Next:
-an explicitly scheduled disposable active lease-expiry canary, proving local
-teardown, cleanup acknowledgement, and safe retry. Provider replay and the
-remaining failure matrix stay open. Pin the revision-1 protocol baseline before
-negotiation changes.
+The October 15 restart checks and October 16 corrected lease-expiry repeat now
+provide host evidence for idle recovery, active-attempt continuity, and resident
+cleanup-gated retry. Audited scheduler pause/resume (v35 Phase 4) is now locally
+implemented, not deployed or host-qualified. Negotiation, resident maintenance,
+audited abort and preflight provenance are also implemented locally, with
+production-store races, source-pinned previous/current worker probes, real
+daemon process signals and local MinIO recovery tests. Validation initialization
+and conservative ETA reporting now have local coverage. Latest full nextest run
+`911b6e1d-cff3-4cfb-8829-97e4dcbd5869`: 1,107 passed, 26 skipped; build and lint
+passed. The [failure matrix](../design/0082-fleet-lifecycle-failure-matrix.md)
+records scope and limitations of each local evidence set.
+
+Next: consolidated release review and a verified recovery package, then
+operator-run server-first host qualification. The old migrator rejects the new
+ledger. On 2026-10-17 the operator separately approved backup/restore-only daemon
+rollback, preferring roll-forward fixes. Restore must include the matching
+database, binaries and configuration; post-backup work/provider effects need
+explicit reconciliation. Local isolated restore passed, but the host drill and
+sign-off remain open. The earlier approval of `0f18950` as the previous worker
+contract still excludes incompatible pre-v33 layouts; worker compatibility is
+not relaxed by the daemon recovery decision.
+
+The second-worker VM location is awaiting operator selection. A same-host VM
+can qualify multi-worker function but does not close the second-physical-host
+gate. Provider/progress/comparison, identity-policy and production rollback
+ceremonies remain open. No pending local release has been deployed by the agent.
 
 Decision 0006 was accepted on 2026-10-14; Decision 0007 remains draft.
 Local v35 tests remain separate from the bounded host evidence above; v35 as a

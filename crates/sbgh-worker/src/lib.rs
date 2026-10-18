@@ -11,6 +11,7 @@ mod fleet;
 mod host_resources;
 pub mod identity;
 mod lease;
+mod preflight;
 mod recipe;
 mod remote_artifacts;
 mod transport;
@@ -30,6 +31,7 @@ pub use fleet::{
     FleetCheckReport, check_connectivity, check_registration, preflight_local_execution,
 };
 pub use host_resources::{HostResources, discover_host_resources};
+pub use preflight::preflight_report;
 pub use sbgh_driver::{
     BenchmarkRunContext, BenchmarkTask, ExecutionContext, ExecutionPlacement, ExecutionRequest,
     ExecutionTask, Terminal, WorkerEvent,

@@ -62,11 +62,25 @@ message ResourceFacts {
   uint64 memory_bytes = 2;
 }
 
+// Additive negotiation extension; absent on the pinned revision-1 contract.
+message ProtocolOffer {
+  uint32 minimum_revision = 1;
+  uint32 maximum_revision = 2;
+  repeated string features = 3;
+}
+
+// Immutable session semantics selected by the daemon.
+message ProtocolContract {
+  uint32 revision = 1;
+  repeated string features = 2;
+}
+
 message CheckRegistrationRequest {
   uint32 protocol_version = 1;
   string software_version = 2;
   repeated WorkerCapability advertised_capabilities = 3;
   ResourceFacts resources = 4;
+  ProtocolOffer protocol_offer = 5;
 }
 
 message CheckRegistrationResponse {
@@ -78,6 +92,7 @@ message CheckRegistrationResponse {
   uint64 heartbeat_interval_ms = 6;
   uint64 lease_ttl_ms = 7;
   int64 server_time_ms = 8;
+  ProtocolContract protocol_contract = 9;
 }
 
 message RegisterRequest {
@@ -86,6 +101,16 @@ message RegisterRequest {
   string software_version = 3;
   repeated WorkerCapability advertised_capabilities = 4;
   ResourceFacts resources = 5;
+  ProtocolOffer protocol_offer = 6;
+  PreflightReport preflight = 7;
+}
+
+// Self-reported successful startup checks; not remote attestation.
+message PreflightReport {
+  uint32 revision = 1;
+  int64 completed_at_ms = 2;
+  string executable_sha256 = 3;
+  string configuration_sha256 = 4;
 }
 
 message RegisterResponse {
@@ -93,6 +118,7 @@ message RegisterResponse {
   uint64 heartbeat_interval_ms = 2;
   uint64 lease_ttl_ms = 3;
   int64 server_time_ms = 4;
+  ProtocolContract protocol_contract = 5;
 }
 
 message ListCleanupRequest {
@@ -144,6 +170,7 @@ message PollResponse {
     PollNoWork no_work = 1;
     Empty drain = 2;
     PollOffer offer = 3;
+    Empty shutdown_after_idle = 4;
   }
 }
 

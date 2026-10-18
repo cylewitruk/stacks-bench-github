@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use sbgh_fleet::ProtocolFeature;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -118,8 +119,16 @@ async fn main() -> anyhow::Result<()> {
             .map(|capability| capability.as_str())
             .collect::<Vec<_>>()
             .join(",");
+        let resident = registration
+            .protocol_contract
+            .as_ref()
+            .is_some_and(|contract| {
+                contract
+                    .features
+                    .contains(&ProtocolFeature::ResidentCordon)
+            });
         println!(
-            "connectivity=ok endpoint={} transport=grpc+tls1.3 registration=authorized worker_id={} protocol_version={} effective_capabilities={} measurement_profile={} draining={} clock_skew_ms={}",
+            "connectivity=ok endpoint={} transport=grpc+tls1.3 registration=authorized worker_id={} protocol_version={} effective_capabilities={} measurement_profile={} draining={} clock_skew_ms={} cordon_semantic={}",
             config.orchestrator_url,
             registration.worker_id,
             registration.protocol_version,
@@ -130,20 +139,17 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or("none"),
             registration.draining,
             report.clock_skew_ms,
+            if resident { "resident" } else { "exit_after_idle" },
         );
         return Ok(());
     }
     let resources =
         sbgh_worker::discover_host_resources().context("discovering worker host resources")?;
     log_host_resources(&resources);
-    config
-        .validate_host_resources(&resources)
-        .context("validating worker profiles against host resources")?;
     if args.preflight_only {
-        sbgh_worker::preflight_local_execution(&config)
+        sbgh_worker::preflight_report(&config, &resources)
             .await
             .context("preflighting local worker execution")?;
-        tracing::info!("local worker execution preflight passed");
         return Ok(());
     }
     let shutdown = CancellationToken::new();

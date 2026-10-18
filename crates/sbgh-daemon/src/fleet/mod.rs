@@ -3,6 +3,9 @@ mod github_queue;
 mod grpc;
 mod lease;
 mod service;
+#[cfg(test)]
+#[path = "../../tests/support/fleet.rs"]
+mod test_support;
 mod tls;
 
 pub use coordinator::{FleetCoordinator, FleetCoordinatorDependencies};

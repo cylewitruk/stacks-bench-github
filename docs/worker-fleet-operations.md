@@ -53,6 +53,20 @@ without cancelling work. Completion exits successfully; failure or cancellation
 exits unsuccessfully. Guest console streaming is not yet available; use service
 logs while running and promoted console artifacts after termination.
 
+Validation progress distinguishes range discovery (`initialize`, no total yet)
+from command startup and processed-block samples. A command with no positive
+sample is described as initializing **or waiting for progress**: older producers
+can remain silent while doing work. Neither elapsed time nor a healthy heartbeat
+proves that blocks have been processed.
+
+A processing ETA appears only after ten seconds and at least three counter
+advances for the same active commands. It uses up to sixty one-second intervals,
+requires the two half-window rates to agree within a factor of two, and disappears
+after ten seconds without an advance. Queued commands, initialization and command
+changes suppress/reset it. The estimate excludes teardown; it is best-effort
+display text, not a deadline or an authoritative result. Short or silent runs
+may never show an ETA.
+
 `fleet status` is the primary view for registered identities, current
 sessions, discovered CPU/memory, active attempts, lease state, traces, and
 pending cleanup.
@@ -89,6 +103,98 @@ results tmpfs.
 The worker keeps a restrictive process umask. Its libvirt adapter explicitly
 makes only each ephemeral VM job directory execute-only to non-owners so QEMU
 can traverse to libvirt-owned disks without making job contents listable.
+
+### Targeted worker maintenance
+
+`fleet cordon` prevents new assignments but does not stop an accepted attempt.
+The current negotiated `resident` semantic keeps the process online; the
+supported previous worker reports `exit_after_idle` and exits on cordon.
+`fleet uncordon` only changes scheduling policy: it never starts a service.
+Legacy `drain`/`undrain` remain aliases for these scheduling changes; use the
+explicit commands with a reason for maintenance audit receipts.
+
+Select the worker UUID and its local service profile explicitly. These commands
+require the new daemon/CLI; inspect `cordon_semantic` before choosing the exit
+path. They do not update binaries or change any other worker's policy.
+
+```bash
+sbgh fleet worker-status --worker-id "$worker_id" --json
+cordon=$(sbgh fleet cordon --worker-id "$worker_id" \
+  --reason 'operator: planned worker update' --json) || exit
+sbgh fleet wait-worker --worker-id "$worker_id" \
+  --generation "$(jq -r .generation <<<"$cordon")" \
+  --until quiescent --timeout-seconds 3600 --json || exit
+```
+
+For a current worker with `shutdown_after_idle` support, explicitly request its
+session to exit. This request does **not** cordon it; the earlier cordon remains
+in place so a replacement process cannot accept work during maintenance.
+
+```bash
+shutdown=$(sbgh fleet shutdown-after-idle --worker-id "$worker_id" \
+  --reason 'operator: planned worker process stop' --json) || exit
+sbgh fleet wait-worker --worker-id "$worker_id" \
+  --generation "$(jq -r .generation <<<"$shutdown")" \
+  --session-id "$(jq -r .target_session_id <<<"$shutdown")" \
+  --until deregistered --timeout-seconds 300 --json || exit
+```
+
+For a previous `exit_after_idle` worker, cordon itself requests the exit. Skip
+`shutdown-after-idle` (unsupported) and wait for `deregistered` with the cordon
+receipt's generation. Never infer clean exit from an expired/offline session.
+
+Both waits require a cordon, pin the lifecycle generation and session, count
+cleanup across all the worker's sessions, and fail if the target changes. The
+deadline includes API requests. JSON goes only to stdout; progress and request
+UUIDs go to stderr. Reuse a request UUID only to recover the receipt of the
+same uncertain mutation. Receipt replay never repeats or retargets an action.
+
+Before touching binaries, config, mounts or rebooting, stop the selected
+systemd unit and verify it is inactive on its host. Database deregistration is
+not proof that a host process has exited. After installation, run local
+preflight and `fleet check`, start the service while still cordoned, and inspect
+the running binary/session. Uncordon explicitly only after successful checks.
+A failed check leaves the worker cordoned; do not uncordon as an error cleanup.
+Previous workers exit while cordoned and need an explicit service start after
+uncordon; current workers can remain resident throughout the canary checks.
+
+`worker-status` also reports `admission.schedulable`, stable blocker codes,
+effective task capabilities and measurement profile. Admission accounts for
+registry enablement, cordon, scheduler pause, session liveness/state, bound-key
+authorization, protocol support/floor, capability intersection, shutdown intent,
+active attempts and cleanup. All facts come from one database snapshot.
+
+After explicitly uncordoning an existing session, wait for admission with:
+
+```bash
+sbgh fleet wait-worker --worker-id "$worker_id" \
+  --until schedulable --timeout-seconds 300 --json
+```
+
+This wait retains the same generation/session checks; it does not follow a
+replacement worker, uncordon, enable an identity or resume the scheduler. An
+older API without admission facts fails explicitly. Schedulability is an
+instantaneous worker-wide observation, not a capacity reservation or a promise
+that a particular job's profile/placement matches. A busy worker may remain
+blocked until its current attempt finishes. Real-host rolling maintenance and a
+second physical worker remain open v35 work.
+
+`worker-status` includes the latest session's optional `preflight` record:
+check revision, worker-clock completion time, executable SHA-256 and loaded
+configuration SHA-256. The worker reports it only after successful startup
+checks; recovery retains exactly the original record. Previous workers report
+no record (`preflight=unreported`), not an assumed pass. This is authenticated
+worker-reported provenance, **not remote attestation**, continuing health or
+proof of the source commit used to build the binary. Compare its executable
+digest with the operator's retained build evidence and `/proc/<pid>/exe`.
+
+Revision 1 fingerprints the default-expanded configuration's compact JSON with
+the `sbgh-worker-preflight-config-v1` domain prefix and a trailing NUL byte.
+Comments and TOML formatting do not matter. Key paths are included, but private
+key contents and referenced image/chainstate contents are not read into this
+fingerprint. It is not the raw TOML file hash. Changes to the check suite or
+fingerprint encoding require a new revision; binary hashes distinguish builds.
+`--preflight-only` logs the same fields but does not register or update a session.
 
 ### Failed VM forensics
 
@@ -141,20 +247,17 @@ one `SBGH_BLOCK_VALIDATION_PROGRESS_WARNING` for canary diagnostics.
 
 ## Coordinated protocol deployment
 
-The current fleet requires an exact protocol revision at session registration.
-Deploy daemon and worker binaries from the same release:
+The deployed predecessor uses revision 1. The local v35 implementation adds
+revision 2 and negotiates the bounded current/previous worker window. It must
+be deployed server-first; an old daemon cannot admit a revision-2 worker.
+See the [supported baseline](#supported-protocol-baseline) for the exact
+predecessor, and [coordinated update](#coordinated-daemon-and-worker-update)
+for the conservative qualification workflow.
 
-1. Drain every worker and wait for active attempts and cleanup obligations to
-   reach zero.
-2. Stop workers.
-3. Deploy and start the daemon.
-4. Deploy and start each matching worker release.
-5. Run one benchmark and one block-validation canary before undraining normal
-   demand.
-
-A protocol mismatch is rejected before registration or assignment. Worker
-software versions may differ only when they implement the same protocol
-revision. Rolling multi-revision compatibility is not currently supported.
+Worker wire compatibility is separate from daemon/database rollback. The old
+daemon cannot start against the expanded migration ledger. Qualify the approved
+[backup/restore rollback](#recovery-policy-for-the-v35-schema-rollout) before closing v35;
+do not infer rollback support from successful mixed-worker tests.
 
 ## Drain, cancellation, and recovery
 
@@ -472,10 +575,12 @@ session only when no successor owns the identity. Older daemons return the
 legacy stale-session error; upgraded workers still fail closed against them.
 Superseded sessions never mint a replacement UUID automatically.
 
-Install the daemon change first, while the fleet is quiescent, then update
-workers using the existing controlled update scripts. The old daemon being
-stopped still has the old drain/abort behavior. Do not use an active-job restart
-as the first upgrade ceremony. No schema or protobuf message change is required.
+Install daemon changes first, while the fleet is quiescent, then update workers
+using the controlled update scripts. The original pre-v35 daemon had destructive
+shutdown behavior; the operator-qualified `d0b6852` daemon already has local-only
+shutdown. The pending negotiation/maintenance release adds migrations and
+additive protobuf fields, unlike that first lifecycle patch. Do not use an
+active-job restart as the first schema-upgrade ceremony.
 
 After both sides are upgraded, a short compatible daemon restart can preserve
 active jobs only inside their **remaining confirmed lease**, including reconnect
@@ -485,17 +590,216 @@ heartbeat RPCs; reassignment remains gated on verified cleanup. Startup waits
 two heartbeat intervals before its first expiry sweep but never renews expired
 authority. Keep timing settings unchanged during an active-job restart canary.
 
-For longer outages, first prevent new submissions/assignments and reach zero
-attempts and cleanup obligations through the existing drain workflow. Explicit
+For longer outages, pause admission and wait for quiescence as described below.
+Until that scheduler implementation is deployed, use the existing drain workflow. Explicit
 revision-1 `fleet drain` still exits the worker after idle; undrain plus service
-start remains necessary for that deliberate action. Resident cordon, scheduler
-pause, and negotiated rolling versions are later v35 work, not implemented by
-this shutdown change. Use authenticated job cancellation or emergency worker
+start remains necessary for that deliberate action. Resident cordon and
+negotiated rolling versions are locally implemented but not deployed-qualified.
+Use authenticated job cancellation or emergency worker
 disable/revoke for destructive actions, never OS signals as a fleet abort.
 
 Live-host restart, provider convergence, and rollback qualification remain
 required before calling this deployment-qualified. See the
 [v35 evidence and handoff](../planning/design/0082-fleet-lifecycle-failure-matrix.md).
+
+### Explicit fleet abort
+
+Normal service signals never cancel remote work. To deliberately cancel fleet
+work, first pause admission and inspect its generation. The locally implemented
+abort control requires admin authorization, an explicit scope and a reason:
+
+```bash
+pause_generation=$(sudo -u sbgh sbgh-cli fleet scheduler pause \
+  --reason 'Operator: deliberate workload cancellation' --json | jq -r '.generation')
+sudo -u sbgh sbgh-cli fleet abort --scope active \
+  --generation "$pause_generation" --reason 'Operator: stop current execution' --json
+sudo -u sbgh sbgh-cli fleet scheduler wait \
+  --generation "$pause_generation" --timeout-seconds 300 --json
+```
+
+`active` selects executing jobs, including jobs whose expired attempts still
+owe cleanup. Use `all-pending` **instead** only when also cancelling currently
+queued/claimed jobs is intended. Both select existing jobs once, not future
+intake or unmaterialized submission runs. Pause blocks assignment, not intake;
+newly arriving jobs remain queued. A concurrent terminal result may win before
+cancellation, so receipts distinguish selected from accepted job IDs.
+
+The receipt is atomic with cancellation and is append-only. Preserve the
+`request_id` printed to stderr; retry with that UUID and identical arguments
+after a lost response. Replay returns the original selection, even after resume,
+and cannot cancel later arrivals. It does not pause, resume, cordon or stop any
+process. A changed pause generation rejects a new request without mutation.
+
+Acceptance is **not** proof of teardown. Active jobs receive the existing
+heartbeat cancellation directive. Expired attempts awaiting cleanup have their
+retry obligation changed to cancellation; their job remains nonterminal until
+cleanup acknowledgement. Continue to use scheduler wait and host resource
+checks before maintenance. Resume only by a separate explicit command. This
+control is locally tested; destructive host qualification remains outstanding.
+
+### Supported protocol baseline
+
+The supported previous protocol contract is the deployed `0f18950` build,
+approved on 2026-10-17. Earlier pre-v33 layouts reused revision 1 despite
+incompatible wire changes and are unsupported. Verify build provenance: the
+revision number and package version alone cannot identify that historical
+cohort. Only the Hetzner worker is currently deployed. Compatibility qualification
+targets that predecessor and the new worker, not arbitrary historical binaries.
+The local implementation advertises revision 2. Source-pinned predecessor and
+current-worker probes pass local TLS/RPC lifecycle tests; real task execution
+and production rollout remain unqualified. Release review and a verified
+recovery package precede an operator-controlled server-first canary; the
+rollback policy is defined [below](#recovery-policy-for-the-v35-schema-rollout).
+Upgrade the daemon before the worker; normal traffic follows successful host
+qualification, not merely local test success.
+
+After deploying that API, `fleet show-worker` includes `worker.protocol`: selected
+`revision` and `features`, plus the explicit `offer` when advertised. A null offer
+means the fixed legacy contract; a null protocol means no recorded session or an
+older daemon. `fleet status` appends selected protocol/features. These describe
+the latest session, including offline sessions: check liveness separately before
+counting a worker as upgraded. Capabilities remain authorization, not proof of
+protocol feature support.
+
+### Compatibility-floor maintenance
+
+These controls are locally implemented; real-task mixed-worker and host rollback
+qualification remain release gates. Keep the floor at 1 during a server-first
+rollout. Upgrading workers does not require immediately retiring revision 1.
+
+After those gates pass, inspect the policy and every enabled worker's live
+session before advancing the floor. All enabled workers count as required,
+including drained workers; an offline or unregistered enabled worker blocks
+advancement. Disable a retired worker only through an explicit policy change.
+
+```bash
+sudo -u sbgh sbgh-cli fleet protocol status --json
+sudo -u sbgh sbgh-cli fleet status
+sudo -u sbgh sbgh-cli fleet scheduler pause --reason 'Qualified protocol upgrade'
+sudo -u sbgh sbgh-cli fleet scheduler wait --timeout-seconds 300
+sudo -u sbgh sbgh-cli fleet protocol set-floor --minimum-revision 2 \
+  --reason 'All required workers upgraded' \
+  --rollback-evidence 'REFERENCE-TO-COMPLETED-ROLLBACK-QUALIFICATION' --json
+sudo -u sbgh sbgh-cli fleet protocol status --json
+```
+
+Replace the evidence placeholder with the actual qualification record. The server
+requires paused admission, zero attempt/cleanup/projection/artifact debt, and live
+compatible sessions before raising the floor. It serializes this check with
+registration, admission and enabled-worker membership changes. A reference is an
+operator declaration, not automatic verification of the referenced evidence.
+
+Changes retain an append-only audit with the shared `api:admin` principal, reason,
+evidence reference and request UUID. Reuse the printed UUID with `--request-id`
+after an uncertain response; replay returns the original receipt, not necessarily
+the current policy. Inspect status separately. Rejected changes leave policy
+unchanged. No-op requests are audited without advancing the generation.
+
+An explicit rollback to floor 1 uses the same command with a fresh request UUID
+and requires paused, quiescent maintenance. It does not rewrite existing session
+contracts. Resume scheduling explicitly after checking the resulting policy.
+Lowering the floor alone does **not** qualify an old daemon binary: migration
+ledger compatibility and its lack of maintenance-policy enforcement must also
+pass the separate rollback procedure. Never start an old daemon while relying
+on controls it does not implement.
+
+### Scheduler maintenance
+
+The scheduler gate is a separate daemon/CLI deployment with an additive database
+migration. It does not require a worker protocol change. Do not use these
+commands until that release is installed; the October 16 recovery worker alone
+does not provide this gate.
+
+```bash
+sudo -u sbgh sbgh-cli fleet scheduler status --json
+sudo -u sbgh sbgh-cli fleet scheduler pause --reason 'Operator: planned daemon maintenance'
+sudo -u sbgh sbgh-cli fleet scheduler wait --timeout-seconds 1800
+```
+
+Pause persists across daemon restarts. It blocks new source freezing, payload
+preparation, offers, and acceptance. Unaccepted offers are withdrawn and their
+jobs requeued atomically; accepted work continues. It does not change worker
+drain policy or terminate sessions. Submission intake, reporting, heartbeats,
+cleanup, terminal submission, and artifact promotion remain available.
+
+`wait` pins the first observed pause generation (or `--generation N`) and fails
+if another operator resumes/repauses it. Success requires zero offered/running/
+cancelling attempts, cleanup obligations, unprojected reliable events, and
+active-attempt uploads or accepted terminal-manifest artifacts awaiting promotion.
+Even a zero-byte required artifact counts. `garbage_artifacts` reports unreferenced
+staging retained for garbage collection; it does not block maintenance. The
+configured staging retention grace still applies. Timeout or API
+failure exits unsuccessfully and never changes policy. Inspect remaining debt
+instead of deleting records to force success. This is a point-in-time readiness
+check, not an exclusive maintenance reservation; coordinate other operators.
+
+After maintenance and API health verification:
+
+```bash
+sudo -u sbgh sbgh-cli fleet scheduler resume --reason 'Operator: maintenance complete'
+sudo -u sbgh sbgh-cli fleet status
+```
+
+Pause/resume print a request UUID to stderr before sending. On an uncertain
+response, retry the same action/reason with `--request-id UUID`. Replays return
+the original receipt without reapplying an old change; inspect `status` for
+current policy. Reusing the UUID differently returns a conflict. Fresh no-op
+requests are audited but do not advance the generation. Read tokens can inspect
+status; only admin can pause/resume. The append-only audit records the shared
+authenticated principal `api:admin`; names included in reasons are operator
+claims, not individually authenticated identities. New commands support
+`--json`; diagnostics and wait progress go to stderr.
+
+Roll out server-first at quiescence with a database backup. Previous daemons do
+not enforce this gate: never rely on a paused row while serving an older daemon.
+For rollback, use a compatible build with the same migration ledger, or follow
+the separately qualified backup/restore procedure with workers stopped and
+drained. Do not down-migrate or erase the audit. The pinned predecessor's startup
+migrator rejects the newer ledger, even though the migration is additive.
+Binary-only rollback to that predecessor will not start. Never remove
+migration-history rows or disable verification to bypass it.
+
+The predecessor also predates scheduler-pause, protocol-floor and targeted
+shutdown admission checks. Bypassing its migration check is unsafe, not a
+shortcut to compatibility. No bridge release is required under the approved
+recovery policy below.
+
+Local qualification restores a pre-upgrade dump into a separate test database
+and verifies that the predecessor migrator accepts it with the original ledger
+and worker policy intact. Host qualification must still rehearse the retained
+daemon, configuration and backup together. Keep intake and workers stopped
+through any restore: a pre-upgrade backup cannot retain later submissions,
+results, audit changes or provider effects. After reopening intake, prefer a
+qualified forward repair; any restore needs explicit reconciliation of that
+post-backup work, not just a successful `pg_restore`.
+
+#### Scheduler host qualification
+
+After release review and server-first installation, use a controlled canary and
+coordinate submission intake with other operators. Keep the existing worker
+binary for this check; scheduler pause does not require a worker update.
+
+1. Capture release/binary hashes, worker PID/invocation/restart count, session
+   UUID, drain policy, scheduler status, and the canary's accepted attempt UUID.
+2. Pause while that attempt is running. Retain the request UUID and receipt;
+   submit one additional canary and confirm it stays queued without an attempt.
+   The accepted attempt must continue heartbeating and complete normally.
+3. Run `fleet scheduler wait --generation N --timeout-seconds 1800`, replacing
+   `N` with the pause receipt's generation. Capture its zero-debt snapshot. If
+   it times out, inspect the remaining debt; do not resume or clear records just
+   to obtain a passing result.
+4. Restart only the daemon while paused. Confirm the same paused generation,
+   queued canary, resident worker process/session, and unchanged drain policy.
+5. Resume, retain its request UUID, and retry that exact request once. Both
+   receipts must agree; generation must advance only once. Confirm the queued
+   canary is offered and completes without restarting or undraining the worker.
+6. Retain final scheduler/fleet status, both canary reports, and audit rows for
+   the request UUIDs. Check offer timestamps/generations in the database, not
+   sampled CLI output alone, before marking the admission gate qualified.
+
+This procedure qualifies scheduler behavior, not old-daemon rollback or
+multi-host operation. A failure leaves maintenance policy for explicit operator
+review; do not automatically resume scheduling.
 
 ### Worker-only update
 
@@ -506,14 +810,40 @@ operator CLI access, run from the updated checkout:
 sudo ./scripts/update-worker-host.sh
 ```
 
-The script derives the configured worker identity, drains only that worker,
-waits for its attempt plus fleet cleanup and reliable events to quiesce, stops
-the local instance, builds and installs `sbgh-worker`, runs preflight and the
-production registration check while still drained, then undrains and verifies
-the worker is online. Failure after draining leaves it drained and, once
-quiescent, stopped. Use `--profile NAME` for another local instance,
+The script requires the v35 maintenance CLI/API before changing policy. It
+derives the configured identity, cordons only that worker, pins the receipt
+generation while waiting for its attempts and cleanup, and requests explicit
+idle shutdown when supported. It stops the local unit, installs `sbgh-worker`,
+then runs preflight and registration checks while still cordoned. A replacement
+advertising resident cordon must establish a new live session before uncordon;
+a previous worker is uncordoned before its service start because it would
+otherwise exit. Readiness reports effective cordon semantics, not merely the
+protocol revision.
+
+Unrelated workers may continue execution and cleanup. Failure recovery attempts
+to cordon only the target and reports if it cannot confirm that policy. Before
+admission reopens it also stops the already-quiesced instance; afterwards it
+does not stop blindly, since new work may have been accepted. Use
+`--profile NAME` for another local instance,
 `--timeout-secs N` for long-running attempts, or `--no-build` for an existing
 release binary.
+
+If a retry finds the worker **stopped with pending cleanup**, waiting alone cannot
+make it quiescent. Inspect `fleet worker-status --worker-id UUID --json`, the
+failure log, and the installed binary/configuration first. Do not clear cleanup
+rows, uncordon to bypass the gate, or start a binary that failed preflight.
+After repairing the failure, run the installed worker's `--preflight-only` and
+`fleet check` with the same service user/config. For a compatible worker reporting
+`cordon_semantic=resident`, confirm it remains cordoned, manually start only its
+systemd instance, and wait for the new live session and acknowledged cleanup.
+Then rerun the updater. Keep scheduling policy unchanged and use a fresh
+`worker-status` snapshot rather than pinning a retired session.
+
+A legacy exit-on-drain worker may exit before processing cleanup. Do not apply
+the resident procedure or blindly uncordon it: use the coordinated release path
+with paused admission and an explicitly reviewed compatible recovery binary.
+If preflight or registration still fails, leave the worker cordoned and resolve
+that failure before retrying.
 
 This workflow does not update or restart the daemon. Use the coordinated update
 for protocol, schema, or daemon-and-worker changes.
@@ -536,13 +866,14 @@ different local instance and `--no-build` for already-built release binaries.
 
 This path does not install a worker binary. Do not use it for worker-protocol,
 worker-runtime, or migration compatibility changes; use the coordinated update
-below. It also refuses multi-worker fleets because the current daemon shutdown
-path globally drains workers.
+below. It also refuses multi-worker fleets because the script only coordinates
+one local worker; daemon shutdown itself no longer globally drains workers.
 
 ### Coordinated daemon and worker update
 
-The daemon and workers require exact worker-protocol compatibility. Use a full
-drain:
+Until the negotiated rollout and rollback gates are qualified, use this
+conservative coordinated-release path rather than assuming arbitrary versions
+are compatible:
 
 1. Drain all workers.
 2. Wait for active attempts and cleanup obligations to reach zero.
@@ -563,9 +894,43 @@ drain:
 Never run an older binary against a schema it was not designed to read.
 Rollback across a schema-changing deployment means stopping traffic and
 restoring the matching database backup before starting the retained binary.
-When the newer schema is backward compatible, a binary-only rollback may be
-safe, but treat that as an explicitly verified property rather than an
-assumption.
+Binary-only rollback to the pinned predecessor is unsupported for this rollout.
+
+### Recovery policy for the v35 schema rollout
+
+Operator-approved on 2026-10-17 for the single-host rollout: prefer a reviewed
+roll-forward fix that preserves the current database and audit history. If
+repair cannot safely restore service, use a coordinated backup/restore fallback;
+do not start the old daemon on the expanded schema. This changes daemon rollback
+scope only, not current/previous worker compatibility or fencing guarantees.
+
+Before migration, freeze intake and quiesce all attempts, cleanup, artifact and
+projection debt. Stop database-writing services before capturing the recovery
+point. Retain a verified PostgreSQL backup and matching executable hashes,
+configuration, service units and source revision; keep secrets protected. Rehearse
+restore into an isolated database with provider delivery disabled and verify the
+retained daemon and configuration can start there. A successful archive listing
+or migration-only probe is not the complete host recovery drill.
+
+For a failure after rollout:
+
+1. Contain intake and new assignments. Use scheduler pause if the API is healthy;
+   if not, use the documented external service controls. Do not weaken leases.
+2. Preserve logs and the failed database state. Prefer a tested forward fix, then
+   verify health and canaries before resuming admission.
+3. If the operator chooses restore, stop intake, workers and database-writing
+   services; verify physical VM/mount/snapshot cleanup before restoring state.
+4. Restore the matching database, binaries, configuration and units together.
+   Verify health and identity/policy state while intake and workers remain stopped.
+5. Reconcile post-backup submissions, accepted results, artifacts, provider
+   comments/checks and webhook redeliveries before re-enabling traffic. Preserve
+   the failed database for this inventory; a database restore does not undo S3
+   objects or external messages. Do not silently discard or automatically replay
+   that work.
+
+Keep the compatibility floor at 1 during qualification. Record restore evidence
+and operator sign-off before closing v35; this policy approval is not a successful
+restore or authorization to perform a production restore.
 
 ## Backup and restore
 

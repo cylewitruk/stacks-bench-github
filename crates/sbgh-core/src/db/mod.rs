@@ -1,13 +1,17 @@
 pub mod fleet;
+pub mod fleet_abort;
 pub mod ingest;
 pub mod installation;
 pub mod jobs;
 pub mod policy;
+pub mod protocol;
 pub mod pull_request;
 pub mod repo;
+pub mod scheduler;
 pub mod submissions;
 pub mod user;
 pub mod webhook;
+pub mod worker_lifecycle;
 
 pub use ingest::{IngestOutcome, IngestStore, NewWebhook, SUPPORTED_WEBHOOK_EVENT_TYPES};
 pub use installation::{DeleteInstallationOutcome, InstallationStore, NewInstallation};

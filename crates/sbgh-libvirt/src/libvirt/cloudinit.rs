@@ -374,7 +374,9 @@ mod tests {
         assert!(rendered.contains("drain_command_progress(state, drain_all=True)"));
         assert!(rendered.contains("command_record[\"end_exclusive\"] - command_record[\"start\"]"));
         assert!(rendered.contains("SBGH_BLOCK_VALIDATION_PROGRESS_WARNING"));
-        assert!(rendered.contains("shards {completed_shards}/{len(ranges)} complete"));
+        assert!(rendered.contains("shards {completed_shards}/{shard_count} complete"));
+        assert!(rendered.contains("discovering chainstate range"));
+        assert!(rendered.contains("initializing or waiting for processed-block progress"));
         assert!(!rendered.contains("{{ block_validation_progress }}"));
         assert!(!rendered.contains(".sbgh-dataset-manifest.json"));
         assert!(rendered.contains("block-validation-result.json"));

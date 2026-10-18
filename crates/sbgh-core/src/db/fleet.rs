@@ -8,11 +8,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use sbgh_fleet::{
     ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DesiredState, ProgressRequest,
-    RegisterSessionRequest, ReliableEventEnvelope, TaskPayload, TerminalOutcome, WorkOffer,
-    WorkerCapability,
+    ProtocolContract, ProtocolOffer, RegisterSessionRequest, ReliableEventEnvelope, TaskPayload,
+    TerminalOutcome, WorkOffer, WorkerCapability,
 };
 use uuid::Uuid;
 
+use super::protocol::ProtocolPolicyStore;
+use super::scheduler::SchedulerStore;
+use super::worker_lifecycle::IdleWorkerControl;
 use crate::Result;
 use crate::models::{JobMetric, JobResult};
 
@@ -28,6 +31,9 @@ pub enum SessionRegistrationError {
     /// Expiry must fence active attempts before a session may recover.
     #[error("worker session recovery is waiting for attempt expiry")]
     RecoveryPending,
+    /// The selected session contract is below the current admission floor.
+    #[error("worker protocol is incompatible with the current compatibility floor")]
+    ProtocolIncompatible,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +56,10 @@ pub struct WorkerAuthorization {
 
 #[derive(Debug, Clone)]
 pub struct WorkerRegistryEntry {
+    /// Monotonic generation of worker lifecycle policy changes.
+    pub lifecycle_generation: i64,
+    /// Session targeted by the last explicit shutdown, never a successor.
+    pub shutdown_session_id: Option<Uuid>,
     pub worker_id: Uuid,
     pub display_name: String,
     pub enabled: bool,
@@ -59,6 +69,10 @@ pub struct WorkerRegistryEntry {
     pub worker_session_id: Option<Uuid>,
     pub session_status: Option<String>,
     pub software_version: Option<String>,
+    /// Explicit advertisement; absent for the pinned legacy registration.
+    pub protocol_offer: Option<ProtocolOffer>,
+    /// Selected contract of the latest session; absent before registration.
+    pub protocol_contract: Option<ProtocolContract>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub session_expires_at: Option<DateTime<Utc>>,
     pub resource_facts: Option<serde_json::Value>,
@@ -94,6 +108,8 @@ pub enum WorkerRegistryMutation {
 
 #[derive(Debug, Clone)]
 pub struct AuthorizedSession {
+    /// Immutable contract negotiated for the session, including implicit legacy semantics.
+    pub protocol_contract: ProtocolContract,
     pub worker_id: Uuid,
     pub worker_session_id: Uuid,
     pub effective_capabilities: Vec<WorkerCapability>,
@@ -104,6 +120,8 @@ pub struct AuthorizedSession {
 
 #[derive(Debug, Clone)]
 pub struct PreparedExecution {
+    /// Scheduler revision captured before beginning preparation.
+    pub scheduler_generation: i64,
     pub job_id: Uuid,
     pub commit: String,
     pub payload: TaskPayload,
@@ -317,7 +335,7 @@ pub trait WorkerRegistryStore: Send + Sync + 'static {
 }
 
 #[async_trait]
-pub trait FleetStore: Send + Sync + 'static {
+pub trait FleetStore: SchedulerStore + ProtocolPolicyStore + Send + Sync + 'static {
     async fn register_session(
         &self,
         worker_id: Uuid,
@@ -336,6 +354,7 @@ pub trait FleetStore: Send + Sync + 'static {
         &self,
         submission_id: Uuid,
         sources: &[ResolvedSpecSource],
+        scheduler_generation: i64,
     ) -> Result<bool>;
 
     async fn prepare_execution(&self, prepared: &PreparedExecution) -> Result<bool>;
@@ -348,7 +367,12 @@ pub trait FleetStore: Send + Sync + 'static {
         lease_ttl: Duration,
     ) -> Result<Option<OfferedAssignment>>;
 
-    async fn session_is_draining(&self, worker_id: Uuid, worker_session_id: Uuid) -> Result<bool>;
+    /// Read an idle directive after admission polling has renewed the session.
+    async fn idle_worker_control(
+        &self,
+        worker_id: Uuid,
+        worker_session_id: Uuid,
+    ) -> Result<IdleWorkerControl>;
 
     async fn session_is_active(&self, worker_id: Uuid, worker_session_id: Uuid) -> Result<bool>;
 
@@ -400,10 +424,6 @@ pub trait FleetStore: Send + Sync + 'static {
     /// required reporting surface. Already-running work is left to its normal
     /// lease and recovery contract.
     async fn fail_queued_slack_jobs_without_connector(&self, remark: &str) -> Result<Vec<Uuid>>;
-
-    async fn set_all_workers_draining(&self, draining: bool) -> Result<u64>;
-
-    async fn request_cancel_all(&self) -> Result<u64>;
 
     /// Start a fresh comparison generation from the first spec/run.
     ///

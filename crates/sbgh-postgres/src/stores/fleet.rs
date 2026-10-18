@@ -1,5 +1,12 @@
 //! PostgreSQL implementation of the worker-fleet state machine.
 
+mod abort;
+mod cancellation;
+mod lifecycle;
+mod protocol;
+mod quiescence;
+mod scheduler;
+
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -15,13 +22,18 @@ use sbgh_core::db::fleet::{
     WorkerAuthorization, WorkerIdentityRecord, WorkerPolicyPatch, WorkerRegistration,
     WorkerRegistryEntry, WorkerRegistryMutation, WorkerRegistryStore,
 };
+use sbgh_core::db::worker_lifecycle::{
+    IdleWorkerControl, WorkerLifecycleAction, WorkerLifecycleChange, WorkerLifecycleOutcome,
+    WorkerLifecycleStore,
+};
 use sbgh_core::models::{JobEventKind, JobEventStatus};
 #[cfg(feature = "testing")]
 use sbgh_core::models::{NewJob, NewPullRequestLink};
 use sbgh_fleet::{
     ArtifactDescriptor, AttemptIdentity, BlockValidationResult, DesiredState, ProgressRequest,
-    RegisterSessionRequest, ReliableEventEnvelope, ReliableEventPayload, TaskPayload,
-    TerminalOutcome, WorkOffer, WorkerCapability,
+    ProtocolContract, ProtocolFeature, ProtocolOffer, RegisterSessionRequest,
+    ReliableEventEnvelope, ReliableEventPayload, TaskPayload, TerminalOutcome, Validate, WorkOffer,
+    WorkerCapability,
 };
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -393,6 +405,7 @@ fn offer_from_row(row: &sqlx::postgres::PgRow) -> sbgh_core::Result<OfferedAssig
 
 const OFFER_SELECT: &str = r#"
     SELECT a.attempt_id,
+           a.scheduler_generation,
            a.job_id,
            a.worker_session_id,
            a.fencing_generation,
@@ -522,6 +535,12 @@ impl WorkerRegistryStore for PostgresFleetStore {
     ) -> sbgh_core::Result<WorkerRegistryMutation> {
         let capabilities = capability_names(&registration.allowed_capabilities);
         let expected_capabilities = capabilities.clone();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        protocol::lock_policy(&mut tx).await?;
         let result = sqlx::query(
             r#"
             INSERT INTO worker_registry
@@ -545,10 +564,11 @@ impl WorkerRegistryStore for PostgresFleetStore {
         .bind(&registration.measurement_profile)
         .bind(registration.enabled)
         .bind(registration.draining)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .core()?;
         if result.rows_affected() == 1 {
+            tx.commit().await.core()?;
             return Ok(WorkerRegistryMutation::Applied);
         }
         let existing = sqlx::query(
@@ -564,7 +584,7 @@ impl WorkerRegistryStore for PostgresFleetStore {
             "#,
         )
         .bind(registration.worker_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .core()?;
         let exact_retry = existing
@@ -587,6 +607,7 @@ impl WorkerRegistryStore for PostgresFleetStore {
                 .try_get::<bool, _>("draining")
                 .core()?
                 == registration.draining;
+        tx.commit().await.core()?;
         Ok(if exact_retry {
             WorkerRegistryMutation::Unchanged
         } else {
@@ -604,6 +625,8 @@ impl WorkerRegistryStore for PostgresFleetStore {
             .begin()
             .await
             .core()?;
+        // Serialize enabled-worker membership with the floor convergence check.
+        protocol::lock_policy(&mut tx).await?;
         let current = sqlx::query(
             r#"
             SELECT display_name,
@@ -1039,6 +1062,8 @@ impl WorkerRegistryStore for PostgresFleetStore {
         let rows = sqlx::query(
             r#"
             SELECT registry.worker_id,
+                   registry.lifecycle_generation,
+                   registry.shutdown_session_id,
                    registry.display_name,
                    registry.enabled,
                    registry.draining,
@@ -1050,6 +1075,8 @@ impl WorkerRegistryStore for PostgresFleetStore {
                    session.worker_session_id,
                    session.status::text AS session_status,
                    session.software_version,
+                   session.protocol_offer,
+                   session.protocol_contract,
                    session.last_heartbeat_at,
                    session.expires_at,
                    session.resource_facts,
@@ -1086,6 +1113,12 @@ impl WorkerRegistryStore for PostgresFleetStore {
                     .try_get("capabilities")
                     .core()?;
                 Ok(WorkerRegistryEntry {
+                    lifecycle_generation: row
+                        .try_get("lifecycle_generation")
+                        .core()?,
+                    shutdown_session_id: row
+                        .try_get("shutdown_session_id")
+                        .core()?,
                     worker_id: row
                         .try_get("worker_id")
                         .core()?,
@@ -1110,6 +1143,18 @@ impl WorkerRegistryStore for PostgresFleetStore {
                         .core()?,
                     software_version: row
                         .try_get("software_version")
+                        .core()?,
+                    protocol_offer: row
+                        .try_get::<Option<serde_json::Value>, _>("protocol_offer")
+                        .core()?
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .core()?,
+                    protocol_contract: row
+                        .try_get::<Option<serde_json::Value>, _>("protocol_contract")
+                        .core()?
+                        .map(serde_json::from_value)
+                        .transpose()
                         .core()?,
                     last_heartbeat_at: row
                         .try_get("last_heartbeat_at")
@@ -1185,39 +1230,26 @@ impl WorkerRegistryStore for PostgresFleetStore {
         worker_id: Uuid,
         draining: bool,
     ) -> sbgh_core::Result<WorkerRegistryMutation> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .core()?;
-        let result = sqlx::query(
-            "UPDATE worker_registry
-                SET draining = $2, updated_at = NOW()
-              WHERE worker_id = $1",
-        )
-        .bind(worker_id)
-        .bind(draining)
-        .execute(&mut *tx)
-        .await
-        .core()?;
-        if result.rows_affected() == 0 {
-            return Ok(WorkerRegistryMutation::NotFound);
-        }
-        if !draining {
-            sqlx::query(
-                "UPDATE worker_session
-                    SET status = 'idle'
-                  WHERE worker_id = $1
-                    AND status = 'draining'
-                    AND expires_at > NOW()",
-            )
-            .bind(worker_id)
-            .execute(&mut *tx)
-            .await
-            .core()?;
-        }
-        tx.commit().await.core()?;
-        Ok(WorkerRegistryMutation::Applied)
+        let outcome = self
+            .change_worker_lifecycle(&WorkerLifecycleChange {
+                request_id: Uuid::new_v4(),
+                worker_id,
+                action: if draining {
+                    WorkerLifecycleAction::Cordon
+                } else {
+                    WorkerLifecycleAction::Uncordon
+                },
+                actor: "legacy:drain".into(),
+                reason: "legacy worker drain control".into(),
+            })
+            .await?;
+        Ok(match outcome {
+            WorkerLifecycleOutcome::Applied(_) => WorkerRegistryMutation::Applied,
+            WorkerLifecycleOutcome::NotFound => WorkerRegistryMutation::NotFound,
+            WorkerLifecycleOutcome::Conflict | WorkerLifecycleOutcome::UnsupportedSession => {
+                WorkerRegistryMutation::Conflict
+            }
+        })
     }
 }
 
@@ -1230,11 +1262,39 @@ impl FleetStore for PostgresFleetStore {
         request: &RegisterSessionRequest,
         session_ttl: Duration,
     ) -> sbgh_core::Result<AuthorizedSession> {
+        request
+            .validate()
+            .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
+        let offer = ProtocolOffer::registration(
+            request.protocol_version,
+            request
+                .protocol_offer
+                .as_ref(),
+        )
+        .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
+        let offer_json = request
+            .protocol_offer
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| sbgh_core::Error::Other(error.into()))?;
+        let preflight_json = request
+            .preflight
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| sbgh_core::Error::Other(error.into()))?;
         let mut tx = self
             .pool
             .begin()
             .await
             .core()?;
+        let protocol_policy = protocol::lock_policy(&mut tx).await?;
+        let contract = offer
+            .negotiate(protocol_policy.minimum_revision)
+            .map_err(|_| SessionRegistrationError::ProtocolIncompatible)?;
+        let contract_json = serde_json::to_value(&contract)
+            .map_err(|error| sbgh_core::Error::Other(error.into()))?;
         let policy = sqlx::query(
             r#"
             SELECT ARRAY(
@@ -1301,6 +1361,9 @@ impl FleetStore for PostgresFleetStore {
                          FROM unnest(advertised_capabilities) AS capability
                    ) AS advertised_capabilities,
                    protocol_version,
+                   protocol_offer,
+                   protocol_contract,
+                   preflight_report,
                    software_version,
                    resource_facts,
                    identity_key_sha256,
@@ -1323,6 +1386,14 @@ impl FleetStore for PostgresFleetStore {
                 .core()?
                 == i32::from(request.protocol_version)
                 && existing
+                    .try_get::<Option<serde_json::Value>, _>("protocol_offer")
+                    .core()?
+                    == offer_json
+                && existing
+                    .try_get::<Option<serde_json::Value>, _>("preflight_report")
+                    .core()?
+                    == preflight_json
+                && existing
                     .try_get::<String, _>("software_version")
                     .core()?
                     == request.software_version
@@ -1341,6 +1412,18 @@ impl FleetStore for PostgresFleetStore {
                     == Some(identity_key_sha256.as_slice());
             if !same {
                 return Err(SessionRegistrationError::FactsChanged.into());
+            }
+            let persisted: ProtocolContract = serde_json::from_value(
+                existing
+                    .try_get("protocol_contract")
+                    .core()?,
+            )
+            .map_err(|error| sbgh_core::Error::Other(error.into()))?;
+            offer
+                .validate_selection(&persisted)
+                .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
+            if persisted.revision < protocol_policy.minimum_revision {
+                return Err(SessionRegistrationError::ProtocolIncompatible.into());
             }
             let status: String = existing
                 .try_get("status")
@@ -1407,6 +1490,7 @@ impl FleetStore for PostgresFleetStore {
             .core()?;
             tx.commit().await.core()?;
             return Ok(AuthorizedSession {
+                protocol_contract: persisted,
                 worker_id,
                 worker_session_id: request.worker_session_id,
                 effective_capabilities: effective
@@ -1533,12 +1617,13 @@ impl FleetStore for PostgresFleetStore {
             INSERT INTO worker_session
                 (worker_session_id, worker_id, status, protocol_version,
                  software_version, advertised_capabilities, effective_capabilities,
-                 resource_facts, expires_at, identity_key_sha256)
+                 resource_facts, expires_at, identity_key_sha256, protocol_offer, protocol_contract,
+                 preflight_report)
             VALUES (
                 $1, $2, $3::text::worker_session_status, $4, $5,
                 ARRAY(SELECT value::worker_capability FROM unnest($6::text[]) AS value),
                 ARRAY(SELECT value::worker_capability FROM unnest($7::text[]) AS value),
-                $8, $9, $10
+                $8, $9, $10, $11, $12, $13
             )
             "#,
         )
@@ -1552,12 +1637,16 @@ impl FleetStore for PostgresFleetStore {
         .bind(resources)
         .bind(expires_at)
         .bind(identity_key_sha256.as_slice())
+        .bind(offer_json)
+        .bind(contract_json)
+        .bind(preflight_json)
         .execute(&mut *tx)
         .await
         .core()?;
         tx.commit().await.core()?;
 
         Ok(AuthorizedSession {
+            protocol_contract: contract,
             worker_id,
             worker_session_id: request.worker_session_id,
             effective_capabilities: effective
@@ -1581,15 +1670,19 @@ impl FleetStore for PostgresFleetStore {
             r#"
             UPDATE worker_session session
                SET status = 'deregistered',
-                   ended_at = NOW()
+                   ended_at = COALESCE(ended_at, NOW())
              WHERE session.worker_id = $1
                AND session.worker_session_id = $2
-               AND session.status IN ('registered', 'idle', 'draining')
+               AND session.status IN ('registered', 'idle', 'draining', 'offline', 'deregistered')
                AND NOT EXISTS (
                    SELECT 1
                      FROM worker_attempt attempt
                     WHERE attempt.worker_session_id = session.worker_session_id
                       AND attempt.status IN ('offered', 'running', 'cancel_requested')
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM worker_cleanup_obligation obligation
+                   WHERE obligation.worker_id = session.worker_id AND obligation.status = 'pending'
                )
             "#,
         )
@@ -1605,6 +1698,7 @@ impl FleetStore for PostgresFleetStore {
         &self,
         submission_id: Uuid,
         sources: &[ResolvedSpecSource],
+        scheduler_generation: i64,
     ) -> sbgh_core::Result<bool> {
         let mut resolved = BTreeMap::new();
         for source in sources {
@@ -1628,6 +1722,10 @@ impl FleetStore for PostgresFleetStore {
             .begin()
             .await
             .core()?;
+        let policy = scheduler::lock_policy(&mut tx).await?;
+        if policy.paused || policy.generation != scheduler_generation {
+            return Ok(false);
+        }
         let rows = sqlx::query(
             r#"
             SELECT id, git_commit_hash
@@ -1718,6 +1816,15 @@ impl FleetStore for PostgresFleetStore {
     }
 
     async fn prepare_execution(&self, prepared: &PreparedExecution) -> sbgh_core::Result<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .core()?;
+        let policy = scheduler::lock_policy(&mut tx).await?;
+        if policy.paused || policy.generation != prepared.scheduler_generation {
+            return Ok(false);
+        }
         let payload = serde_json::to_value(&prepared.payload)
             .map_err(|error| sbgh_core::Error::Other(anyhow::Error::new(error)))?;
         let result = sqlx::query(
@@ -1738,9 +1845,10 @@ impl FleetStore for PostgresFleetStore {
         .bind(i32::from(sbgh_fleet::PROTOCOL_VERSION))
         .bind(payload)
         .bind(&prepared.payload_hash)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .core()?;
+        tx.commit().await.core()?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1756,6 +1864,13 @@ impl FleetStore for PostgresFleetStore {
             .begin()
             .await
             .core()?;
+        let policy = scheduler::lock_policy(&mut tx).await?;
+        let protocol_policy = protocol::lock_policy(&mut tx).await?;
+        sqlx::query("SELECT worker_id FROM worker_registry WHERE worker_id=$1 FOR UPDATE")
+            .bind(worker_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .core()?;
         let session = sqlx::query(
             r#"
             SELECT ARRAY(
@@ -1765,6 +1880,8 @@ impl FleetStore for PostgresFleetStore {
                    ) AS capabilities,
                    registry.measurement_profile,
                    registry.draining,
+                   session.protocol_contract,
+                   registry.shutdown_session_id = session.worker_session_id AS shutdown_requested,
                    session.status::text AS status
               FROM worker_session session
               JOIN worker_registry registry ON registry.worker_id = session.worker_id
@@ -1773,7 +1890,7 @@ impl FleetStore for PostgresFleetStore {
                AND registry.enabled
                AND session.advertised_capabilities && registry.allowed_capabilities
                AND session.expires_at > NOW()
-               AND session.status IN ('registered', 'idle', 'offered')
+               AND session.status IN ('registered', 'idle', 'offered', 'draining')
              FOR UPDATE OF session, registry
             "#,
         )
@@ -1799,10 +1916,26 @@ impl FleetStore for PostgresFleetStore {
         .execute(&mut *tx)
         .await
         .core()?;
+        let contract: ProtocolContract = serde_json::from_value(
+            session
+                .try_get("protocol_contract")
+                .core()?,
+        )
+        .core()?;
+        ProtocolOffer::current()
+            .validate_selection(&contract)
+            .map_err(|error| sbgh_core::Error::Config(error.to_string()))?;
+        if contract.revision < protocol_policy.minimum_revision {
+            return Err(SessionRegistrationError::ProtocolIncompatible.into());
+        }
         let draining: bool = session
             .try_get("draining")
             .core()?;
-        if draining {
+        let shutdown_requested = session
+            .try_get::<Option<bool>, _>("shutdown_requested")
+            .core()?
+            .unwrap_or(false);
+        if draining || shutdown_requested {
             sqlx::query(
                 "UPDATE worker_session SET status = 'draining'
                   WHERE worker_session_id = $1",
@@ -1811,6 +1944,12 @@ impl FleetStore for PostgresFleetStore {
             .execute(&mut *tx)
             .await
             .core()?;
+            tx.commit().await.core()?;
+            return Ok(None);
+        }
+
+        let pending_cleanup = has_pending_cleanup(&mut tx, worker_id).await?;
+        if policy.paused || pending_cleanup {
             tx.commit().await.core()?;
             return Ok(None);
         }
@@ -1834,12 +1973,28 @@ impl FleetStore for PostgresFleetStore {
             .core()?
         {
             tx.commit().await.core()?;
-            return Ok(Some(offer_from_row(&row)?));
+            if row
+                .try_get::<i64, _>("scheduler_generation")
+                .core()?
+                != policy.generation
+            {
+                // The expiry sweep releases this unaccepted offer; never revive
+                // an offer from before a maintenance boundary.
+                return Ok(None);
+            }
+            let offered = offer_from_row(&row)?;
+            if !contract.supports_payload(&offered.payload) {
+                return Ok(None);
+            }
+            return Ok(Some(offered));
         }
 
-        let capabilities: Vec<String> = session
+        let mut capabilities: Vec<String> = session
             .try_get("capabilities")
             .core()?;
+        capabilities.retain(|name| {
+            capability(name).is_ok_and(|capability| contract.supports_capability(capability))
+        });
         let measurement_profile: Option<String> = session
             .try_get("measurement_profile")
             .core()?;
@@ -1924,6 +2079,14 @@ impl FleetStore for PostgresFleetStore {
         };
 
         let job_id: Uuid = row.try_get("job_id").core()?;
+        let payload: TaskPayload = serde_json::from_value(
+            row.try_get("execution_payload")
+                .core()?,
+        )
+        .map_err(|error| sbgh_core::Error::Other(error.into()))?;
+        if !contract.supports_payload(&payload) {
+            return Ok(None);
+        }
         let task_submission_id: Uuid = row
             .try_get("task_submission_id")
             .core()?;
@@ -2001,10 +2164,10 @@ impl FleetStore for PostgresFleetStore {
                 (attempt_id, job_id, task_submission_id, worker_id,
                  worker_session_id, status, fencing_generation,
                  execution_generation, claim_token, trace_id, capability,
-                 payload_hash, offer_expires_at, lease_expires_at)
+                 payload_hash, offer_expires_at, lease_expires_at, scheduler_generation)
             VALUES (
                 $1, $2, $3, $4, $5, 'offered', $6, $7, $8, $9,
-                $10::text::worker_capability, $11, $12, $13
+                $10::text::worker_capability, $11, $12, $13, $14
             )
             "#,
         )
@@ -2024,6 +2187,7 @@ impl FleetStore for PostgresFleetStore {
         )
         .bind(offer_expires_at)
         .bind(lease_expires_at)
+        .bind(policy.generation)
         .execute(&mut *tx)
         .await
         .core()?;
@@ -2077,33 +2241,59 @@ impl FleetStore for PostgresFleetStore {
         }))
     }
 
-    async fn session_is_draining(
+    async fn idle_worker_control(
         &self,
         worker_id: Uuid,
         worker_session_id: Uuid,
-    ) -> sbgh_core::Result<bool> {
-        sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                  FROM worker_session session
-                  JOIN worker_registry registry
-                    ON registry.worker_id = session.worker_id
-                 WHERE session.worker_id = $1
-                   AND session.worker_session_id = $2
-                   AND registry.enabled
-                   AND session.advertised_capabilities && registry.allowed_capabilities
-                   AND registry.draining
-                   AND session.status = 'draining'
-                   AND session.expires_at > NOW()
-            )
-            "#,
+    ) -> sbgh_core::Result<IdleWorkerControl> {
+        let row = sqlx::query(
+            "SELECT registry.draining, registry.shutdown_session_id, session.protocol_contract,
+                EXISTS (SELECT 1 FROM worker_attempt WHERE worker_id=$1 AND status IN ('offered','running','cancel_requested'))
+                OR EXISTS (SELECT 1 FROM worker_cleanup_obligation WHERE worker_id=$1 AND status='pending') AS busy
+             FROM worker_session session JOIN worker_registry registry USING (worker_id)
+             WHERE session.worker_id=$1 AND session.worker_session_id=$2 AND registry.enabled
+               AND session.advertised_capabilities && registry.allowed_capabilities
+               AND session.ended_at IS NULL AND session.expires_at > clock_timestamp()",
         )
         .bind(worker_id)
         .bind(worker_session_id)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .core()
+        .core()?;
+        let Some(row) = row else {
+            return Err(sbgh_core::Error::FleetSessionInactive);
+        };
+        if row
+            .try_get::<bool, _>("busy")
+            .core()?
+        {
+            return Ok(IdleWorkerControl::Poll);
+        }
+        let contract: ProtocolContract = serde_json::from_value(
+            row.try_get("protocol_contract")
+                .core()?,
+        )
+        .core()?;
+        if row
+            .try_get::<Option<Uuid>, _>("shutdown_session_id")
+            .core()?
+            == Some(worker_session_id)
+            && contract
+                .features
+                .contains(&ProtocolFeature::ShutdownAfterIdle)
+        {
+            return Ok(IdleWorkerControl::ShutdownAfterIdle);
+        }
+        if row
+            .try_get::<bool, _>("draining")
+            .core()?
+            && !contract
+                .features
+                .contains(&ProtocolFeature::ResidentCordon)
+        {
+            return Ok(IdleWorkerControl::LegacyDrain);
+        }
+        Ok(IdleWorkerControl::Poll)
     }
 
     async fn session_is_active(
@@ -2220,9 +2410,16 @@ impl FleetStore for PostgresFleetStore {
             .begin()
             .await
             .core()?;
+        let policy = scheduler::lock_policy(&mut tx).await?;
+        let protocol_policy = protocol::lock_policy(&mut tx).await?;
+        let worker = sqlx::query("SELECT enabled, draining, shutdown_session_id FROM worker_registry WHERE worker_id=$1 FOR UPDATE")
+            .bind(worker_id).fetch_optional(&mut *tx).await.core()?;
+        let Some(worker) = worker else {
+            return Ok(false);
+        };
         let attempt = sqlx::query(
             r#"
-            SELECT job_id, claim_token, status::text AS status
+            SELECT job_id, claim_token, status::text AS status, scheduler_generation
               FROM worker_attempt
              WHERE attempt_id = $1
                AND worker_id = $2
@@ -2249,13 +2446,44 @@ impl FleetStore for PostgresFleetStore {
             tx.commit().await.core()?;
             return Ok(true);
         }
-        if status != "offered" {
+        if status != "offered"
+            || !worker
+                .try_get::<bool, _>("enabled")
+                .core()?
+            || worker
+                .try_get::<bool, _>("draining")
+                .core()?
+            || worker
+                .try_get::<Option<Uuid>, _>("shutdown_session_id")
+                .core()?
+                == Some(identity.worker_session_id)
+            || policy.paused
+            || has_pending_cleanup(&mut tx, worker_id).await?
+            || attempt
+                .try_get::<i64, _>("scheduler_generation")
+                .core()?
+                != policy.generation
+        {
             tx.rollback().await.core()?;
             return Ok(false);
         }
         let job_id: Uuid = attempt
             .try_get("job_id")
             .core()?;
+        let compatible: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+            SELECT 1 FROM worker_session WHERE worker_session_id = $1 AND worker_id = $2
+            AND (protocol_contract->>'revision')::integer >= $3)",
+        )
+        .bind(identity.worker_session_id)
+        .bind(worker_id)
+        .bind(i32::from(protocol_policy.minimum_revision))
+        .fetch_one(&mut *tx)
+        .await
+        .core()?;
+        if !compatible {
+            return Err(SessionRegistrationError::ProtocolIncompatible.into());
+        }
         let claim_token: Uuid = attempt
             .try_get("claim_token")
             .core()?;
@@ -2347,12 +2575,13 @@ impl FleetStore for PostgresFleetStore {
             UPDATE worker_attempt attempt
                SET lease_expires_at = NOW() + make_interval(secs => $5),
                    updated_at = NOW()
-              FROM worker_registry registry
+              FROM worker_registry registry, worker_session session
              WHERE attempt.attempt_id = $1
                AND attempt.worker_id = $2
                AND attempt.worker_session_id = $3
                AND attempt.fencing_generation = $4
                AND attempt.worker_id = registry.worker_id
+               AND session.worker_session_id = attempt.worker_session_id
                AND registry.enabled
                AND attempt.capability = ANY(registry.allowed_capabilities)
                AND attempt.status IN ('running', 'cancel_requested')
@@ -2360,7 +2589,8 @@ impl FleetStore for PostgresFleetStore {
             RETURNING attempt.status::text AS status,
                       attempt.lease_expires_at,
                       attempt.highest_contiguous_reliable_seq,
-                      registry.draining
+                      registry.draining,
+                      session.protocol_contract
             "#,
         )
         .bind(identity.attempt_id)
@@ -2395,9 +2625,18 @@ impl FleetStore for PostgresFleetStore {
         let draining: bool = row
             .try_get("draining")
             .core()?;
+        let contract: ProtocolContract = serde_json::from_value(
+            row.try_get("protocol_contract")
+                .core()?,
+        )
+        .core()?;
         let desired_state = if status == "cancel_requested" {
             DesiredState::Cancel
-        } else if draining {
+        } else if draining
+            && !contract
+                .features
+                .contains(&ProtocolFeature::ResidentCordon)
+        {
             DesiredState::Drain
         } else {
             DesiredState::Continue
@@ -2419,102 +2658,9 @@ impl FleetStore for PostgresFleetStore {
             .begin()
             .await
             .core()?;
-        // Lock in the same attempt→job order as accept/terminal transitions.
-        let attempt = sqlx::query(
-            "SELECT attempt_id, worker_session_id, status::text AS status
-               FROM worker_attempt
-              WHERE job_id = $1
-                AND status IN ('offered', 'running', 'cancel_requested')
-              FOR UPDATE",
-        )
-        .bind(job_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .core()?;
-        let job_status: Option<String> =
-            sqlx::query_scalar("SELECT status::text FROM job WHERE id = $1 FOR UPDATE")
-                .bind(job_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .core()?;
-        let Some(job_status) = job_status else {
-            tx.rollback().await.core()?;
-            return Ok(false);
-        };
-        if job_status == "cancelled" {
-            tx.commit().await.core()?;
-            return Ok(true);
-        }
-        if let Some(attempt) = attempt {
-            let attempt_id: Uuid = attempt
-                .try_get("attempt_id")
-                .core()?;
-            let session_id: Uuid = attempt
-                .try_get("worker_session_id")
-                .core()?;
-            let status: String = attempt
-                .try_get("status")
-                .core()?;
-            if matches!(status.as_str(), "running" | "cancel_requested") {
-                sqlx::query(
-                    "UPDATE worker_attempt
-                        SET status = 'cancel_requested', updated_at = NOW()
-                      WHERE attempt_id = $1",
-                )
-                .bind(attempt_id)
-                .execute(&mut *tx)
-                .await
-                .core()?;
-                tx.commit().await.core()?;
-                return Ok(true);
-            }
-
-            // An offer has not acquired local resources. Fence it and
-            // terminal-cancel the job; a concurrent accept serializes on the
-            // same attempt row, so exactly one transition wins.
-            discard_attempt_projection(&mut tx, attempt_id, "offered work was cancelled").await?;
-            sqlx::query(
-                "UPDATE worker_attempt
-                    SET status = 'fenced', updated_at = NOW()
-                  WHERE attempt_id = $1 AND status = 'offered'",
-            )
-            .bind(attempt_id)
-            .execute(&mut *tx)
-            .await
-            .core()?;
-            sqlx::query(
-                "UPDATE worker_session
-                    SET status = 'idle', last_heartbeat_at = NOW()
-                  WHERE worker_session_id = $1 AND status = 'offered'",
-            )
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await
-            .core()?;
-        }
-        let cancelled = sqlx::query(
-            "UPDATE job
-                SET status = 'cancelled', claim_token = NULL,
-                    claimed_at = NULL, updated_at = NOW()
-              WHERE id = $1 AND status IN ('queued', 'claimed')",
-        )
-        .bind(job_id)
-        .execute(&mut *tx)
-        .await
-        .core()?;
-        if cancelled.rows_affected() == 1 {
-            insert_job_event(
-                &mut tx,
-                job_id,
-                JobEventKind::Cancelled,
-                JobEventStatus::Success,
-                Some("cancelled before worker execution started"),
-                None,
-            )
-            .await?;
-        }
+        let accepted = cancellation::request(&mut tx, job_id).await?;
         tx.commit().await.core()?;
-        Ok(cancelled.rows_affected() == 1)
+        Ok(accepted)
     }
 
     async fn expire_unreported_slack_jobs(
@@ -2608,39 +2754,6 @@ impl FleetStore for PostgresFleetStore {
         let failed = fail_locked_queued_jobs(&mut tx, job_ids, remark).await?;
         tx.commit().await.core()?;
         Ok(failed)
-    }
-
-    async fn set_all_workers_draining(&self, draining: bool) -> sbgh_core::Result<u64> {
-        let result = sqlx::query(
-            "UPDATE worker_registry
-                SET draining = $1, updated_at = NOW()
-              WHERE enabled AND draining IS DISTINCT FROM $1",
-        )
-        .bind(draining)
-        .execute(&self.pool)
-        .await
-        .core()?;
-        Ok(result.rows_affected())
-    }
-
-    async fn request_cancel_all(&self) -> sbgh_core::Result<u64> {
-        let job_ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id
-               FROM job
-              WHERE status IN ('queued', 'claimed', 'running')
-              ORDER BY id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .core()?;
-        let mut cancelled = 0_u64;
-        for job_id in job_ids {
-            cancelled += u64::from(
-                self.request_cancel(job_id)
-                    .await?,
-            );
-        }
-        Ok(cancelled)
     }
 
     async fn recover_submission(
@@ -4404,6 +4517,21 @@ impl FleetStore for PostgresFleetStore {
                 .core()? as u64,
         })
     }
+}
+
+/// Check worker-wide teardown debt, including obligations from older sessions.
+async fn has_pending_cleanup(
+    tx: &mut Transaction<'_, Postgres>,
+    worker_id: Uuid,
+) -> sbgh_core::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM worker_cleanup_obligation
+        WHERE worker_id=$1 AND status='pending')",
+    )
+    .bind(worker_id)
+    .fetch_one(&mut **tx)
+    .await
+    .core()
 }
 
 /// Retain stale attempt events for audit while making it explicit that they

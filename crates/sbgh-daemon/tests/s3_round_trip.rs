@@ -12,62 +12,14 @@
 
 use std::time::Duration;
 
-use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use sbgh_daemon::{ArtifactStore, S3Store, S3StoreConfig, artifact_key};
 use sbgh_fleet::ArtifactDescriptor;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const ENDPOINT: &str = "http://127.0.0.1:9100";
-const BUCKET: &str = "sbgh-test";
-const REGION: &str = "us-east-1";
-const ACCESS: &str = "minioadmin";
-const SECRET: &str = "minioadmin";
-
-fn s3_config() -> S3StoreConfig {
-    S3StoreConfig {
-        endpoint: ENDPOINT.into(),
-        bucket: BUCKET.into(),
-        region: REGION.into(),
-        access_key_id: ACCESS.into(),
-        secret_access_key: SECRET.into(),
-    }
-}
-
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap()
-}
-
-/// Create the test bucket. The `minio` setup script's `--wait` already blocks
-/// on the image's healthcheck, so MinIO is ready; the short retry is just
-/// belt-and-suspenders against a transient first-request hiccup. Treats an
-/// already-existing bucket (HTTP 200 or 409) as success. Panics — and so fails
-/// the test loudly — if MinIO never becomes reachable.
-async fn ensure_bucket() {
-    let creds = Credentials::new(ACCESS, SECRET);
-    let bucket =
-        Bucket::new(url::Url::parse(ENDPOINT).unwrap(), UrlStyle::Path, BUCKET, REGION).unwrap();
-    let http = http();
-    let mut last = String::from("(no attempt)");
-    for _ in 0..60 {
-        let url = bucket
-            .create_bucket(&creds)
-            .sign(Duration::from_secs(60));
-        match http.put(url).send().await {
-            // 200 OK (created / us-east-1 re-create) or 409
-            // BucketAlreadyOwnedByYou — both mean "bucket is there".
-            Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => return,
-            Ok(r) => last = format!("HTTP {}", r.status()),
-            Err(e) => last = e.to_string(),
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    panic!("MinIO not ready (bucket create failed after retries): {last}");
-}
-
+#[path = "support/s3.rs"]
+mod s3;
+use s3::{ensure_bucket, http, s3_config};
 #[tokio::test]
 async fn s3_store_round_trips_against_minio() {
     ensure_bucket().await;

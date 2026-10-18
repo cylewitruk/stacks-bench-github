@@ -11,8 +11,8 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use sbgh_fleet::{
-    AttemptIdentity, LeaseToken, PollResponse, RegisterSessionResponse, RegistrationCheckResponse,
-    WorkOffer, WorkerCapability,
+    AttemptIdentity, LeaseToken, PollResponse, PreflightReport, ProtocolOffer,
+    RegisterSessionResponse, RegistrationCheckResponse, WorkOffer, WorkerCapability,
 };
 use sbgh_proto::Wire;
 use sbgh_proto::fleet::v1::worker_fleet_service_server::{
@@ -98,6 +98,7 @@ fn pki_fixture() -> PkiFixture {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Drain,
+    ShutdownAckLoss,
     RejectFirstOffer,
     Recover,
     OldDaemon,
@@ -120,6 +121,8 @@ struct MockFleet {
     worker_id: Uuid,
     mode: Mode,
     session_id: Arc<std::sync::Mutex<Option<Uuid>>>,
+    /// Original successful startup evidence must survive all recovery registrations.
+    preflight: Arc<std::sync::Mutex<Option<PreflightReport>>>,
     polls: Arc<AtomicUsize>,
     deregistrations: Arc<AtomicUsize>,
     registrations: Arc<AtomicUsize>,
@@ -168,8 +171,18 @@ impl WorkerFleetService for MockFleet {
                 .facts()
                 .clone()
         );
+        let contract = ProtocolOffer::registration(
+            request.protocol_version,
+            request
+                .protocol_offer
+                .as_ref(),
+        )
+        .unwrap()
+        .negotiate(1)
+        .unwrap();
         Ok(Response::new(CheckRegistrationResponse::from_domain(RegistrationCheckResponse {
-            protocol_version: sbgh_fleet::PROTOCOL_VERSION,
+            protocol_version: contract.revision,
+            protocol_contract: Some(contract),
             worker_id: self.worker_id,
             effective_capabilities: request.advertised_capabilities,
             measurement_profile: Some("loopback".into()),
@@ -201,6 +214,26 @@ impl WorkerFleetService for MockFleet {
         let previous = self
             .registrations
             .fetch_add(1, Ordering::SeqCst);
+        {
+            let report = registration
+                .preflight
+                .as_ref()
+                .expect("successful preflight before registration");
+            assert_eq!(report.revision, 1);
+            assert_eq!(report.executable_sha256.len(), 64);
+            assert_eq!(
+                report
+                    .configuration_sha256
+                    .len(),
+                64
+            );
+            let mut original = self.preflight.lock().unwrap();
+            if let Some(original) = original.as_ref() {
+                assert_eq!(report, original, "recovery must preserve successful startup evidence");
+            } else {
+                *original = Some(report.clone());
+            }
+        }
         let mut session = self
             .session_id
             .lock()
@@ -212,8 +245,18 @@ impl WorkerFleetService for MockFleet {
             return Err(Self::lifecycle_error("session_superseded"));
         }
         *session = Some(registration.worker_session_id);
+        let contract = ProtocolOffer::registration(
+            registration.protocol_version,
+            registration
+                .protocol_offer
+                .as_ref(),
+        )
+        .unwrap()
+        .negotiate(1)
+        .unwrap();
         Ok(Response::new(WireRegisterResponse::from_domain(RegisterSessionResponse {
-            protocol_version: sbgh_fleet::PROTOCOL_VERSION,
+            protocol_version: contract.revision,
+            protocol_contract: Some(contract),
             heartbeat_interval_ms: 1_000,
             lease_ttl_ms: 5_000,
             server_time_ms: now_millis(),
@@ -239,6 +282,7 @@ impl WorkerFleetService for MockFleet {
             .polls
             .fetch_add(1, Ordering::SeqCst);
         let response = match (self.mode, index) {
+            (Mode::ShutdownAckLoss, _) => PollResponse::ShutdownAfterIdle,
             (Mode::Recover | Mode::Superseded, 0) => {
                 return Err(Self::lifecycle_error("session_recovery_required"));
             }
@@ -402,8 +446,12 @@ impl WorkerFleetService for MockFleet {
                 .lock()
                 .unwrap()
         );
-        self.deregistrations
+        let previous = self
+            .deregistrations
             .fetch_add(1, Ordering::SeqCst);
+        if self.mode == Mode::ShutdownAckLoss && previous == 0 {
+            return Err(Status::unavailable("deregistration response lost"));
+        }
         Ok(Response::new(DeregisterResponse::from_domain(true)))
     }
 
@@ -613,6 +661,7 @@ async fn run_case(mode: Mode) {
         worker_id,
         mode,
         session_id: Arc::new(std::sync::Mutex::new(None)),
+        preflight: Arc::new(std::sync::Mutex::new(None)),
         polls: Arc::new(AtomicUsize::new(0)),
         deregistrations: Arc::new(AtomicUsize::new(0)),
         registrations: Arc::new(AtomicUsize::new(0)),
@@ -650,7 +699,7 @@ async fn run_case(mode: Mode) {
         registration
             .registration
             .protocol_version,
-        sbgh_fleet::PROTOCOL_VERSION
+        sbgh_fleet::NEGOTIATED_PROTOCOL_REVISION
     );
     assert!(
         fleet
@@ -699,7 +748,7 @@ async fn run_case(mode: Mode) {
         fleet
             .deregistrations
             .load(Ordering::SeqCst),
-        usize::from(!rejected)
+        if mode == Mode::ShutdownAckLoss { 2 } else { usize::from(!rejected) }
     );
     assert_eq!(
         fleet
@@ -716,6 +765,11 @@ async fn run_case(mode: Mode) {
 #[tokio::test]
 async fn real_worker_registers_polls_drain_and_deregisters_over_mtls_grpc() {
     run_case(Mode::Drain).await;
+}
+
+#[tokio::test]
+async fn lifecycle_shutdown_retries_lost_deregistration_ack_in_the_same_session() {
+    run_case(Mode::ShutdownAckLoss).await;
 }
 
 #[tokio::test]

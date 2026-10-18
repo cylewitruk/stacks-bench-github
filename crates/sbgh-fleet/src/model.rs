@@ -4,6 +4,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::{PreflightReport, ProtocolContract, ProtocolOffer};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerCapability {
@@ -34,6 +36,8 @@ pub struct ResourceFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrationCheckRequest {
     pub protocol_version: u16,
+    /// Explicit negotiation; absent only for the deployed revision-1 contract.
+    pub protocol_offer: Option<ProtocolOffer>,
     pub software_version: String,
     pub advertised_capabilities: BTreeSet<WorkerCapability>,
     pub resources: ResourceFacts,
@@ -42,6 +46,8 @@ pub struct RegistrationCheckRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrationCheckResponse {
     pub protocol_version: u16,
+    /// Selected semantics, present when explicit negotiation was requested.
+    pub protocol_contract: Option<ProtocolContract>,
     pub worker_id: Uuid,
     pub effective_capabilities: BTreeSet<WorkerCapability>,
     pub measurement_profile: Option<String>,
@@ -53,7 +59,11 @@ pub struct RegistrationCheckResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterSessionRequest {
+    /// Immutable successful startup checks; absent on previous workers.
+    pub preflight: Option<PreflightReport>,
     pub protocol_version: u16,
+    /// Immutable advertised protocol facts for this session.
+    pub protocol_offer: Option<ProtocolOffer>,
     pub worker_session_id: Uuid,
     pub software_version: String,
     pub advertised_capabilities: BTreeSet<WorkerCapability>,
@@ -63,6 +73,8 @@ pub struct RegisterSessionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterSessionResponse {
     pub protocol_version: u16,
+    /// Immutable selected semantics; absent on a legacy registration response.
+    pub protocol_contract: Option<ProtocolContract>,
     pub heartbeat_interval_ms: u64,
     pub lease_ttl_ms: u64,
     pub server_time_ms: i64,
@@ -105,6 +117,8 @@ pub enum PollResponse {
     /// The registry is draining this worker. It must stop polling, finish
     /// cleanup, and deregister.
     Drain,
+    /// Negotiated, session-targeted exit after execution and cleanup are idle.
+    ShutdownAfterIdle,
     Offer {
         offer: Box<WorkOffer>,
     },

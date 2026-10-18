@@ -79,6 +79,7 @@ url.workspace = true
 # Regex matching for tag-pattern trigger policies.
 regex.workspace = true
 [dev-dependencies]
+toml.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 sbgh-driver.workspace = true
 sbgh-github = { workspace = true, features = ["testing"] }

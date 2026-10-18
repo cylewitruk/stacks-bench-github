@@ -9,8 +9,10 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use chrono::Duration;
 use http_body_util::BodyExt;
 use sbgh_core::db::SubmissionStore;
+use sbgh_core::db::fleet::WorkerRegistration;
 use sbgh_core::models::{
     BuildTarget, GitRefKind, JobIntent, JobSource, QueuedEventDetail, TaskKind,
 };
@@ -18,10 +20,15 @@ use sbgh_core::submission::{
     BlockValidationPlan, PreparedSubmission, ProducerKey, ResolvedTaskSource,
     SchedulingConstraints, SubmissionActor, SubmissionCommand, SubmissionProvenance, TaskPlan,
 };
-use sbgh_fleet::{BlockValidationPayload, BlockValidationSelection};
+use sbgh_fleet::{
+    BlockValidationPayload, BlockValidationSelection, PreflightReport, ProtocolOffer,
+    RegisterSessionRequest, ResourceFacts, WorkerCapability,
+};
+use sbgh_postgres::PostgresFleetStore;
 use sbgh_postgres::db::PostgresJobStore;
 use sbgh_postgres::db::{Pool, PostgresIngestStore, setup_pg_db};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use super::{ApiState, ApiTokens, build_router};
 
@@ -429,6 +436,320 @@ async fn authenticated_submission_report_uses_not_found_envelope() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn lifecycle_http_requires_admin_preserves_receipts_and_rejects_spoofed_actors() {
+    let (_db, pool) = setup_pg_db().await;
+    let worker = Uuid::new_v4();
+    PostgresFleetStore::new(pool.clone())
+        .seed_worker(&WorkerRegistration {
+            worker_id: worker,
+            display_name: "lifecycle".into(),
+            allowed_capabilities: vec![WorkerCapability::BuildOnly],
+            measurement_profile: None,
+            enabled: true,
+            draining: false,
+        })
+        .await
+        .unwrap();
+    let router = router_with(pool.clone(), "http://unused".into());
+    let route = format!("/api/fleet/workers/{worker}/lifecycle");
+    let request =
+        serde_json::json!({"request_id":Uuid::new_v4(),"action":"cordon","reason":"maintenance"});
+    for token in [None, Some("readtok"), Some("ingesttok")] {
+        let (status, _) = send(&router, "POST", &route, token, Some(&request.to_string())).await;
+        assert!(status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
+    }
+    let (status, receipt) =
+        send(&router, "POST", &route, Some("admintok"), Some(&request.to_string())).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["actor"], "api:admin");
+    assert_eq!(receipt["generation"], 1);
+    for token in [None, Some("ingesttok")] {
+        let (status, _) = send(&router, "GET", &route, token, None).await;
+        assert!(status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
+    }
+    let (status, snapshot) = send(&router, "GET", &route, Some("readtok"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(snapshot["generation"], 1);
+    assert_eq!(snapshot["cordoned"], true);
+    assert_eq!(snapshot["session_live"], false);
+    assert_eq!(snapshot["cordon_semantic"], "unknown");
+    assert_eq!(snapshot["pending_cleanup"], 0);
+    assert_eq!(snapshot["admission"]["schedulable"], false);
+    assert!(
+        snapshot["admission"]["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("session_inactive"))
+    );
+    let (status, replay) =
+        send(&router, "POST", &route, Some("admintok"), Some(&request.to_string())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt, replay);
+    let mut invalid = request.clone();
+    invalid["actor"] = "spoof".into();
+    let (status, _) =
+        send(&router, "POST", &route, Some("admintok"), Some(&invalid.to_string())).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let mut shutdown = request.clone();
+    shutdown["request_id"] = Uuid::new_v4()
+        .to_string()
+        .into();
+    shutdown["action"] = "shutdown_after_idle".into();
+    let (status, _) =
+        send(&router, "POST", &route, Some("admintok"), Some(&shutdown.to_string())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "unregistered worker has no shutdown contract");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM worker_lifecycle_audit")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn lifecycle_http_exposes_immutable_preflight_provenance() {
+    let (_db, pool) = setup_pg_db().await;
+    let worker = Uuid::new_v4();
+    let store = PostgresFleetStore::new(pool.clone());
+    store
+        .seed_worker(&WorkerRegistration {
+            worker_id: worker,
+            display_name: "preflight".into(),
+            allowed_capabilities: vec![WorkerCapability::BuildOnly],
+            measurement_profile: None,
+            enabled: true,
+            draining: true,
+        })
+        .await
+        .unwrap();
+    let report = PreflightReport {
+        revision: 1,
+        completed_at_ms: 1_792_213_533_000,
+        executable_sha256: "ab".repeat(32),
+        configuration_sha256: "cd".repeat(32),
+    };
+    store
+        .register_session(
+            worker,
+            &RegisterSessionRequest {
+                preflight: Some(report.clone()),
+                protocol_version: 2,
+                protocol_offer: Some(ProtocolOffer::current()),
+                worker_session_id: Uuid::new_v4(),
+                software_version: "test".into(),
+                advertised_capabilities: [WorkerCapability::BuildOnly].into(),
+                resources: ResourceFacts {
+                    logical_cpus: 2,
+                    memory_bytes: 8 << 30,
+                },
+            },
+            Duration::seconds(90),
+        )
+        .await
+        .unwrap();
+    let router = router_with(pool, "http://unused".into());
+    let (status, snapshot) = send(
+        &router,
+        "GET",
+        &format!("/api/fleet/workers/{worker}/lifecycle"),
+        Some("readtok"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(snapshot["preflight"], serde_json::to_value(report).unwrap());
+    assert_eq!(snapshot["admission"]["schedulable"], false);
+}
+
+#[tokio::test]
+async fn protocol_floor_http_requires_admin_and_audits_idempotent_changes() {
+    let (_db, pool) = setup_pg_db().await;
+    let router = router_with(pool.clone(), "http://unused".into());
+    let body = serde_json::json!({
+        "request_id": uuid::Uuid::new_v4(), "minimum_revision":2,
+        "reason":"qualified upgrade", "rollback_evidence":"qualification/test"
+    })
+    .to_string();
+    for (token, expected) in
+        [(None, StatusCode::UNAUTHORIZED), (Some("readtok"), StatusCode::FORBIDDEN)]
+    {
+        let (status, _) = send(&router, "POST", "/api/fleet/protocol", token, Some(&body)).await;
+        assert_eq!(status, expected);
+    }
+    let (status, original) =
+        send(&router, "GET", "/api/fleet/protocol", Some("readtok"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(original["minimum_revision"], 1);
+    let (status, _) =
+        send(&router, "POST", "/api/fleet/protocol", Some("admintok"), Some(&body)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let pause =
+        serde_json::json!({"request_id":uuid::Uuid::new_v4(),"reason":"protocol maintenance"})
+            .to_string();
+    let (status, _) =
+        send(&router, "POST", "/api/fleet/scheduler/pause", Some("admintok"), Some(&pause)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, receipt) =
+        send(&router, "POST", "/api/fleet/protocol", Some("admintok"), Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["minimum_revision"], 2);
+    assert_eq!(receipt["actor"], "api:admin");
+    let (status, replay) =
+        send(&router, "POST", "/api/fleet/protocol", Some("admintok"), Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt, replay);
+    for patch in [
+        serde_json::json!({"minimum_revision":0}),
+        serde_json::json!({"minimum_revision":3}),
+        serde_json::json!({"rollback_evidence":" "}),
+        serde_json::json!({"actor":"spoof"}),
+    ] {
+        let mut invalid: serde_json::Value = serde_json::from_str(&body).unwrap();
+        invalid
+            .as_object_mut()
+            .unwrap()
+            .extend(
+                patch
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/api/fleet/protocol",
+            Some("admintok"),
+            Some(&invalid.to_string()),
+        )
+        .await;
+        assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM fleet_protocol_administration_audit")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn fleet_abort_http_requires_admin_explicit_scope_pause_and_audited_actor() {
+    let (_db, pool) = setup_pg_db().await;
+    let router = router_with(pool, "http://unused".into());
+    let mut request = serde_json::json!({"request_id":Uuid::new_v4(),"scope":"active","scheduler_generation":1,"reason":"operator test"});
+    for token in [None, Some("readtok"), Some("ingesttok")] {
+        let (status, _) =
+            send(&router, "POST", "/api/fleet/abort", token, Some(&request.to_string())).await;
+        assert!(status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
+    }
+    let (status, _) =
+        send(&router, "POST", "/api/fleet/abort", Some("admintok"), Some(&request.to_string()))
+            .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let pause = serde_json::json!({"request_id":Uuid::new_v4(),"reason":"abort test"});
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/api/fleet/scheduler/pause",
+        Some("admintok"),
+        Some(&pause.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, receipt) =
+        send(&router, "POST", "/api/fleet/abort", Some("admintok"), Some(&request.to_string()))
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["actor"], "api:admin");
+    assert_eq!(receipt["accepted_job_ids"], serde_json::json!([]));
+    let (_, replay) =
+        send(&router, "POST", "/api/fleet/abort", Some("admintok"), Some(&request.to_string()))
+            .await;
+    assert_eq!(replay, receipt);
+    request["actor"] = "spoof".into();
+    let (status, _) =
+        send(&router, "POST", "/api/fleet/abort", Some("admintok"), Some(&request.to_string()))
+            .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    request
+        .as_object_mut()
+        .unwrap()
+        .remove("actor");
+    request
+        .as_object_mut()
+        .unwrap()
+        .remove("scope");
+    let (status, _) =
+        send(&router, "POST", "/api/fleet/abort", Some("admintok"), Some(&request.to_string()))
+            .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn worker_protocol_visibility_preserves_advertised_and_selected_facts() {
+    let (_db, pool) = setup_pg_db().await;
+    let store = PostgresFleetStore::new(pool.clone());
+    let router = router_with(pool, "http://unused".into());
+    for revision in [1, 2] {
+        let worker_id = uuid::Uuid::new_v4();
+        store
+            .seed_worker(&WorkerRegistration {
+                worker_id,
+                display_name: format!("revision-{revision}"),
+                allowed_capabilities: vec![WorkerCapability::BuildOnly],
+                measurement_profile: None,
+                enabled: true,
+                draining: false,
+            })
+            .await
+            .unwrap();
+        let mut offer = ProtocolOffer::current();
+        offer.features = ["build_only_v1".into(), "future_feature".into()].into();
+        store
+            .register_session(
+                worker_id,
+                &RegisterSessionRequest {
+                    preflight: None,
+                    protocol_version: revision,
+                    protocol_offer: (revision == 2).then_some(offer),
+                    worker_session_id: uuid::Uuid::new_v4(),
+                    software_version: "test".into(),
+                    advertised_capabilities: [WorkerCapability::BuildOnly].into(),
+                    resources: ResourceFacts {
+                        logical_cpus: 2,
+                        memory_bytes: 8 * 1024 * 1024 * 1024,
+                    },
+                },
+                Duration::seconds(90),
+            )
+            .await
+            .unwrap();
+        let (status, body) =
+            send(&router, "GET", &format!("/api/fleet/workers/{worker_id}"), Some("readtok"), None)
+                .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let protocol = &body["worker"]["protocol"];
+        assert_eq!(protocol["revision"], revision);
+        if revision == 1 {
+            assert!(protocol["offer"].is_null());
+            assert_eq!(
+                protocol["features"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                3
+            );
+        } else {
+            assert_eq!(protocol["offer"]["minimum_revision"], 1);
+            assert_eq!(protocol["offer"]["maximum_revision"], 2);
+            assert_eq!(
+                protocol["offer"]["features"],
+                serde_json::json!(["build_only_v1", "future_feature"])
+            );
+            assert_eq!(protocol["features"], serde_json::json!(["build_only_v1"]));
+        }
+    }
 }
 
 #[tokio::test]

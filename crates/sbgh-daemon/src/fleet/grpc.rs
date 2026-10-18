@@ -234,14 +234,24 @@ async fn serving_health()
 }
 
 pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::Result<()> {
+    let config = runtime.service.config();
+    let listener =
+        MtlsListener::bind(config.listen, &config.server_certificate, &config.server_private_key)
+            .await?;
+    serve(runtime, listener, shutdown).await
+}
+
+/// Serve an already-bound listener, shared with runtime compatibility qualification.
+async fn serve(
+    runtime: FleetRuntime,
+    listener: MtlsListener,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
     let config = runtime
         .service
         .config()
         .clone();
     let request_limit = config.max_concurrent_requests;
-    let listener =
-        MtlsListener::bind(config.listen, &config.server_certificate, &config.server_private_key)
-            .await?;
     let local_addr = listener.local_addr();
     let grpc = GrpcFleet {
         service: runtime.service.clone(),
@@ -270,6 +280,9 @@ pub async fn run(runtime: FleetRuntime, shutdown: CancellationToken) -> anyhow::
     maintenance.abort();
     serving.map_err(anyhow::Error::from)
 }
+
+#[cfg(all(test, unix))]
+mod compatibility;
 
 #[cfg(test)]
 mod tests {

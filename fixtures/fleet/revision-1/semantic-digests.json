@@ -1,0 +1,267 @@
+{
+  "source_commit": "0f18950ad086799015fd1af0d66a7e672a3e5e27",
+  "protocol_revision": 1,
+  "cases": [
+    {
+      "name": "build-only",
+      "kind": "task",
+      "value": {
+        "kind": "build_only"
+      },
+      "sha256": "f295f563cc5a9969f2ac6afc38e115e1594ab18c1a26356eac4013d7a3fbee07"
+    },
+    {
+      "name": "benchmark",
+      "kind": "task",
+      "value": {
+        "kind": "benchmark",
+        "effective_args": [
+          "--start-at",
+          "8694809",
+          "--end-at",
+          "8719808",
+          "--warmup",
+          "5000",
+          "--no-profiler-kv"
+        ],
+        "workload_key": null,
+        "sqlite_seed_key": null,
+        "shared_baseline_calibration": false,
+        "baseline_calibration_id": null,
+        "run_index": 0,
+        "requested_run_count": 1
+      },
+      "sha256": "bab06920aa116293753fc7e19cac31f4433bff0b62bbf70cb90ea1ca598bf600"
+    },
+    {
+      "name": "benchmark-repeat",
+      "kind": "task",
+      "value": {
+        "kind": "benchmark",
+        "effective_args": [
+          "--count",
+          "100"
+        ],
+        "workload_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sqlite_seed_key": "submission/benchmark.sqlite",
+        "shared_baseline_calibration": true,
+        "baseline_calibration_id": 17,
+        "run_index": 1,
+        "requested_run_count": 2
+      },
+      "sha256": "f39901a27749c169701a04a6ade6c611561d8d3c55fe25dfc09fecc6445d8020"
+    },
+    {
+      "name": "validation-recent",
+      "kind": "task",
+      "value": {
+        "kind": "block_validation",
+        "selection": {
+          "kind": "recent",
+          "block_count": 1
+        },
+        "timeout_secs": 1800
+      },
+      "sha256": "30e245d60eddb72ad97a7bf0855d3a506e38de50095d49ad6bcdb7aad35514b9"
+    },
+    {
+      "name": "validation-full",
+      "kind": "task",
+      "value": {
+        "kind": "block_validation",
+        "selection": {
+          "kind": "full"
+        },
+        "timeout_secs": 86400
+      },
+      "sha256": "b3bb35cb326bcb2bd74cc3d1c9c8ece78d0c52357f19ee4fac0b87dd6c3942c9"
+    },
+    {
+      "name": "validation-range",
+      "kind": "task",
+      "value": {
+        "kind": "block_validation",
+        "selection": {
+          "kind": "range",
+          "range": {
+            "start": 185629,
+            "end": 185630
+          }
+        },
+        "timeout_secs": 1800
+      },
+      "sha256": "1dff554ef2ffefb8cc9ac34ca124ec95909babc9b6084b83fe3ec6a987645997"
+    },
+    {
+      "name": "phase",
+      "kind": "event",
+      "value": {
+        "kind": "phase",
+        "label": "validating",
+        "elapsed_ms": 4294967297
+      },
+      "sha256": "e2baa030e5e26f7430e55de38ac1c295d06d802c26cfb0f31de09a8827848717"
+    },
+    {
+      "name": "terminal-event",
+      "kind": "event",
+      "value": {
+        "kind": "terminal",
+        "outcome_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "sha256": "5f714ade53a845a8c928469da3de93e63730d94aca209843b65407a4c2b23a22"
+    },
+    {
+      "name": "completed-build",
+      "kind": "outcome",
+      "value": {
+        "kind": "completed",
+        "summary": {
+          "unicode": "å雪",
+          "quoted": "\"\n\\",
+          "nested": {
+            "z": false,
+            "a": null
+          },
+          "array": [
+            3,
+            1,
+            2
+          ],
+          "large": 18446744073709551615,
+          "ratio": 1.25
+        },
+        "block_validation": null
+      },
+      "sha256": "815cfc1bb57ef25ad130afcfb65498bdfe8debf4d141e3711a154d7f2165b8e8"
+    },
+    {
+      "name": "completed-validation",
+      "kind": "outcome",
+      "value": {
+        "kind": "completed",
+        "summary": {
+          "checked_blocks": 2
+        },
+        "block_validation": {
+          "valid": true,
+          "checked_blocks": 2,
+          "invalid_blocks": [],
+          "chainstate_origin": "vg0/mainnet-2026-09-21",
+          "observed": {
+            "pre_nakamoto_count": 185630,
+            "nakamoto_count": 8865006
+          },
+          "resolved_range": {
+            "start": 185629,
+            "end": 185630
+          },
+          "segments": [
+            {
+              "epoch": "pre_nakamoto",
+              "global_range": {
+                "start": 185629,
+                "end": 185629
+              },
+              "local_range": {
+                "start": 185629,
+                "end": 185629
+              }
+            },
+            {
+              "epoch": "nakamoto",
+              "global_range": {
+                "start": 185630,
+                "end": 185630
+              },
+              "local_range": {
+                "start": 0,
+                "end": 0
+              }
+            }
+          ],
+          "shard_count": 2,
+          "max_concurrency": 2
+        }
+      },
+      "sha256": "e46d2a07d60a5c273ff6468d8cc9dc4f041e70740fcb09b3fdadcf89073a8cb2"
+    },
+    {
+      "name": "invalid-validation",
+      "kind": "outcome",
+      "value": {
+        "kind": "completed",
+        "summary": {},
+        "block_validation": {
+          "valid": false,
+          "checked_blocks": 1,
+          "invalid_blocks": [
+            {
+              "shard": 0,
+              "block": "0xab",
+              "reason": "root mismatch"
+            }
+          ],
+          "chainstate_origin": "vg0/mainnet-2026-09-21",
+          "observed": {
+            "pre_nakamoto_count": 185630,
+            "nakamoto_count": 8865006
+          },
+          "resolved_range": {
+            "start": 185630,
+            "end": 185630
+          },
+          "segments": [
+            {
+              "epoch": "nakamoto",
+              "global_range": {
+                "start": 185630,
+                "end": 185630
+              },
+              "local_range": {
+                "start": 0,
+                "end": 0
+              }
+            }
+          ],
+          "shard_count": 1,
+          "max_concurrency": 1
+        }
+      },
+      "sha256": "9651d5e006aec78c4b05bb9592f09e67548b5e5cf8a71207274d7cb7b2d331b4"
+    },
+    {
+      "name": "failed",
+      "kind": "outcome",
+      "value": {
+        "kind": "failed",
+        "error": "VM failed",
+        "summary": null,
+        "retryable": false
+      },
+      "sha256": "241412941c9cba3c71a2bede31130d41ff72079b04e17bda2d0722c57882a19f"
+    },
+    {
+      "name": "failed-retryable",
+      "kind": "outcome",
+      "value": {
+        "kind": "failed",
+        "error": "temporary",
+        "summary": {
+          "code": 7
+        },
+        "retryable": true
+      },
+      "sha256": "a658fc5426b6b86516f44a9436434d0e857a0c06e88e7c9a91c97dcdd36a51fc"
+    },
+    {
+      "name": "cancelled",
+      "kind": "outcome",
+      "value": {
+        "kind": "cancelled",
+        "reason": "operator request"
+      },
+      "sha256": "9921d6c3931d251429e1ede48a892fbbdab9897f325115193a95fcf43779c82f"
+    }
+  ]
+}

@@ -839,7 +839,9 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
     .unwrap();
     std::fs::write(
         results.join("run.progress.jsonl"),
-        br#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":2,"total":3,"message":"shards 1/2 complete"}}
+        br#"{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"initialize","current":0,"message":"discovering chainstate range (index-range); processed-block total not yet known"}}
+{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"initialize","current":0,"total":3,"message":"shards 0/2 complete; 2 initializing or waiting for processed-block progress"}}
+{"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":2,"total":3,"message":"shards 1/2 complete"}}
 {"schema_version":1,"event_type":"progress","event_version":1,"progress":{"phase":"validate","current":3,"total":3,"message":"shards 2/2 complete"}}
 "#,
     )
@@ -1038,6 +1040,30 @@ async fn block_validation_cache_hit_runs_in_one_vm_and_returns_typed_output() {
             .lock()
             .unwrap(),
         vec![
+            ProgressUpdate {
+                workflow_step: WorkflowStep::Run,
+                run_index: 0,
+                requested_run_count: 1,
+                phase: "initialize".into(),
+                progress: 0,
+                total: None,
+                message: Some(
+                    "discovering chainstate range (index-range); processed-block total not yet known"
+                        .into(),
+                ),
+            },
+            ProgressUpdate {
+                workflow_step: WorkflowStep::Run,
+                run_index: 0,
+                requested_run_count: 1,
+                phase: "initialize".into(),
+                progress: 0,
+                total: Some(3),
+                message: Some(
+                    "shards 0/2 complete; 2 initializing or waiting for processed-block progress"
+                        .into(),
+                ),
+            },
             ProgressUpdate {
                 workflow_step: WorkflowStep::Run,
                 run_index: 0,

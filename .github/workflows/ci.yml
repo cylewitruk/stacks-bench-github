@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0 # Pinned previous-worker source is part of the runtime gate.
 
       - name: Install pinned Rust toolchain
         run: |
@@ -34,7 +36,8 @@ jobs:
           input: proto
           format: false
           lint: true
-          breaking: false
+          breaking: true
+          breaking_against: fixtures/fleet/revision-1/proto
           push: false
           archive: false
           pr_comment: false
@@ -49,3 +52,6 @@ jobs:
       # MinIO fixtures used by the integration-test tier.
       - name: "Test (Docker: Postgres + MinIO)"
         run: just test --summary --no-sccache
+
+      - name: Pinned previous/current worker runtime compatibility
+        run: just qualify-protocol-runtime

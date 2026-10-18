@@ -13,20 +13,25 @@
 //! Migrations are the daemon's responsibility and are applied at startup; the
 //! CLI has no schema-management subcommand.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use sbgh_api::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest, Client,
-    DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest,
+    CordonSemantic, DisableInstallerRequest, DisablePolicyRequest, DisableRepoRequest,
     EnqueueBlockValidationRequest, PinTriggerRequest, RoleRequest, TriggerView,
-    WorkerCreateRequest, WorkerPolicyView, WorkerUpdateRequest, read_cookie,
+    WorkerCreateRequest, WorkerLifecycleAction, WorkerPolicyView, WorkerUpdateRequest, read_cookie,
 };
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod abort;
+mod lifecycle;
 mod output;
+mod protocol;
+mod scheduler;
 mod work;
 
 use output::OutputArgs;
@@ -511,6 +516,28 @@ enum ValidationSelectionArg {
 
 #[derive(Subcommand, Debug)]
 enum FleetAction {
+    /// Cancel a frozen fleet workload at an explicitly paused scheduler generation.
+    Abort(abort::AbortArgs),
+    /// Read coherent worker policy, session semantics and maintenance debt.
+    WorkerStatus(lifecycle::StatusArgs),
+    /// Wait for worker maintenance or schedulability without changing policy.
+    WaitWorker(lifecycle::WaitArgs),
+    /// Block new work; negotiated workers stay resident, legacy workers exit when idle.
+    Cordon(lifecycle::ChangeArgs),
+    /// Remove the worker-specific scheduling restriction without starting a process.
+    Uncordon(lifecycle::ChangeArgs),
+    /// Stop the current compatible session after work and cleanup, without changing cordon policy.
+    ShutdownAfterIdle(lifecycle::ChangeArgs),
+    /// Inspect or deliberately change the protocol compatibility floor.
+    Protocol {
+        #[command(subcommand)]
+        action: protocol::Action,
+    },
+    /// Pause/resume admission or wait for a paused fleet to become quiescent.
+    Scheduler {
+        #[command(subcommand)]
+        action: scheduler::Action,
+    },
     /// Show worker/session/attempt status and fleet health counters.
     Status,
     /// Enroll a new disabled and drained worker policy.
@@ -1338,6 +1365,19 @@ async fn run_status(client: &Client) -> anyhow::Result<()> {
 
 async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
     match action {
+        FleetAction::WorkerStatus(args) => lifecycle::status(client, args).await?,
+        FleetAction::WaitWorker(args) => lifecycle::wait(client, args).await?,
+        FleetAction::Scheduler { action } => scheduler::run(client, action).await?,
+        FleetAction::Cordon(args) => {
+            lifecycle::change(client, WorkerLifecycleAction::Cordon, args).await?
+        }
+        FleetAction::Uncordon(args) => {
+            lifecycle::change(client, WorkerLifecycleAction::Uncordon, args).await?
+        }
+        FleetAction::ShutdownAfterIdle(args) => {
+            lifecycle::change(client, WorkerLifecycleAction::ShutdownAfterIdle, args).await?
+        }
+        FleetAction::Protocol { action } => protocol::run(client, action).await?,
         FleetAction::Status => {
             let fleet = client
                 .fleet_overview()
@@ -1359,9 +1399,18 @@ async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
                     .summary
                     .staged_artifact_bytes,
             );
+            if let Some(policy) = &fleet.scheduler {
+                println!(
+                    "scheduler={} generation={}",
+                    if policy.paused { "paused" } else { "running" },
+                    policy.generation
+                );
+            } else {
+                println!("scheduler=unknown (daemon does not expose maintenance policy)");
+            }
             for worker in fleet.workers {
                 println!(
-                    "{}  {:<20} enabled={} draining={} status={} capabilities={} profile={} job={} heartbeat={}",
+                    "{}  {:<20} enabled={} draining={} status={} capabilities={} profile={} job={} heartbeat={} protocol={} features={} cordon_semantic={} shutdown_session={}",
                     worker.worker_id,
                     worker.display_name,
                     worker.enabled,
@@ -1382,6 +1431,32 @@ async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
                     worker
                         .last_heartbeat_at
                         .as_deref()
+                        .unwrap_or("-"),
+                    worker
+                        .protocol
+                        .as_ref()
+                        .map(|protocol| protocol.revision.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    worker
+                        .protocol
+                        .as_ref()
+                        .map(|protocol| protocol.features.join(","))
+                        .unwrap_or_else(|| "unknown".into()),
+                    match worker
+                        .lifecycle
+                        .as_ref()
+                        .map(|lifecycle| lifecycle.cordon_semantic)
+                    {
+                        Some(CordonSemantic::Resident) => "resident",
+                        Some(CordonSemantic::ExitAfterIdle) => "exit_after_idle",
+                        Some(CordonSemantic::Unknown) | None => "unknown",
+                    },
+                    worker
+                        .lifecycle
+                        .as_ref()
+                        .and_then(|lifecycle| lifecycle
+                            .shutdown_session_id
+                            .as_deref())
                         .unwrap_or("-"),
                 );
             }
@@ -1514,6 +1589,7 @@ async fn run_fleet(client: &Client, action: FleetAction) -> anyhow::Result<()> {
                 .with_context(|| format!("cancel fleet job {job_id}"))?;
             println!("{} cancel_requested={}", response.job_id, response.cancel_requested);
         }
+        FleetAction::Abort(args) => abort::run(client, args).await?,
         FleetAction::RecoverSubmission {
             submission_id,
             worker_id,
@@ -1542,7 +1618,7 @@ fn print_worker_policy(policy: &WorkerPolicyView) {
 fn init_tracing() {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(io::stderr))
         .init();
 }
 

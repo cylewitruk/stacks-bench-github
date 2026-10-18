@@ -1,3 +1,4 @@
+use crate::{SchedulerPolicyView, WorkerLifecycleView};
 use serde::{Deserialize, Serialize};
 
 /// `GET /api/health` response.
@@ -320,8 +321,33 @@ pub struct FleetSummaryView {
     pub staged_artifact_bytes: u64,
 }
 
+/// Explicit revision window and optional features advertised at registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerProtocolOfferView {
+    /// Lowest implemented revision.
+    pub minimum_revision: u16,
+    /// Highest implemented revision.
+    pub maximum_revision: u16,
+    /// Advertised names, including unknown optional features.
+    pub features: Vec<String>,
+}
+
+/// Immutable protocol contract of the worker's latest session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerProtocolView {
+    /// Absent for a legacy registration with fixed revision-1 semantics.
+    pub offer: Option<WorkerProtocolOfferView>,
+    /// Selected protocol revision, not the software package version.
+    pub revision: u16,
+    /// Selected semantics, independent of task authorization.
+    pub features: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetWorkerView {
+    /// Desired process policy and negotiated cordon behavior; absent on old daemons.
+    #[serde(default)]
+    pub lifecycle: Option<WorkerLifecycleView>,
     pub worker_id: String,
     pub display_name: String,
     pub enabled: bool,
@@ -331,6 +357,9 @@ pub struct FleetWorkerView {
     pub worker_session_id: Option<String>,
     pub session_status: Option<String>,
     pub software_version: Option<String>,
+    /// Latest session contract; absent before registration or on older daemons.
+    #[serde(default)]
+    pub protocol: Option<WorkerProtocolView>,
     pub last_heartbeat_at: Option<String>,
     pub session_expires_at: Option<String>,
     pub resource_facts: Option<serde_json::Value>,
@@ -341,6 +370,9 @@ pub struct FleetWorkerView {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetOverview {
+    /// Admission policy; absent only when talking to a pre-maintenance daemon.
+    #[serde(default)]
+    pub scheduler: Option<SchedulerPolicyView>,
     pub summary: FleetSummaryView,
     pub workers: Vec<FleetWorkerView>,
 }

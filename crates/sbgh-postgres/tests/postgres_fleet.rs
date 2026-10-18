@@ -1,4 +1,18 @@
 use std::collections::BTreeSet;
+use std::time::Duration as StdDuration;
+use tokio::time;
+
+#[path = "postgres_fleet/scheduler_tests.rs"]
+mod scheduler_tests;
+
+#[path = "postgres_fleet/protocol_tests.rs"]
+mod protocol_tests;
+
+#[path = "postgres_fleet/lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[path = "postgres_fleet/abort_tests.rs"]
+mod abort_tests;
 
 use chrono::{Duration, Utc};
 use sbgh_core::Error as CoreError;
@@ -8,6 +22,10 @@ use sbgh_core::db::fleet::{
     FleetTerminalWrite, PreparedExecution, ProjectedReportMutation, ResolvedSpecSource,
     SessionRegistrationError, TerminalAcceptance, WorkerPolicyPatch, WorkerRegistration,
     WorkerRegistryMutation, WorkerRegistryStore,
+};
+use sbgh_core::db::worker_lifecycle::{
+    IdleWorkerControl, WorkerLifecycleAction, WorkerLifecycleChange, WorkerLifecycleOutcome,
+    WorkerLifecycleStore,
 };
 use sbgh_core::models::{
     BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobIntent, JobResult, JobSource, NewJob,
@@ -24,6 +42,37 @@ use sbgh_postgres::db::{
 };
 use sbgh_postgres::{PostgresFleetStore, PostgresJobStore, PreparedJobProvenance};
 use uuid::Uuid;
+
+/// Observe actual database lock contention rather than relying on task sleeps.
+async fn wait_for_lock(pool: &Pool, query: &str, count: i64) {
+    let observed = time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1",
+            )
+            .bind(query)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting == count {
+                break;
+            }
+            time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if observed.is_err() {
+        let waiters: Vec<String> = sqlx::query_scalar(
+            "SELECT query FROM pg_stat_activity
+            WHERE datname=current_database() AND wait_event_type='Lock'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        panic!("expected {count} lock waiters matching {query:?}; actual waiters: {waiters:?}");
+    }
+}
 
 #[tokio::test]
 async fn expired_session_recovers_same_identity_without_replacing_successor() {
@@ -762,7 +811,9 @@ fn registration(worker_id: Uuid) -> WorkerRegistration {
 
 fn session(_worker_id: Uuid, worker_session_id: Uuid) -> RegisterSessionRequest {
     RegisterSessionRequest {
+        preflight: None,
         protocol_version: PROTOCOL_VERSION,
+        protocol_offer: None,
         worker_session_id,
         software_version: env!("CARGO_PKG_VERSION").into(),
         advertised_capabilities: BTreeSet::from([WorkerCapability::BuildOnly]),
@@ -802,6 +853,7 @@ async fn enqueue_build(store: &PostgresFleetStore, job_id: Uuid) {
             })
             .unwrap(),
             &PreparedExecution {
+                scheduler_generation: 0,
                 job_id,
                 commit: "1111111111111111111111111111111111111111".into(),
                 payload,
@@ -851,6 +903,7 @@ async fn enqueue_benchmark(store: &PostgresFleetStore, job_id: Uuid) {
             })
             .unwrap(),
             &PreparedExecution {
+                scheduler_generation: 0,
                 job_id,
                 commit: "1111111111111111111111111111111111111111".into(),
                 payload,
@@ -890,6 +943,7 @@ async fn enqueue_slack_block_validation(store: &PostgresFleetStore, job_id: Uuid
             },
             &serde_json::to_value(QueuedEventDetail::BlockValidation { selection }).unwrap(),
             &PreparedExecution {
+                scheduler_generation: 0,
                 job_id,
                 commit: "1111111111111111111111111111111111111111".into(),
                 payload: payload.clone(),
@@ -958,6 +1012,7 @@ async fn prepared_execution_payload_is_immutable_after_enqueue() {
     assert!(
         !store
             .prepare_execution(&PreparedExecution {
+                scheduler_generation: 0,
                 job_id,
                 commit: "2222222222222222222222222222222222222222".into(),
                 payload_hash: sbgh_fleet::payload_digest(&changed).unwrap(),
@@ -1018,13 +1073,13 @@ async fn scheduling_unit_sources_are_frozen_once_before_lazy_runs() {
     };
     assert!(
         store
-            .freeze_submission_sources(job.task_submission_id, std::slice::from_ref(&frozen))
+            .freeze_submission_sources(job.task_submission_id, std::slice::from_ref(&frozen), 0)
             .await
             .unwrap()
     );
     assert!(
         store
-            .freeze_submission_sources(job.task_submission_id, std::slice::from_ref(&frozen))
+            .freeze_submission_sources(job.task_submission_id, std::slice::from_ref(&frozen), 0)
             .await
             .unwrap(),
         "a lost response must make source freezing idempotent"
@@ -1037,6 +1092,7 @@ async fn scheduling_unit_sources_are_frozen_once_before_lazy_runs() {
                     spec_id: job.task_spec_id,
                     commit: "2222222222222222222222222222222222222222".into(),
                 }],
+                0,
             )
             .await
             .is_err(),
@@ -1256,12 +1312,18 @@ async fn idle_drain_is_observable_and_stops_new_claims() {
         .register_session(worker_id, &session(worker_id, session_id), Duration::minutes(5))
         .await
         .unwrap();
-    assert_eq!(
+    std::assert_matches!(
         store
-            .set_all_workers_draining(true)
+            .change_worker_lifecycle(&WorkerLifecycleChange {
+                request_id: Uuid::new_v4(),
+                worker_id,
+                action: WorkerLifecycleAction::Cordon,
+                actor: "api:admin".into(),
+                reason: "test maintenance".into(),
+            })
             .await
             .unwrap(),
-        1
+        WorkerLifecycleOutcome::Applied(_)
     );
     assert!(
         store
@@ -1270,11 +1332,12 @@ async fn idle_drain_is_observable_and_stops_new_claims() {
             .unwrap()
             .is_none()
     );
-    assert!(
+    assert_eq!(
         store
-            .session_is_draining(worker_id, session_id)
+            .idle_worker_control(worker_id, session_id)
             .await
-            .unwrap()
+            .unwrap(),
+        IdleWorkerControl::LegacyDrain
     );
     assert!(
         store
@@ -1857,7 +1920,9 @@ async fn capability_routes_only_to_a_compatible_worker() {
         .register_session(
             block_worker,
             &RegisterSessionRequest {
+                preflight: None,
                 protocol_version: PROTOCOL_VERSION,
+                protocol_offer: None,
                 worker_session_id: block_session,
                 software_version: env!("CARGO_PKG_VERSION").into(),
                 advertised_capabilities: BTreeSet::from([WorkerCapability::BlockValidation]),
@@ -1903,6 +1968,7 @@ async fn capability_routes_only_to_a_compatible_worker() {
             })
             .unwrap(),
             &PreparedExecution {
+                scheduler_generation: 0,
                 job_id,
                 commit: "1111111111111111111111111111111111111111".into(),
                 payload: payload.clone(),
@@ -2032,7 +2098,9 @@ async fn slack_job_is_not_offered_until_canonical_report_message_is_durable() {
         .register_session(
             worker_id,
             &RegisterSessionRequest {
+                preflight: None,
                 protocol_version: PROTOCOL_VERSION,
+                protocol_offer: None,
                 worker_session_id: session_id,
                 software_version: env!("CARGO_PKG_VERSION").into(),
                 advertised_capabilities: BTreeSet::from([WorkerCapability::BlockValidation]),

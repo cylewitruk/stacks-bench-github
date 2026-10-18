@@ -15,7 +15,11 @@ use crate::dto::{
     WorkerDrainRequest, WorkerIdentityRequest, WorkerPolicyView, WorkerUpdateRequest,
 };
 use crate::error::ApiError;
+use crate::{FleetAbortReceiptView, FleetAbortRequest};
+use crate::{ProtocolPolicyChangeRequest, ProtocolPolicyView};
+use crate::{SchedulerChangeRequest, SchedulerPolicyView, SchedulerStatusView};
 use crate::{SubmissionSummaryView, WorkSnapshotView};
+use crate::{WorkerLifecycleReceiptView, WorkerLifecycleRequest, WorkerMaintenanceView};
 
 /// Errors from a `/api` call.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +44,15 @@ pub struct Client {
 }
 
 impl Client {
+    /// Read one coherent worker-maintenance snapshot without changing policy.
+    pub async fn worker_maintenance(
+        &self,
+        worker_id: &str,
+    ) -> Result<WorkerMaintenanceView, ClientError> {
+        self.get(&format!("/api/fleet/workers/{worker_id}/lifecycle"))
+            .await
+    }
+
     /// Default total request timeout. Generous enough for the admin
     /// endpoints (which do server-side GitHub resolution, itself bounded at
     /// ~10s) while still bounding a hung daemon.
@@ -383,6 +396,38 @@ impl Client {
         self.get("/api/fleet").await
     }
 
+    /// Read the durable compatibility floor (read scope).
+    pub async fn protocol_policy(&self) -> Result<ProtocolPolicyView, ClientError> {
+        self.get("/api/fleet/protocol")
+            .await
+    }
+
+    /// Apply an audited compatibility-floor request (admin scope).
+    pub async fn change_protocol_policy(
+        &self,
+        request: &ProtocolPolicyChangeRequest,
+    ) -> Result<ProtocolPolicyView, ClientError> {
+        self.post_json("/api/fleet/protocol", request)
+            .await
+    }
+
+    /// Read scheduler policy and quiescence counters (read scope).
+    pub async fn scheduler_status(&self) -> Result<SchedulerStatusView, ClientError> {
+        self.get("/api/fleet/scheduler")
+            .await
+    }
+
+    /// Pause or resume admission with an idempotent, audited request (admin scope).
+    pub async fn change_scheduler(
+        &self,
+        paused: bool,
+        request: &SchedulerChangeRequest,
+    ) -> Result<SchedulerPolicyView, ClientError> {
+        let action = if paused { "pause" } else { "resume" };
+        self.post_json(&format!("/api/fleet/scheduler/{action}"), request)
+            .await
+    }
+
     pub async fn create_worker(
         &self,
         request: &WorkerCreateRequest,
@@ -458,6 +503,16 @@ impl Client {
         .await
     }
 
+    /// Apply an explicit worker policy/process request or replay its original receipt.
+    pub async fn change_worker_lifecycle(
+        &self,
+        worker_id: &str,
+        request: &WorkerLifecycleRequest,
+    ) -> Result<WorkerLifecycleReceiptView, ClientError> {
+        self.post_json(&format!("/api/fleet/workers/{worker_id}/lifecycle"), request)
+            .await
+    }
+
     pub async fn recover_fleet_submission(
         &self,
         submission_id: &str,
@@ -476,6 +531,15 @@ impl Client {
         job_id: &str,
     ) -> Result<FleetCancellationResponse, ClientError> {
         self.post_json(&format!("/api/fleet/jobs/{job_id}/cancel"), &())
+            .await
+    }
+
+    /// Cancel a frozen selection while admission is paused at the given generation.
+    pub async fn abort_fleet(
+        &self,
+        request: &FleetAbortRequest,
+    ) -> Result<FleetAbortReceiptView, ClientError> {
+        self.post_json("/api/fleet/abort", request)
             .await
     }
 

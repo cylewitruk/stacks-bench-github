@@ -7,9 +7,9 @@ use crate::{
     AcceptOfferRequest, ArtifactDescriptor, ArtifactGrantRequest, Assignment, AttemptIdentity,
     BlockValidationPayload, BlockValidationResult, BlockValidationSelection,
     CleanupCompleteRequest, CleanupListRequest, CompleteAttemptRequest, DeregisterSessionRequest,
-    HeartbeatRequest, InclusiveRange, PROTOCOL_VERSION, PollRequest, ProgressRequest,
-    RegisterSessionRequest, RegistrationCheckRequest, ReliableEventEnvelope, ReliableEventPayload,
-    RepositoryCredentialRequest, TaskPayload,
+    HeartbeatRequest, InclusiveRange, PREVIOUS_PROTOCOL_REVISION, PollRequest, ProgressRequest,
+    ProtocolOffer, RegisterSessionRequest, RegistrationCheckRequest, ReliableEventEnvelope,
+    ReliableEventPayload, RepositoryCredentialRequest, TaskPayload,
 };
 
 /// Verify that a worker's concrete validation result faithfully resolves the
@@ -164,17 +164,6 @@ pub trait Validate {
     fn validate(&self) -> Result<(), ProtocolError>;
 }
 
-fn version(actual: u16) -> Result<(), ProtocolError> {
-    if actual == PROTOCOL_VERSION {
-        Ok(())
-    } else {
-        Err(ProtocolError::Version {
-            actual,
-            expected: PROTOCOL_VERSION,
-        })
-    }
-}
-
 fn bounded(field: &'static str, value: &str, max: usize, empty: bool) -> Result<(), ProtocolError> {
     if (!empty && value.is_empty())
         || value.len() > max
@@ -316,8 +305,12 @@ impl Validate for InclusiveRange {
 
 impl Validate for RegisterSessionRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
+        if let Some(preflight) = &self.preflight {
+            preflight.validate()?;
+        }
         registration_facts(
             self.protocol_version,
+            self.protocol_offer.as_ref(),
             &self.software_version,
             &self.advertised_capabilities,
             &self.resources,
@@ -339,6 +332,7 @@ impl Validate for RegistrationCheckRequest {
     fn validate(&self) -> Result<(), ProtocolError> {
         registration_facts(
             self.protocol_version,
+            self.protocol_offer.as_ref(),
             &self.software_version,
             &self.advertised_capabilities,
             &self.resources,
@@ -348,11 +342,23 @@ impl Validate for RegistrationCheckRequest {
 
 fn registration_facts(
     protocol_version: u16,
+    protocol_offer: Option<&ProtocolOffer>,
     software_version: &str,
     advertised_capabilities: &BTreeSet<crate::WorkerCapability>,
     resources: &crate::ResourceFacts,
 ) -> Result<(), ProtocolError> {
-    version(protocol_version)?;
+    if protocol_offer.is_none() && protocol_version != PREVIOUS_PROTOCOL_REVISION {
+        return Err(ProtocolError::Version {
+            actual: protocol_version,
+            expected: PREVIOUS_PROTOCOL_REVISION,
+        });
+    }
+    ProtocolOffer::registration(protocol_version, protocol_offer).map_err(|error| {
+        ProtocolError::Invalid {
+            field: "protocol_offer",
+            reason: error.to_string(),
+        }
+    })?;
     bounded("software_version", software_version, MAX_VERSION, false)?;
     if advertised_capabilities.is_empty() {
         return Err(ProtocolError::Invalid {
@@ -868,7 +874,9 @@ mod tests {
     #[test]
     fn registration_accepts_resource_facts_without_dataset_coordination() {
         let request = RegisterSessionRequest {
+            preflight: None,
             protocol_version: PROTOCOL_VERSION,
+            protocol_offer: None,
             worker_session_id: Uuid::new_v4(),
             software_version: "test".into(),
             advertised_capabilities: BTreeSet::from([WorkerCapability::Benchmark]),
@@ -881,6 +889,7 @@ mod tests {
 
         let check = RegistrationCheckRequest {
             protocol_version: request.protocol_version,
+            protocol_offer: None,
             software_version: request.software_version,
             advertised_capabilities: request.advertised_capabilities,
             resources: request.resources,
@@ -907,6 +916,7 @@ mod tests {
     fn registration_check_reuses_registration_fact_validation() {
         let mut request = RegistrationCheckRequest {
             protocol_version: PROTOCOL_VERSION,
+            protocol_offer: None,
             software_version: "test".into(),
             advertised_capabilities: BTreeSet::from([WorkerCapability::Benchmark]),
             resources: ResourceFacts {
@@ -939,7 +949,9 @@ mod tests {
     #[test]
     fn registration_protocol_version_and_telemetry_bounds_are_enforced() {
         let registration = RegisterSessionRequest {
+            preflight: None,
             protocol_version: PROTOCOL_VERSION + 1,
+            protocol_offer: None,
             worker_session_id: Uuid::new_v4(),
             software_version: "test".into(),
             advertised_capabilities: BTreeSet::from([WorkerCapability::Benchmark]),

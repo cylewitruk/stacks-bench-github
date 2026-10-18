@@ -6,6 +6,7 @@
 //! The business endpoints (webhook submit, listings, admin) attach to the
 //! scope-gated groups in Phase 3.
 
+mod abort;
 mod auth;
 mod conv;
 mod error;
@@ -15,9 +16,12 @@ mod health;
 mod installations;
 mod installers;
 mod jobs;
+mod lifecycle;
 mod policies;
+mod protocol;
 mod repos;
 mod resolve;
+mod scheduler;
 mod state;
 mod users;
 mod webhooks;
@@ -75,7 +79,10 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/work/{id}", get(work::show))
             .route("/api/submissions/{id}/report", get(jobs::report))
             .route("/api/fleet", get(fleet::overview))
+            .route("/api/fleet/protocol", get(protocol::status))
+            .route("/api/fleet/scheduler", get(scheduler::status))
             .route("/api/fleet/workers/{id}", get(fleet::show_worker))
+            .route("/api/fleet/workers/{id}/lifecycle", get(lifecycle::status))
             .route("/api/fleet/metrics", get(fleet::metrics)),
         tokens.clone(),
         Scope::Read,
@@ -99,6 +106,10 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
             .route("/api/roles/revoke", post(users::revoke))
             .route("/api/jobs/block-validation", post(jobs::enqueue_block_validation))
             .route("/api/fleet/workers", post(fleet::create_worker))
+            .route("/api/fleet/protocol", post(protocol::change))
+            .route("/api/fleet/scheduler/pause", post(scheduler::pause))
+            .route("/api/fleet/abort", post(abort::abort))
+            .route("/api/fleet/scheduler/resume", post(scheduler::resume))
             .route("/api/fleet/workers/{id}", patch(fleet::update_worker))
             .route("/api/fleet/workers/{id}/identities", post(fleet::authorize_identity))
             .route("/api/fleet/workers/{id}/identities/{identity}", delete(fleet::revoke_identity))
@@ -111,6 +122,7 @@ pub fn build_router(state: ApiState, tokens: Arc<ApiTokens>) -> Router {
                 post(fleet::emergency_revoke_identity),
             )
             .route("/api/fleet/workers/{id}/drain", post(fleet::set_drain))
+            .route("/api/fleet/workers/{id}/lifecycle", post(lifecycle::change))
             .route("/api/fleet/jobs/{id}/cancel", post(fleet::cancel_job))
             .route("/api/fleet/submissions/{id}/recover", post(fleet::recover_submission)),
         tokens,
@@ -237,6 +249,101 @@ mod tests {
             .to_bytes();
         let parsed: sbgh_api::HealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn scheduler_routes_enforce_authorization_and_audited_idempotency() {
+        let (_db, pool) = sbgh_postgres::setup_pg_db().await;
+        let mut state = test_state();
+        state.pool = pool.clone();
+        let tokens = Arc::new(
+            ApiTokens::new("admin".into(), Some("ingest".into()), Some("read".into())).unwrap(),
+        );
+        let router = build_router(state, tokens);
+        let request_id = "37bebd8e-6daa-414d-99b9-d662a572639c";
+        let body = serde_json::json!({"request_id":request_id,"reason":"planned test"});
+        for (token, expected) in [
+            ("", StatusCode::UNAUTHORIZED),
+            ("read", StatusCode::FORBIDDEN),
+            ("ingest", StatusCode::FORBIDDEN),
+            ("admin", StatusCode::OK),
+            ("admin", StatusCode::OK),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/fleet/scheduler/pause")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fleet/scheduler/resume")
+                    .header("authorization", "Bearer admin")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet/scheduler")
+                    .header("authorization", "Bearer read")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let status: sbgh_api::SchedulerStatusView = serde_json::from_slice(&bytes).unwrap();
+        assert!(status.quiescent());
+        assert_eq!(status.policy.actor, "api:admin");
+        let audit: (i64, String) =
+            sqlx::query_as("SELECT count(*), min(actor) FROM scheduler_administration_audit")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(audit, (1, "api:admin".into()));
+        for invalid in [
+            serde_json::json!({"request_id":request_id,"reason":" ",}),
+            serde_json::json!({"request_id":"invalid","reason":"test"}),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/fleet/scheduler/pause")
+                        .header("authorization", "Bearer admin")
+                        .header("content-type", "application/json")
+                        .body(Body::from(invalid.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]

@@ -12,14 +12,15 @@ use sbgh_core::db::fleet::{
     FleetTerminalSubmission, FleetTerminalWrite, SessionRegistrationError, TerminalAcceptance,
     WorkerAuthorization, WorkerRegistryStore,
 };
+use sbgh_core::db::worker_lifecycle::IdleWorkerControl;
 use sbgh_core::models::JobResult;
 use sbgh_fleet::{
     AcceptOfferRequest, AcceptOfferResponse, ArtifactGrantRequest, ArtifactGrantResponse,
     ArtifactOperation, Assignment, AssignmentContext, CleanupCompleteRequest, CleanupItem,
     CleanupListRequest, CompleteAttemptRequest, CompleteAttemptResponse, DeregisterSessionRequest,
-    HeartbeatRequest, HeartbeatResponse, PROTOCOL_VERSION, PollRequest, PollResponse,
-    ProgressRequest, RegisterSessionRequest, RegisterSessionResponse, RegistrationCheckRequest,
-    RegistrationCheckResponse, ReliableEventAck, ReliableEventEnvelope,
+    HeartbeatRequest, HeartbeatResponse, PollRequest, PollResponse, ProgressRequest,
+    ProtocolContract, ProtocolOffer, RegisterSessionRequest, RegisterSessionResponse,
+    RegistrationCheckRequest, RegistrationCheckResponse, ReliableEventAck, ReliableEventEnvelope,
     RepositoryCredentialRequest, RepositoryCredentialResponse, RepositoryToken, Validate,
 };
 use sbgh_github::InstallationTokenCache;
@@ -156,7 +157,13 @@ pub(super) async fn register(
         "worker session registered"
     );
     Ok(RegisterSessionResponse {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: session
+            .protocol_contract
+            .revision,
+        protocol_contract: request
+            .protocol_offer
+            .as_ref()
+            .map(|_| session.protocol_contract),
         heartbeat_interval_ms: state
             .config
             .heartbeat_interval()
@@ -176,7 +183,14 @@ pub(super) async fn check_registration(
     peer: &AuthenticatedPeer,
     request: RegistrationCheckRequest,
 ) -> ServiceResult<RegistrationCheckResponse> {
-    registration_readiness(state.registry.as_ref(), state.config.as_ref(), peer, request).await
+    let floor = state
+        .store
+        .protocol_policy()
+        .await
+        .map_err(internal)?
+        .minimum_revision;
+    registration_readiness(state.registry.as_ref(), state.config.as_ref(), peer, request, floor)
+        .await
 }
 
 async fn registration_readiness(
@@ -184,9 +198,17 @@ async fn registration_readiness(
     config: &FleetConfig,
     peer: &AuthenticatedPeer,
     request: RegistrationCheckRequest,
+    minimum_revision: u16,
 ) -> ServiceResult<RegistrationCheckResponse> {
     let configured = authorize_peer(registry, peer).await?;
     validate(&request)?;
+    let contract = negotiate(
+        request.protocol_version,
+        request
+            .protocol_offer
+            .as_ref(),
+        minimum_revision,
+    )?;
     let effective_capabilities =
         effective_capabilities(&configured, &request.advertised_capabilities)?;
     tracing::info!(
@@ -198,7 +220,11 @@ async fn registration_readiness(
         "worker registration readiness checked"
     );
     Ok(RegistrationCheckResponse {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: contract.revision,
+        protocol_contract: request
+            .protocol_offer
+            .as_ref()
+            .map(|_| contract),
         worker_id: configured.worker_id,
         effective_capabilities,
         measurement_profile: configured.measurement_profile,
@@ -209,6 +235,24 @@ async fn registration_readiness(
         lease_ttl_ms: config.lease_ttl().as_millis() as u64,
         server_time_ms: Utc::now().timestamp_millis(),
     })
+}
+
+/// Negotiate before session creation; incompatible workers require operator action.
+fn negotiate(
+    version: u16,
+    offer: Option<&ProtocolOffer>,
+    minimum_revision: u16,
+) -> ServiceResult<ProtocolContract> {
+    ProtocolOffer::registration(version, offer)
+        .and_then(|offer| offer.negotiate(minimum_revision))
+        .map_err(|error| {
+            service_error(
+                ServiceCode::FailedPrecondition,
+                "protocol_incompatible",
+                &error.to_string(),
+                false,
+            )
+        })
 }
 
 fn effective_capabilities(
@@ -280,7 +324,7 @@ pub(super) async fn poll(
                 chrono_duration(state.config.lease_ttl())?,
             )
             .await
-            .map_err(internal)?
+            .map_err(fleet_store_error)?
         {
             offered
                 .offer
@@ -309,13 +353,15 @@ pub(super) async fn poll(
             );
             return Ok(PollResponse::Offer { offer: Box::new(offered.offer) });
         }
-        if state
+        match state
             .store
-            .session_is_draining(worker_id, request.worker_session_id)
+            .idle_worker_control(worker_id, request.worker_session_id)
             .await
-            .map_err(internal)?
+            .map_err(fleet_store_error)?
         {
-            return Ok(PollResponse::Drain);
+            IdleWorkerControl::LegacyDrain => return Ok(PollResponse::Drain),
+            IdleWorkerControl::ShutdownAfterIdle => return Ok(PollResponse::ShutdownAfterIdle),
+            IdleWorkerControl::Poll => {}
         }
         if !state
             .store
@@ -355,7 +401,7 @@ pub(super) async fn accept(
         .store
         .accept_offer(worker_id, &request.identity, chrono_duration(state.config.lease_ttl())?)
         .await
-        .map_err(internal)?;
+        .map_err(fleet_store_error)?;
     if !accepted {
         return Err(stale_attempt());
     }
@@ -1230,6 +1276,7 @@ fn fleet_store_error(error: CoreError) -> ServiceError {
                 SessionRegistrationError::Superseded => ("session_superseded", false),
                 SessionRegistrationError::FactsChanged => ("session_facts_changed", false),
                 SessionRegistrationError::RecoveryPending => ("session_recovery_pending", true),
+                SessionRegistrationError::ProtocolIncompatible => ("protocol_incompatible", false),
             };
             service_error(ServiceCode::FailedPrecondition, code, &reason.to_string(), retryable)
         }
@@ -1254,6 +1301,7 @@ fn service_error(
 
 #[cfg(test)]
 mod tests {
+    mod artifacts;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1284,6 +1332,7 @@ mod tests {
             (SessionRegistrationError::RecoveryPending.into(), "session_recovery_pending", true),
             (SessionRegistrationError::Superseded.into(), "session_superseded", false),
             (SessionRegistrationError::FactsChanged.into(), "session_facts_changed", false),
+            (SessionRegistrationError::ProtocolIncompatible.into(), "protocol_incompatible", false),
         ] {
             let error = fleet_store_error(source);
             assert_eq!(error.code, ServiceCode::FailedPrecondition);
@@ -1428,6 +1477,7 @@ mod tests {
             &peer,
             RegistrationCheckRequest {
                 protocol_version: PROTOCOL_VERSION,
+                protocol_offer: None,
                 software_version: "test".into(),
                 advertised_capabilities: std::collections::BTreeSet::from([
                     WorkerCapability::Benchmark,
@@ -1438,6 +1488,7 @@ mod tests {
                     memory_bytes: 32 * 1024 * 1024 * 1024,
                 },
             },
+            PROTOCOL_VERSION,
         )
         .await
         .unwrap();

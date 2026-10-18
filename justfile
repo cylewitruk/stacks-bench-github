@@ -41,11 +41,26 @@ build *args:
 fmt:
     cargo --locked fmt --all
 
+# Build the exact predecessor source and exercise both worker runtimes over mTLS.
+qualify-protocol-runtime:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash scripts/build-previous-worker-probe.sh
+    CARGO_TARGET_DIR="$PWD/target" RUSTC_WRAPPER= cargo --locked build -p sbgh-worker --example sbgh-current-worker-probe
+    export SBGH_PREVIOUS_WORKER_PROBE="$PWD/target/previous-worker/debug/examples/sbgh-previous-worker-probe"
+    export SBGH_CURRENT_WORKER_PROBE="$PWD/target/debug/examples/sbgh-current-worker-probe"
+    export SBGH_PREVIOUS_SCHEMA_PROBE="$PWD/target/previous-worker/debug/examples/sbgh-previous-schema-probe"
+    just test --no-sccache --failures --run-ignored=only pinned_worker_runtime pinned_predecessor_schema
+
 check-docs:
     python3 scripts/check-docs.py
 
 check-architecture:
     python3 scripts/check-package-dag.py
+
+# Check the deployed contract without a remote or mutable branch baseline.
+check-proto-compat:
+    buf breaking proto --against fixtures/fleet/revision-1/proto
 
 lint *args:
     #!/usr/bin/env bash

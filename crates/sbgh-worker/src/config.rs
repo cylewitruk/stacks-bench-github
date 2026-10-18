@@ -6,12 +6,12 @@ use sbgh_fleet::WorkerCapability;
 use sbgh_libvirt::{
     BenchmarkProfile, BlockValidationProfile, LibvirtConfig, LvmConfig, PathsConfig, VmConfig,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::BinaryCacheConfig;
 use crate::host_resources::{HostResources, parse_cpu_list};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub orchestrator_url: String,
@@ -25,7 +25,7 @@ pub struct WorkerConfig {
     pub binary_cache: Option<BinaryCacheConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     pub jobs_dir: PathBuf,
@@ -34,7 +34,7 @@ pub struct WorkspaceConfig {
     pub results_archive_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     pub service_user: String,
@@ -43,7 +43,7 @@ pub struct SandboxConfig {
     pub host_cpus: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandsConfig {
     pub virsh: PathBuf,
@@ -56,7 +56,7 @@ pub struct CommandsConfig {
 /// Worker-owned benchmark resource and CPU-placement policy. Build and
 /// measurement phases are sequential and intentionally share one isolated CPU
 /// set on a single-assignment worker.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkConfig {
     pub build_vcpus: u32,

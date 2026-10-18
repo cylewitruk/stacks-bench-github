@@ -6,11 +6,24 @@
 //! on this crate, so a contract change breaks the build everywhere — the
 //! compile-time-contract benefit of gRPC without proto/codegen.
 
+mod abort;
 mod client;
 mod dto;
 mod error;
 mod inspection;
+mod lifecycle;
+mod protocol;
+mod scheduler;
 
+pub use lifecycle::{
+    CordonSemantic, WorkerAdmissionView, WorkerLifecycleAction, WorkerLifecycleReceiptView,
+    WorkerLifecycleRequest, WorkerLifecycleView, WorkerMaintenanceView, WorkerPreflightView,
+};
+pub use protocol::{ProtocolPolicyChangeRequest, ProtocolPolicyView};
+
+pub use scheduler::{SchedulerChangeRequest, SchedulerPolicyView, SchedulerStatusView};
+
+pub use abort::{FleetAbortReceiptView, FleetAbortRequest, FleetAbortScope};
 pub use client::{Client, ClientError, read_cookie};
 pub use dto::{
     AddTriggerRequest, AllowInstallerRequest, AllowPolicyRequest, AllowRepoRequest,
@@ -25,7 +38,7 @@ pub use dto::{
     RoleView, SubmissionReportView, TaskReportView, TriggerView, UserView,
     ValidationEpochSegmentDetail, WebhookSubmitResponse, WebhookSummary, WhoamiResponse,
     WorkerCreateRequest, WorkerDrainRequest, WorkerIdentityRequest, WorkerIdentityView,
-    WorkerPolicyView, WorkerUpdateRequest,
+    WorkerPolicyView, WorkerProtocolOfferView, WorkerProtocolView, WorkerUpdateRequest,
 };
 pub use error::{ApiError, ErrorBody};
 pub use inspection::{

@@ -26,7 +26,7 @@ uuid.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
 axum.workspace = true
 sbgh-postgres = { path = ".", features = ["testing"] }
 

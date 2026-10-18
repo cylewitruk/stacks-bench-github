@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
 
 use sbgh_fleet as domain;
+use sbgh_fleet::Validate;
 use uuid::Uuid;
 
 use crate::fleet::v1 as wire;
+
+mod protocol;
 
 /// Conversion implemented by generated transport messages.
 pub trait Wire: Sized {
@@ -573,7 +576,15 @@ impl Wire for wire::RegisterRequest {
 
     fn into_domain(self) -> Result<Self::Domain, domain::ProtocolError> {
         Ok(domain::RegisterSessionRequest {
+            preflight: self
+                .preflight
+                .map(Wire::into_domain)
+                .transpose()?,
             protocol_version: protocol_version(self.protocol_version)?,
+            protocol_offer: self
+                .protocol_offer
+                .map(Wire::into_domain)
+                .transpose()?,
             worker_session_id: uuid("worker_session_id", &self.worker_session_id)?,
             software_version: self.software_version,
             advertised_capabilities: self
@@ -591,6 +602,12 @@ impl Wire for wire::RegisterRequest {
             worker_session_id: value
                 .worker_session_id
                 .to_string(),
+            preflight: value
+                .preflight
+                .map(wire::PreflightReport::from_domain),
+            protocol_offer: value
+                .protocol_offer
+                .map(wire::ProtocolOffer::from_domain),
             software_version: value.software_version,
             advertised_capabilities: value
                 .advertised_capabilities
@@ -602,12 +619,40 @@ impl Wire for wire::RegisterRequest {
     }
 }
 
+impl Wire for wire::PreflightReport {
+    type Domain = domain::PreflightReport;
+
+    fn into_domain(self) -> Result<Self::Domain, domain::ProtocolError> {
+        let report = domain::PreflightReport {
+            revision: self.revision,
+            completed_at_ms: self.completed_at_ms,
+            executable_sha256: self.executable_sha256,
+            configuration_sha256: self.configuration_sha256,
+        };
+        report.validate()?;
+        Ok(report)
+    }
+
+    fn from_domain(value: Self::Domain) -> Self {
+        Self {
+            revision: value.revision,
+            completed_at_ms: value.completed_at_ms,
+            executable_sha256: value.executable_sha256,
+            configuration_sha256: value.configuration_sha256,
+        }
+    }
+}
+
 impl Wire for wire::CheckRegistrationRequest {
     type Domain = domain::RegistrationCheckRequest;
 
     fn into_domain(self) -> Result<Self::Domain, domain::ProtocolError> {
         Ok(domain::RegistrationCheckRequest {
             protocol_version: protocol_version(self.protocol_version)?,
+            protocol_offer: self
+                .protocol_offer
+                .map(Wire::into_domain)
+                .transpose()?,
             software_version: self.software_version,
             advertised_capabilities: self
                 .advertised_capabilities
@@ -622,6 +667,9 @@ impl Wire for wire::CheckRegistrationRequest {
         Self {
             protocol_version: u32::from(value.protocol_version),
             software_version: value.software_version,
+            protocol_offer: value
+                .protocol_offer
+                .map(wire::ProtocolOffer::from_domain),
             advertised_capabilities: value
                 .advertised_capabilities
                 .into_iter()
@@ -730,6 +778,7 @@ impl Wire for wire::RegisterResponse {
     fn into_domain(self) -> Result<Self::Domain, domain::ProtocolError> {
         Ok(domain::RegisterSessionResponse {
             protocol_version: protocol_version(self.protocol_version)?,
+            protocol_contract: protocol::selected(self.protocol_version, self.protocol_contract)?,
             heartbeat_interval_ms: self.heartbeat_interval_ms,
             lease_ttl_ms: self.lease_ttl_ms,
             server_time_ms: self.server_time_ms,
@@ -740,6 +789,9 @@ impl Wire for wire::RegisterResponse {
         Self {
             protocol_version: u32::from(value.protocol_version),
             heartbeat_interval_ms: value.heartbeat_interval_ms,
+            protocol_contract: value
+                .protocol_contract
+                .map(wire::ProtocolContract::from_domain),
             lease_ttl_ms: value.lease_ttl_ms,
             server_time_ms: value.server_time_ms,
         }
@@ -752,6 +804,7 @@ impl Wire for wire::CheckRegistrationResponse {
     fn into_domain(self) -> Result<Self::Domain, domain::ProtocolError> {
         Ok(domain::RegistrationCheckResponse {
             protocol_version: protocol_version(self.protocol_version)?,
+            protocol_contract: protocol::selected(self.protocol_version, self.protocol_contract)?,
             worker_id: uuid("worker_id", &self.worker_id)?,
             effective_capabilities: self
                 .effective_capabilities
@@ -770,6 +823,9 @@ impl Wire for wire::CheckRegistrationResponse {
         Self {
             protocol_version: u32::from(value.protocol_version),
             worker_id: value.worker_id.to_string(),
+            protocol_contract: value
+                .protocol_contract
+                .map(wire::ProtocolContract::from_domain),
             effective_capabilities: value
                 .effective_capabilities
                 .into_iter()
@@ -825,6 +881,9 @@ impl Wire for wire::PollResponse {
                 retry_after_ms: value.retry_after_ms,
             }),
             wire::poll_response::Result::Drain(_) => Ok(domain::PollResponse::Drain),
+            wire::poll_response::Result::ShutdownAfterIdle(_) => {
+                Ok(domain::PollResponse::ShutdownAfterIdle)
+            }
             wire::poll_response::Result::Offer(value) => Ok(domain::PollResponse::Offer {
                 offer: Box::new(offer(required("poll_response.offer", value.offer)?)?),
             }),
@@ -837,6 +896,9 @@ impl Wire for wire::PollResponse {
                 wire::poll_response::Result::NoWork(wire::PollNoWork { retry_after_ms })
             }
             domain::PollResponse::Drain => wire::poll_response::Result::Drain(wire::Empty {}),
+            domain::PollResponse::ShutdownAfterIdle => {
+                wire::poll_response::Result::ShutdownAfterIdle(wire::Empty {})
+            }
             domain::PollResponse::Offer { offer } => {
                 wire::poll_response::Result::Offer(wire::PollOffer {
                     offer: Some(offer_wire(*offer)),
@@ -1254,7 +1316,9 @@ mod tests {
             memory_bytes: 256 * 1024 * 1024 * 1024,
         });
         assert_wire_round_trip::<wire::RegisterRequest>(domain::RegisterSessionRequest {
+            preflight: None,
             protocol_version: domain::PROTOCOL_VERSION,
+            protocol_offer: None,
             worker_session_id: session_id,
             software_version: "v29-test".into(),
             advertised_capabilities: BTreeSet::from([
@@ -1270,6 +1334,7 @@ mod tests {
         assert_wire_round_trip::<wire::CheckRegistrationRequest>(
             domain::RegistrationCheckRequest {
                 protocol_version: domain::PROTOCOL_VERSION,
+                protocol_offer: None,
                 software_version: "v29-test".into(),
                 advertised_capabilities: BTreeSet::from([
                     domain::WorkerCapability::Benchmark,
@@ -1283,6 +1348,7 @@ mod tests {
         );
         assert_wire_round_trip::<wire::RegisterResponse>(domain::RegisterSessionResponse {
             protocol_version: domain::PROTOCOL_VERSION,
+            protocol_contract: None,
             heartbeat_interval_ms: 5_000,
             lease_ttl_ms: 30_000,
             server_time_ms: 1_700_000_000_000,
@@ -1290,6 +1356,7 @@ mod tests {
         assert_wire_round_trip::<wire::CheckRegistrationResponse>(
             domain::RegistrationCheckResponse {
                 protocol_version: domain::PROTOCOL_VERSION,
+                protocol_contract: None,
                 worker_id: id("55555555-5555-4555-8555-555555555555"),
                 effective_capabilities: BTreeSet::from([
                     domain::WorkerCapability::Benchmark,
@@ -1326,6 +1393,7 @@ mod tests {
         for response in [
             domain::PollResponse::NoWork { retry_after_ms: 1_000 },
             domain::PollResponse::Drain,
+            domain::PollResponse::ShutdownAfterIdle,
             domain::PollResponse::Offer {
                 offer: Box::new(domain::WorkOffer {
                     identity: attempt_identity(),
@@ -1501,6 +1569,8 @@ mod tests {
         );
         assert!(
             wire::RegisterRequest {
+                preflight: None,
+                protocol_offer: None,
                 protocol_version: u32::from(domain::PROTOCOL_VERSION),
                 worker_session_id: Uuid::new_v4().to_string(),
                 software_version: "test".into(),

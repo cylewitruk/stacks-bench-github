@@ -14,9 +14,10 @@ usage() {
     cat <<'EOF'
 Usage: sudo ./scripts/update-worker-host.sh [OPTIONS]
 
-Drain one fleet worker, wait for its attempt and fleet cleanup to quiesce, stop
+Cordon one fleet worker, wait for its attempts and cleanup to quiesce, stop
 the local instance, build and install sbgh-worker, run preflight and the
-production registration check, then undrain and return it online.
+production registration check, then uncordon and return it online. A resident
+replacement is first verified online while still cordoned.
 
 Options:
   --profile NAME       Worker systemd instance/config name (default: combined)
@@ -27,6 +28,8 @@ Options:
 The host must have authenticated sbgh-cli operator access. This workflow is for
 wire-compatible worker-only updates; use the coordinated fleet runbook when the
 daemon protocol or database schema also changes.
+Requires the v35 CLI/daemon maintenance API. No unrelated worker is drained or
+required to become idle. Legacy exit-after-idle workers remain supported.
 EOF
 }
 
@@ -60,8 +63,8 @@ done
     echo "error: --profile contains unsupported characters: $profile" >&2
     exit 2
 }
-[[ "$timeout_secs" =~ ^[0-9]+$ && "$timeout_secs" -ge 10 ]] || {
-    echo "error: --timeout-secs must be an integer >= 10" >&2
+[[ "$timeout_secs" =~ ^[0-9]+$ && "$timeout_secs" -ge 10 && "$timeout_secs" -le 86400 ]] || {
+    echo "error: --timeout-secs must be an integer between 10 and 86400" >&2
     exit 2
 }
 [[ ${EUID:-$(id -u)} -eq 0 ]] || {
@@ -104,96 +107,45 @@ worker_command() {
         "$worker" --config "$worker_config" "$@"
 }
 
-metric() {
-    local summary=$1
-    local key=$2
-    local pattern="(^|[[:space:]])${key}=([0-9]+)($|[[:space:]])"
-    if [[ "$summary" =~ $pattern ]]; then
-        printf '%s\n' "${BASH_REMATCH[2]}"
-    else
-        echo "error: fleet status omitted metric '$key': $summary" >&2
-        return 1
-    fi
-}
-
-fleet_status() {
-    local status
-    status=$(operator fleet status)
-    printf '%s\n' "$status" >&2
-    printf '%s\n' "$status"
-}
-
-worker_state() {
+maintenance_state() {
     python3 -c '
 import json, sys
-worker = json.load(sys.stdin)["worker"]
+worker = json.load(sys.stdin)
 print("\t".join((
     str(worker["enabled"]).lower(),
-    str(worker["draining"]).lower(),
+    str(worker["cordoned"]).lower(),
     worker.get("session_status") or "offline",
-    worker.get("attempt_id") or "-",
+    worker.get("session_id") or "-",
+    str(worker["session_live"]).lower(),
 )))
 '
 }
 
-assert_fleet_safe() {
-    local status=$1
-    local summary=${status%%$'\n'*}
-    local gaps
-    gaps=$(metric "$summary" gaps)
-    [[ "$gaps" -eq 0 ]] || {
-        echo "error: fleet has $gaps reliable-event gap(s); reconcile them before deployment" >&2
-        return 1
-    }
-}
-
-wait_for_worker_quiescence() {
-    local worker_id=$1
-    local deadline=$((SECONDS + timeout_secs))
-    local last_state=
-    local policy worker_values draining attempt_id status summary cleanup gaps state
-    while (( SECONDS < deadline )); do
-        if policy=$(operator fleet show-worker --worker-id "$worker_id" 2>/dev/null) \
-            && worker_values=$(worker_state <<<"$policy") \
-            && status=$(operator fleet status 2>/dev/null); then
-            IFS=$'\t' read -r _ draining _ attempt_id <<<"$worker_values"
-            summary=${status%%$'\n'*}
-            cleanup=$(metric "$summary" cleanup)
-            gaps=$(metric "$summary" gaps)
-            state="draining=$draining attempt=${attempt_id} cleanup=$cleanup gaps=$gaps"
-            if [[ "$state" != "$last_state" ]]; then
-                echo "worker quiescence: $state"
-                last_state=$state
-            fi
-            if [[ "$draining" == true && "$attempt_id" == - \
-                && "$cleanup" -eq 0 && "$gaps" -eq 0 ]]; then
-                return 0
-            fi
-        fi
-        sleep 2
-    done
-    echo "error: worker did not become quiescent within ${timeout_secs}s" >&2
-    return 1
+json_field() {
+    python3 -c 'import json, sys; value = json.load(sys.stdin)[sys.argv[1]]; print("-" if value is None else str(value).lower() if isinstance(value, bool) else value)' "$1"
 }
 
 wait_for_worker() {
     local worker_id=$1
+    local expected_cordon=$2
     local deadline=$((SECONDS + timeout_secs))
-    local policy values enabled draining session_status _
+    local values enabled draining session_status snapshot current_session live
     while (( SECONDS < deadline )); do
-        if systemctl is-active --quiet "$worker_unit" \
-            && policy=$(operator fleet show-worker --worker-id "$worker_id" 2>/dev/null) \
-            && values=$(worker_state <<<"$policy"); then
-            IFS=$'\t' read -r enabled draining session_status _ <<<"$values"
-            if [[ "$enabled" == true && "$draining" == false \
-                && "$session_status" =~ ^(registered|idle|offered|running)$ ]]; then
-                echo "worker online: status=$session_status draining=false"
+        if systemctl is-active --quiet "$worker_unit"; then
+            snapshot=$(operator fleet worker-status --worker-id "$worker_id" --json) || return 1
+            values=$(maintenance_state <<<"$snapshot") || return 1
+            IFS=$'\t' read -r enabled draining session_status current_session live <<<"$values"
+            if [[ "$enabled" == true && "$draining" == "$expected_cordon" \
+                && "$live" == true && "$current_session" != - \
+                && "$current_session" != "$previous_session" \
+                && "$session_status" =~ ^(registered|idle|offered|running|draining)$ ]]; then
+                echo "worker online: status=$session_status cordoned=$draining session=$current_session"
                 return 0
             fi
         fi
         sleep 1
     done
-    echo "error: $worker_unit did not become online and schedulable within ${timeout_secs}s" >&2
+    echo "error: $worker_unit did not establish a new live session with cordoned=$expected_cordon within ${timeout_secs}s" >&2
     return 1
 }
 
@@ -208,9 +160,11 @@ recover_on_failure() {
     if (( deployment_started && ! deployment_succeeded )); then
         set +e
         echo >&2
-        echo "UPDATE FAILED — leaving worker fail-closed." >&2
+        echo "UPDATE FAILED — attempting fail-closed worker recovery." >&2
         if [[ -n "$worker_id" ]]; then
-            operator fleet drain --worker-id "$worker_id" >/dev/null 2>&1
+            operator fleet cordon --worker-id "$worker_id" \
+                --reason 'worker updater: failed deployment' >/dev/null 2>&1 || \
+                echo "WARNING: cordon could not be confirmed; inspect the worker policy before continuing." >&2
         fi
         if (( safe_to_stop_worker )); then
             systemctl stop "$worker_unit" >/dev/null 2>&1
@@ -238,23 +192,34 @@ worker_id=$(sed -nE 's/.* registration=authorized worker_id=([^ ]+).*/\1/p' \
     exit 1
 }
 
-initial_fleet=$(fleet_status)
-assert_fleet_safe "$initial_fleet"
-grep -Eq "^${worker_id}[[:space:]]" <<<"$initial_fleet" || {
-    echo "error: configured worker $worker_id is not registered in the fleet" >&2
-    exit 1
-}
-initial_policy=$(operator fleet show-worker --worker-id "$worker_id")
-IFS=$'\t' read -r enabled _ _ _ <<<"$(worker_state <<<"$initial_policy")"
+operator fleet status
+# Require the new read/wait surface before changing any policy.
+initial_snapshot=$(operator fleet worker-status --worker-id "$worker_id" --json)
+previous_session=$(json_field session_id <<<"$initial_snapshot")
+operator fleet wait-worker --help >/dev/null
+enabled=$(json_field enabled <<<"$initial_snapshot")
 [[ "$enabled" == true ]] || {
     echo "error: worker $worker_id is disabled" >&2
     exit 1
 }
 
-echo "==> Drain worker and wait for quiescence"
+echo "==> Cordon worker and wait for targeted quiescence"
 deployment_started=1
-operator fleet drain --worker-id "$worker_id"
-wait_for_worker_quiescence "$worker_id"
+cordon=$(operator fleet cordon --worker-id "$worker_id" \
+    --reason 'worker updater: binary maintenance' --json)
+generation=$(json_field generation <<<"$cordon")
+quiescent=$(operator fleet wait-worker --worker-id "$worker_id" \
+    --generation "$generation" --until quiescent --timeout-seconds "$timeout_secs" --json)
+printf '%s\n' "$quiescent"
+if [[ $(json_field session_live <<<"$quiescent") == true ]] && \
+    python3 -c 'import json, sys; sys.exit("shutdown_after_idle" not in json.load(sys.stdin)["protocol_features"])' <<<"$quiescent"; then
+    shutdown=$(operator fleet shutdown-after-idle --worker-id "$worker_id" \
+        --reason 'worker updater: stop quiescent session' --json)
+    operator fleet wait-worker --worker-id "$worker_id" \
+        --generation "$(json_field generation <<<"$shutdown")" \
+        --session-id "$(json_field target_session_id <<<"$shutdown")" \
+        --until deregistered --timeout-seconds "$timeout_secs" --json
+fi
 safe_to_stop_worker=1
 systemctl stop "$worker_unit"
 systemctl is-active --quiet "$worker_unit" && {
@@ -285,14 +250,23 @@ grep -q ' draining=true ' <<<" $post_registration " || {
 }
 
 echo "==> Return worker to service"
-operator fleet undrain --worker-id "$worker_id"
-systemctl restart "$worker_unit"
-wait_for_worker "$worker_id"
+if grep -q ' cordon_semantic=resident ' <<<" $post_registration "; then
+    systemctl start "$worker_unit"
+    wait_for_worker "$worker_id" true
+fi
+# Once admission reopens, an unrelated incoming job may already be executing.
+# Failure recovery may cordon again, but must not blindly stop that execution.
+safe_to_stop_worker=0
+operator fleet uncordon --worker-id "$worker_id" \
+    --reason 'worker updater: preflight and registration verified'
+if ! grep -q ' cordon_semantic=resident ' <<<" $post_registration "; then
+    systemctl start "$worker_unit"
+fi
+wait_for_worker "$worker_id" false
 
-final_fleet=$(fleet_status)
-assert_fleet_safe "$final_fleet"
+operator fleet status
 systemctl is-active --quiet "$worker_unit"
 
 deployment_succeeded=1
 echo
-echo "Update complete: worker $worker_id is updated, online, and schedulable."
+echo "Update complete: worker $worker_id is updated, online, and uncordoned; scheduler and task admission policies still apply."

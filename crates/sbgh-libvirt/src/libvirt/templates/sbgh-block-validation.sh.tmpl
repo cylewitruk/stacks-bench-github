@@ -104,7 +104,25 @@ def diagnostic_tail(value):
     return encoded[-MAX_PROBE_DIAGNOSTIC_BYTES:].decode("utf-8", errors="replace")
 
 probe_records = []
+
+def write_progress(progress):
+    """Append best-effort UI evidence without affecting validation authority."""
+    try:
+        with open(RESULTS + "/run.progress.jsonl", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "schema_version": 1,
+                "event_type": "progress",
+                "event_version": 1,
+                "progress": progress,
+            }, separators=(",", ":")) + "\n")
+    except OSError as error:
+        print(f"SBGH_BLOCK_VALIDATION_PROGRESS_WARNING {error}", flush=True)
+
 def probe(kind):
+    write_progress({
+        "phase": "initialize", "current": 0,
+        "message": f"discovering chainstate range ({kind}); processed-block total not yet known",
+    })
     ordinal = len(probe_records)
     stdout_name = f"probe-{kind}.stdout.log"
     stderr_name = f"probe-{kind}.stderr.log"
@@ -232,8 +250,8 @@ pending = list(ranges)
 active = {}
 finished = []
 started = time.monotonic()
-last_progress_blocks = -1
-last_progress_shards = -1
+last_progress = None
+progress_rate = ValidationRate()
 last_progress_emit = 0.0
 progress_emit_interval = 5.0
 limit = min(int(plan["max_concurrency"]), len(ranges))
@@ -321,7 +339,7 @@ def warn_missing_live_progress(state, command_record):
     }, sort_keys=True, separators=(",", ":")), flush=True)
 
 def emit_progress(force=False):
-    global last_progress_blocks, last_progress_shards, last_progress_emit
+    global last_progress, last_progress_emit
     finished_ranges = [
         (item["start"], item["end"])
         for item in finished
@@ -334,27 +352,17 @@ def emit_progress(force=False):
     current = aggregate_block_progress(finished_ranges, active_counts, count)
     completed_shards = len(finished_ranges)
     now = time.monotonic()
-    if current < last_progress_blocks:
-        current = last_progress_blocks
-    if current == last_progress_blocks and completed_shards == last_progress_shards:
+    if last_progress is not None:
+        current = max(current, last_progress["current"])
+    progress = validation_progress(
+        current, count, completed_shards, len(ranges), active, pending, progress_rate, now
+    )
+    if progress == last_progress:
         return
     if not force and now - last_progress_emit < progress_emit_interval:
         return
-    with open(RESULTS + "/run.progress.jsonl", "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({
-            "schema_version": 1,
-            "event_type": "progress",
-            "event_version": 1,
-            "progress": {
-                "phase": "validate",
-                "current": current,
-                "total": count,
-                "message": f"shards {completed_shards}/{len(ranges)} complete",
-            },
-        }, separators=(",", ":")) + "\n")
-        handle.flush()
-    last_progress_blocks = current
-    last_progress_shards = completed_shards
+    write_progress(progress)
+    last_progress = progress
     last_progress_emit = now
 
 while pending or active:

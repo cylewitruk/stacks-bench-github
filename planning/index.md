@@ -97,7 +97,7 @@ in progress; v36–v37 remain planned. Decision 0006 is accepted; Decision 0007 
 | `0072-pre-attempt-terminal-projection` | Pre-attempt terminal projection | `candidate` | [backlog.md](backlog.md) |
 | `0073-task-neutral-submission-model` | Task-neutral submission model rename | `shipped` | [archive/completed/0073-task-neutral-submission-model.md](archive/completed/0073-task-neutral-submission-model.md) |
 | `0074-protobuf-fleet-protocol` | Protobuf worker protocol | `shipped` | [archive/completed/0074-protobuf-fleet-protocol.md](archive/completed/0074-protobuf-fleet-protocol.md) |
-| `0075-rolling-worker-protocol-compatibility` | Rolling worker protocol compatibility | `planned` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
+| `0075-rolling-worker-protocol-compatibility` | Rolling worker protocol compatibility | `in_progress` | [iterations/v35-seamless-fleet-lifecycle.md](iterations/v35-seamless-fleet-lifecycle.md) |
 | `0076-database-backed-worker-registry` | Database-backed worker registry | `shipped` | [archive/completed/0076-database-backed-worker-registry.md](archive/completed/0076-database-backed-worker-registry.md) |
 | `0077-worker-identity-and-config-simplification` | Worker identity and configuration simplification | `shipped` | [archive/completed/0077-worker-identity-and-config-simplification.md](archive/completed/0077-worker-identity-and-config-simplification.md) |
 | `0078-slack-task-submission` | Slack task submission | `shipped` | [archive/completed/0069-task-aware-intent-resolution.md](archive/completed/0069-task-aware-intent-resolution.md) |

@@ -3,20 +3,27 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::header;
+use sbgh_api::{CordonSemantic, WorkerLifecycleView};
 use sbgh_api::{
     FleetCancellationResponse, FleetOverview, FleetRecoveryRequest, FleetRecoveryResponse,
     FleetSummaryView, FleetWorkerView, WorkerCreateRequest, WorkerDrainRequest,
-    WorkerIdentityRequest, WorkerIdentityView, WorkerPolicyView, WorkerUpdateRequest,
+    WorkerIdentityRequest, WorkerIdentityView, WorkerPolicyView, WorkerProtocolOfferView,
+    WorkerProtocolView, WorkerUpdateRequest,
 };
 use sbgh_core::db::fleet::{
     FleetStore, WorkerPolicyPatch, WorkerRegistration, WorkerRegistryEntry, WorkerRegistryMutation,
     WorkerRegistryStore,
 };
-use sbgh_fleet::WorkerCapability;
+use sbgh_core::db::scheduler::SchedulerStore;
+use sbgh_core::db::worker_lifecycle::{
+    WorkerLifecycleAction, WorkerLifecycleChange, WorkerLifecycleOutcome, WorkerLifecycleStore,
+};
+use sbgh_fleet::{ProtocolFeature, WorkerCapability};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::api::error::ApiErr;
+use crate::api::scheduler;
 use crate::api::state::ApiState;
 use crate::fleet::validate_worker_identity_key;
 
@@ -30,6 +37,11 @@ pub async fn overview(State(state): State<ApiState>) -> Result<Json<FleetOvervie
         .map(worker_view)
         .collect();
     Ok(Json(FleetOverview {
+        scheduler: Some(scheduler::policy_view(
+            store
+                .scheduler_policy()
+                .await?,
+        )),
         summary: FleetSummaryView {
             registered_workers: summary.registered_workers,
             online_workers: summary.online_workers,
@@ -237,6 +249,26 @@ async fn worker_detail(
 
 fn worker_view(record: WorkerRegistryEntry) -> FleetWorkerView {
     FleetWorkerView {
+        lifecycle: Some(WorkerLifecycleView {
+            generation: record.lifecycle_generation,
+            shutdown_session_id: record
+                .shutdown_session_id
+                .map(|id| id.to_string()),
+            cordon_semantic: match record
+                .protocol_contract
+                .as_ref()
+            {
+                Some(contract)
+                    if contract
+                        .features
+                        .contains(&ProtocolFeature::ResidentCordon) =>
+                {
+                    CordonSemantic::Resident
+                }
+                Some(_) => CordonSemantic::ExitAfterIdle,
+                None => CordonSemantic::Unknown,
+            },
+        }),
         worker_id: record.worker_id.to_string(),
         display_name: record.display_name,
         enabled: record.enabled,
@@ -248,6 +280,26 @@ fn worker_view(record: WorkerRegistryEntry) -> FleetWorkerView {
             .map(|id| id.to_string()),
         session_status: record.session_status,
         software_version: record.software_version,
+        protocol: record
+            .protocol_contract
+            .map(|contract| WorkerProtocolView {
+                offer: record
+                    .protocol_offer
+                    .map(|offer| WorkerProtocolOfferView {
+                        minimum_revision: offer.minimum_revision,
+                        maximum_revision: offer.maximum_revision,
+                        features: offer
+                            .features
+                            .into_iter()
+                            .collect(),
+                    }),
+                revision: contract.revision,
+                features: contract
+                    .features
+                    .into_iter()
+                    .map(|feature| feature.as_str().to_owned())
+                    .collect(),
+            }),
         last_heartbeat_at: record
             .last_heartbeat_at
             .map(|value| value.to_rfc3339()),
@@ -508,12 +560,24 @@ pub async fn set_drain(
     Json(request): Json<WorkerDrainRequest>,
 ) -> Result<Json<FleetWorkerView>, ApiErr> {
     let store = sbgh_postgres::PostgresFleetStore::new(state.pool.clone());
-    mutation_response(
-        store
-            .set_worker_draining(worker_id, request.draining)
-            .await?,
-        "worker drain state conflicts",
-    )?;
+    match store
+        .change_worker_lifecycle(&WorkerLifecycleChange {
+            request_id: Uuid::new_v4(),
+            worker_id,
+            action: if request.draining {
+                WorkerLifecycleAction::Cordon
+            } else {
+                WorkerLifecycleAction::Uncordon
+            },
+            actor: "api:admin".into(),
+            reason: "legacy worker drain endpoint".into(),
+        })
+        .await?
+    {
+        WorkerLifecycleOutcome::Applied(_) => {}
+        WorkerLifecycleOutcome::NotFound => return Err(ApiErr::not_found("worker not found")),
+        _ => return Err(ApiErr::conflict("worker drain state conflicts")),
+    }
     let detail = worker_detail(&state, worker_id)
         .await?
         .0;

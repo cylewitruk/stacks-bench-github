@@ -1,0 +1,1038 @@
+diff --git a/crates/sbgh-api/src/scheduler.rs b/crates/sbgh-api/src/scheduler.rs
+index 66d38f5..bdb6b6b 100644
+--- a/crates/sbgh-api/src/scheduler.rs
++++ b/crates/sbgh-api/src/scheduler.rs
+@@ -38,8 +38,11 @@ pub struct SchedulerStatusView {
+     pub pending_cleanup: i64,
+     /// Attempts with unprojected reliable events.
+     pub pending_projection: i64,
+-    /// Staging records not yet promoted or garbage-collected.
++    /// Active-attempt uploads or accepted-manifest promotion debt, including empty files.
+     pub pending_artifacts: i64,
++    /// Unreferenced staging retained for garbage collection; does not block maintenance.
++    #[serde(default)]
++    pub garbage_artifacts: i64,
+ }
+ 
+ impl SchedulerStatusView {
+@@ -71,6 +74,7 @@ mod tests {
+             pending_cleanup: 0,
+             pending_projection: 0,
+             pending_artifacts: 0,
++            garbage_artifacts: 7,
+         };
+         assert!(ready.quiescent());
+         let mut running = ready.clone();
+diff --git a/crates/sbgh-cli/src/scheduler.rs b/crates/sbgh-cli/src/scheduler.rs
+index 80ff7de..4fa6c33 100644
+--- a/crates/sbgh-cli/src/scheduler.rs
++++ b/crates/sbgh-cli/src/scheduler.rs
+@@ -138,12 +138,13 @@ fn policy_line(policy: &SchedulerPolicyView) -> String {
+ /// Human-readable quiescence counters; zero alone never implies paused admission.
+ fn status_line(status: &SchedulerStatusView) -> String {
+     format!(
+-        "{}quiescent={} attempts={} cleanup={} projection={} artifacts={}\n",
++        "{}quiescent={} attempts={} cleanup={} projection={} artifacts={} garbage_artifacts={}\n",
+         policy_line(&status.policy),
+         status.quiescent(),
+         status.active_attempts,
+         status.pending_cleanup,
+         status.pending_projection,
+-        status.pending_artifacts
++        status.pending_artifacts,
++        status.garbage_artifacts
+     )
+ }
+diff --git a/crates/sbgh-cli/tests/scheduler.rs b/crates/sbgh-cli/tests/scheduler.rs
+index 485e826..bf1b190 100644
+--- a/crates/sbgh-cli/tests/scheduler.rs
++++ b/crates/sbgh-cli/tests/scheduler.rs
+@@ -489,6 +489,28 @@ async fn scheduler_wait_pins_generation_and_emits_clean_json() {
+     assert!(String::from_utf8_lossy(&output.stderr).contains("artifacts=1"));
+ }
+ 
++/// Retained garbage remains observable in both formats without delaying maintenance.
++#[tokio::test]
++async fn scheduler_wait_reports_garbage_without_blocking() {
++    let mut ready = snapshot(true, 1, 0);
++    ready["garbage_artifacts"] = json!(3);
++    for output_args in
++        [vec!["wait", "--timeout-seconds", "1", "--json"], vec!["wait", "--timeout-seconds", "1"]]
++    {
++        let output = run(&output_args, router(vec![ready.clone()])).await;
++        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
++        if output_args.contains(&"--json") {
++            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
++            assert_eq!(value["garbage_artifacts"], 3);
++            assert_eq!(value["pending_artifacts"], 0);
++        } else {
++            let text = String::from_utf8_lossy(&output.stdout);
++            assert!(text.contains("quiescent=true"));
++            assert!(text.contains("garbage_artifacts=3"));
++        }
++    }
++}
++
+ #[tokio::test]
+ async fn scheduler_wait_rejects_resume_generation_change_and_timeout() {
+     for (values, message) in [
+diff --git a/crates/sbgh-core/src/db/fleet.rs b/crates/sbgh-core/src/db/fleet.rs
+index 52994eb..b70809f 100644
+--- a/crates/sbgh-core/src/db/fleet.rs
++++ b/crates/sbgh-core/src/db/fleet.rs
+@@ -425,8 +425,6 @@ pub trait FleetStore: SchedulerStore + ProtocolPolicyStore + Send + Sync + 'stat
+     /// lease and recovery contract.
+     async fn fail_queued_slack_jobs_without_connector(&self, remark: &str) -> Result<Vec<Uuid>>;
+ 
+-    async fn set_all_workers_draining(&self, draining: bool) -> Result<u64>;
+-
+     /// Start a fresh comparison generation from the first spec/run.
+     ///
+     /// The prior submission remains immutable and auditable. This operation is
+diff --git a/crates/sbgh-core/src/db/scheduler.rs b/crates/sbgh-core/src/db/scheduler.rs
+index 9f0eb91..9ced74f 100644
+--- a/crates/sbgh-core/src/db/scheduler.rs
++++ b/crates/sbgh-core/src/db/scheduler.rs
+@@ -54,8 +54,10 @@ pub struct SchedulerSnapshot {
+     pub pending_cleanup: i64,
+     /// Attempts with reliable events awaiting projection.
+     pub pending_projection: i64,
+-    /// Unpromoted staging records, including zero-byte artifacts.
++    /// Active-attempt uploads or accepted-manifest promotion debt, including empty files.
+     pub pending_artifacts: i64,
++    /// Unreferenced staging retained for garbage collection; does not block maintenance.
++    pub garbage_artifacts: i64,
+ }
+ 
+ /// Storage boundary for scheduler maintenance, independent of worker policy.
+diff --git a/crates/sbgh-daemon/src/api/scheduler.rs b/crates/sbgh-daemon/src/api/scheduler.rs
+index d25786a..c5eed4f 100644
+--- a/crates/sbgh-daemon/src/api/scheduler.rs
++++ b/crates/sbgh-daemon/src/api/scheduler.rs
+@@ -23,6 +23,7 @@ pub async fn status(State(state): State<ApiState>) -> Result<Json<SchedulerStatu
+         pending_cleanup: snapshot.pending_cleanup,
+         pending_projection: snapshot.pending_projection,
+         pending_artifacts: snapshot.pending_artifacts,
++        garbage_artifacts: snapshot.garbage_artifacts,
+     }))
+ }
+ 
+diff --git a/crates/sbgh-daemon/src/fleet/coordinator.rs b/crates/sbgh-daemon/src/fleet/coordinator.rs
+index 49af84d..2fcc0ab 100644
+--- a/crates/sbgh-daemon/src/fleet/coordinator.rs
++++ b/crates/sbgh-daemon/src/fleet/coordinator.rs
+@@ -409,7 +409,7 @@ impl FleetCoordinator {
+             self.fleet
+                 .freeze_submission_sources(job.task_submission_id, &sources, scheduler_generation)
+                 .await?,
+-            "benchmark submission {} changed while source refs were being frozen",
++            "benchmark submission {} or scheduler admission changed while source refs were being frozen",
+             job.task_submission_id
+         );
+         sources
+diff --git a/crates/sbgh-postgres/src/stores/fleet.rs b/crates/sbgh-postgres/src/stores/fleet.rs
+index e9bf596..dd4251d 100644
+--- a/crates/sbgh-postgres/src/stores/fleet.rs
++++ b/crates/sbgh-postgres/src/stores/fleet.rs
+@@ -4,6 +4,7 @@ mod abort;
+ mod cancellation;
+ mod lifecycle;
+ mod protocol;
++mod quiescence;
+ mod scheduler;
+ 
+ use std::collections::BTreeMap;
+@@ -1947,7 +1948,8 @@ impl FleetStore for PostgresFleetStore {
+             return Ok(None);
+         }
+ 
+-        if policy.paused {
++        let pending_cleanup = has_pending_cleanup(&mut tx, worker_id).await?;
++        if policy.paused || pending_cleanup {
+             tx.commit().await.core()?;
+             return Ok(None);
+         }
+@@ -2456,6 +2458,7 @@ impl FleetStore for PostgresFleetStore {
+                 .core()?
+                 == Some(identity.worker_session_id)
+             || policy.paused
++            || has_pending_cleanup(&mut tx, worker_id).await?
+             || attempt
+                 .try_get::<i64, _>("scheduler_generation")
+                 .core()?
+@@ -2753,19 +2756,6 @@ impl FleetStore for PostgresFleetStore {
+         Ok(failed)
+     }
+ 
+-    async fn set_all_workers_draining(&self, draining: bool) -> sbgh_core::Result<u64> {
+-        let result = sqlx::query(
+-            "UPDATE worker_registry
+-                SET draining = $1, updated_at = NOW()
+-              WHERE enabled AND draining IS DISTINCT FROM $1",
+-        )
+-        .bind(draining)
+-        .execute(&self.pool)
+-        .await
+-        .core()?;
+-        Ok(result.rows_affected())
+-    }
+-
+     async fn recover_submission(
+         &self,
+         submission_id: Uuid,
+@@ -4529,6 +4519,21 @@ impl FleetStore for PostgresFleetStore {
+     }
+ }
+ 
++/// Check worker-wide teardown debt, including obligations from older sessions.
++async fn has_pending_cleanup(
++    tx: &mut Transaction<'_, Postgres>,
++    worker_id: Uuid,
++) -> sbgh_core::Result<bool> {
++    sqlx::query_scalar(
++        "SELECT EXISTS (SELECT 1 FROM worker_cleanup_obligation
++        WHERE worker_id=$1 AND status='pending')",
++    )
++    .bind(worker_id)
++    .fetch_one(&mut **tx)
++    .await
++    .core()
++}
++
+ /// Retain stale attempt events for audit while making it explicit that they
+ /// were intentionally not sent to an external reporting surface.
+ async fn discard_attempt_projection(
+diff --git a/crates/sbgh-postgres/src/stores/fleet/protocol.rs b/crates/sbgh-postgres/src/stores/fleet/protocol.rs
+index 3be1242..814deea 100644
+--- a/crates/sbgh-postgres/src/stores/fleet/protocol.rs
++++ b/crates/sbgh-postgres/src/stores/fleet/protocol.rs
+@@ -9,7 +9,7 @@ use sbgh_fleet::{NEGOTIATED_PROTOCOL_REVISION, PREVIOUS_PROTOCOL_REVISION};
+ use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
+ use uuid::Uuid;
+ 
+-use super::PostgresFleetStore;
++use super::{PostgresFleetStore, quiescence};
+ use crate::IntoCoreResult;
+ 
+ /// Lock after scheduler policy, if needed, and before worker/job rows.
+@@ -122,12 +122,16 @@ impl ProtocolPolicyStore for PostgresFleetStore {
+         }
+         let changed = current.minimum_revision != change.minimum_revision;
+         if changed {
+-            let busy: bool = sqlx::query_scalar("SELECT
+-                EXISTS(SELECT 1 FROM worker_attempt WHERE status IN ('offered', 'running', 'cancel_requested'))
+-                OR EXISTS(SELECT 1 FROM worker_cleanup_obligation WHERE status = 'pending')
+-                OR EXISTS(SELECT 1 FROM worker_attempt WHERE highest_contiguous_reliable_seq > projected_reliable_seq)
+-                OR EXISTS(SELECT 1 FROM worker_artifact_staging WHERE status IN ('granted', 'uploaded', 'verified'))")
+-                .fetch_one(&mut *tx).await.core()?;
++            let query = format!(
++                "SELECT active_attempts != 0 OR pending_cleanup != 0
++                OR pending_projection != 0 OR pending_artifacts != 0
++                FROM ({}) counters",
++                quiescence::COUNTERS_SQL
++            );
++            let busy: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
++                .fetch_one(&mut *tx)
++                .await
++                .core()?;
+             if !scheduler.paused || busy {
+                 return Ok(ProtocolPolicyChangeOutcome::MaintenanceRequired);
+             }
+diff --git a/crates/sbgh-postgres/src/stores/fleet/scheduler.rs b/crates/sbgh-postgres/src/stores/fleet/scheduler.rs
+index f67cad6..2491a22 100644
+--- a/crates/sbgh-postgres/src/stores/fleet/scheduler.rs
++++ b/crates/sbgh-postgres/src/stores/fleet/scheduler.rs
+@@ -6,7 +6,7 @@ use sbgh_core::db::scheduler::{
+ };
+ use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
+ 
+-use super::PostgresFleetStore;
++use super::{PostgresFleetStore, quiescence};
+ use crate::IntoCoreResult;
+ 
+ /// Hold a shared policy lock before acquiring any job or worker locks.
+@@ -36,13 +36,15 @@ fn policy(row: &PgRow) -> sbgh_core::Result<SchedulerPolicy> {
+ #[async_trait]
+ impl SchedulerStore for PostgresFleetStore {
+     async fn scheduler_snapshot(&self) -> sbgh_core::Result<SchedulerSnapshot> {
+-        let row = sqlx::query("SELECT policy.*,
+-            (SELECT count(*) FROM worker_attempt WHERE status IN ('offered', 'running', 'cancel_requested')) AS active_attempts,
+-            (SELECT count(*) FROM worker_cleanup_obligation WHERE status = 'pending') AS pending_cleanup,
+-            (SELECT count(*) FROM worker_attempt WHERE highest_contiguous_reliable_seq > projected_reliable_seq) AS pending_projection,
+-            (SELECT count(*) FROM worker_artifact_staging WHERE status IN ('granted', 'uploaded', 'verified')) AS pending_artifacts
+-            FROM scheduler_policy policy WHERE singleton")
+-            .fetch_one(&self.pool).await.core()?;
++        let query = format!(
++            "SELECT policy.*, counters.* FROM scheduler_policy policy
++            CROSS JOIN ({}) counters WHERE singleton",
++            quiescence::COUNTERS_SQL
++        );
++        let row = sqlx::query(sqlx::AssertSqlSafe(query))
++            .fetch_one(&self.pool)
++            .await
++            .core()?;
+         Ok(SchedulerSnapshot {
+             policy: policy(&row)?,
+             active_attempts: row
+@@ -57,6 +59,9 @@ impl SchedulerStore for PostgresFleetStore {
+             pending_artifacts: row
+                 .try_get("pending_artifacts")
+                 .core()?,
++            garbage_artifacts: row
++                .try_get("garbage_artifacts")
++                .core()?,
+         })
+     }
+ 
+@@ -143,6 +148,32 @@ impl SchedulerStore for PostgresFleetStore {
+             policy(&row)?
+         };
+         if changed && change.paused {
++            // Serialize with lifecycle/recovery without blocking expiry's foreign-key
++            // checks. Lock attempts before sessions, matching the expiry sweep.
++            sqlx::query(
++                "SELECT worker_id FROM worker_registry registry
++                WHERE EXISTS (SELECT 1 FROM worker_attempt attempt
++                    WHERE attempt.worker_id=registry.worker_id AND attempt.status='offered')
++                ORDER BY worker_id FOR NO KEY UPDATE",
++            )
++            .fetch_all(&mut *tx)
++            .await
++            .core()?;
++            sqlx::query(
++                "SELECT attempt_id FROM worker_attempt WHERE status='offered'
++                ORDER BY attempt_id FOR UPDATE",
++            )
++            .fetch_all(&mut *tx)
++            .await
++            .core()?;
++            sqlx::query("UPDATE worker_session session SET status=CASE
++                WHEN registry.draining OR registry.shutdown_session_id=session.worker_session_id
++                    THEN 'draining'::worker_session_status ELSE 'idle'::worker_session_status END
++                FROM worker_registry registry
++                WHERE session.worker_id=registry.worker_id AND session.status='offered'
++                  AND EXISTS (SELECT 1 FROM worker_attempt attempt
++                    WHERE attempt.worker_session_id=session.worker_session_id AND attempt.status='offered')")
++                .execute(&mut *tx).await.core()?;
+             // No execution exists before acceptance. Withdraw these offers
+             // without expiring their resident worker sessions.
+             sqlx::query(
+diff --git a/crates/sbgh-postgres/tests/postgres_fleet.rs b/crates/sbgh-postgres/tests/postgres_fleet.rs
+index 1562616..390965d 100644
+--- a/crates/sbgh-postgres/tests/postgres_fleet.rs
++++ b/crates/sbgh-postgres/tests/postgres_fleet.rs
+@@ -23,7 +23,10 @@ use sbgh_core::db::fleet::{
+     SessionRegistrationError, TerminalAcceptance, WorkerPolicyPatch, WorkerRegistration,
+     WorkerRegistryMutation, WorkerRegistryStore,
+ };
+-use sbgh_core::db::worker_lifecycle::IdleWorkerControl;
++use sbgh_core::db::worker_lifecycle::{
++    IdleWorkerControl, WorkerLifecycleAction, WorkerLifecycleChange, WorkerLifecycleOutcome,
++    WorkerLifecycleStore,
++};
+ use sbgh_core::models::{
+     BuildTarget, GitRefKind, GithubAccountType, JobAxes, JobIntent, JobResult, JobSource, NewJob,
+     QueuedEventDetail, TaskKind,
+@@ -42,7 +45,7 @@ use uuid::Uuid;
+ 
+ /// Observe actual database lock contention rather than relying on task sleeps.
+ async fn wait_for_lock(pool: &Pool, query: &str, count: i64) {
+-    time::timeout(StdDuration::from_secs(5), async {
++    let observed = time::timeout(StdDuration::from_secs(5), async {
+         loop {
+             let waiting: i64 = sqlx::query_scalar(
+                 "SELECT count(*) FROM pg_stat_activity
+@@ -58,8 +61,17 @@ async fn wait_for_lock(pool: &Pool, query: &str, count: i64) {
+             time::sleep(StdDuration::from_millis(10)).await;
+         }
+     })
+-    .await
+-    .expect("expected database lock contention was not observed");
++    .await;
++    if observed.is_err() {
++        let waiters: Vec<String> = sqlx::query_scalar(
++            "SELECT query FROM pg_stat_activity
++            WHERE datname=current_database() AND wait_event_type='Lock'",
++        )
++        .fetch_all(pool)
++        .await
++        .unwrap();
++        panic!("expected {count} lock waiters matching {query:?}; actual waiters: {waiters:?}");
++    }
+ }
+ 
+ #[tokio::test]
+@@ -1300,12 +1312,18 @@ async fn idle_drain_is_observable_and_stops_new_claims() {
+         .register_session(worker_id, &session(worker_id, session_id), Duration::minutes(5))
+         .await
+         .unwrap();
+-    assert_eq!(
++    std::assert_matches!(
+         store
+-            .set_all_workers_draining(true)
++            .change_worker_lifecycle(&WorkerLifecycleChange {
++                request_id: Uuid::new_v4(),
++                worker_id,
++                action: WorkerLifecycleAction::Cordon,
++                actor: "api:admin".into(),
++                reason: "test maintenance".into(),
++            })
+             .await
+             .unwrap(),
+-        1
++        WorkerLifecycleOutcome::Applied(_)
+     );
+     assert!(
+         store
+diff --git a/crates/sbgh-postgres/tests/postgres_fleet/lifecycle_tests.rs b/crates/sbgh-postgres/tests/postgres_fleet/lifecycle_tests.rs
+index ed5b5ff..525e699 100644
+--- a/crates/sbgh-postgres/tests/postgres_fleet/lifecycle_tests.rs
++++ b/crates/sbgh-postgres/tests/postgres_fleet/lifecycle_tests.rs
+@@ -8,6 +8,182 @@ use sbgh_fleet::{DesiredState, NEGOTIATED_PROTOCOL_REVISION, PreflightReport, Pr
+ 
+ use super::*;
+ 
++/// A successor cannot bypass its predecessor's teardown by requesting another job.
++#[tokio::test]
++async fn lifecycle_pending_cleanup_blocks_new_work_across_sessions() {
++    let (_db, pool) = setup_pg_db().await;
++    seed_install_repo(&pool, 100, 10).await;
++    let store = PostgresFleetStore::new(pool.clone());
++    let worker = Uuid::new_v4();
++    store
++        .seed_worker(&registration(worker))
++        .await
++        .unwrap();
++    let old = resident(worker);
++    store
++        .register_session(worker, &old, Duration::minutes(5))
++        .await
++        .unwrap();
++    let job = Uuid::new_v4();
++    enqueue_build(&store, job).await;
++    running_attempt(&store, worker, old.worker_session_id, job).await;
++    let successor = resident(worker);
++    store
++        .register_session(worker, &successor, Duration::minutes(5))
++        .await
++        .unwrap();
++    let queued = Uuid::new_v4();
++    enqueue_build(&store, queued).await;
++    let snapshot = store
++        .worker_maintenance_snapshot(worker)
++        .await
++        .unwrap()
++        .unwrap();
++    assert!(
++        snapshot
++            .admission_blockers()
++            .contains(&WorkerAdmissionBlocker::PendingCleanup)
++    );
++    assert!(
++        store
++            .poll_offer(
++                worker,
++                successor.worker_session_id,
++                Duration::seconds(30),
++                Duration::seconds(45)
++            )
++            .await
++            .unwrap()
++            .is_none(),
++        "another queued job must not bypass predecessor teardown"
++    );
++    let obligations = store
++        .cleanup_obligations(worker, successor.worker_session_id)
++        .await
++        .unwrap();
++    assert_eq!(obligations.len(), 1);
++    assert!(
++        store
++            .complete_cleanup(worker, successor.worker_session_id, obligations[0].id)
++            .await
++            .unwrap()
++    );
++    assert!(
++        store
++            .poll_offer(
++                worker,
++                successor.worker_session_id,
++                Duration::seconds(30),
++                Duration::seconds(45)
++            )
++            .await
++            .unwrap()
++            .is_some()
++    );
++}
++
++/// Newly committed teardown debt gates both re-delivery and acceptance of an offer.
++#[tokio::test]
++async fn lifecycle_pending_cleanup_blocks_retained_offer_and_acceptance() {
++    let (_db, pool) = setup_pg_db().await;
++    seed_install_repo(&pool, 100, 10).await;
++    let store = PostgresFleetStore::new(pool.clone());
++    let worker = Uuid::new_v4();
++    store
++        .seed_worker(&registration(worker))
++        .await
++        .unwrap();
++    let facts = resident(worker);
++    store
++        .register_session(worker, &facts, Duration::minutes(5))
++        .await
++        .unwrap();
++    let job = Uuid::new_v4();
++    enqueue_build(&store, job).await;
++    let offer = store
++        .poll_offer(worker, facts.worker_session_id, Duration::seconds(30), Duration::seconds(45))
++        .await
++        .unwrap()
++        .unwrap();
++    let identity = offer.offer.identity;
++
++    // Seed independent teardown debt after offer delivery. Admission must enforce
++    // this invariant even when a client retains an earlier offer.
++    let mut tx = pool.begin().await.unwrap();
++    sqlx::query("SELECT worker_id FROM worker_registry WHERE worker_id=$1 FOR UPDATE")
++        .bind(worker)
++        .execute(&mut *tx)
++        .await
++        .unwrap();
++    let obligation: i64 = sqlx::query_scalar(
++        "INSERT INTO worker_cleanup_obligation
++        (worker_id,worker_session_id,attempt_id,job_id,requeue_job,reason)
++        VALUES ($1,$2,$3,$4,false,'admission regression') RETURNING id",
++    )
++    .bind(worker)
++    .bind(facts.worker_session_id)
++    .bind(identity.attempt_id)
++    .bind(job)
++    .fetch_one(&mut *tx)
++    .await
++    .unwrap();
++    let poll_store = store.clone();
++    let poll = tokio::spawn(async move {
++        poll_store
++            .poll_offer(
++                worker,
++                facts.worker_session_id,
++                Duration::seconds(30),
++                Duration::seconds(45),
++            )
++            .await
++            .unwrap()
++    });
++    let accept_store = store.clone();
++    let accept_identity = identity.clone();
++    let accept = tokio::spawn(async move {
++        accept_store
++            .accept_offer(worker, &accept_identity, Duration::seconds(45))
++            .await
++            .unwrap()
++    });
++    wait_for_lock(&pool, "%FROM worker_registry WHERE worker_id=$1 FOR UPDATE", 2).await;
++    tx.commit().await.unwrap();
++    assert!(poll.await.unwrap().is_none());
++    assert!(!accept.await.unwrap());
++    assert!(
++        store
++            .complete_cleanup(worker, facts.worker_session_id, obligation)
++            .await
++            .unwrap()
++    );
++    let retried = store
++        .poll_offer(worker, facts.worker_session_id, Duration::seconds(30), Duration::seconds(45))
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(
++        retried
++            .offer
++            .identity
++            .attempt_id,
++        identity.attempt_id
++    );
++    assert!(
++        store
++            .accept_offer(worker, &identity, Duration::seconds(45))
++            .await
++            .unwrap()
++    );
++    assert!(
++        store
++            .accept_offer(worker, &identity, Duration::seconds(45))
++            .await
++            .unwrap(),
++        "acceptance retries stay idempotent"
++    );
++}
++
+ /// Recovery must retain the original successful check, never silently rewrite it.
+ #[tokio::test]
+ async fn lifecycle_preflight_provenance_is_immutable_and_legacy_is_unreported() {
+diff --git a/crates/sbgh-postgres/tests/postgres_fleet/scheduler_tests.rs b/crates/sbgh-postgres/tests/postgres_fleet/scheduler_tests.rs
+index 1bb0789..df69dfa 100644
+--- a/crates/sbgh-postgres/tests/postgres_fleet/scheduler_tests.rs
++++ b/crates/sbgh-postgres/tests/postgres_fleet/scheduler_tests.rs
+@@ -1,6 +1,10 @@
+ //! Scheduler maintenance against the production store and migrated schema.
+ 
++use sbgh_core::db::protocol::{
++    ProtocolPolicyChange, ProtocolPolicyChangeOutcome, ProtocolPolicyStore,
++};
+ use sbgh_core::db::scheduler::{SchedulerChange, SchedulerChangeOutcome, SchedulerStore};
++use sbgh_fleet::{NEGOTIATED_PROTOCOL_REVISION, ProtocolOffer};
+ 
+ use super::*;
+ 
+@@ -38,7 +42,15 @@ async fn ready(pool: &Pool) -> (PostgresFleetStore, Uuid, Uuid, Uuid) {
+         .await
+         .unwrap();
+     store
+-        .register_session(worker, &session(worker, session_id), Duration::seconds(90))
++        .register_session(
++            worker,
++            &RegisterSessionRequest {
++                protocol_version: NEGOTIATED_PROTOCOL_REVISION,
++                protocol_offer: Some(ProtocolOffer::current()),
++                ..session(worker, session_id)
++            },
++            Duration::seconds(90),
++        )
+         .await
+         .unwrap();
+     enqueue_build(&store, job).await;
+@@ -281,7 +293,7 @@ async fn scheduler_pause_fences_old_offers_but_keeps_accepted_work_live() {
+ }
+ 
+ #[tokio::test]
+-async fn scheduler_snapshot_retains_cleanup_and_zero_byte_artifact_debt() {
++async fn scheduler_snapshot_excludes_fenced_artifact_garbage_but_retains_cleanup_debt() {
+     let (_db, pool) = setup_pg_db().await;
+     let (store, worker, session_id, job) = ready(&pool).await;
+     let (identity, _) = running_attempt(&store, worker, session_id, job).await;
+@@ -302,6 +314,15 @@ async fn scheduler_snapshot_retains_cleanup_and_zero_byte_artifact_debt() {
+             .unwrap()
+     );
+     set_paused(&store, true).await;
++    assert_eq!(
++        store
++            .scheduler_snapshot()
++            .await
++            .unwrap()
++            .pending_artifacts,
++        1,
++        "zero bytes still blocks while the attempt is active"
++    );
+     let successor = Uuid::new_v4();
+     store
+         .register_session(worker, &session(worker, successor), Duration::minutes(5))
+@@ -315,7 +336,8 @@ async fn scheduler_snapshot_retains_cleanup_and_zero_byte_artifact_debt() {
+     assert_eq!(snapshot.active_attempts, 0);
+     assert_eq!(snapshot.pending_cleanup, 1);
+     assert_eq!(snapshot.pending_projection, 0);
+-    assert_eq!(snapshot.pending_artifacts, 1, "zero bytes is still an outstanding artifact");
++    assert_eq!(snapshot.pending_artifacts, 0);
++    assert_eq!(snapshot.garbage_artifacts, 1);
+ 
+     let obligations = store
+         .cleanup_obligations(worker, successor)
+@@ -333,12 +355,15 @@ async fn scheduler_snapshot_retains_cleanup_and_zero_byte_artifact_debt() {
+         .await
+         .unwrap();
+     assert_eq!(snapshot.pending_cleanup, 0);
+-    assert_eq!(snapshot.pending_artifacts, 1, "cleanup cannot clear artifact debt");
++    assert_eq!(snapshot.pending_artifacts, 0);
++    assert_eq!(snapshot.garbage_artifacts, 1);
+     assert!(
+         store
+-            .mark_staged_artifact_reaped(&object_key)
++            .staged_artifacts_due_for_reap(Utc::now() - Duration::days(1))
+             .await
+             .unwrap()
++            .is_empty(),
++        "maintenance does not bypass staging retention"
+     );
+     let snapshot = store
+         .scheduler_snapshot()
+@@ -351,6 +376,310 @@ async fn scheduler_snapshot_retains_cleanup_and_zero_byte_artifact_debt() {
+     assert_eq!(snapshot.pending_artifacts, 0);
+ }
+ 
++/// Try a real floor change so its admission predicate is checked alongside status.
++async fn advance_floor(store: &PostgresFleetStore) -> ProtocolPolicyChangeOutcome {
++    store
++        .change_protocol_policy(&ProtocolPolicyChange {
++            request_id: Uuid::new_v4(),
++            minimum_revision: 2,
++            actor: "api:admin".into(),
++            reason: "quiescence regression".into(),
++            rollback_evidence: "isolated test".into(),
++        })
++        .await
++        .unwrap()
++}
++
++/// Grant one empty staging object, retaining its descriptor for terminal acceptance.
++async fn grant_empty(
++    store: &PostgresFleetStore,
++    identity: &AttemptIdentity,
++    job: Uuid,
++    name: &str,
++) -> ArtifactDescriptor {
++    let artifact = ArtifactDescriptor {
++        key: format!("staging/{}/nonce/{job}/{name}", identity.attempt_id),
++        logical_key: format!("{job}/{name}"),
++        size: 0,
++        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
++    };
++    assert!(
++        store
++            .record_artifact_grant(&ArtifactGrantRecord {
++                attempt_id: identity.attempt_id,
++                object_key: artifact.key.clone(),
++                logical_key: artifact.logical_key.clone(),
++                size: Some(artifact.size),
++                sha256: Some(artifact.sha256.clone()),
++                expires_at: Utc::now() + Duration::minutes(5),
++            })
++            .await
++            .unwrap()
++    );
++    artifact
++}
++
++/// Expiry and acknowledged teardown unblock maintenance without forcing staging GC.
++#[tokio::test]
++async fn scheduler_and_floor_ignore_expired_uploads_after_real_cleanup() {
++    let (_db, pool) = setup_pg_db().await;
++    let (store, worker, session_id, job) = ready(&pool).await;
++    let (identity, _) = running_attempt(&store, worker, session_id, job).await;
++    grant_empty(&store, &identity, job, "unused.log").await;
++    set_paused(&store, true).await;
++    sqlx::query(
++        "UPDATE worker_attempt SET lease_expires_at=NOW()-INTERVAL '1 second' WHERE attempt_id=$1",
++    )
++    .bind(identity.attempt_id)
++    .execute(&pool)
++    .await
++    .unwrap();
++    assert_eq!(
++        store
++            .expire_stale_attempts()
++            .await
++            .unwrap(),
++        1
++    );
++    assert_eq!(advance_floor(&store).await, ProtocolPolicyChangeOutcome::MaintenanceRequired);
++    store
++        .register_session(
++            worker,
++            &RegisterSessionRequest {
++                protocol_version: NEGOTIATED_PROTOCOL_REVISION,
++                protocol_offer: Some(ProtocolOffer::current()),
++                ..session(worker, session_id)
++            },
++            Duration::minutes(5),
++        )
++        .await
++        .unwrap();
++    let obligations = store
++        .cleanup_obligations(worker, session_id)
++        .await
++        .unwrap();
++    assert_eq!(obligations.len(), 1);
++    assert!(
++        store
++            .complete_cleanup(worker, session_id, obligations[0].id)
++            .await
++            .unwrap()
++    );
++    let snapshot = store
++        .scheduler_snapshot()
++        .await
++        .unwrap();
++    assert_eq!(
++        (
++            snapshot.active_attempts,
++            snapshot.pending_cleanup,
++            snapshot.pending_projection,
++            snapshot.pending_artifacts
++        ),
++        (0, 0, 0, 0)
++    );
++    assert_eq!(snapshot.garbage_artifacts, 1);
++    assert!(
++        store
++            .staged_artifacts_due_for_reap(Utc::now() - Duration::days(1))
++            .await
++            .unwrap()
++            .is_empty()
++    );
++    std::assert_matches!(advance_floor(&store).await, ProtocolPolicyChangeOutcome::Applied(_));
++}
++
++/// Only accepted manifest membership retains promotion debt after terminal acceptance.
++#[tokio::test]
++async fn scheduler_and_floor_keep_manifest_promotion_debt_not_verified_garbage() {
++    let (_db, pool) = setup_pg_db().await;
++    let (store, worker, session_id, job) = ready(&pool).await;
++    let (identity, trace_id) = running_attempt(&store, worker, session_id, job).await;
++    let accepted = grant_empty(&store, &identity, job, "accepted.log").await;
++    let unused = grant_empty(&store, &identity, job, "unused.log").await;
++    assert!(
++        store
++            .verify_artifact(&identity, &accepted)
++            .await
++            .unwrap()
++    );
++    set_paused(&store, true).await;
++    let outcome = TerminalOutcome::Cancelled { reason: "test".into() };
++    let terminal = event(
++        &identity,
++        trace_id,
++        1,
++        ReliableEventPayload::Terminal {
++            outcome_digest: sbgh_fleet::payload_digest(&outcome).unwrap(),
++        },
++    );
++    store
++        .ingest_reliable_event(worker, &terminal)
++        .await
++        .unwrap();
++    assert_eq!(
++        store
++            .accept_terminal(
++                worker,
++                &identity,
++                &FleetTerminalSubmission {
++                    reliable_seq: 1,
++                    payload_digest: &terminal.payload_digest,
++                    outcome: &outcome,
++                    artifacts: std::slice::from_ref(&accepted),
++                    write: &FleetTerminalWrite::Cancelled { remark: "test".into() },
++                }
++            )
++            .await
++            .unwrap(),
++        TerminalAcceptance::Accepted
++    );
++    assert!(
++        store
++            .mark_event_projected(identity.attempt_id, 1)
++            .await
++            .unwrap()
++    );
++    let snapshot = store
++        .scheduler_snapshot()
++        .await
++        .unwrap();
++    assert_eq!(snapshot.pending_projection, 0);
++    assert_eq!(snapshot.pending_artifacts, 1, "accepted zero-byte artifact still needs promotion");
++    assert_eq!(snapshot.garbage_artifacts, 1, "unused grant is not promotion debt");
++    assert_eq!(advance_floor(&store).await, ProtocolPolicyChangeOutcome::MaintenanceRequired);
++    // A late verification must not expand the already accepted terminal manifest.
++    assert!(
++        store
++            .verify_artifact(&identity, &unused)
++            .await
++            .unwrap()
++    );
++    assert_eq!(
++        store
++            .scheduler_snapshot()
++            .await
++            .unwrap()
++            .pending_artifacts,
++        1
++    );
++    assert!(
++        store
++            .mark_artifacts_promoted(identity.attempt_id, std::slice::from_ref(&accepted))
++            .await
++            .unwrap()
++    );
++    let snapshot = store
++        .scheduler_snapshot()
++        .await
++        .unwrap();
++    assert_eq!((snapshot.pending_artifacts, snapshot.garbage_artifacts), (0, 1));
++    assert!(
++        store
++            .staged_artifacts_due_for_reap(Utc::now() - Duration::days(1))
++            .await
++            .unwrap()
++            .is_empty()
++    );
++    std::assert_matches!(advance_floor(&store).await, ProtocolPolicyChangeOutcome::Applied(_));
++}
++
++/// Withdrawing an offer leaves its resident session eligible for a clean stop.
++#[tokio::test]
++async fn scheduler_pause_repairs_withdrawn_session_before_deregistration() {
++    let (_db, pool) = setup_pg_db().await;
++    let (store, worker, session_id, _) = ready(&pool).await;
++    assert!(
++        store
++            .poll_offer(worker, session_id, Duration::seconds(30), Duration::seconds(45))
++            .await
++            .unwrap()
++            .is_some()
++    );
++    set_paused(&store, true).await;
++    let status: String =
++        sqlx::query_scalar("SELECT status::text FROM worker_session WHERE worker_session_id=$1")
++            .bind(session_id)
++            .fetch_one(&pool)
++            .await
++            .unwrap();
++    assert_eq!(status, "idle");
++    assert!(
++        store
++            .poll_offer(worker, session_id, Duration::seconds(30), Duration::seconds(45))
++            .await
++            .unwrap()
++            .is_none()
++    );
++    assert!(
++        store
++            .deregister_session(worker, session_id)
++            .await
++            .unwrap()
++    );
++}
++
++/// Pause coexists with expiry locks and preserves the sweep's offline session state.
++#[tokio::test]
++async fn scheduler_pause_waits_for_expiry_without_reviving_its_session() {
++    let (_db, pool) = setup_pg_db().await;
++    let (store, worker, session_id, _) = ready(&pool).await;
++    let offered = store
++        .poll_offer(worker, session_id, Duration::seconds(30), Duration::seconds(45))
++        .await
++        .unwrap()
++        .unwrap();
++    sqlx::query(
++        "UPDATE worker_attempt SET offer_expires_at=NOW()-INTERVAL '1 second' WHERE attempt_id=$1",
++    )
++    .bind(
++        offered
++            .offer
++            .identity
++            .attempt_id,
++    )
++    .execute(&pool)
++    .await
++    .unwrap();
++    let mut tx = pool.begin().await.unwrap();
++    sqlx::query(
++        "SELECT worker_session_id FROM worker_session WHERE worker_session_id=$1 FOR UPDATE",
++    )
++    .bind(session_id)
++    .execute(&mut *tx)
++    .await
++    .unwrap();
++    let expiry_store = store.clone();
++    let expiry = tokio::spawn(async move {
++        expiry_store
++            .expire_stale_attempts()
++            .await
++            .unwrap()
++    });
++    // The attempt update checks its session foreign key before the explicit
++    // session update; the expiry transaction already owns the attempt lock.
++    wait_for_lock(&pool, "%UPDATE worker_attempt%SET status = 'expired'%", 1).await;
++    let pause_store = store.clone();
++    let pause = tokio::spawn(async move { set_paused(&pause_store, true).await });
++    // Pause's registry lock must coexist with expiry's foreign-key key-share lock.
++    wait_for_lock(
++        &pool,
++        "%SELECT attempt_id FROM worker_attempt WHERE status='offered'%FOR UPDATE",
++        1,
++    )
++    .await;
++    tx.commit().await.unwrap();
++    assert_eq!(expiry.await.unwrap(), 1);
++    assert_eq!(pause.await.unwrap(), 1);
++    let status: String =
++        sqlx::query_scalar("SELECT status::text FROM worker_session WHERE worker_session_id=$1")
++            .bind(session_id)
++            .fetch_one(&pool)
++            .await
++            .unwrap();
++    assert_eq!(status, "offline", "pause must not revive an expired session");
++}
++
+ #[tokio::test]
+ async fn scheduler_generation_fences_preparation_across_pause_and_resume() {
+     let (_db, pool) = setup_pg_db().await;
+diff --git a/docs/worker-fleet-operations.md b/docs/worker-fleet-operations.md
+index 9a69fd3..a2277cd 100644
+--- a/docs/worker-fleet-operations.md
++++ b/docs/worker-fleet-operations.md
+@@ -725,7 +725,10 @@ cleanup, terminal submission, and artifact promotion remain available.
+ `wait` pins the first observed pause generation (or `--generation N`) and fails
+ if another operator resumes/repauses it. Success requires zero offered/running/
+ cancelling attempts, cleanup obligations, unprojected reliable events, and
+-unpromoted staging records. Even a zero-byte artifact counts. Timeout or API
++active-attempt uploads or accepted terminal-manifest artifacts awaiting promotion.
++Even a zero-byte required artifact counts. `garbage_artifacts` reports unreferenced
++staging retained for garbage collection; it does not block maintenance. The
++configured staging retention grace still applies. Timeout or API
+ failure exits unsuccessfully and never changes policy. Inspect remaining debt
+ instead of deleting records to force success. This is a point-in-time readiness
+ check, not an exclusive maintenance reservation; coordinate other operators.
+@@ -825,6 +828,23 @@ does not stop blindly, since new work may have been accepted. Use
+ `--timeout-secs N` for long-running attempts, or `--no-build` for an existing
+ release binary.
+ 
++If a retry finds the worker **stopped with pending cleanup**, waiting alone cannot
++make it quiescent. Inspect `fleet worker-status --worker-id UUID --json`, the
++failure log, and the installed binary/configuration first. Do not clear cleanup
++rows, uncordon to bypass the gate, or start a binary that failed preflight.
++After repairing the failure, run the installed worker's `--preflight-only` and
++`fleet check` with the same service user/config. For a compatible worker reporting
++`cordon_semantic=resident`, confirm it remains cordoned, manually start only its
++systemd instance, and wait for the new live session and acknowledged cleanup.
++Then rerun the updater. Keep scheduling policy unchanged and use a fresh
++`worker-status` snapshot rather than pinning a retired session.
++
++A legacy exit-on-drain worker may exit before processing cleanup. Do not apply
++the resident procedure or blindly uncordon it: use the coordinated release path
++with paused admission and an explicitly reviewed compatible recovery binary.
++If preflight or registration still fails, leave the worker cordoned and resolve
++that failure before retrying.
++
+ This workflow does not update or restart the daemon. Use the coordinated update
+ for protocol, schema, or daemon-and-worker changes.
+ 
+diff --git a/crates/sbgh-postgres/src/stores/fleet/quiescence.rs b/crates/sbgh-postgres/src/stores/fleet/quiescence.rs
+new file mode 100644
+index 0000000..a76508c
+--- /dev/null
++++ b/crates/sbgh-postgres/src/stores/fleet/quiescence.rs
+@@ -0,0 +1,23 @@
++//! Shared maintenance counters for scheduler waits and protocol-floor changes.
++
++/// Count execution/promotion debt separately from retained, unreferenced staging.
++pub const COUNTERS_SQL: &str = r#"
++    WITH staging AS (
++        SELECT staging.status,
++               attempt.status IN ('offered', 'running', 'cancel_requested')
++               OR (attempt.status IN ('completed', 'failed', 'cancelled') AND EXISTS (
++                   SELECT 1 FROM jsonb_array_elements(
++                       COALESCE(attempt.terminal_artifacts, '[]'::jsonb)
++                   ) artifact WHERE artifact->>'key' = staging.object_key
++               )) AS required
++        FROM worker_artifact_staging staging
++        JOIN worker_attempt attempt USING (attempt_id)
++        WHERE staging.status IN ('granted', 'uploaded', 'verified', 'rejected')
++    )
++    SELECT
++        (SELECT count(*) FROM worker_attempt WHERE status IN ('offered', 'running', 'cancel_requested')) AS active_attempts,
++        (SELECT count(*) FROM worker_cleanup_obligation WHERE status = 'pending') AS pending_cleanup,
++        (SELECT count(*) FROM worker_attempt WHERE highest_contiguous_reliable_seq > projected_reliable_seq) AS pending_projection,
++        (SELECT count(*) FROM staging WHERE required AND status != 'rejected') AS pending_artifacts,
++        (SELECT count(*) FROM staging WHERE NOT required) AS garbage_artifacts
++"#;

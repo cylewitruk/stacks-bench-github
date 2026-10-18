@@ -10,6 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[[example]]
+name = "sbgh-current-worker-probe"
+path = "../../fixtures/fleet/revision-1/worker-probe.rs"
+
 [dependencies]
 sbgh-driver.workspace = true
 sbgh-libvirt.workspace = true
