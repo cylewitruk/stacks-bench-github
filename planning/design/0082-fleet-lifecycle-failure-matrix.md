@@ -7,8 +7,26 @@ implementation section records the tested subset. Host configuration and install
 on 2026-10-14. The subsequent
 [October 15 qualification](../qualification/2026-10-14-first-fleet.md#v35-deployment-and-restart-qualification--2026-10-15)
 records the deployed release, running executable hashes, idle recovery, and
-active validation continuity. Effective runtime overrides and previous-release
-compatibility fixtures remain open.
+active validation continuity. Later sections are dated evidence snapshots;
+their then-open gates are not a cumulative current release checklist.
+
+## Qualification Scope — 2026-10-19
+
+The operator approved [v35's single-host closure scope](../iterations/v35-seamless-fleet-lifecycle.md#final-validation).
+The matrix below remains the correctness contract, not a requirement to inject
+every failure on production. Production-Postgres, controlled-clock/transport,
+real daemon-process and MinIO tests establish their respective invariants.
+Host evidence establishes the deployed integration and physical cleanup only
+within the observed cases. Prior release evidence is reused with source/config
+limitations; rerun checks when a relevant change invalidates it.
+
+The [October 18 rollout](../qualification/2026-10-18-v35-rollout.md) supersedes
+earlier pending-deployment/compatibility-fixture notes. Scheduler pause/resume,
+active-worker maintenance and evidence closeout remain v35 host work.
+Expanded provider/progress/comparison, identity and physical multi-worker
+ceremonies moved to named follow-ups; historical entries below are not passes.
+Unmeasured G/E/Q/K timing bounds must not be claimed as hard host guarantees.
+The operator-waived isolated application rollback rehearsal is not reopened.
 
 ## Source Baseline
 

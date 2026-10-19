@@ -1,60 +1,58 @@
 # v35: Seamless Fleet Lifecycle and Rolling Maintenance
 
 Successor to
-[v34](../archive/superseded/v34-first-fleet-deployment-readiness.md). Convert the conservative
-first-fleet shutdown behavior exposed by real-host qualification into an
-operator-safe lifecycle for a centralized daemon and independently maintained
-workers. Normal daemon restarts must not drain or stop the fleet; targeted
-worker maintenance and bounded protocol upgrades must preserve availability,
-leases, fencing, and auditability.
+[v34](../archive/superseded/v34-first-fleet-deployment-readiness.md).
+Separate daemon shutdown, scheduler admission, worker cordon and process
+shutdown while preserving leases, fencing, cleanup and replay.
 
-> **Status:** in_progress — active iteration from 2026-10-14, including the
-> carried first-fleet qualification. Decision 0006 was accepted on 2026-10-14.
-> Conservative lease deadlines, resident recovery, and process-local daemon
-> shutdown are implemented and host-tested within the recorded cases. Audited
-> scheduler controls, bounded negotiation and resident worker maintenance are
-> locally implemented; their rollout and remaining qualification remain open.
+> **Status:** in_progress — implementation reviewed and deployed on the single
+> Hetzner host on 2026-10-18. Two maintenance scenarios and evidence closeout
+> remain. This is not qualification of a distributed fleet.
 >
-> v35 owns lifecycle separation and a bounded current/previous protocol rollout
-> window. Multi-orchestrator HA is captured separately as `0083`.
+> **Scope approved 2026-10-19:** close v35 on lifecycle correctness and
+> single-host operational acceptance. Broader feature and multi-worker checks
+> have explicit owners below; they are deferred, not passed.
 
-## Qualification Handoff — 2026-10-14
+## Qualification Policy
 
-v34 is closed as a superseded iteration. This document owns the remaining
-`0080`, `0027`, and `0039` item definitions and qualification checks.
-Completed evidence remains in the
-[qualification record](../qualification/2026-10-14-first-fleet.md) and the
-[v34 archive](../archive/superseded/v34-first-fleet-deployment-readiness.md).
+The [failure matrix](../design/0082-fleet-lifecycle-failure-matrix.md) remains
+the correctness contract. Lease enforcement, stale-result fencing,
+cleanup-before-requeue, authorization, audit and idempotency are hard gates.
 
-**Implementation entry:** the proven same-host substrate, authenticated
-transport, controlled validation, and GitHub benchmark execution are the
-prerequisites for lifecycle work. Completion of carried `0080` is not an entry
-dependency: its restart and maintenance checks require v35 itself.
+- Use production-Postgres tests for persistence and concurrency, controlled
+  clocks/transport tests for timing boundaries, and daemon/MinIO composition
+  tests for signal and artifact recovery. Do not repeat every race manually.
+- Use host checks for installation, real VM teardown, deployed connectivity,
+  representative lifecycle transitions and artifact retrieval.
+- Retain dated evidence with its exact release and limitations. Repeat prior
+  checks when relevant code, configuration or infrastructure changes invalidate
+  them, not automatically for every release.
+- The reviewed `1616c49` suite is the current automated baseline; October 15–16
+  host restart/lease-loss checks are predecessor evidence, not reruns of that
+  release. Source-pinned compatibility and recovery tests supplement them.
+- Record observed teardown times, not an unmeasured universal timing guarantee.
+  Artifact listings do not establish content verification; registration does
+  not establish workload execution; a local VM does not establish independent
+  physical-host availability.
 
-Deploy and qualify the locally tested Phase 2/3 implementation server-first.
-Retain Phase 1's unresolved running-build provenance and pin deployed revision-1
-semantic-digest vectors before Phase 5 protocol changes. Manual undrain/restart
-and quiescent updates do not satisfy transparent-restart qualification.
+## Qualification Handoff — 2026-10-19
 
-Run provider/progress/comparison checks alongside the relevant v35 canaries.
-Recovery belongs to Phases 2–3/7, identity drills to Phases 6–7, and second-host
-commissioning to Phase 6. No second physical host has yet been qualified in the
-available evidence.
-
-An isolated second Linux VM is a useful first functional multi-worker ceremony,
-as proposed by the operator on 2026-10-17. It needs independent worker identity,
-libvirt and storage, including usable nested virtualization. Same-host VM
-evidence does not close the second-physical-host or performance-isolation gates.
+The [first-fleet record](../qualification/2026-10-14-first-fleet.md) preserves
+historical results. The [October 18 rollout](../qualification/2026-10-18-v35-rollout.md)
+records deployment, backup restore, legacy/current worker behavior and successful
+validation/benchmark canaries. Historical handoffs do not add closure gates
+beyond this iteration's Final Validation.
 
 ## Items
 
 | Item | Role | Status |
-| ---- | ---- | ------ |
-| `0082-seamless-fleet-lifecycle-maintenance` | primary: daemon, scheduler, worker, and host lifecycle separation | in_progress |
-| `0075-rolling-worker-protocol-compatibility` | co-primary: bounded server-first worker upgrades | in_progress |
-| `0080-first-fleet-deployment-qualification` | carried: remaining host/provider/recovery evidence | in_progress |
-| `0027-fine-grained-progress` | carried: real-host progress verification | in_progress |
-| `0039-multi-variant-benchmark-comparisons` | carried: real-host comparison verification | planned |
+| ---- | ---- | ---- |
+| `0082-seamless-fleet-lifecycle-maintenance` | primary: lifecycle separation and single-host maintenance | in_progress |
+| `0075-rolling-worker-protocol-compatibility` | co-primary: bounded server-first compatibility | in_progress |
+
+The item acceptance below states the behavior contract. The qualification
+policy and Final Validation specify its evidence level: automated multi-session
+coverage is retained; physical mixed-cohort operation is a separate `0080` gate.
 
 ## 0082 — Seamless Fleet Lifecycle and Maintenance
 
@@ -162,196 +160,26 @@ requirement for a second worker implementation language.
 
 ## Carried Qualification
 
-These items retain their existing status and acceptance criteria. The archived
-v34 evidence supplies the completed checks; the checklist below owns the
-remaining work. Lifecycle implementation remains first in execution order.
+Full entries for `0080`, `0027` and `0039` moved to
+[backlog.md](../backlog.md) as unscheduled candidates on 2026-10-19.
+Existing implementations and evidence are retained; their remaining acceptance
+is not a prerequisite for v35 closure.
 
-### 0080 — First Fleet Deployment Qualification
+| Check formerly blocking v35 | Owner / next gate |
+| ---- | ---- |
+| Second physical worker, independent maintenance, mixed-cohort real workloads | `0080`: before multi-worker production rollout; v36 snapshot bootstrap is `0084` |
+| Overlapping-key rotation, open-connection revocation, capability/profile changes | `0080`: operational worker onboarding; automated authorization/fencing coverage remains mandatory in v35 |
+| Natural-language Slack benchmark/validation journeys | `0080`: provider qualification; combine comparison evidence with `0039` |
+| Calibration/repeat progress, fallback and reporting behavior | `0027`: representative live progress; automated edge-case coverage |
+| Integrated comparison, repeat/calibration reuse and carried database | `0039`: independent feature acceptance |
+| Full-history/cross-epoch validation coverage | v36 `0085`: workload qualification; exhaustive history is an optional scale soak, not a lifecycle gate |
+| Direct S3 put/HEAD/get/checksum/delete ceremony | Replaced by job artifact upload plus download/content verification; automated promotion/GC checks retained |
+| Every signal, race, abort, projection interruption and floor transition on the host | Automated failure-matrix coverage plus representative host scenarios; no destructive production drill solely to tick a box |
+| Missing provenance from every historical job | Preserve known gaps; require reproducible identities for the selected closure evidence, not retrospective reconstruction of all history |
 
-- **id:** `0080-first-fleet-deployment-qualification`
-- **status:** `in_progress`
-- **priority:** `high`
-- **depends_on:** `0004-worker-fleet`, `0017-generic-phase-events`,
-  `0062-sandboxed-worker-execution`, `0063-libvirt-block-validation`,
-  `0066-task-aware-reporting`, `0067-github-block-validation-submission`,
-  `0074-protobuf-fleet-protocol`, `0076-database-backed-worker-registry`,
-  `0077-worker-identity-and-config-simplification`,
-  `0079-dynamic-block-validation-planning`
-- **relates_to:** `0027-fine-grained-progress`,
-  `0039-multi-variant-benchmark-comparisons`,
-  `0075-rolling-worker-protocol-compatibility`
-- **source:** first-deployment readiness review after v33 (2026-08)
-
-**Problem:** Submission, fleet execution, sandboxing, identity, and reporting
-originally lacked separately managed daemon/worker deployment evidence.
-Installer separation and first-host execution are now proven; this item retains
-the remaining provider, recovery, identity, and evidence-completion gates.
-
-**Scope:** Separate daemon and worker installation, provide one parse-tested
-dual-capability worker example, correct current identity documentation, and
-publish a rerunnable qualification playbook. Commission one same-machine
-daemon/worker topology, prove the sandbox before provider traffic, exercise
-benchmark and block-validation submission from GitHub and Slack, verify
-reporting/replay/cancellation, and then repeat worker commissioning on a second
-machine using the same protocol revision.
-
-**Acceptance:**
-
-- Daemon-only installation never installs or starts a worker; worker-only
-  installation never installs or starts the daemon or operator CLI.
-- A combined worker example advertises benchmark, build-only, and
-  block-validation capability from its recipe sections and passes preflight.
-- Setup and operations docs describe public Web-PKI server authentication plus
-  worker P-256 proof-of-possession and database authorization; no private
-  worker CA or certificate enrollment remains.
-- The managed network, golden image, LVM snapshots, read-only chainstate
-  origin, guest probes, cleanup, public-key enrollment, and gRPC session all
-  pass on the real host before provider canaries.
-- GitHub and Slack can each submit and report a benchmark and a block
-  validation without duplicate work or provider messages.
-- Recent, full-history, explicit cross-epoch, cancellation, and daemon-restart
-  canaries preserve fencing, exact coverage, cleanup, and report convergence.
-- A second worker can be installed, enrolled, authorized, and scheduled without
-  a daemon restart or a static fleet file.
-- Every gate records the command/revision, timestamp, outcome, and relevant
-  submission/job/attempt/provider identities in a durable qualification record.
-
-**Deferred / non-goals:** No lifecycle UX (`0065`, `0070`, `0071`), watched-ref
-automation (`0068`), rolling multi-revision protocol support (`0075`), package
-repository, auto-enrollment, common chainstate distribution, multi-orchestrator
-HA, performance certification, or new task kind.
-
-### 0027 — Fine-Grained Benchmark Progress: Real-Host Closure
-
-- **id:** `0027-fine-grained-progress`
-- **status:** `in_progress`
-- **priority:** `medium`
-- **depends_on:** `0017-generic-phase-events`,
-  `0060-slack-snapshot-reporting`, `0074-protobuf-fleet-protocol`
-- **relates_to:** `0039-multi-variant-benchmark-comparisons`
-- **source:** v20 implementation audit during v34 planning (2026-08)
-
-**Problem:** Fine-grained `stacks-bench` JSONL parsing, bounded delivery,
-archiving, fleet transport, and reporting are implemented and tested. Real
-benchmark jobs now retain `run.progress.jsonl`; live attribution, calibration/
-repeat handling, total-less events, and final-line drain still need explicit
-host evidence.
-
-**Scope:** Exercise the existing production path during benchmark canaries.
-Confirm workflow-step and run-index attribution, bounded/debounced snapshot
-updates, optional fallback for a silent or older producer, raw JSONL artifact
-retention, and terminal precedence. Record whether calibration emits progress
-and whether guest shutdown loses a final best-effort line; fix only defects
-that violate the current contract.
-
-**Acceptance:**
-
-- A real benchmark emits parseable progress from the guest and reaches the
-  daemon through the protobuf fleet path without delaying reliable phase or
-  terminal events.
-- Calibration and measured-run events, when emitted upstream, carry the correct
-  workflow step and repeat index; a silent calibration remains a supported
-  coarse-phase fallback.
-- Slack renders bounded canonical snapshots rather than an event transcript;
-  GitHub/check reporting remains bounded and terminal state wins over delayed
-  progress.
-- Archived `run.progress.jsonl` and, when present,
-  `calibration.progress.jsonl` match the executed attempt and remain useful for
-  forensics.
-- Missing, malformed, unknown-version, total-less, or backpressured progress
-  never changes the task terminal outcome.
-
-**Deferred / non-goals:** No return to Slack streaming/append semantics, no
-reconstruction from console text, no change to upstream `stacks-bench`, and no
-native result-envelope cleanup (`0050`).
-
-### 0039 — Multi-Variant Benchmark Comparisons: Real-Host Closure
-
-- **id:** `0039-multi-variant-benchmark-comparisons`
-- **status:** `planned`
-- **priority:** `high`
-- **depends_on:** `0041-shared-benchmark-calibration`,
-  `0060-slack-snapshot-reporting`, `0064-task-submission-kernel`,
-  `0066-task-aware-reporting`
-- **relates_to:** `0027-fine-grained-progress`
-- **source:** v22 implementation audit during v34 planning (2026-08)
-
-**Problem:** Two-variant request validation, atomic multi-spec persistence,
-serial fleet execution, per-variant calibration, artifact carry-forward,
-noise-aware comparison, and one-message reporting are implemented and tested.
-They have not completed together on real hardware.
-
-**Scope:** Submit a natural-language Slack comparison for one small workload
-and two explicit refs, first with one measured run and then with two clean
-repeats if the first canary is healthy. Prove same-worker serial placement,
-one calibration per variant, per-variant calibration reuse, shared SQLite
-carry-forward, bounded progress, comparison aggregation, artifact provenance,
-and one final Slack snapshot.
-
-**Acceptance:**
-
-- One request creates one submission with two ordered specs and never executes
-  variants or repeats concurrently.
-- Each variant receives its own calibration identity; repeats reuse only their
-  variant's identity and run in fresh VMs.
-- Variant 1 receives the carried submission database rather than a fresh file,
-  while artifacts and metrics remain attributable to their spec/run.
-- The terminal task-aware report and Slack snapshot identify both refs,
-  calibration provenance, completed/missing runs, metric deltas, and the
-  conservative noise-aware verdict.
-- Redelivery does not duplicate the submission or Slack message, and daemon
-  restart reconstructs the same aggregate report.
-
-**Deferred / non-goals:** No deterministic Slack flag grammar, variant matrix,
-parallel variants, automatic ref discovery, or cross-worker comparison-group
-recovery. Slack benchmark intake remains natural-language/LLM-only; typed
-HTTP/CLI and exact GitHub triggers remain provider-free.
-
-### Remaining Qualification Checks
-
-- [ ] `0080`: retrieve missing submission/attempt/provider identities,
-  deployed release/image/tool versions, artifact checksums, and protected host
-  reports; complete the dated evidence record and operator sign-off.
-- [ ] `0080`: record direct S3 put/HEAD/get/checksum/delete.
-- [ ] `0080`: run one natural-language Slack benchmark with immutable commit,
-  authorized placement, one canonical report, promoted artifacts, and cleanup.
-- [ ] `0080`: qualify full-history validation in a maintenance window, covering
-  both epochs; accept a negative verdict only after every shard exits normally
-  and the reducer proves exact coverage.
-- [ ] `0080`: complete active-attempt and post-terminal daemon restart, worker
-  loss during execution/cleanup, and cleanup-obligation recovery in Phases 2–3/7.
-- [ ] `0080`: complete overlapping-key rotation, normal/emergency revocation
-  on an open connection, capability/profile intersection, and registry-policy
-  persistence in Phases 6–7.
-- [ ] `0080`: pin deployed revision-1 semantic-digest vectors and binary
-  provenance in Phase 1 before Phase 5's protocol changes.
-- [ ] `0080`: commission a second physical worker by Phase 6: worker-only
-  install, independent sandbox/LVM/preflight, distinct authorized key, compatible
-  protocol, capability-aware placement, independent cordon/revocation, and
-  targeted maintenance while the other worker continues serving work.
-- [ ] `0027`: inspect live guest-to-fleet/provider progress and archived JSONL;
-  verify calibration/repeat attribution, debounce, optional fallback,
-  total-less/backpressured progress, and terminal precedence.
-- [ ] `0039`: run two explicit refs on one compatible worker/snapshot, first
-  once each and then with two clean repeats per variant. Prove serial fresh
-  VMs, per-variant calibration/reuse, carried DB, result/noise aggregation,
-  artifact provenance, and one final Slack snapshot.
-- [ ] `0039`: prove redelivery idempotency and aggregate/provider identity
-  preservation after daemon restart, alongside Phase 7 recovery qualification.
-- [ ] Carried reporting finding: distinguish validation initialization/range
-  discovery from steady-state processed-block progress; derive ETA only after
-  stable post-initialization samples.
-
-The reporting distinction is now implemented locally: range probes publish
-total-less initialization updates, silent commands explicitly wait for
-processed-block evidence, and a bounded rate window supplies an optional
-processing-only ETA after stable samples. New commands, pending work and stalls
-suppress it. Guest/helper and driver-forwarding tests cover these paths; live
-guest-to-provider qualification remains open.
-
-The separate 20,000-block baseline and optimized runs do not satisfy the
-integrated `0039` gate. Existing `run.progress.jsonl` artifact listings prove
-retention, not all `0027` live behavior.
+Second-worker and standalone build-only preparation can follow v35; neither is
+required to finish this deployed single-host release. No performance-isolation,
+community trust or multi-host availability claim is implied.
 
 ## State Model
 
@@ -378,8 +206,8 @@ never silently become fleet-wide maintenance commands.
   creating a successor or relying on an unbounded session promise.
 - **Cleanup delivery is continuous.** Registration-time reconciliation remains
   a safety check, not the only way a resident worker can discover an obligation.
-  Until Phase 5 negotiation exists, revision-1 workers periodically call the
-  existing `ListCleanup` RPC; Phase 2 adds no push field or wire semantic.
+  Revision-1 recovery uses the existing `ListCleanup` RPC without a new
+  push field or wire semantic.
   Cleanup acknowledgement precedes any associated requeue.
 - **Startup grace reconciles; it does not renew.** On daemon startup, overdue
   attempts receive one bounded heartbeat opportunity before expiry. Only an
@@ -445,489 +273,159 @@ never silently become fleet-wide maintenance commands.
 - Keep schema changes additive where practical. The previous daemon is not a
   rollback target for the expanded database: restore its matching database,
   binaries and configuration together. Do not erase migration/audit history or
-  weaken validation. Exercise the restore path before closing v35; prefer a
-  forward fix once new work has been accepted.
+  weaken validation. The October 18 host database restore passed; the operator
+  waived isolated application rehearsal for this rollout. Retain the matching
+  recovery package and reconciliation procedure; prefer a forward fix once
+  new work has been accepted.
 
 ## Phases
 
+Implementation detail and historical test runs remain in the
+[failure matrix](../design/0082-fleet-lifecycle-failure-matrix.md);
+the [review handoff](../reviews/2026-10-18-v35-cleanup-round-2-review.md) and
+[rollout record](../qualification/2026-10-18-v35-rollout.md) supply release evidence.
+The following replaces stale implementation/review checkboxes; it does not
+declare every original host ceremony passed.
+
 ### Phase 1: Lifecycle Contract and Failure Matrix
 
-**Goal:** Freeze the desired/observed state boundaries and transition rules
-before changing shutdown behavior.
-
-Working contract: [failure matrix and timing bounds](../design/0082-fleet-lifecycle-failure-matrix.md).
-Source defaults, operator-reported host configuration, and installed binary
-hashes are recorded separately; effective runtime overrides, running executable
-identities, and exact source/build provenance remain open.
-Lease, recovery, and local-shutdown cases now have executable local coverage;
-see [implementation evidence](../design/0082-fleet-lifecycle-failure-matrix.md#local-implementation--2026-10-14).
-The full matrix and physical-host timing bounds remain unqualified.
-
-**Scope:**
-
-- Implement the direction accepted in Decision 0006 on 2026-10-14.
-- Specify normal stop, short outage, long outage, explicit pause, emergency
-  abort, worker cordon, worker stop, and worker-loss transitions.
-- Define invariants for leases, fencing, cleanup, replay, and provider updates.
-- Derive transparent-restart, session-recovery, startup-grace, and maximum
-  overlap windows from configured heartbeat, attempt-lease, and session TTLs.
-
-**Status:**
-
-- [x] Decision 0006 accepted
-- [ ] Failure matrix and transition table complete
-- [ ] Reviewed (Codex)
-- [ ] Validation cases pinned before implementation
-- [x] Deployed revision-1 semantic-digest vectors and binary provenance pinned
-  for Phase 5 compatibility fixtures
-
-The [deployed-contract fixture](../../fixtures/fleet/revision-1/README.md) pins
-`0f18950`, its operator-verified running worker hash, the exact schema, and 14
-semantic-digest vectors. This does not yet prove a previous binary's runtime
-lifecycle. Historical v29/v31/v33 schemas reused revision 1 across incompatible
-field changes. On 2026-10-17 the operator approved `0f18950` as the supported
-previous contract and explicitly excluded incompatible pre-v33 layouts.
-
-**Acceptance & Validation:**
-
-- [ ] Every transition has one durable authority and one observable terminal
-  state; no transition depends on shell-command ordering for correctness.
-- [ ] The failure matrix identifies which work continues, pauses, cancels, or
-  expires for each daemon/worker/network failure.
-- [ ] The matrix records the deployed timing values and formulas; no acceptance
-  claim uses an unbounded meaning of “restart” or “reconnect.”
-- [ ] The matrix distinguishes loss of authoritative mutation rights from full
-  physical teardown of the VM, mounts, and snapshots; scheduling and requeue
-  remain cleanup-gated until the latter completes.
-
-**Tests:**
-
-- State-transition table tests for valid, idempotent, and rejected mutations.
-- Stalled and delayed heartbeat responses cannot extend local execution past
-  its confirmed lease; cancellation is independent of RPC completion.
+Decision 0006 is accepted. The transition matrix distinguishes authority from
+physical teardown, records host H/L/S settings and pins the supported
+`0f18950` revision-1 schema and semantic digests. Incompatible pre-v33 layouts
+that reused revision 1 are explicitly excluded.
 
 ### Phase 2: Resident Session and Cleanup Recovery
 
-**Goal:** Remove process restart as an implicit prerequisite for session and
-cleanup convergence.
-
-**Implementation evidence (2026-10-14):** same-UUID recovery, successor fencing,
-periodic cleanup, idempotent cleanup acknowledgement, and independent lease
-deadlines are locally tested. Recovery requires the additive
-`session_recovery_required` server response; previous-daemon `stale_session`
-remains fail-closed. The [October 15 host checks](../qualification/2026-10-14-first-fleet.md#v35-deployment-and-restart-qualification--2026-10-15)
-qualify idle same-session recovery after a reported 110-second daemon outage.
-The [October 16 canary](../qualification/2026-10-14-first-fleet.md#active-lease-expiry-canary--2026-10-16-resident-recovery-failed)
-cancelled and cleaned the old execution, but an unstructured gRPC `Unknown`
-reconnect error terminated the worker. Systemd recovery is not a pass for this
-phase. The corrected `0f18950` worker passed the
-[repeat canary](../qualification/2026-10-14-first-fleet.md#active-lease-expiry-repeat--2026-10-16-passed):
-physical teardown preceded same-session cleanup acknowledgement and a single
-replacement attempt, which completed without a worker restart. Duplicate-ack,
-successor-race, and mixed-version host checks remain open.
-
-**Scope:**
-
-- Poll the existing `ListCleanup` RPC on registration and periodically while a
-  revision-1 worker is resident; prioritize obligations ahead of new offers.
-  Do not add cleanup fields to heartbeat/poll responses before Phase 5.
-- Reactivate an idle expired session UUID in process only when the authenticated
-  worker and registration facts match and no live successor session exists.
-- Treat `session_recovery_required` as recoverable only after proving no
-  authoritative local attempt remains; legacy `stale_session` still exits.
-- After active lease loss, cancel and verify local teardown before reactivating
-  the session, reconciling cleanup, or polling for work.
-- Phase 2 never creates a new session UUID for recovery. Retry transient
-  transport failures with the same live session. Permit same-identity recovery
-  only after the server reports it stale or expired, and reject it if another
-  live successor exists. Return typed, non-retryable `session_superseded`; the
-  resident worker exits without minting a fresh UUID. Only a new worker process
-  may initiate the existing successor-session fencing path.
-- Deploy the additive daemon-side recovery transaction before enabling the
-  worker retry path; an upgraded worker against a previous daemon must retain
-  the existing fail-closed exit behavior.
-- Keep cleanup completion and job requeue idempotent under retry and reconnect.
-
-**Status:**
-
-- [x] Core implementation
-- [x] Unit/integration tests, if applicable
-- [x] Review closed — Opus round 2 found all round-1 findings resolved and
-  nothing blocking; final query/status consistency nits addressed
-- [ ] Validated — the acceptance checks below were run
-
-**Acceptance & Validation:**
-
-- [x] An obligation inserted after worker startup is discovered, executed, and
-  acknowledged without process restart; its job is requeued exactly once only
-  after acknowledgement.
-- [x] An idle expired session reactivates its original session ID in process
-  while keeping the same worker identity and policy.
-- [ ] A transient connection failure never creates a successor session; tests
-  pin same-session recovery, rejection when a live successor exists, and the
-  store's successor-fencing contract.
-- [ ] Superseded recovery returns `session_superseded`; the resident worker
-  treats it as non-retryable, exits, and never mints a replacement session ID.
-- [ ] Server-first rollout leaves previous workers unchanged and prevents an
-  upgraded worker from looping against a daemon without recovery support.
-- [ ] An expired active attempt cannot overlap a successor session's work:
-  local cancellation and cleanup finish before session recovery and polling.
-- [ ] Duplicate delivery, acknowledgement loss, daemon restart, and worker
-  reconnect converge on one completed obligation.
-
-**Tests:**
-
-- Worker loopback tests for periodic delivery, same-session recovery,
-  active lease loss, and cleanup-before-poll ordering.
-- PostgreSQL races for obligation insertion/delivery/completion/requeue and
-  same-session recovery versus successor-session fencing.
-- Store and worker tests pin the typed superseded response and fail-closed exit
-  when a live successor owns the worker identity.
+Implemented and reviewed. Automated tests cover expired-session reactivation,
+superseded-session rejection, stalled RPC lease deadlines, cleanup retries and
+acknowledgement loss. October 15–16 host evidence covers idle recovery and the
+corrected active lease-loss/cleanup/retry path without a worker process restart.
 
 ### Phase 3: Non-Destructive Daemon Quiescence
 
-**Goal:** Make a compatible single-daemon restart transparent within explicit
-session and lease bounds.
-
-**Implementation evidence (2026-10-14):** signal handling and coordinator exit
-are process-local, shutdown grace is H, and startup expiry sweeping begins after
-2H. Database lease-expiry predicates are unchanged: an already-expired lease
-cannot be renewed during grace. Local tests pass; the
-[October 15 host checks](../qualification/2026-10-14-first-fleet.md#v35-deployment-and-restart-qualification--2026-10-15)
-also prove idle restart/recovery and active validation continuity through a
-successful terminal result under the same attempt. Startup-grace boundary and
-provider-convergence checks remain open. Existing job cancellation and emergency
-worker disable/revoke remain available. A later local implementation adds an
-audited fleet abort with explicit scope and paused-generation fencing, separate
-from every process signal. Host abort/provider-convergence evidence remains open.
-Local coordinator reconstruction tests now cover successful, failed and cancelled
-terminal projection, including a lost acknowledgement after the provider update.
-They reuse the durable Check Run identity with a recording GitHub adapter;
-full-daemon and live-provider restart qualification remain open.
-Local startup tests also run the coordinator against PostgreSQL: grace does not
-renew expired authority, a live heartbeat survives the first sweep, and expired
-attempts create one cleanup obligation without premature requeue. These do not
-replace the full-daemon/host startup-grace and physical teardown checks below.
-Local PostgreSQL/MinIO composition tests cover accepted-terminal recovery,
-partial artifact promotion and lost promotion acknowledgements with fresh
-storage adapters. Production-host maintenance-loop/process interruption remains unqualified.
-The later `daemon_lifecycle` suite additionally runs the shipped daemon binary:
-real SIGTERM/first/second SIGINT preserve durable state, and its maintenance loop
-recovers a copied artifact after lost acknowledgement and process restart.
-These use seeded attempts and local MinIO; deployed workers and live providers
-remain separate gates.
-
-**Scope:**
-
-- Remove persistent global worker drain and fleet-wide cancellation from normal
-  process signals.
-- Map `SIGTERM` and first `SIGINT` to local quiescence; map second `SIGINT` to
-  forced local exit without fleet mutation. Keep fleet abort as an explicit,
-  authenticated operation.
-- Replace the fleet coordinator's sole-exit ownership with a shutdown supervisor
-  that waits only for local components and bounded in-flight RPC handling.
-- On startup, hold attempt expiry for one configured heartbeat reconciliation
-  opportunity without extending an unconfirmed lease.
-- Reconstruct scheduling and projection state from PostgreSQL after restart.
-
-**Status:**
-
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
-
-**Acceptance & Validation:**
-
-- [x] Restarting inside the session TTL reuses the active idle session; an
-  outage beyond it uses Phase 2 same-session recovery. Neither path needs worker
-  undrain or systemd start.
-- [x] Restarting during an active attempt inside its confirmed lease preserves
-  its authoritative generation and terminal result.
-- [ ] A healthy worker heartbeat during startup grace preserves its attempt;
-  silence beyond the grace expires it once without renewing authority.
-- [ ] The failure matrix separates the authoritative overlap bound (startup
-  grace, after which fencing rejects stale mutation) from the physical-resource
-  bound (startup grace plus the next heartbeat observation and bounded VM,
-  mount, and snapshot teardown). Requeue and local admission remain cleanup
-  gated through the latter.
-- [ ] Restart after reliable terminal acceptance but before projection reuses
-  the same provider identity and terminal state.
-- [ ] All three signal paths and explicit fleet abort have distinct tests and
-  observable outcomes.
-
-**Tests:**
-
-- Daemon composition tests around both signals, forced local exit, listener
-  restart, session reuse/recovery, startup grace, and projection replay.
-- PostgreSQL tests proving shutdown does not mutate worker registry policy and
-  startup expiry remains database-time authoritative after the grace.
+Implemented and reviewed. Actual daemon-process signal tests, PostgreSQL
+startup-grace tests, artifact recovery through MinIO and provider-adapter replay
+tests provide the recorded local recovery evidence. Host short-outage continuity and long-outage
+fail-closed recovery are retained with their recorded releases. No separate
+live-provider interruption at every projection boundary is required.
 
 ### Phase 4: Scheduler Pause and Audited Maintenance State
 
-**Goal:** Provide an explicit control-plane gate for long or incompatible
-maintenance without draining workers.
-
-**Scope:**
-
-- Persist running/paused scheduler state with actor, reason, generation, and
-  timestamps.
-- Add idempotent pause/resume/status/wait operator APIs and CLI commands.
-- Prevent preparation and offers while paused; allow heartbeats, cleanup,
-  terminal submission, artifact promotion, and projection to continue.
-
-**Status:**
-
-- [x] Core implementation
-- [x] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
-
-Local implementation adds the singleton generation gate, append-only request
-audit, authenticated status/pause/resume APIs, and CLI status/pause/resume/wait.
-Preparation and offer/accept transactions serialize with policy changes;
-unaccepted offers are withdrawn without changing worker/session policy.
-CLI wait polls consistent API snapshots and pins one pause generation. Local
-tests cover authorization, audit replay/conflicts, admission races, resident
-polling, terminal acceptance, generation changes, and timeout. Host pause/restart/
-resume qualification and release review remain open. See the
-[operator procedure](../../docs/worker-fleet-operations.md#scheduler-maintenance).
-
-**Acceptance & Validation:**
-
-- [ ] Pause introduces no new offers after its committed generation and does
-  not alter worker registry or session state.
-- [ ] Active attempts finish normally and queued jobs remain queued.
-- [ ] Resume is idempotent, survives daemon restart, and restores scheduling
-  without worker restarts.
-
-**Tests:**
-
-- PostgreSQL race tests for pause generation versus prepare/poll/accept and
-  restart persistence.
-- API/CLI authorization, audit, idempotency, and wait-command tests.
+Implemented, reviewed and deployed. Production-store race tests cover pause
+versus offer/accept, persisted generations and idempotent audit receipts.
+The remaining host scenario is A below.
 
 ### Phase 5: Rolling Protocol Negotiation
 
-**Goal:** Land and validate `0075` compatibility infrastructure independently
-before assigning any new lifecycle semantics.
+Implemented, reviewed and deployed server-first. Source-pinned previous/current
+runtime probes and Buf checks cover the supported window. On October 18 the
+unchanged previous worker registered and exited cleanly on cordon; the current
+worker negotiated revision 2 and remained resident. This is not a two-host
+mixed-workload test; that operational gate belongs to `0080`.
 
-**Scope:**
-
-- Add bounded current/previous protocol and additive-feature negotiation.
-- Persist the negotiated contract and match offers on task plus semantic
-  feature support.
-- Pin previous-worker runtime fixtures and published protobuf baselines.
-- Document server-first rollout and compatibility-floor advancement.
-
-**Entry evidence:** the deployed revision-1 schema and semantic digests are
-frozen under `fixtures/fleet/revision-1`. CI now checks the schema against that
-local immutable baseline with Buf `FILE` rules. Local positive/additive and
-negative field-reuse checks passed. Revision/feature selection, additive
-registration fields, immutable session contracts, worker selection validation,
-task-semantic offer admission, and API/CLI contract visibility are implemented
-locally. Audited floor control now requires paused quiescence and convergence of
-enabled workers, with immutable receipts and explicit rollback. Source-pinned
-previous/current worker probes now exercise production mTLS/RPC/store registration,
-session recovery across short and session-expiring listener/service restarts,
-and legacy drain semantics. Task execution, full daemon-process restart and host
-rollback qualification remain pending.
-The pinned predecessor migrator rejects the new ledger; a binary-only daemon
-rollback is not supported. A local pre-upgrade backup restore into a separate
-database passes migration startup and preserves the ledger and worker policy.
-This does not qualify full daemon startup, host restore or post-backup data
-reconciliation.
-On 2026-10-17 the operator explicitly approved backup/restore-only rollback for
-this one-host rollout and preferred roll-forward fixes. This replaces the
-previous-daemon-on-expanded-schema requirement, not the current/previous worker
-contract or the host restore gate. A coordinated restore must include matching
-database, binaries and configuration; post-backup work and external provider
-effects require explicit reconciliation. No bridge release is required.
-The original v29 schema differs
-in registration and validation field numbers despite sharing revision 1;
-do not imply compatibility with it. On 2026-10-17 the operator approved the
-deployed `0f18950` contract as the supported previous cohort, excluding the
-incompatible pre-v33 layouts.
-
-The operator confirmed on 2026-10-17 that only the Hetzner worker is deployed.
-The upgrade compatibility scope is that exact predecessor and the new worker,
-not a broader historical fleet. Logical mixed-session tests do not satisfy the
-separate second-physical-host qualification requirement.
-
-**Status:**
-
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
-
-**Acceptance & Validation:**
-
-- [ ] Previous and current workers coexist under the current daemon and receive
-  only task semantics they negotiated.
-- [ ] Revision-1 `Drain` retains its deployed exit behavior; no new semantics
-  are silently assigned to an old revision.
-- [ ] An incompatible worker is rejected before assignment with an actionable,
-  non-retryable response.
-- [ ] CI rejects wire breakage against every supported published baseline.
-
-**Tests:**
-
-- Pinned previous-worker runtime and loopback fixtures.
-- Protobuf breaking-change, feature-negotiation, offer-matching, floor-advance,
-  and rollback tests.
+Keep floor 1; advancing it is an operational decision, not a release exercise.
+Old-daemon binary-only rollback onto the expanded schema is unsupported.
+The matching host backup restored successfully; isolated application rehearsal
+was explicitly waived on October 18. Do not reopen that waived ceremony or
+record it as a pass.
 
 ### Phase 6: Live Cordon and Targeted Host Maintenance
 
-**Goal:** Use negotiated lifecycle semantics for safe one-worker-at-a-time
-maintenance.
+Implemented, reviewed and deployed. Idle resident cordon/uncordon and worker
+replacement passed on the host. Automated tests cover targeted command fencing,
+cleanup admission and failed-update isolation. The remaining active-work
+scenario is B below. Physical second-host continuity and host-reboot drills
+belong to `0080`, not this single-host closure.
 
-**Local implementation (2026-10-17):** audited, retry-safe cordon/uncordon and
-session-targeted shutdown are implemented. Current workers remain resident;
-the pinned predecessor retains drain-and-exit behavior. Registry locking
-serializes cordon against offer acceptance, active attempts continue, cleanup
-gates deregistration, and replay cannot target a replacement session.
-`worker-status` and generation/session-pinned `wait-worker` expose coherent
-maintenance debt and distinguish quiescence from clean deregistration. These
-do not attest physical process exit. The worker updater now uses targeted
-maintenance waits, starts resident replacements while cordoned and verifies a
-new live session before uncordon. Command-fixture tests cover failure isolation
-and legacy startup ordering. Worker status and waits now expose effective
-admission blockers separately from liveness. Immutable worker-reported preflight
-revision/build/config provenance is exposed with explicit absence for previous
-workers. Two-worker rollout and host ceremonies remain open; the phase is
-not complete. See the
-[local evidence](../design/0082-fleet-lifecycle-failure-matrix.md#resident-worker-maintenance--2026-10-17).
+### Phase 7: Single-Host Acceptance and Evidence Closeout
 
-**Scope:**
+Use small compatible workloads, not full-history validation or long performance
+runs. Reuse jobs across checks where transitions remain separately observable.
+Only the operator runs host mutations; do not inject destructive failure drills
+into unrelated work. Follow the
+[operations runbook](../../docs/worker-fleet-operations.md).
 
-- Add live cordon/uncordon for current workers; keep them connected through
-  heartbeat and bounded polling while unschedulable.
-- Add explicit shutdown-after-idle, distinct from scheduling policy.
-- Add status and wait commands for schedulability, attempts, cleanup, session
-  revision/features, preflight revision, and the effective cordon semantic.
-- Document worker binary/config updates, reboot, identity rotation, canary
-  cohorts, failure isolation, rollback, and the revision-1 requirement to
-  restart a worker after it exits on drain and is later uncordoned.
+#### Scenario A — Scheduler pause/resume
 
-**Status:**
+- [ ] Pause with active work and a queued canary: the active attempt continues
+  under the same identity; the queued work receives no new attempt while paused.
+- [ ] Restart the daemon while paused; confirm the pause generation persists
+  without changing worker cordon policy or requiring a worker restart.
+- [ ] Retry the same administrative request to verify its idempotent receipt,
+  resume, and observe queued work admitted. Retain audit generation/request
+  identities and successful terminal/cleanup evidence.
 
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
+Keep the restart within confirmed lease bounds if work is still active; if it
+has finished, verify persisted pause before resuming. This is not another
+long-outage drill.
 
-**Acceptance & Validation:**
+#### Scenario B — Active-worker maintenance
 
-- [ ] A current worker can cordon, reach idle, remain online, uncordon, and
-  accept work without systemd intervention.
-- [ ] Mixed-cohort status reports `exit_after_idle` for revision-1 cordon and
-  `resident` for negotiated live cordon; wait/runbook behavior follows the
-  reported semantic rather than assuming one fleet-wide meaning.
-- [ ] Shutdown-after-idle never interrupts an attempt and exits cleanly only
-  after cleanup and deregistration.
-- [ ] Cordon one of at least two workers, update/restart/verify it, and uncordon
-  it while another worker continues accepting compatible work.
-- [ ] A failed preflight leaves only that worker cordoned; rollback restores a
-  compatible worker without daemon restart or attempt duplication.
+- [ ] Cordon an active current worker: the existing attempt finishes normally;
+  queued work is not admitted. Capture the worker's resident behavior.
+- [ ] Request shutdown-after-idle while work is active; verify successful
+  terminal completion, cleanup acknowledgement, clean deregistration and
+  process exit. No forced stop or cancellation substitutes for this check.
+- [ ] Restart while still cordoned, verify preflight/current protocol and
+  persisted policy, then uncordon and observe new work admitted.
 
-**Tests:**
+Use separate transitions or small canaries if necessary to distinguish
+resident cordon from an explicit shutdown request. Finish with the service
+healthy, the intended policy restored and zero attempts/cleanup debt.
 
-- Postgres fencing tests for cordon/uncordon/offer/accept races.
-- Installer isolation plus a two-worker rollout integration ceremony.
-- Manual real-host worker update and host-reboot qualification record.
+#### Evidence closeout
 
-### Phase 7: End-to-End Maintenance Qualification
-
-**Goal:** Prove the complete daemon and worker operating paths on deployed
-infrastructure.
-
-**Scope:**
-
-- Restart the daemon during idle, active validation, cleanup-obligation
-  creation, artifact promotion, and provider projection.
-- Run expired-session recovery, startup-grace, paused long-maintenance, and
-  emergency-abort drills.
-- Complete the carried v34 identity drills: overlapping key rotation, normal
-  and emergency revocation on an open connection, capability/profile
-  intersection, and registry-policy persistence across restart.
-- Roll current and previous worker cohorts, then advance the compatibility
-  floor deliberately.
-
-**Status:**
-
-- [ ] Core implementation
-- [ ] Unit/integration tests, if applicable
-- [ ] Reviewed (Codex)
-- [ ] Validated — the acceptance checks below were run
-
-**Acceptance & Validation:**
-
-- [ ] No ordinary daemon restart requires worker undrain or systemd restart.
-- [ ] No compatible rollout cancels, duplicates, or reassigns an authoritative
-  in-flight attempt.
-- [ ] Every cleanup obligation is delivered and acknowledged before requeue,
-  including when created during daemon or session recovery.
-- [ ] Every deliberate pause, cordon, shutdown, abort, and floor advancement is
-  attributable in durable audit evidence.
-- [ ] Provider reports and promoted artifacts converge exactly once across all
-  restart points.
-
-**Tests:**
-
-- `just build --no-sccache`
-- `just lint --no-sccache`
-- `just test --summary --no-sccache`
-- `git diff --check`
-- Real-host maintenance qualification record with daemon, worker, attempt,
-  cleanup, session, protocol, audit, and provider identities.
+- [ ] Download an artifact from an existing successful release canary; record
+  job/key, retrieval outcome and checksum, and validate its expected content.
+  Compare a producer checksum when available; do not claim end-to-end checksum
+  comparison from a newly computed download hash alone.
+- [ ] Consolidate A/B and artifact evidence into the rollout record with exact
+  release/configuration, job/attempt/session/audit identities and limitations.
+  Operator accepts the single-host closure and retained recovery exception.
 
 ## Final Validation
 
-v35 completes when its lifecycle/protocol checks and carried qualification
-items below pass. Closing v34 did not complete any of those items.
+These are the complete v35 closure gates. The broader correctness contracts
+remain mandatory, but deferred host/feature qualification does not block this
+iteration.
 
-- [ ] `0080` remaining qualification checks pass with a completed evidence
-  record, operator sign-off, and two-host commissioning evidence.
-- [ ] `0027` real-host progress acceptance passes.
-- [ ] `0039` integrated comparison/repeat acceptance passes.
+- [x] Lifecycle/protocol implementation reviewed; Decision 0006 retained.
+- [x] Reviewed automated baseline: 1,114 tests passed, 26 skipped; lint,
+  protocol runtime/Buf and documentation checks recorded in the review handoff.
+  Skipped tests are not counted as passes.
+- [x] Server-first single-host deployment, previous-worker registration/legacy
+  exit, current-worker preflight/resident behavior and both workload smoke tests.
+- [x] Protected matching recovery package and host database restore evidence;
+  isolated application rehearsal explicitly waived, not passed.
+- [ ] Scenario A: scheduler pause/resume host acceptance.
+- [ ] Scenario B: active-worker maintenance host acceptance.
+- [ ] Artifact retrieval and consolidated operator sign-off.
 
-- [ ] Decision 0006 is accepted and reflected in active operations docs.
-- [ ] Ordinary daemon restart is worker-transparent while short-outage lease
-  and long-outage fail-closed behavior are both proven.
-- [ ] Idle session expiry, active lease expiry, startup reconciliation grace,
-  and continuous cleanup delivery converge without relying on systemd restart.
-- [ ] Scheduler pause and worker cordon are independent, persistent, auditable,
-  and idempotent.
-- [ ] Targeted worker update and host maintenance leave unrelated workers
-  schedulable.
-- [ ] Current and previous protocol workers complete the supported lifecycle;
-  incompatible workers fail before assignment.
-- [ ] Rollout, rollback, emergency, and compatibility-floor procedures are
-  executable playbooks rather than undocumented shell history.
-- [ ] Current and previous workers remain compatible until deliberate floor
-  advancement; the approved backup/restore-only daemon rollback is rehearsed
-  with matching database, binaries/configuration and a post-backup reconciliation
-  procedure. Roll-forward remains the preferred recovery strategy.
+October 15–16 restart/lease-loss evidence and the current automated recovery
+suite are retained rather than requiring a replay of the entire host matrix.
+A new defect or a relevant implementation/configuration change reopens the
+affected gate. Closing v35 does not close `0080`, `0027`, `0039`, or qualify
+multi-worker production operation.
 
 ## Stop and Rollback Rules
 
-- Do not weaken lease expiry or accept a stale terminal to make a restart pass.
-- Do not treat startup reconciliation grace as lease renewal; only a confirmed
-  heartbeat extends execution authority.
-- Do not reinterpret revision-1 `Drain` as live cordon without negotiation.
-- Do not advance the compatibility floor until every required worker is on a
-  supported revision and rollback has been exercised.
-- Pause scheduling before a planned outage that may exceed active leases; wait
-  for attempts and cleanup to reach zero rather than granting an implicit
-  indefinite maintenance lease.
-- A failed worker update remains cordoned. A failed daemon update leaves the
-  scheduler paused until the retained compatible daemon is healthy.
+- Never weaken lease expiry, cleanup admission or stale-result fencing.
+- Startup reconciliation grace is not lease renewal.
+- Never reinterpret revision-1 drain as resident cordon without negotiation.
+- Floor advancement requires compatible enabled workers, paused quiescence
+  and an explicit recovery decision; leave floor 1 for this rollout.
+- Pause and reach quiescence before planned outages exceeding active leases.
+- A failed worker update stays cordoned. A failed daemon update keeps intake
+  contained and scheduling paused once reachable; do not resume until healthy.
+- Prefer reviewed roll-forward fixes. If restoring, restore matching database,
+  binaries/configuration/units together, preserve failed-state data and
+  reconcile post-backup jobs, artifacts and provider effects before admission.
 
 ## Follow-Ups
 
-- `0083-multi-orchestrator-high-availability` adds continuous control-plane
-  availability, leader election, and rolling daemon replicas after the
-  single-daemon lifecycle is correct.
-- External package/signing and host-fleet automation may consume v35's
-  cordon/wait/status interfaces; they are not implemented by the daemon.
+- `0080`, `0027`, `0039`: see Carried Qualification and the registry.
+- v36 `0084`/`0085`: trusted-worker snapshot bootstrap and distributed
+  validation workload/coverage qualification.
+- `0083`: multi-orchestrator availability, leader election and rolling replicas.
+- External package/signing and host automation may consume the maintenance
+  interfaces; the daemon does not distribute binaries.

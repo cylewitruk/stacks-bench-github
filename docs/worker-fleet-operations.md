@@ -176,8 +176,9 @@ replacement worker, uncordon, enable an identity or resume the scheduler. An
 older API without admission facts fails explicitly. Schedulability is an
 instantaneous worker-wide observation, not a capacity reservation or a promise
 that a particular job's profile/placement matches. A busy worker may remain
-blocked until its current attempt finishes. Real-host rolling maintenance and a
-second physical worker remain open v35 work.
+blocked until its current attempt finishes. Active single-host maintenance
+remains in v35; physical multi-worker rolling maintenance is the `0080`
+onboarding gate in the [planning registry](../planning/index.md).
 
 `worker-status` includes the latest session's optional `preflight` record:
 check revision, worker-clock completion time, executable SHA-256 and loaded
@@ -247,7 +248,7 @@ one `SBGH_BLOCK_VALIDATION_PROGRESS_WARNING` for canary diagnostics.
 
 ## Coordinated protocol deployment
 
-The deployed predecessor uses revision 1. The local v35 implementation adds
+The deployed predecessor uses revision 1. The v35 implementation adds
 revision 2 and negotiates the bounded current/previous worker window. It must
 be deployed server-first; an old daemon cannot admit a revision-2 worker.
 See the [supported baseline](#supported-protocol-baseline) for the exact
@@ -255,9 +256,9 @@ predecessor, and [coordinated update](#coordinated-daemon-and-worker-update)
 for the conservative qualification workflow.
 
 Worker wire compatibility is separate from daemon/database rollback. The old
-daemon cannot start against the expanded migration ledger. Qualify the approved
-[backup/restore rollback](#recovery-policy-for-the-v35-schema-rollout) before closing v35;
-do not infer rollback support from successful mixed-worker tests.
+daemon cannot start against the expanded migration ledger. Retain the approved
+[backup/restore policy and recorded exception](#recovery-policy-for-the-v35-schema-rollout);
+do not infer binary-only rollback support from successful mixed-worker tests.
 
 ## Drain, cancellation, and recovery
 
@@ -591,21 +592,21 @@ two heartbeat intervals before its first expiry sweep but never renews expired
 authority. Keep timing settings unchanged during an active-job restart canary.
 
 For longer outages, pause admission and wait for quiescence as described below.
-Until that scheduler implementation is deployed, use the existing drain workflow. Explicit
-revision-1 `fleet drain` still exits the worker after idle; undrain plus service
-start remains necessary for that deliberate action. Resident cordon and
-negotiated rolling versions are locally implemented but not deployed-qualified.
+The scheduler and resident worker controls were deployed on October 18.
+Explicit revision-1 `fleet drain` still exits the worker after idle; undrain
+plus service start remains necessary for that deliberate legacy action.
 Use authenticated job cancellation or emergency worker
 disable/revoke for destructive actions, never OS signals as a fleet abort.
 
-Live-host restart, provider convergence, and rollback qualification remain
-required before calling this deployment-qualified. See the
-[v35 evidence and handoff](../planning/design/0082-fleet-lifecycle-failure-matrix.md).
+The [v35 closure checklist](../planning/iterations/v35-seamless-fleet-lifecycle.md#final-validation)
+defines the remaining single-host checks. Automated replay/signal tests and
+scoped prior restart evidence are retained; the full failure matrix is not a
+mandatory production fault-injection ceremony.
 
 ### Explicit fleet abort
 
 Normal service signals never cancel remote work. To deliberately cancel fleet
-work, first pause admission and inspect its generation. The locally implemented
+work, first pause admission and inspect its generation. The
 abort control requires admin authorization, an explicit scope and a reason:
 
 ```bash
@@ -635,7 +636,8 @@ heartbeat cancellation directive. Expired attempts awaiting cleanup have their
 retry obligation changed to cancellation; their job remains nonterminal until
 cleanup acknowledgement. Continue to use scheduler wait and host resource
 checks before maintenance. Resume only by a separate explicit command. This
-control is locally tested; destructive host qualification remains outstanding.
+control has automated acceptance coverage; no destructive production drill is
+required solely for v35 closure. Actual emergency use still needs teardown checks.
 
 ### Supported protocol baseline
 
@@ -645,13 +647,13 @@ incompatible wire changes and are unsupported. Verify build provenance: the
 revision number and package version alone cannot identify that historical
 cohort. Only the Hetzner worker is currently deployed. Compatibility qualification
 targets that predecessor and the new worker, not arbitrary historical binaries.
-The local implementation advertises revision 2. Source-pinned predecessor and
-current-worker probes pass local TLS/RPC lifecycle tests; real task execution
-and production rollout remain unqualified. Release review and a verified
-recovery package precede an operator-controlled server-first canary; the
-rollback policy is defined [below](#recovery-policy-for-the-v35-schema-rollout).
-Upgrade the daemon before the worker; normal traffic follows successful host
-qualification, not merely local test success.
+The October 18 server-first deployment verified predecessor registration and
+legacy exit, followed by current-worker revision-2 registration and both workload
+canaries. Source-pinned previous/current TLS/RPC tests supplement that evidence;
+it does not prove concurrent mixed-cohort workloads on separate physical hosts.
+That operational gate belongs to `0080` before multi-worker production rollout.
+For future updates, retain release review, a verified recovery package and
+operator-controlled canaries; upgrade the daemon before the worker.
 
 After deploying that API, `fleet show-worker` includes `worker.protocol`: selected
 `revision` and `features`, plus the explicit `offer` when advertised. A null offer
@@ -663,12 +665,12 @@ protocol feature support.
 
 ### Compatibility-floor maintenance
 
-These controls are locally implemented; real-task mixed-worker and host rollback
-qualification remain release gates. Keep the floor at 1 during a server-first
-rollout. Upgrading workers does not require immediately retiring revision 1.
+These controls have automated acceptance coverage. Keep the floor at 1 during
+this server-first rollout; advancing it is not a v35 qualification exercise.
+Upgrading workers does not require immediately retiring revision 1.
 
-After those gates pass, inspect the policy and every enabled worker's live
-session before advancing the floor. All enabled workers count as required,
+When deliberately retiring the old revision, inspect the policy and every
+enabled worker's live session before advancing the floor. All enabled workers count as required,
 including drained workers; an offline or unregistered enabled worker blocks
 advancement. Disable a retired worker only through an explicit policy change.
 
@@ -766,9 +768,11 @@ recovery policy below.
 
 Local qualification restores a pre-upgrade dump into a separate test database
 and verifies that the predecessor migrator accepts it with the original ledger
-and worker policy intact. Host qualification must still rehearse the retained
-daemon, configuration and backup together. Keep intake and workers stopped
-through any restore: a pre-upgrade backup cannot retain later submissions,
+and worker policy intact. The October 18 host database restore passed; the
+operator waived isolated application rehearsal for that single-host rollout.
+This is an accepted recovery limitation, not proof of restored daemon startup.
+Keep intake and workers stopped through any restore: a pre-upgrade backup
+cannot retain later submissions,
 results, audit changes or provider effects. After reopening intake, prefer a
 qualified forward repair; any restore needs explicit reconciliation of that
 post-backup work, not just a successful `pg_restore`.
@@ -907,10 +911,13 @@ scope only, not current/previous worker compatibility or fencing guarantees.
 Before migration, freeze intake and quiesce all attempts, cleanup, artifact and
 projection debt. Stop database-writing services before capturing the recovery
 point. Retain a verified PostgreSQL backup and matching executable hashes,
-configuration, service units and source revision; keep secrets protected. Rehearse
-restore into an isolated database with provider delivery disabled and verify the
-retained daemon and configuration can start there. A successful archive listing
-or migration-only probe is not the complete host recovery drill.
+configuration, service units and source revision; keep secrets protected.
+Verify the backup by restoring into an isolated database. For the October 18
+single-host rollout this passed; the operator explicitly waived additional
+isolated application/migration rehearsal. Retain that exception and its limits
+in the [rollout record](../planning/qualification/2026-10-18-v35-rollout.md).
+Do not describe archive integrity or database restore as proof of retained
+daemon startup. Future rollout plans must make their own recovery-risk decision.
 
 For a failure after rollout:
 
@@ -928,9 +935,9 @@ For a failure after rollout:
    objects or external messages. Do not silently discard or automatically replay
    that work.
 
-Keep the compatibility floor at 1 during qualification. Record restore evidence
-and operator sign-off before closing v35; this policy approval is not a successful
-restore or authorization to perform a production restore.
+Keep the compatibility floor at 1 during this qualification. v35 closeout records
+the completed database restore, matching recovery package, accepted application
+rehearsal exception and operator sign-off. None authorizes a production restore.
 
 ## Backup and restore
 

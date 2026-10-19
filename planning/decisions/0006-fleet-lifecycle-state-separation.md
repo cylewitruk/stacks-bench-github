@@ -3,7 +3,9 @@
 - **status:** accepted
 - **date:** 2026-08
 - **accepted:** 2026-10-14 — operator approved the lifecycle separation direction;
-  deployed timing bounds and executable failure cases remain v35 Phase 1 gates.
+  timing/authority bounds and executable failure cases are recorded in v35's
+  failure matrix. Qualification scope was narrowed on 2026-10-19 without
+  changing these lifecycle invariants.
 - **related items:** `0004-worker-fleet`,
   `0075-rolling-worker-protocol-compatibility`,
   `0082-seamless-fleet-lifecycle-maintenance`,

@@ -338,61 +338,41 @@ not qualify `0039`'s automated multi-variant/repeat/calibration workflow, ABBA,
 or automatic PR-baseline selection. Instructions to download both databases
 were supplied; local receipt and checksum verification were not reported.
 
-## Explicit Follow-Up Schedule
+## Explicit Follow-Up Schedule — Revised 2026-10-19
 
-Unchecked means not demonstrated; rescheduling does not mark a gate passed.
-v34 is closed as superseded. Its unfinished `0080`, `0027`, and `0039` checks
-now belong to [v35's carried qualification](../iterations/v35-seamless-fleet-lifecycle.md#carried-qualification),
-with their existing item statuses preserved. Lifecycle implementation comes first;
-closure requires the carried evidence as well.
+The operator approved narrowing v35 to lifecycle correctness and single-host
+acceptance. Historical results above remain unchanged. Deferred requirements
+are not passes; the [registry](../index.md) resolves their current owners.
 
-| Remaining gate | Owner and next checkpoint |
+| Remaining qualification | Owner / disposition |
 | ---- | ---- |
-| Raw evidence completion | v35 carried qualification: retrieve benchmark submission/attempt/provider identities, exact deployed release/image/tool versions, and artifact checksums; retain host reports and operator sign-off before final qualification |
-| Direct S3 ceremony | v35 carried qualification: record put/HEAD/get/checksum/delete before final qualification; existing artifact reads are partial evidence |
-| Slack benchmark journey | v35 carried qualification: one small natural-language benchmark with one canonical report and cleanup evidence; not proven by Slack parser tests |
-| Fine benchmark progress (`0027`) | v35 carried qualification: inspect live guest-to-provider progress and archived JSONL, then calibration/repeat/debounce/fallback cases |
-| Integrated comparison (`0039`) | v35 carried qualification: two refs on one compatible snapshot/worker, then clean repeats and per-variant calibration/DB carry-forward; combine restart portion with v35 |
-| Full-history validation | v35 carried qualification: schedule an explicit maintenance window and retain complete coverage/reduction/artifact/cleanup evidence before final qualification |
-| Post-terminal daemon restart, worker loss, cleanup recovery | October 15 restart checks and October 16 corrected active lease-loss/cleanup/retry passed above; provider replay and the remaining v35 Phases 2–3/7 failure matrix stay open |
-| Identity rotation/revocation, capability/profile changes, policy persistence | Rescheduled to v35 Phases 6–7; retain the original v34 Phase 8 acceptance checks |
-| Previous-protocol runtime qualification | The deployed `0f18950` schema/digests/hash and source-pinned local TLS/RPC probes pass; real-task mixed-cohort and host qualification remain open. Operator approved backup/restore-only daemon rollback on 2026-10-17, preferring roll-forward; host restore/reconciliation remains unqualified |
-| Second physical host | Explicitly deferred from v34; commission by v35 Phase 6's two-worker maintenance gate, then use v36's snapshot-bootstrap contract; no multi-machine claim yet |
-| Validation initialization/progress distinction | Locally implemented and tested, including conservative processing-only ETA; live guest/provider qualification remains open. Retain the scan delay as v36 timing input, not a measured placement model |
+| Selected closure evidence and artifact retrieval | v35 rollout record; preserve historical provenance gaps without reconstructing every old run |
+| Direct S3 ceremony | Replaced by actual job upload plus artifact download/content verification; automated promotion and GC checks retained |
+| Natural-language Slack benchmark/validation journey | `0080` provider follow-up; combine with `0039` where useful |
+| Live progress, calibration/repeat attribution and initialization/ETA | `0027`; one representative live path plus automated edge cases |
+| Integrated comparison, repeats, calibration and database carry-forward | `0039`; independent feature acceptance, not proved by the separate 20k runs |
+| Full-history/cross-epoch coverage | v36 `0085`; bounded cross-epoch canary and fixture coverage proofs, exhaustive history an optional scale soak |
+| Lifecycle failure-matrix permutations | Current automated suite plus scoped October 15–16 host evidence; rerun only affected checks after relevant changes |
+| Identity rotation/revocation, capability/profile policy and physical second worker | `0080` before multi-worker production rollout; snapshot bootstrap is v36 `0084` |
+| Mixed-cohort real workloads and independent rolling maintenance | `0080`; local protocol probes and October 18 sequential previous/current registration do not prove physical multi-host operation |
 
-## Next Implementation Checkpoint
+## Current Checkpoint — 2026-10-19
 
-The first v35 implementation now has local evidence for conservative lease
-deadlines, resident session/cleanup recovery, and process-local daemon shutdown.
-See the [failure matrix and validation record](../design/0082-fleet-lifecycle-failure-matrix.md#local-implementation--2026-10-14).
-The October 15 restart checks and October 16 corrected lease-expiry repeat now
-provide host evidence for idle recovery, active-attempt continuity, and resident
-cleanup-gated retry. Audited scheduler pause/resume (v35 Phase 4) is now locally
-implemented, not deployed or host-qualified. Negotiation, resident maintenance,
-audited abort and preflight provenance are also implemented locally, with
-production-store races, source-pinned previous/current worker probes, real
-daemon process signals and local MinIO recovery tests. Validation initialization
-and conservative ETA reporting now have local coverage. Latest full nextest run
-`911b6e1d-cff3-4cfb-8829-97e4dcbd5869`: 1,107 passed, 26 skipped; build and lint
-passed. The [failure matrix](../design/0082-fleet-lifecycle-failure-matrix.md)
-records scope and limitations of each local evidence set.
+The reviewed `1616c49` release was deployed on October 18. The
+[rollout record](2026-10-18-v35-rollout.md) contains hashes, preflight, backup
+restore, server-first previous/current worker behavior and successful benchmark
+and block-validation smoke tests. It supersedes the earlier not-yet-deployed
+checkpoint, not the historical evidence or its limitations.
 
-Next: consolidated release review and a verified recovery package, then
-operator-run server-first host qualification. The old migrator rejects the new
-ledger. On 2026-10-17 the operator separately approved backup/restore-only daemon
-rollback, preferring roll-forward fixes. Restore must include the matching
-database, binaries and configuration; post-backup work/provider effects need
-explicit reconciliation. Local isolated restore passed, but the host drill and
-sign-off remain open. The earlier approval of `0f18950` as the previous worker
-contract still excludes incompatible pre-v33 layouts; worker compatibility is
-not relaxed by the daemon recovery decision.
+Remaining v35 host work is scheduler pause/resume, active-worker
+cordon/shutdown-after-idle/restart, and artifact retrieval/evidence sign-off.
+See the [authoritative closure checklist](../iterations/v35-seamless-fleet-lifecycle.md#final-validation).
+The supported previous worker remains `0f18950`; incompatible pre-v33 layouts
+are excluded. Backup/restore rollback must restore matching DB/binaries/configs
+and reconcile post-backup effects; roll-forward is preferred. Host database
+restore passed, while isolated application rehearsal was explicitly waived
+on October 18, not passed.
 
-The second-worker VM location is awaiting operator selection. A same-host VM
-can qualify multi-worker function but does not close the second-physical-host
-gate. Provider/progress/comparison, identity-policy and production rollback
-ceremonies remain open. No pending local release has been deployed by the agent.
-
-Decision 0006 was accepted on 2026-10-14; Decision 0007 remains draft.
-Local v35 tests remain separate from the bounded host evidence above; v35 as a
-whole is not qualified. Neither a canonical ledger nor cross-worker validation
-has been demonstrated.
+No second physical worker, canonical ledger or cross-worker validation has
+been qualified. v35 remains open until its reduced checklist is satisfied;
+`0080`, `0027` and `0039` remain unscheduled candidates.

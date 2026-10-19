@@ -18,7 +18,9 @@ Workflow: Opus drafts, Codex reviews, Opus fixes. Keep planning docs concise.
 - [design/](design/) — optional detailed plans for backlog/iteration items.
 - [decisions/](decisions/) — durable architecture decisions (ADRs).
 - [First-fleet qualification record](qualification/2026-10-14-first-fleet.md) —
-  dated deployment evidence, missing checks, and the v34 → v35 handoff.
+  dated deployment evidence and the historical v34 → v35 handoff.
+- [v35 rollout record](qualification/2026-10-18-v35-rollout.md) — deployed
+  single-host evidence, accepted recovery exception and remaining closure checks.
 - [archive/completed/](archive/completed/) — shipped work summaries.
 - [archive/rejected/](archive/rejected/) — ideas we deliberately declined.
 - [archive/superseded/](archive/superseded/) — historical plans kept for

@@ -14,10 +14,11 @@ and convergent GitHub/Slack reporting.
 > of parked v23. v23 (`0026`) remains responsible for transaction facts,
 > workload import packs, and benchmark pre-seeding.
 >
-> **Entry condition:** at least two v35-compatible, operator-trusted workers can
-> be enrolled and one qualified canonical snapshot can be provisioned manually
-> onto each. v36 owns that repeatable bootstrap/verification runbook; automated
-> snapshot production and distribution remain later work.
+> **Multi-worker rollout condition:** qualify worker onboarding/independent
+> maintenance under `0080`, then provision a canonical snapshot on each of at
+> least two v35-compatible, operator-trusted workers. This is not a prerequisite
+> for v35 closure or local v36 implementation. v36 `0084` owns snapshot
+> bootstrap/verification; automated production and distribution remain later work.
 
 ## Items
 
@@ -35,6 +36,25 @@ single-worker parity. Phase 5 adds the first multiworker capability; Phase 6
 optimizes placement; Phase 7 qualifies failures and reorg behavior. Community
 result authority is deliberately split into [v37](v37-community-worker-validation-trust.md)
 so it does not block trusted-fleet distribution.
+
+## Qualification Ownership — 2026-10-19
+
+- `0080` in [the backlog](../backlog.md) owns physical second-worker
+  commissioning, identity-policy drills and independent maintenance. Complete
+  those before multi-worker production rollout; a same-host VM may first prove
+  functional placement, but not physical failure or performance isolation.
+- `0084` owns canonical snapshot bootstrap and inventory verification on those
+  workers. Do not repeat already-qualified installation/lifecycle ceremonies
+  unless relevant changes invalidate their evidence.
+- `0085` owns the full-history/cross-epoch coverage checks transferred from v35.
+  Test full-selection planning/reduction on pinned fixtures and qualify bounded
+  real ranges spanning both epochs, exact coverage, cancellation and retries.
+  An exhaustive mainnet-history run is an optional scale soak, not a substitute
+  for coverage proofs or a mandatory lifecycle/release gate. When run, retain
+  every shard outcome and exact reduction; a negative verdict is acceptable
+  evidence only if execution completed normally and coverage is complete.
+- `0027` owns live initialization/progress/ETA presentation; use actual startup
+  observations here, without treating unmeasured ETA accuracy as qualified.
 
 ## 0084 — Canonical Chainstate and Worker Inventory
 
