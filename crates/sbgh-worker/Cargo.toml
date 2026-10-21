@@ -56,6 +56,7 @@ tonic-health.workspace = true
 hyper-util.workspace = true
 
 [dev-dependencies]
+x509-parser.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-stream.workspace = true

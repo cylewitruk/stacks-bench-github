@@ -10,6 +10,7 @@ use anyhow::{Context, ensure};
 use hyper_util::rt::TokioIo;
 use reqwest::header::{HeaderName, HeaderValue};
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+use rustls::time_provider::{DefaultTimeProvider, TimeProvider};
 use rustls::{ClientConfig, RootCertStore};
 use sbgh_fleet::{
     AcceptOfferRequest, AcceptOfferResponse, ArtifactGrantRequest, ArtifactGrantResponse,
@@ -55,7 +56,12 @@ struct Tls13Connector {
     host: Arc<str>,
     port: u16,
     server_name: ServerName<'static>,
-    tls: tokio_rustls::TlsConnector,
+    /// Trust anchors loaded once, independent of ephemeral client wrappers.
+    roots: Arc<RootCertStore>,
+    /// Stable enrolled identity, retained across every transport reconnect.
+    identity: Arc<rcgen::KeyPair>,
+    /// Shared source of time for wrapper issuance and TLS verification.
+    clock: Arc<dyn TimeProvider>,
 }
 
 impl Service<Uri> for Tls13Connector {
@@ -80,13 +86,41 @@ impl Service<Uri> for Tls13Connector {
 }
 
 impl Tls13Connector {
+    /// Connect with a newly issued wrapper without replacing the fleet session.
     async fn connect(&self) -> io::Result<TlsStream<TcpStream>> {
         let tcp = TcpStream::connect((self.host.as_ref(), self.port)).await?;
         tcp.set_nodelay(true)?;
-        self.tls
+        let config = self
+            .client_config()
+            .map_err(io::Error::other)?;
+        tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(self.server_name.clone(), tcp)
             .await
             .map_err(io::Error::other)
+    }
+
+    /// Issue a one-hour proof wrapper at connection time using the enrolled key.
+    fn client_config(&self) -> anyhow::Result<ClientConfig> {
+        let now = self
+            .clock
+            .current_time()
+            .context("TLS clock is unavailable")?;
+        let now = time::OffsetDateTime::from_unix_timestamp(i64::try_from(now.as_secs())?)?;
+        let mut params = rcgen::CertificateParams::default();
+        params.not_before = now - time::Duration::minutes(1);
+        params.not_after = now + time::Duration::hours(1);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let wrapper = params
+            .self_signed(self.identity.as_ref())
+            .context("creating ephemeral worker TLS wrapper")?;
+        let private_key = PrivatePkcs8KeyDer::from(self.identity.serialize_der()).into();
+        let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(self.roots.clone())
+            .with_client_auth_cert(vec![wrapper.der().clone()], private_key)
+            .context("building TLS 1.3 worker client configuration")?;
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        config.time_provider = self.clock.clone();
+        Ok(config)
     }
 }
 
@@ -433,28 +467,14 @@ fn tls13_connector(
         key.algorithm() == &rcgen::PKCS_ECDSA_P256_SHA256,
         "worker identity key must use P-256"
     );
-    let mut params = rcgen::CertificateParams::default();
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now - time::Duration::minutes(1);
-    params.not_after = now + time::Duration::hours(1);
-    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let wrapper = params
-        .self_signed(&key)
-        .context("creating ephemeral worker TLS wrapper")?;
-    let certificate_chain = vec![wrapper.der().clone()];
-    let private_key = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
-    let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_root_certificates(roots)
-        .with_client_auth_cert(certificate_chain, private_key)
-        .context("building TLS 1.3 worker client configuration")?;
-    config.alpn_protocols = vec![b"h2".to_vec()];
-
     Ok(Tls13Connector {
         host: Arc::from(host),
         port,
         server_name: ServerName::try_from(host.to_owned())
             .context("fleet server name is invalid")?,
-        tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+        roots: Arc::new(roots),
+        identity: Arc::new(key),
+        clock: Arc::new(DefaultTimeProvider),
     })
 }
 
@@ -506,6 +526,8 @@ fn fleet_error(path: &str, status: tonic::Status) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    mod tls_tests;
+
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 

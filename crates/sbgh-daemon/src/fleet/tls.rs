@@ -217,13 +217,13 @@ impl ClientCertVerifier for PossessionVerifier {
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
-        if !intermediates.is_empty()
-            || canonical_spki_from_certificate(end_entity.as_ref()).is_err()
-        {
+        if !intermediates.is_empty() {
             return Err(TlsError::InvalidCertificate(CertificateError::BadEncoding));
         }
+        canonical_spki_from_certificate(end_entity.as_ref(), now)
+            .map_err(TlsError::InvalidCertificate)?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -291,42 +291,48 @@ fn canonical_spki_digest(spki: &[u8]) -> anyhow::Result<[u8; 32]> {
     Ok(Sha256::digest(canonical.as_bytes()).into())
 }
 
-fn canonical_spki_from_certificate(der: &[u8]) -> anyhow::Result<&[u8]> {
-    ensure!(der.len() <= MAX_IDENTITY_BYTES, "worker TLS wrapper exceeds 16 KiB");
-    let (remainder, certificate) = parse_x509_certificate(der)
-        .map_err(|error| anyhow::anyhow!("parsing worker X.509: {error}"))?;
-    ensure!(remainder.is_empty(), "worker TLS wrapper has trailing bytes");
-    ensure!(
-        certificate
-            .validity()
-            .is_valid(),
-        "worker TLS wrapper is not currently valid"
-    );
-    ensure!(
-        certificate
-            .validity()
-            .not_after
+/// Validate a proof wrapper at the handshake's clock time and extract its key.
+fn canonical_spki_from_certificate(der: &[u8], now: UnixTime) -> Result<&[u8], CertificateError> {
+    if der.len() > MAX_IDENTITY_BYTES {
+        return Err(CertificateError::BadEncoding);
+    }
+    let (remainder, certificate) =
+        parse_x509_certificate(der).map_err(|_| CertificateError::BadEncoding)?;
+    if !remainder.is_empty() {
+        return Err(CertificateError::BadEncoding);
+    }
+    let now = i64::try_from(now.as_secs()).map_err(|_| CertificateError::BadEncoding)?;
+    let validity = certificate.validity();
+    if now
+        < validity
+            .not_before
             .timestamp()
-            - certificate
-                .validity()
-                .not_before
-                .timestamp()
-            <= 24 * 60 * 60,
-        "worker TLS wrapper lifetime exceeds 24 hours"
-    );
+    {
+        return Err(CertificateError::NotValidYet);
+    }
+    if now > validity.not_after.timestamp() {
+        return Err(CertificateError::Expired);
+    }
+    if validity.not_after.timestamp()
+        - validity
+            .not_before
+            .timestamp()
+        > 24 * 60 * 60
+    {
+        return Err(CertificateError::BadEncoding);
+    }
     let usage = certificate
         .extended_key_usage()
-        .context("reading worker TLS wrapper extended key usage")?
-        .context("worker TLS wrapper lacks extended key usage")?;
-    ensure!(
-        usage.value.client_auth && !usage.value.any && !usage.value.server_auth,
-        "worker TLS wrapper is not client-auth-only"
-    );
+        .map_err(|_| CertificateError::BadEncoding)?
+        .ok_or(CertificateError::InvalidPurpose)?;
+    if !usage.value.client_auth || usage.value.any || usage.value.server_auth {
+        return Err(CertificateError::InvalidPurpose);
+    }
     let spki = certificate
         .tbs_certificate
         .subject_pki
         .raw;
-    canonical_spki_digest(spki)?;
+    canonical_spki_digest(spki).map_err(|_| CertificateError::BadEncoding)?;
     Ok(spki)
 }
 
@@ -358,11 +364,16 @@ fn peer_identity_key_sha256(stream: &TlsStream<TcpStream>) -> anyhow::Result<[u8
         .peer_certificates()
         .and_then(|certificates| certificates.first())
         .context("authenticated worker presented no TLS wrapper")?;
-    canonical_spki_digest(canonical_spki_from_certificate(leaf.as_ref())?)
+    let spki = canonical_spki_from_certificate(leaf.as_ref(), UnixTime::now())
+        .map_err(TlsError::InvalidCertificate)?;
+    canonical_spki_digest(spki)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+    use std::time::Duration;
+
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
     use p256::elliptic_curve::rand_core::OsRng;
@@ -374,6 +385,92 @@ mod tests {
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     use super::*;
+
+    /// Expiry diagnostics use the TLS clock, including exact validity boundaries.
+    #[test]
+    fn proof_wrapper_validity_uses_handshake_time_and_typed_errors() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        let start = 1_800_000_000;
+        params.not_before = time::OffsetDateTime::from_unix_timestamp(start).unwrap();
+        params.not_after = params.not_before + time::Duration::hours(1);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = params
+            .self_signed(&key)
+            .unwrap();
+        let verify = |seconds| {
+            PossessionVerifier.verify_client_cert(
+                cert.der(),
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(seconds)),
+            )
+        };
+        assert_matches!(
+            verify(start as u64 - 1),
+            Err(TlsError::InvalidCertificate(CertificateError::NotValidYet))
+        );
+        assert!(verify(start as u64).is_ok());
+        assert!(verify(start as u64 + 3600).is_ok());
+        assert_matches!(
+            verify(start as u64 + 3601),
+            Err(TlsError::InvalidCertificate(CertificateError::Expired))
+        );
+        assert_matches!(
+            PossessionVerifier.verify_client_cert(
+                &CertificateDer::from(b"malformed".to_vec()),
+                &[],
+                UnixTime::now()
+            ),
+            Err(TlsError::InvalidCertificate(CertificateError::BadEncoding))
+        );
+    }
+
+    /// More precise time errors do not relax purpose, chain, key or lifetime rules.
+    #[test]
+    fn proof_wrapper_constraints_remain_fail_closed() {
+        let key = KeyPair::generate().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let mut params = CertificateParams::default();
+        params.not_before = now - time::Duration::minutes(1);
+        params.not_after = now + time::Duration::hours(1);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let wrong_usage = params
+            .self_signed(&key)
+            .unwrap();
+        assert_matches!(
+            PossessionVerifier.verify_client_cert(wrong_usage.der(), &[], UnixTime::now()),
+            Err(TlsError::InvalidCertificate(CertificateError::InvalidPurpose))
+        );
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let valid = params
+            .self_signed(&key)
+            .unwrap();
+        assert_matches!(
+            PossessionVerifier.verify_client_cert(
+                valid.der(),
+                &[valid.der().clone()],
+                UnixTime::now()
+            ),
+            Err(TlsError::InvalidCertificate(CertificateError::BadEncoding))
+        );
+        params.not_after = now + time::Duration::days(2);
+        let long_lived = params
+            .self_signed(&key)
+            .unwrap();
+        assert_matches!(
+            PossessionVerifier.verify_client_cert(long_lived.der(), &[], UnixTime::now()),
+            Err(TlsError::InvalidCertificate(CertificateError::BadEncoding))
+        );
+        params.not_after = now + time::Duration::hours(1);
+        let other_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let unsupported = params
+            .self_signed(&other_key)
+            .unwrap();
+        assert_matches!(
+            PossessionVerifier.verify_client_cert(unsupported.der(), &[], UnixTime::now()),
+            Err(TlsError::InvalidCertificate(CertificateError::BadEncoding))
+        );
+    }
 
     #[test]
     fn enrollment_accepts_only_canonical_p256_public_keys() {

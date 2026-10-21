@@ -576,6 +576,14 @@ session only when no successor owns the identity. Older daemons return the
 legacy stale-session error; upgraded workers still fail closed against them.
 Superseded sessions never mint a replacement UUID automatically.
 
+Each new TLS connection issues a fresh one-hour client certificate wrapper using
+the same enrolled P-256 key. Wrapper renewal is not key rotation or fleet session
+registration. Expired/not-yet-valid wrappers remain rejected; check host clock
+alignment and the installed worker version if those handshake errors recur.
+Workers predating this fix reuse their startup wrapper and can lose connectivity
+after a daemon restart once it expires. A worker restart is temporary mitigation,
+not a fix; use normal maintenance controls and account for active work first.
+
 Install daemon changes first, while the fleet is quiescent, then update workers
 using the controlled update scripts. The original pre-v35 daemon had destructive
 shutdown behavior; the operator-qualified `d0b6852` daemon already has local-only

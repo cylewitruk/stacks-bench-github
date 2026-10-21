@@ -1,0 +1,7 @@
+a7939b8d71d82d4ad0e8eed1c61c40e32016dea9113b6a84b73c179d2d5ecdba  Cargo.lock
+9b22da750d0f68b5784943ed3b921c716d5f2fc5b906800ee86c067bad1bead0  crates/sbgh-worker/Cargo.toml
+d4816462c3668d1e53b853ce9e9d0804a3823037c98ab7fe751609edbc0e6d87  crates/sbgh-worker/src/transport.rs
+a2e97b3aeeeb51e41172e7e6bfdc0ab090c29ca03bb635434fb6118586b2ea8c  crates/sbgh-worker/src/transport/tests/tls_tests.rs
+5d6a3ca31af0f09dc71c32e03b99f7bfe6e2326af4f3ea5b723839a964874ce3  crates/sbgh-daemon/src/fleet/tls.rs
+10393403a6c829dd411ad72a46d59b9afe424a0696bd72e3de2013306306977a  docs/worker-fleet-operations.md
+1ce3849b947efc8725a30166861e8cffc85c1672dee36b3fa64e9cc21092865b  planning/qualification/2026-10-18-v35-rollout.md
